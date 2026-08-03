@@ -291,6 +291,7 @@ pub(crate) async fn attach_send_pump(
             session_id: requested_session,
             since_seq: None,
             project_root: Some(project_root),
+            initial_model: None,
             no_sandbox,
             // A streamed run has no UI to answer an interrupt — a
             // non-interactive attach. The loop guard treats the session as

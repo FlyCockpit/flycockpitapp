@@ -567,13 +567,15 @@ fn merge_provider_files_for_layer(merged: &mut Value, config_path: &Path) {
         };
         match load_provider_raw_file(&path) {
             Ok(mut provider) => {
-                let url_changed = merged
-                    .get("providers")
-                    .and_then(Value::as_object)
-                    .and_then(|providers| providers.get(&id))
-                    .and_then(Value::as_object)
-                    .and_then(|previous| previous.get("url"))
-                    .is_some_and(|previous_url| provider.get("url") != Some(previous_url));
+                let url_changed = provider.get("url").is_some_and(|new_url| {
+                    merged
+                        .get("providers")
+                        .and_then(Value::as_object)
+                        .and_then(|providers| providers.get(&id))
+                        .and_then(Value::as_object)
+                        .and_then(|previous| previous.get("url"))
+                        .is_some_and(|previous_url| new_url != previous_url)
+                });
                 if url_changed {
                     provider
                         .entry("credential_ref".to_string())

@@ -25,10 +25,15 @@ fn app_for_skills(tmp: &tempfile::TempDir) -> App {
         .to_string(),
     )
     .unwrap();
-    App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || {
+            App::new_with_db(
+                Some(tmp.path()),
+                false,
+                cockpit_db::Db::open_in_memory().unwrap(),
+            )
+        },
     )
 }
 
@@ -40,6 +45,13 @@ fn write_skill(scan: &Path, dir: &str, name: &str, description: &str) {
         format!("---\nname: {name}\ndescription: {description}\n---\nBody\n"),
     )
     .unwrap();
+}
+
+fn open_skills_pane_trusted(app: &mut App, tmp: &tempfile::TempDir) {
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || app.open_skills_pane(),
+    );
 }
 
 fn runner_with_attached_request_tx(
@@ -122,7 +134,7 @@ async fn skills_pane_uses_attached_client_when_runner_present() {
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
 
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
 
     assert_eq!(
         app.async_actions.pending_kinds(),
@@ -157,7 +169,7 @@ fn skills_pane_local_fallback_when_detached() {
     write_skill(&scan, "local", "local-skill", "from local discovery");
     let mut app = app_for_skills(&tmp);
 
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
 
     assert_eq!(app.async_actions.pending_count(), 0);
     let text = skills_text(&app);
@@ -175,7 +187,7 @@ async fn skills_pane_attached_failure_degrades_to_local() {
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
 
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
     let attached = attached_request_rx.recv().await.unwrap();
     attached
         .response_tx
@@ -198,7 +210,7 @@ async fn skills_pane_fetch_is_async_action() {
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
 
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
 
     assert_eq!(
         app.async_actions.pending_kinds(),
@@ -216,11 +228,11 @@ async fn skills_pane_stale_result_dropped() {
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
 
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
     let stale_id = app.async_actions.pending_ids().pop().unwrap();
     let stale_generation = skills_generation(&app);
     app.agent_runner = None;
-    app.open_skills_pane();
+    open_skills_pane_trusted(&mut app, &tmp);
 
     app.apply_async_action_result(AsyncActionResult {
         id: stale_id,

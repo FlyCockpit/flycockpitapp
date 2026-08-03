@@ -60,10 +60,8 @@ pub enum TurnEvent {
     /// same-model reselect. TUI chrome is driven from this snapshot instead of
     /// local config writes.
     ActiveModelState {
-        provider: String,
-        model: String,
-        config_provider: Option<String>,
-        config_model: Option<String>,
+        selection: crate::config::providers::ActiveModelRef,
+        default_selection: Option<crate::config::providers::ActiveModelRef>,
         diverged: bool,
         generation: u64,
     },

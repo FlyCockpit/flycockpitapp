@@ -71,7 +71,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate/control {list} with `intent` plus optional `payload`. Handoff uses @file/@file:XX-YY/@dir/ and /skill tags. Backgrounded JSON: detached child; use task_call_id controls/async result. `mode=sealed_fetch` runs a noninteractive child whose text is withheld; require `value_id` and read the typed sealed status only.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls. `sealed_fetch` needs `value_id`; hides text, returns status.{recursion_note}"
         );
         // Defensive (`LlmMode::Defensive`) steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job

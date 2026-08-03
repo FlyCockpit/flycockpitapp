@@ -68,18 +68,27 @@ fn load_effective_count() -> usize {
     cockpit_config::providers::load_effective_call_count()
 }
 
+fn with_trusted_tree<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(cwd),
+        f,
+    )
+}
+
 /// Build the wire snapshot the daemon would push for a config tree: the
 /// resolved `ExtendedConfig` plus the redacted provider projection.
 fn snapshot_from_tree(cwd: &Path, generation: u64) -> cockpit_core::daemon::proto::ConfigSnapshot {
-    let extended = cockpit_config::extended::load_for_cwd(cwd);
-    let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-    let providers = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
-    cockpit_core::daemon::proto::ConfigSnapshot {
-        session_id: uuid::Uuid::new_v4(),
-        generation,
-        extended,
-        providers: cockpit_core::secret_ref::redact_provider_view(&providers),
-    }
+    with_trusted_tree(cwd, || {
+        let extended = cockpit_config::extended::load_for_cwd(cwd);
+        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+        let providers = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+        cockpit_core::daemon::proto::ConfigSnapshot {
+            session_id: uuid::Uuid::new_v4(),
+            generation,
+            extended,
+            providers: cockpit_core::secret_ref::redact_provider_view(&providers),
+        }
+    })
 }
 
 /// A minimal attached runner so `resync_config_after_local_write` takes the
@@ -121,7 +130,9 @@ fn stub_runner() -> AgentRunner {
 }
 
 fn app_for_tree(tree: &Path) -> App {
-    App::new_with_db(Some(tree), false, cockpit_db::Db::open_in_memory().unwrap())
+    with_trusted_tree(tree, || {
+        App::new_with_db(Some(tree), false, cockpit_db::Db::open_in_memory().unwrap())
+    })
 }
 
 // ---- Criterion 8: behavior parity ------------------------------------------
@@ -152,12 +163,14 @@ fn config_snapshot_values_match_previous_resolution() {
     );
     // Model-picker ordering: the global LLM mode is now threaded from the held
     // snapshot (the provider list read is owned by `tui-inventory-from-daemon`).
-    let choices = crate::tui::model_picker::ordered_model_choices(
-        cwd,
-        app.config_snapshot.extended.llm_mode,
-        &std::collections::HashMap::new(),
-    )
-    .unwrap();
+    let choices = with_trusted_tree(cwd, || {
+        crate::tui::model_picker::ordered_model_choices(
+            cwd,
+            app.config_snapshot.extended.llm_mode,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+    });
     let ordering: Vec<(String, String, bool, LlmMode)> = choices
         .into_iter()
         .map(|c| (c.provider_id, c.model_id, c.is_favorite, c.mode))
@@ -258,7 +271,18 @@ fn tui_config_count_stable_across_interactions() {
         snapshot: Box::new(pushed),
     });
     // /model change: apply an active-model state.
-    app.apply_active_model_state("p".to_string(), "a".to_string(), None, None, false, 1);
+    app.apply_active_model_state(
+        cockpit_config::providers::ActiveModelRef {
+            provider: "p".to_string(),
+            model: "a".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        None,
+        false,
+        1,
+    );
     // turn-event application: a foreground-target event re-runs skill discovery.
     app.apply_event(cockpit_core::engine::TurnEvent::ForegroundInputTarget {
         target: cockpit_core::engine::message::QueueTarget::root("Build"),

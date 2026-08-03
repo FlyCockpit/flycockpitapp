@@ -244,7 +244,7 @@ fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<u64> 
     let roots = old_session_roots(conn, cutoff_secs)?;
     let mut removed = 0;
     for root in roots {
-        crate::db::sessions::delete_session_conn(conn, root, true)
+        crate::db::sessions::delete_session_conn(conn, root)
             .with_context(|| format!("expiring old session {root}"))?;
         removed += 1;
     }

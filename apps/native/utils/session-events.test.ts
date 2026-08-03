@@ -137,10 +137,8 @@ describe("native session event helpers", () => {
         active_agent: "Build",
         history: [],
         active_model_state: {
-          provider: "openai",
-          model: "gpt-4o",
-          config_provider: "openai",
-          config_model: "gpt-5",
+          selection: { provider: "openai", model: "gpt-4o" },
+          default_selection: { provider: "openai", model: "gpt-5" },
           diverged: true,
           generation: 4,
         },

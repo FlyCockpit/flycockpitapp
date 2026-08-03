@@ -696,6 +696,19 @@ impl SessionWorkerHandle {
         (handle, work_rx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_config_snapshot_for_tests(
+        &self,
+        providers: crate::config::providers::ProvidersConfig,
+        extended: crate::config::extended::ExtendedConfig,
+    ) {
+        *self
+            .config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            SessionConfigSnapshot::new(0, providers, extended);
+    }
+
     pub fn set_created_by_principal(&self, principal: Option<String>) -> anyhow::Result<()> {
         self.session.set_created_by_principal(principal)
     }
@@ -1106,10 +1119,12 @@ impl SessionWorkerHandle {
         self.session.short_id.clone()
     }
 
-    /// The session's active (provider, model) selection. Test observability
-    /// for the daemon config seam (`daemon-trust-test-isolation.md`).
-    pub(crate) fn active_model_selection(&self) -> (Option<String>, Option<String>) {
-        (self.session.active_provider(), self.session.active_model())
+    /// The session's complete active selection. This is the daemon-owned
+    /// resume source, not a projection reconstructed from config defaults.
+    pub(crate) fn active_model_selection(
+        &self,
+    ) -> Option<crate::config::providers::ActiveModelRef> {
+        self.session.active_model_ref()
     }
 
     /// Broadcast the session's current gitignore read-allowlist over the
@@ -1314,7 +1329,7 @@ pub enum SessionWork {
         persist_as_default: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
-        thinking_mode: Option<String>,
+        thinking_mode: Option<crate::config::providers::ThinkingMode>,
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
     },
     SetAgent {

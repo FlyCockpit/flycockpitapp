@@ -732,16 +732,18 @@ fn has_execution_bearing_option(args: &[String], program: &str) -> bool {
             "rsync" if arg == "--rsh" || arg.starts_with("--rsh=") => return true,
             "scp" if arg == "-S" || arg.starts_with("-S") && arg.len() > 2 => return true,
             "ssh" if arg == "-o" => {
-                if let Some(value) = args.get(index + 1) {
-                    if value.starts_with("ProxyCommand=") || value.starts_with("LocalCommand=") {
-                        return true;
-                    }
-                }
-            }
-            "ssh" if let Some(value) = arg.strip_prefix("-o") => {
-                if value.starts_with("ProxyCommand=") || value.starts_with("LocalCommand=") {
+                if let Some(value) = args.get(index + 1)
+                    && (value.starts_with("ProxyCommand=") || value.starts_with("LocalCommand="))
+                {
                     return true;
                 }
+            }
+            "ssh"
+                if let Some(value) = arg.strip_prefix("-o")
+                    && (value.starts_with("ProxyCommand=")
+                        || value.starts_with("LocalCommand=")) =>
+            {
+                return true;
             }
             _ => {}
         }

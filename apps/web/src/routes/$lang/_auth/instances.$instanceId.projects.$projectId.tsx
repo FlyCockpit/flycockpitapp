@@ -1303,6 +1303,7 @@ function NewSessionDialog({
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [agent, setAgent] = useState("codex");
+  const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
 
   async function submit() {
@@ -1311,10 +1312,12 @@ function NewSessionDialog({
         projectRoot,
         title: title || undefined,
         agent,
-        model: model || undefined,
+        initialModel: provider && model ? { provider, model } : undefined,
       });
       setOpen(false);
       setTitle("");
+      setProvider("");
+      setModel("");
       onCreated(result.summary.sessionId);
     } catch {
       toast.error(t("remote.createFailed"));
@@ -1346,10 +1349,19 @@ function NewSessionDialog({
             <Input value={agent} onChange={(event) => setAgent(event.target.value)} />
           </div>
           <div className="space-y-2">
+            <Label>{t("remote.provider")}</Label>
+            <Input value={provider} onChange={(event) => setProvider(event.target.value)} />
+          </div>
+          <div className="space-y-2">
             <Label>{t("remote.model")}</Label>
             <Input value={model} onChange={(event) => setModel(event.target.value)} />
           </div>
-          <Button type="button" className="w-full" onClick={() => void submit()}>
+          <Button
+            type="button"
+            className="w-full"
+            disabled={Boolean(provider) !== Boolean(model)}
+            onClick={() => void submit()}
+          >
             {t("remote.createSession")}
           </Button>
         </div>

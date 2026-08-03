@@ -60,12 +60,16 @@
         "task_call_id": "task-1"
       },
       "active_model_state": {
-        "config_model": "model-fixture",
-        "config_provider": "provider-fixture",
+        "default_selection": {
+          "model": "model-fixture",
+          "provider": "provider-fixture"
+        },
         "diverged": false,
         "generation": 0,
-        "model": "model-fixture",
-        "provider": "provider-fixture"
+        "selection": {
+          "model": "model-fixture",
+          "provider": "provider-fixture"
+        }
       },
       "compatible": true,
       "daemon_version": "daemon_version-fixture",
@@ -287,6 +291,13 @@
     },
     "response": "export_session_data"
   },
+  "import_session_archive": {
+    "data": {
+      "imported": ["11111111-1111-4111-8111-111111111111"],
+      "redacted": true
+    },
+    "response": "import_session_archive"
+  },
   "fs_list": {
     "data": {
       "entries": [
@@ -405,6 +416,12 @@
     },
     "response": "guidance_estimate"
   },
+  "longcache_state": {
+    "data": {
+      "enabled": true
+    },
+    "response": "longcache_state"
+  },
   "lsp_control_result": {
     "data": {
       "message": "message-fixture"
@@ -423,6 +440,13 @@
       ]
     },
     "response": "models"
+  },
+  "restart_decision": {
+    "data": {
+      "reason": "a session is busy",
+      "will_restart": false
+    },
+    "response": "restart_decision"
   },
   "note_recorded": {
     "data": {
@@ -887,6 +911,24 @@
     },
     "response": "history_page"
   },
+  "subagent_history_page": {
+    "data": {
+      "entries": [
+        {
+          "role": "user",
+          "seq": 5,
+          "text": "message",
+          "ts_ms": 1700000000000
+        }
+      ],
+      "has_more": true,
+      "label": "label-fixture",
+      "oldest_seq": 5,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "response": "subagent_history_page"
+  },
   "sessions": {
     "data": {
       "sessions": [
@@ -1117,5 +1159,106 @@
       ]
     },
     "response": "user_message_queued"
+  },
+  "assistant_upserted": {
+    "response": "assistant_upserted",
+    "data": {
+      "assistant": {
+        "name": "helper-bot",
+        "created_at": 1700000000,
+        "home_dir": "/tmp/assistants/helper-bot",
+        "config_json": "{\"name\":\"helper-bot\"}",
+        "content_hash": "hash-fixture"
+      }
+    }
+  },
+  "pin_changed": {
+    "response": "pin_changed",
+    "data": {
+      "changed": true
+    }
+  },
+  "pin_count": {
+    "response": "pin_count",
+    "data": {
+      "count": 7
+    }
+  },
+  "pin_seqs": {
+    "response": "pin_seqs",
+    "data": {
+      "seqs": [7]
+    }
+  },
+  "pin_state": {
+    "response": "pin_state",
+    "data": {
+      "state": {
+        "count": 1,
+        "seqs": [7]
+      }
+    }
+  },
+  "pin_toggled": {
+    "response": "pin_toggled",
+    "data": {
+      "pinned": true
+    }
+  },
+  "pins_with_text": {
+    "response": "pins_with_text",
+    "data": {
+      "pins": [
+        {
+          "seq": 7,
+          "is_assistant": false,
+          "text": "pinned text"
+        }
+      ]
+    }
+  },
+  "project_note_created": {
+    "response": "project_note_created",
+    "data": {
+      "note": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "project_root": "/tmp/project",
+        "name": "note-fixture",
+        "content": "content-fixture"
+      }
+    }
+  },
+  "project_note_renamed": {
+    "response": "project_note_renamed",
+    "data": {
+      "name": "note-fixture"
+    }
+  },
+  "project_notes": {
+    "response": "project_notes",
+    "data": {
+      "notes": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "project_root": "/tmp/project",
+          "name": "note-fixture",
+          "content": "content-fixture"
+        }
+      ]
+    }
+  },
+  "sealed_values": {
+    "response": "sealed_values",
+    "data": {
+      "values": [
+        {
+          "value_id": "prod_token",
+          "reason": "deploy",
+          "origin": "user",
+          "created_at": 1700000000,
+          "origin_session_id": "11111111-1111-4111-8111-111111111111"
+        }
+      ]
+    }
   }
 }

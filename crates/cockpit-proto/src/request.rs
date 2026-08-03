@@ -21,6 +21,12 @@ pub enum Request {
         /// it knows for this client connection.
         #[serde(default)]
         project_root: Option<String>,
+        /// Full model selection used to create a new session, or to recover a
+        /// model-less existing session. Resume never overwrites an existing
+        /// durable selection; intentional changes use `SetActiveModel` after
+        /// attach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_model: Option<cockpit_config::config::providers::ActiveModelRef>,
         /// The client's `--no-sandbox` flag (sandboxing part 2). When
         /// `true`, sessions this client *creates* start with filesystem
         /// sandboxing OFF — unless the daemon itself was launched
@@ -259,6 +265,8 @@ pub enum Request {
     CreateAssistantSession {
         name: String,
         project_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_model: Option<cockpit_config::config::providers::ActiveModelRef>,
         #[serde(default)]
         no_sandbox: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,13 +537,10 @@ pub enum Request {
         text: String,
     },
 
-    /// Drop a session and (optionally) its descendant forks.
-    /// FK cascades take care of tool_call_events / inference_calls /
-    /// lock state. GOALS §17h.
+    /// Drop a session and its complete descendant fork subtree. SQLite
+    /// owns the cascading relationship and all session-owned rows.
     DeleteSession {
         session_id: Uuid,
-        #[serde(default)]
-        cascade: bool,
     },
 
     /// List discovered skills, resolving the configured scan dirs from
@@ -596,6 +601,14 @@ pub enum Request {
         provider: Option<String>,
     },
 
+    /// Set or clear one configured model’s favorite flag. The daemon validates
+    /// the model, owns the config write, then broadcasts a fresh config snapshot.
+    SetModelFavorite {
+        provider: String,
+        model: String,
+        favorite: bool,
+    },
+
     /// Switch the attached session to a different model.
     SetActiveModel {
         selection_id: Uuid,
@@ -609,7 +622,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking_mode: Option<String>,
+        thinking_mode: Option<cockpit_config::config::providers::ThinkingMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_cache_retention: Option<PromptCacheRetention>,
     },
@@ -947,6 +960,7 @@ macro_rules! request_variants {
             (Request::RunScheduledJob { .. }, "run_scheduled_job");
             (Request::ListAgents, "list_agents");
             (Request::ListModels { .. }, "list_models");
+            (Request::SetModelFavorite { .. }, "set_model_favorite");
             (Request::SetActiveModel { .. }, "set_active_model");
             (Request::SetAgent { .. }, "set_agent");
             (Request::SetLlmMode { .. }, "set_llm_mode");
@@ -1082,7 +1096,8 @@ macro_rules! command {
             (Request::RunScheduledJob { .. }, "run_scheduled_job", owner_only, none, true, serialized, none);
             (Request::ListAgents, "list_agents", owner_only, none, false, concurrent, none);
             (Request::ListModels { .. }, "list_models", owner_only, none, false, concurrent, none);
-            (Request::SetActiveModel { .. }, "set_active_model", session_writer, attached, true, serialized, none);
+            (Request::SetModelFavorite { .. }, "set_model_favorite", owner_only, attached, true, serialized, none);
+            (Request::SetActiveModel { .. }, "set_active_model", custom(authorize_set_active_model), attached, true, serialized, none);
             (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, serialized, none);
             (Request::SetLlmMode { .. }, "set_llm_mode", session_writer, attached, true, serialized, none);
             (Request::SetSessionLlmMode { .. }, "set_session_llm_mode", session_writer, attached, true, serialized, none);

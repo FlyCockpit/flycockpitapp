@@ -258,6 +258,11 @@ fn aligned_lines(header: &[&str], rows: &[Vec<String>], indent: &str) -> Vec<Str
 /// row, then data rows — so a script can split on blank lines or filter
 /// by the section marker.
 fn print_csv(r: &StatsRollup) -> Result<()> {
+    print!("{}", render_csv(r)?);
+    Ok(())
+}
+
+fn render_csv(r: &StatsRollup) -> Result<String> {
     use std::io::Write;
     let mut out = Vec::<u8>::new();
 
@@ -435,9 +440,7 @@ fn print_csv(r: &StatsRollup) -> Result<()> {
         w.flush()?;
     }
 
-    let text = String::from_utf8(out).map_err(|e| anyhow::anyhow!("csv was not utf-8: {e}"))?;
-    print!("{text}");
-    Ok(())
+    String::from_utf8(out).map_err(|e| anyhow::anyhow!("csv was not utf-8: {e}"))
 }
 
 // ---- formatting helpers ----------------------------------------------------
@@ -588,19 +591,12 @@ mod tests {
     #[test]
     fn csv_has_section_markers_and_costs() {
         let r = sample_rollup();
-        // Exercise the same buffer-building path print_csv uses.
-        use std::io::Write;
-        let mut out = Vec::<u8>::new();
-        writeln!(out, "# token_spend").unwrap();
-        let mut w = csv::Writer::from_writer(&mut out);
-        w.write_record(["model", "cost_usd"]).unwrap();
-        w.write_record(["opus", &csv_cost(r.tokens.by_model[0].cost_usd)])
-            .unwrap();
-        w.flush().unwrap();
-        drop(w);
-        let text = String::from_utf8(out).unwrap();
+        let text = render_csv(&r).unwrap();
         assert!(text.contains("# token_spend"));
-        assert!(text.contains("opus,0.920000"));
+        assert!(text.contains("opus,anthropic"));
+        assert!(text.contains(",0.920000"));
+        assert!(text.contains("# recovery_by_llm_mode"));
+        assert!(text.contains("# language"));
     }
 
     #[test]

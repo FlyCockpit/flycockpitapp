@@ -18,6 +18,13 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
+    pub const ALL: [Self; 4] = [
+        Self::Pending,
+        Self::InProgress,
+        Self::Completed,
+        Self::Cancelled,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -50,6 +57,15 @@ pub enum TodoNoteKind {
 }
 
 impl TodoNoteKind {
+    pub const ALL: [Self; 6] = [
+        Self::Summary,
+        Self::Finding,
+        Self::Decision,
+        Self::Artifact,
+        Self::Blocker,
+        Self::Handoff,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Summary => "summary",

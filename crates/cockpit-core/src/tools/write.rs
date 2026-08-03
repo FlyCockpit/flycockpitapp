@@ -92,9 +92,12 @@ impl Tool for WriteTool {
         )
         .await?;
         enforce_write_scope(ctx, &path, self.name())?;
-        let identity_note =
+        let (identity_note, identity_write_preauthorized) =
             match crate::assistants::identity::check_identity_write(ctx, &path).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
+                crate::assistants::identity::IdentityWriteGate::Allow {
+                    note,
+                    preauthorized,
+                } => (note, preauthorized),
                 crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
@@ -108,10 +111,11 @@ impl Tool for WriteTool {
         };
         let want_crlf = existing_before.as_deref().is_some_and(detect_crlf);
         let normalized = normalize_line_endings(content, want_crlf);
-        if existing_before
-            .as_deref()
-            .is_some_and(|bytes| !bytes.is_empty())
-            || crate::tools::sandbox::is_workspace_cockpit_path(&ctx.cwd, &path)
+        if !identity_write_preauthorized
+            && (existing_before
+                .as_deref()
+                .is_some_and(|bytes| !bytes.is_empty())
+                || crate::tools::sandbox::is_workspace_cockpit_path(&ctx.cwd, &path))
         {
             authorize_existing_write(
                 ctx,
@@ -435,6 +439,33 @@ mod tests {
         }
     }
 
+    fn discover_skills(
+        ctx: &ToolCtx,
+        cfg: &crate::config::extended::SkillsConfig,
+    ) -> anyhow::Result<Vec<crate::skills::Skill>> {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(&ctx.cwd), || {
+            crate::skills::discover(&ctx.cwd, cfg)
+        })
+    }
+
+    fn catalog_cache_contains(ctx: &ToolCtx, cfg: &crate::config::extended::SkillsConfig) -> bool {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(&ctx.cwd), || {
+            crate::skills::catalog_cache_contains(&ctx.cwd, cfg)
+        })
+    }
+
+    async fn load_skill(
+        name: &str,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
+            crate::tools::skill::SkillTool
+                .call(serde_json::json!({"name": name}), ctx)
+                .await
+        })
+        .await
+    }
+
     async fn write(path: &Path, content: &str, ctx: &ToolCtx) -> anyhow::Result<String> {
         crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
             Ok(WriteTool
@@ -663,7 +694,7 @@ mod tests {
         let manifest = package.join("SKILL.md");
         note_read(&ctx, &manifest).await;
         let cfg = ctx.config.extended();
-        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        let discovered = discover_skills(&ctx, &cfg.skills).unwrap();
         assert_eq!(discovered[0].frontmatter.description, "old");
         let before = crate::skills::catalog_generation();
 
@@ -672,7 +703,7 @@ mod tests {
             .unwrap();
 
         assert!(crate::skills::catalog_generation() > before);
-        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        let discovered = discover_skills(&ctx, &cfg.skills).unwrap();
         assert_eq!(discovered[0].frontmatter.description, "new");
     }
 
@@ -716,10 +747,7 @@ mod tests {
         assert!(err.contains("must load `view-first`"), "{err}");
         assert!(!support.exists());
 
-        crate::tools::skill::SkillTool
-            .call(serde_json::json!({"name": "view-first"}), &ctx)
-            .await
-            .unwrap();
+        load_skill("view-first", &ctx).await.unwrap();
         let out = write(&support, "reviewed", &ctx).await.unwrap();
         assert!(out.contains("[skill] validated view-first"), "{out}");
         assert_eq!(std::fs::read_to_string(support).unwrap(), "reviewed");
@@ -771,22 +799,16 @@ mod tests {
         );
         let ctx = skill_test_ctx(tmp.path());
         let cfg = ctx.config.extended();
-        let discovered = crate::skills::discover(tmp.path(), &cfg.skills).unwrap();
+        let discovered = discover_skills(&ctx, &cfg.skills).unwrap();
         assert_eq!(discovered[0].frontmatter.description, "old");
-        assert!(crate::skills::catalog_cache_contains(
-            tmp.path(),
-            &cfg.skills
-        ));
+        assert!(catalog_cache_contains(&ctx, &cfg.skills));
 
         let out = write(&tmp.path().join("plain.md"), "hello", &ctx)
             .await
             .unwrap();
 
         assert!(!out.contains("[skill]"), "{out}");
-        assert!(crate::skills::catalog_cache_contains(
-            tmp.path(),
-            &cfg.skills
-        ));
+        assert!(catalog_cache_contains(&ctx, &cfg.skills));
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("plain.md")).unwrap(),
             "hello"
@@ -1083,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn write_releases_lock_on_every_failure_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
 
         let stale = tmp.path().join("stale.md");
         std::fs::write(&stale, "old\n").unwrap();
@@ -1104,6 +1126,7 @@ mod tests {
         );
         assert!(ctx.locks.holder(&stale).is_none());
 
+        ctx.approver = None;
         let outside = tmp.path().parent().unwrap().join("outside-write-denied.md");
         let err = WriteTool
             .call(
@@ -1513,7 +1536,8 @@ mod write_approval_regressions {
     #[tokio::test]
     async fn cockpit_dir_creation_requires_approval() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        ctx.approver = None;
         ctx.session.set_approval_mode(ApprovalMode::Manual);
         let args = serde_json::json!({"path": ".cockpit/mcp.json", "content": "{}"});
         let err = WriteTool.call(args, &ctx).await.unwrap_err();
@@ -1530,7 +1554,8 @@ mod write_approval_regressions {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("existing.txt");
         std::fs::write(&path, "before").unwrap();
-        let ctx = test_ctx(tmp.path());
+        let mut ctx = test_ctx(tmp.path());
+        ctx.approver = None;
         ctx.session.set_approval_mode(ApprovalMode::Manual);
         ctx.locks
             .note_read(&path, &ctx.lock_identity, ctx.session.id)

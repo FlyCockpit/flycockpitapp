@@ -859,249 +859,291 @@ mod tests {
     #[tokio::test]
     async fn consolidation_delete_guard() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let cfg = config(&root);
-        let svc = service(tmp.path(), &cfg);
-        svc.apply(&create_args("umbrella")).await.unwrap();
-        svc.apply(&create_args("specific")).await.unwrap();
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let cfg = config(&root);
+            let svc = service(tmp.path(), &cfg);
+            svc.apply(&create_args("umbrella")).await.unwrap();
+            svc.apply(&create_args("specific")).await.unwrap();
 
-        let mut bare = create_args("specific");
-        bare.action = SkillManageAction::Delete;
-        bare.description = None;
-        bare.content = None;
-        let err = svc.apply(&bare).await.unwrap_err();
-        assert!(err.to_string().contains("absorbed_into"));
-        assert!(root.join("specific/SKILL.md").is_file());
+            let mut bare = create_args("specific");
+            bare.action = SkillManageAction::Delete;
+            bare.description = None;
+            bare.content = None;
+            let err = svc.apply(&bare).await.unwrap_err();
+            assert!(err.to_string().contains("absorbed_into"));
+            assert!(root.join("specific/SKILL.md").is_file());
 
-        let mut still_invalid = bare.clone();
-        still_invalid.absorbed_into = Some("umbrella".to_string());
-        let err = svc.apply(&still_invalid).await.unwrap_err();
-        assert!(err.to_string().contains("must reference absorbed skill"));
-        assert!(root.join("specific/SKILL.md").is_file());
+            let mut still_invalid = bare.clone();
+            still_invalid.absorbed_into = Some("umbrella".to_string());
+            let err = svc.apply(&still_invalid).await.unwrap_err();
+            assert!(err.to_string().contains("must reference absorbed skill"));
+            assert!(root.join("specific/SKILL.md").is_file());
 
-        append_to_manifest(&root, "umbrella", "Forward absorbed skill: specific.");
+            append_to_manifest(&root, "umbrella", "Forward absorbed skill: specific.");
 
-        let mut valid = bare;
-        valid.absorbed_into = Some("umbrella".to_string());
-        let out = svc.apply(&valid).await.unwrap();
-        assert!(out.message.contains("consolidation into `umbrella`"));
-        assert!(!root.join("specific").exists());
-        assert!(root.join("umbrella/SKILL.md").is_file());
+            let mut valid = bare;
+            valid.absorbed_into = Some("umbrella".to_string());
+            let out = svc.apply(&valid).await.unwrap();
+            assert!(out.message.contains("consolidation into `umbrella`"));
+            assert!(!root.join("specific").exists());
+            assert!(root.join("umbrella/SKILL.md").is_file());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn db_pinned_skill_delete_is_blocked() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let cfg = config(&root);
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let svc = service(tmp.path(), &cfg).with_db(&db);
-        svc.apply(&create_args("umbrella")).await.unwrap();
-        svc.apply(&create_args("pinned-db")).await.unwrap();
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let cfg = config(&root);
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let svc = service(tmp.path(), &cfg).with_db(&db);
+            svc.apply(&create_args("umbrella")).await.unwrap();
+            svc.apply(&create_args("pinned-db")).await.unwrap();
 
-        append_to_manifest(&root, "umbrella", "Forward absorbed skill: pinned-db.");
-        db.set_skill_usage_pinned("pinned-db", true, 100)
-            .await
-            .unwrap();
+            append_to_manifest(&root, "umbrella", "Forward absorbed skill: pinned-db.");
+            db.set_skill_usage_pinned("pinned-db", true, 100)
+                .await
+                .unwrap();
 
-        let mut delete = create_args("pinned-db");
-        delete.action = SkillManageAction::Delete;
-        delete.description = None;
-        delete.content = None;
-        delete.absorbed_into = Some("umbrella".to_string());
-        let err = svc.apply(&delete).await.unwrap_err();
-        assert!(err.to_string().contains("pinned skill"));
-        assert!(root.join("pinned-db/SKILL.md").is_file());
+            let mut delete = create_args("pinned-db");
+            delete.action = SkillManageAction::Delete;
+            delete.description = None;
+            delete.content = None;
+            delete.absorbed_into = Some("umbrella".to_string());
+            let err = svc.apply(&delete).await.unwrap_err();
+            assert!(err.to_string().contains("pinned skill"));
+            assert!(root.join("pinned-db/SKILL.md").is_file());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skill_manage_retained_actions_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let cfg = config(&root);
-        let svc = service(tmp.path(), &cfg);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let cfg = config(&root);
+            let svc = service(tmp.path(), &cfg);
 
-        svc.apply(&create_args("roundtrip")).await.unwrap();
-        assert!(manifest(&root, "roundtrip").is_file());
+            svc.apply(&create_args("roundtrip")).await.unwrap();
+            assert!(manifest(&root, "roundtrip").is_file());
 
-        std::fs::create_dir_all(root.join("roundtrip/references")).unwrap();
-        std::fs::write(root.join("roundtrip/references/guide.md"), "support").unwrap();
+            std::fs::create_dir_all(root.join("roundtrip/references")).unwrap();
+            std::fs::write(root.join("roundtrip/references/guide.md"), "support").unwrap();
 
-        let mut remove = create_args("roundtrip");
-        remove.action = SkillManageAction::RemoveFile;
-        remove.description = None;
-        remove.content = None;
-        remove.path = Some("references/guide.md".to_string());
-        svc.apply(&remove).await.unwrap();
-        assert!(!root.join("roundtrip/references/guide.md").exists());
+            let mut remove = create_args("roundtrip");
+            remove.action = SkillManageAction::RemoveFile;
+            remove.description = None;
+            remove.content = None;
+            remove.path = Some("references/guide.md".to_string());
+            svc.apply(&remove).await.unwrap();
+            assert!(!root.join("roundtrip/references/guide.md").exists());
 
-        svc.apply(&create_args("roundtrip-umbrella")).await.unwrap();
-        append_to_manifest(
-            &root,
-            "roundtrip-umbrella",
-            "Forward absorbed skill: roundtrip.",
-        );
-        let mut delete = create_args("roundtrip");
-        delete.action = SkillManageAction::Delete;
-        delete.description = None;
-        delete.content = None;
-        delete.absorbed_into = Some("roundtrip-umbrella".to_string());
-        svc.apply(&delete).await.unwrap();
-        assert!(!root.join("roundtrip").exists());
+            svc.apply(&create_args("roundtrip-umbrella")).await.unwrap();
+            append_to_manifest(
+                &root,
+                "roundtrip-umbrella",
+                "Forward absorbed skill: roundtrip.",
+            );
+            let mut delete = create_args("roundtrip");
+            delete.action = SkillManageAction::Delete;
+            delete.description = None;
+            delete.content = None;
+            delete.absorbed_into = Some("roundtrip-umbrella".to_string());
+            svc.apply(&delete).await.unwrap();
+            assert!(!root.join("roundtrip").exists());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skill_protection_rules() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let external = tmp.path().join("external");
-        let mut cfg = config(&root);
-        cfg.external_dirs
-            .push(external.to_string_lossy().into_owned());
-        let svc = service(tmp.path(), &cfg);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let external = tmp.path().join("external");
+            let mut cfg = config(&root);
+            cfg.external_dirs
+                .push(external.to_string_lossy().into_owned());
+            let svc = service(tmp.path(), &cfg);
 
-        svc.apply(&create_args("pinned")).await.unwrap();
-        let mut provenance = read_provenance(&root.join("pinned")).unwrap().unwrap();
-        provenance.pinned = true;
-        atomic_write(
-            &root.join("pinned").join(PROVENANCE_FILE),
-            &serde_json::to_vec(&provenance).unwrap(),
-        )
-        .unwrap();
-        let mut delete = create_args("pinned");
-        delete.action = SkillManageAction::Delete;
-        delete.description = None;
-        delete.content = None;
-        assert!(svc.apply(&delete).await.is_err());
+            svc.apply(&create_args("pinned")).await.unwrap();
+            let mut provenance = read_provenance(&root.join("pinned")).unwrap().unwrap();
+            provenance.pinned = true;
+            atomic_write(
+                &root.join("pinned").join(PROVENANCE_FILE),
+                &serde_json::to_vec(&provenance).unwrap(),
+            )
+            .unwrap();
+            let mut delete = create_args("pinned");
+            delete.action = SkillManageAction::Delete;
+            delete.description = None;
+            delete.content = None;
+            assert!(svc.apply(&delete).await.is_err());
 
-        let mut frontmatter_pinned = create_args("frontmatter-pinned");
-        frontmatter_pinned.content = Some("Pinned body.".to_string());
-        svc.apply(&frontmatter_pinned).await.unwrap();
-        let pinned_path = manifest(&root, "frontmatter-pinned");
-        let raw = std::fs::read_to_string(&pinned_path).unwrap().replacen(
-            "description: \"Reusable workflow\"",
-            "description: \"Reusable workflow\"\npinned: true",
-            1,
-        );
-        atomic_write(&pinned_path, raw.as_bytes()).unwrap();
-        std::fs::write(
-            &pinned_path,
-            "---\nname: frontmatter-pinned\ndescription: Still pinned\n---\n\nUpdated body.\n",
-        )
-        .unwrap();
-        let mut delete_pinned = create_args("frontmatter-pinned");
-        delete_pinned.action = SkillManageAction::Delete;
-        delete_pinned.description = None;
-        delete_pinned.content = None;
-        assert!(svc.apply(&delete_pinned).await.is_err());
+            let mut frontmatter_pinned = create_args("frontmatter-pinned");
+            frontmatter_pinned.content = Some("Pinned body.".to_string());
+            svc.apply(&frontmatter_pinned).await.unwrap();
+            let pinned_path = manifest(&root, "frontmatter-pinned");
+            let raw = std::fs::read_to_string(&pinned_path).unwrap().replacen(
+                "description: \"Reusable workflow\"",
+                "description: \"Reusable workflow\"\npinned: true",
+                1,
+            );
+            atomic_write(&pinned_path, raw.as_bytes()).unwrap();
+            std::fs::write(
+                &pinned_path,
+                "---\nname: frontmatter-pinned\ndescription: Still pinned\n---\n\nUpdated body.\n",
+            )
+            .unwrap();
+            let mut delete_pinned = create_args("frontmatter-pinned");
+            delete_pinned.action = SkillManageAction::Delete;
+            delete_pinned.description = None;
+            delete_pinned.content = None;
+            assert!(svc.apply(&delete_pinned).await.is_err());
 
-        std::fs::write(
-            root.join("frontmatter-pinned").join(PROVENANCE_FILE),
-            b"not json",
-        )
-        .unwrap();
-        let before_corrupt = std::fs::read_to_string(&pinned_path).unwrap();
-        assert!(svc.apply(&delete_pinned).await.is_err());
-        assert_eq!(
-            std::fs::read_to_string(&pinned_path).unwrap(),
-            before_corrupt
-        );
+            std::fs::write(
+                root.join("frontmatter-pinned").join(PROVENANCE_FILE),
+                b"not json",
+            )
+            .unwrap();
+            let before_corrupt = std::fs::read_to_string(&pinned_path).unwrap();
+            assert!(svc.apply(&delete_pinned).await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(&pinned_path).unwrap(),
+                before_corrupt
+            );
 
-        std::fs::create_dir_all(external.join("shared")).unwrap();
-        std::fs::write(
-            external.join("shared/SKILL.md"),
-            "---\nname: shared\ndescription: Shared skill\n---\n\nRead only.\n",
-        )
-        .unwrap();
-        let mut external_delete = create_args("shared");
-        external_delete.action = SkillManageAction::Delete;
-        external_delete.description = None;
-        external_delete.content = None;
-        assert!(svc.apply(&external_delete).await.is_err());
+            std::fs::create_dir_all(external.join("shared")).unwrap();
+            std::fs::write(
+                external.join("shared/SKILL.md"),
+                "---\nname: shared\ndescription: Shared skill\n---\n\nRead only.\n",
+            )
+            .unwrap();
+            let mut external_delete = create_args("shared");
+            external_delete.action = SkillManageAction::Delete;
+            external_delete.description = None;
+            external_delete.content = None;
+            assert!(svc.apply(&external_delete).await.is_err());
 
-        let mut bundled = create_args("bundled");
-        bundled.content = Some("Bundled body.".to_string());
-        svc.apply(&bundled).await.unwrap();
-        let path = manifest(&root, "bundled");
-        let raw = std::fs::read_to_string(&path).unwrap().replacen(
-            "description: \"Reusable workflow\"",
-            "description: \"Reusable workflow\"\nbundled: true",
-            1,
-        );
-        atomic_write(&path, raw.as_bytes()).unwrap();
-        let mut bundled_delete = create_args("bundled");
-        bundled_delete.action = SkillManageAction::Delete;
-        bundled_delete.description = None;
-        bundled_delete.content = None;
-        assert!(svc.apply(&bundled_delete).await.is_err());
+            let mut bundled = create_args("bundled");
+            bundled.content = Some("Bundled body.".to_string());
+            svc.apply(&bundled).await.unwrap();
+            let path = manifest(&root, "bundled");
+            let raw = std::fs::read_to_string(&path).unwrap().replacen(
+                "description: \"Reusable workflow\"",
+                "description: \"Reusable workflow\"\nbundled: true",
+                1,
+            );
+            atomic_write(&path, raw.as_bytes()).unwrap();
+            let mut bundled_delete = create_args("bundled");
+            bundled_delete.action = SkillManageAction::Delete;
+            bundled_delete.description = None;
+            bundled_delete.content = None;
+            assert!(svc.apply(&bundled_delete).await.is_err());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skill_write_invalidates_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let cfg = config(&root);
-        assert!(super::super::discover(tmp.path(), &cfg).unwrap().is_empty());
-        assert!(super::super::catalog_cache_contains(tmp.path(), &cfg));
-        let before = super::super::catalog_generation();
-        service(tmp.path(), &cfg)
-            .apply(&create_args("generation"))
-            .await
-            .unwrap();
-        assert!(super::super::catalog_generation() > before);
-        assert!(!super::super::catalog_cache_contains(tmp.path(), &cfg));
-        assert!(
-            super::super::discover(tmp.path(), &cfg)
-                .unwrap()
-                .iter()
-                .any(|skill| skill.frontmatter.name == "generation")
-        );
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let cfg = config(&root);
+            assert!(super::super::discover(tmp.path(), &cfg).unwrap().is_empty());
+            assert!(super::super::catalog_cache_contains(tmp.path(), &cfg));
+            let before = super::super::catalog_generation();
+            service(tmp.path(), &cfg)
+                .apply(&create_args("generation"))
+                .await
+                .unwrap();
+            assert!(super::super::catalog_generation() > before);
+            assert!(!super::super::catalog_cache_contains(tmp.path(), &cfg));
+            assert!(
+                super::super::discover(tmp.path(), &cfg)
+                    .unwrap()
+                    .iter()
+                    .any(|skill| skill.frontmatter.name == "generation")
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skill_write_records_origin() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let cfg = config(&root);
-        service(tmp.path(), &cfg)
-            .apply(&create_args("foreground"))
-            .await
-            .unwrap();
-        let foreground = read_provenance(&root.join("foreground")).unwrap().unwrap();
-        assert_eq!(foreground.created_origin, SkillWriteOrigin::Foreground);
-        assert_eq!(foreground.writes[0].origin, SkillWriteOrigin::Foreground);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let cfg = config(&root);
+            service(tmp.path(), &cfg)
+                .apply(&create_args("foreground"))
+                .await
+                .unwrap();
+            let foreground = read_provenance(&root.join("foreground")).unwrap().unwrap();
+            assert_eq!(foreground.created_origin, SkillWriteOrigin::Foreground);
+            assert_eq!(foreground.writes[0].origin, SkillWriteOrigin::Foreground);
 
-        SkillMutationService::new(tmp.path(), &cfg)
-            .with_origin(SkillWriteOrigin::BackgroundReview)
-            .apply(&create_args("background"))
-            .await
-            .unwrap();
-        let background = read_provenance(&root.join("background")).unwrap().unwrap();
-        assert_eq!(
-            background.created_origin,
-            SkillWriteOrigin::BackgroundReview
-        );
-        assert_eq!(
-            background.writes[0].origin,
-            SkillWriteOrigin::BackgroundReview
-        );
+            SkillMutationService::new(tmp.path(), &cfg)
+                .with_origin(SkillWriteOrigin::BackgroundReview)
+                .apply(&create_args("background"))
+                .await
+                .unwrap();
+            let background = read_provenance(&root.join("background")).unwrap().unwrap();
+            assert_eq!(
+                background.created_origin,
+                SkillWriteOrigin::BackgroundReview
+            );
+            assert_eq!(
+                background.writes[0].origin,
+                SkillWriteOrigin::BackgroundReview
+            );
 
-        std::fs::create_dir_all(root.join("background/references")).unwrap();
-        std::fs::write(root.join("background/references/old.md"), "obsolete").unwrap();
-        let mut remove = create_args("background");
-        remove.action = SkillManageAction::RemoveFile;
-        remove.description = None;
-        remove.content = None;
-        remove.path = Some("references/old.md".to_string());
-        SkillMutationService::new(tmp.path(), &cfg)
-            .with_origin(SkillWriteOrigin::BackgroundReview)
-            .apply(&remove)
-            .await
-            .unwrap();
-        let background = read_provenance(&root.join("background")).unwrap().unwrap();
-        assert_eq!(
-            background.writes.last().unwrap().origin,
-            SkillWriteOrigin::BackgroundReview
-        );
+            std::fs::create_dir_all(root.join("background/references")).unwrap();
+            std::fs::write(root.join("background/references/old.md"), "obsolete").unwrap();
+            let mut remove = create_args("background");
+            remove.action = SkillManageAction::RemoveFile;
+            remove.description = None;
+            remove.content = None;
+            remove.path = Some("references/old.md".to_string());
+            SkillMutationService::new(tmp.path(), &cfg)
+                .with_origin(SkillWriteOrigin::BackgroundReview)
+                .apply(&remove)
+                .await
+                .unwrap();
+            let background = read_provenance(&root.join("background")).unwrap().unwrap();
+            assert_eq!(
+                background.writes.last().unwrap().origin,
+                SkillWriteOrigin::BackgroundReview
+            );
+        })
+        .await;
     }
 }

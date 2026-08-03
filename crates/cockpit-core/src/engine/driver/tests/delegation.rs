@@ -24,17 +24,23 @@ async fn dispatch_task_args(
 ) -> crate::engine::agent::TurnOutcome {
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
     let tc = task_tool_call_with_args("task-unknown-agent", "fn-task-unknown-agent", args);
-    match crate::engine::agent::phase_10_dispatch_one_call(
-        &driver.stack[0].agent,
-        &driver.session,
-        &driver.config,
-        &tx,
-        &tc,
-        "task",
+    let outcome = crate::config::trust::scope_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&driver.cwd).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        },
+        crate::engine::agent::phase_10_dispatch_one_call(
+            &driver.stack[0].agent,
+            &driver.session,
+            &driver.config,
+            &tx,
+            &tc,
+            "task",
+        ),
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match outcome {
         ControlFlow::Break(outcome) => outcome,
         ControlFlow::Continue(()) => panic!("task dispatch must be structural"),
     }

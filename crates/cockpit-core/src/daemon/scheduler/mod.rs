@@ -813,12 +813,12 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
     ) -> Result<String> {
         let handle = match self
             .registry
-            .attach(Some(session_id), None, false, None, env_snapshot)
+            .attach(Some(session_id), None, None, false, None, env_snapshot)
             .await
         {
             Ok(handle) => handle,
             Err(error) => {
-                if let Err(cleanup_error) = db.delete_session(session_id, true).await {
+                if let Err(cleanup_error) = db.delete_session(session_id).await {
                     tracing::warn!(
                         error = %cleanup_error,
                         %session_id,

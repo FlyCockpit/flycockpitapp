@@ -253,7 +253,13 @@ fn learn_driver(
     let redact = Arc::new(RedactionTable::empty());
     let mut driver =
         Driver::with_max_schedules(session, locks, redact, tmp.path().to_path_buf(), agent, 1);
-    driver.refresh_config_from_disk_for_tests();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::with_workspace_trust_policy(policy, || {
+        driver.refresh_config_from_disk_for_tests();
+    });
     driver.stack[0].history.push(Message::user(
         "We verified the setup with cockpit verify --local.",
     ));

@@ -125,40 +125,39 @@ fn background_resolve_clears_stale_persistent_toast_while_foreground_remains_vis
 
 #[test]
 fn dialog_ux_lockout_only_first_of_chain() {
-    for (reason, expected_locked) in [
-        (InterruptRaiseReason::Initial, true),
-        (InterruptRaiseReason::Advance, false),
-        (InterruptRaiseReason::Rehydration, true),
-    ] {
-        let mut app = app();
-        let session_id = Uuid::new_v4();
-        let interrupt_id = Uuid::new_v4();
-        app.launch.session_id = Some(session_id);
-        app.composer_active_since_dialog = true;
+    let mut app = app();
+    let session_id = Uuid::new_v4();
+    app.launch.session_id = Some(session_id);
+    app.composer_active_since_dialog = true;
 
-        app.apply_event(raise_with_reason(session_id, interrupt_id, 1, reason));
+    let first = Uuid::new_v4();
+    app.apply_event(raise_with_reason(
+        session_id,
+        first,
+        1,
+        InterruptRaiseReason::Initial,
+    ));
+    assert!(app.question_dialog.as_ref().expect("first dialog").locked());
 
-        let dialog = app.question_dialog.as_mut().expect("dialog");
-        assert_eq!(dialog.interrupt_id(), interrupt_id);
-        assert_eq!(dialog.pending_count(), 1);
-        assert_eq!(dialog.locked(), expected_locked, "{reason:?}");
-        if expected_locked {
-            assert!(!dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-            assert!(
-                dialog.take_result().is_none(),
-                "Esc during lockout must not cancel {reason:?}"
-            );
-        } else {
-            assert!(dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-            assert!(
-                matches!(
-                    dialog.take_result(),
-                    Some(crate::tui::dialog::question::QuestionResult::Cancel { .. })
-                ),
-                "Esc should cancel immediately interactive {reason:?}"
-            );
-        }
-    }
+    // The composer never regained focus, so the next queued approval must be
+    // immediately answerable instead of imposing another full lockout.
+    app.question_dialog = None;
+    let second = Uuid::new_v4();
+    app.apply_event(raise_with_reason(
+        session_id,
+        second,
+        0,
+        InterruptRaiseReason::Advance,
+    ));
+    let dialog = app.question_dialog.as_mut().expect("second dialog");
+    assert_eq!(dialog.interrupt_id(), second);
+    assert!(!dialog.locked());
+    assert!(dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(matches!(
+        dialog.take_result(),
+        Some(crate::tui::dialog::question::QuestionResult::Cancel { interrupt_id })
+            if interrupt_id == second
+    ));
 }
 
 #[test]

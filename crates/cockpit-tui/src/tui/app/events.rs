@@ -243,21 +243,12 @@ impl App {
                 self.refresh_skill_commands();
             }
             TurnEvent::ActiveModelState {
-                provider,
-                model,
-                config_provider,
-                config_model,
+                selection,
+                default_selection,
                 diverged,
                 generation,
             } => {
-                self.apply_active_model_state(
-                    provider,
-                    model,
-                    config_provider,
-                    config_model,
-                    diverged,
-                    generation,
-                );
+                self.apply_active_model_state(selection, default_selection, diverged, generation);
             }
             TurnEvent::ModelSelectionResult {
                 selection_id,
@@ -266,20 +257,23 @@ impl App {
                 outcome,
                 ..
             } => {
-                let (applied, user_message, generation, applied_state) = match &outcome {
-                    cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-                        active_state,
-                    } => (
-                        true,
-                        None,
-                        active_state.generation,
-                        Some(active_state.clone()),
-                    ),
-                    cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
-                        user_message,
-                        ..
-                    } => (false, Some(user_message.clone()), 0, None),
-                };
+                let (applied, user_message, generation, applied_state, default_update) =
+                    match &outcome {
+                        cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
+                            active_state,
+                            default_update,
+                        } => (
+                            true,
+                            None,
+                            active_state.generation,
+                            Some(active_state.clone()),
+                            Some(default_update.clone()),
+                        ),
+                        cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
+                            user_message,
+                            ..
+                        } => (false, Some(user_message.clone()), 0, None, None),
+                    };
                 let matching = self
                     .pending_model_selection
                     .as_ref()
@@ -296,45 +290,66 @@ impl App {
                 let pending = matching
                     .then(|| self.pending_model_selection.take())
                     .flatten();
+                let trigger = pending.as_ref().map(|selection| selection.trigger);
                 let requested = pending
                     .as_ref()
-                    .map(|selection| (selection.provider.clone(), selection.model.clone()));
+                    .map(|selection| selection.requested.clone());
                 if let Some(selection) = pending.as_ref() {
                     tracing::info!(
                         session_id = ?selection.session_id,
                         %selection_id,
-                        provider = %selection.provider,
-                        model = %selection.model,
+                        provider = %selection.requested.provider,
+                        model = %selection.requested.model,
                         trigger = ?selection.trigger,
                         generation,
                         applied,
                         "model selection terminal result received by tui"
                     );
                 }
-                let queued = pending.and_then(|selection| selection.queued_submission);
+                let mut queued = pending.and_then(|selection| selection.queued_submission);
                 if !matching {
                     return;
                 }
                 if let Some(active_state) = applied_state {
                     self.apply_active_model_state(
-                        active_state.provider,
-                        active_state.model,
-                        active_state.config_provider,
-                        active_state.config_model,
+                        active_state.selection,
+                        active_state.default_selection,
                         active_state.diverged,
                         active_state.generation,
                     );
                 }
-                if !applied {
-                    self.push_plain(user_message.unwrap_or_else(|| {
-                        format!("Could not switch to `{provider}/{model}`; keeping the confirmed model active.")
-                    }));
-                    if let Some((requested_provider, requested_model)) = requested {
-                        self.open_model_picker_highlighting(Some((
-                            &requested_provider,
-                            &requested_model,
-                        )));
+                if applied && let Some(default_update) = default_update {
+                    match default_update {
+                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested => {
+                            self.push_plain(format!("Using {provider}/{model} for this session."));
+                        }
+                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Saved => {
+                            self.push_plain(format!(
+                                "Using {provider}/{model} and saved it as the default."
+                            ));
+                            self.resync_config_after_local_write();
+                        }
+                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Failed {
+                            user_message,
+                            ..
+                        } => self.push_plain(user_message),
                     }
+                }
+                if !applied {
+                    if self.retry_model_submission.is_none() {
+                        self.retry_model_submission = queued.take();
+                    }
+                    let message = user_message.unwrap_or_else(|| {
+                        format!("Could not switch to `{provider}/{model}`; keeping the confirmed model active.")
+                    });
+                    let trigger = trigger.expect("a matching result always has pending intent");
+                    self.show_model_selection_error(
+                        requested
+                            .as_ref()
+                            .expect("a matching result retains its request"),
+                        trigger,
+                        message,
+                    );
                 } else if let Some(queued) = queued {
                     tracing::info!(
                         session_id = ?self.launch.session_id,
@@ -1093,7 +1108,7 @@ impl App {
                         crate::tui::dialog::DialogState::NO_LOCKOUT
                     }
                     cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
-                        self.fresh_dialog_lockout()
+                        self.rehydrated_dialog_lockout()
                     }
                 };
                 // Attention: a permission/approval prompt vs an agent question
@@ -1563,10 +1578,8 @@ impl App {
 
     pub(super) fn apply_active_model_state(
         &mut self,
-        provider: String,
-        model: String,
-        config_provider: Option<String>,
-        config_model: Option<String>,
+        selection: cockpit_config::providers::ActiveModelRef,
+        default_selection: Option<cockpit_config::providers::ActiveModelRef>,
         diverged: bool,
         generation: u64,
     ) {
@@ -1574,12 +1587,18 @@ impl App {
             return;
         }
         self.active_model_state_generation = generation;
+        let provider = selection.provider.clone();
+        let model = selection.model.clone();
+        self.active_model_selection = Some(selection);
+        self.default_model_selection = default_selection.clone();
         self.launch.provider_line = format!("{provider} / {model}");
         self.launch.active_model = Some((provider, model));
         self.launch.active_model_diverged = diverged;
         self.config_drift = diverged.then_some(ConfigDriftState {
-            config_provider,
-            config_model,
+            config_provider: default_selection
+                .as_ref()
+                .map(|selection| selection.provider.clone()),
+            config_model: default_selection.map(|selection| selection.model),
         });
         self.refresh_config_drift_surfaces();
         // Favorite/trust/capabilities/llm-mode are projected off the held
@@ -1643,6 +1662,9 @@ impl App {
         self.has_no_providers_at_startup = self.config_snapshot.providers.providers.is_empty();
         self.apply_tui_config_from_snapshot();
         self.refresh_active_model_projection();
+        if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+            self.open_model_picker_for_provider(&provider);
+        }
     }
 
     /// Find the most-recent tool call with `call_id` — in a `ToolBox` or

@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::extended::ExtendedConfig;
-use crate::config::providers::ProvidersConfig;
+use crate::config::providers::{ActiveModelRef, ProvidersConfig};
 use crate::config::trust::{
     WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_from_db,
 };
@@ -223,6 +223,23 @@ fn with_worker_model_runtime(
     Arc::new(model)
 }
 
+fn resolve_or_seed_session_active_model(
+    providers_cfg: &ProvidersConfig,
+    session: &Session,
+) -> Result<ActiveModelRef> {
+    if let Some(active) = session.active_model_ref() {
+        return Ok(active);
+    }
+    let active = providers_cfg
+        .active_model
+        .clone()
+        .context("session has no active model selection and no default is configured")?;
+    session
+        .set_active_model_ref(active.clone())
+        .context("backfilling the session model from the configured default")?;
+    Ok(active)
+}
+
 fn resolve_session_worker_model(
     providers_cfg: &ProvidersConfig,
     extended_cfg: &ExtendedConfig,
@@ -233,8 +250,11 @@ fn resolve_session_worker_model(
     shutdown: &ShutdownSignal,
 ) -> Result<Arc<Model>> {
     let inherited_model = {
+        let active = resolve_or_seed_session_active_model(providers_cfg, session)?;
+        let mut session_providers = providers_cfg.clone();
+        session_providers.active_model = Some(active);
         let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-        let model = Model::from_config_with_env(providers_cfg, redact.clone(), env_lookup)?;
+        let model = Model::from_config_with_env(&session_providers, redact.clone(), env_lookup)?;
         with_worker_model_runtime(model, shutdown, config_path.clone())
     };
 
@@ -387,6 +407,7 @@ impl SessionRegistry {
         &self,
         session_id: Option<Uuid>,
         project_root: Option<PathBuf>,
+        initial_model: Option<ActiveModelRef>,
         client_no_sandbox: bool,
         model_override: Option<&str>,
         env_snapshot: EnvSnapshot,
@@ -414,7 +435,13 @@ impl SessionRegistry {
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
                     let result = self
-                        .start_resumed_worker(id, client_no_sandbox, env_snapshot, generation)
+                        .start_resumed_worker(
+                            id,
+                            initial_model,
+                            client_no_sandbox,
+                            env_snapshot,
+                            generation,
+                        )
                         .await;
                     self.finish_attach_start(ticket, &result);
                     let handle = result?;
@@ -434,8 +461,13 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&project_root, &trust_policy)?;
+        let active = initial_model
+            .or_else(|| providers_cfg.active_model.clone())
+            .context("no model selected for the new session")?;
+        let mut llm_providers = providers_cfg.clone();
+        llm_providers.active_model = Some(active.clone());
         let llm_mode =
-            session_worker::resolve_new_session_llm_mode(&providers_cfg, extended_cfg.llm_mode);
+            session_worker::resolve_new_session_llm_mode(&llm_providers, extended_cfg.llm_mode);
         let initial_agent =
             session_worker::initial_active_agent_for_llm_mode(&extended_cfg, llm_mode);
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
@@ -443,11 +475,9 @@ impl SessionRegistry {
         // un-written. The worker persists it on the first user message.
         let session = Session::create_deferred(self.inner.db.clone(), project_root, &initial_agent)
             .context("creating session")?;
-        if let Some(active) = &providers_cfg.active_model {
-            session
-                .set_active_model(&active.provider, &active.model)
-                .context("setting active model on new session")?;
-        }
+        session
+            .set_active_model_ref(active)
+            .context("setting active model on new session")?;
         let generation = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
@@ -471,6 +501,7 @@ impl SessionRegistry {
         &self,
         assistant_name: &str,
         project_root: PathBuf,
+        initial_model: Option<ActiveModelRef>,
         client_no_sandbox: bool,
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
@@ -489,6 +520,9 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&project_root, &trust_policy)?;
+        let active = initial_model
+            .or_else(|| providers_cfg.active_model.clone())
+            .context("no model selected for the new assistant session")?;
         let session = Session::create_assistant_deferred(
             self.inner.db.clone(),
             project_root,
@@ -496,11 +530,9 @@ impl SessionRegistry {
             assistant_name,
         )
         .context("creating assistant session")?;
-        if let Some(active) = &providers_cfg.active_model {
-            session
-                .set_active_model(&active.provider, &active.model)
-                .context("setting active model on new assistant session")?;
-        }
+        session
+            .set_active_model_ref(active)
+            .context("setting active model on new assistant session")?;
         let generation = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
@@ -521,6 +553,7 @@ impl SessionRegistry {
     async fn start_resumed_worker(
         &self,
         id: Uuid,
+        initial_model: Option<ActiveModelRef>,
         client_no_sandbox: bool,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
@@ -534,9 +567,16 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&session.project_root, &trust_policy)?;
-        // Resume keeps the running worker's model; an override only seeds
-        // a newly-created session (matched by the server's gating). Plan
-        // attribution is likewise create-only.
+        // A recovery model may seed an old session that predates durable
+        // model selection. It never overwrites an existing session choice;
+        // the normal SetActiveModel request performs intentional switches.
+        if session.active_model_ref().is_none()
+            && let Some(initial_model) = initial_model
+        {
+            session
+                .set_active_model_ref(initial_model)
+                .context("seeding a model-less resumed session")?;
+        }
         self.start_worker(
             session,
             &providers_cfg,
@@ -668,13 +708,14 @@ impl SessionRegistry {
         // write to the most-specific layer that defines the active provider,
         // matching the runtime config write-target rule. `None` when nothing
         // is discoverable (the fallback still works, it just isn't persisted).
-        let config_path = providers_cfg.active_model.as_ref().and_then(|active| {
+        let session_active = resolve_or_seed_session_active_model(providers_cfg, &session)?;
+        let config_path = {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 self.inner
                     .config_source
-                    .config_write_target_for_provider(&project_root, &active.provider)
+                    .config_write_target_for_provider(&project_root, &session_active.provider)
             })
-        });
+        };
         let model = resolve_session_worker_model(
             providers_cfg,
             extended_cfg,
@@ -691,7 +732,9 @@ impl SessionRegistry {
         // thinking modes (implementation note). Threaded
         // onto the root spawn's `ModelParams` so every outbound request on the
         // session model carries the vendor reasoning controls.
-        let thinking_params = model.resolve_reasoning_params(providers_cfg);
+        let mut session_providers = providers_cfg.clone();
+        session_providers.active_model = Some(session_active);
+        let thinking_params = model.resolve_reasoning_params(&session_providers);
 
         // Plan-level model override (`cockpit run --model`): a well-formed
         // `provider/model` selector built through the same provider pipeline as
@@ -1426,6 +1469,7 @@ mod tests {
             .attach(
                 None,
                 Some(tmp.path().to_path_buf()),
+                None,
                 false,
                 None,
                 EnvSnapshot::new(
@@ -1532,6 +1576,118 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fallback.model_id_ref(), "parent-model");
+    }
+    #[tokio::test]
+    async fn explicit_initial_model_is_durable_and_wins_on_cold_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut no_default = providers_for_btw_model_tests();
+        no_default.active_model = None;
+        let source = crate::daemon::config_source::ConfigSource::new(
+            move |_cwd| Ok((no_default.clone(), ExtendedConfig::default())),
+            |_cwd, _provider_id| None,
+            |_cwd| crate::daemon::config_source::ConfigWatchPaths::new(Vec::new(), Vec::new()),
+        );
+        let reg = test_registry_with_config_source(source);
+        reg.inner
+            .db
+            .set_workspace_trust(
+                tmp.path(),
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .await
+            .unwrap();
+        let selection = ActiveModelRef {
+            provider: "lmstudio".to_string(),
+            model: "btw-model".to_string(),
+            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+        };
+
+        let handle = reg
+            .attach(
+                None,
+                Some(tmp.path().to_path_buf()),
+                Some(selection.clone()),
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .expect("explicit model should create a session without a configured default");
+        assert_eq!(handle.active_model_selection(), Some(selection.clone()));
+        handle.persist_if_needed().unwrap();
+        let session_id = handle.session_id;
+        reg.forget(session_id);
+
+        let resumed = Session::resume(reg.inner.db.clone(), session_id)
+            .unwrap()
+            .expect("persisted session resumes");
+        assert_eq!(resumed.active_model_ref(), Some(selection.clone()));
+
+        let config_with_different_default = providers_for_btw_model_tests();
+        let resolved = resolve_session_worker_model(
+            &config_with_different_default,
+            &ExtendedConfig::default(),
+            &resumed,
+            Arc::new(RedactionTable::empty()),
+            &EnvSnapshot::new(proto::EnvSnapshotSource::ExplicitCli, HashMap::new()),
+            None,
+            &reg.inner.shutdown,
+        )
+        .expect("cold resume resolves the persisted session model");
+        assert_eq!(resolved.model_id_ref(), "btw-model");
+
+        // A picker recovering an existing model-less session must retain its
+        // identity and durably seed it, not create a replacement session.
+        let legacy =
+            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let legacy_id = legacy.id;
+        let recovered = reg
+            .attach(
+                Some(legacy_id),
+                None,
+                Some(selection.clone()),
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .expect("explicit model should recover the same model-less session");
+        assert_eq!(recovered.session_id, legacy_id);
+        assert_eq!(recovered.active_model_selection(), Some(selection.clone()));
+        reg.forget(legacy_id);
+        let durable = Session::resume(reg.inner.db.clone(), legacy_id)
+            .unwrap()
+            .expect("recovered session remains durable");
+        assert_eq!(durable.active_model_ref(), Some(selection.clone()));
+
+        let missing = reg
+            .attach(
+                None,
+                Some(tmp.path().to_path_buf()),
+                None,
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await;
+        let missing = match missing {
+            Ok(_) => panic!("new session without an explicit or default model must be rejected"),
+            Err(error) => error,
+        };
+        assert!(missing.to_string().contains("no model selected"));
     }
 
     #[tokio::test]
@@ -1805,6 +1961,7 @@ mod tests {
             .attach(
                 Some(id),
                 None,
+                None,
                 false,
                 None,
                 EnvSnapshot::new(
@@ -1851,6 +2008,7 @@ mod tests {
         let result = reg
             .start_resumed_worker(
                 id,
+                None,
                 false,
                 EnvSnapshot::new(
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,

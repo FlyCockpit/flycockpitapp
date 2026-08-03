@@ -9,6 +9,17 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
 #[derive(Clone)]
 struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
 
@@ -479,17 +490,20 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     let (driver_tx, mut driver_rx) = mpsc::channel(1);
     let mut notified = HashSet::new();
 
-    refresh_redaction_for_turn(
-        &session,
-        session.id,
-        tmp.path(),
-        crate::config::extended::RedactConfig::default(),
-        &RedactionSourceOverrides::default(),
-        &mut notified,
-        &redaction,
-        &event_tx,
-        &driver_tx,
-        &HashMap::new(),
+    crate::config::trust::scope_workspace_trust_policy(
+        trusted_test_policy(tmp.path()),
+        refresh_redaction_for_turn(
+            &session,
+            session.id,
+            tmp.path(),
+            crate::config::extended::RedactConfig::default(),
+            &RedactionSourceOverrides::default(),
+            &mut notified,
+            &redaction,
+            &event_tx,
+            &driver_tx,
+            &HashMap::new(),
+        ),
     )
     .await;
 
@@ -502,7 +516,19 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
     assert!(!scrubbed.contains("worker-secret"));
     assert!(scrubbed.contains("REDACTED"));
     let persisted = session.persisted_redaction_table().unwrap().unwrap();
-    assert!(!persisted.scrub("worker-secret").contains("worker-secret"));
+    assert_eq!(
+        persisted.scrub("worker-secret"),
+        "worker-secret",
+        "dotenv-derived secret values must not be persisted"
+    );
+    assert!(
+        session
+            .persisted_disk_redaction_origins()
+            .unwrap()
+            .iter()
+            .any(|origin| origin.contains(".env")),
+        "the safe source marker should remain available for resume warnings"
+    );
 }
 
 async fn persisted_notice_text(session: &Session) -> String {
@@ -776,10 +802,12 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
     let secret = "worker-resume-dotenv-secret-123456";
     std::fs::write(&env_path, format!("TOKEN={secret}\n")).unwrap();
 
-    let mut redaction_cfg = crate::config::extended::RedactConfig::default();
-    redaction_cfg.scan_environment = false;
-    redaction_cfg.scan_dotenv = true;
-    redaction_cfg.scan_ssh_keys = false;
+    let redaction_cfg = crate::config::extended::RedactConfig {
+        scan_environment: false,
+        scan_dotenv: true,
+        scan_ssh_keys: false,
+        ..Default::default()
+    };
     let env = HashMap::new();
     let initial =
         Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
@@ -2163,8 +2191,10 @@ async fn turn_config_values_match_pre_adoption_resolution() {
 
     // Resolve through the production ConfigSource (secret_ref::load_effective
     // + extended::load_for_cwd), then serve it through the handle.
-    let (providers, extended) = crate::daemon::config_source::ConfigSource::production()
-        .load(tmp.path())
+    let (providers, extended) =
+        crate::config::trust::with_workspace_trust_policy(trusted_test_policy(tmp.path()), || {
+            crate::daemon::config_source::ConfigSource::production().load(tmp.path())
+        })
         .expect("production config resolution");
     let handle = SessionConfigHandle::detached(SessionConfigSnapshot::new(0, providers, extended));
 
@@ -2381,16 +2411,18 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
 }
 
 #[tokio::test]
-async fn invalid_stored_session_llm_mode_falls_back() {
+async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-    db.set_session_llm_mode(created.id, Some("turbo"))
-        .await
-        .unwrap();
 
-    let resumed = Session::resume(db, created.id).unwrap().unwrap();
-    assert_eq!(stored_session_llm_mode(&resumed), None);
+    let error = db
+        .set_session_llm_mode(created.id, Some("turbo"))
+        .await
+        .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("CHECK constraint failed"), "{message}");
 }
 
 #[tokio::test]

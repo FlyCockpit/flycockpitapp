@@ -987,9 +987,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        db.delete_session(deleted_build_session_id, true)
-            .await
-            .unwrap();
+        db.delete_session(deleted_build_session_id).await.unwrap();
 
         let fresh = StartBuildTool
             .call(Value::Null, &ctx)

@@ -59,10 +59,8 @@ impl App {
                     return false;
                 }
                 self.refresh_bootstrap_config_snapshot();
-                let summary = self
-                    .config_snapshot
-                    .providers
-                    .active_model
+                let configured_model = self.config_snapshot.providers.active_model.clone();
+                let summary = configured_model
                     .as_ref()
                     .map(|active| {
                         format!(
@@ -75,6 +73,27 @@ impl App {
                     });
                 self.dialog = crate::tui::settings::Dialog::open_first_run_complete(summary);
                 self.first_run_flow = FirstRunFlow::None;
+                if self.submit_after_model_selection {
+                    match configured_model {
+                        Some(active) => {
+                            if self.notify_active_model_selected(
+                                active,
+                                false,
+                                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+                            ) {
+                                self.submit_after_model_selection = false;
+                                let _ = self.submit_input();
+                            }
+                        }
+                        None => {
+                            self.submit_after_model_selection = false;
+                            self.push_plain(
+                                "Your draft is still here; choose a model before sending."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
                 true
             }
         }

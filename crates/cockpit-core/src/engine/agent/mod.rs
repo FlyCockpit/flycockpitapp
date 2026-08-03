@@ -2370,12 +2370,6 @@ mod project_guidance_injection_tests {
             .collect()
     }
 
-    fn write_project_config(root: &std::path::Path, json: &str) {
-        let cockpit = root.join(".cockpit");
-        std::fs::create_dir_all(&cockpit).unwrap();
-        std::fs::write(cockpit.join("config.json"), json).unwrap();
-    }
-
     fn write_skill(root: &std::path::Path, name: &str, frontmatter: &str, body: &str) {
         let sub = root.join(name);
         std::fs::create_dir_all(&sub).unwrap();
@@ -2397,6 +2391,12 @@ mod project_guidance_injection_tests {
     #[test]
     fn catalog_injected_once_on_first_turn() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: WorkspaceTrustMode::Trust,
+            },
+        );
         let scan = tmp.path().join("scan");
         write_skill(
             &scan,
@@ -2431,6 +2431,12 @@ mod project_guidance_injection_tests {
     #[test]
     fn catalog_reinjected_after_generation_bump() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: WorkspaceTrustMode::Trust,
+            },
+        );
         let scan = tmp.path().join("scan");
         write_skill(
             &scan,
@@ -2468,6 +2474,12 @@ mod project_guidance_injection_tests {
     #[test]
     fn no_catalog_without_skill_tool_or_when_empty() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: WorkspaceTrustMode::Trust,
+            },
+        );
         let scan = tmp.path().join("scan");
         write_skill(
             &scan,
@@ -2519,6 +2531,12 @@ mod project_guidance_injection_tests {
     #[test]
     fn catalog_body_is_nonce_fenced() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: WorkspaceTrustMode::Trust,
+            },
+        );
         let scan = tmp.path().join("scan");
         write_skill(
             &scan,
@@ -2592,12 +2610,13 @@ mod project_guidance_injection_tests {
         let _env =
             cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
         crate::config::trust::clear_runtime_policy_for_tests();
-        write_project_config(
-            tmp.path(),
+        let global_config = tmp.path().join("global-config.json");
+        std::fs::write(
+            &global_config,
             r#"{"prompt_injection_guard":{"threshold":"low"}}"#,
-        );
-        let _config_override =
-            _env.override_cockpit_config(&tmp.path().join(".cockpit/config.json"));
+        )
+        .unwrap();
+        let _config_override = _env.override_cockpit_config(&global_config);
         assert_eq!(
             crate::config::extended::resolve_injection_guard(tmp.path()).threshold,
             crate::config::extended::InjectionThreshold::Low,

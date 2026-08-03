@@ -9,13 +9,14 @@
 //! follow-up "level" picker appears using the provider-native values. Legacy
 //! `thinking_modes` still get their original `off` / `low` / `medium` /
 //! `high` picker. The result is sent to the daemon, which owns the active
-//! model transaction and performs a config write only for the explicit
-//! make-default action.
+//! model transaction and performs a config write for an explicit
+//! make-default action or when no default exists yet.
 //!
-//! The dialog is independent of `tui/settings.rs` to keep that file's
-//! state machine focused on configuration editing. Enter is session-only;
-//! Ctrl+Enter explicitly asks the daemon to persist the confirmed choice as
-//! the future default.
+//! The dialog is independent of `tui/settings.rs` to keep that file’s state
+//! machine focused on configuration editing. Enter uses the model for the
+//! session and establishes the default when none exists. Once a default
+//! exists, Enter is session-only; Ctrl+Enter explicitly asks the daemon to
+//! replace the future-session default.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,13 +31,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_config::dirs::{
-    COCKPIT_CONFIG_ENV, config_file_paths_for_load, config_write_target_for_provider,
-};
+use cockpit_config::dirs::{COCKPIT_CONFIG_ENV, config_file_paths_for_load};
 use cockpit_config::providers::{
-    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ConfigDoc, ModelEntry,
-    PromptCacheRetention, ProviderEntry, ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
+    ActiveModelRef, ActiveReasoningEffort, CapabilityValue, ModelEntry, PromptCacheRetention,
+    ProviderEntry, ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
 };
+#[cfg(test)]
+use cockpit_config::providers::{CapabilityStatus, ConfigDoc, ModelCapabilities};
 use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 18;
@@ -292,7 +293,7 @@ impl ModelPickerDialog {
         self.done
     }
 
-    /// Consume an explicit empty-state request to edit models for the scoped provider.
+    /// Consume an explicit request to edit models for the scoped provider.
     pub fn take_add_model_provider(&mut self) -> Option<String> {
         self.add_model_provider.take()
     }
@@ -335,9 +336,29 @@ impl ModelPickerDialog {
         self.pick = ScrollList::at(cursor, scroll);
     }
 
+    /// Restore the complete rejected request as the picker draft so retrying keeps
+    /// reasoning, thinking, and cache preferences instead of silently clearing them.
+    /// This mutates only the dialog draft; the daemon-confirmed app state remains
+    /// authoritative until a subsequent selection result is applied.
+    pub fn restore_requested_selection(&mut self, requested: &ActiveModelRef) {
+        self.cfg.active_model = Some(requested.clone());
+        self.highlight_requested_model(&requested.provider, &requested.model);
+    }
+
+    /// Show an actionable failure without discarding the user's highlighted
+    /// selection or reopening an unrelated modal.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.error = Some(message.into());
+    }
+
     #[cfg(test)]
     pub fn error_text(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn draft_active_model(&self) -> Option<&ActiveModelRef> {
+        self.cfg.active_model.as_ref()
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -352,8 +373,10 @@ impl ModelPickerDialog {
     /// Returns true if the dialog should close.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if matches!(key.code, KeyCode::Char('a'))
-            && self.entries.is_empty()
-            && self.filter.text().is_empty()
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && matches!(self.step, Step::Pick)
             && let Some(provider) = self.scope_provider.clone()
         {
             self.add_model_provider = Some(provider);
@@ -473,22 +496,29 @@ impl ModelPickerDialog {
                             cursor,
                         };
                     } else if entry.thinking_modes.is_empty() {
+                        let retention = self
+                            .retained_prompt_cache_retention(&entry.provider_id, &entry.model_id);
                         return self.commit_active_model(
                             entry.provider_id,
                             entry.model_id,
                             None,
                             None,
-                            None,
+                            retention,
                             key.modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL),
                         );
                     } else {
                         let modes = entry.thinking_modes.clone();
+                        let cursor = self.initial_thinking_cursor(
+                            &entry.provider_id,
+                            &entry.model_id,
+                            &modes,
+                        );
                         self.step = Step::ChooseThinking {
                             provider_id: entry.provider_id,
                             model_id: entry.model_id,
                             modes,
-                            cursor: 0,
+                            cursor,
                         };
                     }
                 }
@@ -544,12 +574,13 @@ impl ModelPickerDialog {
                 let mode = modes.get(*cursor).copied();
                 let p = provider_id.clone();
                 let m = model_id.clone();
+                let retention = self.retained_prompt_cache_retention(&p, &m);
                 return self.commit_active_model(
                     p,
                     m,
                     None,
                     mode,
-                    None,
+                    retention,
                     key.modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL),
                 );
@@ -588,12 +619,13 @@ impl ModelPickerDialog {
                     });
                 let p = provider_id.clone();
                 let m = model_id.clone();
+                let retention = self.retained_prompt_cache_retention(&p, &m);
                 return self.commit_active_model(
                     p,
                     m,
                     effort,
                     None,
-                    None,
+                    retention,
                     key.modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL),
                 );
@@ -651,6 +683,9 @@ impl ModelPickerDialog {
             Step::ChooseReasoning { .. } => self.render_reasoning(frame, layout[0]),
         }
         let help = match &self.step {
+            Step::Pick if self.scope_provider.is_some() => {
+                "type to filter  ↑/↓  enter: session  Ctrl+enter: session + default  Ctrl+a: add model  esc: cancel"
+            }
             Step::Pick => {
                 "type to filter  ↑/↓ or Ctrl+n/Ctrl+p  enter: session  Ctrl+enter: session + default  esc: cancel"
             }
@@ -726,7 +761,7 @@ impl ModelPickerDialog {
                 match self.scope_provider.as_deref() {
                     Some(provider) => {
                         format!(
-                            "(no models configured for {provider} — press `a` to Add model to this provider)"
+                            "(no models configured for {provider} — press Ctrl+A to add a model)"
                         )
                     }
                     None => "(no models — run `/fetch-models` or add a provider via `/settings`)"
@@ -970,6 +1005,40 @@ impl ModelPickerDialog {
             .and_then(|drift| drift.config_model.as_ref())
     }
 
+    fn initial_thinking_cursor(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        modes: &[ThinkingMode],
+    ) -> usize {
+        self.cfg
+            .active_model
+            .as_ref()
+            .filter(|active| active.provider == provider_id && active.model == model_id)
+            .and_then(|active| active.thinking_mode)
+            .and_then(|selected| modes.iter().position(|mode| *mode == selected))
+            .unwrap_or(0)
+    }
+
+    fn retained_prompt_cache_retention(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<PromptCacheRetention> {
+        let selected = self
+            .cfg
+            .active_model
+            .as_ref()
+            .filter(|active| active.provider == provider_id && active.model == model_id)
+            .and_then(|active| active.prompt_cache_retention)
+            .filter(|retention| !retention.is_default());
+        selected.filter(|retention| {
+            self.cfg
+                .resolve_prompt_cache_retention(provider_id, model_id, Some(*retention))
+                .is_some()
+        })
+    }
+
     fn initial_reasoning_cursor(
         &self,
         provider_id: &str,
@@ -1082,52 +1151,13 @@ fn reasoning_summary(capability: &ReasoningEffortCapability) -> String {
         .join("/")
 }
 
-/// Toggle the favorite flag on the currently-active model, persisting
-/// the change to `config.json`. Returns the new favorite state, or
-/// `Err` if there's no active model or no config to write to.
-pub fn toggle_active_favorite(
-    cwd: &Path,
-    providers: &cockpit_config::providers::ProvidersConfig,
-) -> Result<(bool, String, String), String> {
-    ensure_config_reachable(cwd).map_err(|_| "no cockpit config found".to_string())?;
-    let active = providers
-        .active_model
-        .clone()
-        .ok_or_else(|| "no active model — run `/model` first".to_string())?;
-    let entry = providers
-        .providers
-        .get(&active.provider)
-        .ok_or_else(|| format!("provider `{}` not in config", active.provider))?;
-    let model = entry
-        .models
-        .iter()
-        .find(|m| m.id == active.model)
-        .ok_or_else(|| {
-            format!(
-                "model `{}` not in provider `{}` — refetch `/models` first",
-                active.model, active.provider
-            )
-        })?;
-    let new = !model.favorite;
-    let p = active.provider.clone();
-    let m = active.model.clone();
-    let path = config_write_target_for_provider(cwd, &p)
-        .ok_or_else(|| "no cockpit config found".to_string())?;
-    let mut doc = ConfigDoc::load(&path).map_err(|e| e.to_string())?;
-    doc.write_model_favorite(&p, &m, new)
-        .map_err(|e| e.to_string())?;
-    Ok((new, p, m))
-}
-
 pub fn cycle_active_favorite(
     cfg: &cockpit_config::providers::ProvidersConfig,
+    active: Option<&ActiveModelRef>,
     counts: &HashMap<String, u64>,
     forward: bool,
 ) -> Result<Option<ActiveModelRef>, String> {
-    let active = cfg
-        .active_model
-        .as_ref()
-        .map(|active| (active.provider.clone(), active.model.clone()));
+    let active_key = active.map(|active| (active.provider.clone(), active.model.clone()));
     let mut entries: Vec<Entry> = Vec::new();
     for (pid, entry) in &cfg.providers {
         for model in &entry.models {
@@ -1146,10 +1176,17 @@ pub fn cycle_active_favorite(
         }
     }
     sort_entries(&mut entries, counts);
-    if entries.len() < 2 {
+    if entries.is_empty() {
         return Ok(None);
     }
-    let current = active.as_ref().and_then(|(p, m)| {
+    if entries.len() == 1
+        && active_key.as_ref().is_some_and(|(provider, model)| {
+            entries[0].provider_id == *provider && entries[0].model_id == *model
+        })
+    {
+        return Ok(None);
+    }
+    let current = active_key.as_ref().and_then(|(p, m)| {
         entries
             .iter()
             .position(|e| &e.provider_id == p && &e.model_id == m)
@@ -1161,14 +1198,37 @@ pub fn cycle_active_favorite(
         (None, _) => 0,
     };
     let target = &entries[target_idx];
-    let active = ActiveModelRef {
+    let mut selection = ActiveModelRef {
         provider: target.provider_id.clone(),
         model: target.model_id.clone(),
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    Ok(Some(active))
+    if let Some(current) = active {
+        selection.reasoning_effort = current.reasoning_effort.clone().filter(|effort| {
+            target.reasoning_effort.as_ref().is_some_and(|capability| {
+                capability
+                    .values
+                    .iter()
+                    .any(|candidate| candidate.value == effort.value)
+            })
+        });
+        selection.thinking_mode = current
+            .thinking_mode
+            .filter(|mode| target.thinking_modes.contains(mode));
+        selection.prompt_cache_retention = current.prompt_cache_retention.filter(|retention| {
+            retention.is_default()
+                || cfg
+                    .resolve_prompt_cache_retention(
+                        &target.provider_id,
+                        &target.model_id,
+                        Some(*retention),
+                    )
+                    .is_some()
+        });
+    }
+    Ok(Some(selection))
 }
 
 fn ensure_config_reachable(cwd: &Path) -> Result<(), String> {
@@ -1689,9 +1749,25 @@ mod tests {
     }
 
     #[test]
+    fn scoped_picker_ctrl_a_adds_model_while_plain_a_filters() {
+        let mut picker = dialog_with(vec![entry("existing")]);
+        picker.scope_provider = Some("p".to_string());
+
+        assert!(picker.handle_key(ctrl_press(KeyCode::Char('a'))));
+        assert_eq!(picker.take_add_model_provider(), Some("p".to_string()));
+
+        let mut typing = dialog_with(Vec::new());
+        typing.scope_provider = Some("p".to_string());
+        assert!(!typing.handle_key(press(KeyCode::Char('a'))));
+        assert_eq!(typing.filter.text(), "a");
+        assert_eq!(typing.take_add_model_provider(), None);
+    }
+
+    #[test]
     fn cycle_active_favorite_skips_nonfavorites_and_wraps() {
         let tmp = tempfile::tempdir().unwrap();
         let cockpit = tmp.path().join(".cockpit");
+        let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         fs::create_dir(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, r#"{"providers":{"p":{"url":"https://example.test","models":[{"id":"a","favorite":true},{"id":"b"},{"id":"c","favorite":true}]}}}"#).unwrap();
@@ -1722,7 +1798,7 @@ mod tests {
             thinking_mode: None,
             prompt_cache_retention: None,
         });
-        let next = cycle_active_favorite(&cfg, &HashMap::new(), true)
+        let next = cycle_active_favorite(&cfg, cfg.active_model.as_ref(), &HashMap::new(), true)
             .unwrap()
             .expect("next favorite");
         assert_eq!(next.provider, "p");
@@ -1733,11 +1809,46 @@ mod tests {
             .unwrap();
 
         cfg.active_model = Some(next.clone());
-        let prev = cycle_active_favorite(&cfg, &HashMap::new(), false)
+        let prev = cycle_active_favorite(&cfg, cfg.active_model.as_ref(), &HashMap::new(), false)
             .unwrap()
             .expect("previous favorite");
         assert_eq!(prev.provider, "p");
         assert_eq!(prev.model, "a");
+    }
+
+    #[test]
+    fn cycle_active_favorite_selects_sole_favorite_when_active_model_differs() {
+        let mut cfg = cockpit_config::providers::ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".into(),
+            cockpit_config::providers::ProviderEntry {
+                models: vec![
+                    ModelEntry {
+                        id: "active".into(),
+                        ..Default::default()
+                    },
+                    ModelEntry {
+                        id: "favorite".into(),
+                        favorite: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let active = ActiveModelRef {
+            provider: "p".into(),
+            model: "active".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+
+        let next = cycle_active_favorite(&cfg, Some(&active), &HashMap::new(), true)
+            .unwrap()
+            .expect("the different sole favorite is a valid target");
+        assert_eq!(next.provider, "p");
+        assert_eq!(next.model, "favorite");
     }
 
     /// The think step is a non-typing list: `j`/`k` (and arrows) navigate
@@ -1850,6 +1961,68 @@ mod tests {
         assert_eq!(active.model, "legacy");
         assert_eq!(active.reasoning_effort, None);
         assert_eq!(active.thinking_mode, Some(ThinkingMode::High));
+    }
+
+    #[test]
+    fn rejected_selection_retry_preserves_supported_preferences() {
+        let mut reasoning = reasoning_entry("codex");
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "codex".into(),
+                    capabilities: ModelCapabilities {
+                        reasoning_effort: reasoning.reasoning_effort.clone(),
+                        prompt_cache_retention: CapabilityStatus::Supported,
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        reasoning.thinking_modes.clear();
+        let mut dialog = dialog_with(vec![reasoning]);
+        dialog.cfg = cfg;
+        let requested = ActiveModelRef {
+            provider: "p".into(),
+            model: "codex".into(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: "minimal".into(),
+            }),
+            thinking_mode: None,
+            prompt_cache_retention: Some(PromptCacheRetention::Extended),
+        };
+
+        dialog.restore_requested_selection(&requested);
+        assert_eq!(dialog.draft_active_model(), Some(&requested));
+        assert!(!dialog.handle_key(press(KeyCode::Enter)));
+        match &dialog.step {
+            Step::ChooseReasoning { cursor, .. } => assert_eq!(*cursor, 0),
+            _ => panic!("expected reasoning step"),
+        }
+        assert!(dialog.handle_key(press(KeyCode::Enter)));
+        assert_eq!(dialog.selected_active_model(), Some(requested));
+
+        let mut legacy = entry("legacy");
+        legacy.thinking_modes = vec![ThinkingMode::Off, ThinkingMode::Low, ThinkingMode::High];
+        let mut dialog = dialog_with(vec![legacy]);
+        let requested = ActiveModelRef {
+            provider: "p".into(),
+            model: "legacy".into(),
+            reasoning_effort: None,
+            thinking_mode: Some(ThinkingMode::High),
+            prompt_cache_retention: None,
+        };
+        dialog.restore_requested_selection(&requested);
+        assert!(!dialog.handle_key(press(KeyCode::Enter)));
+        match &dialog.step {
+            Step::ChooseThinking { cursor, .. } => assert_eq!(*cursor, 2),
+            _ => panic!("expected thinking step"),
+        }
+        assert!(dialog.handle_key(press(KeyCode::Enter)));
+        assert_eq!(dialog.selected_active_model(), Some(requested));
     }
 
     #[test]

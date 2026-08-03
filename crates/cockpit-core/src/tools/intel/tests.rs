@@ -848,29 +848,36 @@ async fn intel_walk_context_pack_missing_path_does_not_freshen_siblings() {
 #[tokio::test]
 async fn intel_walk_tool_output_contains_truncation_note() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
-    write(
-        tmp.path(),
-        ".cockpit/config.json",
-        r#"{"intel":{"max_cold_index_files":1}}"#,
-    );
-    write(tmp.path(), "a.rs", "pub fn a() {}\n");
-    write(tmp.path(), "b.rs", "pub fn b() {}\n");
-    let ctx = test_ctx(tmp.path());
-    clear_freshness_cache();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        write(
+            tmp.path(),
+            ".cockpit/config.json",
+            r#"{"intel":{"max_cold_index_files":1}}"#,
+        );
+        write(tmp.path(), "a.rs", "pub fn a() {}\n");
+        write(tmp.path(), "b.rs", "pub fn b() {}\n");
+        let ctx = test_ctx(tmp.path());
+        clear_freshness_cache();
 
-    let out = CodeTool
-        .call(code_args("tree", serde_json::json!({})), &ctx)
-        .await
-        .unwrap();
+        let out = CodeTool
+            .call(code_args("tree", serde_json::json!({})), &ctx)
+            .await
+            .unwrap();
 
-    assert!(
-        out.content
-            .contains("note: intel index bounded to 1 of 2 discovered files"),
-        "{}",
-        out.content
-    );
-    clear_freshness_cache();
+        assert!(
+            out.content
+                .contains("note: intel index bounded to 1 of 2 discovered files"),
+            "{}",
+            out.content
+        );
+        clear_freshness_cache();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1829,58 +1836,65 @@ async fn symbol_find_ranks_central_file_first_and_reverts_when_disabled() {
 #[tokio::test]
 async fn symbol_find_ranking_flips_order_vs_disabled() {
     let tmp = tempfile::tempdir().unwrap();
-    // `zcore.rs` (sorts last) is heavily called; `acold.rs` (sorts
-    // first) is not. Both define `gadget`.
-    write(
-        tmp.path(),
-        "zcore.rs",
-        "pub fn gadget() {}\npub fn beacon() {}\n",
-    );
-    write(tmp.path(), "acold.rs", "pub fn gadget() {}\n");
-    let mut body = String::from("pub fn run() {\n");
-    for _ in 0..10 {
-        body.push_str("    beacon();\n");
-    }
-    body.push_str("}\n");
-    write(tmp.path(), "callers.rs", &body);
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        // `zcore.rs` (sorts last) is heavily called; `acold.rs` (sorts
+        // first) is not. Both define `gadget`.
+        write(
+            tmp.path(),
+            "zcore.rs",
+            "pub fn gadget() {}\npub fn beacon() {}\n",
+        );
+        write(tmp.path(), "acold.rs", "pub fn gadget() {}\n");
+        let mut body = String::from("pub fn run() {\n");
+        for _ in 0..10 {
+            body.push_str("    beacon();\n");
+        }
+        body.push_str("}\n");
+        write(tmp.path(), "callers.rs", &body);
 
-    // ON: central `zcore.rs` ranked first despite sorting last.
-    set_centrality(tmp.path(), true);
-    let ctx = test_ctx(tmp.path());
-    let on = CodeTool
-        .call(
-            code_args(
-                "symbol_find",
-                serde_json::json!({ "name": "gadget", "exact": true }),
-            ),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert!(
-        on.content.find("zcore.rs").unwrap() < on.content.find("acold.rs").unwrap(),
-        "ranking must lift central zcore.rs above acold.rs; got:\n{}",
-        on.content
-    );
+        // ON: central `zcore.rs` ranked first despite sorting last.
+        set_centrality(tmp.path(), true);
+        let ctx = test_ctx(tmp.path());
+        let on = CodeTool
+            .call(
+                code_args(
+                    "symbol_find",
+                    serde_json::json!({ "name": "gadget", "exact": true }),
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            on.content.find("zcore.rs").unwrap() < on.content.find("acold.rs").unwrap(),
+            "ranking must lift central zcore.rs above acold.rs; got:\n{}",
+            on.content
+        );
 
-    // OFF: alphabetical → `acold.rs` first.
-    set_centrality(tmp.path(), false);
-    let ctx2 = test_ctx(tmp.path());
-    let off = CodeTool
-        .call(
-            code_args(
-                "symbol_find",
-                serde_json::json!({ "name": "gadget", "exact": true }),
-            ),
-            &ctx2,
-        )
-        .await
-        .unwrap();
-    assert!(
-        off.content.find("acold.rs").unwrap() < off.content.find("zcore.rs").unwrap(),
-        "disabled must revert to alphabetical (acold.rs first); got:\n{}",
-        off.content
-    );
+        // OFF: alphabetical → `acold.rs` first.
+        set_centrality(tmp.path(), false);
+        let ctx2 = test_ctx(tmp.path());
+        let off = CodeTool
+            .call(
+                code_args(
+                    "symbol_find",
+                    serde_json::json!({ "name": "gadget", "exact": true }),
+                ),
+                &ctx2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            off.content.find("acold.rs").unwrap() < off.content.find("zcore.rs").unwrap(),
+            "disabled must revert to alphabetical (acold.rs first); got:\n{}",
+            off.content
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

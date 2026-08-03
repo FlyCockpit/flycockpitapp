@@ -128,12 +128,16 @@ pub async fn check_native_access(
         return Ok(effective);
     }
 
-    if ctx
-        .review_cage
-        .as_ref()
-        .is_some_and(|cage| cage.preauthorizes_package_path(&effective))
-    {
-        return Ok(effective);
+    if let Some(cage) = &ctx.review_cage {
+        if cage.preauthorizes_package_path(&effective) {
+            return Ok(effective);
+        }
+        if cage.auto_deny_approvals() {
+            return Err(invalid_input(format!(
+                "`{}` is outside the session boundary and background review cannot approve it",
+                effective.display()
+            )));
+        }
     }
 
     let Some(approver) = ctx.approver.as_ref() else {

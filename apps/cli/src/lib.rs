@@ -231,6 +231,7 @@ pub mod integration {
                     session_id,
                     since_seq,
                     project_root: Some(project_root.display().to_string()),
+                    initial_model: None,
                     no_sandbox: false,
                     interactive,
                     model_override: None,
@@ -662,6 +663,13 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(Command::Debug(crate::cli::DebugCommand::Paths))
+    )
+}
+
 fn error_stderr_line(err: &anyhow::Error) -> String {
     if let Some(removed) = err.downcast_ref::<commands::RemovedCommandError>() {
         format!("error: {}", removed.message())
@@ -684,7 +692,9 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         }
     }
 
-    install_cli_trust_policy(cli.project.as_deref()).await?;
+    if command_requires_workspace_trust(cli.command.as_ref()) {
+        install_cli_trust_policy(cli.project.as_deref()).await?;
+    }
 
     match cli.command {
         None => {
@@ -916,15 +926,14 @@ mod tests {
     }
 
     #[test]
-    fn every_subcommand_installs_trust_policy() {
-        let source = include_str!("lib.rs");
-        let installation = source
-            .find("install_cli_trust_policy(cli.project.as_deref()).await?;")
-            .expect("all CLI dispatch must follow the trust-policy install");
-        let dispatch = source
-            .find("match cli.command {")
-            .expect("CLI command dispatch exists");
-        assert!(installation < dispatch);
+    fn debug_paths_is_diagnostic_and_does_not_initialize_trust_storage() {
+        assert!(!command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::Paths,
+        ))));
+        assert!(command_requires_workspace_trust(None));
+        assert!(command_requires_workspace_trust(Some(&Command::Debug(
+            crate::cli::DebugCommand::Config,
+        ))));
     }
 
     #[test]

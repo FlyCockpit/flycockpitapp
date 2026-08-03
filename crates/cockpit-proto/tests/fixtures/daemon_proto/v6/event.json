@@ -1,15 +1,46 @@
 {
   "active_model_state": {
     "data": {
-      "config_model": "gpt-5",
-      "config_provider": "openai",
+      "default_selection": {
+        "model": "gpt-5",
+        "provider": "openai"
+      },
       "diverged": false,
       "generation": 3,
-      "model": "gpt-5",
-      "provider": "openai",
+      "selection": {
+        "model": "gpt-5",
+        "provider": "openai"
+      },
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "active_model_state"
+  },
+  "model_selection_result": {
+    "data": {
+      "model": "gpt-5",
+      "outcome": {
+        "active_state": {
+          "default_selection": {
+            "model": "gpt-5",
+            "provider": "openai"
+          },
+          "diverged": false,
+          "generation": 3,
+          "selection": {
+            "model": "gpt-5",
+            "provider": "openai"
+          }
+        },
+        "default_update": {
+          "status": "saved"
+        },
+        "status": "applied"
+      },
+      "provider": "openai",
+      "selection_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "model_selection_result"
   },
   "agent_idle": {
     "data": {
@@ -152,6 +183,7 @@
             "scan_dotenv": true,
             "scan_environment": true,
             "scan_ssh_keys": true,
+            "secret_path_patterns": [],
             "ssh_key_dir": null
           },
           "resourceScheduler": {
@@ -190,10 +222,6 @@
             "prune_builtins": false,
             "scan_dirs": [],
             "write_approval": false
-          },
-          "swarm": {
-            "maxConcurrency": 8,
-            "maxDepth": 3
           },
           "system_prompt": {
             "time_injection_interval_minutes": 5

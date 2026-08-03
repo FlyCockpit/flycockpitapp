@@ -238,11 +238,35 @@ pub fn resolve_provider_request_blocking(
     {
         return resolve_provider_request(provider_id, entry);
     }
-    let handle = tokio::runtime::Handle::try_current()
-        .context("subscription auth requires an async runtime")?;
-    tokio::task::block_in_place(|| {
-        handle.block_on(resolve_provider_request_async(provider_id, entry))
-    })
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(resolve_provider_request_async(provider_id, entry))
+            })
+        }
+        Ok(_) => {
+            // `block_in_place` panics on Tokios current-thread runtime. The
+            // model builder is intentionally synchronous, so bridge OAuth on
+            // a dedicated thread instead of making every caller runtime-flavor
+            // dependent.
+            let provider_id = provider_id.to_owned();
+            let entry = entry.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("build subscription-auth runtime")?
+                    .block_on(resolve_provider_request_async(&provider_id, &entry))
+            })
+            .join()
+            .map_err(|_| anyhow!("subscription-auth worker panicked"))?
+        }
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build subscription-auth runtime")?
+            .block_on(resolve_provider_request_async(provider_id, entry)),
+    }
 }
 
 pub fn resolve_provider_request_blocking_with_env<F>(

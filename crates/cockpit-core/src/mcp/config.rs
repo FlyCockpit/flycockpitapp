@@ -562,7 +562,13 @@ mod tests {
         .unwrap();
         let _override = env.override_cockpit_config(&override_config);
 
-        let cfg = McpConfig::discover(&project);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&project).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let cfg = crate::config::trust::with_workspace_trust_policy(policy, || {
+            McpConfig::discover(&project)
+        });
 
         assert!(cfg.servers.contains_key("project"));
         assert!(

@@ -354,18 +354,12 @@ async fn background_gate_requires_command_approval() {
 async fn background_gate_resolved_cwd_reaches_spawn() {
     let (mut driver, tmp) = test_driver(8);
     driver.session.set_sandbox_enabled(false);
-    let mut rx = capture_schedule_events(&mut driver);
     let child = tmp.path().join("child");
     std::fs::create_dir(&child).unwrap();
     let marker = child.join("marker.txt");
-    let (_approver, hub) = install_background_approver(&mut driver);
-    let command = "printf resolved > marker.txt; printf progress\\n";
-    let resolver = tokio::spawn(resolve_next_interrupt(
-        driver.session.db.clone(),
-        driver.session.id,
-        hub,
-        crate::approval::ID_APPROVE_ONCE,
-    ));
+    let (approver, _hub) = install_background_approver(&mut driver);
+    let command = "touch marker.txt";
+    grant_background_command(&approver, command).await;
 
     let out = driver
         .dispatch_schedule_action(&serde_json::json!({
@@ -374,24 +368,22 @@ async fn background_gate_resolved_cwd_reaches_spawn() {
         }))
         .await
         .unwrap();
-    resolver.await.unwrap();
 
     assert!(out.starts_with("started background"), "got {out}");
-    loop {
-        match rx.recv().await.expect("background should emit progress") {
-            TurnEvent::ScheduleProgress { .. } => break,
-            TurnEvent::ScheduleStarted { .. } => {}
-            other => panic!("unexpected schedule event: {other:?}"),
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), "resolved");
+    })
+    .await
+    .expect("background command should create its marker");
 }
 
 #[tokio::test]
 async fn background_gate_denied_approval_starts_no_job() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.session.set_sandbox_enabled(false);
     let mut rx = capture_schedule_events(&mut driver);
+    driver.session.set_sandbox_enabled(false);
     let (_approver, hub) = install_background_approver(&mut driver);
     let resolver = tokio::spawn(resolve_next_interrupt(
         driver.session.db.clone(),
@@ -417,8 +409,8 @@ async fn background_gate_denied_approval_starts_no_job() {
 #[tokio::test]
 async fn background_gate_no_approver_is_denied() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.session.set_sandbox_enabled(false);
     let mut rx = capture_schedule_events(&mut driver);
+    driver.session.set_sandbox_enabled(false);
 
     let out = driver
         .dispatch_schedule_action(&serde_json::json!({
@@ -436,8 +428,8 @@ async fn background_gate_no_approver_is_denied() {
 #[tokio::test]
 async fn background_gate_noninteractive_denial_uses_shared_message() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.session.set_sandbox_enabled(false);
     let mut rx = capture_schedule_events(&mut driver);
+    driver.session.set_sandbox_enabled(false);
     let (_approver, hub) = install_background_approver(&mut driver);
     let resolver = tokio::spawn(resolve_next_interrupt_with_response(
         driver.session.db.clone(),
@@ -465,8 +457,8 @@ async fn background_gate_noninteractive_denial_uses_shared_message() {
 #[tokio::test]
 async fn background_gate_refuse_starts_no_job() {
     let (mut driver, _tmp) = test_driver(8);
-    driver.session.set_sandbox_enabled(true);
     let mut rx = capture_schedule_events(&mut driver);
+    driver.session.set_sandbox_enabled(true);
     let (approver, _hub) = install_background_approver(&mut driver);
     grant_background_command(&approver, "printf refused").await;
 

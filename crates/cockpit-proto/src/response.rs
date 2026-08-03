@@ -550,12 +550,9 @@ mod tests {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveModelState {
-    pub provider: String,
-    pub model: String,
+    pub selection: cockpit_config::config::providers::ActiveModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_model: Option<String>,
+    pub default_selection: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub diverged: bool,
     #[serde(default)]
     pub generation: u64,

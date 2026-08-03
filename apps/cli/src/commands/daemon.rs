@@ -58,10 +58,20 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::Stop { grace } => {
             validate_grace(grace)?;
+            let old_pid = daemon::daemon_pid(&paths);
             if let Ok(client) = DaemonClient::connect(&paths.socket).await {
                 client
                     .request_ok(Request::StopDaemon { grace_secs: grace })
                     .await?;
+                if !daemon::wait_for_restart_release(
+                    &paths,
+                    old_pid,
+                    daemon::restart_release_timeout(grace),
+                )
+                .await
+                {
+                    bail!("timed out waiting for daemon shutdown to release its pid and socket");
+                }
                 println!("daemon: stopped");
                 return Ok(());
             }
@@ -106,12 +116,15 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     let _ = daemon::stop(&paths)?;
                     false
                 };
-                daemon::wait_for_restart_release(
+                let released = daemon::wait_for_restart_release(
                     &paths,
                     old_pid,
                     restart_release_timeout_for_stop_path(grace, stop_via_socket),
                 )
                 .await;
+                if !released {
+                    bail!("timed out waiting for daemon restart to release its pid and socket");
+                }
             }
 
             let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
@@ -293,7 +306,14 @@ struct RunningJsonStatus {
 }
 
 async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
-    let response = match request_daemon_status(socket).await {
+    let client = match DaemonClient::connect(socket).await {
+        Ok(client) => client,
+        Err(error) if is_wire_protocol_mismatch(&error.to_string()) => {
+            return RunningStatusVersionRead::ProtocolMismatch;
+        }
+        Err(error) => return RunningStatusVersionRead::ReadFailed(error.to_string()),
+    };
+    let response = match client.request(Request::DaemonStatus).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if is_protocol_mismatch_status_error(&error) => {
             return RunningStatusVersionRead::ProtocolMismatch;
@@ -301,13 +321,7 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
         Ok(Err(error)) => {
             return RunningStatusVersionRead::ReadFailed(format!("daemon error: {error}"));
         }
-        Err(error) => {
-            let error = error.to_string();
-            if is_envelope_gate_protocol_mismatch(&error) {
-                return RunningStatusVersionRead::ProtocolMismatch;
-            }
-            return RunningStatusVersionRead::ReadFailed(error);
-        }
+        Err(error) => return RunningStatusVersionRead::ReadFailed(error.to_string()),
     };
 
     match response {
@@ -327,26 +341,10 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
 
 fn is_protocol_mismatch_status_error(error: &proto::ErrorPayload) -> bool {
     error.code == proto::ErrorCode::ProtocolVersion
-        || is_envelope_gate_protocol_mismatch(&error.message)
 }
 
-fn is_envelope_gate_protocol_mismatch(message: &str) -> bool {
+fn is_wire_protocol_mismatch(message: &str) -> bool {
     message.contains("wire protocol version mismatch")
-        || matches!(
-            message,
-            "daemon connection closed"
-                | "daemon client task has stopped"
-                | "daemon client dropped reply channel"
-        )
-}
-
-async fn request_daemon_status(
-    socket: &Path,
-) -> Result<std::result::Result<Response, proto::ErrorPayload>> {
-    DaemonClient::connect(socket)
-        .await?
-        .request(Request::DaemonStatus)
-        .await
 }
 
 fn render_running_status(
@@ -681,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_version_classifies_envelope_gate_refusal_as_protocol_mismatch() {
+    fn daemon_status_version_classifies_only_typed_errors_as_protocol_mismatch() {
         let typed_protocol_error = proto::ErrorPayload {
             code: proto::ErrorCode::ProtocolVersion,
             message: proto::version_mismatch_message(proto::PROTOCOL_VERSION + 1),
@@ -706,13 +704,13 @@ mod tests {
         assert!(super::is_protocol_mismatch_status_error(
             &typed_protocol_error
         ));
-        assert!(super::is_protocol_mismatch_status_error(
+        assert!(!super::is_protocol_mismatch_status_error(
             &envelope_gate_error
         ));
-        assert!(super::is_protocol_mismatch_status_error(
+        assert!(!super::is_protocol_mismatch_status_error(
             &client_task_stopped_error
         ));
-        assert!(super::is_protocol_mismatch_status_error(
+        assert!(!super::is_protocol_mismatch_status_error(
             &dropped_reply_error
         ));
         assert!(!super::is_protocol_mismatch_status_error(&timeout_error));
@@ -745,7 +743,7 @@ mod tests {
             daemon_version: "0.0.test-skew".to_string(),
             protocol_version: proto::PROTOCOL_VERSION,
             database_path: "/tmp/cockpit.db".to_string(),
-            schema_version: 7,
+            schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
         });
         let object = value.as_object().expect("json object");
         let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();

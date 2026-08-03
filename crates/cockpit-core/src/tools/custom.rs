@@ -655,7 +655,10 @@ mod tests {
     #[tokio::test]
     async fn unconfined_custom_tool_requires_grant_or_ask() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let tpl = ToolCommandTemplate {
             enabled: true,
             command: "printf should-not-run".into(),

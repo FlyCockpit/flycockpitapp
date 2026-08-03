@@ -122,9 +122,8 @@ impl Tool for ReadTool {
                         std::sync::Arc::new(table)
                     }
                 };
-                match &mut output {
-                    ToolOutput { content, .. } => *content = updated.scrub(content),
-                }
+                let ToolOutput { content, .. } = &mut output;
+                *content = updated.scrub(content);
             }
             return Ok(output);
         }

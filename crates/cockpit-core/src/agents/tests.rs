@@ -25,6 +25,37 @@ fn write_large_agent(path: &Path, size: u64) {
         .unwrap();
 }
 
+fn trusted_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
+fn trusted_resolve(root: &Path, name: &str) -> Result<Option<AgentDef>> {
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || resolve(root, name))
+}
+
+fn trusted_list_all(root: &Path) -> Vec<AgentListing> {
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || list_all(root))
+}
+
+fn trusted_eject_builtin(
+    root: &Path,
+    config_dir: &Path,
+    name: &str,
+) -> Result<(std::path::PathBuf, bool)> {
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+        eject_builtin(root, config_dir, name)
+    })
+}
+
+fn trusted_reset_all_builtins(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+        reset_all_builtins(root)
+    })
+}
+
 #[test]
 fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -33,7 +64,10 @@ fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
     let config = config_dir.join("config.json");
     fs::write(&config, r#"{"agent_dirs":["relative-agents"]}"#).unwrap();
 
-    let dirs = configured_agent_dirs_for_paths(std::slice::from_ref(&config));
+    let dirs =
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+            configured_agent_dirs_for_paths(std::slice::from_ref(&config))
+        });
 
     assert_eq!(dirs, vec![config_dir.join("relative-agents")]);
 }
@@ -155,7 +189,10 @@ fn list_all_excludes_oversized_custom_agent() {
     .unwrap();
     write_large_agent(&dir.join("large.md"), MAX_MARKDOWN_BYTES + 1);
 
-    let names: Vec<String> = list_all(tmp.path()).into_iter().map(|a| a.name).collect();
+    let names: Vec<String> = trusted_list_all(tmp.path())
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
 
     assert!(names.iter().any(|name| name == "small"), "{names:?}");
     assert!(!names.iter().any(|name| name == "large"), "{names:?}");
@@ -497,7 +534,7 @@ fn absent_tools_grant_validates() {
 #[test]
 fn resolve_returns_embedded_default_when_no_override() {
     let tmp = tempfile::tempdir().unwrap();
-    let def = resolve(tmp.path(), "builder").unwrap().unwrap();
+    let def = trusted_resolve(tmp.path(), "builder").unwrap().unwrap();
     // Embedded default has an empty source.
     assert!(def.source.as_os_str().is_empty());
     assert_eq!(def.name, "builder");
@@ -512,7 +549,7 @@ fn resolve_prefers_on_disk_override() {
         "---\ndescription: edited builder\nmode: subagent\ntools: [read]\n---\nNEW BODY\n",
     )
     .unwrap();
-    let def = resolve(tmp.path(), "builder").unwrap().unwrap();
+    let def = trusted_resolve(tmp.path(), "builder").unwrap().unwrap();
     assert!(!def.source.as_os_str().is_empty(), "override has a source");
     assert_eq!(def.description, "edited builder");
     assert_eq!(def.prompt, "NEW BODY");
@@ -562,7 +599,7 @@ fn custom_name_colliding_with_builtin_is_treated_as_override() {
         "---\ndescription: my explore\n---\nbody\n",
     )
     .unwrap();
-    let listings = list_all(tmp.path());
+    let listings = trusted_list_all(tmp.path());
     let explore_rows: Vec<_> = listings.iter().filter(|l| l.name == "explore").collect();
     assert_eq!(explore_rows.len(), 1, "explore appears exactly once");
     assert!(
@@ -577,7 +614,11 @@ fn custom_name_colliding_with_builtin_is_treated_as_override() {
 #[test]
 fn resolve_returns_none_for_unknown_name() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(resolve(tmp.path(), "no-such-agent").unwrap().is_none());
+    assert!(
+        trusted_resolve(tmp.path(), "no-such-agent")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -586,7 +627,7 @@ fn resolve_malformed_override_fails_loudly() {
     let dir = project_agents_dir(tmp.path());
     let path = dir.join("builder.md");
     fs::write(&path, "---\nmode: subagent\n---\nno description\n").unwrap();
-    let err = resolve(tmp.path(), "builder").unwrap_err();
+    let err = trusted_resolve(tmp.path(), "builder").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("builder.md"), "names the source: {msg}");
     // Did NOT silently fall back to the embedded default.
@@ -603,7 +644,7 @@ fn resolve_rejects_override_with_invariant_violation() {
         "---\ndescription: e\ntools: [read, glob]\n---\nbody\n",
     )
     .unwrap();
-    let err = resolve(tmp.path(), "explore").unwrap_err();
+    let err = trusted_resolve(tmp.path(), "explore").unwrap_err();
     assert!(format!("{err}").contains("docs-answerer-only"));
 }
 
@@ -618,7 +659,7 @@ fn list_all_lists_builtins_and_custom() {
         "---\ndescription: reviewer\nmode: subagent\n---\nbody\n",
     )
     .unwrap();
-    let listings = list_all(tmp.path());
+    let listings = trusted_list_all(tmp.path());
     for name in BUILTIN_AGENT_NAMES {
         assert!(
             listings.iter().any(|l| &l.name == name),
@@ -637,7 +678,7 @@ fn eject_writes_faithful_file() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join(".cockpit");
     fs::create_dir_all(&config_dir).unwrap();
-    let (path, written) = eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
+    let (path, written) = trusted_eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
     assert!(written, "first eject writes a new file");
     assert!(path.exists());
     let on_disk = fs::read_to_string(&path).unwrap();
@@ -647,7 +688,7 @@ fn eject_writes_faithful_file() {
     assert_eq!(parsed.tools, embedded.tools);
     assert_eq!(parsed.prompt, embedded.prompt);
     // And the ejected file is now the resolved override.
-    let resolved = resolve(tmp.path(), "builder").unwrap().unwrap();
+    let resolved = trusted_resolve(tmp.path(), "builder").unwrap().unwrap();
     assert!(!resolved.source.as_os_str().is_empty());
 }
 
@@ -662,7 +703,7 @@ fn eject_does_not_clobber_existing_override() {
         "---\ndescription: mine\ntools: [read]\n---\nMY EDITS\n",
     )
     .unwrap();
-    let (path, written) = eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
+    let (path, written) = trusted_eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
     assert!(!written, "must not clobber");
     assert_eq!(path, existing);
     // The user's content is intact.
@@ -673,7 +714,7 @@ fn eject_does_not_clobber_existing_override() {
 fn eject_rejects_non_builtin() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join(".cockpit");
-    assert!(eject_builtin(tmp.path(), &config_dir, "my-custom").is_err());
+    assert!(trusted_eject_builtin(tmp.path(), &config_dir, "my-custom").is_err());
 }
 
 // ── Reset ────────────────────────────────────────────────────────────────
@@ -691,7 +732,7 @@ fn reset_all_removes_builtin_overrides_only() {
     fs::write(dir.join("explore.md"), "---\ndescription: e\n---\nb\n").unwrap();
     fs::write(dir.join("my-reviewer.md"), "---\ndescription: r\n---\nb\n").unwrap();
 
-    let removed = reset_all_builtins(tmp.path()).unwrap();
+    let removed = trusted_reset_all_builtins(tmp.path()).unwrap();
     assert_eq!(removed.len(), 2, "only the two built-in overrides removed");
     assert!(!dir.join("builder.md").exists());
     assert!(!dir.join("explore.md").exists());
@@ -701,7 +742,7 @@ fn reset_all_removes_builtin_overrides_only() {
     );
     // Built-ins now resolve from embedded again.
     assert!(
-        resolve(tmp.path(), "builder")
+        trusted_resolve(tmp.path(), "builder")
             .unwrap()
             .unwrap()
             .source
@@ -714,7 +755,7 @@ fn reset_all_removes_builtin_overrides_only() {
 fn reset_with_no_overrides_is_a_noop() {
     let tmp = tempfile::tempdir().unwrap();
     project_agents_dir(tmp.path());
-    let removed = reset_all_builtins(tmp.path()).unwrap();
+    let removed = trusted_reset_all_builtins(tmp.path()).unwrap();
     assert!(removed.is_empty());
 }
 
@@ -780,7 +821,9 @@ fn dir_form_selects_per_mode_prompt() {
     write_mode_file(&agents, "rev", LlmMode::Frontier, "FRONTIER BODY");
     write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
 
-    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
     assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "NORMAL BODY");
     assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "FRONTIER BODY");
     assert_eq!(
@@ -802,7 +845,9 @@ fn dir_form_missing_mode_falls_back_to_flat_sibling() {
     )
     .unwrap();
 
-    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
     assert_eq!(
         def.resolved_prompt_for(LlmMode::Defensive),
         "DEFENSIVE BODY"
@@ -825,7 +870,9 @@ fn dir_form_frontier_falls_back_to_normal_before_flat() {
     )
     .unwrap();
 
-    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
     assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "NORMAL BODY");
 }
 
@@ -838,7 +885,9 @@ fn dir_form_missing_mode_no_flat_errors_naming_agent_and_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
     write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
-    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
     assert_eq!(
         def.resolved_prompt_for(LlmMode::Defensive),
         "DEFENSIVE BODY"
@@ -854,7 +903,7 @@ fn dir_form_empty_directory_errors_naming_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
     fs::create_dir_all(agents.join("rev")).unwrap();
-    let err = resolve(tmp.path(), "rev").unwrap_err();
+    let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("rev"), "names the agent: {msg}");
     assert!(
@@ -874,7 +923,9 @@ fn flat_file_agent_is_single_mode_in_both_modes() {
         "---\ndescription: Single mode.\nmode: subagent\n---\n\nONE BODY\n",
     )
     .unwrap();
-    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    let def = trusted_resolve(tmp.path(), "rev")
+        .unwrap()
+        .expect("agent resolves");
     assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "ONE BODY");
     assert_eq!(def.resolved_prompt_for(LlmMode::Frontier), "ONE BODY");
     assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), "ONE BODY");
@@ -921,7 +972,7 @@ fn dir_form_enforces_invariants_at_load() {
         "---\ndescription: x\nmode: subagent\ntools: [read, grep]\n---\n\nB\n",
     )
     .unwrap();
-    let err = resolve(tmp.path(), "rev").unwrap_err();
+    let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
     assert!(
         format!("{err}").contains("docs-answerer-only"),
         "core invariant must be enforced in the dir form: {err}"
@@ -1002,12 +1053,15 @@ fn roster_trim_removed_builtin_override_file_ignored() {
         .unwrap();
 
         assert!(
-            resolve(tmp.path(), name).unwrap().is_none(),
+            trusted_resolve(tmp.path(), name).unwrap().is_none(),
             "removed builtin {name} override must not resolve"
         );
     }
 
-    let listed: Vec<String> = list_all(tmp.path()).into_iter().map(|a| a.name).collect();
+    let listed: Vec<String> = trusted_list_all(tmp.path())
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
     assert!(
         !listed.iter().any(|name| name == "Auto" || name == "Swarm"),
         "removed builtin overrides must not appear in list_all: {listed:?}"

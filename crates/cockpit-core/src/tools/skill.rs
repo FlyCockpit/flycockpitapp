@@ -112,6 +112,18 @@ impl Tool for SkillTool {
 /// tests can supply an explicit [`ExtendedConfig`] instead of depending
 /// on the host's layered config discovery.
 #[cfg(test)]
+fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
+#[cfg(test)]
 async fn load_skill_into_output(
     name: &str,
     cwd: &std::path::Path,
@@ -128,16 +140,19 @@ async fn load_skill_into_output(
         },
         ..Default::default()
     };
-    load_skill_for_session(
-        name,
-        None,
-        cwd,
-        extended,
-        redact,
-        &activation,
-        &std::sync::RwLock::new(std::collections::HashMap::new()),
-        None,
-        None,
+    crate::config::trust::scope_workspace_trust_policy(
+        trusted_test_policy(cwd),
+        load_skill_for_session(
+            name,
+            None,
+            cwd,
+            extended,
+            redact,
+            &activation,
+            &std::sync::RwLock::new(std::collections::HashMap::new()),
+            None,
+            None,
+        ),
     )
     .await
 }
@@ -299,6 +314,35 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn trusted_load_skill_for_session(
+        name: &str,
+        path: Option<&str>,
+        cwd: &std::path::Path,
+        extended: &ExtendedConfig,
+        redact: &crate::redact::RedactionTable,
+        activation: &crate::skills::ActivationContext,
+        env_overlay: &std::sync::RwLock<std::collections::HashMap<String, String>>,
+        store: Option<&crate::credentials::CredentialStore>,
+        db: Option<&crate::db::Db>,
+    ) -> Result<ToolOutput> {
+        crate::config::trust::scope_workspace_trust_policy(
+            trusted_test_policy(cwd),
+            load_skill_for_session(
+                name,
+                path,
+                cwd,
+                extended,
+                redact,
+                activation,
+                env_overlay,
+                store,
+                db,
+            ),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn usage_ledger_counts_uses() {
         let tmp = tempfile::tempdir().unwrap();
@@ -319,7 +363,7 @@ mod tests {
         let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
         let extended = cfg_for(&scan, false);
 
-        load_skill_for_session(
+        trusted_load_skill_for_session(
             "ledger",
             None,
             tmp.path(),
@@ -332,7 +376,7 @@ mod tests {
         )
         .await
         .unwrap();
-        load_skill_for_session(
+        trusted_load_skill_for_session(
             "ledger",
             None,
             tmp.path(),
@@ -345,7 +389,7 @@ mod tests {
         )
         .await
         .unwrap();
-        load_skill_for_session(
+        trusted_load_skill_for_session(
             "ledger",
             Some("references/support.md"),
             tmp.path(),
@@ -434,7 +478,7 @@ mod tests {
         std::fs::write(support_dir.join("steps.md"), "Support details.").unwrap();
         let package_dir = scan.join("deploy").canonicalize().unwrap();
 
-        let out = load_skill_for_session(
+        let out = trusted_load_skill_for_session(
             "deploy",
             Some("references/steps.md"),
             tmp.path(),
@@ -659,7 +703,7 @@ mod tests {
             crate::skills::ActivationContext::from_tool_names(std::iter::empty::<&str>());
         let overlay = std::sync::RwLock::new(std::collections::HashMap::new());
 
-        let out = load_skill_for_session(
+        let out = trusted_load_skill_for_session(
             "package",
             Some("references/foo.md"),
             tmp.path(),
@@ -674,7 +718,7 @@ mod tests {
         .unwrap();
         assert!(out.content.contains("Reference body"));
 
-        let err = load_skill_for_session(
+        let err = trusted_load_skill_for_session(
             "package",
             Some("references/../SKILL.md"),
             tmp.path(),
@@ -710,7 +754,7 @@ mod tests {
             crate::skills::ActivationContext::from_tool_names(std::iter::empty::<&str>());
         let overlay = std::sync::RwLock::new(std::collections::HashMap::new());
 
-        let out = load_skill_for_session(
+        let out = trusted_load_skill_for_session(
             "credentialed",
             None,
             tmp.path(),

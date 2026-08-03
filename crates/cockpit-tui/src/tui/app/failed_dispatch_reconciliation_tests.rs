@@ -242,6 +242,7 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
 fn queued_submit_from_off_tail_returns_to_live_tail_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
+    super::seed_ready_model_for_tests(&mut app);
     let (input_tx, mut input_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_sender(
         input_tx,

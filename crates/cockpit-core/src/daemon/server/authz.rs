@@ -91,6 +91,25 @@ pub(super) async fn require_remote_session_writer(
     }
 }
 
+pub(super) async fn authorize_set_active_model(
+    request: &Request,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let Request::SetActiveModel {
+        persist_as_default, ..
+    } = request
+    else {
+        unreachable!("authorize_set_active_model called for non-SetActiveModel request");
+    };
+    if *persist_as_default {
+        return Err(authorization_error(
+            "saving the default model requires the local owner",
+        ));
+    }
+    require_remote_session_writer(&state.principal, state, ctx).await
+}
+
 pub(super) async fn require_remote_shared_session_writer(
     principal: &ClientPrincipal,
     shared: &SharedClientState,
@@ -549,6 +568,17 @@ pub(super) async fn authorize_shared_custom(
                 Err(authorization_error(
                     "remote principal cannot control project language servers",
                 ))
+            }
+        }
+        Request::SetActiveModel {
+            persist_as_default, ..
+        } => {
+            if *persist_as_default {
+                Err(authorization_error(
+                    "saving the default model requires the local owner",
+                ))
+            } else {
+                require_remote_shared_session_writer(principal, shared, ctx).await
             }
         }
         _ => unreachable!("authorize_shared_custom called for non-custom command"),

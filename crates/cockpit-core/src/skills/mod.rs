@@ -339,6 +339,23 @@ pub fn validate_skill_package_write_for_paths(
     cfg: &SkillsConfig,
     content: &str,
 ) -> Result<Option<SkillPackageWriteValidation>> {
+    if requested_path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        let raw_absolute = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            cwd.join(requested_path)
+        };
+        if resolve_scan_dirs(cwd, cfg)
+            .iter()
+            .any(|scan_dir| raw_absolute.starts_with(scan_dir))
+        {
+            anyhow::bail!("skill package writes cannot contain parent traversal segments");
+        }
+    }
+
     if let Some((target, _)) = package_target_for_path_with_skill(requested_path, cwd, cfg) {
         ensure_no_skill_symlink(&target)?;
     }
@@ -1115,6 +1132,56 @@ mod tests {
     use super::*;
     use crate::config::extended::RedactConfig;
 
+    fn trusted_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: root.to_path_buf(),
+                root: root.to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        }
+    }
+
+    fn trusted_discover(root: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+            discover(root, cfg)
+        })
+    }
+
+    fn trusted_resolve_scan_dirs(root: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+            resolve_scan_dirs(root, cfg)
+        })
+    }
+
+    fn trusted_render_body(
+        body: &str,
+        root: &Path,
+        expand_commands: bool,
+        redact: &RedactionTable,
+    ) -> String {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+            render_body(body, root, expand_commands, redact)
+        })
+    }
+
+    fn trusted_package_target_for_path(
+        path: &Path,
+        root: &Path,
+        cfg: &SkillsConfig,
+    ) -> Option<SkillPackageTarget> {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+            package_target_for_path(path, root, cfg)
+        })
+    }
+
+    fn trusted_invalidate_catalog_cache(root: &Path, cfg: &SkillsConfig) {
+        crate::config::trust::with_workspace_trust_policy(trusted_policy(root), || {
+            invalidate_catalog_cache(root, cfg);
+        });
+    }
+
     fn no_redact() -> RedactionTable {
         RedactionTable::build(&RedactConfig::default(), Path::new("/")).unwrap()
     }
@@ -1287,7 +1354,7 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
         assert_eq!(names, vec!["ok"], "the both-false skill must be skipped");
     }
@@ -1314,7 +1381,7 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
         assert_eq!(names, vec!["ok"], "only the well-formed skill survives");
     }
@@ -1341,7 +1408,7 @@ mod tests {
             consolidate: false,
         };
 
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
 
         assert_eq!(
             found
@@ -1367,9 +1434,9 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        let first = discover(tmp.path(), &cfg).unwrap();
+        let first = trusted_discover(tmp.path(), &cfg).unwrap();
         std::fs::remove_dir_all(&scan).unwrap();
-        let second = discover(tmp.path(), &cfg).unwrap();
+        let second = trusted_discover(tmp.path(), &cfg).unwrap();
 
         assert_eq!(
             first
@@ -1403,13 +1470,13 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        invalidate_catalog_cache(tmp.path(), &cfg);
-        discover(tmp.path(), &cfg).unwrap();
+        trusted_invalidate_catalog_cache(tmp.path(), &cfg);
+        trusted_discover(tmp.path(), &cfg).unwrap();
         write_skill(&scan, "two", "---\nname: two\ndescription: d\n---\n", "B");
         reset_discovery_walk_call_count();
 
-        invalidate_catalog_cache(tmp.path(), &cfg);
-        let found = discover(tmp.path(), &cfg).unwrap();
+        trusted_invalidate_catalog_cache(tmp.path(), &cfg);
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
 
         assert!(
             discovery_walk_call_count() > 0,
@@ -1446,7 +1513,7 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
         assert_eq!(names, vec!["small"]);
     }
@@ -1492,7 +1559,7 @@ mod tests {
             prune_builtins: false,
             consolidate: false,
         };
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].frontmatter.name, "small");
@@ -1572,7 +1639,7 @@ mod tests {
         let cwd = Path::new("/tmp/project");
         // Relative resolves against cwd; absolute stays absolute.
         let cfg = skills_cfg(vec!["skills/dir", "/abs/skills"], false);
-        let dirs = resolve_scan_dirs(cwd, &cfg);
+        let dirs = trusted_resolve_scan_dirs(cwd, &cfg);
         assert_eq!(
             dirs,
             vec![
@@ -1587,7 +1654,7 @@ mod tests {
         let env = crate::test_env::lock();
         env.set_var("COCKPIT_TEST_SKILLS_ROOT", "/var/skills");
         let cfg = skills_cfg(vec!["$COCKPIT_TEST_SKILLS_ROOT/sub"], false);
-        let dirs = resolve_scan_dirs(Path::new("/cwd"), &cfg);
+        let dirs = trusted_resolve_scan_dirs(Path::new("/cwd"), &cfg);
         assert_eq!(dirs, vec![PathBuf::from("/var/skills/sub")]);
     }
 
@@ -1595,7 +1662,7 @@ mod tests {
     fn resolve_scan_dirs_empty_yields_no_dirs() {
         // No implicit fallback: an empty list scans nothing.
         let cfg = skills_cfg(vec![], false);
-        assert!(resolve_scan_dirs(Path::new("/tmp/project"), &cfg).is_empty());
+        assert!(trusted_resolve_scan_dirs(Path::new("/tmp/project"), &cfg).is_empty());
     }
 
     #[test]
@@ -1621,13 +1688,13 @@ mod tests {
 
         // Ancestor walk OFF: the relative entry resolves against cwd only.
         let off = skills_cfg(vec![".agents/skills"], false);
-        let dirs_off = resolve_scan_dirs(&nested, &off);
+        let dirs_off = trusted_resolve_scan_dirs(&nested, &off);
         assert_eq!(dirs_off, vec![nested.join(".agents").join("skills")]);
 
         // Ancestor walk ON: cwd plus every ancestor up to and including
         // the worktree root.
         let on = skills_cfg(vec![".agents/skills"], true);
-        let dirs_on = resolve_scan_dirs(&nested, &on);
+        let dirs_on = trusted_resolve_scan_dirs(&nested, &on);
         let expected = vec![
             nested.join(".agents").join("skills"),
             root.join("a").join(".agents").join("skills"),
@@ -1639,7 +1706,7 @@ mod tests {
     #[test]
     fn resolve_scan_dirs_absolute_entry_ignores_ancestor_walk() {
         let cfg = skills_cfg(vec!["/abs/skills"], true);
-        let dirs = resolve_scan_dirs(Path::new("/tmp/a/b"), &cfg);
+        let dirs = trusted_resolve_scan_dirs(Path::new("/tmp/a/b"), &cfg);
         assert_eq!(dirs, vec![PathBuf::from("/abs/skills")]);
     }
 
@@ -1653,7 +1720,7 @@ mod tests {
     #[test]
     fn render_body_claude_mode_runs_command() {
         let body = "value: !`echo hello`";
-        let out = render_body(body, Path::new("."), true, &no_redact());
+        let out = trusted_render_body(body, Path::new("."), true, &no_redact());
         assert_eq!(out, "value: hello", "Claude mode substitutes stdout");
     }
 
@@ -1688,7 +1755,7 @@ mod tests {
     #[test]
     fn render_body_claude_mode_error_marker_on_failure() {
         let body = "x !`exit 3` y";
-        let out = render_body(body, Path::new("."), true, &no_redact());
+        let out = trusted_render_body(body, Path::new("."), true, &no_redact());
         assert!(
             out.contains("[skill command") && out.contains("exit 3"),
             "expected an inline error marker, got {out:?}"
@@ -1773,21 +1840,25 @@ mod tests {
         let package = scan.join("target");
 
         let manifest =
-            package_target_for_path(&package.join("SKILL.md"), tmp.path(), &cfg).unwrap();
+            trusted_package_target_for_path(&package.join("SKILL.md"), tmp.path(), &cfg).unwrap();
         assert_eq!(manifest.name, "target");
         assert_eq!(manifest.package_root, package);
         assert!(manifest.is_manifest);
         assert_eq!(manifest.relative_path, Path::new("SKILL.md"));
 
-        let support =
-            package_target_for_path(&package.join("references").join("a.md"), tmp.path(), &cfg)
-                .unwrap();
+        let support = trusted_package_target_for_path(
+            &package.join("references").join("a.md"),
+            tmp.path(),
+            &cfg,
+        )
+        .unwrap();
         assert_eq!(support.name, "target");
         assert!(!support.is_manifest);
         assert_eq!(support.relative_path, Path::new("references/a.md"));
 
         assert!(
-            package_target_for_path(&tmp.path().join("outside.md"), tmp.path(), &cfg).is_none()
+            trusted_package_target_for_path(&tmp.path().join("outside.md"), tmp.path(), &cfg)
+                .is_none()
         );
     }
 
@@ -1868,7 +1939,7 @@ mod tests {
         std::fs::write(package.join("references/foo.md"), "Reference details").unwrap();
         let cfg = skills_cfg(vec![scan.to_str().unwrap()], false);
 
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(
             load_body(&found[0]).unwrap(),
@@ -2010,7 +2081,7 @@ mod tests {
             external_dirs: vec![external.to_string_lossy().into_owned()],
             ..Default::default()
         };
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].frontmatter.name, "shared");
         assert!(
@@ -2066,7 +2137,7 @@ mod tests {
             ..Default::default()
         };
 
-        let found = discover(tmp.path(), &cfg).unwrap();
+        let found = trusted_discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found
             .iter()
             .map(|skill| skill.frontmatter.name.as_str())
@@ -2095,7 +2166,11 @@ mod tests {
             ..Default::default()
         };
 
-        let found = discover_for_agent(tmp.path(), &cfg, "agent-that-does-not-exist").unwrap();
+        let found =
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+                discover_for_agent(tmp.path(), &cfg, "agent-that-does-not-exist")
+            })
+            .unwrap();
         let names: Vec<&str> = found
             .iter()
             .map(|skill| skill.frontmatter.name.as_str())

@@ -155,6 +155,49 @@ impl Drop for ClientTasks {
 }
 
 impl AgentRunner {
+    #[cfg(test)]
+    pub(crate) fn stub_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> Self {
+        let (input_tx, _input_rx) = mpsc::channel(8);
+        Self::stub_with_channels(control_tx, input_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_with_channels(
+        control_tx: mpsc::Sender<ControlRequest>,
+        input_tx: mpsc::Sender<cockpit_core::engine::message::UserSubmission>,
+    ) -> Self {
+        let (record_tx, _record_rx) = mpsc::channel(1);
+        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
+        Self {
+            input_tx,
+            record_tx,
+            control_tx,
+            attached_request_tx,
+            events: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(Notify::new()),
+            active_agent: Arc::new(Mutex::new("Build".to_string())),
+            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
+            skill_inventory_names: Arc::new(Mutex::new(None)),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            active_model_state: None,
+            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            short_id: "abc123".to_string(),
+            project_id: "project".to_string(),
+            usage: UsageCounts::default(),
+            owns_daemon: false,
+            socket: PathBuf::from("/tmp/cockpit-test.sock"),
+            history: Vec::new(),
+            paused_work: Vec::new(),
+            repair_required: None,
+            btw_fork: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            current_client: None,
+            attach_context: None,
+            last_applied_seq: None,
+            client_tasks: ClientTasks::default(),
+        }
+    }
     /// Stop this runner's socket-side client tasks. This intentionally sends no
     /// daemon request: abandoning a TUI handle must not cancel or discard the
     /// daemon-owned session.
@@ -630,6 +673,7 @@ where
         session_id: target_session_id,
         since_seq,
         project_root: Some(ctx.project_root.clone()),
+        initial_model: None,
         no_sandbox: ctx.no_sandbox,
         interactive: true,
         model_override: None,
@@ -774,7 +818,20 @@ impl Drop for AgentRunner {
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
 pub fn try_spawn(cwd: &Path, no_sandbox: bool, mode: LifecycleMode) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, no_sandbox, mode)
+    try_spawn_inner(cwd, None, None, no_sandbox, mode)
+}
+
+/// Attach a fresh or model-less existing session seeded with the complete
+/// selection accepted by the picker. An existing durable selection is never
+/// overwritten during attach; the correlated SetActiveModel request does that.
+pub fn try_spawn_with_model(
+    cwd: &Path,
+    session_id: Option<uuid::Uuid>,
+    initial_model: cockpit_config::providers::ActiveModelRef,
+    no_sandbox: bool,
+    mode: LifecycleMode,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode)
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -789,12 +846,13 @@ pub fn attach_to_session(
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), no_sandbox, mode)
+    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode)
 }
 
 fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
+    initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
@@ -824,6 +882,7 @@ fn try_spawn_inner(
                     session_id,
                     since_seq: None,
                     project_root: Some(project_root),
+                    initial_model,
                     no_sandbox,
                     // The TUI can answer interrupts (approval / loop-guard /
                     // `question` prompts) — mark this attach interactive so
@@ -1927,6 +1986,7 @@ where
         session_id: Some(session_id),
         since_seq: current_last_applied_seq(last_applied_seq),
         project_root: Some(attach_context.project_root.clone()),
+        initial_model: None,
         no_sandbox: attach_context.no_sandbox,
         interactive: true,
         model_override: None,
@@ -2160,18 +2220,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             target: queue_target_from_proto(target),
         },
         ActiveModelState {
-            provider,
-            model,
-            config_provider,
-            config_model,
+            selection,
+            default_selection,
             diverged,
             generation,
             ..
         } => TurnEvent::ActiveModelState {
-            provider,
-            model,
-            config_provider,
-            config_model,
+            selection,
+            default_selection,
             diverged,
             generation,
         },

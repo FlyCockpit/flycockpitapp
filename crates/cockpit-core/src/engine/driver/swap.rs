@@ -1,5 +1,49 @@
 use super::*;
 
+/// Deadline and exactly-once terminal-claim state for a timed model request.
+pub(super) struct ModelSelectionTerminal<'a> {
+    pub(super) deadline: std::time::Instant,
+    pub(super) claimed: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelSelectionCommitClaim {
+    Untimed,
+    Owned,
+    Expired,
+    Lost,
+}
+
+struct ModelSelectionTerminalEmission<'a> {
+    claimed: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    owned: bool,
+}
+
+fn claim_model_selection_commit(
+    terminal: Option<&ModelSelectionTerminal<'_>>,
+) -> ModelSelectionCommitClaim {
+    let Some(terminal) = terminal else {
+        return ModelSelectionCommitClaim::Untimed;
+    };
+    if std::time::Instant::now() >= terminal.deadline {
+        return ModelSelectionCommitClaim::Expired;
+    }
+    if terminal
+        .claimed
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        ModelSelectionCommitClaim::Owned
+    } else {
+        ModelSelectionCommitClaim::Lost
+    }
+}
+
 /// Switch the active model+provider live (`mid-session-model-
 /// switch.md`), at the idle control boundary like every other primary swap.
 /// Builds the new [`Model`](crate::engine::model::Model) for
@@ -19,12 +63,13 @@ impl Driver {
         selection_id: uuid::Uuid,
         target: crate::config::providers::ActiveModelRef,
         persist_as_default: bool,
-        deadline: Option<std::time::Instant>,
-        terminal_claimed: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        terminal: Option<ModelSelectionTerminal<'_>>,
         trigger: crate::session::ModelSwitchTrigger,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
         let provider = target.provider.as_str();
+        let deadline = terminal.as_ref().map(|terminal| terminal.deadline);
+        let terminal_claimed = terminal.as_ref().map(|terminal| terminal.claimed);
         let model = target.model.as_str();
         tracing::info!(
             session_id = %self.session.id,
@@ -36,32 +81,88 @@ impl Driver {
             "model selection received by driver"
         );
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
-                .await;
+            self.emit_model_selection_result(
+                selection_id,
+                &target,
+                false,
+                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                ModelSelectionTerminalEmission {
+                    claimed: terminal_claimed,
+                    owned: false,
+                },
+                tx,
+            )
+            .await;
             return false;
         }
-        let old_session_provider = self.session.active_provider();
-        let old_session_model = self.session.active_model();
+        let old_session_selection = self.session.active_model_ref();
+        let old_session_provider = old_session_selection
+            .as_ref()
+            .map(|value| value.provider.clone());
+        let old_session_model = old_session_selection
+            .as_ref()
+            .map(|value| value.model.clone());
         let Some(active_idx) = self.active_frame_index() else {
-            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
-                .await;
+            self.emit_model_selection_result(
+                selection_id,
+                &target,
+                false,
+                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                ModelSelectionTerminalEmission {
+                    claimed: terminal_claimed,
+                    owned: false,
+                },
+                tx,
+            )
+            .await;
             return false;
         };
         let current = &self.stack[active_idx].agent.model;
         let old_llm_mode = self.stack[active_idx].agent.llm_mode;
         let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
         self.prompt_cache_retention_preference = target.prompt_cache_retention;
-        if current.provider_id() == provider && current.model_id_ref() == model {
-            let mut applied = true;
+        if current.provider_id() == provider
+            && current.model_id_ref() == model
+            && old_session_selection.as_ref() == Some(&target)
+        {
+            let terminal_owned = match claim_model_selection_commit(terminal.as_ref()) {
+                ModelSelectionCommitClaim::Untimed => false,
+                ModelSelectionCommitClaim::Owned => true,
+                ModelSelectionCommitClaim::Lost => {
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                    return false;
+                }
+                ModelSelectionCommitClaim::Expired => {
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                    self.emit_model_selection_result(
+                        selection_id,
+                        &target,
+                        false,
+                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                        ModelSelectionTerminalEmission {
+                            claimed: terminal_claimed,
+                            owned: false,
+                        },
+                        tx,
+                    )
+                    .await;
+                    return false;
+                }
+            };
+            let mut default_update = if persist_as_default {
+                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+            } else {
+                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+            };
             if persist_as_default && self.live_config_active_model().as_ref() != Some(&target) {
                 if let Err(e) = self.write_active_model_config(&target) {
-                    applied = false;
-                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
-                    let _ = tx
-                        .send(TurnEvent::Notice {
-                            text: format!("Model settings for `{provider}/{model}` could not be saved — {e:#}."),
-                        })
-                        .await;
+                    let user_message = format!(
+                        "Using `{provider}/{model}` for this session, but could not save it as the default — {e:#}."
+                    );
+                    default_update = crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
+                        user_message: user_message.clone(),
+                        diagnostic_code: "default_model_write_failed".to_string(),
+                    };
                 } else {
                     for idx in 0..self.stack.len() {
                         let retention =
@@ -86,9 +187,19 @@ impl Driver {
             if self.prompt_cache_retention_override.is_some() {
                 self.emit_longcache_state(tx).await;
             }
-            self.emit_model_selection_result(selection_id, &target, applied, terminal_claimed, tx)
-                .await;
-            return applied;
+            self.emit_model_selection_result(
+                selection_id,
+                &target,
+                true,
+                default_update,
+                ModelSelectionTerminalEmission {
+                    claimed: terminal_claimed,
+                    owned: terminal_owned,
+                },
+                tx,
+            )
+            .await;
+            return true;
         }
         // The new model inherits the running model's shutdown gate so a daemon
         // drain still refuses its dispatch.
@@ -121,7 +232,11 @@ impl Driver {
                     selection_id,
                     &target,
                     false,
-                    terminal_claimed,
+                    crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                    ModelSelectionTerminalEmission {
+                        claimed: terminal_claimed,
+                        owned: false,
+                    },
                     tx,
                 )
                 .await;
@@ -161,98 +276,44 @@ impl Driver {
                         selection_id,
                         &target,
                         false,
-                        terminal_claimed,
+                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                        ModelSelectionTerminalEmission {
+                            claimed: terminal_claimed,
+                            owned: false,
+                        },
                         tx,
                     )
                     .await;
                     return false;
                 }
             };
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
-            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
-                .await;
-            return false;
-        }
-        if let Err(e) = self.persist_active_model_session(provider, model) {
-            let error = format!("{e:#}");
-            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
-            self.session
-                .restore_active_model_memory(old_session_provider, old_session_model);
-            let restored_provider = self.session.active_provider();
-            let restored_model = self.session.active_model();
-            self.record_model_switch_audit(crate::session::ModelSwitchAudit {
-                from_provider: restored_provider.as_deref(),
-                from_model: restored_model.as_deref(),
-                to_provider: provider,
-                to_model: model,
-                trigger,
-                outcome: crate::session::ModelSwitchOutcome::SendFailed,
-                error: Some(&error),
-            })
-            .await;
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: format!(
-                        "Model switch to `{provider}/{model}` failed — {error}. \
-                         Keeping the current model active."
-                    ),
-                })
-                .await;
-            self.emit_active_model_state(tx).await;
-            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
-                .await;
-            return false;
-        }
-        if persist_as_default && let Err(e) = self.write_active_model_config(&target) {
-            let error = format!("{e:#}");
-            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
-            if let (Some(old_provider), Some(old_model)) = (
-                old_session_provider.as_deref(),
-                old_session_model.as_deref(),
-            ) {
-                if let Err(restore_error) =
-                    self.persist_active_model_session(old_provider, old_model)
-                {
-                    let combined_error = format!(
-                        "{error}; restoring previous session model failed — {restore_error:#}"
-                    );
-                    let restored_provider = self.session.active_provider();
-                    let restored_model = self.session.active_model();
-                    self.record_model_switch_audit(crate::session::ModelSwitchAudit {
-                        from_provider: restored_provider.as_deref(),
-                        from_model: restored_model.as_deref(),
-                        to_provider: provider,
-                        to_model: model,
-                        trigger,
-                        outcome: crate::session::ModelSwitchOutcome::SendFailed,
-                        error: Some(&combined_error),
-                    })
-                    .await;
-                    let _ = tx
-                        .send(TurnEvent::Notice {
-                            text: format!(
-                                "Model switch to `{provider}/{model}` failed — {error}. \
-                                 Restoring the previous session model also failed — \
-                                 {restore_error:#}. The config and session may diverge."
-                            ),
-                        })
-                        .await;
-                    self.emit_active_model_state(tx).await;
-                    self.emit_model_selection_result(
-                        selection_id,
-                        &target,
-                        false,
-                        terminal_claimed,
-                        tx,
-                    )
-                    .await;
-                    return false;
-                }
-            } else {
-                self.session
-                    .restore_active_model_memory(old_session_provider, old_session_model);
+        let terminal_owned = match claim_model_selection_commit(terminal.as_ref()) {
+            ModelSelectionCommitClaim::Untimed => false,
+            ModelSelectionCommitClaim::Owned => true,
+            ModelSelectionCommitClaim::Lost => {
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                return false;
             }
+            ModelSelectionCommitClaim::Expired => {
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                self.emit_model_selection_result(
+                    selection_id,
+                    &target,
+                    false,
+                    crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                    ModelSelectionTerminalEmission {
+                        claimed: terminal_claimed,
+                        owned: false,
+                    },
+                    tx,
+                )
+                .await;
+                return false;
+            }
+        };
+        if let Err(e) = self.persist_active_model_session(&target) {
+            let error = format!("{e:#}");
+            self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
             let restored_provider = self.session.active_provider();
             let restored_model = self.session.active_model();
             self.record_model_switch_audit(crate::session::ModelSwitchAudit {
@@ -274,10 +335,36 @@ impl Driver {
                 })
                 .await;
             self.emit_active_model_state(tx).await;
-            self.emit_model_selection_result(selection_id, &target, false, terminal_claimed, tx)
-                .await;
+            self.emit_model_selection_result(
+                selection_id,
+                &target,
+                false,
+                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                ModelSelectionTerminalEmission {
+                    claimed: terminal_claimed,
+                    owned: terminal_owned,
+                },
+                tx,
+            )
+            .await;
             return false;
         }
+        let default_update = if !persist_as_default {
+            crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+        } else {
+            match self.write_active_model_config(&target) {
+                Ok(()) => crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                Err(e) => {
+                    let user_message = format!(
+                        "Using `{provider}/{model}` for this session, but could not save it as the default — {e:#}."
+                    );
+                    crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
+                        user_message,
+                        diagnostic_code: "default_model_write_failed".to_string(),
+                    }
+                }
+            }
+        };
         self.record_model_switch_audit(crate::session::ModelSwitchAudit {
             from_provider: old_session_provider.as_deref(),
             from_model: old_session_model.as_deref(),
@@ -302,8 +389,18 @@ impl Driver {
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
-        self.emit_model_selection_result(selection_id, &target, true, terminal_claimed, tx)
-            .await;
+        self.emit_model_selection_result(
+            selection_id,
+            &target,
+            true,
+            default_update,
+            ModelSelectionTerminalEmission {
+                claimed: terminal_claimed,
+                owned: terminal_owned,
+            },
+            tx,
+        )
+        .await;
         true
     }
 
@@ -312,11 +409,14 @@ impl Driver {
         selection_id: uuid::Uuid,
         target: &crate::config::providers::ActiveModelRef,
         applied: bool,
-        terminal_claimed: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        default_update: crate::daemon::proto::DefaultModelUpdateOutcome,
+        terminal: ModelSelectionTerminalEmission<'_>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        if terminal_claimed
-            .is_some_and(|claimed| claimed.swap(true, std::sync::atomic::Ordering::AcqRel))
+        if !terminal.owned
+            && terminal
+                .claimed
+                .is_some_and(|claimed| claimed.swap(true, std::sync::atomic::Ordering::AcqRel))
         {
             return;
         }
@@ -329,6 +429,14 @@ impl Driver {
             applied,
             "model selection terminal result"
         );
+        // Config-watch refresh is asynchronous. A successful write is already
+        // authoritative for this terminal result even if the worker's live
+        // snapshot still contains the prior default for a few milliseconds.
+        let terminal_default_selection = match &default_update {
+            crate::daemon::proto::DefaultModelUpdateOutcome::Saved => Some(target.clone()),
+            _ => self.live_config_active_model(),
+        };
+        let terminal_diverged = terminal_default_selection.as_ref() != Some(target);
         let _ = tx
             .send(TurnEvent::ModelSelectionResult {
                 selection_id,
@@ -338,28 +446,17 @@ impl Driver {
                     .reasoning_effort
                     .as_ref()
                     .map(|effort| effort.value.clone()),
-                thinking_mode: target.thinking_mode.as_ref().and_then(|mode| {
-                    serde_json::to_value(mode)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_string))
-                }),
+                thinking_mode: target.thinking_mode.map(|mode| mode.as_str().to_string()),
                 prompt_cache_retention: target.prompt_cache_retention,
                 outcome: if applied {
                     crate::daemon::proto::ModelSelectionOutcome::Applied {
                         active_state: crate::daemon::proto::ModelSelectionActiveState {
-                            provider: target.provider.clone(),
-                            model: target.model.clone(),
-                            config_provider: self
-                                .live_config_active_model()
-                                .as_ref()
-                                .map(|model| model.provider.clone()),
-                            config_model: self
-                                .live_config_active_model()
-                                .as_ref()
-                                .map(|model| model.model.clone()),
-                            diverged: self.live_config_active_model().as_ref() != Some(target),
+                            selection: target.clone(),
+                            default_selection: terminal_default_selection,
+                            diverged: terminal_diverged,
                             generation: self.active_model_state_generation,
                         },
+                        default_update,
                     }
                 } else {
                     crate::daemon::proto::ModelSelectionOutcome::Rejected {
@@ -470,13 +567,16 @@ impl Driver {
         doc.write_active_model(Some(active))
     }
 
-    fn persist_active_model_session(&mut self, provider: &str, model: &str) -> Result<()> {
+    fn persist_active_model_session(
+        &mut self,
+        selection: &crate::config::providers::ActiveModelRef,
+    ) -> Result<()> {
         #[cfg(test)]
         if self.test_fail_next_active_model_session_persist {
             self.test_fail_next_active_model_session_persist = false;
             anyhow::bail!("test injected active model session persist failure");
         }
-        self.session.set_active_model(provider, model)
+        self.session.set_active_model_ref(selection.clone())
     }
 
     async fn record_model_switch_audit(&mut self, audit: crate::session::ModelSwitchAudit<'_>) {
@@ -512,25 +612,21 @@ impl Driver {
 
     async fn emit_active_model_state(&mut self, tx: &mpsc::Sender<TurnEvent>) {
         self.active_model_state_generation = self.active_model_state_generation.saturating_add(1);
-        let config = self.live_config_active_model();
-        let provider = self
-            .session
-            .active_provider()
-            .unwrap_or_else(|| self.stack[0].agent.model.provider_id().to_string());
-        let model = self
-            .session
-            .active_model()
-            .unwrap_or_else(|| self.stack[0].agent.model.model_id_ref().to_string());
-        let config_provider = config.as_ref().map(|active| active.provider.clone());
-        let config_model = config.as_ref().map(|active| active.model.clone());
-        let diverged = config_provider.as_deref() != Some(provider.as_str())
-            || config_model.as_deref() != Some(model.as_str());
+        let default_selection = self.live_config_active_model();
+        let selection = self.session.active_model_ref().unwrap_or_else(|| {
+            crate::config::providers::ActiveModelRef {
+                provider: self.stack[0].agent.model.provider_id().to_string(),
+                model: self.stack[0].agent.model.model_id_ref().to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }
+        });
+        let diverged = default_selection.as_ref() != Some(&selection);
         let _ = tx
             .send(TurnEvent::ActiveModelState {
-                provider,
-                model,
-                config_provider,
-                config_model,
+                selection,
+                default_selection,
                 diverged,
                 generation: self.active_model_state_generation,
             })

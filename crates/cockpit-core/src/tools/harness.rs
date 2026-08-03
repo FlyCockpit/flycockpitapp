@@ -690,6 +690,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.agent_id = "Build".to_string();
+        ctx.approver = None;
         let err = with_trusted_workspace(tmp.path(), async {
             HarnessInvokeTool
                 .call(
@@ -932,7 +933,8 @@ mod tests {
     async fn harness_invoke_approval_yolo_opens_no_interrupt_and_reaches_preflight() {
         let tmp = tempfile::tempdir().unwrap();
         write_test_harness_config(tmp.path(), false);
-        let (ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+        let (mut ctx, _approver, db, _hub) = ctx_with_approver(tmp.path());
+        ctx.approver = None;
         ctx.session.set_approval_mode(ApprovalMode::Yolo);
 
         let err = with_trusted_workspace(tmp.path(), async {
@@ -982,6 +984,7 @@ mod tests {
         write_test_harness_config(tmp.path(), false);
         let mut ctx = crate::tools::common::test_ctx(tmp.path());
         ctx.agent_id = "Build".to_string();
+        ctx.approver = None;
         ctx.session.set_approval_mode(ApprovalMode::Manual);
 
         let err = with_trusted_workspace(tmp.path(), async {

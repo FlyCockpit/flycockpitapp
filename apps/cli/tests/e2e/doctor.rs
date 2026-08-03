@@ -18,7 +18,7 @@ fn reports_unopenable_database() {
 }
 
 #[test]
-fn reports_schema_version_mismatch() {
+fn reports_amended_migration() {
     let home = IsolatedHome::new();
     let first = home
         .cockpit()
@@ -28,7 +28,11 @@ fn reports_schema_version_mismatch() {
     assert_eq!(first.status.code(), Some(1), "{}", output_text(&first));
 
     let conn = rusqlite::Connection::open(home.db_path()).unwrap();
-    conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+    conn.execute(
+        "UPDATE schema_version SET sha256 = 'amended' WHERE version = 1",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     let output = home
@@ -40,7 +44,8 @@ fn reports_schema_version_mismatch() {
     assert_eq!(output.status.code(), Some(1), "{text}");
     assert!(text.contains("openability: ok (SQLite opened"), "{text}");
     assert!(text.contains("schema: FAILED"), "{text}");
-    assert!(text.contains("database schema version mismatch"), "{text}");
+    assert!(text.contains("migration checksum mismatch"), "{text}");
+    assert!(text.contains("applied migration was amended"), "{text}");
 }
 
 #[test]

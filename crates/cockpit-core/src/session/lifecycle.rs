@@ -114,12 +114,21 @@ impl Session {
     /// stored row carries the latest provider/model so a model picked before
     /// the first message survives the deferred write.
     pub fn persist_if_needed(&self) -> Result<bool> {
+        // Model mutation and the deferred INSERT share this lock so a picker
+        // update cannot be overwritten by an older selection snapshot.
+        let selection = self.model_selection.lock().unwrap();
+        let model_selection_json = selection
+            .as_ref()
+            .map(|active| serde_json::to_string(&active))
+            .transpose()
+            .context("encoding deferred session model selection")?;
         let row = {
             let mut slot = self.pending_row.lock().unwrap();
             match slot.take() {
                 Some(mut row) => {
-                    row.provider = self.active_provider();
-                    row.model = self.active_model();
+                    row.provider = selection.as_ref().map(|active| active.provider.clone());
+                    row.model = selection.as_ref().map(|active| active.model.clone());
+                    row.model_selection_json = model_selection_json;
                     row.session_llm_mode = self.session_llm_mode_raw();
                     row.tool_surface_override_json = self.tool_surface_override_json();
                     row.goal_settings_override_json = self.goal_settings_override_json();
@@ -235,6 +244,21 @@ impl Session {
                 .context("backfilling short_id")?
             }
         };
+        let model_selection = match row.model_selection_json.as_deref() {
+            Some(raw) => Some(
+                serde_json::from_str(raw).context("decoding persisted session model selection")?,
+            ),
+            None => match (row.provider.as_ref(), row.model.as_ref()) {
+                (Some(provider), Some(model)) => Some(crate::config::providers::ActiveModelRef {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                }),
+                _ => None,
+            },
+        };
         Ok(Self {
             id: row.session_id,
             project_id: row.project_id,
@@ -250,8 +274,7 @@ impl Session {
             title: Mutex::new(row.title),
             user_renamed: Mutex::new(row.user_renamed),
             active_agent: Mutex::new(row.active_agent),
-            model: Mutex::new(row.model),
-            provider: Mutex::new(row.provider),
+            model_selection: Mutex::new(model_selection),
             session_llm_mode: Mutex::new(row.session_llm_mode),
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),

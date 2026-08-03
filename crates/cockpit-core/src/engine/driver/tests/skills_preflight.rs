@@ -538,7 +538,14 @@ async fn user_invoked_skill_enters_the_seedable_set() {
     .unwrap();
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    driver.seed_forced_skill("release-notes", &tx).await;
+    crate::config::trust::scope_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        },
+        driver.seed_forced_skill("release-notes", &tx),
+    )
+    .await;
 
     // The stored seedable body is the rendered skill body itself — the
     // `Skill \`name\`:\n\n` wrapper the skill tool prepends is stripped, so
@@ -569,7 +576,14 @@ async fn failed_user_invoked_skill_does_not_enter_seedable_set() {
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
 
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    driver.seed_forced_skill("missing-skill", &tx).await;
+    crate::config::trust::scope_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        },
+        driver.seed_forced_skill("missing-skill", &tx),
+    )
+    .await;
 
     assert!(
         driver.active_skills.is_empty(),

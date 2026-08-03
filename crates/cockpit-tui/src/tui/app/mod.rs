@@ -300,8 +300,7 @@ pub(crate) struct PendingModelSelection {
     /// input into a different conversation.
     pub session_id: Option<uuid::Uuid>,
     pub selection_id: uuid::Uuid,
-    pub provider: String,
-    pub model: String,
+    pub requested: cockpit_config::providers::ActiveModelRef,
     // Origin retained for lifecycle diagnostics. It is metadata only: the
     // daemon remains the authority for the resulting session state.
     pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
@@ -324,14 +323,29 @@ pub(crate) struct QueuedModelSubmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApplied {
     None,
-    ModelSelection { selection_id: uuid::Uuid },
+    ModelSelection {
+        selection_id: uuid::Uuid,
+    },
     CacheBreakWarning,
     LlmModeSwitchWarning,
-    PrimaryAgentSwitch { name: String },
-    Multireview { kickoff: String },
-    QuickActiveModel { provider: String, model: String },
-    ScheduleCancel { command: String, job_id: String },
-    PinContext { text: String },
+    PrimaryAgentSwitch {
+        name: String,
+    },
+    Multireview {
+        kickoff: String,
+    },
+    ScheduleCancel {
+        command: String,
+        job_id: String,
+    },
+    ModelFavorite {
+        provider: String,
+        model: String,
+        favorite: bool,
+    },
+    PinContext {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +527,39 @@ fn daemon_autostart_notice(
     }
     db?;
     Some(text.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn trusted_workspace_policy_for_tests(
+    cwd: &Path,
+) -> cockpit_config::trust::WorkspaceTrustPolicy {
+    cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
+        mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_ready_model_for_tests(app: &mut App) {
+    app.config_snapshot.providers.providers.insert(
+        "test-provider".to_string(),
+        cockpit_config::providers::ProviderEntry {
+            models: vec![cockpit_config::providers::ModelEntry {
+                id: "test-model".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let selection = cockpit_config::providers::ActiveModelRef {
+        provider: "test-provider".to_string(),
+        model: "test-model".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    app.launch.active_model = Some((selection.provider.clone(), selection.model.clone()));
+    app.active_model_selection = Some(selection);
 }
 
 impl App {
@@ -1473,6 +1520,13 @@ pub struct App {
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pub(super) active_model_state_generation: u64,
+    /// Complete daemon-confirmed session selection. Quick edits modify this
+    /// value and never reconstruct session state from the config default.
+    pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
+    /// Daemon-confirmed configured default, retained even when it equals the
+    /// session selection so first-selection defaulting never relies on drift.
+    pub(super) default_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
+
     pub(super) composer: Composer,
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
     /// the Normal-mode hint chip is shown.
@@ -1926,6 +1980,17 @@ pub struct App {
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
     pub(super) pending_model_selection: Option<PendingModelSelection>,
+    /// Exact send intent retained after a rejected/expired model selection.
+    /// The next picker selection adopts it so git blocks, tag expansions,
+    /// images, and display text survive recovery without being rebuilt.
+    pub(super) retry_model_submission: Option<QueuedModelSubmission>,
+    /// Provider whose model editor was opened from the picker. The picker is
+    /// restored only after the daemon publishes the refreshed inventory.
+    pub(super) reopen_model_picker_after_settings: Option<String>,
+    /// A send opened the model picker; after a confirmed choice, rerun the
+    /// untouched composer through the normal submit path and hold it behind
+    /// the correlated model transaction.
+    pub(super) submit_after_model_selection: bool,
     pub(super) next_control_request_seq: u64,
     /// The live set of wire-side elided tool-result `call_id`s on the
     /// foreground agent (from the daemon's `Pruned` event). The scrollback
@@ -2917,10 +2982,14 @@ impl App {
             });
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
+        let active_model_selection = config_snapshot.providers.active_model.clone();
+        let default_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
             launch,
             config_snapshot,
             active_model_state_generation: 0,
+            active_model_selection,
+            default_model_selection,
             composer,
             vim_setting,
             thinking_setting,
@@ -3046,6 +3115,9 @@ impl App {
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,
+            retry_model_submission: None,
+            reopen_model_picker_after_settings: None,
+            submit_after_model_selection: false,
             next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,

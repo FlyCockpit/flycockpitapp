@@ -1645,6 +1645,17 @@ pub enum ThinkingMode {
     High,
 }
 
+impl ThinkingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inputs {
     #[serde(default, skip_serializing_if = "Option::is_none")]

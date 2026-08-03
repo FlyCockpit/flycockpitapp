@@ -61,6 +61,7 @@ pub(super) async fn handle_serialized_request(
             session_id,
             since_seq,
             project_root,
+            initial_model,
             no_sandbox,
             interactive,
             model_override,
@@ -75,6 +76,7 @@ pub(super) async fn handle_serialized_request(
                 session_id,
                 since_seq,
                 project_root,
+                initial_model,
                 no_sandbox,
                 interactive,
                 model_override,
@@ -544,6 +546,7 @@ pub(super) async fn handle_serialized_request(
         Request::CreateAssistantSession {
             name,
             project_root,
+            initial_model,
             no_sandbox,
             env_snapshot,
         } => {
@@ -558,6 +561,7 @@ pub(super) async fn handle_serialized_request(
                 .create_assistant_session(
                     &name,
                     PathBuf::from(project_root),
+                    initial_model,
                     no_sandbox,
                     env_snapshot,
                 )
@@ -915,10 +919,7 @@ pub(super) async fn handle_serialized_request(
             record_session_note(ctx, session_id, &text).await
         }
 
-        Request::DeleteSession {
-            session_id,
-            cascade,
-        } => delete_session(ctx, session_id, cascade).await,
+        Request::DeleteSession { session_id } => delete_session(ctx, session_id).await,
 
         Request::ListSkills { project_root } => {
             // Resolve the configured scan dirs from the client's cwd so
@@ -994,6 +995,43 @@ pub(super) async fn handle_serialized_request(
 
         Request::ListAgents => list_agents(ctx, state).await,
         Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()).await,
+
+        Request::SetModelFavorite {
+            provider,
+            model,
+            favorite,
+        } => {
+            let att = require_attached(state)?;
+            let snapshot = att.handle.config_snapshot();
+            let provider_entry = snapshot
+                .providers
+                .providers
+                .get(&provider)
+                .ok_or_else(|| bad_request(format!("provider {provider} not in config")))?;
+            if !provider_entry.models.iter().any(|entry| entry.id == model) {
+                return Err(bad_request(format!(
+                    "model {model} not in provider {provider}"
+                )));
+            }
+            let trust_policy = attached_trust_policy(ctx, att).await?;
+            let path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                ctx.config_source()
+                    .config_write_target_for_provider(&att.handle.project_root, &provider)
+            })
+            .ok_or_else(|| bad_request("no cockpit config found"))?;
+            let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+            doc.write_model_favorite(&provider, &model, favorite)
+                .map_err(internal)?;
+            crate::daemon::config_refresh::refresh_session_config(
+                &ctx.db,
+                ctx.config_source(),
+                &att.handle,
+                None,
+            )
+            .await
+            .map_err(internal)?;
+            Ok(Response::Ack)
+        }
 
         Request::SetActiveModel {
             selection_id,
@@ -2331,6 +2369,7 @@ pub(super) async fn attach(
     session_id: Option<Uuid>,
     since_seq: Option<i64>,
     project_root: Option<String>,
+    initial_model: Option<crate::config::providers::ActiveModelRef>,
     no_sandbox: bool,
     interactive: bool,
     model_override: Option<String>,
@@ -2390,6 +2429,7 @@ pub(super) async fn attach(
         .attach(
             session_id,
             project_root,
+            initial_model,
             client_no_sandbox,
             model_override.as_deref(),
             session_env,
@@ -2456,25 +2496,18 @@ pub(super) async fn attach(
     // persist) and has no `sessions` row yet, so `get_session` would miss.
     let project_id = handle.project_id();
     let short_id = handle.short_id();
-    let (session_active_provider, session_active_model) = handle.active_model_selection();
+    let session_active = handle.active_model_selection();
     let config_active = providers_cfg.active_model.as_ref();
-    let active_model_state = match (session_active_provider, session_active_model) {
-        (Some(provider), Some(model)) => {
-            let config_provider = config_active.map(|active| active.provider.clone());
-            let config_model = config_active.map(|active| active.model.clone());
-            let diverged = config_provider.as_deref() != Some(provider.as_str())
-                || config_model.as_deref() != Some(model.as_str());
-            Some(proto::ActiveModelState {
-                provider,
-                model,
-                config_provider,
-                config_model,
-                diverged,
-                generation: 0,
-            })
+    let active_model_state = session_active.map(|selection| {
+        let default_selection = config_active.cloned();
+        let diverged = default_selection.as_ref() != Some(&selection);
+        proto::ActiveModelState {
+            selection,
+            default_selection,
+            diverged,
+            generation: 0,
         }
-        _ => None,
-    };
+    });
 
     state.pending_uploads.clear();
     state.ready_attachments.clear();

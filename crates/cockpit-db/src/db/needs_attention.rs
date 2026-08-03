@@ -32,6 +32,14 @@ pub enum InterruptState {
 }
 
 impl InterruptState {
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Parked,
+        Self::Executing,
+        Self::Interrupted,
+        Self::Resolved,
+    ];
+
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {

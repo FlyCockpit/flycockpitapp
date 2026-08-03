@@ -3,9 +3,8 @@ use super::*;
 #[cfg(test)]
 use super::recheck::{RecheckAction, result_recheck_action};
 
-pub(super) const AUTO_GATE_UNSET_NOTICE: &str = "No utility model configured; asking you instead. Set utility_model (provider:model) in your config to enable Auto approval.";
-pub(super) const AUTO_GATE_UNUSABLE_NOTICE: &str =
-    "The configured utility model is unavailable; asking you instead until it recovers.";
+pub(super) const AUTO_GATE_UNSET_NOTICE: &str = "Auto approval needs a utility model to pre-screen commands; falling back to manual approval — set utility_model (provider:model) in your config to enable it.";
+pub(super) const AUTO_GATE_UNUSABLE_NOTICE: &str = "The configured utility model is unreachable; Auto approval is falling back to manual asks until it recovers.";
 
 /// What the command-safety gate decided for one call.
 #[derive(Clone)]
@@ -916,7 +915,7 @@ mod safety_gate_tests {
         let approver = ctx.approver.as_ref().unwrap();
         approver
             .store()
-            .record_mcp_tool_reject("example", "mutate", Scope::Project)
+            .record_mcp_tool_reject("example", "mutate", Scope::Session)
             .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(8);
@@ -932,7 +931,7 @@ mod safety_gate_tests {
             GateOutcome::Block(block) => {
                 assert_eq!(block.status, "blocked_standing_reject");
                 assert!(
-                    block.message.contains("rejected at project scope"),
+                    block.message.contains("rejected at session scope"),
                     "{}",
                     block.message
                 );
@@ -1070,7 +1069,15 @@ mod safety_gate_tests {
             row.parked.is_none(),
             "ordinary gate escalation must await an open user interrupt"
         );
-        assert_eq!(hub.park_all_registered().await, 1);
+        let mut parked = 0;
+        for _ in 0..1000 {
+            parked = hub.park_all_registered().await;
+            if parked == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(parked, 1, "gate interrupt must register before parking");
         assert!(matches!(task.await.unwrap(), GateOutcome::Parked));
     }
 
@@ -1119,7 +1126,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unset_warns_once_and_asks_manual_equivalent() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1153,14 +1160,14 @@ mod safety_gate_tests {
         ctx.session.set_approval_mode(ApprovalMode::Auto);
         let reentered =
             safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
-        assert!(matches!(reentered, GateOutcome::Run { recheck: false }));
+        assert!(matches!(reentered, GateOutcome::Block(_)));
         assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
     }
 
     #[tokio::test]
     async fn gate_degrade_unusable_warns_once_but_keeps_probing() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1201,7 +1208,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_recovery_resumes_auto_and_rearms_notice() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "gh pr create" });
         let providers = crate::config::providers::ProvidersConfig::default();
@@ -1270,10 +1277,7 @@ mod safety_gate_tests {
             &providers,
         )
         .await;
-        assert!(matches!(
-            still_regressed,
-            GateOutcome::Run { recheck: false }
-        ));
+        assert!(matches!(still_regressed, GateOutcome::Block(_)));
         assert_no_notice(&mut rx);
         assert_eq!(safety_gate_evaluate_calls(), 4);
     }
@@ -1281,7 +1285,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_config_refresh_upgrades_live() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let shared = Arc::new(std::sync::RwLock::new(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -1320,7 +1324,7 @@ mod safety_gate_tests {
     #[tokio::test]
     async fn gate_degrade_unrelated_config_change_no_rewarn() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, true);
+        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let shared = Arc::new(std::sync::RwLock::new(
             crate::daemon::session_worker::SessionConfigSnapshot::new(
                 0,
@@ -1421,28 +1425,18 @@ mod safety_gate_tests {
     }
 
     #[tokio::test]
-    async fn gate_degrade_unset_no_client_denies_at_dispatch() {
-        // `auto` + no utility model configured degrades to manual-equivalent
-        // dispatch. The gate itself does not approve the command; downstream
-        // bash/MCP approval paths still fail closed when no approver exists.
+    async fn gate_degrade_unset_no_client_blocks_before_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
         let (tx, mut rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "ls" });
         let providers = crate::config::providers::ProvidersConfig::default();
+
         let outcome =
             safety_gate_decision_with_configs("bash", &args, &ctx, &tx, None, &providers).await;
-        assert!(matches!(outcome, GateOutcome::Run { recheck: false }));
-        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
 
-        let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
-        let (result, _duration_ms) = dispatch_one_timed(&tools, "bash", args, &ctx, None).await;
-        let output = result.expect("bash denial is a model-facing tool output");
-        assert!(
-            output.content.contains("approval was denied"),
-            "{}",
-            output.content
-        );
+        assert!(matches!(outcome, GateOutcome::Block(_)));
+        assert_next_notice(&mut rx, AUTO_GATE_UNSET_NOTICE);
     }
 
     #[tokio::test]
@@ -1476,78 +1470,80 @@ mod safety_gate_tests {
         assert!(matches!(outcome, GateOutcome::Run { recheck: true }));
     }
 
-    #[tokio::test]
-    async fn interrupt_replay_gate_escalation_parks_and_replays() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
-        let hub = attached_interrupt_hub(&ctx);
-        attach_approver_with_hub(&mut ctx, hub.clone());
-        let ctx = Arc::new(ctx);
-        let (tx, _rx) = mpsc::channel(8);
-        let args = serde_json::json!({ "server": "example", "tool": "mutate" });
-        let payload = crate::db::needs_attention::InterruptParkPayload {
-            tool: "mcp".to_string(),
-            args: args.clone(),
-            call_id: "call-1".to_string(),
-            resume: crate::db::needs_attention::InterruptResumeAnchor {
-                agent_id: "builder".to_string(),
+    #[test]
+    fn interrupt_replay_gate_escalation_parks_and_replays() {
+        crate::test_env::run_async_with_large_stack(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ctx = gate_ctx(tmp.path(), ApprovalMode::Auto, false);
+            let hub = attached_interrupt_hub(&ctx);
+            attach_approver_with_hub(&mut ctx, hub.clone());
+            let ctx = Arc::new(ctx);
+            let (tx, _rx) = mpsc::channel(8);
+            let args = serde_json::json!({ "server": "example", "tool": "mutate" });
+            let payload = crate::db::needs_attention::InterruptParkPayload {
+                tool: "mcp".to_string(),
+                args: args.clone(),
                 call_id: "call-1".to_string(),
-                provider_call_id: None,
-                assistant_seq: None,
-                call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
-            },
-            gate: None,
-        };
-        let first_ctx = ctx.clone();
-        let first_tx = tx.clone();
-        let first_args = args.clone();
-        let first_payload = payload.clone();
-        let first = tokio::spawn(async move {
-            crate::engine::interrupt::with_interrupt_park_payload(first_payload, async {
-                escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx, true).await
-            })
-            .await
-        });
-
-        let interrupt_id = wait_for_open_interrupt(&ctx).await;
-        let row = ctx
-            .session
-            .db
-            .get_interrupt(interrupt_id)
-            .await
-            .unwrap()
-            .expect("parked gate row");
-        assert!(
-            row.parked.is_some(),
-            "gate interrupt must carry replay payload"
-        );
-        assert_eq!(hub.park_all_registered().await, 1);
-        assert_eq!(first.await.unwrap(), GateApproval::Parked);
-
-        let response = crate::daemon::proto::ResolveResponse::Single {
-            selected_id: crate::approval::ID_APPROVE.to_string(),
-        };
-        assert!(
-            ctx.session
-                .db
-                .begin_parked_interrupt_execution(interrupt_id, &response)
-                .await
-                .unwrap()
-        );
-        let question = replay_question_from_row(&ctx, interrupt_id).await;
-        let replayed = crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            response,
-            question,
-            async {
-                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                    escalate_gated_call("mcp", &args, &ctx, true, &tx, true).await
+                resume: crate::db::needs_attention::InterruptResumeAnchor {
+                    agent_id: "builder".to_string(),
+                    call_id: "call-1".to_string(),
+                    provider_call_id: None,
+                    assistant_seq: None,
+                    call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
+                },
+                gate: None,
+            };
+            let first_ctx = ctx.clone();
+            let first_tx = tx.clone();
+            let first_args = args.clone();
+            let first_payload = payload.clone();
+            let first = tokio::spawn(async move {
+                crate::engine::interrupt::with_interrupt_park_payload(first_payload, async {
+                    escalate_gated_call("mcp", &first_args, &first_ctx, true, &first_tx, true).await
                 })
                 .await
-            },
-        )
-        .await;
-        assert_eq!(replayed, GateApproval::Allow);
+            });
+
+            let interrupt_id = wait_for_open_interrupt(&ctx).await;
+            let row = ctx
+                .session
+                .db
+                .get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("parked gate row");
+            assert!(
+                row.parked.is_some(),
+                "gate interrupt must carry replay payload"
+            );
+            assert_eq!(hub.park_all_registered().await, 1);
+            assert_eq!(first.await.unwrap(), GateApproval::Parked);
+
+            let response = crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE.to_string(),
+            };
+            assert!(
+                ctx.session
+                    .db
+                    .begin_parked_interrupt_execution(interrupt_id, &response)
+                    .await
+                    .unwrap()
+            );
+            let question = replay_question_from_row(&ctx, interrupt_id).await;
+            let replayed = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                response,
+                question,
+                async {
+                    crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                        escalate_gated_call("mcp", &args, &ctx, true, &tx, true).await
+                    })
+                    .await
+                },
+            )
+            .await;
+            assert_eq!(replayed, GateApproval::Allow);
+        });
     }
 
     #[test]

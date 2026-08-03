@@ -165,7 +165,7 @@ mod tests {
             r#"{"brief":"other"}"#
         );
 
-        db.delete_session(one, true).await.unwrap();
+        db.delete_session(one).await.unwrap();
         assert!(db.compaction_shadow(one).await.unwrap().is_none());
         assert_eq!(db.count_compaction_shadows().await.unwrap(), 1);
     }

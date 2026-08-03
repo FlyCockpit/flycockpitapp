@@ -138,6 +138,35 @@ pub enum SessionEventKind {
 }
 
 impl SessionEventKind {
+    pub const ALL: [Self; 26] = [
+        Self::UserMessage,
+        Self::UserNote,
+        Self::AssistantMessage,
+        Self::InferenceRequest,
+        Self::ToolCall,
+        Self::TandemInference,
+        Self::ToolCallStarted,
+        Self::ToolCallCompleted,
+        Self::SubagentSpawned,
+        Self::SubagentRouting,
+        Self::SubagentReport,
+        Self::ContextPruned,
+        Self::SessionCompacted,
+        Self::PermissionDecision,
+        Self::InterruptDecision,
+        Self::ToolRejected,
+        Self::PrimarySwap,
+        Self::InferenceFailure,
+        Self::FailedTurnRecovery,
+        Self::TurnInterrupted,
+        Self::SkillAutoSelect,
+        Self::AutoPruneDiagnostic,
+        Self::GoalProgressDiagnostic,
+        Self::ResourcePromotion,
+        Self::Notice,
+        Self::ModelSwitch,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             SessionEventKind::UserMessage => "user_message",
@@ -189,6 +218,14 @@ pub enum InferenceRequestStatus {
 }
 
 impl InferenceRequestStatus {
+    pub const ALL: [Self; 5] = [
+        Self::Pending,
+        Self::Completed,
+        Self::Errored,
+        Self::TimedOut,
+        Self::Cancelled,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             InferenceRequestStatus::Pending => "pending",

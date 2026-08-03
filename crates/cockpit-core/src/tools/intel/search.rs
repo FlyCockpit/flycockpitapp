@@ -327,7 +327,10 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let file = project.path().join(".env.production");
         std::fs::write(&file, "TOKEN=long-secret-value").unwrap();
-        let ctx = crate::tools::common::test_ctx(project.path());
+        let mut ctx = crate::tools::common::test_ctx(project.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let out = SearchTool
             .call(
                 serde_json::json!({ "pattern": "(?s).", "path": file }),
@@ -345,7 +348,10 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let outside_file = outside.path().join("secret.txt");
         std::fs::write(&outside_file, "needle").unwrap();
-        let ctx = crate::tools::common::test_ctx(project.path());
+        let mut ctx = crate::tools::common::test_ctx(project.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
 
         let err = SearchTool
             .call(

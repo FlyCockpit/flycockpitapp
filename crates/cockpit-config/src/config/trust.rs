@@ -161,20 +161,34 @@ pub fn runtime_policy() -> Option<WorkspaceTrustPolicy> {
     None
 }
 
-pub fn with_workspace_trust_policy<T>(policy: WorkspaceTrustPolicy, f: impl FnOnce() -> T) -> T {
-    struct ResetGuard(Option<WorkspaceTrustPolicy>);
+#[must_use = "dropping the guard immediately restores the previous workspace trust policy"]
+pub struct ThreadWorkspaceTrustGuard {
+    previous: Option<WorkspaceTrustPolicy>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
-    impl Drop for ResetGuard {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            THREAD_POLICY.with(|cell| {
-                *cell.borrow_mut() = previous;
-            });
-        }
+impl Drop for ThreadWorkspaceTrustGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        THREAD_POLICY.with(|cell| {
+            *cell.borrow_mut() = previous;
+        });
     }
+}
 
+/// Install a workspace-trust policy for synchronous work on the current
+/// thread. Async code must use [`scope_workspace_trust_policy`] so the policy
+/// follows the task if Tokio moves it between worker threads.
+pub fn enter_workspace_trust_policy(policy: WorkspaceTrustPolicy) -> ThreadWorkspaceTrustGuard {
     let previous = THREAD_POLICY.with(|cell| cell.replace(Some(policy)));
-    let _guard = ResetGuard(previous);
+    ThreadWorkspaceTrustGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+pub fn with_workspace_trust_policy<T>(policy: WorkspaceTrustPolicy, f: impl FnOnce() -> T) -> T {
+    let _guard = enter_workspace_trust_policy(policy);
     f()
 }
 
@@ -183,6 +197,12 @@ where
     F: std::future::Future<Output = T>,
 {
     TASK_POLICY.scope(policy, f).await
+}
+
+/// Return the effective policy for propagation into blocking worker threads.
+/// Task-local trust does not cross thread or database executor boundaries.
+pub fn current_workspace_trust_policy() -> Option<WorkspaceTrustPolicy> {
+    runtime_policy()
 }
 
 pub fn project_config_allowed(cockpit_dir: &Path) -> bool {

@@ -44,7 +44,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     session.set_shell_compression(extended.shell_compression);
     if let Some(active) = providers.active_model.as_ref() {
         session
-            .set_active_model(&active.provider, &active.model)
+            .set_active_model_ref(active.clone())
             .context("recording active model for docs ask session")?;
     }
 

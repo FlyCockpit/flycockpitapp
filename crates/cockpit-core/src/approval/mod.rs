@@ -2004,7 +2004,9 @@ mod tests {
             "outer command and both substituted constituents prompt"
         );
         assert!(
-            prompts.iter().any(|prompt| prompt.contains("Run `curl`?")),
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("Run `curl -s`?")),
             "{prompts:?}"
         );
         assert!(
@@ -2044,7 +2046,9 @@ mod tests {
             "a remembered outer command cannot skip a compound authorization"
         );
         assert!(
-            prompts.iter().any(|prompt| prompt.contains("Run `curl`?")),
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("Run `curl -s`?")),
             "{prompts:?}"
         );
         assert!(
@@ -2186,7 +2190,7 @@ mod tests {
     async fn grant_does_not_apply_when_invocation_tier_exceeds_granted_tier() {
         let tmp = tempfile::tempdir().unwrap();
         let approver = approver_with_policy(tmp.path(), policy_with_destructive_session_scope());
-        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        let ordinary = classify::classify("dd if=input").simple_commands()[0].clone();
         approver
             .store
             .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
@@ -2195,7 +2199,7 @@ mod tests {
 
         let resolver = resolve_sequence_collecting_prompts(&approver, &[ID_APPROVE_ONCE]);
         let decision = approver
-            .approve_command("git push --force origin main")
+            .approve_command("dd if=input of=artifact")
             .await
             .unwrap();
         let prompts = resolver.await.unwrap();
@@ -2210,20 +2214,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
         let destructive =
-            classify::classify("git push --force origin main").simple_commands()[0].clone();
+            classify::classify("dd if=input of=artifact").simple_commands()[0].clone();
         approver
             .store
             .record_command(&destructive, RiskTier::Destructive, Scope::Session)
             .await
             .unwrap();
 
-        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        let ordinary = classify::classify("dd if=input").simple_commands()[0].clone();
         assert!(command_grant_allowed_by_policy(&approver.store, &ordinary).await);
         // No client is attached; if this prompted it would block.
-        let decision = approver
-            .approve_command("git push origin main")
-            .await
-            .unwrap();
+        let decision = approver.approve_command("dd if=input").await.unwrap();
         assert_eq!(
             decision,
             Decision::Allow {
@@ -2236,7 +2237,7 @@ mod tests {
     async fn reapproval_upgrades_stored_grant_tier_in_place() {
         let tmp = tempfile::tempdir().unwrap();
         let approver = approver_with_policy(tmp.path(), policy_with_destructive_session_scope());
-        let ordinary = classify::classify("git push origin main").simple_commands()[0].clone();
+        let ordinary = classify::classify("dd if=input").simple_commands()[0].clone();
         approver
             .store
             .record_command(&ordinary, RiskTier::Ordinary, Scope::Session)
@@ -2245,7 +2246,7 @@ mod tests {
 
         let resolver = resolve_sequence(&approver, &[ID_APPROVE_SESSION]);
         let decision = approver
-            .approve_command("git push --force origin main")
+            .approve_command("dd if=input of=artifact")
             .await
             .unwrap();
         resolver.await.unwrap();
@@ -2265,10 +2266,7 @@ mod tests {
         assert_eq!(grant.granted_tier, RiskTier::Destructive);
 
         // A lower-tier later invocation is covered silently by the upgraded grant.
-        let later = approver
-            .approve_command("git push origin main")
-            .await
-            .unwrap();
+        let later = approver.approve_command("dd if=input").await.unwrap();
         assert_eq!(
             later,
             Decision::Allow {
@@ -2299,21 +2297,7 @@ mod tests {
     async fn already_granted_command_skips_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
-        let info = SimpleCommandInfo {
-            program: "cargo".into(),
-            normalized_program: "cargo".into(),
-            subcommand: Some("build".into()),
-            args: vec!["build".into()],
-            key: ApprovalKey {
-                program: "cargo".into(),
-                subcommand: Some("build".into()),
-                option_names: std::collections::BTreeSet::new(),
-            },
-            wrapper: false,
-            execution_bearing_option: false,
-            risk: Default::default(),
-            span: None,
-        };
+        let info = classify::classify("cargo build --release").simple_commands()[0].clone();
         approver
             .store
             .record_command(&info, info.risk.tier, Scope::Session)
@@ -2337,21 +2321,7 @@ mod tests {
     async fn already_granted_records_permission_decision() {
         let tmp = tempfile::tempdir().unwrap();
         let (approver, _) = approver(tmp.path());
-        let info = SimpleCommandInfo {
-            program: "cargo".into(),
-            normalized_program: "cargo".into(),
-            subcommand: Some("build".into()),
-            args: vec!["build".into()],
-            key: ApprovalKey {
-                program: "cargo".into(),
-                subcommand: Some("build".into()),
-                option_names: std::collections::BTreeSet::new(),
-            },
-            wrapper: false,
-            execution_bearing_option: false,
-            risk: Default::default(),
-            span: None,
-        };
+        let info = classify::classify("cargo build --release").simple_commands()[0].clone();
         approver
             .store
             .record_command(&info, info.risk.tier, Scope::Session)

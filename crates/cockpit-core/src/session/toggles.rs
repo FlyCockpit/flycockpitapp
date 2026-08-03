@@ -193,11 +193,23 @@ impl Session {
     }
 
     pub fn active_model(&self) -> Option<String> {
-        self.model.lock().unwrap().clone()
+        self.model_selection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|selection| selection.model.clone())
     }
 
     pub fn active_provider(&self) -> Option<String> {
-        self.provider.lock().unwrap().clone()
+        self.model_selection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|selection| selection.provider.clone())
+    }
+
+    pub fn active_model_ref(&self) -> Option<crate::config::providers::ActiveModelRef> {
+        self.model_selection.lock().unwrap().clone()
     }
 
     pub fn session_llm_mode_raw(&self) -> Option<String> {
@@ -288,37 +300,54 @@ impl Session {
     }
 
     pub fn set_active_model(&self, provider: &str, model: &str) -> Result<()> {
-        *self.provider.lock().unwrap() = Some(provider.to_string());
-        *self.model.lock().unwrap() = Some(model.to_string());
+        self.set_active_model_ref(crate::config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        })
+    }
+
+    pub fn set_active_model_ref(
+        &self,
+        selection: crate::config::providers::ActiveModelRef,
+    ) -> Result<()> {
+        let mut active = self.model_selection.lock().unwrap();
+        let selection_json =
+            serde_json::to_string(&selection).context("encoding session model selection")?;
+        let provider = selection.provider.clone();
+        let model = selection.model.clone();
         if self.stage_pending_row(|row| {
-            row.provider = Some(provider.to_string());
-            row.model = Some(model.to_string());
+            row.provider = Some(provider.clone());
+            row.model = Some(model.clone());
+            row.model_selection_json = Some(selection_json.clone());
         }) {
+            *active = Some(selection);
             return Ok(());
         }
         let session_id = self.id;
-        let provider = provider.to_string();
-        let model = model.to_string();
+        let persisted_provider = provider.clone();
+        let persisted_model = model.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
-                    params![provider, model, session_id.to_string()],
+                    "UPDATE sessions
+                        SET provider = ?1, model = ?2, model_selection_json = ?3
+                      WHERE session_id = ?4",
+                    params![
+                        persisted_provider,
+                        persisted_model,
+                        selection_json,
+                        session_id.to_string()
+                    ],
                 )
                 .context("setting session model")?;
                 Ok(())
             })
             .context("persisting active model")?;
+        *active = Some(selection);
         Ok(())
-    }
-
-    pub(crate) fn restore_active_model_memory(
-        &self,
-        provider: Option<String>,
-        model: Option<String>,
-    ) {
-        *self.provider.lock().unwrap() = provider;
-        *self.model.lock().unwrap() = model;
     }
 
     pub fn active_agent(&self) -> String {

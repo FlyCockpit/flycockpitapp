@@ -514,8 +514,10 @@ fn bare_skill_inventory_hides_conditionally_incompatible_skill() {
     let mut extended = cockpit_config::extended::ExtendedConfig::default();
     extended.skills.scan_dirs = vec![scan.to_string_lossy().into_owned()];
 
-    let entries =
-        super::discover_bare_skill_commands(tmp.path(), &extended, "agent-that-does-not-exist");
+    let entries = cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || super::discover_bare_skill_commands(tmp.path(), &extended, "agent-that-does-not-exist"),
+    );
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert_eq!(names, ["plain"]);
 }

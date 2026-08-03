@@ -150,8 +150,8 @@ impl App {
                         old_session_id = ?pending.session_id,
                         new_session_id = %r.session_id(),
                         selection_id = %pending.selection_id,
-                        provider = %pending.provider,
-                        model = %pending.model,
+                        provider = %pending.requested.provider,
+                        model = %pending.requested.model,
                         trigger = ?pending.trigger,
                         generation = pending.minimum_generation,
                         "model selection cancelled by session replacement"
@@ -184,10 +184,8 @@ impl App {
             self.foreground_input_target = r.foreground_target.clone();
             if let Some(state) = &r.active_model_state {
                 self.apply_active_model_state(
-                    state.provider.clone(),
-                    state.model.clone(),
-                    state.config_provider.clone(),
-                    state.config_model.clone(),
+                    state.selection.clone(),
+                    state.default_selection.clone(),
                     state.diverged,
                     state.generation,
                 );

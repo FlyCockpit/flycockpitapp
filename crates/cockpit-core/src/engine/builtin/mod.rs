@@ -2414,10 +2414,32 @@ mod tests {
         crate::db::Db::open_in_memory().unwrap()
     }
 
+    fn trusted_policy(cwd: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(cwd).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        }
+    }
+
+    async fn unknown_agent_rejection_for_test(
+        cwd: &Path,
+        config: &crate::daemon::session_worker::SessionConfigHandle,
+        parent_agent: &str,
+        requested_agent: &str,
+        db: &crate::db::Db,
+    ) -> Option<String> {
+        crate::config::trust::scope_workspace_trust_policy(
+            trusted_policy(cwd),
+            unknown_agent_rejection(cwd, config, parent_agent, requested_agent, db),
+        )
+        .await
+    }
+
     fn test_spawn_args_with_provider_can_delegate(
         cwd: &Path,
         can_delegate: Option<bool>,
     ) -> SpawnArgs {
+        let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(cwd));
         use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
         use std::collections::BTreeMap;
         let mut providers = BTreeMap::new();
@@ -3157,7 +3179,10 @@ mod tests {
         let mut args = test_spawn_args(tmp.path());
         args.granted_tools = vec!["search".to_string()];
 
-        let err = match load("disabled-child", &args) {
+        let err = match crate::config::trust::with_workspace_trust_policy(
+            trusted_policy(tmp.path()),
+            || load("disabled-child", &args),
+        ) {
             Ok(_) => panic!("disabled child grant unexpectedly succeeded"),
             Err(err) => err,
         };
@@ -3170,7 +3195,11 @@ mod tests {
             "---\ndescription: child\nmode: subagent\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
         )
         .unwrap();
-        let promoted = load("discoverable-child", &args).unwrap();
+        let promoted =
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+                load("discoverable-child", &args)
+            })
+            .unwrap();
         assert!(promoted.tools.names().contains(&"search"));
     }
 
@@ -3425,9 +3454,10 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db)
-            .await
-            .unwrap();
+        let message =
+            unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", "missing", &db)
+                .await
+                .unwrap();
 
         assert!(message.contains("unknown agent `missing`"), "{message}");
         assert!(
@@ -3452,9 +3482,10 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "missing", &db)
-            .await
-            .unwrap();
+        let message =
+            unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", "missing", &db)
+                .await
+                .unwrap();
 
         assert!(message.contains("my-reviewer"), "{message}");
     }
@@ -3496,7 +3527,7 @@ mod tests {
             "helper-bot",
         ] {
             assert!(
-                unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db)
+                unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", name, &db)
                     .await
                     .is_none(),
                 "{name}"
@@ -3510,9 +3541,10 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", "Build", &db)
-            .await
-            .unwrap();
+        let message =
+            unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", "Build", &db)
+                .await
+                .unwrap();
 
         assert!(message.contains("unknown agent `Build`"), "{message}");
         assert!(
@@ -3532,14 +3564,15 @@ mod tests {
         let db = test_assistant_db();
 
         for name in ["docs-resolver", "docs-answerer"] {
-            let message = unknown_agent_rejection(tmp.path(), &args.config, "Build", name, &db)
-                .await
-                .expect("internal docs stages are not task targets");
+            let message =
+                unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", name, &db)
+                    .await
+                    .expect("internal docs stages are not task targets");
             assert!(message.contains(name), "{message}");
             assert!(message.contains("builder"), "{message}");
         }
         assert!(
-            unknown_agent_rejection(tmp.path(), &args.config, "Build", "docs", &db)
+            unknown_agent_rejection_for_test(tmp.path(), &args.config, "Build", "docs", &db)
                 .await
                 .is_none()
         );
@@ -3551,10 +3584,15 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let db = test_assistant_db();
 
-        let message =
-            unknown_agent_rejection(tmp.path(), &args.config, "locked-parent", "missing", &db)
-                .await
-                .unwrap();
+        let message = unknown_agent_rejection_for_test(
+            tmp.path(),
+            &args.config,
+            "locked-parent",
+            "missing",
+            &db,
+        )
+        .await
+        .unwrap();
 
         assert!(message.contains("unknown agent `missing`"), "{message}");
         assert!(
@@ -3630,6 +3668,7 @@ mod tests {
     }
 
     fn disk_model_spawn_args(cwd: &Path, model_id: &str) -> SpawnArgs {
+        let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(cwd));
         let providers = crate::config::providers::ConfigDoc::load_effective(cwd);
         let model = Arc::new(
             crate::engine::model::Model::for_provider(
@@ -4018,6 +4057,7 @@ mod tests {
     #[test]
     fn ask_routes_to_approval() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(trusted_policy(tmp.path()));
         write_computer_provider_config(
             tmp.path(),
             "{}",

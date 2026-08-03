@@ -1678,6 +1678,12 @@ async fn sealed_fetch_discards_child_report_and_returns_store_state() {
         value_id: "deploy_token".to_string(),
         existed_before: false,
     });
+    driver.noninteractive_delegations.register_running(
+        "sealed-fetch",
+        "default",
+        "subagent".to_string(),
+        completion.snapshot.clone(),
+    );
     let result = driver
         .finalize_single_noninteractive_task(completion, &tx, true)
         .await

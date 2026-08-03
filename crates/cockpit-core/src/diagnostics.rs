@@ -224,7 +224,7 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
                         crate::db::EXPECTED_SCHEMA_VERSION
                     ));
                     lines.push(format!(
-                        "ledger: legacy schema_version migration {migration}; checksums unavailable (squashed-schema runner)"
+                        "ledger: migration {migration}; checksum verification enabled"
                     ));
                 }
                 (schema, migration) => {
@@ -248,7 +248,7 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
         }
         Err(error) => {
             let message = format!("{error:#}");
-            if message.contains("database schema version mismatch") {
+            if is_schema_rejection(&message) {
                 lines.push(
                     "openability: ok (SQLite opened, but Cockpit rejected its schema)".to_string(),
                 );
@@ -263,6 +263,16 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
             (lines, true)
         }
     }
+}
+
+fn is_schema_rejection(message: &str) -> bool {
+    [
+        "database schema version mismatch",
+        "database migration ledger is newer than this binary",
+        "migration checksum mismatch",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
@@ -945,6 +955,26 @@ mod tests {
         }
     }
 
+    fn trusted_snapshot(input: DiagnosticsInput) -> DiagnosticsSnapshot {
+        let cwd = input.cwd.clone();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(&cwd);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&cwd).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::with_workspace_trust_policy(policy, || build_snapshot(input).unwrap())
+    }
+
+    fn trusted_tui_snapshot(input: DiagnosticsInput) -> DiagnosticsSnapshot {
+        let cwd = input.cwd.clone();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(&cwd);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&cwd).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::with_workspace_trust_policy(policy, || tui_snapshot(input).unwrap())
+    }
+
     fn provider_with_header(value: &str) -> ProviderEntry {
         ProviderEntry {
             url: "https://example.test/v1".to_string(),
@@ -962,18 +992,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = base_input(tmp.path());
 
-        let tui = tui_snapshot(input.clone()).unwrap();
-        let direct = build_snapshot(input).unwrap();
+        let tui = trusted_tui_snapshot(input.clone());
+        let direct = trusted_snapshot(input);
 
         assert_eq!(tui, direct);
         assert!(render(&tui).contains("Cockpit diagnostics"));
     }
 
     #[test]
-    fn unresolved_trust_marks_harness_probe_blocked() {
-        let _env = crate::test_env::lock();
-        crate::config::trust::clear_runtime_policy_for_tests();
+    fn unresolved_trust_ignores_project_harness_config() {
         let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        crate::config::trust::clear_runtime_policy_for_tests();
         let cockpit = tmp.path().join(".cockpit");
         std::fs::create_dir_all(&cockpit).unwrap();
         std::fs::write(
@@ -985,7 +1015,11 @@ mod tests {
         let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
 
         assert!(snapshot.workspace_trust.contains("unresolved"));
-        assert!(snapshot.harnesses[0].contains("trust-blocked"));
+        assert!(
+            snapshot.harnesses.is_empty(),
+            "untrusted project harness definitions must not be loaded: {:?}",
+            snapshot.harnesses
+        );
         crate::config::trust::clear_runtime_policy_for_tests();
     }
 
@@ -1023,7 +1057,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let snapshot = trusted_snapshot(base_input(tmp.path()));
         let rendered = render(&snapshot);
 
         assert!(
@@ -1069,7 +1103,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let snapshot = trusted_snapshot(base_input(tmp.path()));
         let rendered = render(&snapshot);
 
         assert!(rendered.contains("can-delegate 1/3"), "{rendered}");
@@ -1220,7 +1254,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let snapshot = trusted_snapshot(base_input(tmp.path()));
         let rendered = render(&snapshot);
 
         assert!(
@@ -1233,7 +1267,7 @@ mod tests {
     #[test]
     fn doctor_renders_container_block() {
         let tmp = tempfile::tempdir().unwrap();
-        let rendered = render(&build_snapshot(base_input(tmp.path())).unwrap());
+        let rendered = render(&trusted_snapshot(base_input(tmp.path())));
 
         assert!(rendered.contains("container:"), "{rendered}");
         assert!(rendered.contains("runtime:"), "{rendered}");
@@ -1312,7 +1346,7 @@ mod tests {
             ),
             ..base_input(tmp.path())
         };
-        let rendered = render(&build_snapshot(input).unwrap());
+        let rendered = render(&trusted_snapshot(input));
         assert!(
             rendered.contains("model selection: pending 00000000-0000-0000-0000-000000000000: p/m"),
             "{rendered}"
@@ -1465,7 +1499,7 @@ mod tests {
     #[test]
     fn doctor_exit_codes() {
         let tmp = tempfile::tempdir().unwrap();
-        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let snapshot = trusted_snapshot(base_input(tmp.path()));
         assert!(snapshot.has_failures);
 
         let mut cfg = ProvidersConfig::default();
@@ -1507,7 +1541,7 @@ mod tests {
         )
         .unwrap();
 
-        let rendered = render(&build_snapshot(base_input(tmp.path())).unwrap());
+        let rendered = render(&trusted_snapshot(base_input(tmp.path())));
 
         assert!(
             rendered.contains("embedding_model: resolved openai/embed (1536 dims)"),

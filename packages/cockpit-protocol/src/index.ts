@@ -1,9 +1,29 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 4 as const;
+export const PROTOCOL_VERSION = 6 as const;
 
 export const uuidSchema = z.string().uuid();
 export const requestIdSchema = uuidSchema;
+export const activeModelRefSchema = z
+  .object({
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    reasoning_effort: z.object({ value: z.string().min(1) }).optional(),
+    thinking_mode: z.enum(["off", "low", "medium", "high"]).optional(),
+    prompt_cache_retention: z.enum(["default", "extended"]).optional(),
+  })
+  .passthrough();
+export type ActiveModelRef = z.infer<typeof activeModelRefSchema>;
+
+export const activeModelStateSchema = z
+  .object({
+    selection: activeModelRefSchema,
+    default_selection: activeModelRefSchema.nullable().optional(),
+    diverged: z.boolean(),
+    generation: z.number().int().nonnegative(),
+  })
+  .passthrough();
+export type ActiveModelState = z.infer<typeof activeModelStateSchema>;
 export const sessionIdSchema = uuidSchema;
 export const projectRootSchema = z.string().trim().min(1).max(4096);
 
@@ -153,6 +173,7 @@ const requestParamSchemas = {
       project_root: z.string().optional(),
       no_sandbox: z.boolean().optional(),
       interactive: z.boolean().optional(),
+      initial_model: activeModelRefSchema.optional(),
       model_override: z.string().optional(),
       client_protocol_version: z.number().int().nonnegative().optional(),
       env_snapshot: z.unknown().optional(),
@@ -160,7 +181,7 @@ const requestParamSchemas = {
     })
     .strict(),
   cancel_paused_work: z.object({ session_id: uuidSchema }).strict(),
-  delete_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
+  delete_session: z.object({ session_id: uuidSchema }).strict(),
   fork_session: z
     .object({
       parent_session_id: uuidSchema,
@@ -236,13 +257,23 @@ const requestParamSchemas = {
     })
     .strict(),
   session_live_status: z.object({ session_ids: z.array(uuidSchema) }).strict(),
+  set_model_favorite: z
+    .object({
+      provider: z.string().min(1),
+      model: z.string().min(1),
+      favorite: z.boolean(),
+    })
+    .strict(),
   set_active_model: z
     .object({
+      selection_id: uuidSchema,
       provider: z.string().min(1),
       model: z.string().min(1),
       trigger: activeModelSwitchTriggerSchema.optional(),
       reasoning_effort: z.string().optional(),
-      thinking_mode: z.string().optional(),
+      thinking_mode: z.enum(["off", "low", "medium", "high"]).optional(),
+      prompt_cache_retention: z.enum(["default", "extended"]).optional(),
+      persist_as_default: z.boolean(),
     })
     .strict(),
   set_agent: z.object({ name: z.string().min(1) }).strict(),
@@ -307,6 +338,7 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
+  requestVariant("set_model_favorite", requestParamSchemas.set_model_favorite),
   requestVariant("set_active_model", requestParamSchemas.set_active_model),
   requestVariant("set_agent", requestParamSchemas.set_agent),
   requestVariant("share_session", requestParamSchemas.share_session),
@@ -668,6 +700,7 @@ export const knownEventKindSchema = z.enum([
   "llm_mode_changed",
   "longcache_state",
   "lsp_notice",
+  "model_selection_result",
   "nested_turn",
   "notice",
   "paused_work_available",
@@ -751,10 +784,51 @@ const eventStreamLaggedDataSchema = z
     dropped: z.number().int().nonnegative(),
   })
   .passthrough();
+const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("not_requested") }).passthrough(),
+  z.object({ status: z.literal("saved") }).passthrough(),
+  z
+    .object({
+      status: z.literal("failed"),
+      user_message: z.string(),
+      diagnostic_code: z.string().min(1),
+    })
+    .passthrough(),
+]);
+
+const modelSelectionOutcomeSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("applied"),
+      active_state: activeModelStateSchema,
+      default_update: defaultModelUpdateOutcomeSchema,
+    })
+    .passthrough(),
+  z
+    .object({
+      status: z.literal("rejected"),
+      user_message: z.string(),
+      diagnostic_code: z.string().min(1),
+    })
+    .passthrough(),
+]);
+
+const modelSelectionResultDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    selection_id: uuidSchema,
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    outcome: modelSelectionOutcomeSchema,
+  })
+  .passthrough();
+
 const structuredEventDataSchemas = {
+  active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   interrupt_raised: interruptRaisedDataSchema,
+  model_selection_result: modelSelectionResultDataSchema,
   interrupt_resolved: interruptResolvedDataSchema,
 } as const satisfies Partial<Record<KnownEventKind, z.ZodTypeAny>>;
 
@@ -856,6 +930,7 @@ export const attachResultSchema = z
     project_root: projectRootSchema,
     project_id: z.string(),
     active_agent: z.string(),
+    active_model_state: activeModelStateSchema.nullable().optional(),
     history: z.array(historyEntrySchema),
   })
   .passthrough();

@@ -354,46 +354,53 @@ mod tests {
         )
         .unwrap();
 
-        let mut ctx = crate::tools::common::test_ctx(tmp.path());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        ctx.events = Some(tx);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let mut ctx = crate::tools::common::test_ctx(tmp.path());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            ctx.events = Some(tx);
 
-        let tool = McpTool;
-        let output = tool
-            .call(
-                serde_json::json!({ "script": "mcp.search('context_usage')" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
-            panic!(
-                "mcp.search output should be JSON: {error}; output bytes: {:?}",
-                output.content.as_bytes()
-            )
-        });
-        assert_no_configured_cockpit_hits(&hits, &output.content);
-        let notice = rx.try_recv().expect("expected reserved-id notice");
-        assert!(
-            matches!(notice, TurnEvent::Notice { ref text } if text.contains("reserved")),
-            "unexpected notice: {notice:?}"
-        );
+            let tool = McpTool;
+            let output = tool
+                .call(
+                    serde_json::json!({ "script": "mcp.search('context_usage')" }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
+                panic!(
+                    "mcp.search output should be JSON: {error}; output bytes: {:?}",
+                    output.content.as_bytes()
+                )
+            });
+            assert_no_configured_cockpit_hits(&hits, &output.content);
+            let notice = rx.try_recv().expect("expected reserved-id notice");
+            assert!(
+                matches!(notice, TurnEvent::Notice { ref text } if text.contains("reserved")),
+                "unexpected notice: {notice:?}"
+            );
 
-        let output = tool
-            .call(
-                serde_json::json!({ "script": "mcp.search('context_usage')" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
-            panic!(
-                "mcp.search output should be JSON: {error}; output bytes: {:?}",
-                output.content.as_bytes()
-            )
-        });
-        assert_no_configured_cockpit_hits(&hits, &output.content);
-        assert!(rx.try_recv().is_err(), "notice should be once per session");
+            let output = tool
+                .call(
+                    serde_json::json!({ "script": "mcp.search('context_usage')" }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            let hits: Value = serde_json::from_str(&output.content).unwrap_or_else(|error| {
+                panic!(
+                    "mcp.search output should be JSON: {error}; output bytes: {:?}",
+                    output.content.as_bytes()
+                )
+            });
+            assert_no_configured_cockpit_hits(&hits, &output.content);
+            assert!(rx.try_recv().is_err(), "notice should be once per session");
+        })
+        .await;
     }
 
     fn assert_no_configured_cockpit_hits(hits: &Value, output: &str) {

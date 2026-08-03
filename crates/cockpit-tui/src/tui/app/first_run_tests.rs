@@ -1,9 +1,11 @@
 use super::*;
+use crate::tui::agent_runner::AgentRunner;
 use cockpit_config::providers::{ConfigDoc, ModelEntry, ProviderEntry, ProvidersConfig};
 use cockpit_test_support::TestEnvGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use tokio::sync::mpsc;
 
 fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
     cockpit_core::daemon::DaemonPaths {
@@ -24,6 +26,14 @@ fn write_raw_config(cwd: &std::path::Path, json: &str) {
     let cockpit = cwd.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
     std::fs::write(cockpit.join("config.json"), json).unwrap();
+}
+
+fn with_trusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+        root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
+        mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    cockpit_config::trust::with_workspace_trust_policy(policy, f)
 }
 
 fn config_with_provider(provider_id: &str, model_id: &str) -> ProvidersConfig {
@@ -121,7 +131,7 @@ fn first_run_chains_provider_then_model() {
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
-    assert!(app.service_first_run_flow());
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
 
     assert_eq!(
         app.dialog.test_page_name(),
@@ -160,14 +170,63 @@ fn first_run_flow_completes_end_to_end() {
     write_config(tmp.path(), &config_with_provider("p", "m"));
     app.dialog.test_mark_provider_add_done("p");
 
-    assert!(app.service_first_run_flow());
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     assert_eq!(
         app.dialog.test_page_name(),
         Some(cockpit_core::wizard::MODEL_WIZARD_ID)
     );
     app.dialog.test_mark_setup_complete("model-save");
-    assert!(app.service_first_run_flow());
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
     assert_eq!(app.dialog.test_page_name(), Some("first_run_complete"));
+}
+
+#[test]
+fn first_run_configuration_queues_held_draft_behind_selected_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let mut app = App::new_with_db(
+        Some(tmp.path()),
+        false,
+        cockpit_db::Db::open_in_memory().unwrap(),
+    );
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.composer.set("draft from first run".to_string());
+
+    assert!(!app.submit_input());
+    assert!(app.dialog.test_provider_is_add());
+
+    let mut cfg = config_with_provider("p", "m");
+    cfg.active_model = Some(cockpit_config::providers::ActiveModelRef {
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    write_config(tmp.path(), &cfg);
+    app.dialog.test_mark_provider_add_done("p");
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+    app.dialog.test_mark_setup_complete("model-save");
+
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
+    assert!(with_trusted_workspace(tmp.path(), || app.service_first_run_flow()));
+
+    let request = control_rx.try_recv().expect("model request queued").request;
+    let selection_id = match request {
+        cockpit_core::daemon::proto::Request::SetActiveModel { selection_id, .. } => selection_id,
+        other => panic!("expected model request, got {other:?}"),
+    };
+    let pending = app
+        .pending_model_selection
+        .as_ref()
+        .expect("selection pending");
+    assert_eq!(pending.selection_id, selection_id);
+    let queued = pending.queued_submission.as_ref().expect("draft held");
+    assert_eq!(queued.submission.text, "draft from first run");
+    assert_eq!(app.composer.text(), "draft from first run");
 }
 
 #[test]
@@ -188,6 +247,7 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     assert_eq!(app.composer.text(), "draft message");
     assert!(app.queue.is_empty());
     assert!(app.history.is_empty());
+    assert!(app.submit_after_model_selection);
     assert!(app.dialog.test_provider_is_add());
     assert_eq!(
         app.dialog.test_provider_add_status(),
@@ -198,7 +258,7 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
 }
 
 #[test]
-fn no_model_send_opens_wizard_preserves_input() {
+fn no_provider_send_opens_provider_setup_preserves_input() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
@@ -216,6 +276,7 @@ fn no_model_send_opens_wizard_preserves_input() {
     assert_eq!(app.composer.text(), "draft message");
     assert!(app.queue.is_empty());
     assert!(app.history.is_empty());
+    assert!(app.submit_after_model_selection);
     assert!(app.dialog.test_provider_is_add());
 }
 
@@ -311,6 +372,32 @@ async fn onboarding_never_auto_trusts() {
             .unwrap()
             .is_none()
     );
+    cockpit_config::trust::clear_runtime_policy_for_tests();
+}
+
+#[tokio::test]
+async fn trusting_fresh_workspace_opens_provider_setup_without_manual_reentry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    write_config(tmp.path(), &ProvidersConfig::default());
+    let db = cockpit_db::Db::open_in_memory().unwrap();
+    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
+    let mut app = App::new_with_db_and_workspace_trust(
+        Some(tmp.path()),
+        false,
+        db,
+        StartupWorkspaceTrust::Pending(root.clone()),
+    );
+    app.daemon_prompt = None;
+
+    assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
+    assert!(!app.apply_workspace_trust_choice(
+        root,
+        cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+    ));
+
+    assert!(app.dialog.test_provider_is_add());
+    assert_eq!(app.first_run_flow, FirstRunFlow::AwaitProvider);
     cockpit_config::trust::clear_runtime_policy_for_tests();
 }
 

@@ -392,7 +392,6 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
-    cascade: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     match ctx.db.get_session(session_id).await {
         Ok(Some(_)) => {}
@@ -407,11 +406,8 @@ pub(super) async fn delete_session(
     // Don't delete out from under a running worker (GOALS §17h): stop any
     // live workers in the affected subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
-    stop_subtree(ctx, session_id, cascade).await?;
-    ctx.db
-        .delete_session(session_id, cascade)
-        .await
-        .map_err(internal)?;
+    stop_subtree(ctx, session_id, true).await?;
+    ctx.db.delete_session(session_id).await.map_err(internal)?;
     Ok(Response::Ack)
 }
 

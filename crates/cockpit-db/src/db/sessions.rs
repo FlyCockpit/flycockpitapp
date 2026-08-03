@@ -31,6 +31,10 @@ pub struct SessionRow {
     pub ended_at: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Full daemon-owned session model selection. Kept alongside the indexed
+    /// provider/model projection so reasoning, thinking, and cache choices
+    /// survive resume without making cockpit-db depend on cockpit-config.
+    pub model_selection_json: Option<String>,
     pub session_llm_mode: Option<String>,
     pub tool_surface_override_json: Option<String>,
     pub goal_settings_override_json: Option<String>,
@@ -130,6 +134,7 @@ impl SessionRow {
             ended_at: row.get("ended_at")?,
             provider: row.get("provider")?,
             model: row.get("model")?,
+            model_selection_json: row.get("model_selection_json")?,
             session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
@@ -283,220 +288,38 @@ fn is_short_id_collision(conn: &Connection, err: &rusqlite::Error, row: &Session
         .unwrap_or(false)
 }
 
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for name in rows {
-        if name? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
-    let has_created_by_principal = table_has_column(conn, "sessions", "created_by_principal")?;
-    let has_redaction_table = table_has_column(conn, "sessions", "redaction_table_json")?;
-    let has_model_prompt_snapshot =
-        table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
-    let has_assistant_name = table_has_column(conn, "sessions", "assistant_name")?;
-    let has_goal_settings_override =
-        table_has_column(conn, "sessions", "goal_settings_override_json")?;
-    match (has_created_by_principal, has_redaction_table) {
-        (true, true) => {
-            conn.execute(
-                "INSERT INTO sessions
-                 (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent, short_id, provider, model,
-                  session_llm_mode, tool_surface_override_json,
-                  guidance_baseline_path, guidance_baseline_hash, redaction_table_json,
-                  created_by_principal, shared_with_collaborators)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                params![
-                    row.session_id.to_string(),
-                    row.project_id,
-                    row.project_root,
-                    row.started_at,
-                    row.last_active_at,
-                    row.active_agent,
-                    row.short_id,
-                    row.provider,
-                    row.model,
-                    row.session_llm_mode,
-                    row.tool_surface_override_json,
-                    row.guidance_baseline_path,
-                    row.guidance_baseline_hash,
-                    row.redaction_table_json,
-                    row.created_by_principal,
-                    row.shared_with_collaborators as i64,
-                ],
-            )?;
-        }
-        (true, false) => {
-            conn.execute(
-                "INSERT INTO sessions
-                 (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent, short_id, provider, model,
-                  session_llm_mode, tool_surface_override_json,
-                  guidance_baseline_path, guidance_baseline_hash, created_by_principal,
-                  shared_with_collaborators)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    row.session_id.to_string(),
-                    row.project_id,
-                    row.project_root,
-                    row.started_at,
-                    row.last_active_at,
-                    row.active_agent,
-                    row.short_id,
-                    row.provider,
-                    row.model,
-                    row.session_llm_mode,
-                    row.tool_surface_override_json,
-                    row.guidance_baseline_path,
-                    row.guidance_baseline_hash,
-                    row.created_by_principal,
-                    row.shared_with_collaborators as i64,
-                ],
-            )?;
-        }
-        (_, true) => {
-            conn.execute(
-                "INSERT INTO sessions
-                 (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent, short_id, provider, model,
-                  session_llm_mode, tool_surface_override_json,
-                  guidance_baseline_path, guidance_baseline_hash, redaction_table_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    row.session_id.to_string(),
-                    row.project_id,
-                    row.project_root,
-                    row.started_at,
-                    row.last_active_at,
-                    row.active_agent,
-                    row.short_id,
-                    row.provider,
-                    row.model,
-                    row.session_llm_mode,
-                    row.tool_surface_override_json,
-                    row.guidance_baseline_path,
-                    row.guidance_baseline_hash,
-                    row.redaction_table_json,
-                ],
-            )?;
-        }
-        (false, false) => {
-            conn.execute(
-                "INSERT INTO sessions
-                 (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent, short_id, provider, model,
-                  session_llm_mode, tool_surface_override_json,
-                  guidance_baseline_path, guidance_baseline_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    row.session_id.to_string(),
-                    row.project_id,
-                    row.project_root,
-                    row.started_at,
-                    row.last_active_at,
-                    row.active_agent,
-                    row.short_id,
-                    row.provider,
-                    row.model,
-                    row.session_llm_mode,
-                    row.tool_surface_override_json,
-                    row.guidance_baseline_path,
-                    row.guidance_baseline_hash,
-                ],
-            )?;
-        }
-    }
-    if has_goal_settings_override {
-        conn.execute(
-            "UPDATE sessions
-                SET goal_settings_override_json = ?1
-              WHERE session_id = ?2",
-            params![row.goal_settings_override_json, row.session_id.to_string()],
-        )?;
-    }
-    match (has_model_prompt_snapshot, has_assistant_name) {
-        (true, true) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET model_system_prompt_snapshot_json = ?1,
-                        assistant_name = ?2
-                  WHERE session_id = ?3",
-                params![
-                    row.model_system_prompt_snapshot_json,
-                    row.assistant_name,
-                    row.session_id.to_string(),
-                ],
-            )?;
-        }
-        (true, false) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET model_system_prompt_snapshot_json = ?1
-                  WHERE session_id = ?2",
-                params![
-                    row.model_system_prompt_snapshot_json,
-                    row.session_id.to_string(),
-                ],
-            )?;
-        }
-        (false, true) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET assistant_name = ?1
-                  WHERE session_id = ?2",
-                params![row.assistant_name, row.session_id.to_string()],
-            )?;
-        }
-        (false, false) => {}
-    }
-    Ok(())
-}
-
-fn execute_fork_post_insert_update(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
-    let has_model_prompt_snapshot =
-        table_has_column(conn, "sessions", "model_system_prompt_snapshot_json")?;
-    let has_assistant_name = table_has_column(conn, "sessions", "assistant_name")?;
-    match (has_model_prompt_snapshot, has_assistant_name) {
-        (true, true) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET model_system_prompt_snapshot_json = ?1,
-                        assistant_name = ?2
-                  WHERE session_id = ?3",
-                params![
-                    row.model_system_prompt_snapshot_json,
-                    row.assistant_name,
-                    row.session_id.to_string(),
-                ],
-            )?;
-        }
-        (true, false) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET model_system_prompt_snapshot_json = ?1
-                  WHERE session_id = ?2",
-                params![
-                    row.model_system_prompt_snapshot_json,
-                    row.session_id.to_string(),
-                ],
-            )?;
-        }
-        (false, true) => {
-            conn.execute(
-                "UPDATE sessions
-                    SET assistant_name = ?1
-                  WHERE session_id = ?2",
-                params![row.assistant_name, row.session_id.to_string()],
-            )?;
-        }
-        (false, false) => {}
-    }
+    conn.execute(
+        "INSERT INTO sessions
+         (session_id, project_id, project_root, started_at, last_active_at, active_agent,
+          short_id, provider, model, model_selection_json, session_llm_mode,
+          tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
+          guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
+          assistant_name, created_by_principal, shared_with_collaborators)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        params![
+            row.session_id.to_string(),
+            row.project_id,
+            row.project_root,
+            row.started_at,
+            row.last_active_at,
+            row.active_agent,
+            row.short_id,
+            row.provider,
+            row.model,
+            row.model_selection_json,
+            row.session_llm_mode,
+            row.tool_surface_override_json,
+            row.goal_settings_override_json,
+            row.guidance_baseline_path,
+            row.guidance_baseline_hash,
+            row.redaction_table_json,
+            row.model_system_prompt_snapshot_json,
+            row.assistant_name,
+            row.created_by_principal,
+            row.shared_with_collaborators as i64,
+        ],
+    )?;
     Ok(())
 }
 
@@ -532,8 +355,9 @@ fn execute_fork_insert(
           provider, model, session_llm_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
-          shared_with_collaborators, btw_parent_session_id, btw_tangent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+          shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
+          model_system_prompt_snapshot_json, assistant_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -559,9 +383,11 @@ fn execute_fork_insert(
             row.shared_with_collaborators as i64,
             row.btw_parent_session_id.map(|id| id.to_string()),
             row.btw_tangent as i64,
+            row.model_selection_json,
+            row.model_system_prompt_snapshot_json,
+            row.assistant_name,
         ],
     )?;
-    execute_fork_post_insert_update(conn, row)?;
     Ok(())
 }
 
@@ -633,6 +459,7 @@ fn build_session_row(
         ended_at: None,
         provider: None,
         model: None,
+        model_selection_json: None,
         session_llm_mode: None,
         tool_surface_override_json: None,
         goal_settings_override_json: None,
@@ -862,30 +689,12 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
     })
 }
 
-pub fn delete_session_conn(conn: &Connection, session_id: Uuid, cascade: bool) -> Result<()> {
-    let tx = conn
-        .unchecked_transaction()
-        .context("begin delete_session tx")?;
-    if cascade {
-        let mut to_delete = collect_subtree(&tx, session_id)?;
-        // Descendants first, so a successful cascade never depends on
-        // deleting a parent before its app-level child pointers.
-        to_delete.reverse();
-        for id in to_delete {
-            tx.execute(
-                "DELETE FROM sessions WHERE session_id = ?1",
-                [id.to_string()],
-            )
-            .context("deleting session in cascade")?;
-        }
-    } else {
-        tx.execute(
-            "DELETE FROM sessions WHERE session_id = ?1",
-            [session_id.to_string()],
-        )
-        .context("deleting session")?;
-    }
-    tx.commit().context("commit delete_session tx")?;
+pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    conn.execute(
+        "DELETE FROM sessions WHERE session_id = ?1",
+        [session_id.to_string()],
+    )
+    .context("deleting session")?;
     Ok(())
 }
 
@@ -1128,6 +937,7 @@ impl Db {
                 ended_at: None,
                 provider: parent.provider,
                 model: parent.model,
+                model_selection_json: parent.model_selection_json,
                 session_llm_mode: parent.session_llm_mode,
                 tool_surface_override_json: parent.tool_surface_override_json,
                 goal_settings_override_json: parent.goal_settings_override_json,
@@ -1182,7 +992,7 @@ impl Db {
             let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? else {
                 return Ok(false);
             };
-            delete_session_conn(conn, info.session_id, true)?;
+            delete_session_conn(conn, info.session_id)?;
             Ok(true)
         })
         .await
@@ -1233,6 +1043,7 @@ impl Db {
             ended_at: None,
             provider: parent.provider,
             model: parent.model,
+            model_selection_json: parent.model_selection_json,
             session_llm_mode: parent.session_llm_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
@@ -1536,16 +1347,13 @@ impl Db {
         Ok(out)
     }
 
-    /// Delete a session. With `cascade = true`, also deletes every
-    /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
-    /// / inference_calls / lock state takes care of dependent rows.
-    pub async fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
-        let session_ids = if cascade {
-            self.read(move |conn| collect_subtree(conn, session_id))
-                .await?
-        } else {
-            vec![session_id]
-        };
+    /// Delete a session and its complete fork subtree. SQLite owns the
+    /// cascading relationship; the pre-delete walk only discovers sidecar
+    /// files that must be removed after the transaction commits.
+    pub async fn delete_session(&self, session_id: Uuid) -> Result<()> {
+        let session_ids = self
+            .read(move |conn| collect_subtree(conn, session_id))
+            .await?;
         let mut sidecars = Vec::new();
         for id in session_ids {
             for payload in self.list_task_delegation_payloads(id).await? {
@@ -1554,7 +1362,7 @@ impl Db {
                 }
             }
         }
-        self.write(move |conn| delete_session_conn(conn, session_id, cascade))
+        self.write(move |conn| delete_session_conn(conn, session_id))
             .await?;
         for path in sidecars {
             match std::fs::remove_file(&path) {
@@ -1583,7 +1391,7 @@ impl Db {
                 Some(row) if row.ephemeral => {}
                 _ => return Ok(false),
             }
-            delete_session_conn(conn, session_id, true)?;
+            delete_session_conn(conn, session_id)?;
             Ok(true)
         })
         .await
@@ -1621,7 +1429,7 @@ impl Db {
         let mut removed = 0;
         for id in roots {
             // Cascade in case a side conversation itself spawned forks.
-            match self.delete_session(id, true).await {
+            match self.delete_session(id).await {
                 Ok(()) => removed += 1,
                 Err(error) => {
                     tracing::warn!(
@@ -1800,25 +1608,6 @@ impl Db {
                 params![redaction_table_json, session_id.to_string()],
             )
             .context("setting session redaction table")?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn set_session_model(
-        &self,
-        session_id: Uuid,
-        provider: &str,
-        model: &str,
-    ) -> Result<()> {
-        let provider = provider.to_owned();
-        let model = model.to_owned();
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
-                params![provider, model, session_id.to_string()],
-            )
-            .context("setting session model")?;
             Ok(())
         })
         .await
@@ -2555,9 +2344,6 @@ mod tests {
             .await
             .unwrap();
 
-        db.set_session_model(session.session_id, "openai", "gpt-5")
-            .await
-            .unwrap();
         db.set_session_agent(session.session_id, "Review")
             .await
             .unwrap();
@@ -2566,8 +2352,6 @@ mod tests {
             .unwrap();
 
         let stored = db.get_session(session.session_id).await.unwrap().unwrap();
-        assert_eq!(stored.provider.as_deref(), Some("openai"));
-        assert_eq!(stored.model.as_deref(), Some("gpt-5"));
         assert_eq!(stored.active_agent, "Review");
         assert_eq!(stored.title.as_deref(), Some("Reviewed title"));
         assert!(stored.user_renamed);
@@ -2695,17 +2479,14 @@ mod tests {
                  BEFORE DELETE ON sessions
                  WHEN OLD.session_id = '{}'
                  BEGIN
-                     SELECT RAISE(FAIL, 'db async sessions injected delete failure');
+                     SELECT RAISE(ABORT, 'db async sessions injected delete failure');
                  END;",
                 child.session_id
             ),
         )
         .await;
 
-        let error = db
-            .delete_session(parent.session_id, true)
-            .await
-            .unwrap_err();
+        let error = db.delete_session(parent.session_id).await.unwrap_err();
         assert!(
             format!("{error:#}").contains("db async sessions injected delete failure"),
             "unexpected error: {error:#}"
@@ -3441,7 +3222,7 @@ mod tests {
         let parent = db.create_session("p", "/x", "a").await.unwrap();
         let child = db.create_fork(parent.session_id, None).await.unwrap();
         let grandchild = db.create_fork(child.session_id, None).await.unwrap();
-        db.delete_session(parent.session_id, true).await.unwrap();
+        db.delete_session(parent.session_id).await.unwrap();
         assert!(db.get_session(parent.session_id).await.unwrap().is_none());
         assert!(db.get_session(child.session_id).await.unwrap().is_none());
         assert!(
@@ -3465,17 +3246,14 @@ mod tests {
                  BEFORE DELETE ON sessions
                  WHEN OLD.session_id = '{}'
                  BEGIN
-                     SELECT RAISE(FAIL, 'injected cascade delete failure');
+                     SELECT RAISE(ABORT, 'injected cascade delete failure');
                  END;",
                 child.session_id
             ),
         )
         .await;
 
-        let err = db
-            .delete_session(parent.session_id, true)
-            .await
-            .unwrap_err();
+        let err = db.delete_session(parent.session_id).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected cascade delete failure"),
@@ -3490,15 +3268,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_session_no_cascade_leaves_forks() {
+    async fn raw_sql_delete_cascades_through_the_fork_tree() {
         let db = Db::open_in_memory().unwrap();
         let parent = db.create_session("p", "/x", "a").await.unwrap();
         let child = db.create_fork(parent.session_id, None).await.unwrap();
-        db.delete_session(parent.session_id, false).await.unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                [parent.session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert!(db.get_session(parent.session_id).await.unwrap().is_none());
-        // The child is still there — its parent_session_id now points at a
-        // dangling id, which the application layer is expected to handle.
-        assert!(db.get_session(child.session_id).await.unwrap().is_some());
+        assert!(db.get_session(child.session_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4187,7 +3971,7 @@ mod tests {
         let parent = db.create_session("p", "/proj", "Build").await.unwrap();
         let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
 
-        db.delete_session(parent.session_id, true).await.unwrap();
+        db.delete_session(parent.session_id).await.unwrap();
 
         assert!(db.get_session(parent.session_id).await.unwrap().is_none());
         assert!(db.get_session(btw.info.session_id).await.unwrap().is_none());

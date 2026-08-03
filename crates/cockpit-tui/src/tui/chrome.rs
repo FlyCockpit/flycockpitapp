@@ -65,6 +65,18 @@ pub struct LeftStatus {
     pub hits: Vec<FooterHit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongcacheStatus {
+    enabled: bool,
+    supported: bool,
+}
+
+impl LongcacheStatus {
+    pub const fn new(enabled: bool, supported: bool) -> Self {
+        Self { enabled, supported }
+    }
+}
+
 /// Bottom-left status: `agent path · provider/model · mode`.
 ///
 ///   - The model glyph is green when trusted, dark yellow when marked
@@ -78,9 +90,12 @@ pub fn left_status(
     selected: Option<FooterControl>,
     sandbox_mode: SandboxMode,
     sandbox_escalation_enabled: bool,
-    longcache_enabled: bool,
-    longcache_supported: bool,
+    longcache: LongcacheStatus,
 ) -> LeftStatus {
+    let LongcacheStatus {
+        enabled: longcache_enabled,
+        supported: longcache_supported,
+    } = longcache;
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut hits = Vec::new();
@@ -410,8 +425,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         )
         .spans;
         let agent = spans
@@ -436,8 +450,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         )
         .spans;
         let model = spans
@@ -458,8 +471,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         )
         .spans
         .iter()
@@ -480,8 +492,7 @@ mod tests {
             Some(FooterControl::Mode),
             SandboxMode::Sandbox,
             true,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         );
         let text = status
             .spans
@@ -529,8 +540,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         );
         let off_text = off
             .spans
@@ -546,8 +556,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            true,
-            true,
+            LongcacheStatus::new(true, true),
         );
         let supported_text = supported
             .spans
@@ -564,8 +573,7 @@ mod tests {
             None,
             SandboxMode::Sandbox,
             true,
-            true,
-            false,
+            LongcacheStatus::new(true, false),
         );
         let unsupported_text = unsupported
             .spans
@@ -587,8 +595,7 @@ mod tests {
             None,
             mode,
             escalation_enabled,
-            false,
-            true,
+            LongcacheStatus::new(false, true),
         )
         .spans
         .iter()

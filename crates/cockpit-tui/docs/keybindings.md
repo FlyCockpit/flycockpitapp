@@ -106,6 +106,8 @@ Open the in-TUI keybinding overlay with `Ctrl+K` or `/keys`. `Esc`, `q`, or `Ctr
 | `↑/↓` | move | highlight a model |
 | `type` | filter | filter the model list |
 | `Enter` | select | switch to the highlighted model |
+| `Ctrl+Enter` | make default | switch this session and save the future-session default |
+| `Ctrl+A` | add model | add a model to the scoped provider |
 | `Esc` | cancel | close without changing the model |
 
 ## Settings

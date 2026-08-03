@@ -538,6 +538,13 @@ async fn model_switch_carries_prompt_cache_retention() {
             .as_deref(),
         Some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
     );
+    assert_eq!(
+        driver
+            .session
+            .active_model_ref()
+            .and_then(|active| active.prompt_cache_retention),
+        Some(PromptCacheRetention::Extended)
+    );
     let (cfg, _, _) = driver
         .test_providers_override
         .as_ref()
@@ -613,21 +620,22 @@ async fn live_model_switch_commits_config_and_session_together() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
-    driver
-        .run_control(
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::nil(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Daemon,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx,
-        )
-        .await;
+    run_control_with_trusted_project_config(
+        &mut driver,
+        tmp.path(),
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::nil(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: true,
+            trigger: crate::session::ModelSwitchTrigger::Daemon,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx,
+    )
+    .await;
 
     assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
@@ -639,6 +647,25 @@ async fn live_model_switch_commits_config_and_session_together() {
     assert_disk_config_active_model(tmp.path(), "provider-b", "model-b");
     assert_one_model_switch_event(&driver, "ok", false).await;
     drain_until_active_model_state(&mut rx);
+    match rx.try_recv().expect("terminal selection result") {
+        TurnEvent::ModelSelectionResult {
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Applied {
+                    active_state,
+                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                },
+            ..
+        } => {
+            let default = active_state
+                .default_selection
+                .as_ref()
+                .expect("saved default reflected immediately");
+            assert_eq!(default.provider, "provider-b");
+            assert_eq!(default.model, "model-b");
+            assert!(!active_state.diverged);
+        }
+        other => panic!("expected successful default save, got {other:?}"),
+    }
 }
 #[tokio::test]
 async fn expired_model_selection_deadline_rejects_without_mutating_session() {
@@ -687,6 +714,45 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
     assert!(
         rx.try_recv().is_err(),
         "deadline emits exactly one terminal result"
+    );
+}
+
+#[tokio::test]
+async fn worker_terminal_claim_before_commit_prevents_late_model_mutation() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let terminal_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModelWithDeadline {
+                selection_id: uuid::Uuid::new_v4(),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                terminal_claimed,
+                completion: completion_tx,
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    completion_rx.await.expect("driver completion signal");
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert!(
+        rx.try_recv().is_err(),
+        "the worker-owned terminal outcome remains the only result"
     );
 }
 
@@ -742,12 +808,29 @@ async fn live_model_switch_persists_requested_reasoning_options() {
                 persist_as_default: true,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
-                thinking_mode: Some("high".into()),
+                thinking_mode: Some(crate::config::providers::ThinkingMode::High),
                 prompt_cache_retention: None,
             },
             &tx,
         )
         .await;
+    let persisted = driver
+        .session
+        .active_model_ref()
+        .expect("full selection persisted in the session");
+    assert_eq!(persisted.provider, "provider-b");
+    assert_eq!(persisted.model, "model-b");
+    assert_eq!(
+        persisted
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| effort.value.as_str()),
+        Some("xhigh")
+    );
+    assert_eq!(
+        persisted.thinking_mode,
+        Some(crate::config::providers::ThinkingMode::High)
+    );
 
     let (cfg, _, _) = driver
         .test_providers_override
@@ -767,6 +850,65 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         active.thinking_mode,
         Some(crate::config::providers::ThinkingMode::High)
     );
+}
+
+#[tokio::test]
+async fn same_identity_preference_change_is_applied_and_persisted() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let before = Arc::as_ptr(&driver.stack[0].agent);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                persist_as_default: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: Some("xhigh".into()),
+                thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_ne!(
+        Arc::as_ptr(&driver.stack[0].agent),
+        before,
+        "changing preferences on the same provider/model is not a no-op"
+    );
+    let persisted = driver
+        .session
+        .active_model_ref()
+        .expect("full selection persisted in the session");
+    assert_eq!(
+        persisted
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| effort.value.as_str()),
+        Some("xhigh")
+    );
+    assert_eq!(
+        persisted.thinking_mode,
+        Some(crate::config::providers::ThinkingMode::High)
+    );
+    let state = drain_until_active_model_state(&mut rx);
+    match state {
+        TurnEvent::ActiveModelState {
+            selection,
+            default_selection,
+            diverged,
+            ..
+        } => {
+            assert_eq!(selection, persisted);
+            assert!(default_selection.is_some());
+            assert!(diverged);
+        }
+        other => panic!("expected ActiveModelState, got {other:?}"),
+    }
+    assert_terminal_model_selection(&mut rx, true);
 }
 
 /// Switching to an unconfigured model surfaces a loud `Notice` error and
@@ -859,10 +1001,10 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     assert_terminal_model_selection(&mut rx, false);
 }
 
-/// A config write failure rolls the session row back and keeps the live root
-/// model on the previous provider/model pair.
+/// Saving the future default is a secondary outcome: a config write failure
+/// must not undo a successfully-built and durably-persisted session switch.
 #[tokio::test]
-async fn live_model_switch_config_write_failure_rolls_back() {
+async fn live_model_switch_config_write_failure_keeps_session_switch() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver.test_fail_next_active_model_config_write = true;
@@ -883,17 +1025,36 @@ async fn live_model_switch_config_write_failure_rolls_back() {
         )
         .await;
 
-    assert_notice_contains(&mut rx, "config write failure");
-    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
     assert_eq!(
         driver.session.active_provider().as_deref(),
-        Some("provider-a")
+        Some("provider-b")
     );
-    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
     assert_config_active_model(&driver, "provider-a", "model-a");
-    assert_one_model_switch_event(&driver, "send_failed", true).await;
+    assert_one_model_switch_event(&driver, "ok", false).await;
     drain_until_active_model_state(&mut rx);
+    match rx.try_recv().expect("terminal selection result") {
+        TurnEvent::ModelSelectionResult {
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Applied {
+                    active_state,
+                    default_update:
+                        crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
+                            diagnostic_code,
+                            user_message,
+                        },
+                },
+            ..
+        } => {
+            assert!(active_state.diverged);
+            assert_eq!(diagnostic_code, "default_model_write_failed");
+            assert!(user_message.contains("could not save it as the default"));
+        }
+        other => panic!("expected applied selection with default-save failure, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "failure is reported exactly once");
 }
 
 /// The legacy unconfigured-target regression remains: the active model is
@@ -975,17 +1136,16 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
         .expect("same-model re-select emits authoritative state")
     {
         TurnEvent::ActiveModelState {
-            provider,
-            model,
-            config_provider,
-            config_model,
+            selection,
+            default_selection,
             diverged,
             generation,
         } => {
-            assert_eq!(provider, "provider-a");
-            assert_eq!(model, "model-a");
-            assert_eq!(config_provider.as_deref(), Some("provider-a"));
-            assert_eq!(config_model.as_deref(), Some("model-a"));
+            assert_eq!(selection.provider, "provider-a");
+            assert_eq!(selection.model, "model-a");
+            let default_selection = default_selection.expect("default selection");
+            assert_eq!(default_selection.provider, "provider-a");
+            assert_eq!(default_selection.model, "model-a");
             assert!(!diverged);
             assert_eq!(generation, 1);
         }
@@ -999,14 +1159,14 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
             selection_id,
             provider,
             model,
-            outcome: crate::daemon::proto::ModelSelectionOutcome::Applied { active_state },
+            outcome: crate::daemon::proto::ModelSelectionOutcome::Applied { active_state, .. },
             ..
         } => {
             assert_eq!(selection_id, uuid::Uuid::nil());
             assert_eq!(provider, "provider-a");
             assert_eq!(model, "model-a");
-            assert_eq!(active_state.provider, "provider-a");
-            assert_eq!(active_state.model, "model-a");
+            assert_eq!(active_state.selection.provider, "provider-a");
+            assert_eq!(active_state.selection.model, "model-a");
         }
         other => panic!("expected ModelSelectionResult, got {other:?}"),
     }
@@ -1066,17 +1226,16 @@ async fn live_model_switch_emits_active_model_state_event() {
     let event = drain_until_active_model_state(&mut rx);
     match event {
         TurnEvent::ActiveModelState {
-            provider,
-            model,
-            config_provider,
-            config_model,
+            selection,
+            default_selection,
             diverged,
             generation,
         } => {
-            assert_eq!(provider, "provider-b");
-            assert_eq!(model, "model-b");
-            assert_eq!(config_provider.as_deref(), Some("provider-b"));
-            assert_eq!(config_model.as_deref(), Some("model-b"));
+            assert_eq!(selection.provider, "provider-b");
+            assert_eq!(selection.model, "model-b");
+            let default_selection = default_selection.expect("default selection");
+            assert_eq!(default_selection.provider, "provider-b");
+            assert_eq!(default_selection.model, "model-b");
             assert!(!diverged);
             assert_eq!(generation, 1);
         }
@@ -1092,21 +1251,22 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver.test_fail_next_model_switch_audit_record = true;
 
-    driver
-        .run_control(
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::nil(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Daemon,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx,
-        )
-        .await;
+    run_control_with_trusted_project_config(
+        &mut driver,
+        tmp.path(),
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::nil(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: true,
+            trigger: crate::session::ModelSwitchTrigger::Daemon,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx,
+    )
+    .await;
 
     assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
     assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
@@ -1175,7 +1335,10 @@ fn assert_terminal_model_selection(rx: &mut mpsc::Receiver<TurnEvent>, applied: 
         } => {
             assert_eq!(selection_id, uuid::Uuid::nil());
             match (applied, outcome) {
-                (true, crate::daemon::proto::ModelSelectionOutcome::Applied { active_state }) => {
+                (
+                    true,
+                    crate::daemon::proto::ModelSelectionOutcome::Applied { active_state, .. },
+                ) => {
                     assert_eq!(active_state.generation, 1);
                 }
                 (
@@ -1206,8 +1369,29 @@ fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = model_switch_driver();
     write_two_model_config(tmp.path(), "provider-a", "model-a");
     driver.test_providers_override = None;
-    driver.refresh_config_from_disk_for_tests();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::with_workspace_trust_policy(policy, || {
+        driver.refresh_config_from_disk_for_tests();
+    });
     (driver, tmp)
+}
+
+async fn run_control_with_trusted_project_config(
+    driver: &mut Driver,
+    project_root: &std::path::Path,
+    control: DriverControl,
+    tx: &mpsc::Sender<TurnEvent>,
+) {
+    let root = crate::config::trust::resolve_trust_root(project_root).unwrap();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, driver.run_control(control, tx))
+        .await;
 }
 
 fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
@@ -1358,25 +1542,32 @@ async fn active_frame_refresh_root_only_stack_is_unchanged_behavior() {
 #[tokio::test]
 async fn active_frame_refresh_picks_up_new_custom_agent_in_subagent_frame() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    push_test_child(&mut driver, Vec::new());
-    let custom = "active-frame-helper";
-    assert!(
-        !task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
-        "custom agent should not be present before its file exists"
-    );
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        push_test_child(&mut driver, Vec::new());
+        let custom = "active-frame-helper";
+        assert!(
+            !task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+            "custom agent should not be present before its file exists"
+        );
 
-    write_custom_agent(tmp.path(), custom);
-    driver.refresh_active_frame_for_turn(&tx).await;
+        write_custom_agent(tmp.path(), custom);
+        driver.refresh_active_frame_for_turn(&tx).await;
 
-    assert!(
-        task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
-        "active child task schema should include the new custom agent after refresh"
-    );
-    assert!(
-        !task_definition_mentions_agent(driver.stack[0].agent.as_ref(), custom),
-        "parked root task schema should not be rebuilt while the child is active"
-    );
+        assert!(
+            task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+            "active child task schema should include the new custom agent after refresh"
+        );
+        assert!(
+            !task_definition_mentions_agent(driver.stack[0].agent.as_ref(), custom),
+            "parked root task schema should not be rebuilt while the child is active"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1398,116 +1589,137 @@ async fn active_frame_refresh_is_byte_identical_when_config_unchanged() {
 #[tokio::test]
 async fn active_frame_tool_surface_refresh_survives_model_build_failure() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_test_child(&mut driver, Vec::new());
-    let custom = "model-failure-helper";
-    write_custom_agent(tmp.path(), custom);
-    driver.test_providers_override = Some((
-        crate::config::providers::ProvidersConfig::default(),
-        "provider-a".into(),
-        "model-a".into(),
-    ));
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_test_child(&mut driver, Vec::new());
+        let custom = "model-failure-helper";
+        write_custom_agent(tmp.path(), custom);
+        driver.test_providers_override = Some((
+            crate::config::providers::ProvidersConfig::default(),
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
-    driver.refresh_active_frame_for_turn(&tx).await;
+        driver.refresh_active_frame_for_turn(&tx).await;
 
-    let notices = drain_notices(&mut rx);
-    assert!(
-        notices
-            .iter()
-            .any(|text| text.contains("Refreshing the active model from config failed")),
-        "model refresh failure must emit its existing notice: {notices:?}"
-    );
-    assert!(
-        task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
-        "tool surface should still pick up the custom agent when model rebuild fails"
-    );
+        let notices = drain_notices(&mut rx);
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("Refreshing the active model from config failed")),
+            "model refresh failure must emit its existing notice: {notices:?}"
+        );
+        assert!(
+            task_definition_mentions_agent(driver.stack.last().unwrap().agent.as_ref(), custom),
+            "tool surface should still pick up the custom agent when model rebuild fails"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn active_frame_tool_surface_refresh_failure_emits_its_own_notice() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_named_test_child(&mut driver, "builder");
-    let active_idx = driver.stack.len() - 1;
-    let before = Arc::as_ptr(&driver.stack[active_idx].agent);
-    write_malformed_agent_override(tmp.path(), "builder");
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_named_test_child(&mut driver, "builder");
+        let active_idx = driver.stack.len() - 1;
+        let before = Arc::as_ptr(&driver.stack[active_idx].agent);
+        write_malformed_agent_override(tmp.path(), "builder");
 
-    driver
-        .refresh_active_tool_surface_for_turn(active_idx, &tx)
-        .await;
+        driver
+            .refresh_active_tool_surface_for_turn(active_idx, &tx)
+            .await;
 
-    assert_eq!(
-        Arc::as_ptr(&driver.stack[active_idx].agent),
-        before,
-        "non-root tool-surface failure must retain the previous agent"
-    );
-    let notices = drain_notices(&mut rx);
-    assert_eq!(notices.len(), 1, "expected one tool-surface notice");
-    assert!(
-        notices[0].contains("tool surface")
-            && notices[0].contains("Keeping the previous tool surface"),
-        "unexpected notice: {}",
-        notices[0]
-    );
-    assert_eq!(
-        driver.stack[active_idx].agent.name, "builder",
-        "non-root failure must not fall back to the default Build primary"
-    );
+        assert_eq!(
+            Arc::as_ptr(&driver.stack[active_idx].agent),
+            before,
+            "non-root tool-surface failure must retain the previous agent"
+        );
+        let notices = drain_notices(&mut rx);
+        assert_eq!(notices.len(), 1, "expected one tool-surface notice");
+        assert!(
+            notices[0].contains("tool surface")
+                && notices[0].contains("Keeping the previous tool surface"),
+            "unexpected notice: {}",
+            notices[0]
+        );
+        assert_eq!(
+            driver.stack[active_idx].agent.name, "builder",
+            "non-root failure must not fall back to the default Build primary"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn active_frame_refresh_notices_dedupe_independently() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_named_test_child(&mut driver, "builder");
-    write_malformed_agent_override(tmp.path(), "builder");
-    driver.test_providers_override = Some((
-        crate::config::providers::ProvidersConfig::default(),
-        "provider-a".into(),
-        "model-a".into(),
-    ));
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_named_test_child(&mut driver, "builder");
+        write_malformed_agent_override(tmp.path(), "builder");
+        driver.test_providers_override = Some((
+            crate::config::providers::ProvidersConfig::default(),
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
-    driver.refresh_active_frame_for_turn(&tx).await;
-    let notices = drain_notices(&mut rx);
-    assert_eq!(
-        notices.len(),
-        2,
-        "both independent failures should report once"
-    );
-    assert!(notices.iter().any(|text| text.contains("active model")));
-    assert!(notices.iter().any(|text| text.contains("tool surface")));
+        driver.refresh_active_frame_for_turn(&tx).await;
+        let notices = drain_notices(&mut rx);
+        assert_eq!(
+            notices.len(),
+            2,
+            "both independent failures should report once"
+        );
+        assert!(notices.iter().any(|text| text.contains("active model")));
+        assert!(notices.iter().any(|text| text.contains("tool surface")));
 
-    driver.refresh_active_frame_for_turn(&tx).await;
-    assert!(
-        drain_notices(&mut rx).is_empty(),
-        "identical recurring failures should dedupe independently"
-    );
+        driver.refresh_active_frame_for_turn(&tx).await;
+        assert!(
+            drain_notices(&mut rx).is_empty(),
+            "identical recurring failures should dedupe independently"
+        );
 
-    remove_agent_override(tmp.path(), "builder");
-    driver.test_providers_override = Some((
-        two_model_providers_config(),
-        "provider-a".into(),
-        "model-a".into(),
-    ));
-    driver.refresh_active_frame_for_turn(&tx).await;
-    assert!(
-        drain_notices(&mut rx).is_empty(),
-        "successful refresh clears both dedupe slots without a notice"
-    );
+        remove_agent_override(tmp.path(), "builder");
+        driver.test_providers_override = Some((
+            two_model_providers_config(),
+            "provider-a".into(),
+            "model-a".into(),
+        ));
+        driver.refresh_active_frame_for_turn(&tx).await;
+        assert!(
+            drain_notices(&mut rx).is_empty(),
+            "successful refresh clears both dedupe slots without a notice"
+        );
 
-    write_malformed_agent_override(tmp.path(), "builder");
-    driver.refresh_active_frame_for_turn(&tx).await;
-    let notices = drain_notices(&mut rx);
-    assert_eq!(
-        notices.len(),
-        1,
-        "only the reintroduced failure should notify"
-    );
-    assert!(
-        notices[0].contains("tool surface"),
-        "unexpected notice: {}",
-        notices[0]
-    );
+        write_malformed_agent_override(tmp.path(), "builder");
+        driver.refresh_active_frame_for_turn(&tx).await;
+        let notices = drain_notices(&mut rx);
+        assert_eq!(
+            notices.len(),
+            1,
+            "only the reintroduced failure should notify"
+        );
+        assert!(
+            notices[0].contains("tool surface"),
+            "unexpected notice: {}",
+            notices[0]
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1524,45 +1736,59 @@ async fn active_frame_refresh_updates_schedule_agent() {
 #[tokio::test]
 async fn active_frame_refresh_updates_schedule_when_tool_surface_fails() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_named_test_child(&mut driver, "builder");
-    write_malformed_agent_override(tmp.path(), "builder");
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_named_test_child(&mut driver, "builder");
+        write_malformed_agent_override(tmp.path(), "builder");
 
-    driver.refresh_active_frame_for_turn(&tx).await;
+        driver.refresh_active_frame_for_turn(&tx).await;
 
-    assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
-    assert!(
-        drain_notices(&mut rx)
-            .iter()
-            .any(|notice| notice.contains("tool surface")),
-        "tool-surface failure should still be surfaced"
-    );
+        assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
+        assert!(
+            drain_notices(&mut rx)
+                .iter()
+                .any(|notice| notice.contains("tool surface")),
+            "tool-surface failure should still be surfaced"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_named_test_child(&mut driver, "builder");
-    write_malformed_agent_override(tmp.path(), "builder");
-    driver.test_providers_override = Some((
-        crate::config::providers::ProvidersConfig::default(),
-        "provider-a".into(),
-        "model-a".into(),
-    ));
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_named_test_child(&mut driver, "builder");
+        write_malformed_agent_override(tmp.path(), "builder");
+        driver.test_providers_override = Some((
+            crate::config::providers::ProvidersConfig::default(),
+            "provider-a".into(),
+            "model-a".into(),
+        ));
 
-    driver.refresh_active_frame_for_turn(&tx).await;
+        driver.refresh_active_frame_for_turn(&tx).await;
 
-    assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
-    let notices = drain_notices(&mut rx);
-    assert!(
-        notices.iter().any(|notice| notice.contains("active model")),
-        "model refresh failure should be surfaced: {notices:?}"
-    );
-    assert!(
-        notices.iter().any(|notice| notice.contains("tool surface")),
-        "tool-surface failure should be surfaced: {notices:?}"
-    );
+        assert_eq!(driver.schedule.agent_name_for_tests(), "builder");
+        let notices = drain_notices(&mut rx);
+        assert!(
+            notices.iter().any(|notice| notice.contains("active model")),
+            "model refresh failure should be surfaced: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|notice| notice.contains("tool surface")),
+            "tool-surface failure should be surfaced: {notices:?}"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1610,50 +1836,73 @@ async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
 #[tokio::test]
 async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
-    push_named_test_child(&mut driver, "builder");
-    let root_before = Arc::as_ptr(&driver.stack[0].agent);
-    let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
-    write_malformed_agent_override(tmp.path(), "builder");
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        push_named_test_child(&mut driver, "builder");
+        let root_before = Arc::as_ptr(&driver.stack[0].agent);
+        let child_before = Arc::as_ptr(&driver.stack.last().unwrap().agent);
+        let child_provider_before = driver
+            .stack
+            .last()
+            .unwrap()
+            .agent
+            .model
+            .provider_id()
+            .to_string();
+        let child_model_before = driver
+            .stack
+            .last()
+            .unwrap()
+            .agent
+            .model
+            .model_id_ref()
+            .to_string();
+        write_malformed_agent_override(tmp.path(), "builder");
 
-    driver
-        .run_control(
-            DriverControl::SetActiveModel {
-                selection_id: uuid::Uuid::nil(),
-                provider: "provider-b".into(),
-                model: "model-b".into(),
-                persist_as_default: true,
-                trigger: crate::session::ModelSwitchTrigger::Daemon,
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            &tx,
-        )
-        .await;
+        driver
+            .run_control(
+                DriverControl::SetActiveModel {
+                    selection_id: uuid::Uuid::nil(),
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                    persist_as_default: true,
+                    trigger: crate::session::ModelSwitchTrigger::Daemon,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                },
+                &tx,
+            )
+            .await;
 
-    assert_eq!(Arc::as_ptr(&driver.stack[0].agent), root_before);
-    assert_eq!(
-        Arc::as_ptr(&driver.stack.last().unwrap().agent),
-        child_before
-    );
-    assert_eq!(driver.stack.last().unwrap().agent.name, "builder");
-    assert_eq!(
-        driver.stack.last().unwrap().agent.model.provider_id(),
-        "provider-a"
-    );
-    assert_eq!(
-        driver.stack.last().unwrap().agent.model.model_id_ref(),
-        "model-a"
-    );
-    let notices = drain_notices(&mut rx);
-    assert!(
-        notices.iter().any(|notice| {
-            notice.contains("Model switch to `provider-b/model-b` failed")
-                && notice.contains("Keeping the current model active")
-        }),
-        "model switch rebuild failure should be surfaced: {notices:?}"
-    );
+        assert_eq!(Arc::as_ptr(&driver.stack[0].agent), root_before);
+        assert_eq!(
+            Arc::as_ptr(&driver.stack.last().unwrap().agent),
+            child_before
+        );
+        assert_eq!(driver.stack.last().unwrap().agent.name, "builder");
+        assert_eq!(
+            driver.stack.last().unwrap().agent.model.provider_id(),
+            child_provider_before
+        );
+        assert_eq!(
+            driver.stack.last().unwrap().agent.model.model_id_ref(),
+            child_model_before
+        );
+        let notices = drain_notices(&mut rx);
+        assert!(
+            notices.iter().any(|notice| {
+                notice.contains("Model switch to `provider-b/model-b` failed")
+                    && notice.contains("Keeping the current model active")
+            }),
+            "model switch rebuild failure should be surfaced: {notices:?}"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

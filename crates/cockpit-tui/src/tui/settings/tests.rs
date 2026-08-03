@@ -339,10 +339,7 @@ fn oauth_add_step_help_collapses_after_login() {
     let mut add = providers::AddState::new();
     add.enter_oauth_for_test(codex);
     d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
-    assert_eq!(
-        d.help_text(),
-        "enter: continue  s: skip/continue  esc: back"
-    );
+    assert_eq!(d.help_text(), "enter: acknowledge  esc: back");
 
     let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
     grok.logged_in = false;
@@ -436,7 +433,8 @@ fn grok_and_codex_oauth_render_register_link_regions() {
     let links = render_settings_links(&d, 96, 24);
     assert_eq!(links.regions().len(), 0);
 
-    let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://microsoft.com/devicelogin",
         "ABCD-EFGH",
@@ -457,7 +455,8 @@ fn grok_and_codex_oauth_render_register_link_regions() {
         "https://microsoft.com/devicelogin"
     );
 
-    let mut codex_confirming = providers::OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex_confirming =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     codex_confirming.set_device_login_for_test(
         cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
             "https://microsoft.com/devicelogin",

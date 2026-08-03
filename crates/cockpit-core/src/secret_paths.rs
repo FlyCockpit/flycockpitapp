@@ -105,8 +105,10 @@ mod tests {
     }
     #[test]
     fn redact_config_patterns_extend_builtins() {
-        let mut cfg = crate::config::extended::RedactConfig::default();
-        cfg.secret_path_patterns = vec!["vault/**/*.token".to_string()];
+        let cfg = crate::config::extended::RedactConfig {
+            secret_path_patterns: vec!["vault/**/*.token".to_string()],
+            ..Default::default()
+        };
         let matcher = SecretPathMatcher::from_redact_config(&cfg);
         assert!(matcher.is_secret_path(Path::new("vault/app.token")));
         assert!(matcher.is_secret_path(Path::new(".env.local")));

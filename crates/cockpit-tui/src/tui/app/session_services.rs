@@ -164,10 +164,8 @@ impl App {
         self.foreground_input_target = outcome.foreground_target;
         if let Some(state) = outcome.active_model_state {
             self.apply_active_model_state(
-                state.provider,
-                state.model,
-                state.config_provider,
-                state.config_model,
+                state.selection,
+                state.default_selection,
                 state.diverged,
                 state.generation,
             );
@@ -204,10 +202,8 @@ impl App {
         self.foreground_input_target = outcome.foreground_target;
         if let Some(state) = outcome.active_model_state {
             self.apply_active_model_state(
-                state.provider,
-                state.model,
-                state.config_provider,
-                state.config_model,
+                state.selection,
+                state.default_selection,
                 state.diverged,
                 state.generation,
             );

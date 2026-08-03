@@ -899,9 +899,6 @@ pub async fn wait_for_restart_release(
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            if let Some(pid) = expected_pid {
-                remove_metadata_if_pid_matches(paths, pid);
-            }
             return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1373,6 +1370,25 @@ fn stop_unix_with(
     signal: impl Fn(u32) -> Result<()>,
     pid_file_exists: impl Fn() -> bool,
 ) -> Result<bool> {
+    stop_unix_with_timeout(
+        paths,
+        pid,
+        verify,
+        signal,
+        pid_file_exists,
+        restart_release_timeout(None),
+    )
+}
+
+#[cfg(unix)]
+fn stop_unix_with_timeout(
+    paths: &DaemonPaths,
+    pid: u32,
+    verify: impl Fn(u32) -> PidIdentity,
+    signal: impl Fn(u32) -> Result<()>,
+    pid_file_exists: impl Fn() -> bool,
+    timeout: Duration,
+) -> Result<bool> {
     match verify(pid) {
         PidIdentity::VerifiedDaemon => {}
         PidIdentity::Missing | PidIdentity::NotDaemon => {
@@ -1386,18 +1402,36 @@ fn stop_unix_with(
         }
     }
 
-    // SIGTERM is graceful — daemon's signal handler removes its pid/socket
-    // files. Fall back to outright file cleanup if a verified daemon does not
-    // clean up promptly.
+    // SIGTERM is graceful — the daemon may legitimately need the full drain
+    // window before its metadata guard removes the pid/socket files. Never
+    // unlink matching metadata while that verified process remains alive:
+    // doing so would let a replacement start against the same database.
     signal(pid)?;
-    for _ in 0..20 {
-        if !pid_file_exists() {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !pid_file_exists() || read_pid(paths) != Some(pid) {
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(
+            Duration::from_millis(100)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
-    remove_metadata_if_pid_matches(paths, pid);
-    Ok(true)
+    match verify(pid) {
+        PidIdentity::Missing | PidIdentity::NotDaemon => {
+            remove_metadata_if_pid_matches(paths, pid);
+            Ok(true)
+        }
+        PidIdentity::VerifiedDaemon => anyhow::bail!(
+            "timed out waiting for daemon pid {pid} to stop; preserving its pid and socket metadata"
+        ),
+        PidIdentity::Unverified => anyhow::bail!(
+            "daemon pid {pid} did not stop and its identity can no longer be verified; preserving metadata"
+        ),
+    }
 }
 
 fn remove_metadata_if_pid_matches(paths: &DaemonPaths, expected_pid: u32) -> bool {
@@ -2379,6 +2413,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stop_timeout_preserves_matching_live_daemon_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::write(&paths.pid_file, "123").unwrap();
+        std::fs::write(&paths.socket, "live socket").unwrap();
+
+        let error = stop_unix_with_timeout(
+            &paths,
+            123,
+            |_| PidIdentity::VerifiedDaemon,
+            |_| Ok(()),
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("preserving"));
+        assert_eq!(std::fs::read_to_string(&paths.pid_file).unwrap(), "123");
+        assert_eq!(
+            std::fs::read_to_string(&paths.socket).unwrap(),
+            "live socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stop_unverified_pid_fails_closed_without_cleanup_or_signal() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
@@ -2446,7 +2506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_release_wait_cleans_matching_metadata_after_timeout() {
+    async fn restart_release_wait_preserves_live_metadata_after_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::write(&paths.pid_file, "123").unwrap();
@@ -2454,8 +2514,8 @@ mod tests {
 
         wait_for_restart_release(&paths, Some(123), Duration::ZERO).await;
 
-        assert!(!paths.pid_file.exists());
-        assert!(!paths.socket.exists());
+        assert!(paths.pid_file.exists());
+        assert!(paths.socket.exists());
     }
 
     #[cfg(unix)]

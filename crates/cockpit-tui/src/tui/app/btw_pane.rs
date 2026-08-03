@@ -749,7 +749,7 @@ impl App {
                 crate::tui::dialog::DialogState::NO_LOCKOUT
             }
             cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
-                self.fresh_dialog_lockout()
+                self.rehydrated_dialog_lockout()
             }
         };
         self.question_dialog = Some(
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_ux_lockout_only_first_of_chain_btw_path() {
+    fn btw_interrupt_raise_reasons_control_lockout() {
         for (reason, expected_locked) in [
             (InterruptRaiseReason::Initial, true),
             (InterruptRaiseReason::Advance, false),

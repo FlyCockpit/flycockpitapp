@@ -1,4 +1,5 @@
 import type {
+  ActiveModelRef,
   AttachResult,
   EventEnvelope,
   FsListResult,
@@ -11,7 +12,7 @@ import type {
   HistoryEntry as WireHistoryEntry,
   SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";
-import { eventEnvelopeSchema } from "@flycockpit/cockpit-protocol";
+import { activeModelStateSchema, eventEnvelopeSchema } from "@flycockpit/cockpit-protocol";
 import { RemoteSessionClient } from "@flycockpit/cockpit-protocol/client";
 import { create } from "zustand";
 import {
@@ -188,7 +189,12 @@ type RemoteSessionState = {
   loadOlderHistory: (instanceId: string, sessionId: string) => Promise<void>;
   createSession: (
     instanceId: string,
-    input: { projectRoot: string; title?: string; agent?: string; model?: string },
+    input: {
+      projectRoot: string;
+      title?: string;
+      agent?: string;
+      initialModel?: ActiveModelRef;
+    },
   ) => Promise<SessionDetail>;
   sendMessage: (instanceId: string, sessionId: string, text: string) => Promise<void>;
   resolveInterrupt: (
@@ -538,7 +544,11 @@ function nextSeqFromHistory(history: WebHistoryEntry[]) {
   );
 }
 
-function attachSummary(attach: AttachResult, current?: WebSessionSummary): WebSessionSummary {
+function attachSummary(
+  attach: AttachResult,
+  activeModel: WebActiveModelState | undefined,
+  current?: WebSessionSummary,
+): WebSessionSummary {
   return {
     sessionId: attach.session_id,
     projectId: attach.project_id,
@@ -554,7 +564,7 @@ function attachSummary(attach: AttachResult, current?: WebSessionSummary): WebSe
     updatedAt: current?.updatedAt ?? Date.now(),
     createdBy: current?.createdBy ?? null,
     agent: attach.active_agent,
-    model: current?.model,
+    model: activeModel ? `${activeModel.provider}/${activeModel.model}` : current?.model,
     sharedWithCollaborators: current?.sharedWithCollaborators ?? false,
   };
 }
@@ -566,7 +576,15 @@ export function mergeAttach(
   const current = existing.detailsBySession[attach.session_id];
   const mappedHistory = attach.history.map((entry, index) => toWebHistoryEntry(entry, index));
   const mergedHistory = mergeHistorySnapshot(current?.history ?? [], mappedHistory);
-  const summary = attachSummary(attach, current?.summary);
+  const attachedActiveModel = attach.active_model_state
+    ? activeModelFromData(attach.active_model_state as Record<string, unknown>)
+    : null;
+  const activeModel =
+    attachedActiveModel &&
+    (!current?.activeModel || attachedActiveModel.generation >= current.activeModel.generation)
+      ? attachedActiveModel
+      : current?.activeModel;
+  const summary = attachSummary(attach, activeModel, current?.summary);
   return {
     ...existing,
     sessionsByProject: {
@@ -586,7 +604,7 @@ export function mergeAttach(
         usage: current?.usage ?? null,
         paging: pagingFromHistory(mergedHistory, current?.paging),
         llmMode: current?.llmMode,
-        activeModel: current?.activeModel,
+        activeModel,
         sandboxUnavailable: current?.sandboxUnavailable,
         waitingLocks: current?.waitingLocks ?? {},
         pausedWork: current?.pausedWork,
@@ -746,16 +764,14 @@ function applyInferenceFailure(history: WebHistoryEntry[], data: Record<string, 
 }
 
 function activeModelFromData(data: Record<string, unknown>): WebActiveModelState | null {
-  const provider = stringField(data, "provider");
-  const model = stringField(data, "model");
-  const generation = numberField(data, "generation") ?? 0;
-  const diverged = booleanField(data, "diverged");
-  if (!provider || !model || diverged === undefined) return null;
+  const parsed = activeModelStateSchema.safeParse(data);
+  if (!parsed.success) return null;
+  const { selection, default_selection: defaultSelection, diverged, generation } = parsed.data;
   return {
-    provider,
-    model,
-    configProvider: stringField(data, "config_provider"),
-    configModel: stringField(data, "config_model"),
+    provider: selection.provider,
+    model: selection.model,
+    configProvider: defaultSelection?.provider,
+    configModel: defaultSelection?.model,
     diverged,
     generation,
   };
@@ -1279,7 +1295,7 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     const result = await get().clients[instanceId]?.attach({
       project_root: input.projectRoot,
       interactive: true,
-      model_override: input.model,
+      initial_model: input.initialModel,
     });
     if (!result) throw new Error("Instance connection is not open.");
     let created: SessionDetail | null = null;

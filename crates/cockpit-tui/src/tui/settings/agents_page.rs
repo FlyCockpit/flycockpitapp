@@ -914,16 +914,51 @@ mod tests {
         }
     }
 
+    struct TrustedAgentsDialog {
+        dialog: SettingsDialog,
+        trust: cockpit_config::trust::ThreadWorkspaceTrustGuard,
+    }
+
+    impl std::ops::Deref for TrustedAgentsDialog {
+        type Target = SettingsDialog;
+
+        fn deref(&self) -> &Self::Target {
+            &self.dialog
+        }
+    }
+
+    impl std::ops::DerefMut for TrustedAgentsDialog {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.dialog
+        }
+    }
+
+    impl TrustedAgentsDialog {
+        fn into_parts(
+            self,
+        ) -> (
+            SettingsDialog,
+            cockpit_config::trust::ThreadWorkspaceTrustGuard,
+        ) {
+            (self.dialog, self.trust)
+        }
+    }
+
     /// A settings dialog whose `config.json` lives in `<tmp>/.cockpit/`
-    /// and whose picker cwd is `<tmp>`, on the Agents page.
-    fn agents_dialog(tmp: &TempDir) -> SettingsDialog {
+    /// and whose picker cwd is `<tmp>`, on the Agents page. The trust guard
+    /// remains live for the whole test so refreshes exercise the same trusted
+    /// project policy as the production TUI.
+    fn agents_dialog(tmp: &TempDir) -> TrustedAgentsDialog {
         let cockpit = tmp.path().join(".cockpit");
         fs::create_dir_all(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
+        let trust = cockpit_config::trust::enter_workspace_trust_policy(
+            crate::tui::app::trusted_workspace_policy_for_tests(tmp.path()),
+        );
         let mut d = SettingsDialog::open_from_picker(config_path, tmp.path().to_path_buf());
         d.set_test_page(Page::Agents(AgentsPage::new(tmp.path())));
-        d
+        TrustedAgentsDialog { dialog: d, trust }
     }
 
     fn page(d: &SettingsDialog) -> &AgentsPage {
@@ -1530,7 +1565,8 @@ mod tests {
         // external-edit path is recorded and drainable.
         let _g = EditorEnv::with(Some("true"));
         let tmp = TempDir::new().unwrap();
-        let mut outer = super::super::Dialog::Settings(Box::new(agents_dialog(&tmp)));
+        let (dialog, _trust) = agents_dialog(&tmp).into_parts();
+        let mut outer = super::super::Dialog::Settings(Box::new(dialog));
         // Focus + edit `builder` (auto-ejects, then requests $EDITOR).
         if let super::super::Dialog::Settings(s) = &mut outer {
             focus(s, "builder");

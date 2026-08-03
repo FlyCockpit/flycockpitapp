@@ -547,7 +547,17 @@ const MODEL_PICKER: KeyGroup = KeyGroup {
         KeyBinding {
             key: "Enter",
             action: "select",
-            desc: "switch to the highlighted model",
+            desc: "switch session; set default if none exists",
+        },
+        KeyBinding {
+            key: "Ctrl+Enter",
+            action: "make default",
+            desc: "switch this session and save the future-session default",
+        },
+        KeyBinding {
+            key: "Ctrl+A",
+            action: "add model",
+            desc: "add a model to the scoped provider",
         },
         KeyBinding {
             key: "Esc",

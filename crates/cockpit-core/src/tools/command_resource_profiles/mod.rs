@@ -301,7 +301,7 @@ fn collect_matches(
 ) -> BTreeMap<String, ProfileMatch> {
     let mut out: BTreeMap<String, ProfileMatch> = BTreeMap::new();
     for info in simple_commands {
-        let key = info.key.as_storage_str();
+        let key = info.key.as_policy_str();
         let program_name = program_basename(&info.normalized_program);
         for id in builtin_profiles_for_program(&program_name) {
             let entry = out.entry(id.to_string()).or_default();

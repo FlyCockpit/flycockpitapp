@@ -826,9 +826,12 @@ fn run_setup(app: &mut App, args: &str) -> bool {
             } else {
                 None
             },
-            app.pending_model_selection
-                .as_ref()
-                .map(|pending| (pending.provider.clone(), pending.model.clone())),
+            app.pending_model_selection.as_ref().map(|pending| {
+                (
+                    pending.requested.provider.clone(),
+                    pending.requested.model.clone(),
+                )
+            }),
         ))
     } else {
         Dialog::open_setup_wizard(&app.launch.cwd, wizard_id)
@@ -891,21 +894,49 @@ fn run_model_comparison(app: &mut App, _: &str) -> bool {
 }
 
 fn run_favorite(app: &mut App, _: &str) -> bool {
-    match crate::tui::model_picker::toggle_active_favorite(
-        &app.launch.cwd,
-        &app.config_snapshot.providers,
-    ) {
-        Ok((new, p, m)) => {
-            let verb = if new { "marked" } else { "unmarked" };
-            app.history.push(HistoryEntry::Plain {
-                line: format!("/favorite: {verb} {p}/{m} as favorite"),
-            });
-            app.resync_config_after_local_write();
-        }
-        Err(e) => app.history.push(HistoryEntry::Plain {
-            line: format!("/favorite: {e}"),
-        }),
-    }
+    let Some(active) = app.active_model_selection.clone() else {
+        app.history.push(HistoryEntry::Plain {
+            line: "/favorite: no active model — run /model first".to_string(),
+        });
+        return false;
+    };
+    let Some(provider) = app
+        .config_snapshot
+        .providers
+        .providers
+        .get(&active.provider)
+    else {
+        app.push_plain(format!(
+            "/favorite: active provider {} is no longer configured",
+            active.provider
+        ));
+        return false;
+    };
+    let Some(model) = provider
+        .models
+        .iter()
+        .find(|model| model.id == active.model)
+    else {
+        app.push_plain(format!(
+            "/favorite: active model {} is no longer configured for provider {}",
+            active.model, active.provider
+        ));
+        return false;
+    };
+    let favorite = !model.favorite;
+    app.send_daemon_request(
+        "/favorite",
+        cockpit_core::daemon::proto::Request::SetModelFavorite {
+            provider: active.provider.clone(),
+            model: active.model.clone(),
+            favorite,
+        },
+        super::ControlApplied::ModelFavorite {
+            provider: active.provider,
+            model: active.model,
+            favorite,
+        },
+    );
     false
 }
 
@@ -1945,7 +1976,7 @@ impl App {
             pending_model_selection: self.pending_model_selection.as_ref().map(|pending| {
                 format!(
                     "pending {}: {}/{}",
-                    pending.selection_id, pending.provider, pending.model
+                    pending.selection_id, pending.requested.provider, pending.requested.model
                 )
             }),
             sandbox_enabled: Some(!self.no_sandbox),
@@ -2748,6 +2779,61 @@ mod table_tests {
         app.composer.set("/setup security".to_string());
         app.execute_slash(cmd);
         assert_eq!(app.dialog.test_page_name(), Some("security"));
+    }
+
+    #[test]
+    fn favorite_uses_daemon_confirmed_session_model_not_stale_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new(Some(tmp.path()), false);
+        app.daemon_prompt = None;
+        app.dialog = Dialog::None;
+        app.config_snapshot.providers.providers.insert(
+            "p".to_string(),
+            cockpit_config::providers::ProviderEntry {
+                models: vec![cockpit_config::providers::ModelEntry {
+                    id: "a".to_string(),
+                    favorite: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        app.config_snapshot.providers.active_model =
+            Some(cockpit_config::providers::ActiveModelRef {
+                provider: "provider-b".to_string(),
+                model: "stale".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            });
+        app.active_model_selection = Some(cockpit_config::providers::ActiveModelRef {
+            provider: "p".to_string(),
+            model: "a".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        });
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(4);
+        app.agent_runner = Some(Ok(
+            crate::tui::agent_runner::AgentRunner::stub_with_control_tx(control_tx),
+        ));
+
+        run_favorite(&mut app, "");
+
+        assert!(matches!(
+            control_rx.try_recv().expect("favorite request").request,
+            cockpit_core::daemon::proto::Request::SetModelFavorite {
+                provider,
+                model,
+                favorite: true,
+            } if provider == "p" && model == "a"
+        ));
+        assert!(
+            !app.history.iter().any(
+                |entry| matches!(entry, HistoryEntry::Plain { line } if line.contains("marked"))
+            ),
+            "success must wait for daemon acknowledgement"
+        );
     }
 
     #[test]

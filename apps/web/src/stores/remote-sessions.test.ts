@@ -60,6 +60,28 @@ describe("remote session reducers", () => {
     expect(detail.summary.sessionId).toBe(sessionId);
   });
 
+  it("seeds authoritative active model state from the attach snapshot", () => {
+    const state = mergeAttach(empty, {
+      ...attachFixture,
+      active_model_state: {
+        selection: { provider: "openai", model: "gpt-5" },
+        default_selection: { provider: "openai", model: "gpt-5-pro" },
+        diverged: true,
+        generation: 4,
+      },
+    });
+
+    expect(state.detailsBySession[sessionId].activeModel).toEqual({
+      provider: "openai",
+      model: "gpt-5",
+      configProvider: "openai",
+      configModel: "gpt-5-pro",
+      diverged: true,
+      generation: 4,
+    });
+    expect(state.detailsBySession[sessionId].summary.model).toBe("openai/gpt-5");
+  });
+
   it("merges reconnect backfill without dropping newer optimistic entries", () => {
     const first = addOptimisticUserMessage(withDetail(), sessionId, "newer", "local-1");
     const state = mergeAttach(first, attachFixture);
@@ -381,10 +403,8 @@ describe("remote session reducers", () => {
       withDetail(),
       event("active_model_state", {
         session_id: sessionId,
-        provider: "openai",
-        model: "gpt-5",
-        config_provider: "openai",
-        config_model: "gpt-5-pro",
+        selection: { provider: "openai", model: "gpt-5" },
+        default_selection: { provider: "openai", model: "gpt-5-pro" },
         diverged: true,
         generation: 7,
       }),
@@ -393,8 +413,7 @@ describe("remote session reducers", () => {
       first,
       event("active_model_state", {
         session_id: sessionId,
-        provider: "anthropic",
-        model: "claude",
+        selection: { provider: "anthropic", model: "claude" },
         diverged: false,
         generation: 6,
       }),
@@ -403,8 +422,7 @@ describe("remote session reducers", () => {
       stale,
       event("active_model_state", {
         session_id: sessionId,
-        provider: "openai",
-        model: "gpt-5-mini",
+        selection: { provider: "openai", model: "gpt-5-mini" },
         diverged: false,
         generation: 8,
       }),

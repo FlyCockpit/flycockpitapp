@@ -128,10 +128,16 @@ mod tests {
         assert_eq!(loaded.tools.unwrap(), vec!["read", "bash"]);
 
         let cwd = temp.path();
-        let listing = crate::agents::list_all(cwd)
-            .into_iter()
-            .find(|entry| entry.name == "helper")
-            .expect("custom agent listed");
+        let policy = cockpit_config::trust::WorkspaceTrustPolicy {
+            root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
+            mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let listing = cockpit_config::trust::with_workspace_trust_policy(policy, || {
+            crate::agents::list_all(cwd)
+                .into_iter()
+                .find(|entry| entry.name == "helper")
+                .expect("custom agent listed")
+        });
         assert!(matches!(listing.kind, AgentKind::Custom));
         assert!(listing.def.is_ok());
     }

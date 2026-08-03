@@ -21,6 +21,16 @@ pub enum GoalStatus {
 }
 
 impl GoalStatus {
+    pub const ALL: [Self; 7] = [
+        Self::Active,
+        Self::Paused,
+        Self::Blocked,
+        Self::PendingVerification,
+        Self::Complete,
+        Self::BudgetLimited,
+        Self::UsageLimited,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",

@@ -59,19 +59,19 @@ CREATE TABLE sessions (
     ended_at        INTEGER,
     provider        TEXT,
     model           TEXT,
-    session_llm_mode TEXT,
+    model_selection_json TEXT,
+    session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     tool_surface_override_json TEXT,
     goal_settings_override_json TEXT,
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
     assistant_name  TEXT,
 
-    -- fork tree + auto-titling (GOALS §17). Parent/fork integrity and the
-    -- fork-subtree deletion cascade are enforced at the application layer
-    -- (src/db/sessions.rs), not by an FK.
+    -- fork tree + auto-titling (GOALS §17). SQLite owns parent integrity
+    -- and cascades deletion through the complete fork subtree.
     parent_session_id  TEXT,                     -- NULL = root
     fork_point_turn_id TEXT,                     -- turn in parent where fork branched; NULL = root
     title              TEXT,                     -- utility-model-generated label (§17d)
-    user_renamed       INTEGER NOT NULL DEFAULT 0, -- 1 = user set title; locks out auto-titling
+    user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT,                     -- 6-char Crockford base32 display id
 
     -- read/unread + archive state for the session browser (GOALS §17f).
@@ -103,13 +103,13 @@ CREATE TABLE sessions (
     -- throwaway and swept on daemon boot; BTW rows carry
     -- btw_parent_session_id and are persistent until explicit end or parent
     -- deletion.
-    ephemeral INTEGER NOT NULL DEFAULT 0,
+    ephemeral INTEGER NOT NULL DEFAULT 0 CHECK (ephemeral IN (0, 1)),
 
     -- Persistent `/btw` side-conversation linkage. A BTW row is also a
     -- fork-tree child via parent_session_id, but this typed linkage is the
     -- authoritative lifecycle marker and uniqueness key.
     btw_parent_session_id TEXT,
-    btw_tangent INTEGER NOT NULL DEFAULT 0,
+    btw_tangent INTEGER NOT NULL DEFAULT 0 CHECK (btw_tangent IN (0, 1)),
 
     -- persisted auto-title progress (GOALS §17d): running cl100k_base
     -- estimate of RAW typed user content, and the last consumed scheduled
@@ -120,8 +120,10 @@ CREATE TABLE sessions (
 
     -- remote principal attribution + collaborator sharing.
     created_by_principal TEXT,
-    shared_with_collaborators INTEGER NOT NULL DEFAULT 0,
+    shared_with_collaborators INTEGER NOT NULL DEFAULT 0 CHECK (shared_with_collaborators IN (0, 1)),
 
+    CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -198,13 +200,13 @@ CREATE TABLE tool_call_events (
     -- recovery telemetry (GOALS §14 / §15b)
     recovery_kind       TEXT,                       -- NULL | edit_cascade | shape_repair | relational_default
     recovery_stage      TEXT,
-    hard_fail           INTEGER NOT NULL DEFAULT 0,
+    hard_fail           INTEGER NOT NULL DEFAULT 0 CHECK (hard_fail IN (0, 1)),
 
     -- structured bash/sandbox outcome fields for escalation lookup. NULL
     -- exit_code means no shell exit was produced (spawn/cancel/signaled).
     exit_code           INTEGER DEFAULT NULL,
-    sandbox_enabled     INTEGER NOT NULL DEFAULT 0,
-    sandboxed           INTEGER NOT NULL DEFAULT 0,
+    sandbox_enabled     INTEGER NOT NULL DEFAULT 0 CHECK (sandbox_enabled IN (0, 1)),
+    sandboxed           INTEGER NOT NULL DEFAULT 0 CHECK (sandboxed IN (0, 1)),
     sandbox_unavailable_reason TEXT DEFAULT NULL,
 
     -- audit: the two projections live on the same row (GOALS §14a)
@@ -212,13 +214,13 @@ CREATE TABLE tool_call_events (
     wire_input_json     TEXT    NOT NULL,
 
     output              TEXT    NOT NULL DEFAULT '',
-    truncated           INTEGER NOT NULL DEFAULT 0,
+    truncated           INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
     duration_ms         INTEGER,
 
     -- tool-call mining across versions: CARGO_PKG_VERSION at call time,
     -- and the LLM steering mode (defensive/normal) at call time.
     cockpit_version     TEXT    DEFAULT NULL,
-    llm_mode            TEXT    DEFAULT '',
+    llm_mode            TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')),
 
     -- §12 repair shape fingerprint: a short stable hash of the malformed
     -- input shape (tool :: sorted[ instance_path | error_code | expected |
@@ -267,7 +269,7 @@ CREATE TABLE inference_calls (
     -- 1 = made by the utility model / background machinery (auto-titling,
     -- auto-router, prompt-injection guard, `/compact` brief, …) rather
     -- than a foreground user turn, so `/export debug` can split them out.
-    is_utility INTEGER NOT NULL DEFAULT 0,
+    is_utility INTEGER NOT NULL DEFAULT 0 CHECK (is_utility IN (0, 1)),
 
     -- input tokens *written into* the prompt cache on a miss (Anthropic
     -- `cache_creation`), as distinct from cached_input_tokens (served
@@ -316,7 +318,7 @@ CREATE TABLE needs_attention (
     session_id     TEXT    NOT NULL,
     agent_id       TEXT    NOT NULL,
     description    TEXT    NOT NULL,
-    state          TEXT    NOT NULL DEFAULT 'open',
+    state          TEXT    NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'parked', 'executing', 'interrupted', 'resolved')),
     question_json  TEXT,                            -- serialized proto::InterruptQuestion or NULL
     raised_at      INTEGER NOT NULL,
     resolved_at    INTEGER,
@@ -327,6 +329,16 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    CHECK (question_json IS NULL OR questions_json IS NULL),
+    CHECK (
+        (parked_tool IS NULL AND parked_args_json IS NULL AND parked_call_id IS NULL AND parked_resume_json IS NULL)
+        OR
+        (parked_tool IS NOT NULL AND parked_args_json IS NOT NULL AND parked_call_id IS NOT NULL AND parked_resume_json IS NOT NULL)
+    ),
+    CHECK (state <> 'executing' OR parked_tool IS NOT NULL),
+    CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
+    CHECK (state IN ('executing', 'interrupted', 'resolved') OR response_json IS NULL),
+    CHECK (state <> 'executing' OR response_json IS NOT NULL),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -387,7 +399,7 @@ FROM tool_call_events;
 
 CREATE TABLE usage_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT    NOT NULL,   -- 'model' | 'slash' | 'tag'
+    kind        TEXT    NOT NULL CHECK (kind IN ('model', 'slash', 'tag')),
     key         TEXT    NOT NULL,   -- 'provider/model' | command name | relative tag path
     project_id  TEXT,               -- NULL for model+slash (global); set for tag
     ts          INTEGER NOT NULL    -- unix seconds
@@ -529,16 +541,16 @@ CREATE TABLE packages (
     id            TEXT PRIMARY KEY,
     identifier    TEXT NOT NULL UNIQUE,
     display_name  TEXT NOT NULL,
-    source_type   TEXT NOT NULL,
+    source_type   TEXT NOT NULL CHECK (source_type IN ('git', 'local')),
     source_url    TEXT,
     source_branch TEXT,
     path          TEXT NOT NULL,
-    shallow       INTEGER NOT NULL DEFAULT 1,
+    shallow       INTEGER NOT NULL DEFAULT 1 CHECK (shallow IN (0, 1)),
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
     -- kcl package preparation scope imported from the portable
     -- `kcl packages export` manifest.
-    prepare_scope TEXT NOT NULL DEFAULT 'global'
+    prepare_scope TEXT NOT NULL DEFAULT 'global' CHECK (prepare_scope IN ('global', 'branch'))
 );
 
 CREATE INDEX packages_source_url ON packages(source_url);
@@ -566,7 +578,7 @@ CREATE TABLE inference_requests (
     session_id   TEXT    NOT NULL,
     ts_ms        INTEGER NOT NULL,              -- epoch milliseconds
     payload_json TEXT    NOT NULL,              -- full post-redaction request
-    status       TEXT    NOT NULL DEFAULT 'completed',
+    status       TEXT    NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -576,7 +588,17 @@ CREATE TABLE session_events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- globally monotonic order
     session_id  TEXT    NOT NULL,
     ts_ms       INTEGER NOT NULL,                  -- epoch milliseconds
-    type        TEXT    NOT NULL,                  -- TurnEvent-aligned discriminant
+    type        TEXT    NOT NULL CHECK (type IN (
+        'user_message', 'user_note', 'assistant_message', 'inference_request',
+        'tool_call', 'tandem_inference', 'tool_call_started',
+        'tool_call_completed', 'subagent_spawned', 'subagent_routing',
+        'subagent_report', 'context_pruned', 'session_compacted',
+        'permission_decision', 'interrupt_decision', 'tool_rejected',
+        'primary_swap', 'inference_failure', 'failed_turn_recovery',
+        'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
+        'goal_progress_diagnostic', 'resource_promotion', 'notice',
+        'model_switch'
+    )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable
     task_call_id TEXT,                             -- owning delegation run, when inside a child
@@ -590,12 +612,12 @@ CREATE TABLE session_events (
     origin_principal TEXT,                         -- remote principal attribution
     provider_id TEXT,                              -- authoring model provider id, NULL for model-less events
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
-    llm_mode TEXT,                                 -- authoring LLM mode, NULL for model-less events
+    llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_sevents_session_seq ON session_events (session_id, seq);
+CREATE UNIQUE INDEX uq_session_events_session_seq ON session_events (session_id, seq);
 CREATE INDEX idx_sevents_call        ON session_events (call_id);
 CREATE INDEX idx_sevents_task_child  ON session_events (session_id, task_call_id, label, seq)
   WHERE task_call_id IS NOT NULL;
@@ -719,7 +741,9 @@ CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
     row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    seq        INTEGER REFERENCES session_events(seq) ON DELETE CASCADE,
+    seq        INTEGER,
+    FOREIGN KEY (session_id, seq)
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
     UNIQUE(row_kind, session_id, seq)
 );
 
@@ -1002,8 +1026,8 @@ CREATE TABLE pins (
     seq         INTEGER NOT NULL,             -- == session_events.seq
     pinned_ms   INTEGER NOT NULL,             -- epoch milliseconds (pin order)
     PRIMARY KEY (session_id, seq),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (seq)        REFERENCES session_events(seq)  ON DELETE CASCADE
+    FOREIGN KEY (session_id, seq)
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
@@ -1048,7 +1072,7 @@ CREATE TABLE tandem_inference (
     request_json  TEXT    NOT NULL,                 -- full post-redaction request body
     response_json TEXT,                             -- full raw completion (text + tool calls)
     usage_json    TEXT,                             -- provider-reported token usage
-    status        TEXT    NOT NULL DEFAULT 'pending',
+    status        TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -1121,7 +1145,7 @@ CREATE TABLE session_goals (
     project_id TEXT NOT NULL,
     objective TEXT NOT NULL,
     context TEXT,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'blocked', 'pending_verification', 'complete', 'budget_limited', 'usage_limited')),
     token_budget INTEGER,
     tokens_used INTEGER NOT NULL DEFAULT 0,
     blocked_attempts INTEGER NOT NULL DEFAULT 0,
@@ -1380,7 +1404,7 @@ CREATE TABLE sync_state (
     cursor_seq        INTEGER NOT NULL DEFAULT 0,
     policy_version    TEXT,
     policy_json       TEXT,
-    enabled           INTEGER NOT NULL DEFAULT 0,
+    enabled           INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
     last_synced_at_ms INTEGER,
     last_error        TEXT,
     updated_at_ms     INTEGER NOT NULL,
@@ -1395,8 +1419,8 @@ CREATE INDEX idx_sync_state_server ON sync_state (server_url, enabled);
 CREATE TABLE connector_state (
     server_url           TEXT    NOT NULL,
     instance_id          TEXT    NOT NULL,
-    enabled              INTEGER NOT NULL DEFAULT 1,
-    status               TEXT    NOT NULL DEFAULT 'off',
+    enabled              INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    status               TEXT    NOT NULL DEFAULT 'off' CHECK (status IN ('off', 'reconnecting', 'connected')),
     relay_url            TEXT,
     relay_id             TEXT,
     relay_region         TEXT,
@@ -1437,7 +1461,7 @@ CREATE TABLE remote_principal_audit (
     principal    TEXT    NOT NULL,
     request_kind TEXT    NOT NULL,
     session_id   TEXT,
-    verdict      TEXT    NOT NULL,
+    verdict      TEXT    NOT NULL CHECK (verdict IN ('allowed', 'denied')),
     path         TEXT,                              -- path attribution for project-file audit rows
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );

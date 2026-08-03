@@ -1809,7 +1809,10 @@ async fn sandbox_off_granted_command_runs_without_prompt() {
 #[tokio::test]
 async fn sandbox_off_without_approver_denies() {
     let tmp = tempfile::tempdir().unwrap();
-    let ctx = crate::tools::common::test_ctx(tmp.path());
+    let mut ctx = crate::tools::common::test_ctx(tmp.path());
+    ctx.approver = None;
+    ctx.session
+        .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
     let marker = tmp.path().join("marker");
 
     let out = BashTool::new()

@@ -699,76 +699,97 @@ mod tests {
     #[tokio::test]
     async fn foreground_write_requires_approval_by_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
-        assert!(ctx.config.extended().skills.write_approval);
-        let args = create_value("default-gated");
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+            assert!(ctx.config.extended().skills.write_approval);
+            let args = create_value("default-gated");
 
-        let interrupt_id =
-            assert_parks_without_writing(ctx.clone(), &db, args.clone(), "default-gated-call")
-                .await;
+            let interrupt_id =
+                assert_parks_without_writing(ctx.clone(), &db, args.clone(), "default-gated-call")
+                    .await;
 
-        assert!(!root.join("default-gated/SKILL.md").exists());
-        let question = replay_question_from_row(&db, interrupt_id).await;
-        let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE.to_string(),
-            },
-            question,
-            SkillManageTool.call(args, &ctx),
-        )
-        .await
-        .unwrap();
-        assert!(output.content.contains("Created skill"));
-        assert!(root.join("default-gated/SKILL.md").is_file());
+            assert!(!root.join("default-gated/SKILL.md").exists());
+            let question = replay_question_from_row(&db, interrupt_id).await;
+            let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                ResolveResponse::Single {
+                    selected_id: crate::approval::ID_APPROVE.to_string(),
+                },
+                question,
+                SkillManageTool.call(args, &ctx),
+            )
+            .await
+            .unwrap();
+            assert!(output.content.contains("Created skill"));
+            assert!(root.join("default-gated/SKILL.md").is_file());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn background_review_bypasses_default_gate() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        apply_test_config(&mut ctx, &root, None);
-        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
-        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            apply_test_config(&mut ctx, &root, None);
+            ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+            ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
 
-        let output = SkillManageTool
-            .call(create_value("background-default"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(output.content.contains("Created skill"));
-        assert!(root.join("background-default/SKILL.md").is_file());
-        assert!(
-            db.list_open_interrupts(ctx.session.id)
+            let output = SkillManageTool
+                .call(create_value("background-default"), &ctx)
                 .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
+
+            assert!(output.content.contains("Created skill"));
+            assert!(root.join("background-default/SKILL.md").is_file());
+            assert!(
+                db.list_open_interrupts(ctx.session.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn explicit_write_approval_false_still_bypasses_foreground() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        let mut ctx = ctx;
-        apply_test_config(&mut ctx, &root, Some(false));
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let (ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            let mut ctx = ctx;
+            apply_test_config(&mut ctx, &root, Some(false));
 
-        let output = SkillManageTool
-            .call(create_value("explicit-direct"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(output.content.contains("Created skill"));
-        assert!(root.join("explicit-direct/SKILL.md").is_file());
-        assert!(
-            db.list_open_interrupts(ctx.session.id)
+            let output = SkillManageTool
+                .call(create_value("explicit-direct"), &ctx)
                 .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
+
+            assert!(output.content.contains("Created skill"));
+            assert!(root.join("explicit-direct/SKILL.md").is_file());
+            assert!(
+                db.list_open_interrupts(ctx.session.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -796,182 +817,215 @@ mod tests {
 
         for (action, args, skill_name, seed_existing) in cases {
             let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().join("skills");
-            if seed_existing {
-                create_seed_skill(tmp.path(), &root, &skill_name).await;
-            }
-            let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
+            let policy = crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            };
+            crate::config::trust::scope_workspace_trust_policy(policy, async {
+                let root = tmp.path().join("skills");
+                if seed_existing {
+                    create_seed_skill(tmp.path(), &root, &skill_name).await;
+                }
+                let (ctx, db) = ctx_with_interrupt_hub(tmp.path(), &root, None);
 
-            assert_parks_without_writing(ctx.clone(), &db, args, &format!("gate-{action}-call"))
+                assert_parks_without_writing(
+                    ctx.clone(),
+                    &db,
+                    args,
+                    &format!("gate-{action}-call"),
+                )
                 .await;
 
-            if seed_existing {
-                assert!(root.join(&skill_name).join("SKILL.md").is_file());
-                assert!(
-                    !std::fs::read_to_string(root.join(&skill_name).join("SKILL.md"))
-                        .unwrap()
-                        .contains("mutated")
-                );
-                assert_eq!(
-                    std::fs::read_to_string(root.join(&skill_name).join("references/old.md"))
-                        .unwrap(),
-                    "old support"
-                );
-                assert!(!root.join(&skill_name).join("references/new.md").exists());
-            } else {
-                assert!(!root.join(&skill_name).join("SKILL.md").exists());
-            }
+                if seed_existing {
+                    assert!(root.join(&skill_name).join("SKILL.md").is_file());
+                    assert!(
+                        !std::fs::read_to_string(root.join(&skill_name).join("SKILL.md"))
+                            .unwrap()
+                            .contains("mutated")
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(root.join(&skill_name).join("references/old.md"))
+                            .unwrap(),
+                        "old support"
+                    );
+                    assert!(!root.join(&skill_name).join("references/new.md").exists());
+                } else {
+                    assert!(!root.join(&skill_name).join("SKILL.md").exists());
+                }
+            })
+            .await;
         }
     }
 
     #[tokio::test]
     async fn review_auto_denies_approvals() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        write_config(tmp.path(), &root, true);
-        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            write_config(tmp.path(), &root, true);
+            let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
 
-        let output = SkillManageTool
-            .call(create_value("auto-denied"), &ctx)
-            .await
-            .unwrap();
-
-        assert!(output.content.contains("automatically denied"));
-        assert!(!root.join("auto-denied/SKILL.md").exists());
-        assert!(
-            db.list_open_interrupts(ctx.session.id)
+            let output = SkillManageTool
+                .call(create_value("auto-denied"), &ctx)
                 .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
+
+            assert!(output.content.contains("automatically denied"));
+            assert!(!root.join("auto-denied/SKILL.md").exists());
+            assert!(
+                db.list_open_interrupts(ctx.session.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn review_writes_background_origin() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        write_config(tmp.path(), &root, false);
-        let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
-        ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            write_config(tmp.path(), &root, false);
+            let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+            ctx.skill_write_origin = crate::skills::manage::SkillWriteOrigin::BackgroundReview;
 
-        SkillManageTool
-            .call(create_value("background-created"), &ctx)
-            .await
-            .unwrap();
-
-        let provenance =
-            std::fs::read_to_string(root.join("background-created/.cockpit-provenance.json"))
+            SkillManageTool
+                .call(create_value("background-created"), &ctx)
+                .await
                 .unwrap();
-        assert!(provenance.contains("\"created_origin\": \"background_review\""));
-        assert!(provenance.contains("\"origin\": \"background_review\""));
+
+            let provenance =
+                std::fs::read_to_string(root.join("background-created/.cockpit-provenance.json"))
+                    .unwrap();
+            assert!(provenance.contains("\"created_origin\": \"background_review\""));
+            assert!(provenance.contains("\"origin\": \"background_review\""));
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn skill_write_gate_stages_and_replays() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        write_config(tmp.path(), &root, true);
-        let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        let (events, _receiver) = tokio::sync::broadcast::channel(8);
-        let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::redact::RedactionTable::empty(),
-        )));
-        ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
-            events,
-            redaction,
-            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            db.clone(),
-            ctx.session.id,
-        ));
-        let mut ctx = Arc::new(ctx);
-        let args = create_value("gated-skill");
-        let payload = InterruptParkPayload {
-            tool: "skill_manage".to_string(),
-            args: args.clone(),
-            call_id: "skill-manage-call".to_string(),
-            resume: InterruptResumeAnchor {
-                agent_id: ctx.agent_id.clone(),
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            write_config(tmp.path(), &root, true);
+            let (mut ctx, db) = crate::tools::common::test_ctx_with_db(tmp.path());
+            let (events, _receiver) = tokio::sync::broadcast::channel(8);
+            let redaction = Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            )));
+            ctx.interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+                events,
+                redaction,
+                Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                db.clone(),
+                ctx.session.id,
+            ));
+            let mut ctx = Arc::new(ctx);
+            let args = create_value("gated-skill");
+            let payload = InterruptParkPayload {
+                tool: "skill_manage".to_string(),
+                args: args.clone(),
                 call_id: "skill-manage-call".to_string(),
-                provider_call_id: None,
-                assistant_seq: None,
-                call_origin: ctx.skill_write_origin,
-            },
-            gate: None,
-        };
-        let task_ctx = ctx.clone();
-        let task_args = args.clone();
-        let task = tokio::spawn(async move {
-            crate::engine::interrupt::with_interrupt_park_payload(payload, async {
-                SkillManageTool.call(task_args, &task_ctx).await
-            })
-            .await
-        });
+                resume: InterruptResumeAnchor {
+                    agent_id: ctx.agent_id.clone(),
+                    call_id: "skill-manage-call".to_string(),
+                    provider_call_id: None,
+                    assistant_seq: None,
+                    call_origin: ctx.skill_write_origin,
+                },
+                gate: None,
+            };
+            let task_ctx = ctx.clone();
+            let task_args = args.clone();
+            let task = tokio::spawn(async move {
+                crate::engine::interrupt::with_interrupt_park_payload(payload, async {
+                    SkillManageTool.call(task_args, &task_ctx).await
+                })
+                .await
+            });
 
-        let interrupt_id = loop {
-            let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
-            if let Some(row) = open
-                .iter()
-                .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
-            {
-                let interrupt_id = row.interrupt_id;
-                if ctx.interrupts.park_all_registered().await == 1 {
-                    break interrupt_id;
+            let interrupt_id = loop {
+                let open = db.list_open_interrupts(ctx.session.id).await.unwrap();
+                if let Some(row) = open
+                    .iter()
+                    .find(|row| ctx.interrupts.has_waiter(row.interrupt_id))
+                {
+                    let interrupt_id = row.interrupt_id;
+                    if ctx.interrupts.park_all_registered().await == 1 {
+                        break interrupt_id;
+                    }
                 }
-            }
-            tokio::task::yield_now().await;
-        };
-        let error = task.await.unwrap().unwrap_err();
-        assert!(crate::engine::interrupt::is_parked(&error));
-        assert!(!root.join("gated-skill/SKILL.md").exists());
-        let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
-        let parked = row.parked.unwrap();
-        assert_eq!(parked.tool, "skill_manage");
-        assert_eq!(parked.args, args);
+                tokio::task::yield_now().await;
+            };
+            let error = task.await.unwrap().unwrap_err();
+            assert!(crate::engine::interrupt::is_parked(&error));
+            assert!(!root.join("gated-skill/SKILL.md").exists());
+            let row = db.get_interrupt(interrupt_id).await.unwrap().unwrap();
+            let parked = row.parked.unwrap();
+            assert_eq!(parked.tool, "skill_manage");
+            assert_eq!(parked.args, args);
 
-        let question = replay_question_from_row(&db, interrupt_id).await;
-        let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            interrupt_id,
-            ResolveResponse::Single {
-                selected_id: crate::approval::ID_APPROVE.to_string(),
-            },
-            question,
-            SkillManageTool.call(args, &ctx),
-        )
-        .await
-        .unwrap();
-        assert!(output.content.contains("Created skill"));
-        assert!(root.join("gated-skill/SKILL.md").is_file());
-
-        write_config(tmp.path(), &root, false);
-        // Config is snapshotted onto the ctx handle; refresh it after rewriting
-        // the write-approval config on disk (`engine-config-snapshot-adoption`).
-        // The spawned task has joined, so this is the sole `Arc` owner.
-        Arc::get_mut(&mut ctx)
-            .expect("sole ctx owner after task join")
-            .config =
-            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
-        let denied_args = create_value("denied-after-config-drift");
-        let denied_id = uuid::Uuid::new_v4();
-        let denied_question = skill_write_replay_question(&ctx, &denied_args);
-        let denied = crate::engine::interrupt::with_pre_resolved_interrupt_question(
-            denied_id,
-            ResolveResponse::Single {
-                selected_id: crate::approval::ID_REJECT.to_string(),
-            },
-            denied_question,
-            SkillManageTool.call(denied_args, &ctx),
-        )
-        .await
-        .unwrap();
-        assert!(denied.content.contains("not approved"));
-        assert!(!root.join("denied-after-config-drift/SKILL.md").exists());
-
-        SkillManageTool
-            .call(create_value("direct-skill"), &ctx)
+            let question = replay_question_from_row(&db, interrupt_id).await;
+            let output = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                interrupt_id,
+                ResolveResponse::Single {
+                    selected_id: crate::approval::ID_APPROVE.to_string(),
+                },
+                question,
+                SkillManageTool.call(args, &ctx),
+            )
             .await
             .unwrap();
-        assert!(root.join("direct-skill/SKILL.md").is_file());
+            assert!(output.content.contains("Created skill"));
+            assert!(root.join("gated-skill/SKILL.md").is_file());
+
+            write_config(tmp.path(), &root, false);
+            // Config is snapshotted onto the ctx handle; refresh it after rewriting
+            // the write-approval config on disk (`engine-config-snapshot-adoption`).
+            // The spawned task has joined, so this is the sole `Arc` owner.
+            Arc::get_mut(&mut ctx)
+                .expect("sole ctx owner after task join")
+                .config =
+                crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+            let denied_args = create_value("denied-after-config-drift");
+            let denied_id = uuid::Uuid::new_v4();
+            let denied_question = skill_write_replay_question(&ctx, &denied_args);
+            let denied = crate::engine::interrupt::with_pre_resolved_interrupt_question(
+                denied_id,
+                ResolveResponse::Single {
+                    selected_id: crate::approval::ID_REJECT.to_string(),
+                },
+                denied_question,
+                SkillManageTool.call(denied_args, &ctx),
+            )
+            .await
+            .unwrap();
+            assert!(denied.content.contains("not approved"));
+            assert!(!root.join("denied-after-config-drift/SKILL.md").exists());
+
+            SkillManageTool
+                .call(create_value("direct-skill"), &ctx)
+                .await
+                .unwrap();
+            assert!(root.join("direct-skill/SKILL.md").is_file());
+        })
+        .await;
     }
 }

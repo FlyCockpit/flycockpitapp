@@ -22,6 +22,16 @@ pub enum DelegationStatus {
 }
 
 impl DelegationStatus {
+    pub const ALL: [Self; 7] = [
+        Self::Running,
+        Self::Backgrounded,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+        Self::PausedPendingTool,
+        Self::Lost,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",

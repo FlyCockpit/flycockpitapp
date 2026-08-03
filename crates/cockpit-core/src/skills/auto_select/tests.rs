@@ -2,6 +2,17 @@ use super::*;
 use crate::skills::{Skill, SkillFrontmatter};
 use std::path::PathBuf;
 
+fn trusted_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
 fn skill(name: &str) -> Skill {
     Skill {
         frontmatter: SkillFrontmatter {
@@ -675,12 +686,14 @@ fn select_catalog_excluding(
     cfg: &crate::config::extended::SkillsConfig,
     already_injected: &std::collections::HashSet<String>,
 ) -> Vec<crate::skills::Skill> {
-    crate::skills::discover(cwd, cfg)
-        .unwrap()
-        .into_iter()
-        .filter(|s| !s.frontmatter.disable_model_invocation)
-        .filter(|s| !already_injected.contains(&s.frontmatter.name))
-        .collect()
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(cwd), || {
+        crate::skills::discover(cwd, cfg)
+    })
+    .unwrap()
+    .into_iter()
+    .filter(|s| !s.frontmatter.disable_model_invocation)
+    .filter(|s| !already_injected.contains(&s.frontmatter.name))
+    .collect()
 }
 
 #[test]
@@ -999,12 +1012,14 @@ fn render_budget_drops_lowest_priority_whole_bodies() {
 /// enters the utility-model catalog iff `disable-model-invocation` is not
 /// true. `user-invocable` does not affect catalog membership.
 fn auto_select_catalog(cwd: &Path, cfg: &crate::config::extended::SkillsConfig) -> String {
-    let skills: Vec<crate::skills::Skill> = crate::skills::discover(cwd, cfg)
-        .unwrap()
-        .into_iter()
-        .filter(|s| !s.frontmatter.disable_model_invocation)
-        .collect();
-    crate::skills::catalog_lines(&skills)
+    crate::config::trust::with_workspace_trust_policy(trusted_policy(cwd), || {
+        let skills: Vec<crate::skills::Skill> = crate::skills::discover(cwd, cfg)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !s.frontmatter.disable_model_invocation)
+            .collect();
+        crate::skills::catalog_lines(&skills)
+    })
 }
 
 fn write_fm_skill(dir: &Path, name: &str, frontmatter_extra: &str) {
@@ -1128,15 +1143,18 @@ async fn select_low_information_turn_skips_before_model_lookup_with_diagnostics(
         agent: String::new(),
     }];
 
-    let (sel, diagnostics) = select_with_diagnostics(
-        tmp.path(),
-        &extended,
-        &providers,
-        redact,
-        None,
-        &[],
-        &turns,
-        &std::collections::HashSet::new(),
+    let (sel, diagnostics) = crate::config::trust::scope_workspace_trust_policy(
+        trusted_policy(tmp.path()),
+        select_with_diagnostics(
+            tmp.path(),
+            &extended,
+            &providers,
+            redact,
+            None,
+            &[],
+            &turns,
+            &std::collections::HashSet::new(),
+        ),
     )
     .await;
 

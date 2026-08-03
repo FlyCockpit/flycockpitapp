@@ -36,6 +36,8 @@ pub enum SourceType {
 }
 
 impl SourceType {
+    pub const ALL: [Self; 2] = [Self::Git, Self::Local];
+
     pub fn as_str(self) -> &'static str {
         match self {
             SourceType::Git => "git",

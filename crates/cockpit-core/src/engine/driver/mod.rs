@@ -197,7 +197,7 @@ pub enum DriverControl {
         persist_as_default: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
-        thinking_mode: Option<String>,
+        thinking_mode: Option<crate::config::providers::ThinkingMode>,
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
     },
     /// Production selection lifecycle: the worker awaits `completion` until
@@ -213,7 +213,7 @@ pub enum DriverControl {
         persist_as_default: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
-        thinking_mode: Option<String>,
+        thinking_mode: Option<crate::config::providers::ThinkingMode>,
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
     },
     /// Set the session's model-comparison tandem (shadow) set
@@ -3397,12 +3397,7 @@ impl Driver {
                     model,
                     reasoning_effort: reasoning_effort
                         .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
-                    thinking_mode: thinking_mode.and_then(|value| {
-                        serde_json::from_value::<crate::config::providers::ThinkingMode>(
-                            serde_json::Value::String(value),
-                        )
-                        .ok()
-                    }),
+                    thinking_mode,
                     prompt_cache_retention,
                 };
                 let _ = self
@@ -3410,7 +3405,6 @@ impl Driver {
                         selection_id,
                         target,
                         persist_as_default,
-                        None,
                         None,
                         trigger,
                         tx,
@@ -3435,12 +3429,7 @@ impl Driver {
                     model,
                     reasoning_effort: reasoning_effort
                         .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
-                    thinking_mode: thinking_mode.and_then(|value| {
-                        serde_json::from_value::<crate::config::providers::ThinkingMode>(
-                            serde_json::Value::String(value),
-                        )
-                        .ok()
-                    }),
+                    thinking_mode,
                     prompt_cache_retention,
                 };
                 let _ = self
@@ -3448,8 +3437,10 @@ impl Driver {
                         selection_id,
                         target,
                         persist_as_default,
-                        Some(deadline),
-                        Some(&terminal_claimed),
+                        Some(swap::ModelSelectionTerminal {
+                            deadline,
+                            claimed: &terminal_claimed,
+                        }),
                         trigger,
                         tx,
                     )
@@ -4655,8 +4646,8 @@ impl Driver {
 
     /// Load the layered providers config for the live model switch, honoring a
     /// test-injected config when present (mirrors [`Self::active_providers_config`])
-    /// and otherwise reading the top discovered `.cockpit/config.json` — the same
-    /// file the `/model` picker just wrote the new active model into.
+    /// and otherwise reading the worker's generation-aware config snapshot.
+    /// Disk writes become visible here when the config watcher refreshes it.
     fn live_providers_config(&self) -> Result<crate::config::providers::ProvidersConfig> {
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {

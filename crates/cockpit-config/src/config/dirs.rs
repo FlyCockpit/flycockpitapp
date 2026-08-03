@@ -448,6 +448,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = test_support::IsolatedCockpitHome::new(tmp.path());
         crate::config::trust::clear_runtime_policy_for_tests();
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
         let home = tmp.path().join("home");
         let parent = tmp.path().join("repo");
         let child = parent.join("child");

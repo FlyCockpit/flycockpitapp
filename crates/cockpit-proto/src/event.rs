@@ -19,12 +19,23 @@ const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 /// Authoritative active-model state embedded in a completed selection.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelSelectionActiveState {
-    pub provider: String,
-    pub model: String,
-    pub config_provider: Option<String>,
-    pub config_model: Option<String>,
+    pub selection: cockpit_config::config::providers::ActiveModelRef,
+    pub default_selection: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub diverged: bool,
     pub generation: u64,
+}
+
+/// Result of the optional, independent request to save a selected session
+/// model as the default for future sessions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DefaultModelUpdateOutcome {
+    NotRequested,
+    Saved,
+    Failed {
+        user_message: String,
+        diagnostic_code: String,
+    },
 }
 
 /// Explicit terminal outcome for a client-correlated model selection.
@@ -33,6 +44,7 @@ pub struct ModelSelectionActiveState {
 pub enum ModelSelectionOutcome {
     Applied {
         active_state: ModelSelectionActiveState,
+        default_update: DefaultModelUpdateOutcome,
     },
     Rejected {
         user_message: String,
@@ -560,12 +572,9 @@ pub enum Event {
     /// client renders this instead of assuming a requested switch succeeded.
     ActiveModelState {
         session_id: Uuid,
-        provider: String,
-        model: String,
+        selection: cockpit_config::config::providers::ActiveModelRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        config_provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        config_model: Option<String>,
+        default_selection: Option<cockpit_config::config::providers::ActiveModelRef>,
         diverged: bool,
         generation: u64,
     },

@@ -582,7 +582,8 @@ for line in sys.stdin:
         let mut cfg = McpConfig::default();
         cfg.servers.insert("fake".into(), stdio_cfg(&script));
         let context_root = tempfile::tempdir().unwrap();
-        let (tool_ctx, _) = crate::tools::common::test_ctx_with_db(context_root.path());
+        let (mut tool_ctx, _) = crate::tools::common::test_ctx_with_db(context_root.path());
+        tool_ctx.approver = None;
         tool_ctx
             .session
             .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);

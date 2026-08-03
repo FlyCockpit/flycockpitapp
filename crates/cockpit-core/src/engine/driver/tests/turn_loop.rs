@@ -273,172 +273,180 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
     assert_eq!(assistant.data["text"], "plain assistant reply");
 }
 
-#[tokio::test]
-async fn turn_loop_tool_call_result_feeds_second_inference() {
-    let provider = ScriptedProvider::builder()
-        .dialect(WireDialect::ChatCompletions)
-        .turn(Turn::ToolCall {
-            id: "read-fixture".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({ "path": "fixture.txt" }),
-        })
-        .turn(Turn::Text("I read the file.".into()))
-        .start()
-        .await;
-    let (mut driver, tmp) = scripted_read_driver(&provider);
-    std::fs::write(tmp.path().join("fixture.txt"), "fixture body").unwrap();
-    let (queue, tx, mut rx) = event_harness();
+#[test]
+fn turn_loop_tool_call_result_feeds_second_inference() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "read-fixture".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "fixture.txt" }),
+            })
+            .turn(Turn::Text("I read the file.".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        std::fs::write(tmp.path().join("fixture.txt"), "fixture body").unwrap();
+        let (queue, tx, mut rx) = event_harness();
 
-    driver
-        .run_user_input(UserSubmission::text("read fixture"), &queue, &tx)
-        .await
-        .unwrap();
+        driver
+            .run_user_input(UserSubmission::text("read fixture"), &queue, &tx)
+            .await
+            .unwrap();
 
-    let events = drain_events(&mut rx);
-    assert_eq!(tool_results(&events).len(), 1);
-    assert_eq!(tool_results(&events)[0].0, "read-fixture");
-    assert_eq!(tool_results(&events)[0].1, "read");
-    assert!(tool_results(&events)[0].2.contains("fixture body"));
-    assert_eq!(assistant_texts(&events), vec!["I read the file."]);
-    assert_eq!(provider.captured().len(), 2);
+        let events = drain_events(&mut rx);
+        assert_eq!(tool_results(&events).len(), 1);
+        assert_eq!(tool_results(&events)[0].0, "read-fixture");
+        assert_eq!(tool_results(&events)[0].1, "read");
+        assert!(tool_results(&events)[0].2.contains("fixture body"));
+        assert_eq!(assistant_texts(&events), vec!["I read the file."]);
+        assert_eq!(provider.captured().len(), 2);
 
-    let captured = provider.captured();
-    let second_messages = chat_messages(&captured[1]);
-    let [.., assistant_call, result] = second_messages else {
-        panic!(
-            "second request should end with assistant tool call and tool result: {second_messages:?}"
+        let captured = provider.captured();
+        let second_messages = chat_messages(&captured[1]);
+        let [.., assistant_call, result] = second_messages else {
+            panic!(
+                "second request should end with assistant tool call and tool result: {second_messages:?}"
+            );
+        };
+        assert_eq!(message_role(assistant_call), "assistant");
+        assert_eq!(assistant_call["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(assistant_call["tool_calls"][0]["id"], "read-fixture");
+        assert_eq!(message_role(result), "tool");
+        assert_eq!(result["tool_call_id"], "read-fixture");
+        assert!(message_content_text(result).contains("fixture body"));
+    });
+}
+
+#[test]
+fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ParallelToolCalls(vec![
+                (
+                    "read-alpha".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "alpha.txt" }),
+                ),
+                (
+                    "read-beta".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "beta.txt" }),
+                ),
+            ]))
+            .turn(Turn::Text("Both files were read.".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        std::fs::write(tmp.path().join("alpha.txt"), "alpha body").unwrap();
+        std::fs::write(tmp.path().join("beta.txt"), "beta body").unwrap();
+        let (queue, tx, mut rx) = event_harness();
+
+        driver
+            .run_user_input(UserSubmission::text("read both"), &queue, &tx)
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        let results = tool_results(&events);
+        assert_eq!(
+            results.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec!["read-alpha", "read-beta"]
         );
-    };
-    assert_eq!(message_role(assistant_call), "assistant");
-    assert_eq!(assistant_call["tool_calls"][0]["function"]["name"], "read");
-    assert_eq!(assistant_call["tool_calls"][0]["id"], "read-fixture");
-    assert_eq!(message_role(result), "tool");
-    assert_eq!(result["tool_call_id"], "read-fixture");
-    assert!(message_content_text(result).contains("fixture body"));
+        assert!(results[0].2.contains("alpha body"));
+        assert!(results[1].2.contains("beta body"));
+
+        let captured = provider.captured();
+        let second_messages = chat_messages(&captured[1]);
+        let result_ids = second_messages
+            .iter()
+            .filter(|message| message_role(message) == "tool")
+            .map(|message| message["tool_call_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, vec!["read-alpha", "read-beta"]);
+    });
 }
 
-#[tokio::test]
-async fn turn_loop_parallel_tool_calls_preserve_order_and_call_id_pairing() {
-    let provider = ScriptedProvider::builder()
-        .dialect(WireDialect::ChatCompletions)
-        .turn(Turn::ParallelToolCalls(vec![
-            (
-                "read-alpha".into(),
-                "read".into(),
-                serde_json::json!({ "path": "alpha.txt" }),
-            ),
-            (
-                "read-beta".into(),
-                "read".into(),
-                serde_json::json!({ "path": "beta.txt" }),
-            ),
-        ]))
-        .turn(Turn::Text("Both files were read.".into()))
-        .start()
-        .await;
-    let (mut driver, tmp) = scripted_read_driver(&provider);
-    std::fs::write(tmp.path().join("alpha.txt"), "alpha body").unwrap();
-    std::fs::write(tmp.path().join("beta.txt"), "beta body").unwrap();
-    let (queue, tx, mut rx) = event_harness();
+#[test]
+fn turn_loop_tool_error_becomes_tool_result_not_turn_abort() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "read-missing".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "missing.txt" }),
+            })
+            .turn(Turn::Text("I handled the missing file.".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_read_driver(&provider);
+        let (queue, tx, mut rx) = event_harness();
 
-    driver
-        .run_user_input(UserSubmission::text("read both"), &queue, &tx)
-        .await
-        .unwrap();
+        driver
+            .run_user_input(UserSubmission::text("read missing"), &queue, &tx)
+            .await
+            .unwrap();
 
-    let events = drain_events(&mut rx);
-    let results = tool_results(&events);
-    assert_eq!(
-        results.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-        vec!["read-alpha", "read-beta"]
-    );
-    assert!(results[0].2.contains("alpha body"));
-    assert!(results[1].2.contains("beta body"));
+        let events = drain_events(&mut rx);
+        let results = tool_results(&events);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "read-missing");
+        assert_eq!(results[0].1, "read");
+        assert!(results[0].2.contains("missing.txt"), "{}", results[0].2);
+        assert_eq!(
+            assistant_texts(&events),
+            vec!["I handled the missing file."]
+        );
+        assert_eq!(provider.captured().len(), 2);
 
-    let captured = provider.captured();
-    let second_messages = chat_messages(&captured[1]);
-    let result_ids = second_messages
-        .iter()
-        .filter(|message| message_role(message) == "tool")
-        .map(|message| message["tool_call_id"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(result_ids, vec!["read-alpha", "read-beta"]);
+        let captured = provider.captured();
+        let tool_result = chat_messages(&captured[1])
+            .iter()
+            .find(|message| message_role(message) == "tool")
+            .expect("tool error returned to model");
+        assert_eq!(tool_result["tool_call_id"], "read-missing");
+        assert!(message_content_text(tool_result).contains("missing.txt"));
+    });
 }
 
-#[tokio::test]
-async fn turn_loop_tool_error_becomes_tool_result_not_turn_abort() {
-    let provider = ScriptedProvider::builder()
-        .dialect(WireDialect::ChatCompletions)
-        .turn(Turn::ToolCall {
-            id: "read-missing".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({ "path": "missing.txt" }),
-        })
-        .turn(Turn::Text("I handled the missing file.".into()))
-        .start()
-        .await;
-    let (mut driver, _tmp) = scripted_read_driver(&provider);
-    let (queue, tx, mut rx) = event_harness();
+#[test]
+fn turn_loop_max_rounds_guard_terminates_turn() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "read-one".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "one.txt" }),
+            })
+            .turn(Turn::Text("should not be requested".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        std::fs::write(tmp.path().join("one.txt"), "one body").unwrap();
+        write_max_primary_rounds_config(tmp.path(), 1);
+        driver.refresh_config_from_disk_for_tests();
+        let (queue, tx, mut rx) = event_harness();
 
-    driver
-        .run_user_input(UserSubmission::text("read missing"), &queue, &tx)
-        .await
-        .unwrap();
+        driver
+            .run_user_input(UserSubmission::text("read once"), &queue, &tx)
+            .await
+            .unwrap();
 
-    let events = drain_events(&mut rx);
-    let results = tool_results(&events);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0, "read-missing");
-    assert_eq!(results[0].1, "read");
-    assert!(results[0].2.contains("missing.txt"), "{}", results[0].2);
-    assert_eq!(
-        assistant_texts(&events),
-        vec!["I handled the missing file."]
-    );
-    assert_eq!(provider.captured().len(), 2);
-
-    let captured = provider.captured();
-    let tool_result = chat_messages(&captured[1])
-        .iter()
-        .find(|message| message_role(message) == "tool")
-        .expect("tool error returned to model");
-    assert_eq!(tool_result["tool_call_id"], "read-missing");
-    assert!(message_content_text(tool_result).contains("missing.txt"));
-}
-
-#[tokio::test]
-async fn turn_loop_max_rounds_guard_terminates_turn() {
-    let provider = ScriptedProvider::builder()
-        .dialect(WireDialect::ChatCompletions)
-        .turn(Turn::ToolCall {
-            id: "read-one".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({ "path": "one.txt" }),
-        })
-        .turn(Turn::Text("should not be requested".into()))
-        .start()
-        .await;
-    let (mut driver, tmp) = scripted_read_driver(&provider);
-    std::fs::write(tmp.path().join("one.txt"), "one body").unwrap();
-    write_max_primary_rounds_config(tmp.path(), 1);
-    driver.refresh_config_from_disk_for_tests();
-    let (queue, tx, mut rx) = event_harness();
-
-    driver
-        .run_user_input(UserSubmission::text("read once"), &queue, &tx)
-        .await
-        .unwrap();
-
-    let events = drain_events(&mut rx);
-    assert_eq!(tool_results(&events).len(), 1);
-    assert!(assistant_texts(&events).is_empty());
-    assert!(
+        let events = drain_events(&mut rx);
+        assert_eq!(tool_results(&events).len(), 1);
+        assert!(assistant_texts(&events).is_empty());
+        assert!(
         events
             .iter()
             .any(|event| matches!(event, TurnEvent::Notice { text } if text.contains("configured limit of 1") && text.contains("no interactive client"))),
         "{events:?}"
     );
-    assert_eq!(provider.captured().len(), 1);
+        assert_eq!(provider.captured().len(), 1);
+    });
 }
 
 #[tokio::test]

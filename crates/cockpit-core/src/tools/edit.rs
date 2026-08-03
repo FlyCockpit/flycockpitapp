@@ -127,9 +127,12 @@ impl Tool for EditTool {
         )
         .await?;
         crate::tools::write::enforce_write_scope(ctx, &path, self.name())?;
-        let identity_note =
+        let (identity_note, identity_write_preauthorized) =
             match crate::assistants::identity::check_identity_write(ctx, &path).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note } => note,
+                crate::assistants::identity::IdentityWriteGate::Allow {
+                    note,
+                    preauthorized,
+                } => (note, preauthorized),
                 crate::assistants::identity::IdentityWriteGate::Refuse(message) => {
                     return Ok(crate::assistants::identity::tool_refusal(message));
                 }
@@ -176,8 +179,15 @@ impl Tool for EditTool {
                 validation.name
             )));
         }
-        crate::tools::write::authorize_existing_write(ctx, &path, &existing, normalized.as_bytes())
+        if !identity_write_preauthorized {
+            crate::tools::write::authorize_existing_write(
+                ctx,
+                &path,
+                &existing,
+                normalized.as_bytes(),
+            )
             .await?;
+        }
         let acquire =
             crate::tools::lock_wait::acquire_waiting(ctx, &path, self.name(), false).await?;
         let write_guard = ctx
@@ -701,6 +711,39 @@ mod tests {
         ctx
     }
 
+    fn trusted_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: root.to_path_buf(),
+                root: root.to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        }
+    }
+
+    async fn trusted_edit(
+        args: serde_json::Value,
+        ctx: &crate::engine::tool::ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
+            EditTool.call(args, ctx).await
+        })
+        .await
+    }
+
+    async fn trusted_skill(
+        name: &str,
+        ctx: &crate::engine::tool::ToolCtx,
+    ) -> anyhow::Result<crate::engine::tool::ToolOutput> {
+        crate::config::trust::scope_workspace_trust_policy(trusted_policy(&ctx.cwd), async {
+            crate::tools::skill::SkillTool
+                .call(serde_json::json!({"name": name}), ctx)
+                .await
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn edit_without_prior_read_is_rejected_and_names_edit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -774,36 +817,31 @@ mod tests {
             .note_read(&manifest, &ctx.lock_identity, ctx.session.id)
             .await;
 
-        let err = EditTool
-            .call(
-                serde_json::json!({
-                    "path": manifest.display().to_string(),
-                    "old_string": "description: old",
-                    "new_string": "description: new",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = trusted_edit(
+            serde_json::json!({
+                "path": manifest.display().to_string(),
+                "old_string": "description: old",
+                "new_string": "description: new",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("must load `view-edit`"), "{err}");
 
-        crate::tools::skill::SkillTool
-            .call(serde_json::json!({"name": "view-edit"}), &ctx)
-            .await
-            .unwrap();
-        let out = EditTool
-            .call(
-                serde_json::json!({
-                    "path": manifest.display().to_string(),
-                    "old_string": "description: old",
-                    "new_string": "description: new",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap()
-            .content;
+        trusted_skill("view-edit", &ctx).await.unwrap();
+        let out = trusted_edit(
+            serde_json::json!({
+                "path": manifest.display().to_string(),
+                "old_string": "description: old",
+                "new_string": "description: new",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .content;
         assert!(out.contains("[skill] validated view-edit"), "{out}");
         assert!(
             std::fs::read_to_string(manifest)

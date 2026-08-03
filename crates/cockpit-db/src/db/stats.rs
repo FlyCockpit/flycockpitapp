@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_by_llm_mode_buckets_blank_mode_as_unknown() {
+    async fn recovery_by_llm_mode_buckets_null_mode_as_unknown() {
         let db = Db::open_in_memory().unwrap();
         let sid = seed_session(&db, "p1").await;
         let cid = ic(&db, sid, "p1", "qwen", "local", 1000, 1, 1, 0).await;
@@ -1320,7 +1320,7 @@ mod tests {
             Some("a.rs"),
             Recovery::Clean,
             false,
-            Some(""),
+            None,
             None,
         )
         .await;

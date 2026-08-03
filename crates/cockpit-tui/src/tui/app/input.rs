@@ -431,6 +431,11 @@ impl App {
                 // updates when it arrives (no optimistic render of the written
                 // value). Detached, this refreshes the bootstrap snapshot once.
                 self.resync_config_after_local_write();
+                if !matches!(self.agent_runner.as_ref(), Some(Ok(_)))
+                    && let Some(provider) = self.reopen_model_picker_after_settings.take()
+                {
+                    self.open_model_picker_for_provider(&provider);
+                }
             } else if let Some(req) = self.dialog.take_daemon_request() {
                 self.send_daemon_request("/settings", req, ControlApplied::None);
             }
@@ -451,9 +456,12 @@ impl App {
                     let accepted = picker.is_done();
                     let add_model_provider = picker.take_add_model_provider();
                     self.overlay = Overlay::ModelPicker(picker);
-                    self.close_model_picker(accepted);
                     if let Some(provider) = add_model_provider {
+                        self.overlay = Overlay::None;
+                        self.reopen_model_picker_after_settings = Some(provider.clone());
                         self.dialog = Dialog::open_provider_models(&self.launch.cwd, &provider);
+                    } else {
+                        self.close_model_picker(accepted);
                     }
                 } else {
                     self.overlay = Overlay::ModelPicker(picker);
@@ -2161,7 +2169,7 @@ impl App {
             }
             let status = format!(
                 "Switching to {}/{}; message will send when ready.",
-                pending.provider, pending.model
+                pending.requested.provider, pending.requested.model
             );
             pending.queued_submission = Some(super::QueuedModelSubmission {
                 composer_text: self.composer.text().to_string(),
@@ -2282,6 +2290,7 @@ impl App {
     fn open_missing_model_setup(&mut self, reason: MissingModelReason) {
         let status = reason.status();
         let cfg = self.config_snapshot.providers.clone();
+        self.submit_after_model_selection = true;
         if cfg.providers.is_empty() {
             self.first_run_flow = FirstRunFlow::AwaitProvider;
             self.dialog = Dialog::open_providers_add_with_status(&self.launch.cwd, Some(status));
@@ -4226,6 +4235,7 @@ mod paste_routing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
         app.dialog = Dialog::None;
+        crate::tui::app::seed_ready_model_for_tests(&mut app);
         app
     }
 
@@ -4248,8 +4258,13 @@ mod paste_routing_tests {
         app.pending_model_selection = Some(PendingModelSelection {
             session_id: app.launch.session_id,
             selection_id: uuid::Uuid::new_v4(),
-            provider: "p".to_string(),
-            model: "new-model".to_string(),
+            requested: cockpit_config::providers::ActiveModelRef {
+                provider: "p".to_string(),
+                model: "new-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
             trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             minimum_generation: app.active_model_state_generation,
             started_at: std::time::Instant::now(),
@@ -5161,6 +5176,7 @@ mod shift_enter_keyboard_protocol_tests {
         app.daemon_prompt = None;
         app.dialog = Dialog::None;
         app.composer.set_vim_enabled(false);
+        crate::tui::app::seed_ready_model_for_tests(&mut app);
         app
     }
 

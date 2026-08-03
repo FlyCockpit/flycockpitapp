@@ -20,7 +20,11 @@ fn configured_app(tmp: &tempfile::TempDir) -> App {
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
     fs::create_dir(&cockpit).unwrap();
-    fs::write(cockpit.join("config.json"), "{}").unwrap();
+    fs::write(
+        cockpit.join("config.json"),
+        r#"{"active_model":{"provider":"p","model":"m"}}"#,
+    )
+    .unwrap();
     let provider_dir = cockpit.join("providers");
     fs::create_dir(&provider_dir).unwrap();
     fs::write(
@@ -28,7 +32,10 @@ fn configured_app(tmp: &tempfile::TempDir) -> App {
         r#"{"url":"https://example.test","models":[{"id":"m"}]}"#,
     )
     .unwrap();
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || App::new(Some(tmp.path()), false),
+    );
     app.daemon_prompt = None;
     app
 }

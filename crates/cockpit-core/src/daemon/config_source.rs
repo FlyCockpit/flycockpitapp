@@ -184,7 +184,13 @@ mod tests {
         let layer = tmp.path().join(".cockpit");
         std::fs::create_dir_all(layer.join("providers")).unwrap();
 
-        let paths = ConfigSource::production().watch_paths(tmp.path());
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let paths = crate::config::trust::with_workspace_trust_policy(policy, || {
+            ConfigSource::production().watch_paths(tmp.path())
+        });
 
         assert!(paths.config_files.contains(&layer.join("config.json")));
         assert!(paths.provider_dirs.contains(&layer.join("providers")));
@@ -200,7 +206,13 @@ mod tests {
         std::fs::write(layer.join("mcp.json"), "{}").unwrap();
         std::fs::write(layer.join("agents/build.md"), "agent").unwrap();
 
-        let paths = ConfigSource::production().watch_paths(tmp.path());
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let paths = crate::config::trust::with_workspace_trust_policy(policy, || {
+            ConfigSource::production().watch_paths(tmp.path())
+        });
         let rendered = format!("{paths:?}");
 
         assert!(!rendered.contains("mcp.json"), "{rendered}");

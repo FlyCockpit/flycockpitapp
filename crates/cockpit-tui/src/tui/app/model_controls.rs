@@ -109,7 +109,12 @@ impl App {
         self.open_model_picker_highlighting(None);
     }
 
-    pub(super) fn open_model_picker_highlighting(&mut self, requested: Option<(&str, &str)>) {
+    pub(super) fn open_model_picker_highlighting(
+        &mut self,
+        requested: Option<&cockpit_config::providers::ActiveModelRef>,
+    ) {
+        let expired = self.expire_stale_model_selection();
+        let requested = requested.or(expired.as_ref());
         self.footer_selection = None;
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
@@ -122,8 +127,8 @@ impl App {
         ) {
             Ok(mut picker) => {
                 picker.set_config_drift(self.model_picker_drift());
-                if let Some((provider, model)) = requested {
-                    picker.highlight_requested_model(provider, model);
+                if let Some(requested) = requested {
+                    picker.restore_requested_selection(requested);
                 }
                 self.overlay = Overlay::ModelPicker(picker);
             }
@@ -131,6 +136,32 @@ impl App {
                 self.push_plain(format!("/model: {e}"));
             }
         }
+    }
+
+    fn expire_stale_model_selection(
+        &mut self,
+    ) -> Option<cockpit_config::providers::ActiveModelRef> {
+        let expired = self
+            .pending_model_selection
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.started_at.elapsed() >= std::time::Duration::from_secs(60)
+            });
+        if !expired {
+            return None;
+        }
+        let pending = self
+            .pending_model_selection
+            .take()
+            .expect("expired pending selection exists");
+        if self.retry_model_submission.is_none() {
+            self.retry_model_submission = pending.queued_submission;
+        }
+        self.push_plain(
+            "The previous model selection timed out. Choose a model to retry; your queued message is retained."
+                .to_string(),
+        );
+        Some(pending.requested)
     }
 
     pub(super) fn open_model_picker_for_provider(&mut self, provider: &str) {
@@ -321,6 +352,9 @@ impl App {
     }
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {
+        if !accepted {
+            self.submit_after_model_selection = false;
+        }
         let selected = match std::mem::take(&mut self.overlay) {
             Overlay::ModelPicker(picker) if accepted => picker
                 .selected_active_model()
@@ -331,20 +365,30 @@ impl App {
             }
         };
         self.overlay = Overlay::None;
-        if let Some((active, persist_as_default)) = selected {
+        if selected.is_none() {
+            self.submit_after_model_selection = false;
+        }
+        if let Some((active, explicitly_persist_as_default)) = selected {
+            let persist_as_default =
+                explicitly_persist_as_default || self.default_model_selection.is_none();
             let provider = active.provider.clone();
             let model = active.model.clone();
-            self.notify_active_model_selected(
+            if self.notify_active_model_selected(
                 active,
                 persist_as_default,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
-            );
-            let scope = if persist_as_default {
-                " and make default"
-            } else {
-                ""
-            };
-            self.push_plain(format!("Selecting {provider}/{model}{scope}…"));
+            ) {
+                let scope = if persist_as_default {
+                    " for this session and saving it as the default"
+                } else {
+                    " for this session"
+                };
+                self.push_plain(format!("Selecting {provider}/{model}{scope}…"));
+                if self.submit_after_model_selection {
+                    self.submit_after_model_selection = false;
+                    let _ = self.submit_input();
+                }
+            }
         }
     }
 
@@ -353,7 +397,7 @@ impl App {
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
-    ) {
+    ) -> bool {
         let provider = active.provider.clone();
         let model = active.model.clone();
         self.record_usage(
@@ -361,13 +405,7 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.request_model_selection(
-            "/model",
-            active,
-            persist_as_default,
-            trigger,
-            ControlApplied::None,
-        );
+        self.request_model_selection("/model", active, persist_as_default, trigger)
     }
 
     pub(super) fn request_model_selection(
@@ -376,49 +414,83 @@ impl App {
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
-        applied: ControlApplied,
-    ) {
+    ) -> bool {
+        if self.pending_model_selection.is_some() {
+            let message =
+                "Another model selection is still in progress; wait for it to finish.".to_string();
+            self.show_model_selection_error(&active, trigger, message);
+            return false;
+        }
         if !matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
-            self.report_control_not_delivered(label, ControlRequestNotDelivered::NoRunner);
-            self.open_model_picker_highlighting(Some((&active.provider, &active.model)));
-            return;
+            let runner = agent_runner::try_spawn_with_model(
+                &self.launch.cwd,
+                self.launch.session_id,
+                active.clone(),
+                self.no_sandbox,
+                self.lifecycle_mode(),
+            );
+            match runner {
+                Ok(runner) => self.adopt_runner(Ok(runner)),
+                Err(error) => {
+                    let message = format!("{label}: could not start a session — {error}");
+                    self.show_model_selection_error(&active, trigger, message);
+                    return false;
+                }
+            }
         }
         let selection_id = uuid::Uuid::new_v4();
         self.pending_model_selection = Some(super::PendingModelSelection {
             session_id: self.launch.session_id,
             selection_id,
-            provider: active.provider.clone(),
-            model: active.model.clone(),
+            requested: active.clone(),
             trigger,
             minimum_generation: self.active_model_state_generation,
             started_at: std::time::Instant::now(),
-            queued_submission: None,
+            queued_submission: self.retry_model_submission.take(),
         });
         self.send_daemon_request(
             label,
             active_model_request(selection_id, active, persist_as_default, trigger),
-            match applied {
-                ControlApplied::None => ControlApplied::ModelSelection { selection_id },
-                other => other,
-            },
+            ControlApplied::ModelSelection { selection_id },
         );
+        true
+    }
+    pub(super) fn show_model_selection_error(
+        &mut self,
+        active: &cockpit_config::providers::ActiveModelRef,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        message: String,
+    ) {
+        if matches!(
+            trigger,
+            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
+        ) {
+            self.open_model_picker_highlighting(Some(active));
+            if let Overlay::ModelPicker(picker) = &mut self.overlay {
+                picker.set_error(message);
+            }
+            return;
+        }
+        self.push_plain(message);
     }
 
     pub(super) fn cycle_footer_model(&mut self, forward: bool) {
         match crate::tui::model_picker::cycle_active_favorite(
             &self.config_snapshot.providers,
+            self.active_model_selection.as_ref(),
             &self.usage_models,
             forward,
         ) {
             Ok(Some(active)) => {
                 let provider = active.provider.clone();
                 let model = active.model.clone();
-                self.notify_active_model_selected(
+                if self.notify_active_model_selected(
                     active,
                     false,
                     cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
-                );
-                self.push_plain(format!("/model: selecting {provider}/{model} ★"));
+                ) {
+                    self.push_plain(format!("/model: selecting {provider}/{model} ★"));
+                }
             }
             Ok(None) => {
                 self.push_plain(
@@ -455,9 +527,7 @@ impl App {
             approval_mode: self.approval_mode,
             active_model: self.launch.active_model.clone(),
             prompt_cache_retention: self
-                .config_snapshot
-                .providers
-                .active_model
+                .active_model_selection
                 .as_ref()
                 .and_then(|active| active.prompt_cache_retention)
                 .unwrap_or_default(),
@@ -514,38 +584,48 @@ impl App {
                 ControlApplied::None,
             );
         }
-        if let Some(retention) = commit.prompt_cache_retention {
-            let Some(mut active) = self.config_snapshot.providers.active_model.clone() else {
-                self.push_plain("/quick: no active model selected".to_string());
-                return;
-            };
+        let retention = commit.prompt_cache_retention;
+        let requested_model = commit.active_model;
+        let model_changed = requested_model.is_some();
+        let mut active = match requested_model {
+            Some((provider, model)) => {
+                let mut selection = self.active_model_selection.clone().unwrap_or(
+                    cockpit_config::providers::ActiveModelRef {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        reasoning_effort: None,
+                        thinking_mode: None,
+                        prompt_cache_retention: None,
+                    },
+                );
+                selection.provider = provider;
+                selection.model = model;
+                Some(selection)
+            }
+            None => retention.and_then(|_| self.active_model_selection.clone()),
+        };
+        if retention.is_some() && active.is_none() {
+            self.push_plain("/quick: no session model is active".to_string());
+            return;
+        }
+        if let (Some(retention), Some(active)) = (retention, active.as_mut()) {
             active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
+        }
+        if let Some(active) = active {
+            let provider = active.provider.clone();
+            let model = active.model.clone();
+            if model_changed {
+                self.record_usage(
+                    cockpit_core::daemon::proto::UsageKind::Model,
+                    format!("{provider}/{model}"),
+                    None,
+                );
+            }
             self.request_model_selection(
                 "/quick",
                 active,
-                true,
+                false,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-                ControlApplied::None,
-            );
-        }
-        if let Some((provider, model)) = commit.active_model {
-            self.record_usage(
-                cockpit_core::daemon::proto::UsageKind::Model,
-                format!("{provider}/{model}"),
-                None,
-            );
-            self.request_model_selection(
-                "/quick",
-                cockpit_config::providers::ActiveModelRef {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    reasoning_effort: None,
-                    thinking_mode: None,
-                    prompt_cache_retention: None,
-                },
-                true,
-                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-                ControlApplied::QuickActiveModel { provider, model },
             );
         }
     }
@@ -607,17 +687,19 @@ impl App {
             req,
         );
         if let Err(reason) = result {
-            let pending = self.pending_control_requests.remove(&request_id);
-            if let Some(PendingControlRequest {
-                applied: ControlApplied::ModelSelection { selection_id },
-                ..
-            }) = pending
-                && let Some((provider, model)) =
-                    self.clear_pending_model_selection(Some(selection_id))
-            {
-                self.open_model_picker_highlighting(Some((&provider, &model)));
+            let selection_id =
+                self.pending_control_requests
+                    .remove(&request_id)
+                    .and_then(|pending| match pending.applied {
+                        ControlApplied::ModelSelection { selection_id } => Some(selection_id),
+                        _ => None,
+                    });
+            let message = Self::control_not_delivered_message(label, reason);
+            if let Some(pending) = self.clear_pending_model_selection(selection_id) {
+                self.show_failed_model_selection(pending, message);
+            } else {
+                self.push_plain(message);
             }
-            self.report_control_not_delivered(label, reason);
         }
     }
 
@@ -636,19 +718,20 @@ impl App {
         match outcome {
             ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
             ControlRequestOutcome::Rejected(error) => {
-                if let Some((provider, model)) = self.clear_pending_model_selection(selection_id) {
-                    self.open_model_picker_highlighting(Some((&provider, &model)));
+                let message = format!("{}: daemon rejected request: {error}", pending.label);
+                if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                    self.show_failed_model_selection(selection, message);
+                } else {
+                    self.push_plain(message);
                 }
-                self.push_plain(format!(
-                    "{}: daemon rejected request: {error}",
-                    pending.label
-                ));
             }
             ControlRequestOutcome::NotDelivered(reason) => {
-                if let Some((provider, model)) = self.clear_pending_model_selection(selection_id) {
-                    self.open_model_picker_highlighting(Some((&provider, &model)));
+                let message = Self::control_not_delivered_message(&pending.label, reason);
+                if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                    self.show_failed_model_selection(selection, message);
+                } else {
+                    self.push_plain(message);
                 }
-                self.report_control_not_delivered(&pending.label, reason);
             }
         }
     }
@@ -656,13 +739,20 @@ impl App {
     fn clear_pending_model_selection(
         &mut self,
         selection_id: Option<uuid::Uuid>,
-    ) -> Option<(String, String)> {
+    ) -> Option<super::PendingModelSelection> {
         let pending = self.pending_model_selection.as_ref()?;
         if Some(pending.selection_id) != selection_id {
             return None;
         }
-        let pending = self.pending_model_selection.take()?;
-        Some((pending.provider, pending.model))
+        self.pending_model_selection.take()
+    }
+
+    fn show_failed_model_selection(
+        &mut self,
+        pending: super::PendingModelSelection,
+        message: String,
+    ) {
+        self.show_model_selection_error(&pending.requested, pending.trigger, message);
     }
 
     fn apply_control_success(&mut self, applied: ControlApplied) {
@@ -706,11 +796,16 @@ impl App {
                     &[],
                 );
             }
-            ControlApplied::QuickActiveModel { provider, model } => {
-                self.push_plain(format!("/quick: active model is now {provider}/{model}"));
-            }
             ControlApplied::ScheduleCancel { command, job_id } => {
-                self.push_plain(format!("{command}: cancel requested for `{job_id}`"));
+                self.push_plain(format!("{command}: cancel requested for {job_id}"));
+            }
+            ControlApplied::ModelFavorite {
+                provider,
+                model,
+                favorite,
+            } => {
+                let verb = if favorite { "marked" } else { "unmarked" };
+                self.push_plain(format!("/favorite: {verb} {provider}/{model} as favorite"));
             }
             ControlApplied::PinContext { text } => {
                 self.push_plain(format!(
@@ -725,7 +820,11 @@ impl App {
         label: &str,
         reason: ControlRequestNotDelivered,
     ) {
-        let message = match reason {
+        self.push_plain(Self::control_not_delivered_message(label, reason));
+    }
+
+    fn control_not_delivered_message(label: &str, reason: ControlRequestNotDelivered) -> String {
+        match reason {
             ControlRequestNotDelivered::NoRunner => {
                 format!("{label}: send a message first to start a session")
             }
@@ -736,8 +835,7 @@ impl App {
             | ControlRequestNotDelivered::RunnerTeardown => {
                 format!("{label}: request not sent - daemon control channel closed; try again")
             }
-        };
-        self.push_plain(message);
+        }
     }
 
     /// The anti-misfire lockout to stamp on a question dialog about to be
@@ -760,12 +858,11 @@ impl App {
         lockout
     }
 
-    /// Fresh lockout for daemon-authoritative interrupt re-install paths:
-    /// queue advance and attach re-hydration. The old zero-lockout branch is
-    /// still valid for a genuine same-flow continuation, but FIFO advance and
-    /// re-hydration are new dialogs from the user's perspective and must not
-    /// be immediately answerable.
-    pub(super) fn fresh_dialog_lockout(&mut self) -> Duration {
+    /// Full lockout for a daemon-authoritative interrupt restored after
+    /// attach/reconnect. Unlike FIFO queue advancement, rehydration can put a
+    /// dialog under input that was intended for the composer or another
+    /// surface, so it deliberately starts a new anti-misfire window.
+    pub(super) fn rehydrated_dialog_lockout(&mut self) -> Duration {
         self.composer_active_since_dialog = false;
         Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms)
     }
@@ -784,11 +881,7 @@ fn active_model_request(
         persist_as_default,
         trigger,
         reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
-        thinking_mode: active.thinking_mode.and_then(|mode| {
-            serde_json::to_value(mode)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-        }),
+        thinking_mode: active.thinking_mode,
         prompt_cache_retention: active.prompt_cache_retention,
     }
 }

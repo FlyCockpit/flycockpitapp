@@ -558,10 +558,10 @@ fn remap_task_call_id_references(value: &mut Value, task_call_id_map: &BTreeMap<
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
                 if key == "task_call_id" || key == "cockpit_call_id" {
-                    if let Some(old) = value.as_str() {
-                        if let Some(new) = task_call_id_map.get(old) {
-                            *value = Value::String(new.clone());
-                        }
+                    if let Some(old) = value.as_str()
+                        && let Some(new) = task_call_id_map.get(old)
+                    {
+                        *value = Value::String(new.clone());
                     }
                 } else {
                     remap_task_call_id_references(value, task_call_id_map);
@@ -1544,7 +1544,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let bytes = crate::session::export::build_zip(&source, &row, &[row.clone()])
+        let bytes = crate::session::export::build_zip(&source, &row, std::slice::from_ref(&row))
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();
@@ -1613,7 +1613,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let bytes = crate::session::export::build_zip(&source, &row, &[row.clone()])
+        let bytes = crate::session::export::build_zip(&source, &row, std::slice::from_ref(&row))
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();

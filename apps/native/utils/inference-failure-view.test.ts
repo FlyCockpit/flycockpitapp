@@ -79,13 +79,11 @@ describe("inferenceFailureView", () => {
 describe("active model state", () => {
   it("keeps the highest generation", () => {
     const high = activeModelReducer(null, {
-      provider: "openai",
-      model: "gpt-5",
+      selection: { provider: "openai", model: "gpt-5" },
       generation: 10,
     });
     const stale = activeModelReducer(high, {
-      provider: "anthropic",
-      model: "claude",
+      selection: { provider: "anthropic", model: "claude" },
       generation: 9,
     });
 

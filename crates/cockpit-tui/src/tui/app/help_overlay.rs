@@ -548,8 +548,12 @@ mod tests {
             "missing Ctrl+K hint:\n{snapshot}"
         );
         assert!(
-            snapshot.contains("/setup opens provider and workspace setup wizards"),
+            snapshot.contains("/setup lists provider"),
             "missing /setup hint:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("use /setup model"),
+            "missing model setup hint:\n{snapshot}"
         );
     }
 

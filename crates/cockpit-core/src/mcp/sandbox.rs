@@ -1275,7 +1275,10 @@ mod tests {
     async fn external_mcp_invoke_without_approver_is_denied() {
         let cfg = configured_external_stub_cfg();
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let calls = Arc::new(AtomicUsize::new(0));
         let host = HostContext::from_tool_ctx(&ctx).with_test_external_invoke({
             let calls = calls.clone();

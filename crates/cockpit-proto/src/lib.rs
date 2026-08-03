@@ -461,10 +461,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// such as removals, renames, and type changes bump
 /// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
 /// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
-/// Oldest wire schema version this binary accepts.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+/// Oldest wire schema version this binary accepts. Protocol v6 deliberately
+/// breaks the active-model state shape so clients cannot silently lose
+/// session-level reasoning, thinking, or cache preferences.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 6;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -887,7 +889,8 @@ fn default_client_protocol_version() -> u32 {
 
 mod event;
 pub use event::{
-    AuthFailureKind, Event, InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome,
+    AuthFailureKind, DefaultModelUpdateOutcome, Event, InferenceErrorClass,
+    ModelSelectionActiveState, ModelSelectionOutcome,
 };
 
 // ---- Errors ----------------------------------------------------------------
@@ -1756,9 +1759,9 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 
 #[cfg(test)]
 mod proto_fixture_tests {
-    //! Fixture release ritual: when `PROTOCOL_VERSION` is bumped, copy the
-    //! current `vN/` directory to `vN+1/` and let the strict tests re-point to
-    //! the new current version. Never edit a frozen `v*/` directory.
+    //! Protocol fixtures cover every version accepted by this build. When the
+    //! supported range changes, add or remove the corresponding `vN/`
+    //! directories together with `SUPPORTED_PROTOCOL_VERSIONS`.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -1770,7 +1773,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const RELEASED_PROTOCOL_VERSIONS: &[u32] = &[1, 2, 3, 4, 5];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[6];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -1839,32 +1842,33 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_every_released_version_still_deserializes() {
-        for version in RELEASED_PROTOCOL_VERSIONS {
-            assert_frozen_fixture_deserializes::<Request>(*version, "request.json");
-            assert_frozen_fixture_deserializes::<Response>(*version, "response.json");
-            assert_frozen_fixture_deserializes::<Event>(*version, "event.json");
+    fn frozen_fixture_every_supported_version_still_deserializes() {
+        for version in SUPPORTED_PROTOCOL_VERSIONS.iter().copied() {
+            assert!(version >= MIN_SUPPORTED_PROTOCOL_VERSION);
+            assert_frozen_fixture_deserializes::<Request>(version, "request.json");
+            assert_frozen_fixture_deserializes::<Response>(version, "response.json");
+            assert_frozen_fixture_deserializes::<Event>(version, "event.json");
         }
     }
 
     #[test]
-    fn frozen_fixture_released_version_list_matches_directories() {
-        let listed = RELEASED_PROTOCOL_VERSIONS
+    fn frozen_fixture_supported_version_list_matches_directories() {
+        let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
         assert!(
             !listed.is_empty(),
-            "released protocol version list is empty"
+            "supported protocol version list is empty"
         );
-        let directories = released_fixture_directories();
+        let directories = supported_fixture_directories();
         assert!(
             !directories.is_empty(),
             "daemon_proto has no v*/ fixture directories"
         );
         assert_eq!(
             directories, listed,
-            "released protocol version list must match daemon_proto/v*/ directories"
+            "supported protocol version list must match daemon_proto/v*/ directories"
         );
         for version in listed {
             assert_fixture_directory_files(version);
@@ -1874,8 +1878,8 @@ mod proto_fixture_tests {
     #[test]
     fn frozen_fixture_current_version_directory_exists() {
         assert!(
-            RELEASED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION),
-            "current protocol v{PROTOCOL_VERSION} must be listed as released"
+            SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION),
+            "current protocol v{PROTOCOL_VERSION} must be listed as supported"
         );
         let root = fixture_root_for(PROTOCOL_VERSION);
         assert!(
@@ -2020,7 +2024,7 @@ mod proto_fixture_tests {
             .join("daemon_proto")
     }
 
-    fn released_fixture_directories() -> BTreeSet<u32> {
+    fn supported_fixture_directories() -> BTreeSet<u32> {
         let root = daemon_proto_fixture_root();
         let entries = std::fs::read_dir(&root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
@@ -2149,6 +2153,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_live_status",
         "set_active_model",
         "set_agent",
+        "set_model_favorite",
         "share_session",
         "stats_rollup",
         "unarchive_session",
@@ -3108,6 +3113,24 @@ mod tests {
             .expect_err("below-min daemon protocol must be rejected");
         assert_eq!(err.code, ErrorCode::ProtocolVersion);
         assert_eq!(err.message, incompatible_daemon_protocol_message(below_min));
+    }
+
+    #[test]
+    fn set_active_model_rejects_unknown_thinking_mode_during_deserialization() {
+        let raw = json!({
+            "request": "set_active_model",
+            "params": {
+                "selection_id": "11111111-1111-4111-8111-111111111111",
+                "provider": "openai",
+                "model": "gpt-5",
+                "persist_as_default": false,
+                "thinking_mode": "turbo"
+            }
+        });
+
+        let error = serde_json::from_value::<Request>(raw)
+            .expect_err("unknown thinking mode must fail at the wire boundary");
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[tokio::test]

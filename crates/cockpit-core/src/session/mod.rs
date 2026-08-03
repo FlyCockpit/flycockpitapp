@@ -194,8 +194,9 @@ pub struct Session {
     title: Mutex<Option<String>>,
     user_renamed: Mutex<bool>,
     active_agent: Mutex<String>,
-    model: Mutex<Option<String>>,
-    provider: Mutex<Option<String>>,
+    /// Complete session selection, including invocation preferences that are
+    /// not part of the provider/model identity.
+    model_selection: Mutex<Option<crate::config::providers::ActiveModelRef>>,
     session_llm_mode: Mutex<Option<String>>,
     tool_surface_override_json: Mutex<Option<String>>,
     goal_settings_override_json: Mutex<Option<String>>,
@@ -1697,19 +1698,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_persist_carries_provider_and_model() {
+    async fn deferred_persist_carries_the_complete_model_selection() {
         // A model picked before the first message survives the deferred
-        // write (session-id-display-and-lazy-persist).
+        // write as one atomic value, including inference preferences.
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
-        // set_active_model's DB UPDATE is a no-op while un-persisted; the
-        // value lives in memory and must land in the deferred INSERT.
-        s.set_active_model("anthropic", "claude-opus-4-7").unwrap();
+        let selection = crate::config::providers::ActiveModelRef {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-7".to_string(),
+            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+        };
+        s.set_active_model_ref(selection.clone()).unwrap();
         assert!(db.get_session(s.id).await.unwrap().is_none());
         s.persist_if_needed().unwrap();
         let row = db.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(row.provider.as_deref(), Some("anthropic"));
         assert_eq!(row.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            serde_json::from_str::<crate::config::providers::ActiveModelRef>(
+                row.model_selection_json.as_deref().unwrap()
+            )
+            .unwrap(),
+            selection
+        );
     }
 
     #[tokio::test]

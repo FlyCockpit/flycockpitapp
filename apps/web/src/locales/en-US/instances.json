@@ -106,6 +106,7 @@
     "newSessionDescription": "Create a browser-controlled session in this project.",
     "sessionTitle": "Session title",
     "agent": "Agent",
+    "provider": "Provider",
     "model": "Model",
     "createSession": "Create session",
     "createFailed": "Could not create the session.",

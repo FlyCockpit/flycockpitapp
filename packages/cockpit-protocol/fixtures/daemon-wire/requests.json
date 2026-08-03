@@ -7,7 +7,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "archive_session",
-    "v": 5
+    "v": 6
   },
   "attach": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -23,6 +23,15 @@
           "TOKEN": "redacted"
         }
       },
+      "initial_model": {
+        "model": "gpt-5",
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
+      },
       "interactive": true,
       "model_override": "model_override-fixture",
       "no_sandbox": true,
@@ -31,7 +40,7 @@
       "since_seq": 7
     },
     "request": "attach",
-    "v": 5
+    "v": 6
   },
   "cancel_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -40,17 +49,16 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "cancel_paused_work",
-    "v": 5
+    "v": 6
   },
   "delete_session": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "params": {
-      "cascade": true,
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "delete_session",
-    "v": 5
+    "v": 6
   },
   "fork_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -61,7 +69,7 @@
       "parent_session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "fork_session",
-    "v": 5
+    "v": 6
   },
   "fs_create_dir": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -71,7 +79,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_create_dir",
-    "v": 5
+    "v": 6
   },
   "fs_delete": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -81,7 +89,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_delete",
-    "v": 5
+    "v": 6
   },
   "fs_list": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -92,7 +100,7 @@
       "show_hidden": true
     },
     "request": "fs_list",
-    "v": 5
+    "v": 6
   },
   "fs_read": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -103,7 +111,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_read",
-    "v": 5
+    "v": 6
   },
   "fs_rename": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -114,7 +122,7 @@
       "to_path": "to_path-fixture"
     },
     "request": "fs_rename",
-    "v": 5
+    "v": 6
   },
   "fs_stat": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -124,7 +132,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_stat",
-    "v": 5
+    "v": 6
   },
   "fs_write": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -136,7 +144,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_write",
-    "v": 5
+    "v": 6
   },
   "git_diff_file": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -146,7 +154,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "git_diff_file",
-    "v": 5
+    "v": 6
   },
   "git_status": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -155,7 +163,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "git_status",
-    "v": 5
+    "v": 6
   },
   "list_sessions": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -165,7 +173,7 @@
       "project_id": "project_id-fixture"
     },
     "request": "list_sessions",
-    "v": 5
+    "v": 6
   },
   "read_history_page": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -176,7 +184,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "read_history_page",
-    "v": 5
+    "v": 6
   },
   "read_session_messages": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -187,7 +195,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "read_session_messages",
-    "v": 5
+    "v": 6
   },
   "read_subagent_history_page": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -200,7 +208,7 @@
       "task_call_id": "task_call_id-fixture"
     },
     "request": "read_subagent_history_page",
-    "v": 5
+    "v": 6
   },
   "rename_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -210,7 +218,7 @@
       "title": "title-fixture"
     },
     "request": "rename_session",
-    "v": 5
+    "v": 6
   },
   "resolve_interrupt": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -238,13 +246,13 @@
       }
     },
     "request": "resolve_interrupt",
-    "v": 5
+    "v": 6
   },
   "restart_if_idle": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "request": "restart_if_idle",
-    "v": 5
+    "v": 6
   },
   "resume_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -253,7 +261,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "resume_paused_work",
-    "v": 5
+    "v": 6
   },
   "send_user_message": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -277,7 +285,7 @@
       "text": "text-fixture"
     },
     "request": "send_user_message",
-    "v": 5
+    "v": 6
   },
   "session_live_status": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -286,18 +294,20 @@
       "session_ids": ["11111111-1111-4111-8111-111111111111"]
     },
     "request": "session_live_status",
-    "v": 5
+    "v": 6
   },
   "set_active_model": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "params": {
       "model": "model-fixture",
+      "persist_as_default": false,
       "provider": "provider-fixture",
+      "selection_id": "11111111-1111-4111-8111-111111111111",
       "trigger": "daemon"
     },
     "request": "set_active_model",
-    "v": 5
+    "v": 6
   },
   "set_agent": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -306,7 +316,18 @@
       "name": "name-fixture"
     },
     "request": "set_agent",
-    "v": 5
+    "v": 6
+  },
+  "set_model_favorite": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "favorite": true,
+      "model": "gpt-5",
+      "provider": "openai"
+    },
+    "request": "set_model_favorite",
+    "v": 6
   },
   "share_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -316,7 +337,7 @@
       "shared": true
     },
     "request": "share_session",
-    "v": 5
+    "v": 6
   },
   "stats_rollup": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -327,7 +348,7 @@
       "range": "all_time"
     },
     "request": "stats_rollup",
-    "v": 5
+    "v": 6
   },
   "unarchive_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -336,6 +357,6 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "unarchive_session",
-    "v": 5
+    "v": 6
   }
 }

@@ -17,6 +17,14 @@ pub enum PausedWorkStatus {
 }
 
 impl PausedWorkStatus {
+    pub const ALL: [Self; 5] = [
+        Self::Paused,
+        Self::Resumed,
+        Self::Cancelled,
+        Self::FailedToPause,
+        Self::Lost,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Paused => "paused",

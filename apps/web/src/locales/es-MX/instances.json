@@ -106,6 +106,7 @@
     "newSessionDescription": "Crea una sesion controlada desde el navegador en este proyecto.",
     "sessionTitle": "Titulo de sesion",
     "agent": "Agente",
+    "provider": "Proveedor",
     "model": "Modelo",
     "createSession": "Crear sesion",
     "createFailed": "No se pudo crear la sesion.",

@@ -198,10 +198,8 @@ export class RemoteSessionClient {
     );
   }
 
-  async deleteSession(session_id: string, cascade = false) {
-    return parseAckResult(
-      await this.send({ request: "delete_session", params: { session_id, cascade } }),
-    );
+  async deleteSession(session_id: string) {
+    return parseAckResult(await this.send({ request: "delete_session", params: { session_id } }));
   }
 
   async setActiveModel(params: ParamsOf<"set_active_model">) {

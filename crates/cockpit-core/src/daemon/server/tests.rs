@@ -9,10 +9,21 @@ use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
+
+fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
 
 macro_rules! pin_registration_rows_from_command_table {
     (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
@@ -334,6 +345,17 @@ async fn pin_rpc_rejects_seq_not_in_session() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let other = ctx.db.create_session("p", "/repo", "Other").await.unwrap();
+    assert_ne!(session.session_id, other.session_id);
+    assert_eq!(
+        ctx.db
+            .read(|conn| {
+                Ok(conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))?)
+            })
+            .await
+            .unwrap(),
+        1,
+        "daemon DB connections must enforce foreign keys"
+    );
     let seq = ctx
         .db
         .insert_session_event(
@@ -351,10 +373,6 @@ async fn pin_rpc_rejects_seq_not_in_session() {
             session_id: session.session_id,
             seq,
         },
-        Request::UnpinMessage {
-            session_id: session.session_id,
-            seq,
-        },
         Request::TogglePinnedMessage {
             session_id: session.session_id,
             seq,
@@ -364,6 +382,18 @@ async fn pin_rpc_rejects_seq_not_in_session() {
         assert_eq!(error.code, ErrorCode::BadRequest);
         assert!(error.message.contains("is not a member"));
     }
+
+    let response = handle_request(
+        Request::UnpinMessage {
+            session_id: session.session_id,
+            seq,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, Response::PinChanged { changed: false }));
 }
 
 #[tokio::test]
@@ -1229,6 +1259,7 @@ async fn new_session_state_requests_are_classified() {
             Request::CreateAssistantSession {
                 name: "helper".into(),
                 project_root: "/repo".into(),
+                initial_model: None,
                 no_sandbox: false,
                 env_snapshot: None,
             },
@@ -1308,6 +1339,7 @@ async fn new_session_state_requests_enforce_authorization() {
         Request::CreateAssistantSession {
             name: "helper".into(),
             project_root: "/repo".into(),
+            initial_model: None,
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -1337,6 +1369,42 @@ async fn new_session_state_requests_enforce_authorization() {
             .unwrap_or_else(|| panic!("{kind} unexpectedly authorized"));
         assert_eq!(err.code, ErrorCode::Authorization, "{kind}");
     }
+}
+
+#[tokio::test]
+async fn remote_session_writer_cannot_persist_active_model_as_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = test_ctx();
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    state.principal = ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
+        user_id: "writer".into(),
+        grants: vec![crate::daemon::principal::PrincipalGrant {
+            scope: crate::daemon::principal::PrincipalScope::Agent,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+        }],
+    });
+    let request = |persist_as_default| Request::SetActiveModel {
+        selection_id: Uuid::new_v4(),
+        provider: "p".into(),
+        model: "a".into(),
+        persist_as_default,
+        trigger: proto::ActiveModelSwitchTrigger::Picker,
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+
+    authorize_request(&request(false), &state, &ctx)
+        .await
+        .expect("session-only selection remains available to a writer");
+    let error = authorize_request(&request(true), &state, &ctx)
+        .await
+        .expect_err("durable default mutation must remain owner-only");
+    assert_eq!(error.code, ErrorCode::Authorization);
 }
 
 #[tokio::test]
@@ -1445,6 +1513,7 @@ async fn assistant_rpc_creates_session_via_registry() {
         Request::CreateAssistantSession {
             name: "helper-bot".into(),
             project_root: project.path().to_string_lossy().into_owned(),
+            initial_model: None,
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -1486,6 +1555,7 @@ async fn assistant_session_creation_is_atomic() {
         Request::CreateAssistantSession {
             name: "helper-bot".into(),
             project_root: untrusted_project.path().to_string_lossy().into_owned(),
+            initial_model: None,
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -1504,6 +1574,50 @@ async fn assistant_session_creation_is_atomic() {
         ctx.db.list_sessions(false, 100).await.unwrap().is_empty(),
         "failed assistant session creation must not persist a session row"
     );
+}
+
+#[tokio::test]
+async fn assistant_session_requires_an_initial_or_default_model() {
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        crate::config::providers::ProvidersConfig::default(),
+        crate::config::extended::ExtendedConfig::default(),
+    ));
+    let assistant_home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    create_test_assistant(&ctx, &assistant_home, "helper-bot").await;
+    let mut state = owner_state();
+
+    let error = handle_request(
+        Request::CreateAssistantSession {
+            name: "helper-bot".into(),
+            project_root: project.path().to_string_lossy().into_owned(),
+            initial_model: None,
+            no_sandbox: false,
+            env_snapshot: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("model-less assistant creation must fail immediately");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error
+            .message
+            .contains("no model selected for the new assistant session"),
+        "{}",
+        error.message
+    );
+    assert!(ctx.registry.active_session_ids().is_empty());
+    assert!(ctx.db.list_sessions(false, 100).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -3347,6 +3461,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "untitled session row receives generated title",
         },
         MutatingDispatchCase {
+            kind: "import_session_archive",
+            effect_class: Durable,
+            observation: "valid archive creates its session rows atomically",
+        },
+        MutatingDispatchCase {
             kind: "curator",
             effect_class: Durable,
             observation: "skill curator state changes through daemon-owned DB/filesystem path",
@@ -3470,6 +3589,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "run_scheduled_job",
             effect_class: Durable,
             observation: "scheduled job run result is recorded in the shared daemon",
+        },
+        MutatingDispatchCase {
+            kind: "set_model_favorite",
+            effect_class: Durable,
+            observation: "provider config favorite changes and refreshed snapshot is emitted",
         },
         MutatingDispatchCase {
             kind: "set_active_model",
@@ -3817,12 +3941,14 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "create_assistant_session"
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
-        | "set_goal_status" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        | "set_goal_status"
+        | "import_session_archive" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "set_project_note_content" | "rename_project_note" | "delete_project_note" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
         "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
+        "set_model_favorite" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "send_user_message"
         | "steer_delegation"
         | "remove_queued_user_message"
@@ -3892,6 +4018,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
+        authz_owner_only("import_session_archive"),
         authz_owner_only("curator"),
         authz_session_writer("cancel_turn"),
         authz_project_files("fs_list"),
@@ -3934,6 +4061,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("list_agents"),
         authz_owner_only("list_models"),
         authz_session_writer("set_active_model"),
+        authz_owner_only("set_model_favorite"),
         authz_session_writer("set_agent"),
         authz_session_writer("set_tool_surface_override"),
         authz_session_writer("set_goal_settings_override"),
@@ -4654,6 +4782,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "repair_resume"
             | "cancel_turn"
             | "resolve_interrupt"
+            | "set_model_favorite"
             | "set_active_model"
             | "set_agent"
             | "set_tool_surface_override"
@@ -4779,6 +4908,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "create_assistant_session" => Request::CreateAssistantSession {
             name: "missing-assistant".into(),
             project_root: root,
+            initial_model: None,
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -4885,6 +5015,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             before_seq: None,
             limit: 20,
         },
+        "import_session_archive" => Request::ImportSessionArchive {
+            archive_base64: "not-base64".to_string(),
+            as_new: false,
+        },
         "archive_session" => Request::ArchiveSession {
             session_id,
             cascade: false,
@@ -4915,10 +5049,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             text: "authz".into(),
         },
-        "delete_session" => Request::DeleteSession {
-            session_id,
-            cascade: false,
-        },
+        "delete_session" => Request::DeleteSession { session_id },
         "list_skills" => Request::ListSkills { project_root: root },
         "resource_snapshot" => Request::ResourceSnapshot,
         "promote_resource" => Request::PromoteResource {
@@ -4950,6 +5081,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "list_agents" => Request::ListAgents,
         "list_models" => Request::ListModels { provider: None },
+        "set_model_favorite" => Request::SetModelFavorite {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            favorite: true,
+        },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::from_u128(3),
             provider: "openai".into(),
@@ -5327,6 +5463,7 @@ impl ReadonlyDispatchCaseKind {
                         session_id: None,
                         since_seq: None,
                         project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                        initial_model: None,
                         no_sandbox: false,
                         interactive: true,
                         model_override: None,
@@ -5663,6 +5800,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                     session_id: None,
                     since_seq: None,
                     project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                    initial_model: None,
                     no_sandbox: false,
                     interactive: true,
                     model_override: None,
@@ -5773,6 +5911,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "delete_sealed_value" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
+        "import_session_archive" => assert_import_session_archive_happy().await,
         "curator" => assert_curator_mutating_happy().await,
         "archive_session"
         | "unarchive_session"
@@ -5800,6 +5939,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "restart_if_idle"
         | "stop_daemon"
         | "lsp_control" => assert_in_memory_or_global_mutating_happy(case.kind).await,
+        "set_model_favorite" => assert_set_model_favorite_happy().await,
         "send_user_message"
         | "steer_delegation"
         | "remove_queued_user_message"
@@ -5839,6 +5979,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                     session_id: Some(Uuid::new_v4()),
                     since_seq: None,
                     project_root: None,
+                    initial_model: None,
                     no_sandbox: false,
                     interactive: true,
                     model_override: None,
@@ -5901,6 +6042,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
                 Request::CreateAssistantSession {
                     name: "missing-assistant".into(),
                     project_root: "/repo".into(),
+                    initial_model: None,
                     no_sandbox: false,
                     env_snapshot: None,
                 },
@@ -5911,6 +6053,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             assert!(ctx.registry.active_session_ids().is_empty());
         }
         "auto_title" => assert_auto_title_mutating_malformed().await,
+        "import_session_archive" => assert_import_session_archive_malformed().await,
         "curator" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
@@ -5968,6 +6111,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "repair_resume"
         | "cancel_turn"
         | "resolve_interrupt"
+        | "set_model_favorite"
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
@@ -6135,6 +6279,7 @@ async fn dispatch_attached_worker_request(
                 session_id: Some(session_id),
                 since_seq: None,
                 project_root: Some(project_root.to_string_lossy().into_owned()),
+                initial_model: None,
                 no_sandbox: false,
                 interactive: true,
                 model_override: None,
@@ -6220,6 +6365,11 @@ async fn assert_worker_delivery_happy(kind: &str) {
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::from_u128(2),
             response: proto::ResolveResponse::Cancel,
+        },
+        "set_model_favorite" => Request::SetModelFavorite {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            favorite: true,
         },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::from_u128(3),
@@ -6598,6 +6748,11 @@ async fn assert_attached_required_malformed(kind: &str) {
         "resolve_interrupt" => Request::ResolveInterrupt {
             interrupt_id: Uuid::new_v4(),
             response: proto::ResolveResponse::Cancel,
+        },
+        "set_model_favorite" => Request::SetModelFavorite {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            favorite: true,
         },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::new_v4(),
@@ -7155,6 +7310,7 @@ async fn assert_create_assistant_session_happy() {
         Request::CreateAssistantSession {
             name: "helper-bot".into(),
             project_root: project.path().to_string_lossy().into_owned(),
+            initial_model: None,
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -7390,6 +7546,78 @@ async fn assert_auto_title_mutating_malformed() {
         .unwrap();
     assert!(row.title.is_none());
     assert!(!row.user_renamed);
+}
+
+fn minimal_import_archive_base64() -> (Uuid, String) {
+    let session_id = Uuid::new_v4();
+    let manifest = serde_json::json!({
+        "schema": "cockpit-session-export/1",
+        "redacted": false,
+        "target": {
+            "project_id": "import-dispatch-test",
+            "project_root": "/tmp/import-dispatch-test"
+        },
+        "sessions": [{
+            "session_id": session_id,
+            "short_id": "import",
+            "parent_session_id": null,
+            "fork_point_turn_id": null,
+            "provider": "test-provider",
+            "model": "test-model",
+            "active_agent": "Build",
+            "started_at": 100,
+            "ended_at": null,
+            "title": "Imported through daemon"
+        }]
+    });
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut cursor);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("manifest.json", options).unwrap();
+    zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes())
+        .unwrap();
+    zip.start_file("events.json", options).unwrap();
+    zip.write_all(b"[]").unwrap();
+    zip.finish().unwrap();
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cursor.into_inner(),
+    );
+    (session_id, encoded)
+}
+
+async fn assert_import_session_archive_happy() {
+    let ctx = test_ctx();
+    let (session_id, archive_base64) = minimal_import_archive_base64();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::ImportSessionArchive {
+            archive_base64,
+            as_new: false,
+        },
+    )
+    .await
+    .expect("valid archive imports");
+    assert!(matches!(
+        response,
+        Response::ImportSessionArchive { imported, redacted: false }
+            if imported == vec![session_id]
+    ));
+    assert!(ctx.db.get_session(session_id).await.unwrap().is_some());
+}
+
+async fn assert_import_session_archive_malformed() {
+    let ctx = test_ctx();
+    let error = dispatch_matrix_request(
+        &ctx,
+        Request::ImportSessionArchive {
+            archive_base64: "not-base64".to_string(),
+            as_new: false,
+        },
+    )
+    .await
+    .expect_err("invalid archive encoding is rejected");
+    assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
 #[cfg(unix)]
@@ -7644,7 +7872,6 @@ async fn assert_session_db_mutating_happy(kind: &str) {
                 &ctx,
                 Request::DeleteSession {
                     session_id: session.session_id,
-                    cascade: false,
                 },
             )
             .await
@@ -7704,7 +7931,6 @@ async fn assert_session_db_mutating_malformed(kind: &str) {
         },
         "delete_session" => Request::DeleteSession {
             session_id: missing,
-            cascade: false,
         },
         _ => unreachable!(),
     };
@@ -8066,6 +8292,7 @@ fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
         session_id: Some(session_id),
         since_seq: None,
         project_root: Some(project_root.to_string_lossy().into_owned()),
+        initial_model: None,
         no_sandbox: false,
         interactive: true,
         model_override: None,
@@ -8309,6 +8536,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "cancel_turn",
         "steer_delegation",
         "resolve_interrupt",
+        "set_model_favorite",
         "set_active_model",
         "set_agent",
         "set_llm_mode",
@@ -8366,6 +8594,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 session_id: Some(attach_session_id),
                 since_seq: None,
                 project_root: Some(project_root.clone()),
+                initial_model: None,
                 no_sandbox: false,
                 interactive: false,
                 model_override: None,
@@ -8577,6 +8806,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             request: Request::CreateAssistantSession {
                 name: "helper-bot".into(),
                 project_root: project_root.clone(),
+                initial_model: None,
                 no_sandbox: false,
                 env_snapshot: None,
             },
@@ -8900,10 +9130,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
-            request: Request::DeleteSession {
-                session_id,
-                cascade: false,
-            },
+            request: Request::DeleteSession { session_id },
             kind: "delete_session",
             session_id: Some(session_id),
             audit_path: None,
@@ -8999,6 +9226,17 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: None,
             audit_path: None,
             mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::SetModelFavorite {
+                provider: "openai".into(),
+                model: "gpt".into(),
+                favorite: true,
+            },
+            kind: "set_model_favorite",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
         },
         CommandMetadataCase {
             request: Request::SetActiveModel {
@@ -9514,6 +9752,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         RunScheduledJob,
         ListAgents,
         ListModels,
+        SetModelFavorite,
         SetActiveModel,
         SetAgent,
         SetLlmMode,
@@ -10625,6 +10864,159 @@ async fn list_models_returns_resolved_models() {
     assert!(models[0].favorite);
 }
 
+async fn assert_set_model_favorite_happy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, r#"{"providers":{"p":{}}}"#).unwrap();
+    let provider_path =
+        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+    std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &provider_path,
+        r#"{"url":"https://example.test","models":[{"id":"a","favorite":false}]}"#,
+    )
+    .unwrap();
+
+    let load_path = config_path.clone();
+    let write_path = config_path.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            Ok((
+                crate::config::providers::ConfigDoc::providers_from_paths(std::slice::from_ref(
+                    &load_path,
+                )),
+                crate::config::extended::ExtendedConfig::default(),
+            ))
+        },
+        move |_cwd, _provider| Some(write_path.clone()),
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let (mut state, _, mut work_rx) = attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+    state
+        .attached
+        .as_ref()
+        .expect("attached state")
+        .handle
+        .set_config_snapshot_for_tests(
+            crate::config::providers::ConfigDoc::providers_from_paths(std::slice::from_ref(
+                &config_path,
+            )),
+            crate::config::extended::ExtendedConfig::default(),
+        );
+    let refresh = tokio::spawn(async move {
+        match work_rx.recv().await.expect("config refresh work") {
+            SessionWork::ReplaceConfigSnapshot {
+                snapshot,
+                respond_to,
+            } => {
+                let model = snapshot.providers.providers["p"]
+                    .models
+                    .iter()
+                    .find(|model| model.id == "a")
+                    .expect("model in refreshed snapshot");
+                assert!(model.favorite);
+                respond_to.send(1).unwrap();
+            }
+            other => panic!("unexpected work: {other:?}"),
+        }
+    });
+
+    let response = handle_request(
+        Request::SetModelFavorite {
+            provider: "p".to_string(),
+            model: "a".to_string(),
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("favorite update succeeds");
+
+    assert!(matches!(response, Response::Ack));
+    refresh.await.unwrap();
+    let providers = crate::config::providers::ConfigDoc::providers_from_paths(&[config_path]);
+    assert!(providers.providers["p"].models[0].favorite);
+}
+
+#[tokio::test]
+async fn set_model_favorite_writes_config_and_refreshes_daemon_snapshot() {
+    assert_set_model_favorite_happy().await;
+}
+
+#[tokio::test]
+async fn set_model_favorite_writes_trusted_project_provider_layer() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+
+    let write_provider = |root: &Path| {
+        let cockpit_dir = root.join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        let config_path = cockpit_dir.join("config.json");
+        std::fs::write(&config_path, r#"{"providers":{"p":{}}}"#).unwrap();
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+        std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            provider_path,
+            r#"{"url":"https://example.test","models":[{"id":"a","favorite":false}]}"#,
+        )
+        .unwrap();
+        config_path
+    };
+    let global_config = write_provider(home.path());
+    let project_config = write_provider(project.path());
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    let (mut state, _, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let trust_policy = state.attached.as_ref().unwrap().handle.trust_policy.clone();
+    let (providers, extended) = ctx
+        .config_source()
+        .load_with_trust(project.path(), &trust_policy)
+        .unwrap();
+    state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .set_config_snapshot_for_tests(providers, extended);
+    let refresh = tokio::spawn(async move {
+        match work_rx.recv().await.expect("config refresh work") {
+            SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+                respond_to.send(1).unwrap();
+            }
+            other => panic!("unexpected work: {other:?}"),
+        }
+    });
+
+    handle_request(
+        Request::SetModelFavorite {
+            provider: "p".to_string(),
+            model: "a".to_string(),
+            favorite: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("favorite update succeeds");
+    refresh.await.unwrap();
+
+    let project_providers = crate::config::providers::ConfigDoc::load(&project_config)
+        .unwrap()
+        .providers();
+    let global_providers = crate::config::providers::ConfigDoc::load(&global_config)
+        .unwrap()
+        .providers();
+    assert!(project_providers.providers["p"].models[0].favorite);
+    assert!(!global_providers.providers["p"].models[0].favorite);
+}
+
 #[tokio::test]
 async fn list_models_response_contains_no_secrets() {
     use crate::config::providers::{ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry};
@@ -10758,12 +11150,15 @@ async fn skill_summary_carries_user_invocable() {
     ));
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let response = handle_request(
-        Request::ListSkills {
-            project_root: tmp.path().to_string_lossy().into_owned(),
-        },
-        &mut state,
-        &ctx,
+    let response = crate::config::trust::scope_workspace_trust_policy(
+        trusted_test_policy(tmp.path()),
+        handle_request(
+            Request::ListSkills {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            &mut state,
+            &ctx,
+        ),
     )
     .await
     .expect("list skills succeeds");
@@ -10936,6 +11331,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     session_id: Some(session.session_id),
                     since_seq: None,
                     project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                    initial_model: None,
                     no_sandbox: false,
                     interactive: true,
                     model_override: None,
@@ -11449,6 +11845,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
                 session_id: Some(session.session_id),
                 since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                initial_model: None,
                 no_sandbox: false,
                 interactive: true,
                 model_override: None,
@@ -11561,6 +11958,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
                 session_id: Some(session.session_id),
                 since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                initial_model: None,
                 no_sandbox: false,
                 interactive: true,
                 model_override: None,
@@ -11894,7 +12292,6 @@ async fn delete_live_session_timeout_leaves_row_intact() {
     let err = handle_request(
         Request::DeleteSession {
             session_id: session.session_id,
-            cascade: false,
         },
         &mut state,
         &ctx,
@@ -12233,6 +12630,7 @@ async fn btw_rehydrate_reports_live_fork() {
             session_id: Some(parent.session_id),
             since_seq: None,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,
@@ -12267,7 +12665,6 @@ async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
     let err = handle_request(
         Request::DeleteSession {
             session_id: root.session_id,
-            cascade: true,
         },
         &mut state,
         &ctx,
@@ -12605,6 +13002,7 @@ async fn attach_replays_drain_state_after_attached_response() {
                 session_id: Some(session.session_id),
                 since_seq: None,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                initial_model: None,
                 no_sandbox: false,
                 interactive: true,
                 model_override: None,
@@ -12706,6 +13104,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
             session_id: Some(session.session_id),
             since_seq: Some(seq1),
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,
@@ -12769,6 +13168,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             session_id: None,
             since_seq: None,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,
@@ -12792,6 +13192,7 @@ async fn attach_compatible_reflects_client_protocol_version() {
             session_id: None,
             since_seq: None,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,
@@ -12860,6 +13261,7 @@ async fn attach_resolves_model_from_injected_config_source() {
             session_id: None,
             since_seq: None,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,
@@ -12877,10 +13279,22 @@ async fn attach_resolves_model_from_injected_config_source() {
             active_model_state: Some(active),
             ..
         } => {
-            assert_eq!(active.provider, "lmstudio");
-            assert_eq!(active.model, "injected-model");
-            assert_eq!(active.config_provider.as_deref(), Some("lmstudio"));
-            assert_eq!(active.config_model.as_deref(), Some("injected-model"));
+            assert_eq!(active.selection.provider, "lmstudio");
+            assert_eq!(active.selection.model, "injected-model");
+            assert_eq!(
+                active
+                    .default_selection
+                    .as_ref()
+                    .map(|selection| selection.provider.as_str()),
+                Some("lmstudio")
+            );
+            assert_eq!(
+                active
+                    .default_selection
+                    .as_ref()
+                    .map(|selection| selection.model.as_str()),
+                Some("injected-model")
+            );
             assert!(!active.diverged);
         }
         other => panic!("expected Attached, got {other:?}"),
@@ -12889,10 +13303,13 @@ async fn attach_resolves_model_from_injected_config_source() {
     let att = state.attached.as_ref().expect("client is attached");
     assert_eq!(
         att.handle.active_model_selection(),
-        (
-            Some("lmstudio".to_string()),
-            Some("injected-model".to_string())
-        ),
+        Some(crate::config::providers::ActiveModelRef {
+            provider: "lmstudio".to_string(),
+            model: "injected-model".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }),
         "session active model must match the injected config source"
     );
 }
@@ -13092,6 +13509,7 @@ async fn attach_requires_db_workspace_trust_row() {
             session_id: None,
             since_seq: None,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: true,
             model_override: None,

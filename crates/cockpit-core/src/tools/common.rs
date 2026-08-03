@@ -262,16 +262,32 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
     );
 
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session =
-        crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap();
+    let session = Arc::new(
+        crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap(),
+    );
     // Test ctx has no daemon and no zerobox Linux helper installed, so
-    // the shell sandbox can't run here (sandboxing part 2). Default the
+    // the shell sandbox cannot run here (sandboxing part 2). Default the
     // session sandbox OFF — tests that exercise sandbox config/decision
     // logic build their own ctx or flip the flag explicitly.
     session.set_sandbox_enabled(false);
     session.set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
     let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
     let redact = Arc::new(crate::redact::RedactionTable::empty());
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let config = crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root);
+    let approver = Arc::new(crate::approval::Approver::new_for_session(
+        crate::approval::store::GrantStore::new(
+            db.clone(),
+            session.id,
+            root.to_path_buf(),
+            config.clone(),
+        ),
+        db.clone(),
+        session.clone(),
+        Arc::new(std::sync::RwLock::new(redact.clone())),
+        "builder",
+        interrupts.clone(),
+    ));
     (
         ToolCtx {
             agent_id: "builder".to_string(),
@@ -280,13 +296,13 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             current_tool_call_id: None,
             llm_mode: crate::config::extended::LlmMode::Normal,
             locks,
-            session: Arc::new(session),
+            session,
             cwd: root.to_path_buf(),
             redact,
-            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            interrupts,
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
-            approver: None,
+            approver: Some(approver),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,
@@ -301,7 +317,7 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
             events: None,
             lsp: None,
             resource_scheduler: None,
-            config: crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(root),
+            config,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         },
         db,

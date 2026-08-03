@@ -428,7 +428,7 @@ async fn call_bash_inner(
     if let ShellWriteTargets::Concrete(targets) = shell_write_targets(command, &cwd) {
         for target in targets {
             match crate::assistants::identity::check_identity_write(ctx, &target).await? {
-                crate::assistants::identity::IdentityWriteGate::Allow { note } => {
+                crate::assistants::identity::IdentityWriteGate::Allow { note, .. } => {
                     if let Some(note) = note {
                         tracing::info!(%note, path = %target.display(), "assistant identity bash write allowed");
                         identity_write_targets.push(target);
@@ -1938,7 +1938,7 @@ fn resource_rule_matches(
                 && rule
                     .approval_key
                     .as_ref()
-                    .is_none_or(|key| key == &simple.key.as_storage_str())
+                    .is_none_or(|key| key == &simple.key.as_policy_str())
         });
     if structured {
         return true;

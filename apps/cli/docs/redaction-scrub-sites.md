@@ -5,8 +5,8 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 ## Machine-checked inventory
 
 <!-- scrub-inventory:start -->
-- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`
-- Client boundary: `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
+- Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`
+- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
@@ -23,9 +23,11 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - `crates/cockpit-core/src/mcp/builtin.rs`: adapted native tool output is scrubbed before it crosses into the Monty builtin MCP result path.
 - `crates/cockpit-core/src/skills/auto_select/mod.rs`: auto-selected skill headers scrub package directories before folded skill bodies enter model context.
 - `crates/cockpit-core/src/tools/skill.rs`: manually loaded skill and support-file headers scrub package directories before returning tool output.
+- `crates/cockpit-core/src/tools/read.rs`: approved reads that add persisted environment-derived redaction metadata re-scrub the returned tool output with the updated table before it reaches model context.
 
 ## Client Boundary
 
+- `apps/cli/src/commands/debug.rs`: assembled-context diagnostics are scrubbed and bounded before they are printed to the local client.
 - `crates/cockpit-core/src/daemon/server/mod.rs`: recursively scrubs event JSON strings for non-owner principals at socket forwarding and attach-history egress.
 - `crates/cockpit-core/src/daemon/server/dispatch.rs`: applies the server scrub helpers when returning attach/list history to non-owner clients.
 - `crates/cockpit-core/src/engine/driver/reports.rs`: `redacted_bounded_snippet` emits bounded, scrubbed failure diagnostics for client/display payloads while the raw failure remains local.

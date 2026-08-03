@@ -18,7 +18,7 @@
 //! [`pin_message`] uses `INSERT OR IGNORE` and a re-pin is a no-op.
 
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{ErrorCode, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -38,41 +38,6 @@ pub struct PinnedMessage {
     pub text: String,
 }
 
-/// The requested transcript event does not belong to the supplied session.
-/// This remains distinct from an idempotent pin/unpin no-op.
-#[derive(Debug)]
-pub struct PinSeqNotInSession {
-    pub session_id: Uuid,
-    pub seq: i64,
-}
-
-impl std::fmt::Display for PinSeqNotInSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "session event {} is not a member of session {}",
-            self.seq, self.session_id
-        )
-    }
-}
-
-impl std::error::Error for PinSeqNotInSession {}
-
-fn ensure_pin_seq_member(conn: &rusqlite::Connection, session_id: Uuid, seq: i64) -> Result<()> {
-    let member: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM session_events WHERE session_id = ?1 AND seq = ?2",
-            params![session_id.to_string(), seq],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("checking pin session-event membership")?;
-    if member.is_none() {
-        return Err(PinSeqNotInSession { session_id, seq }.into());
-    }
-    Ok(())
-}
-
 impl Db {
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
@@ -80,14 +45,15 @@ impl Db {
     pub async fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
         self.write(move |conn| {
-            ensure_pin_seq_member(conn, session_id, seq)?;
-            let n = conn
-                .execute(
+            let n = map_pin_insert(
+                conn.execute(
                     "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
                      VALUES (?1, ?2, ?3)",
                     params![session_id.to_string(), seq, pinned_ms],
-                )
-                .context("inserting pin")?;
+                ),
+                session_id,
+                seq,
+            )?;
             Ok(n == 1)
         })
         .await
@@ -98,7 +64,6 @@ impl Db {
     /// `d` (delete) and checking a checklist item in `/pins`.
     pub async fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         self.write(move |conn| {
-            ensure_pin_seq_member(conn, session_id, seq)?;
             let n = conn
                 .execute(
                     "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -132,7 +97,6 @@ impl Db {
     pub async fn toggle_pin(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
         self.transaction(move |conn| {
-            ensure_pin_seq_member(conn, session_id, seq)?;
             let found: Option<i64> = conn
                 .query_row(
                     "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
@@ -149,12 +113,15 @@ impl Db {
                 .context("deleting pin")?;
                 Ok(false)
             } else {
-                conn.execute(
-                    "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id.to_string(), seq, pinned_ms],
-                )
-                .context("inserting pin")?;
+                map_pin_insert(
+                    conn.execute(
+                        "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
+                         VALUES (?1, ?2, ?3)",
+                        params![session_id.to_string(), seq, pinned_ms],
+                    ),
+                    session_id,
+                    seq,
+                )?;
                 Ok(true)
             }
         })
@@ -250,6 +217,20 @@ impl Db {
     }
 }
 
+fn map_pin_insert(result: rusqlite::Result<usize>, session_id: Uuid, seq: i64) -> Result<usize> {
+    result.map_err(|error| {
+        if matches!(
+            error,
+            rusqlite::Error::SqliteFailure(sqlite, _)
+                if sqlite.code == ErrorCode::ConstraintViolation
+        ) {
+            anyhow::anyhow!("event seq {seq} is not a member of session {session_id}")
+        } else {
+            anyhow::Error::new(error).context("inserting pin")
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,11 +298,10 @@ mod tests {
         let seq = record_msg(&db, b.session_id, SessionEventKind::UserMessage, "in b").await;
 
         let error = db.pin_message(a.session_id, seq).await.unwrap_err();
-        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
-        let error = db.unpin_message(a.session_id, seq).await.unwrap_err();
-        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+        assert!(format!("{error:#}").contains("is not a member"));
+        assert!(!db.unpin_message(a.session_id, seq).await.unwrap());
         let error = db.toggle_pin(a.session_id, seq).await.unwrap_err();
-        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+        assert!(format!("{error:#}").contains("is not a member"));
     }
 
     #[tokio::test]
@@ -333,7 +313,7 @@ mod tests {
             .pin_message(session.session_id, 99_999)
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<PinSeqNotInSession>().is_some());
+        assert!(format!("{error:#}").contains("is not a member"));
     }
 
     #[tokio::test]

@@ -57,6 +57,12 @@ mod tests {
         let _guard = crate::config::dirs::test_support::CockpitConfigOverride::new(
             &cockpit.join("config.json"),
         );
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
 
         assert_eq!(
             detect_from_configs(tmp.path()),
@@ -79,6 +85,12 @@ mod tests {
         let _guard = crate::config::dirs::test_support::CockpitConfigOverride::new(
             &cockpit.join("config.json"),
         );
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
+        );
 
         assert_eq!(
             detect_from_configs(tmp.path()),
@@ -98,6 +110,12 @@ mod tests {
         .unwrap();
         let _guard = crate::config::dirs::test_support::CockpitConfigOverride::new(
             &cockpit.join("config.json"),
+        );
+        let _trust = crate::config::trust::enter_workspace_trust_policy(
+            crate::config::trust::WorkspaceTrustPolicy {
+                root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            },
         );
 
         assert_eq!(detect_from_configs(tmp.path()), None);

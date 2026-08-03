@@ -48,12 +48,19 @@ fn write_auth_header(root: &std::path::Path, value: &str) {
     fs::write(provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
 }
 
+fn app_for_provider(root: &std::path::Path) -> App {
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(root),
+        || App::new(Some(root), false),
+    )
+}
+
 #[test]
 fn auth_failure_notice_actions() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = app_for_provider(tmp.path());
     app.daemon_prompt = None;
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
         status: 403,
@@ -67,7 +74,10 @@ fn auth_failure_notice_actions() {
     assert!(matches!(app.overlay, Overlay::ModelPicker(_)));
     app.overlay = Overlay::None;
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)),
+    );
     assert_eq!(app.dialog.test_provider_surface(), Some("edit"));
 }
 
@@ -76,7 +86,7 @@ fn annotation_cleared_on_success() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = app_for_provider(tmp.path());
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
         status: 401,
     }));
@@ -95,7 +105,7 @@ fn nested_subagent_auth_recovery_updates_when_pane_is_not_active() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = app_for_provider(tmp.path());
 
     app.apply_event(TurnEvent::NestedTurn {
         task_call_id: "task-1".into(),
@@ -133,7 +143,7 @@ fn annotation_cleared_on_provider_auth_structure_change() {
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_provider(tmp.path(), None, "https://example.test/v1");
     write_auth_header(tmp.path(), "Bearer old-secret");
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = app_for_provider(tmp.path());
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
         status: 401,
     }));
@@ -154,7 +164,10 @@ fn annotation_cleared_on_provider_auth_structure_change() {
     )
     .unwrap();
     // Detached: the bootstrap snapshot refresh stands in for the daemon push.
-    app.refresh_bootstrap_config_snapshot();
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || app.refresh_bootstrap_config_snapshot(),
+    );
     app.clear_changed_provider_auth_failures();
 
     assert!(app.auth_failure_annotations.is_empty());
@@ -169,12 +182,15 @@ fn oauth_expired_notice_deep_links() {
         Some("codex"),
         "https://chatgpt.com/backend-api/codex",
     );
-    let mut app = App::new(Some(tmp.path()), false);
+    let mut app = app_for_provider(tmp.path());
     app.apply_event(auth_event(AuthFailureKind::OAuthExpired {
         provider: "p".into(),
     }));
 
-    app.open_auth_failure_provider();
+    cockpit_config::trust::with_workspace_trust_policy(
+        super::trusted_workspace_policy_for_tests(tmp.path()),
+        || app.open_auth_failure_provider(),
+    );
 
     assert_eq!(app.dialog.test_provider_surface(), Some("oauth"));
 }

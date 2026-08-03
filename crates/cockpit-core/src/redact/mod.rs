@@ -478,10 +478,12 @@ impl RedactionTable {
             .collect();
         #[cfg(test)]
         {
-            return Self::build_with_env(cfg, cwd, &env);
+            Self::build_with_env(cfg, cwd, &env)
         }
         #[cfg(not(test))]
-        Self::build_with_env_and_store(cfg, cwd, &env)
+        {
+            Self::build_with_env_and_store(cfg, cwd, &env)
+        }
     }
 
     /// Build a table from the provided session env + the env files matched
@@ -1265,6 +1267,7 @@ mod scrub_inventory_tests {
     const INVENTORY_START: &str = "<!-- scrub-inventory:start -->";
     const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
     const EXPECTED_SCRUB_FILES: &[&str] = &[
+        "apps/cli/src/commands/debug.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",
@@ -1282,6 +1285,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
+        "crates/cockpit-core/src/tools/read.rs",
         "crates/cockpit-core/src/tools/skill.rs",
     ];
 

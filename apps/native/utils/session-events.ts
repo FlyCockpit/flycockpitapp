@@ -1,5 +1,6 @@
 import {
   type AttachResult,
+  activeModelStateSchema,
   type EventEnvelope,
   eventEnvelopeSchema,
   type HistoryEntry,
@@ -121,16 +122,8 @@ function eventStateWithDaemon(
 }
 
 function activeModelInputFromRecord(value: unknown) {
-  if (!value || typeof value !== "object") return null;
-  const data = value as Record<string, unknown>;
-  return {
-    provider: typeof data.provider === "string" ? data.provider : undefined,
-    model: typeof data.model === "string" ? data.model : undefined,
-    config_provider: typeof data.config_provider === "string" ? data.config_provider : undefined,
-    config_model: typeof data.config_model === "string" ? data.config_model : undefined,
-    diverged: typeof data.diverged === "boolean" ? data.diverged : undefined,
-    generation: typeof data.generation === "number" ? data.generation : undefined,
-  };
+  const parsed = activeModelStateSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 }
 
 function authFailureFromData(value: unknown): AuthFailureKind | null {
@@ -257,11 +250,8 @@ export function nativeAttachRuntimeState(
   attach: AttachResult,
   previousDaemonState: NativeDaemonState = emptyNativeDaemonState,
 ): NativeAttachRuntimeState {
-  const raw = attach as AttachResult & {
-    active_model_state?: unknown;
-    paused_work?: unknown;
-  };
-  const activeModelInput = activeModelInputFromRecord(raw.active_model_state);
+  const raw = attach as AttachResult & { paused_work?: unknown };
+  const activeModelInput = activeModelInputFromRecord(attach.active_model_state);
   const pausedWork = Array.isArray(raw.paused_work)
     ? raw.paused_work.filter((item) => item && typeof item === "object")
     : [];

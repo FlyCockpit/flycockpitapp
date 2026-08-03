@@ -17,6 +17,7 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let skills_config = self.config_snapshot.extended.skills.clone();
         let agent_name = self.launch.agent_name.clone();
+        let trust_policy = cockpit_config::trust::current_workspace_trust_policy();
         let attached_request_tx = self
             .agent_runner
             .as_ref()
@@ -31,13 +32,15 @@ impl App {
                 cwd,
                 skills_config,
                 agent_name,
+                trust_policy,
             );
             return;
         }
 
         self.async_actions
             .abort_key(&AsyncActionKey::new(SKILLS_LIST_ACTION));
-        let skills = skills_pane::local_skill_summaries(&cwd, &skills_config, &agent_name);
+        let skills =
+            local_skill_summaries_with_policy(&cwd, &skills_config, &agent_name, trust_policy);
         self.overlay = Overlay::Skills(SkillsPane::ready(
             generation,
             SkillsPaneSource::Local,
@@ -57,6 +60,7 @@ impl App {
         cwd: PathBuf,
         skills_config: SkillsConfig,
         agent_name: String,
+        trust_policy: Option<cockpit_config::trust::WorkspaceTrustPolicy>,
     ) {
         self.async_actions.start(
             AsyncActionKind::DaemonRpc(SKILLS_LIST_ACTION),
@@ -69,6 +73,7 @@ impl App {
                         cwd,
                         skills_config,
                         agent_name,
+                        trust_policy,
                     )
                     .await,
                 ))
@@ -83,6 +88,7 @@ async fn fetch_attached_or_local_skills(
     cwd: PathBuf,
     skills_config: SkillsConfig,
     agent_name: String,
+    trust_policy: Option<cockpit_config::trust::WorkspaceTrustPolicy>,
 ) -> SkillsPaneFetchResult {
     match request_attached_skills(&attached_request_tx, &cwd).await {
         Ok(skills) => SkillsPaneFetchResult {
@@ -93,7 +99,7 @@ async fn fetch_attached_or_local_skills(
         Err(_) => SkillsPaneFetchResult {
             generation,
             source: SkillsPaneSource::Local,
-            skills: local_skill_summaries_async(cwd, skills_config, agent_name).await,
+            skills: local_skill_summaries_async(cwd, skills_config, agent_name, trust_policy).await,
         },
     }
 }
@@ -125,10 +131,25 @@ async fn local_skill_summaries_async(
     cwd: PathBuf,
     skills_config: SkillsConfig,
     agent_name: String,
+    trust_policy: Option<cockpit_config::trust::WorkspaceTrustPolicy>,
 ) -> Result<Vec<SkillSummary>, String> {
     tokio::task::spawn_blocking(move || {
-        skills_pane::local_skill_summaries(&cwd, &skills_config, &agent_name)
+        local_skill_summaries_with_policy(&cwd, &skills_config, &agent_name, trust_policy)
     })
     .await
     .map_err(|error| format!("local skill discovery task failed: {error}"))?
+}
+
+fn local_skill_summaries_with_policy(
+    cwd: &std::path::Path,
+    skills_config: &SkillsConfig,
+    agent_name: &str,
+    trust_policy: Option<cockpit_config::trust::WorkspaceTrustPolicy>,
+) -> Result<Vec<SkillSummary>, String> {
+    match trust_policy {
+        Some(policy) => cockpit_config::trust::with_workspace_trust_policy(policy, || {
+            skills_pane::local_skill_summaries(cwd, skills_config, agent_name)
+        }),
+        None => skills_pane::local_skill_summaries(cwd, skills_config, agent_name),
+    }
 }

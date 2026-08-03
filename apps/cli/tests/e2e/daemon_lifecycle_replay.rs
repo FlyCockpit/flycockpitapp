@@ -361,24 +361,7 @@ async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
         .output()
         .expect("daemon restart command");
     let text = output_text(&output);
-    if !output.status.success() {
-        assert!(
-            text.contains("daemon connection closed"),
-            "unexpected daemon restart failure: {text}"
-        );
-        let start = daemon
-            .command()
-            .args(["daemon", "start", "--detach"])
-            .output()
-            .expect("daemon restart fallback start command");
-        assert!(
-            start.status.success(),
-            "restart fallback start failed after:\n{text}\n{}",
-            output_text(&start)
-        );
-        daemon.wait_for_handshake().await;
-        return;
-    }
+    assert!(output.status.success(), "daemon restart failed: {text}");
     assert!(text.contains("daemon: restarted"));
     daemon.wait_for_handshake().await;
 }

@@ -734,10 +734,20 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 
 // ---- migration runner ------------------------------------------------------
 
-/// All schema migrations, in order. Adding one: append `include_str!`
-/// for the new file and bump nothing else — the index in this slice
-/// is the version number.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+/// An immutable, explicitly named schema migration. Names are part of the
+/// checksum ledger contract and must describe the real file.
+#[derive(Debug, Clone, Copy)]
+struct Migration {
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// All schema migrations in version order. Append the exact filename and SQL;
+/// never derive names from the numeric position.
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_initial.sql",
+    sql: include_str!("migrations/0001_initial.sql"),
+}];
 
 /// Latest schema version understood by this build.
 ///
@@ -801,9 +811,6 @@ fn migrate(conn: &Connection) -> Result<()> {
     migrate_with(conn, MIGRATIONS)
 }
 
-fn migration_name(version: usize) -> String {
-    format!("{version:04}_initial.sql")
-}
 fn migration_hash(sql: &str) -> String {
     Sha256::digest(sql.as_bytes())
         .iter()
@@ -811,7 +818,7 @@ fn migration_hash(sql: &str) -> String {
         .collect()
 }
 
-fn verify_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
+fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT version, name, sha256 FROM schema_version ORDER BY version")?;
     for row in stmt.query_map([], |row| {
@@ -825,8 +832,9 @@ fn verify_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
         if version > migrations.len() as i64 {
             anyhow::bail!("database migration ledger is newer than this binary");
         }
-        let expected_name = migration_name(version as usize);
-        let expected_hash = migration_hash(migrations[(version - 1) as usize]);
+        let expected = &migrations[(version - 1) as usize];
+        let expected_name = expected.name;
+        let expected_hash = migration_hash(expected.sql);
         if name != expected_name || hash != expected_hash {
             anyhow::bail!(
                 "migration checksum mismatch for {expected_name}: applied migration was amended"
@@ -836,7 +844,7 @@ fn verify_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn upgrade_legacy_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
+fn upgrade_legacy_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let mut names = Vec::new();
     let mut stmt = conn.prepare("PRAGMA table_info(schema_version)")?;
     for row in stmt.query_map([], |row| row.get::<_, String>(1))? {
@@ -849,9 +857,9 @@ fn upgrade_legacy_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
             ))?;
         }
     }
-    for (index, sql) in migrations.iter().enumerate() {
+    for (index, migration) in migrations.iter().enumerate() {
         let version = (index + 1) as i64;
-        conn.execute("UPDATE schema_version SET name=?2, sha256=?3, applied_at=COALESCE(applied_at, CURRENT_TIMESTAMP) WHERE version=?1 AND (name IS NULL OR sha256 IS NULL)", rusqlite::params![version, migration_name(index + 1), migration_hash(sql)])?;
+        conn.execute("UPDATE schema_version SET name=?2, sha256=?3, applied_at=COALESCE(applied_at, CURRENT_TIMESTAMP) WHERE version=?1 AND (name IS NULL OR sha256 IS NULL)", rusqlite::params![version, migration.name, migration_hash(migration.sql)])?;
     }
     Ok(())
 }
@@ -863,7 +871,7 @@ fn upgrade_legacy_ledger(conn: &Connection, migrations: &[&str]) -> Result<()> {
 /// commit. This is the runner-owned seam for SQLite table-rebuild
 /// migrations; migration SQL must not emit `PRAGMA foreign_keys` itself
 /// because that pragma is a no-op inside a transaction.
-fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
+fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock > migrations.len() as i64 {
         anyhow::bail!("database migration ledger is newer than this binary");
@@ -885,16 +893,16 @@ fn migrate_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
 
-        for (i, sql) in migrations.iter().enumerate() {
+        for (i, migration) in migrations.iter().enumerate() {
             let version = (i as i64) + 1;
             if version <= current {
                 continue;
             }
-            conn.execute_batch(sql)
+            conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
             conn.execute(
                 "INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
-                rusqlite::params![version, migration_name(version as usize), migration_hash(sql)],
+                rusqlite::params![version, migration.name, migration_hash(migration.sql)],
             )
             .with_context(|| format!("recording migration {version}"))?;
         }
@@ -999,6 +1007,25 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    fn migrate_test_with(conn: &Connection, sqls: &[&'static str]) -> Result<()> {
+        const NAMES: &[&str] = &[
+            "0001_test.sql",
+            "0002_test.sql",
+            "0003_test.sql",
+            "0004_test.sql",
+        ];
+        assert!(sqls.len() <= NAMES.len());
+        let migrations = sqls
+            .iter()
+            .enumerate()
+            .map(|(index, sql)| Migration {
+                name: NAMES[index],
+                sql,
+            })
+            .collect::<Vec<_>>();
+        migrate_with(conn, &migrations)
+    }
+
     #[tokio::test]
     async fn migrate_idempotent() {
         let db = Db::open_in_memory().unwrap();
@@ -1070,7 +1097,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");
         let conn = Connection::open(&path).unwrap();
-        migrate_with(
+        migrate_test_with(
             &conn,
             &["CREATE TABLE first_backup_probe (id INTEGER PRIMARY KEY);"],
         )
@@ -1126,7 +1153,7 @@ mod tests {
     #[test]
     fn backup_failure_aborts_migration() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate_with(
+        migrate_test_with(
             &conn,
             &["CREATE TABLE backup_failure_probe (id INTEGER PRIMARY KEY);"],
         )
@@ -1227,10 +1254,18 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let first = "CREATE TABLE first_migration (id INTEGER PRIMARY KEY);";
         let second = "CREATE TABLE second_migration (id INTEGER PRIMARY KEY);";
-        migrate_with(&conn, &[first]).unwrap();
-        migrate_with(&conn, &[first, second]).unwrap();
+        migrate_test_with(&conn, &[first]).unwrap();
+        migrate_test_with(&conn, &[first, second]).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 2);
         assert_eq!(sqlite_schema_version(&conn).unwrap(), 2);
+        let names = conn
+            .prepare("SELECT name FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(names, vec!["0001_test.sql", "0002_test.sql"]);
     }
 
     #[tokio::test]
@@ -1680,7 +1715,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let conn_b = Connection::open(path_for_thread).unwrap();
             apply_connection_pragmas(&conn_b, true).unwrap();
-            let result = migrate_with(
+            let result = migrate_test_with(
                 &conn_b,
                 &["CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);"],
             );
@@ -1729,7 +1764,7 @@ mod tests {
         let conn_b = Connection::open(&path).unwrap();
         apply_connection_pragmas(&conn_b, true).unwrap();
         conn_b.busy_timeout(Duration::from_millis(50)).unwrap();
-        let err = migrate_with(
+        let err = migrate_test_with(
             &conn_b,
             &["CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);"],
         )
@@ -1747,7 +1782,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_connection_pragmas(&conn, false).unwrap();
 
-        migrate_with(
+        migrate_test_with(
             &conn,
             &[
                 r#"
@@ -1786,7 +1821,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_connection_pragmas(&conn, false).unwrap();
 
-        let err = migrate_with(
+        let err = migrate_test_with(
             &conn,
             &[
                 r#"
@@ -1839,8 +1874,8 @@ mod tests {
             ALTER TABLE parent_new RENAME TO parent;
         "#;
 
-        migrate_with(&conn, &[first]).unwrap();
-        let err = migrate_with(&conn, &[first, violating_second]).unwrap_err();
+        migrate_test_with(&conn, &[first]).unwrap();
+        let err = migrate_test_with(&conn, &[first, violating_second]).unwrap_err();
         assert!(
             format!("{err:#}").contains("migration left dangling foreign keys"),
             "unexpected error: {err:#}"
@@ -1865,7 +1900,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_connection_pragmas(&conn, false).unwrap();
 
-        let err = migrate_with(
+        let err = migrate_test_with(
             &conn,
             &[
                 "CREATE TABLE restore_probe (id INTEGER PRIMARY KEY);",
@@ -1903,10 +1938,10 @@ mod tests {
         apply_connection_pragmas(&conn, false).unwrap();
         let migrations = &["CREATE TABLE no_pending_probe (id INTEGER PRIMARY KEY);"];
 
-        migrate_with(&conn, migrations).unwrap();
+        migrate_test_with(&conn, migrations).unwrap();
         set_foreign_keys(&conn, false).unwrap();
 
-        migrate_with(&conn, migrations).unwrap();
+        migrate_test_with(&conn, migrations).unwrap();
 
         assert!(!foreign_keys_enabled(&conn).unwrap());
         let version: i64 = conn
@@ -1923,7 +1958,7 @@ mod tests {
         apply_connection_pragmas(&conn, false).unwrap();
         set_foreign_keys(&conn, false).unwrap();
 
-        migrate_with(
+        migrate_test_with(
             &conn,
             &[
                 r#"
@@ -2065,6 +2100,35 @@ mod tests {
         .unwrap();
     }
 
+    fn has_cascade_path_to_sessions(
+        conn: &Connection,
+        table: &str,
+        visiting: &mut std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        if table == "sessions" {
+            return Ok(true);
+        }
+        if !visiting.insert(table.to_string()) {
+            return Ok(false);
+        }
+        let mut foreign_keys = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+        let parents = foreign_keys
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(6)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (parent, on_delete) in parents {
+            if on_delete.eq_ignore_ascii_case("cascade")
+                && has_cascade_path_to_sessions(conn, &parent, visiting)?
+            {
+                visiting.remove(table);
+                return Ok(true);
+            }
+        }
+        visiting.remove(table);
+        Ok(false)
+    }
+
     fn session_tables_missing_cascade(conn: &Connection) -> Result<Vec<String>> {
         let mut tables = conn.prepare(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -2082,21 +2146,7 @@ mod tests {
             if !has_session_id || name == "sessions" {
                 continue;
             }
-            let mut foreign_keys = conn.prepare(&format!("PRAGMA foreign_key_list({name})"))?;
-            let cascades = foreign_keys
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if !cascades.iter().any(|(table, from, on_delete)| {
-                table == "sessions"
-                    && from == "session_id"
-                    && on_delete.eq_ignore_ascii_case("cascade")
-            }) {
+            if !has_cascade_path_to_sessions(conn, &name, &mut std::collections::HashSet::new())? {
                 missing.push(name);
             }
         }
@@ -2126,6 +2176,134 @@ mod tests {
         .unwrap();
     }
 
+    fn schema_check_values(conn: &Connection, table: &str, column: &str) -> Result<Vec<String>> {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        let marker = format!("CHECK ({column} IN (");
+        let values = sql
+            .split_once(&marker)
+            .and_then(|(_, tail)| tail.split_once("))"))
+            .map(|(body, _)| {
+                body.split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing closed CHECK for {table}.{column}"))?;
+        Ok(values)
+    }
+
+    #[tokio::test]
+    async fn rust_enums_and_schema_checks_have_identical_vocabularies() {
+        let db = Db::open_in_memory().unwrap();
+        db.read(|conn| {
+            let cases: Vec<(&str, &str, Vec<&str>)> = vec![
+                (
+                    "needs_attention",
+                    "state",
+                    crate::db::needs_attention::InterruptState::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "inference_requests",
+                    "status",
+                    crate::db::session_log::InferenceRequestStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "tandem_inference",
+                    "status",
+                    crate::db::session_log::InferenceRequestStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "session_events",
+                    "type",
+                    crate::db::session_log::SessionEventKind::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "session_goals",
+                    "status",
+                    crate::db::session_goals::GoalStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "task_todos",
+                    "status",
+                    crate::db::task_todos::TodoStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "task_todo_notes",
+                    "kind",
+                    crate::db::task_todos::TodoNoteKind::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "task_delegation_jobs",
+                    "status",
+                    crate::db::task_delegations::DelegationStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "task_delegation_children",
+                    "status",
+                    crate::db::task_delegations::DelegationStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "paused_session_work",
+                    "status",
+                    crate::db::paused_work::PausedWorkStatus::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+                (
+                    "packages",
+                    "source_type",
+                    crate::db::packages::SourceType::ALL
+                        .iter()
+                        .map(|value| value.as_str())
+                        .collect(),
+                ),
+            ];
+            for (table, column, expected) in cases {
+                assert_eq!(
+                    schema_check_values(conn, table, column)?,
+                    expected,
+                    "schema vocabulary drift for {table}.{column}"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn foreign_keys_enforced_on_open() {
         let db = Db::open_in_memory().unwrap();
@@ -2146,10 +2324,10 @@ mod tests {
         let id = session_id.to_string();
         db.write(move |conn| {
             conn.execute("INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at) VALUES (?1, 'p', '/p', 1, 1)", [&id])?;
-            conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allow')", [&id])?;
+            conn.execute("INSERT INTO remote_principal_audit (ts_ms, principal, request_kind, session_id, verdict) VALUES (1, 'p', 'request', ?1, 'allowed')", [&id])?;
             Ok(())
         }).await.unwrap();
-        db.delete_session(session_id, false).await.unwrap();
+        db.delete_session(session_id).await.unwrap();
         let remaining: i64 = db
             .read(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM remote_principal_audit", [], |row| {
@@ -2236,7 +2414,7 @@ mod tests {
             conn.execute("INSERT INTO task_delegation_payloads (task_call_id, label, payload_hash, parent_session_id, parent_agent, child_agent, prompt_byte_len, sidecar_path, created_at) VALUES ('task', 'default', 'hash', ?1, 'agent', 'child', 7, ?2, 1)", rusqlite::params![id, relative_for_db])?;
             Ok(())
         }).await.unwrap();
-        db.delete_session(session_id, false).await.unwrap();
+        db.delete_session(session_id).await.unwrap();
         assert!(!sidecar.exists());
     }
 

@@ -214,41 +214,47 @@ async fn ephemeral_session_resumes_on_shared_daemon() {
 }
 
 #[test]
-fn daemon_refuses_stale_schema() {
+fn daemon_refuses_newer_migration_ledger() {
     let home = IsolatedHome::new();
-    let db_path = home.db_path();
-    std::fs::create_dir_all(db_path.parent().expect("DB parent")).expect("create DB parent");
-    let conn = Connection::open(&db_path).expect("create stale DB");
-    conn.execute_batch(
-        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);\n\
-         INSERT INTO schema_version(version) VALUES (1);",
+    let initialize = home
+        .cockpit()
+        .args(["doctor", "--offline"])
+        .output()
+        .expect("initialize current database");
+    assert_failure("doctor without providers", &initialize, &home);
+
+    let conn = Connection::open(home.db_path()).expect("open current DB");
+    conn.execute(
+        "INSERT INTO schema_version (version, name, sha256, applied_at) \
+         VALUES (?1, 'future', 'future', CURRENT_TIMESTAMP)",
+        [cockpit_cli::db::EXPECTED_SCHEMA_VERSION + 1],
     )
-    .expect("seed stale migration ledger");
+    .expect("seed newer migration ledger");
     drop(conn);
 
     let output = home
         .cockpit()
         .args(["daemon", "start", "--foreground"])
         .output()
-        .expect("start daemon against stale schema");
-    assert_failure("stale-schema daemon start", &output, &home);
+        .expect("start daemon against newer migration ledger");
+    assert_failure("newer-ledger daemon start", &output, &home);
     let text = output_text(&output);
-    assert!(text.contains("database schema version mismatch"), "{text}");
     assert!(
-        text.contains(&format!(
-            "found 0, expected {}",
-            cockpit_cli::db::EXPECTED_SCHEMA_VERSION
-        )),
+        text.contains("database migration ledger is newer than this binary"),
         "{text}"
     );
-    assert!(text.contains("move the database"), "{text}");
-    assert!(text.contains("Development schema resets"), "{text}");
-    assert!(!home.pid_file().exists(), "stale daemon pid file survived");
-    assert!(!home.socket_path().exists(), "stale daemon socket survived");
+    assert!(
+        !home.pid_file().exists(),
+        "newer-ledger daemon pid file survived"
+    );
+    assert!(
+        !home.socket_path().exists(),
+        "newer-ledger daemon socket survived"
+    );
     let endpoint = home
         .pid_file()
         .parent()
         .expect("daemon state dir")
         .join("daemon-endpoint.json");
-    assert!(!endpoint.exists(), "stale daemon endpoint survived");
+    assert!(!endpoint.exists(), "newer-ledger daemon endpoint survived");
 }

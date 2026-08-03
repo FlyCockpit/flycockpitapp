@@ -51,7 +51,10 @@ pub struct IdentityLoad {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityWriteGate {
-    Allow { note: Option<String> },
+    Allow {
+        note: Option<String>,
+        preauthorized: bool,
+    },
     Refuse(String),
 }
 
@@ -266,7 +269,10 @@ fn contains_base64_blob(body: &str) -> bool {
 
 pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<IdentityWriteGate> {
     let Some((row, identity_file)) = identity_target(ctx, path).await? else {
-        return Ok(IdentityWriteGate::Allow { note: None });
+        return Ok(IdentityWriteGate::Allow {
+            note: None,
+            preauthorized: false,
+        });
     };
     let config: crate::assistants::AssistantConfig =
         serde_json::from_str(&row.config_json).unwrap_or_default();
@@ -292,6 +298,7 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
                     note: Some(format!(
                         " assistant identity edit approved for {identity_file};"
                     )),
+                    preauthorized: true,
                 })
             } else if matches!(decision, crate::approval::Decision::NoninteractiveDeny) {
                 Ok(IdentityWriteGate::Refuse(
@@ -308,6 +315,7 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
             note: Some(format!(
                 " assistant identity edit allowed by soul_edit_mode=autonomous for {identity_file};"
             )),
+            preauthorized: false,
         }),
     }
 }
@@ -705,8 +713,38 @@ mod tests {
     async fn soul_edit_modes_autonomous_applies_and_records_hash() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let (ctx, _) =
+        let (mut ctx, _) =
             assistant_tool_ctx(project.path(), home.path(), SoulEditMode::Autonomous).await;
+        let store = crate::approval::store::GrantStore::new(
+            ctx.session.db.clone(),
+            ctx.session.id,
+            ctx.cwd.clone(),
+            ctx.config.clone(),
+        );
+        ctx.approver = Some(Arc::new(crate::approval::Approver::new(
+            store,
+            ctx.session.db.clone(),
+            ctx.session.id,
+            "helper",
+            ctx.interrupts.clone(),
+        )));
+        let db = ctx.session.db.clone();
+        let session_id = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(session_id).await.unwrap();
+                if let Some(row) = open.iter().find(|row| hub.has_waiter(row.interrupt_id)) {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            let response = crate::daemon::proto::ResolveResponse::Single {
+                selected_id: crate::approval::ID_APPROVE_ONCE.to_string(),
+            };
+            db.resolve_interrupt(iid, &response).await.unwrap();
+            assert!(hub.resolve(iid, response));
+        });
         crate::tools::read::ReadTool
             .call(
                 serde_json::json!({"path": soul_path(home.path()).display().to_string()}),
@@ -725,6 +763,7 @@ mod tests {
             )
             .await
             .unwrap();
+        resolver.await.unwrap();
 
         assert!(
             out.content.contains("soul_edit_mode=autonomous"),

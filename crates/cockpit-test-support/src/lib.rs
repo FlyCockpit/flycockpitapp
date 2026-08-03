@@ -325,11 +325,6 @@ mod tests {
                 symbol: "clear_runtime_policy_for_tests",
                 reason: "cross-crate test helper resets the production runtime policy cell and inherited trust env",
             },
-            AllowedMutation {
-                file: "crates/cockpit-tui/src/tui/settings/providers/mod.rs",
-                symbol: "apply_copilot_setup",
-                reason: "interactive Copilot setup injects the fetched token into the current TUI process",
-            },
         ];
 
         let mut violations = Vec::new();

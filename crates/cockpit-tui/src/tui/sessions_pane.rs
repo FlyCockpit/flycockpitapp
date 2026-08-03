@@ -1128,10 +1128,7 @@ impl SessionsPane {
                 session_id,
                 cascade: true,
             },
-            ConfirmChoice::Delete => Request::DeleteSession {
-                session_id,
-                cascade: true,
-            },
+            ConfirmChoice::Delete => Request::DeleteSession { session_id },
         };
         match agent_runner::daemon_request_blocking(req) {
             Ok(_) => {

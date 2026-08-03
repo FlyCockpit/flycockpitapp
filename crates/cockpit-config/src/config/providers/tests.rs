@@ -12,6 +12,13 @@ fn read_provider_file(config_path: &Path, provider_id: &str) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
+fn enter_trusted_workspace(root: &Path) -> crate::config::trust::ThreadWorkspaceTrustGuard {
+    crate::config::trust::enter_workspace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    })
+}
+
 #[derive(Clone)]
 struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -736,6 +743,7 @@ fn raw_provider_model_write_preserves_layered_provider_fields() {
             }"#,
     );
 
+    let _trust = enter_trusted_workspace(tmp.path());
     let mut fetched = model("new", false);
     fetched.name = Some("New Model".to_string());
     let fetched_at = Utc::now();

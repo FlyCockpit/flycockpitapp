@@ -2,6 +2,20 @@ use super::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+fn enter_trusted_workspace(
+    root: &std::path::Path,
+) -> crate::config::trust::ThreadWorkspaceTrustGuard {
+    crate::config::trust::enter_workspace_trust_policy(crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    })
+}
+
+fn trusted_load_for_cwd(root: &std::path::Path) -> ExtendedConfig {
+    let _trust = enter_trusted_workspace(root);
+    load_for_cwd(root)
+}
+
 #[test]
 fn skills_write_approval_defaults_on() {
     assert!(SkillsConfig::default().write_approval);
@@ -752,6 +766,7 @@ fn project_writes_target_nearest_project_layer() {
     let cwd = nested.join("src");
     std::fs::create_dir_all(&cwd).unwrap();
 
+    let _trust = enter_trusted_workspace(&cwd);
     append_gitignore_allow_to_project(&cwd, "target/").unwrap();
     persist_review_default_participants(&cwd, vec!["scout".into()]).unwrap();
 
@@ -1335,7 +1350,7 @@ fn load_for_cwd_seeds_default_skill_scan_dirs_when_no_config_exists() {
     )
     .unwrap();
 
-    let cfg = load_for_cwd(&cwd);
+    let cfg = trusted_load_for_cwd(&cwd);
     assert_eq!(
         cfg.skills.scan_dirs,
         SEEDED_SCAN_DIRS
@@ -1364,7 +1379,7 @@ fn load_for_cwd_merges_home_and_project_with_project_scalar_winning() {
     )
     .unwrap();
 
-    let cfg = load_for_cwd(&project);
+    let cfg = trusted_load_for_cwd(&project);
 
     assert_eq!(cfg.name.as_deref(), Some("Project"));
     assert!(
@@ -1392,7 +1407,7 @@ fn load_for_cwd_keeps_valid_name_when_unrelated_known_field_is_malformed() {
     let cwd = tmp.path().join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let cfg = load_for_cwd(&cwd);
+    let cfg = trusted_load_for_cwd(&cwd);
 
     assert_eq!(cfg.name.as_deref(), Some("Christopher"));
     assert!(cfg.tui.banner.enabled);
@@ -1420,7 +1435,7 @@ fn load_for_cwd_legacy_jobs_cannot_override_canonical_schedule_or_drop_name() {
     let cwd = tmp.path().join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let cfg = load_for_cwd(&cwd);
+    let cfg = trusted_load_for_cwd(&cwd);
 
     assert_eq!(cfg.name.as_deref(), Some("Christopher"));
     assert_eq!(cfg.schedule.max_concurrent, 3);
@@ -1437,7 +1452,7 @@ fn load_for_cwd_more_specific_name_null_clears_broader_name() {
     std::fs::create_dir_all(project.join(".cockpit")).unwrap();
     std::fs::write(project.join(".cockpit/config.json"), r#"{"name":null}"#).unwrap();
 
-    let cfg = load_for_cwd(&project);
+    let cfg = trusted_load_for_cwd(&project);
 
     assert_eq!(cfg.name, None);
 }
@@ -1486,6 +1501,7 @@ fn load_for_cwd_paths_merge_split_home_and_project_provider_models_by_id() {
     )
     .unwrap();
 
+    let _trust = enter_trusted_workspace(&project);
     let cfg = crate::config::providers::ConfigDoc::load_effective(&project);
 
     let models = &cfg.providers.get("p").expect("provider survives").models;
@@ -1516,7 +1532,7 @@ fn load_for_cwd_child_project_wins_over_parent_project() {
     .unwrap();
     std::fs::write(child.join(".cockpit/config.json"), r#"{"name":"Child"}"#).unwrap();
 
-    let cfg = load_for_cwd(&child);
+    let cfg = trusted_load_for_cwd(&child);
 
     assert_eq!(cfg.name.as_deref(), Some("Child"));
     assert!(
@@ -1540,7 +1556,7 @@ fn cockpit_config_env_overrides_normal_config_discovery() {
     std::fs::write(&override_path, r#"{"name":"Override"}"#).unwrap();
     let _override = env.override_cockpit_config(&override_path);
 
-    let cfg = load_for_cwd(&project);
+    let cfg = trusted_load_for_cwd(&project);
 
     assert_eq!(cfg.name.as_deref(), Some("Override"));
 }
@@ -1601,7 +1617,7 @@ fn config_resolution_reads_each_layer_once() {
     .unwrap();
 
     reset_config_layer_read_count();
-    let cfg = load_for_cwd(&child);
+    let cfg = trusted_load_for_cwd(&child);
 
     assert_eq!(config_layer_read_count(), 2);
     assert_eq!(cfg.redact.denylist, vec!["home-secret"]);
@@ -1637,7 +1653,7 @@ fn config_resolution_result_unchanged_after_single_pass_rewrite() {
     )
     .unwrap();
 
-    let cfg = load_for_cwd(&child);
+    let cfg = trusted_load_for_cwd(&child);
 
     assert_eq!(cfg.name.as_deref(), Some("Project"));
     assert_eq!(

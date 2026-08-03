@@ -1606,6 +1606,9 @@ mod tests {
     ) -> HostContext {
         let mut ctx = crate::tools::common::test_ctx(root);
         ctx.llm_mode = mode;
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool))
     }
 
@@ -2481,7 +2484,10 @@ mod tests {
     async fn monty_adapter_effect_requires_approval_and_denial_is_distinct() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("mutating_probe", "should not run").mutating());
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
         let out = invoke(&host, "mutating_probe", serde_json::json!({}))
@@ -2498,7 +2504,10 @@ mod tests {
     async fn monty_adapter_in_script_denial_resumes_without_deadlock() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = Arc::new(MontyAdapterTool::new("mutating_probe", "should not run").mutating());
-        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.approver = None;
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
 
         let out = tokio::time::timeout(

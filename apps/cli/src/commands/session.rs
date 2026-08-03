@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -37,7 +37,7 @@ async fn delete(session: &str, yes: bool) -> Result<()> {
     if session.ended_at.is_none() {
         bail!("session {session_id} is active; end it before deleting");
     }
-    db.delete_session(session_id, true).await?;
+    db.delete_session(session_id).await?;
     println!("deleted session {session_id} and all associated local data");
     Ok(())
 }
@@ -63,7 +63,7 @@ async fn purge(before: &str, dry_run: bool, yes: bool) -> Result<()> {
     }
     confirm_destructive(yes, &format!("Delete {} ended session(s)", sessions.len()))?;
     for id in sessions {
-        db.delete_session(Uuid::parse_str(&id)?, true).await?;
+        db.delete_session(Uuid::parse_str(&id)?).await?;
     }
     println!("deleted ended sessions before {before}");
     Ok(())
@@ -99,16 +99,30 @@ async fn refuse_direct_write_while_daemon_running() -> Result<()> {
 }
 
 fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stderr = std::io::stderr();
+    let mut output = stderr.lock();
+    confirm_destructive_with_io(yes, prompt, stdin.is_terminal(), &mut input, &mut output)
+}
+
+fn confirm_destructive_with_io(
+    yes: bool,
+    prompt: &str,
+    stdin_is_terminal: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
     if yes {
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() {
+    if !stdin_is_terminal {
         bail!("{prompt} is irreversible; rerun with --yes in non-interactive mode");
     }
-    eprint!("{prompt}? [y/N] ");
-    std::io::stderr().flush()?;
+    write!(output, "{prompt}? [y/N] ")?;
+    output.flush()?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    input.read_line(&mut answer)?;
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         bail!("deletion cancelled");
     }
@@ -280,6 +294,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
             session_id: Some(session_id),
             since_seq: None,
             project_root: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
+            initial_model: None,
             no_sandbox: false,
             interactive: false,
             model_override: None,
@@ -620,9 +635,18 @@ mod tests {
 
     #[test]
     fn delete_noninteractive_without_yes_refuses() {
-        // The actual terminal branch is environment dependent; this guards the
-        // fail-closed wording used by non-interactive callers.
-        let message = "Delete this session and all local data is irreversible; rerun with --yes in non-interactive mode";
-        assert!(message.contains("--yes"));
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = confirm_destructive_with_io(
+            false,
+            "Delete this session and all local data",
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rerun with --yes"));
+        assert!(output.is_empty());
     }
 }

@@ -607,7 +607,7 @@ fn load_for_cwd_unions_redact_lists_and_keeps_dotenv_patterns_replace() {
     )
     .unwrap();
 
-    let cfg = load_for_cwd(&project);
+    let cfg = trusted_load_for_cwd(&project);
 
     assert_eq!(
         cfg.redact.denylist,

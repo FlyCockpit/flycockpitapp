@@ -7,6 +7,42 @@ use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;
 
+fn trusted_test_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
+    crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.to_path_buf(),
+            root: root.to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    }
+}
+
+async fn trusted_build_zip_with_options(
+    db: &Db,
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
+) -> Result<Vec<u8>> {
+    crate::config::trust::scope_workspace_trust_policy(
+        trusted_test_policy(Path::new(&target.project_root)),
+        build_zip_with_options_and_env(db, target, bundle, options, env),
+    )
+    .await
+}
+
+async fn trusted_build_zip(db: &Db, target: &SessionRow, bundle: &[SessionRow]) -> Result<Vec<u8>> {
+    trusted_build_zip_with_options(
+        db,
+        target,
+        bundle,
+        ExportBundleOptions::default(),
+        &test_export_env(),
+    )
+    .await
+}
+
 async fn create_test_session(
     db: &crate::db::Db,
     project_id: &str,
@@ -756,7 +792,7 @@ async fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preser
 
     let target = get_test_session(&db, s.session_id).await;
     let bundle = collect_bundle(&db, s.session_id).await.unwrap();
-    let safe = build_zip_with_options_and_env(
+    let safe = trusted_build_zip_with_options(
         &db,
         &target,
         &bundle,
@@ -777,7 +813,7 @@ async fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preser
             .contains("trusted-secret-value")
     );
 
-    let sensitive = build_zip_with_options_and_env(
+    let sensitive = trusted_build_zip_with_options(
         &db,
         &target,
         &bundle,
@@ -2500,7 +2536,7 @@ async fn export_task_delegation_steers_includes_origin_and_redacted_body() {
 
     let target = get_test_session(&db, sid).await;
     let bundle = collect_bundle(&db, sid).await.unwrap();
-    let zip = build_zip(&db, &target, &bundle).await.unwrap();
+    let zip = trusted_build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
     assert!(names.iter().any(|n| n == "delegation_steers/index.json"));
     let index: Vec<Value> =
@@ -3314,7 +3350,7 @@ async fn build_zip_with_config_override(
         crate::config::dirs::COCKPIT_CONFIG_ENV.to_string(),
         config_path.to_string_lossy().into_owned(),
     );
-    build_zip_with_options_and_env(db, target, bundle, ExportBundleOptions::default(), &env)
+    trusted_build_zip_with_options(db, target, bundle, ExportBundleOptions::default(), &env)
         .await
         .unwrap()
 }

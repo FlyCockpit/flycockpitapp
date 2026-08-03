@@ -738,124 +738,131 @@ mod tests {
     #[tokio::test]
     async fn curator_transitions_matrix() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let now = 10_000_000;
-        write_skill(&root, "fresh", "background_review", now - 10);
-        write_skill(
-            &root,
-            "old-stale",
-            "background_review",
-            now - STALE_AFTER_SECONDS - 1,
-        );
-        write_skill(
-            &root,
-            "old-archive",
-            "background_review",
-            now - ARCHIVE_AFTER_SECONDS - 1,
-        );
-        write_skill(
-            &root,
-            "foreground",
-            "foreground",
-            now - ARCHIVE_AFTER_SECONDS - 1,
-        );
-        write_skill(
-            &root,
-            "pinned",
-            "background_review",
-            now - ARCHIVE_AFTER_SECONDS - 1,
-        );
-        write_skill(
-            &root,
-            "cron-ref",
-            "background_review",
-            now - ARCHIVE_AFTER_SECONDS - 1,
-        );
-
-        let db = Db::open_in_memory().unwrap();
-        db.insert_scheduled_job(crate::db::scheduler::NewScheduledJobRow {
-            id: "cron".into(),
-            owner: "system:test".into(),
-            schedule_json: serde_json::to_string(&ScheduledJobSchedule::Cron {
-                expr: "0 0 * * *".into(),
-            })
-            .unwrap(),
-            payload_json: serde_json::json!({"prompt": "/skill cron-ref"}).to_string(),
-            enabled: true,
-            missed_run_policy: "skip".into(),
-            created_at: now,
-            updated_at: now,
-            next_run_at: Some(now + 60),
-        })
-        .await
-        .unwrap();
-        let clock = FixedClock::new(now);
-        let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
-        c.status().await.unwrap();
-        db.set_skill_usage_pinned("pinned", true, now)
-            .await
-            .unwrap();
-        let report = c
-            .run(CuratorRunOptions {
-                dry_run: false,
-                consolidate: false,
-            })
-            .await
-            .unwrap();
-
-        assert!(report.stale.contains(&"old-stale".to_string()));
-        assert!(report.archived.contains(&"old-archive".to_string()));
-        assert!(
-            root.join(".cockpit-skill-archive")
-                .join(format!("old-archive-{now}"))
-                .exists()
-        );
-        for skipped in ["foreground:foreground", "pinned:pinned", "cron-ref:cron"] {
-            assert!(report.skipped.contains(&skipped.to_string()), "{report:?}");
-        }
-        assert_eq!(
-            db.get_skill_usage("fresh").await.unwrap().unwrap().state,
-            SkillUsageState::Active
-        );
-        assert_eq!(
-            db.get_skill_usage("old-stale")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SkillUsageState::Stale
-        );
-        assert_eq!(
-            db.get_skill_usage("old-archive")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SkillUsageState::Archived
-        );
-
-        clock.set(now + 1);
-        let seed = SkillUsageSeed {
-            name: "old-stale".into(),
-            source_path: root.join("old-stale/SKILL.md").display().to_string(),
-            created_by: SkillCreatedBy::Background,
-            created_at: now - STALE_AFTER_SECONDS - 1,
-            pinned: false,
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
-        db.record_skill_use(seed, true, now + 1).await.unwrap();
-        db.set_skill_usage_state("old-stale", SkillUsageState::Stale, None, None, now + 1)
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let now = 10_000_000;
+            write_skill(&root, "fresh", "background_review", now - 10);
+            write_skill(
+                &root,
+                "old-stale",
+                "background_review",
+                now - STALE_AFTER_SECONDS - 1,
+            );
+            write_skill(
+                &root,
+                "old-archive",
+                "background_review",
+                now - ARCHIVE_AFTER_SECONDS - 1,
+            );
+            write_skill(
+                &root,
+                "foreground",
+                "foreground",
+                now - ARCHIVE_AFTER_SECONDS - 1,
+            );
+            write_skill(
+                &root,
+                "pinned",
+                "background_review",
+                now - ARCHIVE_AFTER_SECONDS - 1,
+            );
+            write_skill(
+                &root,
+                "cron-ref",
+                "background_review",
+                now - ARCHIVE_AFTER_SECONDS - 1,
+            );
+
+            let db = Db::open_in_memory().unwrap();
+            db.insert_scheduled_job(crate::db::scheduler::NewScheduledJobRow {
+                id: "cron".into(),
+                owner: "system:test".into(),
+                schedule_json: serde_json::to_string(&ScheduledJobSchedule::Cron {
+                    expr: "0 0 * * *".into(),
+                })
+                .unwrap(),
+                payload_json: serde_json::json!({"prompt": "/skill cron-ref"}).to_string(),
+                enabled: true,
+                missed_run_policy: "skip".into(),
+                created_at: now,
+                updated_at: now,
+                next_run_at: Some(now + 60),
+            })
             .await
             .unwrap();
-        let report = c.run(CuratorRunOptions::default()).await.unwrap();
-        assert!(report.reactivated.contains(&"old-stale".to_string()));
-        assert_eq!(
-            db.get_skill_usage("old-stale")
+            let clock = FixedClock::new(now);
+            let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
+            c.status().await.unwrap();
+            db.set_skill_usage_pinned("pinned", true, now)
                 .await
-                .unwrap()
-                .unwrap()
-                .state,
-            SkillUsageState::Active
-        );
+                .unwrap();
+            let report = c
+                .run(CuratorRunOptions {
+                    dry_run: false,
+                    consolidate: false,
+                })
+                .await
+                .unwrap();
+
+            assert!(report.stale.contains(&"old-stale".to_string()));
+            assert!(report.archived.contains(&"old-archive".to_string()));
+            assert!(
+                root.join(".cockpit-skill-archive")
+                    .join(format!("old-archive-{now}"))
+                    .exists()
+            );
+            for skipped in ["foreground:foreground", "pinned:pinned", "cron-ref:cron"] {
+                assert!(report.skipped.contains(&skipped.to_string()), "{report:?}");
+            }
+            assert_eq!(
+                db.get_skill_usage("fresh").await.unwrap().unwrap().state,
+                SkillUsageState::Active
+            );
+            assert_eq!(
+                db.get_skill_usage("old-stale")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                SkillUsageState::Stale
+            );
+            assert_eq!(
+                db.get_skill_usage("old-archive")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                SkillUsageState::Archived
+            );
+
+            clock.set(now + 1);
+            let seed = SkillUsageSeed {
+                name: "old-stale".into(),
+                source_path: root.join("old-stale/SKILL.md").display().to_string(),
+                created_by: SkillCreatedBy::Background,
+                created_at: now - STALE_AFTER_SECONDS - 1,
+                pinned: false,
+            };
+            db.record_skill_use(seed, true, now + 1).await.unwrap();
+            db.set_skill_usage_state("old-stale", SkillUsageState::Stale, None, None, now + 1)
+                .await
+                .unwrap();
+            let report = c.run(CuratorRunOptions::default()).await.unwrap();
+            assert!(report.reactivated.contains(&"old-stale".to_string()));
+            assert_eq!(
+                db.get_skill_usage("old-stale")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                SkillUsageState::Active
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -902,64 +909,78 @@ mod tests {
     #[tokio::test]
     async fn curator_never_deletes() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let now = 10_000_000;
-        write_skill(
-            &root,
-            "archive-me",
-            "background_review",
-            now - ARCHIVE_AFTER_SECONDS - 1,
-        );
-        let db = Db::open_in_memory().unwrap();
-        let c = curator(db, tmp.path(), cfg(&root), FixedClock::new(now));
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let now = 10_000_000;
+            write_skill(
+                &root,
+                "archive-me",
+                "background_review",
+                now - ARCHIVE_AFTER_SECONDS - 1,
+            );
+            let db = Db::open_in_memory().unwrap();
+            let c = curator(db, tmp.path(), cfg(&root), FixedClock::new(now));
 
-        c.run(CuratorRunOptions::default()).await.unwrap();
+            c.run(CuratorRunOptions::default()).await.unwrap();
 
-        assert!(!root.join("archive-me").exists());
-        assert!(
-            root.join(".cockpit-skill-archive/archive-me-10000000/SKILL.md")
-                .is_file()
-        );
+            assert!(!root.join("archive-me").exists());
+            assert!(
+                root.join(".cockpit-skill-archive/archive-me-10000000/SKILL.md")
+                    .is_file()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn curator_snapshot_rollback() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
-        let now = 10_000_000;
-        write_skill(&root, "keep", "background_review", now);
-        let db = Db::open_in_memory().unwrap();
-        let clock = FixedClock::new(now);
-        let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
-        c.status().await.unwrap();
-        let snap = c.snapshot("manual").await.unwrap();
-        std::fs::write(root.join("keep/SKILL.md"), "changed").unwrap();
-        db.set_skill_usage_state(
-            "keep",
-            SkillUsageState::Archived,
-            Some("/tmp/archive/keep".to_string()),
-            Some(now + 1),
-            now + 1,
-        )
-        .await
-        .unwrap();
-        clock.set(now + 1);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let root = tmp.path().join("skills");
+            let now = 10_000_000;
+            write_skill(&root, "keep", "background_review", now);
+            let db = Db::open_in_memory().unwrap();
+            let clock = FixedClock::new(now);
+            let c = curator(db.clone(), tmp.path(), cfg(&root), clock.clone());
+            c.status().await.unwrap();
+            let snap = c.snapshot("manual").await.unwrap();
+            std::fs::write(root.join("keep/SKILL.md"), "changed").unwrap();
+            db.set_skill_usage_state(
+                "keep",
+                SkillUsageState::Archived,
+                Some("/tmp/archive/keep".to_string()),
+                Some(now + 1),
+                now + 1,
+            )
+            .await
+            .unwrap();
+            clock.set(now + 1);
 
-        let restored = c.rollback(Some(&snap.id)).await.unwrap();
+            let restored = c.rollback(Some(&snap.id)).await.unwrap();
 
-        assert_eq!(restored.id, snap.id);
-        let body = std::fs::read_to_string(root.join("keep/SKILL.md")).unwrap();
-        assert!(body.contains("description: test skill"));
-        assert_eq!(
-            db.get_skill_usage("keep").await.unwrap().unwrap().state,
-            SkillUsageState::Active
-        );
-        assert!(
-            c.snapshots()
-                .await
-                .unwrap()
-                .iter()
-                .any(|s| s.reason == "rollback-before")
-        );
+            assert_eq!(restored.id, snap.id);
+            let body = std::fs::read_to_string(root.join("keep/SKILL.md")).unwrap();
+            assert!(body.contains("description: test skill"));
+            assert_eq!(
+                db.get_skill_usage("keep").await.unwrap().unwrap().state,
+                SkillUsageState::Active
+            );
+            assert!(
+                c.snapshots()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.reason == "rollback-before")
+            );
+        })
+        .await;
     }
 }

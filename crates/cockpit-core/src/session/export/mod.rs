@@ -622,8 +622,22 @@ async fn build_zip_with_options_and_env(
     let target = target.clone();
     let bundle = bundle.to_vec();
     let env = env.clone();
+    let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {
-        build_zip_with_options_and_env_conn(&db_for_files, conn, &target, &bundle, options, &env)
+        let build = || {
+            build_zip_with_options_and_env_conn(
+                &db_for_files,
+                conn,
+                &target,
+                &bundle,
+                options,
+                &env,
+            )
+        };
+        match trust_policy {
+            Some(policy) => crate::config::trust::with_workspace_trust_policy(policy, build),
+            None => build(),
+        }
     })
     .await
 }

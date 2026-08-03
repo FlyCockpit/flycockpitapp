@@ -405,10 +405,10 @@ pub(super) async fn run_worker(
     // models so a tandem request — itself a new provider round-trip — refuses
     // to dispatch once a drain begins (`model-comparison-tandem-
     // inference.md`).
-    let active_model_for_toggles = model_override.as_ref().unwrap_or(&model);
-    let mut active_model_for_toggles = (
-        active_model_for_toggles.provider_id().to_string(),
-        active_model_for_toggles.model_id_ref().to_string(),
+    let initial_model_for_toggles = model_override.as_ref().unwrap_or(&model);
+    let initial_model_for_toggles = (
+        initial_model_for_toggles.provider_id().to_string(),
+        initial_model_for_toggles.model_id_ref().to_string(),
     );
     let shutdown_gate = model.shutdown_gate();
     let spawn_args = SpawnArgs {
@@ -1559,7 +1559,7 @@ pub(super) async fn run_worker(
                                 provider,
                                 model,
                                 reasoning_effort,
-                                thinking_mode,
+                                thinking_mode: thinking_mode.map(|mode| mode.as_str().to_string()),
                                 prompt_cache_retention,
                                 outcome: proto::ModelSelectionOutcome::Rejected {
                                     user_message: "Model selection timed out before the daemon could apply it; retry from /model.".to_string(),
@@ -1575,12 +1575,12 @@ pub(super) async fn run_worker(
                         );
                         continue;
                     }
-                    active_model_for_toggles = (provider.clone(), model.clone());
                     let rejected_provider = provider.clone();
                     let rejected_model = model.clone();
                     let rejected_reasoning_effort = reasoning_effort.clone();
-                    let rejected_thinking_mode = thinking_mode.clone();
-                    let rejected_prompt_cache_retention = prompt_cache_retention.clone();
+                    let rejected_thinking_mode =
+                        thinking_mode.map(|mode| mode.as_str().to_string());
+                    let rejected_prompt_cache_retention = prompt_cache_retention;
                     // Mid-session model switch (implementation note):
                     // route the new `(provider, model)` to the running driver. The
                     // driver owns the whole daemon-side transaction: build first,
@@ -2033,10 +2033,18 @@ pub(super) async fn run_worker(
                         .providers
                         .clone();
                     let target = enabled.unwrap_or(!longcache_enabled);
+                    let active_selection = session.active_model_ref();
+                    let (active_provider, active_model) = active_selection
+                        .as_ref()
+                        .map(|active| (active.provider.as_str(), active.model.as_str()))
+                        .unwrap_or((
+                            initial_model_for_toggles.0.as_str(),
+                            initial_model_for_toggles.1.as_str(),
+                        ));
                     let supported = providers_cfg
                         .resolve_prompt_cache_retention(
-                            &active_model_for_toggles.0,
-                            &active_model_for_toggles.1,
+                            active_provider,
+                            active_model,
                             Some(crate::config::providers::PromptCacheRetention::Extended),
                         )
                         .is_some();

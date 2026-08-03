@@ -476,15 +476,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             target: _,
         }
-        | proto::Event::ActiveModelState {
-            session_id: _,
-            provider: _,
-            model: _,
-            config_provider: _,
-            config_model: _,
-            diverged: _,
-            generation: _,
-        }
+        | proto::Event::ActiveModelState { .. }
         | proto::Event::ModelSelectionResult { .. }
         | proto::Event::PreflightStarted { session_id: _ }
         | proto::Event::UserMessageRetracted { session_id: _ }
@@ -2056,7 +2048,7 @@ fn sweep_ephemeral_sessions_blocking(db: &Db) -> Result<usize> {
         drop(stmt);
         let mut removed = 0;
         for id in roots {
-            match crate::db::sessions::delete_session_conn(conn, id, true)
+            match crate::db::sessions::delete_session_conn(conn, id)
                 .with_context(|| format!("sweeping ephemeral session {id}"))
             {
                 Ok(_) => removed += 1,

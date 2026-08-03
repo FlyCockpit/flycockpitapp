@@ -1,3 +1,5 @@
+import type { ActiveModelRef } from "@flycockpit/cockpit-protocol";
+
 export type AuthFailureKind =
   | { kind: "credentials_rejected"; status?: number | null }
   | { kind: "missing_entitlement"; feature?: string | null }
@@ -35,10 +37,8 @@ export type InferenceFailureView = {
 };
 
 export type ActiveModelInput = {
-  provider?: string | null;
-  model?: string | null;
-  config_provider?: string | null;
-  config_model?: string | null;
+  selection?: ActiveModelRef | null;
+  default_selection?: ActiveModelRef | null;
   diverged?: boolean | null;
   generation?: number | null;
 };
@@ -117,11 +117,13 @@ export function activeModelReducer(
 ): ActiveModelState {
   const generation = typeof input.generation === "number" ? input.generation : 0;
   if (current && generation < current.generation) return current;
+  const selection = input.selection;
+  const defaultSelection = input.default_selection;
   return {
-    provider: displayValue(input.provider, "Unknown provider"),
-    model: displayValue(input.model, "Unknown model"),
-    configProvider: input.config_provider ?? null,
-    configModel: input.config_model ?? null,
+    provider: displayValue(selection?.provider, "Unknown provider"),
+    model: displayValue(selection?.model, "Unknown model"),
+    configProvider: defaultSelection?.provider ?? null,
+    configModel: defaultSelection?.model ?? null,
     diverged: input.diverged === true,
     generation,
   };

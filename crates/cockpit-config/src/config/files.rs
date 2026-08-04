@@ -180,7 +180,16 @@ fn open_file_at_nofollow(
     let name = path_component_cstring(name)?;
     // SAFETY: the directory fd and name remain live for the call; callers
     // supply O_NOFOLLOW and creation flags appropriate to the file role.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+    // Cast mode to c_uint: openat is variadic, and on macOS mode_t is u16
+    // which cannot be passed to a variadic function without promotion.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::c_uint,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("opening no-follow config file");
     }

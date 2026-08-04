@@ -1,6 +1,6 @@
 //! `spawn` — the recursive `Swarm`/`bee` fan-out tool (GOALS §24).
 //!
-//! Structural, like `task`/`schedule`/`handoff`: the engine intercepts it by
+//! Structural, like `task`/`schedule`: the engine intercepts it by
 //! name in [`crate::engine::agent::turn`] and routes the spawn request to
 //! the driver's single async-job authority (GOALS §22), which owns the
 //! queue, enforces the depth ceiling + global concurrency cap, and

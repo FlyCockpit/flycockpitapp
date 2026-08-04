@@ -1112,7 +1112,6 @@ pub(crate) fn is_monty_builtin_adaptable(name: &str) -> bool {
     !matches!(
         name,
         "question"
-            | "handoff"
             | "return"
             | "schedule"
             | "task"
@@ -2604,7 +2603,6 @@ mod llm_mode_tests {
             ("graph", ToolEffect::ReadOnly),
             ("glob", ToolEffect::ReadOnly),
             ("grep", ToolEffect::ReadOnly),
-            ("handoff", ToolEffect::Dynamic),
             ("harness_invoke", ToolEffect::Dynamic),
             ("harness_list", ToolEffect::Dynamic),
             ("list-packages", ToolEffect::Dynamic),

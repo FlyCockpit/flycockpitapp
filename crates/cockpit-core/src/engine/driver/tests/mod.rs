@@ -323,9 +323,8 @@ async fn record_goal_tool_event(driver: &Driver, tool: &str, wire_input: serde_j
 }
 
 /// Build a driver rooted on the real `Plan` primary. The model is keyless
-/// localhost and never called:
-/// these tests drive [`Driver::apply_handoff`] (the engine side of a
-/// model-issued `handoff` call) directly, so no inference round-trips.
+/// localhost and never called: primary-swap tests drive
+/// [`Driver::swap_primary`] directly, so no inference round-trips.
 fn plan_rooted_driver() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = test_driver(1);
     // Re-root on a genuine `Plan`, built through the same factory the

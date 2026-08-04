@@ -2930,7 +2930,7 @@ mod tests {
 
     /// The registered tool set used by the name-repair tests — built-in
     /// lowercase names plus a structural one, mirroring a real agent.
-    const KNOWN: &[&str] = &["read", "edit", "bash", "task", "handoff"];
+    const KNOWN: &[&str] = &["read", "edit", "bash", "task", "spawn"];
 
     /// A clean exact-match name is a zero-cost passthrough: byte-identical,
     /// no recovery, idempotent.

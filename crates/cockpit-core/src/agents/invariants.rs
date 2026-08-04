@@ -55,16 +55,16 @@ pub const SPAWN_TOOL: &str = "spawn";
 
 const SPAWN_AGENTS: &[&str] = &["bee", "Multireview", "scout"];
 
-/// The structural delegation/handoff tools. Never grantable to a delegation
-/// child (prompt `parent-granted-tools.md`): a delegated child is a leaf and
-/// must report a single result up, so it may not gain the power to spawn its
-/// own subagents (`task`) or hand off the conversation (`handoff`). The
-/// recursive fan-out exception is [`SPAWN_TOOL`], gated separately.
-pub const DELEGATION_TOOLS: &[&str] = &["task", "handoff", "start_build"];
+/// The structural delegation tools. Never grantable to a delegation child
+/// (prompt `parent-granted-tools.md`): a delegated child is a leaf and must
+/// report a single result up, so it may not gain the power to spawn its own
+/// subagents (`task`) or jump primaries (`start_build`). A stale grant of the
+/// retired native `handoff` name fails as unknown-tool rather than via this
+/// list. The recursive fan-out exception is [`SPAWN_TOOL`], gated separately.
+pub const DELEGATION_TOOLS: &[&str] = &["task", "start_build"];
 
 pub const STRUCTURAL_TOOLS: &[&str] = &[
     "question",
-    "handoff",
     "return",
     "schedule",
     "task",
@@ -148,13 +148,13 @@ pub fn validate_grant(
         if !known.contains(&tool.as_str()) {
             bail!("delegation to `{target_name}` granted unknown tool `{tool}`");
         }
-        // Delegation/handoff tools are never grantable: handing a child the
-        // power to spawn or hand off would break leaf-termination — the child
-        // is a leaf and must report one result up. (`spawn` is the
-        // documented exception, gated to recursive fan-out agents below.)
+        // Delegation tools are never grantable: handing a child the power to
+        // spawn further work would break leaf-termination — the child is a
+        // leaf and must report one result up. (`spawn` is the documented
+        // exception, gated to recursive fan-out agents below.)
         if DELEGATION_TOOLS.contains(&tool.as_str()) {
             bail!(
-                "delegation to `{target_name}` may not be granted the delegation tool `{tool}` — a delegated child is a leaf and may not spawn or hand off (leaf-termination rule)"
+                "delegation to `{target_name}` may not be granted the delegation tool `{tool}` — a delegated child is a leaf and may not spawn further work (leaf-termination rule)"
             );
         }
         if SANDBOX_ONLY_TOOLS.contains(&tool.as_str()) {
@@ -458,17 +458,31 @@ mod grant_tests {
         assert!(err.contains("spawn"), "{err}");
     }
 
-    /// A delegation/handoff tool may not be granted to a leaf child — that
-    /// would break leaf-termination.
+    /// A delegation tool may not be granted to a leaf child — that would break
+    /// leaf-termination.
     #[test]
     fn rejects_delegation_tools() {
-        for t in ["task", "handoff"] {
+        for t in ["task", "start_build"] {
             let err = validate_grant("explore", AgentMode::Subagent, &g(&[t]))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(t), "{err}");
             assert!(err.contains("leaf-termination"), "{err}");
         }
+        // Retired native `handoff` is not materializable; a stale grant fails
+        // as a normal unknown tool (no dedicated compatibility rejection path).
+        let err = validate_grant("explore", AgentMode::Subagent, &g(&["handoff"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("handoff"), "{err}");
+        assert!(
+            err.contains("unknown tool"),
+            "stale handoff grant must use unknown-tool path, not a special-case: {err}"
+        );
+        assert!(
+            !err.contains("leaf-termination"),
+            "retired handoff must not use DELEGATION_TOOLS leaf-termination path: {err}"
+        );
     }
 
     /// The external-harness tools are primary-only — rejected for a subagent.

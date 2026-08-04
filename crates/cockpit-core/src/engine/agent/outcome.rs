@@ -146,18 +146,6 @@ pub enum TurnOutcome {
         task_call_id: String,
         task_function_call_id: Option<String>,
     },
-    /// Agent invoked the `handoff` tool (the `Auto` front door). Like
-    /// `task`/`schedule` this is intercepted by the engine and routed to the
-    /// driver, which swaps the root-frame primary in place at the idle
-    /// boundary (the same machinery `/plan`/`/build` use) and delivers a
-    /// confirmation as this call's tool_result. The swapped-in primary
-    /// then takes over the conversation.
-    Handoff {
-        /// The target primary agent name (`Plan` or `Build`).
-        target: String,
-        task_call_id: String,
-        task_function_call_id: Option<String>,
-    },
     /// A delegated subagent invoked the structural `return` tool to finish with
     /// a structured summary (implementation note).
     /// The model-authored fields are carried up so the driver assembles the
@@ -196,37 +184,6 @@ pub struct BatchTaskEntry {
     pub granted_tools: Vec<String>,
     pub todo_ids: Vec<uuid::Uuid>,
     pub write_scope: Option<String>,
-}
-
-/// Resolve the `handoff` target (`Plan`/`Build`) from a model-issued
-/// `handoff` call's raw arguments, applying the same validate-then-repair
-/// contract (§12) every structural tool uses so a weak model's loose
-/// `{ "target": … }` still routes. The schema's `enum` is the authority:
-/// the repaired `target` is honored only when it is a declared target;
-/// anything else (missing, misspelled, or a non-enum string) falls back to
-/// `Build` (the make-the-change-now primary), so a clear handoff intent
-/// never stalls in `Auto` on a malformed argument. Pure + side-effect-free
-/// so the interception decision is unit-testable without the model.
-pub(super) fn handoff_target(raw_args: &Value, schema: &Value) -> String {
-    let mut args = raw_args.clone();
-    // Some weak models emit the whole arguments object as a JSON *string*
-    // (`"{\"target\":\"Plan\"}"`) rather than an object. The §12 repair
-    // catalog walks per-key and can't recover a stringified *root*, so unwrap
-    // that one shape here before validating — otherwise a clear `Plan`/`Build`
-    // intent silently routes to the `Build` fallback (priority #1: defensive
-    // against the failure modes small models actually exhibit).
-    if let Value::String(s) = &args
-        && let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(s)
-    {
-        args = parsed;
-    }
-    let _ = repair(&mut args, schema, "handoff");
-    let allowed = crate::tools::handoff::HANDOFF_TARGETS;
-    args.get("target")
-        .and_then(Value::as_str)
-        .filter(|t| allowed.contains(t))
-        .unwrap_or("Build")
-        .to_string()
 }
 
 /// Resolve whether a `task` delegation runs **noninteractively** (synchronous
@@ -321,50 +278,35 @@ pub(super) fn task_refusal(
 }
 
 #[cfg(test)]
-mod handoff_target_tests {
-    use super::*;
-    use crate::engine::tool::Tool;
-
-    fn schema() -> Value {
-        crate::tools::handoff::HandoffTool.parameters()
-    }
-
-    /// A clean `handoff(target="Plan")` / `handoff(target="Build")` routes to
-    /// exactly that primary (the two clear-intent acceptance cases).
+mod handoff_outcome_removal_tests {
+    /// The dead native handoff tool's structural outcome and helper must not
+    /// reappear. Source-level so this fails first while the variant/helper
+    /// remain, then passes after deletion. Banned tokens are assembled at
+    /// runtime so this test body does not self-match via `include_str!`.
     #[test]
-    fn clean_targets_route_through() {
-        assert_eq!(
-            handoff_target(&serde_json::json!({ "target": "Plan" }), &schema()),
-            "Plan"
+    fn turn_outcome_has_no_handoff_variant() {
+        let src = include_str!("outcome.rs");
+        // Strip this test module before scanning so assert messages cannot
+        // self-match.
+        let production = src
+            .split("mod handoff_outcome_removal_tests")
+            .next()
+            .unwrap_or(src);
+        let variant = format!("{} {{", "Handoff");
+        let helper = format!("fn hand{}target", "off_");
+        let path = format!("TurnOutcome::{}", "Handoff");
+        assert!(
+            !production.contains(&variant),
+            "TurnOutcome must not declare a Handoff variant"
         );
-        assert_eq!(
-            handoff_target(&serde_json::json!({ "target": "Build" }), &schema()),
-            "Build"
+        assert!(
+            !production.contains(&helper),
+            "handoff_target helper must be removed with the dead tool"
         );
-    }
-
-    /// A weak model's stringified-object args (`"{\"target\":\"Plan\"}"`) are
-    /// repaired through the §12 contract and still route — the interception
-    /// must not stall on a recoverable malformation.
-    #[test]
-    fn stringified_args_are_repaired_and_route() {
-        let raw = Value::String("{\"target\": \"Plan\"}".to_string());
-        assert_eq!(handoff_target(&raw, &schema()), "Plan");
-    }
-
-    /// Unrecoverable / off-enum / missing `target` falls back to `Build` (the
-    /// make-the-change-now primary) rather than stalling in `Auto`: a clear
-    /// handoff intent never fails to fire on a malformed argument.
-    #[test]
-    fn malformed_target_falls_back_to_build() {
-        for raw in [
-            serde_json::json!({}),
-            serde_json::json!({ "target": "plan" }),
-            serde_json::json!({ "target": "Explore" }),
-            serde_json::json!({ "target": 7 }),
-        ] {
-            assert_eq!(handoff_target(&raw, &schema()), "Build", "args: {raw}");
-        }
+        assert!(
+            !production.contains(&path),
+            "no TurnOutcome::Handoff references may remain in outcome production code"
+        );
     }
 }
 

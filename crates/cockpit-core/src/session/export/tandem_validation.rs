@@ -346,7 +346,7 @@ fn classify_tool(name: &str) -> ToolCategory {
     match name {
         "read" | "code" | "graph" | "search" => ToolCategory::ReadOnly,
         "bash" => ToolCategory::Shell,
-        "task" | "spawn" | "handoff" => ToolCategory::Delegation,
+        "task" | "spawn" => ToolCategory::Delegation,
         "question" | "mcp" => ToolCategory::ApprovalRequiring,
         "write" | "edit" | "unlock" => ToolCategory::WriteOrLockCapable,
         _ => ToolCategory::Unknown,

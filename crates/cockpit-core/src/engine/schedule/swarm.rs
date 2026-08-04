@@ -196,7 +196,7 @@ async fn run_swarm_loop(
             // A `bee` child is leaf-terminated for every edge *except*
             // bee→bee (handled above via `spawn`): it holds `task` only to
             // reach `docs`, which the noninteractive child path does not run
-            // recursively here, and never holds handoff/done/jobs-as-spawn.
+            // recursively here, and never holds done/jobs-as-spawn.
             // `return` is its structured finish tool — treat it (and any stray
             // structural outcome from a weak model) as end-of-run, returning
             // what the child has (clamp, don't crash).
@@ -206,7 +206,6 @@ async fn run_swarm_loop(
             | TurnOutcome::TaskControl { .. }
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
-            | TurnOutcome::Handoff { .. }
             | TurnOutcome::Return { .. } => {
                 return Ok(collect_final_text(&history));
             }

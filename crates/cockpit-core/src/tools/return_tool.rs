@@ -1,6 +1,6 @@
 //! `return` — a delegated subagent's structured finish tool.
 //!
-//! Structural, like `done`/`handoff`/`task`: the engine intercepts it by name
+//! Structural, like `done`/`task`: the engine intercepts it by name
 //! in [`crate::engine::agent::turn`] and routes the model-authored fields to
 //! the driver, which assembles the structured summary envelope the caller
 //! ingests as this delegation's tool result (see

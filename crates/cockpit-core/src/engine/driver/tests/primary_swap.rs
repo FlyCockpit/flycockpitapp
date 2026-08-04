@@ -1,118 +1,25 @@
 use super::*;
 
 #[tokio::test]
-async fn plan_hands_off_to_build_on_clear_build_intent() {
+async fn plan_swaps_to_build_via_swap_command() {
     let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     assert_eq!(driver.active_agent(), "Plan", "starts on Plan");
 
-    let next = driver
-        .apply_handoff("Build", "call-1".to_string(), Some("fc-1".to_string()), &tx)
-        .await;
+    driver.swap_primary("Build", &tx).await;
 
     assert_eq!(driver.active_agent(), "Build", "primary swapped to `Build`");
     assert_eq!(driver.stack.len(), 1, "swap stays on the root frame");
-    // Persisted so a resume restarts on the handed-off primary.
-    assert_eq!(persisted_active_agent(&driver), "Build");
-    // The confirmation tool_result is what drives `Build`'s next turn.
-    assert!(
-        matches!(&next, Message::User { .. }),
-        "tool_result delivered"
-    );
 }
 
 #[tokio::test]
-async fn failed_handoff_does_not_persist_target_agent() {
+async fn failed_swap_does_not_persist_target_agent() {
     let (mut driver, _t) = plan_rooted_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
 
-    driver
-        .apply_handoff(
-            "DefinitelyNotAnAgent",
-            "call-1".to_string(),
-            Some("fc-1".to_string()),
-            &tx,
-        )
-        .await;
+    driver.swap_primary("DefinitelyNotAnAgent", &tx).await;
 
     assert_eq!(driver.active_agent(), "Plan");
-    assert_eq!(persisted_active_agent(&driver), "Plan");
-}
-
-/// Part 1 (implementation note): the swapped-in
-/// primary's first turn is driven by an IMPERATIVE kickoff — the user's
-/// originating request restated verbatim + a begin-now instruction — NOT
-/// the bare `` "Handed off to `Build`." `` ack a weak model would merely
-/// narrate.
-#[tokio::test]
-async fn handoff_kickoff_restates_user_request_and_commands_action() {
-    let (mut driver, _t) = plan_rooted_driver();
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    // The originating user request that triggered the handoff.
-    let request = "Add a confirm-on-quit toggle to /settings";
-    push_user_turn(&mut driver, request);
-
-    let next = driver
-        .apply_handoff("Build", "call-1".to_string(), Some("fc-1".to_string()), &tx)
-        .await;
-
-    let kickoff = tool_result_text(&next);
-    assert!(
-        kickoff.contains(request),
-        "kickoff restates the user's request verbatim: {kickoff:?}"
-    );
-    assert!(
-        kickoff.to_lowercase().contains("begin now")
-            && kickoff.to_lowercase().contains("tool call"),
-        "kickoff commands a begin-now tool call, not narration: {kickoff:?}"
-    );
-    assert!(
-        !kickoff.contains("Handed off to"),
-        "the bare ack is NOT the model-facing kickoff: {kickoff:?}"
-    );
-}
-
-/// The kickoff restates the SALIENT (most recent) user turn when several
-/// preceded the handoff — not the whole transcript.
-#[tokio::test]
-async fn handoff_kickoff_restates_only_the_salient_request() {
-    let (mut driver, _t) = plan_rooted_driver();
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-    push_user_turn(&mut driver, "What does the config loader do?");
-    // An intervening agent reply closes that turn so the next user message
-    // opens a fresh, salient one.
-    driver.stack[0]
-        .history
-        .push(Message::assistant("It walks up .cockpit/."));
-    let salient = "Now rename `loadConfig` to `load_config` everywhere";
-    push_user_turn(&mut driver, salient);
-
-    let next = driver
-        .apply_handoff("Build", "c".to_string(), Some("fc".to_string()), &tx)
-        .await;
-
-    let kickoff = tool_result_text(&next);
-    assert!(
-        kickoff.contains(salient),
-        "salient request restated: {kickoff:?}"
-    );
-    assert!(
-        !kickoff.contains("config loader"),
-        "the earlier turn is not dragged in: {kickoff:?}"
-    );
-}
-
-/// Companion to the above: a clear planning request routes to `Plan`.
-#[tokio::test]
-async fn build_hands_off_to_plan_on_clear_plan_intent() {
-    let (mut driver, _t) = test_driver(1);
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
-
-    driver
-        .apply_handoff("Plan", "call-2".to_string(), Some("fc-2".to_string()), &tx)
-        .await;
-
-    assert_eq!(driver.active_agent(), "Plan", "primary swapped to `Plan`");
     assert_eq!(persisted_active_agent(&driver), "Plan");
 }
 
@@ -698,7 +605,7 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
 /// skill's call + result are stripped from the root history (both halves,
 /// together) so `Build` follows its own role.
 #[tokio::test]
-async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
+async fn abandoned_skill_pair_is_stripped_on_primary_swap() {
     use crate::engine::message::AssistantContent;
     use rig::message::UserContent;
 
@@ -739,10 +646,9 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
     );
     assert_eq!(driver.skill_pairs.len(), 1, "ownership recorded");
 
-    // Hand off to `Build`. The abandoned skill pair must be gone.
-    driver
-        .apply_handoff("Build", "call-1".to_string(), Some("fc-1".to_string()), &tx)
-        .await;
+    // Swap to `Build` via the live slash-command path. Abandoned skill pair
+    // must be gone so it does not govern the incoming primary.
+    driver.swap_primary("Build", &tx).await;
 
     assert!(
         !skill_call_present(&driver),
@@ -756,8 +662,6 @@ async fn abandoned_skill_pair_is_stripped_on_handoff_swap() {
         driver.skill_pairs.is_empty(),
         "stripped pair dropped from the ledger"
     );
-    // The kickoff still restated the user's own request (not the skill).
-    // History stays well-formed: every tool_result has its call.
     assert_eq!(driver.active_agent(), "Build");
 }
 
@@ -777,9 +681,7 @@ async fn intentional_steer_skill_pair_survives_swap() {
     driver.skill_pairs[0].intentional_steer = true;
     let before = driver.stack[0].history.len();
 
-    driver
-        .apply_handoff("Build", "c".to_string(), Some("fc".to_string()), &tx)
-        .await;
+    driver.swap_primary("Build", &tx).await;
 
     assert_eq!(
         driver.stack[0].history.len(),
@@ -819,7 +721,7 @@ async fn delegated_subagent_first_turn_is_the_actionable_brief() {
 #[tokio::test]
 async fn ambiguous_turn_keeps_plan_active() {
     let (driver, _t) = plan_rooted_driver();
-    // No `apply_handoff` call (the model emitted no `handoff` tool call).
+    // No primary swap was requested.
     assert_eq!(
         driver.active_agent(),
         "Plan",

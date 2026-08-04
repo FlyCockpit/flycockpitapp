@@ -249,7 +249,6 @@ async fn run_iteration(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Spawn { .. }
-            | TurnOutcome::Handoff { .. }
             // A fork runs a primary's surface; it never holds the delegated-
             // subagent `return` tool, but be exhaustive and end the iteration.
             | TurnOutcome::Return { .. } => {

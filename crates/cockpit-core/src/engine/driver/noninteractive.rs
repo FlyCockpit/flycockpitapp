@@ -4272,12 +4272,11 @@ pub(crate) async fn run_noninteractive_resumable(
             | TurnOutcome::TaskControl { .. }
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
-            | TurnOutcome::Spawn { .. }
-            | TurnOutcome::Handoff { .. } => {
-                // explore is a leaf without `task`/`schedule`/`handoff`; this
-                // shouldn't happen, but if it does we bail rather than spin
-                // (the single async-job + primary-swap authority is the main
-                // driver, never a noninteractive subagent — §22 anti-runaway).
+            | TurnOutcome::Spawn { .. } => {
+                // explore is a leaf without `task`/`schedule`; this shouldn't
+                // happen, but if it does we bail rather than spin (the single
+                // async-job authority is the main driver, never a noninteractive
+                // subagent — §22 anti-runaway).
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(

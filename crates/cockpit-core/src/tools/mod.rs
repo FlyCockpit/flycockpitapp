@@ -26,7 +26,6 @@ pub mod escalate;
 pub mod glob;
 pub mod goal;
 pub mod grep;
-pub mod handoff;
 pub mod harness;
 pub mod intel;
 pub mod jq_shim;

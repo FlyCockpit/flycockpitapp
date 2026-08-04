@@ -43,7 +43,6 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("glob"),
     ToolTimeoutSafety::abandon_safe("goal"),
     ToolTimeoutSafety::abandon_safe("grep"),
-    ToolTimeoutSafety::abandon_safe("handoff"),
     ToolTimeoutSafety::abandon_safe("harness_invoke"),
     ToolTimeoutSafety::abandon_safe("harness_list"),
     ToolTimeoutSafety::abandon_safe("graph"),

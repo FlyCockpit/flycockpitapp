@@ -376,17 +376,13 @@ mod goal_verification_tests {
 const ID_PRIMARY_ROUNDS_CONTINUE: &str = "primary_rounds_continue";
 const ID_PRIMARY_ROUNDS_STOP: &str = "primary_rounds_stop";
 
-/// Trigger string for an `Auto`→primary `handoff` swap (the `handoff` tool).
-const SWAP_TRIGGER_HANDOFF: &str = "handoff";
-/// Trigger string for a `/plan`/`/build`/`/swarm` (and `/agent`/`Shift+Tab`)
+/// Trigger string for a `/plan`/`/build` (and `/agent`/`Shift+Tab`)
 /// slash-command swap routed through `DriverControl::SwapPrimary` at idle.
 const SWAP_TRIGGER_COMMAND: &str = "swap_command";
 
 /// The export-audit context for a primary swap (`primary_swap` event). Carries
-/// the trigger and — for the `handoff` path only — both halves of the
-/// wire-vs-user split (GOALS §14): the user-facing `display` row and the
-/// model-facing wire `kickoff`. The slash-command swaps inject no kickoff, so
-/// both are absent there (never fabricated).
+/// the trigger and optional wire-vs-user `display`/`kickoff` halves (GOALS §14).
+/// Live slash-command swaps inject no kickoff (never fabricated).
 struct PrimarySwapContext<'a> {
     trigger: &'a str,
     display: Option<&'a str>,
@@ -418,23 +414,13 @@ struct ScheduleToolCallRecord {
 }
 
 impl<'a> PrimarySwapContext<'a> {
-    /// A `/plan`/`/build`/`/swarm` slash-command swap: trigger only, no
-    /// kickoff (the new primary's first turn is the user's next message).
+    /// A `/plan`/`/build` slash-command swap: trigger only, no kickoff (the
+    /// new primary's first turn is the user's next message).
     fn swap_command() -> Self {
         Self {
             trigger: SWAP_TRIGGER_COMMAND,
             display: None,
             kickoff: None,
-        }
-    }
-
-    /// An `Auto`→primary `handoff` swap: trigger plus both halves of the
-    /// wire-vs-user split.
-    fn handoff(display: &'a str, kickoff: &'a str) -> Self {
-        Self {
-            trigger: SWAP_TRIGGER_HANDOFF,
-            display: Some(display),
-            kickoff: Some(kickoff),
         }
     }
 }
@@ -848,7 +834,8 @@ pub struct Driver {
     /// previously-effective agent (net no-op), in which case nothing is
     /// injected. Deferred to send time so the cached prefix stays byte-stable
     /// until the message is actually sent. `None` outside a swap window. The
-    /// `handoff` path injects its own kickoff and never sets this.
+    /// Primary-swap marker is cleared/set only by idle-boundary primary swaps
+    /// (`/plan`/`/build`); it is not a model tool-call path.
     pending_swap_marker_from: Option<String>,
     /// Per-call ownership of historical tool calls, keyed by the tool call's
     /// `id` → the primary that **actually made it**
@@ -7627,22 +7614,6 @@ impl Driver {
                         task_function_call_id,
                         output,
                     );
-                    continue;
-                }
-                TurnOutcome::Handoff {
-                    target,
-                    task_call_id,
-                    task_function_call_id,
-                } => {
-                    // The `Auto` front door hands the conversation to a
-                    // primary agent. The shared application path confirms the
-                    // call as `handoff`'s tool_result, persists the new active
-                    // agent, and swaps the root-frame primary in place; the
-                    // delivered tool_result then drives the swapped-in
-                    // primary's next turn — `Auto` is no longer in the loop.
-                    next_prompt = self
-                        .apply_handoff(&target, task_call_id, task_function_call_id, tx)
-                        .await;
                     continue;
                 }
             }

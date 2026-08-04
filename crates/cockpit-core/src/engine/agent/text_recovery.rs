@@ -268,7 +268,7 @@ pub(super) fn decide_text_recovery(
     let name_repair = repair::repair_tool_name(&tool_name, &known);
     tool_name = name_repair.name;
 
-    // Structural tools (`task`/`schedule`/`handoff`/`spawn`/`done`/`return`) are
+    // Structural tools (`task`/`schedule`/`spawn`/`done`/`return`) are
     // registered in the toolbox, so `known.contains` resolves them too and they
     // route through their special-cases in the dispatch loop.
     let resolves = known.contains(&tool_name.as_str());

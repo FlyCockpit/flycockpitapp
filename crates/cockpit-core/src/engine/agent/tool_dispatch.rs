@@ -438,7 +438,7 @@ pub(crate) async fn execute_ordinary_call(
     // path-field pointing at a nonexistent file (`path_not_found` — model
     // path-hallucination, kept distinct so it doesn't pollute repair
     // telemetry), and a name not in the agent's advertised toolbox
-    // (`not_in_advertised_set`) — structural tools (`task`/`handoff`/`done`/
+    // (`not_in_advertised_set`) — structural tools (`task`/`done`/
     // `schedule`/`spawn`/`return`) already returned above, so any unknown name
     // here is a hallucination.
     // Loop-guard / safety-gate blocks are NOT rejections in this sense (the

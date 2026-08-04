@@ -828,14 +828,15 @@ impl Session {
     }
 
     /// Record a `primary_swap` timeline event (export-audit fidelity). Fired
-    /// whenever the root-frame primary is re-rooted (GOALS §26): an `Auto`→
-    /// primary `handoff` (trigger `handoff`) or a `/plan`/`/build`/`/swarm`
-    /// slash-command swap (trigger `swap_command`). Preserves the wire-vs-user
-    /// split (GOALS §14): `display` is the user-facing row and `kickoff` is the
-    /// model-facing wire kickoff. The `handoff` path supplies both; the
-    /// slash-command swaps inject no kickoff, so `kickoff` is absent there
-    /// (`None`) — never fabricated. Carries only `from`/`to`/`trigger`/`display`
-    /// /`kickoff` (token economy, project guidance priority #2).
+    /// whenever the root-frame primary is re-rooted (GOALS §26): live
+    /// `/plan`/`/build` slash-command swaps use trigger `swap_command`.
+    /// Historical sessions may also carry trigger `handoff` from the retired
+    /// native handoff tool. Preserves the wire-vs-user split (GOALS §14):
+    /// `display` is the user-facing row and `kickoff` is the model-facing wire
+    /// kickoff. Live slash-command swaps inject no kickoff, so `kickoff` is
+    /// absent there (`None`) — never fabricated. Carries only
+    /// `from`/`to`/`trigger`/`display`/`kickoff` (token economy, project
+    /// guidance priority #2).
     pub async fn record_primary_swap(
         &self,
         from: &str,

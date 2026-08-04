@@ -475,7 +475,6 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "question",
         "schedule",
         "spawn",
-        "handoff",
         "mcp",
         "webfetch",
         "websearch",
@@ -686,12 +685,6 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
         },
         BuiltinToolInventoryItem {
             family: "Delegation",
-            name: "handoff",
-            summary: "Hand off control to another agent.",
-            condition: None,
-        },
-        BuiltinToolInventoryItem {
-            family: "Delegation",
             name: "return",
             summary: "Return from a delegated agent.",
             condition: Some("delegated agents"),
@@ -809,7 +802,6 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::web::WebFetchTool),
         Arc::new(tools::mcp_tool::McpTool),
         Arc::new(tools::lsp::LspTool),
-        Arc::new(tools::handoff::HandoffTool),
         Arc::new(tools::return_tool::ReturnTool),
         Arc::new(tools::plan_doc::PlanReadTool),
         Arc::new(tools::plan_doc::PlanWriteTool),
@@ -872,7 +864,6 @@ fn materialize_tool_by_name(
             &args.cwd,
         )?),
         "lsp" => tb.with(Arc::new(tools::lsp::LspTool)),
-        "handoff" => tb.with(Arc::new(tools::handoff::HandoffTool)),
         "return" => tb.with(Arc::new(tools::return_tool::ReturnTool)),
         "plan_read" => tb.with(Arc::new(tools::plan_doc::PlanReadTool)),
         "plan_write" => tb.with(Arc::new(tools::plan_doc::PlanWriteTool)),
@@ -1447,7 +1438,7 @@ pub fn default_build(args: &SpawnArgs) -> Agent {
 
 /// Append the parent-granted tools onto a built agent's base toolbox (prompt
 /// `parent-granted-tools.md`). Only non-structural, non-delegation tools are
-/// grantable (the delegation/handoff tools are rejected up front by
+/// grantable (the delegation tools are rejected up front by
 /// [`crate::agents::invariants::validate_grant`], so they never reach here),
 /// which is why no `AgentDef`/subagent wiring is needed. A name already present
 /// on the box (the parent granted a tool the child already holds) is a no-op
@@ -1518,14 +1509,14 @@ pub fn is_followup_eligible(name: &str) -> bool {
 /// - it holds **none** of the single-writer lock/write tools
 ///   ([`crate::agents::invariants::LOCK_WRITE_TOOLS`]) — i.e. it cannot
 ///   mutate the tree, so re-running it is side-effect-free, and
-/// - it is a leaf — it holds no `task`/`handoff` (it delegates to no one;
-///   re-querying must not grant a subagent new delegation powers,
-///   leaf-termination, GOALS §3c).
+/// - it is a leaf — it holds no `task` (it delegates to no one; re-querying
+///   must not grant a subagent new delegation powers, leaf-termination,
+///   GOALS §3c).
 ///
 /// Today this is `explore` (and any custom read-only leaf subagent); a future
 /// read-only noninteractive leaf subagent qualifies automatically. A primary
-/// (`Build`/`Plan`/`Auto`) is excluded by the leaf check — it holds `task` /
-/// `handoff` — and is never delegated to via `task` anyway.
+/// (`Build`/`Plan`) is excluded by the leaf check — it holds `task` — and is
+/// never delegated to via `task` anyway.
 pub fn is_read_only_noninteractive(agent: &Agent) -> bool {
     if !is_noninteractive(&agent.name) || is_docs_pipeline(&agent.name) {
         return false;
@@ -1547,11 +1538,10 @@ pub fn is_write_capable(agent: &Agent) -> bool {
         .any(|w| names.contains(w))
 }
 
-/// True when `agent` holds a delegation/handoff tool (`task`/`handoff`) — it is
-/// not a leaf. Used to keep the read-only-leaf scope tight.
+/// True when `agent` holds a delegation tool (`task`) — it is not a leaf. Used
+/// to keep the read-only-leaf scope tight.
 fn is_delegating(agent: &Agent) -> bool {
-    let names = agent.tools.names();
-    names.contains(&"task") || names.contains(&"handoff")
+    agent.tools.names().contains(&"task")
 }
 
 /// Register the structural `return` tool on `tb` for a **delegated subagent**
@@ -1560,9 +1550,9 @@ fn is_delegating(agent: &Agent) -> bool {
 /// returning a structured summary envelope, so it holds `return` from session
 /// start (cache-safe; the tools array is never mutated mid-session). The `docs`
 /// pipeline stages are **exempt** (their answer is the payload), so they never
-/// get it; a chat-owning primary (`Auto`/`Build`/`Plan`/`Swarm`) is never
-/// delegated to and finishes via `Done`/`handoff`/`done`, so it is excluded
-/// too. `name` is the agent's own name.
+/// get it; a chat-owning primary (`Build`/`Plan`/`Multireview`) is never
+/// delegated to and finishes via `Done`, so it is excluded too. `name` is the
+/// agent's own name.
 fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
     if name == "deepthink" {
         return tb;
@@ -1575,7 +1565,7 @@ fn with_return_tool(tb: ToolBox, name: &str) -> ToolBox {
 
 /// Whether `name` is a bundled chat-owning **primary** (top-level) agent. Used
 /// to exclude primaries from the delegated-subagent `return` tool: a primary is
-/// never delegated to and finishes via `Done`/`handoff`.
+/// never delegated to and finishes via `Done`.
 fn is_primary(name: &str) -> bool {
     crate::agents::is_builtin_primary(name)
 }
@@ -2843,7 +2833,6 @@ mod tests {
         let host = host_for_agent(&agent, tmp.path());
         for tool in [
             "question",
-            "handoff",
             "return",
             "schedule",
             "task",
@@ -3780,7 +3769,7 @@ mod tests {
 
     #[test]
     fn configured_custom_tools_cannot_collide_with_reserved_native_names() {
-        for name in ["read", "write", "edit", "unlock", "task", "handoff", "seed"] {
+        for name in ["read", "write", "edit", "unlock", "task", "seed"] {
             let tmp = tempfile::tempdir().unwrap();
             write_project_config(
                 tmp.path(),
@@ -4504,6 +4493,142 @@ mod tests {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }
+    }
+
+    /// Dead native `handoff` tool must not be grantable, inventoried, or
+    /// materializable. Written first so it fails while the tool remains
+    /// registered, then passes after deletion.
+    #[test]
+    fn builtin_inventory_excludes_dead_handoff() {
+        let names = known_agent_tool_names();
+        assert!(
+            !names.contains(&"handoff"),
+            "known_agent_tool_names must not list handoff: {names:?}"
+        );
+        assert!(
+            !builtin_tool_inventory()
+                .iter()
+                .any(|tool| tool.name == "handoff"),
+            "builtin_tool_inventory must not list handoff"
+        );
+        assert!(
+            !invariant_builtin_tools()
+                .into_iter()
+                .any(|tool| tool.name() == "handoff"),
+            "invariant_builtin_tools must not materialize HandoffTool"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        match materialize_tool_by_name(ToolBox::new(), "handoff", None, &args) {
+            Ok(_) => panic!("handoff must not materialize"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("unknown tool"),
+                    "materialize_tool_by_name(handoff) must fail as unknown tool: {err}"
+                );
+            }
+        }
+    }
+
+    /// Module + source file for the dead native handoff tool must be gone.
+    #[test]
+    fn handoff_tool_source_and_module_are_removed() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/handoff.rs");
+        assert!(
+            !path.exists(),
+            "tools/handoff.rs must be deleted (still present at {})",
+            path.display()
+        );
+        let tools_mod = include_str!("../../tools/mod.rs");
+        assert!(
+            !tools_mod.contains("mod handoff"),
+            "tools/mod.rs must not export the handoff module"
+        );
+    }
+
+    /// Live same-word "handoff" features remain after the dead native tool is
+    /// removed: CompactReady, /compact assembly, todo note kind, plan notes
+    /// path, expand_handoff_tags, and BTW inventory without a handoff tool.
+    #[test]
+    fn live_handoff_named_features_unchanged() {
+        use crate::engine::agent::TurnEvent;
+        use crate::engine::compact::{StateAppendix, assemble_handoff};
+
+        // CompactReady still carries a handoff string field (compaction).
+        let compact_ready = TurnEvent::CompactReady {
+            new_session_id: uuid::Uuid::nil(),
+            handoff: "brief".into(),
+            brief: "brief body".into(),
+            source: "test".into(),
+            trigger_ctx_pct: None,
+            tokens_before: 0,
+            tokens_after: 0,
+            turns_summarized: 0,
+            tail_kept: 0,
+            tail_trimmed: 0,
+            seed_tool_count: 0,
+            seed_tool_tokens: 0,
+        };
+        match &compact_ready {
+            TurnEvent::CompactReady { handoff, brief, .. } => {
+                assert_eq!(handoff, "brief");
+                assert_eq!(brief, "brief body");
+            }
+            other => panic!("expected CompactReady, got {other:?}"),
+        }
+        // Drop forces the variant shape to be constructed (not merely named).
+        drop(compact_ready);
+
+        // /compact still assembles review-ready handoff text.
+        let appendix = StateAppendix {
+            files_read: Vec::new(),
+            files_edited: Vec::new(),
+            commands: Vec::new(),
+            git_branch: None,
+            dirty_files: None,
+            open_todos: Vec::new(),
+            active_goal: None,
+            task_overview: Vec::new(),
+            pinned_messages: Vec::new(),
+        };
+        let assembled = assemble_handoff("brief body", &appendix, &[], false);
+        assert!(
+            assembled.contains("brief body"),
+            "assemble_handoff must keep brief: {assembled}"
+        );
+
+        // Todo note kind `handoff` remains a first-class enum value.
+        assert_eq!(
+            crate::db::task_todos::TodoNoteKind::Handoff.as_str(),
+            "handoff"
+        );
+        let todo_kind = serde_json::to_value(crate::db::task_todos::TodoNoteKind::Handoff).unwrap();
+        assert_eq!(todo_kind, serde_json::json!("handoff"));
+
+        // expand_handoff_tags remains on the driver (delegation tag expansion).
+        let driver_src = include_str!("../driver/mod.rs");
+        assert!(
+            driver_src.contains("fn expand_handoff_tags("),
+            "expand_handoff_tags must remain as a callable"
+        );
+
+        // Plan handoff notes helpers remain for plan→build handoff notes.
+        let plan_src = include_str!("../../tools/plan_doc.rs");
+        assert!(
+            plan_src.contains("fn plan_handoff_notes")
+                && plan_src.contains("fn find_existing_build_handoff"),
+            "plan-doc handoff note helpers must remain"
+        );
+
+        // BTW tool-effect closed set (Monty inventory) has no handoff tool entry.
+        let effects: std::collections::BTreeMap<_, _> = invariant_builtin_tools()
+            .into_iter()
+            .map(|tool| (tool.name().to_string(), tool.effect()))
+            .collect();
+        assert!(!effects.contains_key("handoff"), "{effects:?}");
+        assert!(effects.contains_key("task"), "{effects:?}");
+        assert!(effects.contains_key("todo"), "{effects:?}");
     }
 
     #[test]

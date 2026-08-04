@@ -641,24 +641,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
         });
     }
 
-    // `handoff` is structural: the driver owns the single primary-swap
-    // authority (same idle-boundary mechanism as `/plan`/`/build`), so
-    // the `Auto` front door routes the chosen target there via
-    // [`TurnOutcome::Handoff`] rather than dispatching a tool here.
-    if resolved_name == "handoff" {
-        let schema = agent
-            .tools
-            .get("handoff")
-            .map(|t| t.parameters())
-            .unwrap_or(Value::Null);
-        let target = handoff_target(&tc.function.arguments, &schema);
-        return_structural!(TurnOutcome::Handoff {
-            target,
-            task_call_id: tc.id.clone(),
-            task_function_call_id: tc.call_id.clone(),
-        });
-    }
-
     // `spawn` is structural: the driver routes the spawn to the
     // single async-job authority (GOALS §22/§24), which enforces the depth
     // ceiling + global concurrency cap and schedules the child `Swarm`
@@ -805,7 +787,7 @@ pub(crate) async fn run_turn(
     // Live pre-send pairing heal (implementation note).
     // The history sent to the provider must never carry an orphan `tool_use`
     // (a tool call with no matching `tool_result`) — strict providers 400 on
-    // it. A structural tool (`task`/`handoff`/`spawn`/`done`/`schedule`/`return`)
+    // it. A structural tool (`task`/`spawn`/`done`/`schedule`/`return`)
     // returns early from the dispatch loop, so any sibling `tool_use` in the
     // same assistant turn never gets a result and lingers as an orphan in
     // `history`. We heal it here, immediately before the request is assembled,
@@ -1539,7 +1521,7 @@ pub(crate) async fn run_turn(
         // without a wasted round-trip; (b) charset-sanitize a still-unknown
         // name to `^[a-zA-Z0-9_-]{1,64}$` so the failed `tool_use` left in
         // history can't 400 the provider on replay. The structural tools
-        // below (`task`/`schedule`/`handoff`/`spawn`/`done`) are
+        // below (`task`/`schedule`/`spawn`/`done`) are
         // registered in the toolbox, so a rebind resolves them here and they
         // route correctly. `resolved_name` is the wire/model form; the
         // original (malformed) name rides `name_recovery` for the §14

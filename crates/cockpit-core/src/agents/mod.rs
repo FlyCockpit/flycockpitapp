@@ -325,7 +325,6 @@ fn tool_family(name: &str) -> &'static str {
         "bash" | "escalate" | "harness_list" | "harness_invoke" => "execution",
         "task"
         | "spawn"
-        | "handoff"
         | "return"
         | "question"
         | "defer_to_orchestrator"

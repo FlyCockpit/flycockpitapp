@@ -1,3 +1,12 @@
+//! External binary capability detection for tools.
+//!
+//! Tool-scoped binary requirements and PATH probes live here. The broader
+//! external-runtime dependency health foundation (descriptors, generation
+//! snapshots, trusted-catalog vs configured-command probe policy, platform
+//! recipes) lives in [`crate::external_runtime`] and is the long-term home for
+//! dependency health. This module remains the fail-closed gate for
+//! `Tool::binary_requirements`.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -5,7 +14,10 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionTarget {
     Host,
     Container,

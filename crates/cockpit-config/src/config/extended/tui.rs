@@ -48,6 +48,12 @@ pub struct TuiConfig {
     /// clipboard layer; falls back to plain text over SSH).
     #[serde(default = "default_true")]
     pub rich_text_copy: bool,
+    /// Automatically copy the current mouse selection to the system
+    /// clipboard when the selection gesture is released. Independent of
+    /// [`Self::mouse_capture`]: the value persists even when capture is
+    /// disabled. Default on.
+    #[serde(default = "default_true")]
+    pub copy_on_release: bool,
     /// Lines of conversation tail to dump back into terminal
     /// scrollback at TUI exit (GOALS §1d). Default 100. `0` disables
     /// the dump entirely; `-1` dumps the whole session.
@@ -379,6 +385,7 @@ impl Default for TuiConfig {
             mouse_capture: true,
             hyperlinks: true,
             rich_text_copy: true,
+            copy_on_release: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,
             caffeinate_display_awake: false,

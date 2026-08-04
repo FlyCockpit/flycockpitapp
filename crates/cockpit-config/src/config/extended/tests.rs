@@ -1889,4 +1889,111 @@ fn web_custom_migration_drops_legacy_descriptions() {
     }));
 }
 
+#[test]
+fn copy_on_release_defaults_true_when_omitted() {
+    // Absent tui block.
+    let empty: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert!(empty.tui.copy_on_release);
+
+    // Present tui block, key omitted.
+    let partial: ExtendedConfig =
+        serde_json::from_str(r#"{"tui":{"mouse_capture":false}}"#).unwrap();
+    assert!(partial.tui.copy_on_release);
+    assert!(!partial.tui.mouse_capture);
+}
+
+#[test]
+fn copy_on_release_struct_default_is_true() {
+    assert!(TuiConfig::default().copy_on_release);
+    assert!(ExtendedConfig::default().tui.copy_on_release);
+}
+
+#[test]
+fn copy_on_release_false_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.tui.copy_on_release = false;
+    doc.write(&cfg).unwrap();
+
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(!reloaded.tui.copy_on_release);
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("\"copy_on_release\": false")
+            || on_disk.contains("\"copy_on_release\":false"),
+        "{on_disk}"
+    );
+
+    // Explicit true after false round-trips as well.
+    let mut doc2 = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg2 = doc2.config();
+    cfg2.tui.copy_on_release = true;
+    doc2.write(&cfg2).unwrap();
+    assert!(
+        ExtendedConfigDoc::load(&path)
+            .unwrap()
+            .config()
+            .tui
+            .copy_on_release
+    );
+
+    // Layering: project layer overrides home for tui.copy_on_release in both
+    // directions (true→false and false→true).
+    for (home_val, project_val) in [(true, false), (false, true)] {
+        let layer_tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(layer_tmp.path());
+        let home_cfg = layer_tmp.path().join("home/.config/cockpit/config.json");
+        std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+        std::fs::write(
+            &home_cfg,
+            format!(r#"{{"tui":{{"copy_on_release":{home_val},"mouse_capture":true}}}}"#),
+        )
+        .unwrap();
+        let project = layer_tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+        std::fs::write(
+            project.join(".cockpit/config.json"),
+            format!(r#"{{"tui":{{"copy_on_release":{project_val}}}}}"#),
+        )
+        .unwrap();
+        let layered = trusted_load_for_cwd(&project);
+        assert_eq!(
+            layered.tui.copy_on_release, project_val,
+            "project layer must override home copy_on_release (home={home_val} project={project_val})"
+        );
+        assert!(
+            layered.tui.mouse_capture,
+            "omitted nested sibling inherits home layer"
+        );
+    }
+}
+
+#[test]
+fn copy_on_release_omission_preserves_sibling_tui_values() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tui": {
+                "mouse_capture": false,
+                "rich_text_copy": false,
+                "hyperlinks": false,
+                "show_cwd": false
+            }
+        }"#,
+    )
+    .unwrap();
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert!(cfg.tui.copy_on_release, "omitted key defaults true");
+    assert!(!cfg.tui.mouse_capture);
+    assert!(!cfg.tui.rich_text_copy);
+    assert!(!cfg.tui.hyperlinks);
+    assert!(!cfg.tui.show_cwd);
+}
+
 mod guards_and_resolvers;

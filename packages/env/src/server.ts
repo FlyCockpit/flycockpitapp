@@ -1,4 +1,14 @@
 import { createEnv } from "@t3-oss/env-core";
+import {
+  parseRemoteConnectionsMode,
+  type RemoteConnectionCapabilities,
+  type RemoteConnectionMode,
+  remoteConnectionCapabilities,
+} from "./remote-connections";
+
+export { remoteConnectionCapabilities } from "./remote-connections";
+export type { RemoteConnectionCapabilities, RemoteConnectionMode };
+
 import { z } from "zod";
 import {
   S3_FORCE_PATH_STYLE as SHARED_S3_FORCE_PATH_STYLE,
@@ -98,6 +108,25 @@ export const env = createEnv({
     RELAY_CONTROL_SECRET: z.string().min(32).optional(),
     RELAY_CA_PUBLIC_KEYS: z.string().optional(),
     RELAY_REVOKED_IDS: z.string().optional(),
+    /**
+     * Remote data-transport capability ceiling. Omitted/empty → `both`.
+     * Exact case-sensitive values only: webrtc | websocket | both.
+     * Does not control main-app WebSocket signaling (always required).
+     */
+    REMOTE_CONNECTIONS: z
+      .string()
+      .optional()
+      .transform((value, ctx) => {
+        try {
+          return parseRemoteConnectionsMode(value);
+        } catch (error) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: error instanceof Error ? error.message : "invalid REMOTE_CONNECTIONS value",
+          });
+          return z.NEVER;
+        }
+      }),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
@@ -125,6 +154,13 @@ export const SSO_ENABLED: boolean = env.SSO_ENABLED;
 export const FORCE_SSO: boolean = env.FORCE_SSO;
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
 export const DEPLOYMENT_PROFILE = env.DEPLOYMENT_PROFILE;
+
+/** Validated remote data-transport mode (default `both`). */
+export const REMOTE_CONNECTIONS: RemoteConnectionMode = env.REMOTE_CONNECTIONS ?? "both";
+
+/** Derived data-transport capabilities for {@link REMOTE_CONNECTIONS}. */
+export const REMOTE_CONNECTION_CAPABILITIES: RemoteConnectionCapabilities =
+  remoteConnectionCapabilities(REMOTE_CONNECTIONS);
 
 // ---------------------------------------------------------------------------
 // BETTER_AUTH_SECRET entropy check — catch weak/placeholder secrets early.

@@ -4,7 +4,193 @@ fn should_clear_sandbox_down_notice(enabled: bool, sandbox_supported: bool) -> b
     !enabled && sandbox_supported
 }
 
+/// Replace every optimistic row represented by one daemon fold with exactly
+/// one authoritative transcript row. The event text is canonical; individual
+/// optimistic rows may contain only one member of a multi-message fold.
+pub(super) trait FoldedUserHistory {
+    fn entries(&self) -> &[HistoryEntry];
+    fn remove_entry(&mut self, index: usize);
+    fn insert_entry(&mut self, index: usize, entry: HistoryEntry);
+}
+
+impl FoldedUserHistory for Vec<HistoryEntry> {
+    fn entries(&self) -> &[HistoryEntry] {
+        self
+    }
+
+    fn remove_entry(&mut self, index: usize) {
+        self.remove(index);
+    }
+
+    fn insert_entry(&mut self, index: usize, entry: HistoryEntry) {
+        self.insert(index, entry);
+    }
+}
+
+impl FoldedUserHistory for HistoryWindow {
+    fn entries(&self) -> &[HistoryEntry] {
+        self.as_slice()
+    }
+
+    fn remove_entry(&mut self, index: usize) {
+        self.remove(index);
+    }
+
+    fn insert_entry(&mut self, index: usize, entry: HistoryEntry) {
+        self.insert(index, entry);
+    }
+}
+
+pub(super) struct FoldedUserHistoryResult {
+    pub inserted: bool,
+    pub replaced_optimistic: bool,
+}
+
+fn is_optimistic_tag_expansion(entry: &HistoryEntry) -> bool {
+    matches!(entry, HistoryEntry::Plain { line } if line.starts_with("  → "))
+}
+
+/// Remove exactly the optimistic user rows named by daemon client-submission
+/// receipts, together with their immediately following optimistic tag rows.
+/// Returns the first removed position so an authoritative replay can preserve
+/// transcript order when it replaces those rows.
+pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
+    history: &mut H,
+    client_submission_ids: &HashSet<uuid::Uuid>,
+) -> Option<usize> {
+    let matched_indices = history
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            HistoryEntry::User {
+                seq: None,
+                optimistic_submission_id: Some(id),
+                ..
+            } if client_submission_ids.contains(id) => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let first = matched_indices.first().copied()?;
+    for index in matched_indices.into_iter().rev() {
+        while history
+            .entries()
+            .get(index + 1)
+            .is_some_and(is_optimistic_tag_expansion)
+        {
+            history.remove_entry(index + 1);
+        }
+        history.remove_entry(index);
+    }
+    Some(first)
+}
+
+/// Merge a daemon replay into an already-rendered live transcript. Durable
+/// receipt ids replace matching optimistic rows in place instead of appending
+/// a second copy after reconnect or lag resync. A multi-id folded row replaces
+/// every represented optimistic row with the one authoritative history row.
+pub(super) fn reconcile_history_replay<H: FoldedUserHistory>(
+    history: &mut H,
+    wire: Vec<cockpit_core::daemon::proto::HistoryEntry>,
+) {
+    let replayed_ids = wire
+        .iter()
+        .flat_map(|entry| match entry {
+            cockpit_core::daemon::proto::HistoryEntry::User {
+                client_submission_ids,
+                ..
+            } => client_submission_ids.clone(),
+            _ => Vec::new(),
+        })
+        .collect::<HashSet<_>>();
+    let insertion_index = remove_correlated_optimistic_user_history(history, &replayed_ids)
+        .unwrap_or_else(|| history.entries().len());
+    for (offset, entry) in wire_history_to_entries(wire).into_iter().enumerate() {
+        history.insert_entry(
+            (insertion_index + offset).min(history.entries().len()),
+            entry,
+        );
+    }
+}
+
+pub(super) fn reconcile_folded_user_history<H: FoldedUserHistory>(
+    history: &mut H,
+    folded_ids: &HashSet<uuid::Uuid>,
+    text: String,
+    display_text: Option<String>,
+    seq: Option<i64>,
+    preflight_cleaned: Option<String>,
+) -> FoldedUserHistoryResult {
+    let already_recorded = seq.is_some_and(|seq| {
+        history.entries().iter().any(
+            |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
+        )
+    });
+    let matched_indices = history
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match entry {
+            HistoryEntry::User {
+                seq: None,
+                optimistic_submission_id: Some(id),
+                persist_failed: false,
+                ..
+            } if folded_ids.contains(id) => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let insertion_index = matched_indices
+        .first()
+        .copied()
+        .unwrap_or(history.entries().len());
+    let replaced_optimistic = !matched_indices.is_empty();
+    for index in matched_indices.into_iter().rev() {
+        history.remove_entry(index);
+    }
+    if already_recorded {
+        return FoldedUserHistoryResult {
+            inserted: false,
+            replaced_optimistic,
+        };
+    }
+    history.insert_entry(
+        insertion_index.min(history.entries().len()),
+        HistoryEntry::User {
+            text: display_text
+                .filter(|value| !value.is_empty())
+                .unwrap_or(text),
+            cleaned: preflight_cleaned,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq,
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        },
+    );
+    FoldedUserHistoryResult {
+        inserted: true,
+        replaced_optimistic,
+    }
+}
+
 impl App {
+    const FOLDED_QUEUE_TOMBSTONE_CAPACITY: usize = 1024;
+
+    fn remember_folded_queue_item_ids(&mut self, ids: impl IntoIterator<Item = uuid::Uuid>) {
+        for id in ids {
+            if self.folded_queue_item_ids.insert(id) {
+                self.folded_queue_item_order.push_back(id);
+            }
+        }
+        while self.folded_queue_item_order.len() > Self::FOLDED_QUEUE_TOMBSTONE_CAPACITY {
+            if let Some(expired) = self.folded_queue_item_order.pop_front() {
+                self.folded_queue_item_ids.remove(&expired);
+            }
+        }
+    }
+
     pub(super) fn apply_sandbox_state(
         &mut self,
         mode: cockpit_core::tools::sandbox_mode::SandboxMode,
@@ -43,21 +229,33 @@ impl App {
     }
 
     pub(super) fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
-        if matches!(self.fresh_queue_ack, FreshQueueAck::AwaitingAck)
-            && let Some(item) = queue.first()
-        {
-            self.fresh_queue_ack = FreshQueueAck::SuppressId(item.id);
-        }
-        let folded_before_ack = matches!(self.fresh_queue_ack, FreshQueueAck::FoldedBeforeAck(_));
-        self.queue = match self.fresh_queue_ack {
-            FreshQueueAck::SuppressId(id) | FreshQueueAck::FoldedBeforeAck(id) => {
-                queue.into_iter().filter(|item| item.id != id).collect()
+        let contains_tracked = |id| queue.iter().any(|item| item.id == id);
+        let (suppress_id, next_ack) = match self.fresh_queue_ack {
+            FreshQueueAck::AwaitingAck(id) if contains_tracked(id) => {
+                (Some(id), FreshQueueAck::SuppressId(id))
             }
-            FreshQueueAck::None | FreshQueueAck::AwaitingAck => queue,
+            FreshQueueAck::SuppressId(id) => (Some(id), FreshQueueAck::SuppressId(id)),
+            FreshQueueAck::FoldedBeforeAck(id) if contains_tracked(id) => {
+                // This is the delayed per-request snapshot that still contains
+                // an item already folded into history. Suppress it once, then
+                // release the correlation state.
+                (Some(id), FreshQueueAck::None)
+            }
+            FreshQueueAck::FoldedBeforeAck(id) => {
+                // Authoritative empty/unrelated queue broadcasts may overtake
+                // the delayed request response. Keep waiting for the exact id
+                // instead of letting that later stale snapshot resurrect it.
+                (Some(id), FreshQueueAck::FoldedBeforeAck(id))
+            }
+            FreshQueueAck::None | FreshQueueAck::AwaitingAck(_) => (None, self.fresh_queue_ack),
         };
-        if folded_before_ack {
-            self.fresh_queue_ack = FreshQueueAck::None;
-        }
+        self.queue = queue
+            .into_iter()
+            .filter(|item| {
+                !self.folded_queue_item_ids.contains(&item.id) && suppress_id != Some(item.id)
+            })
+            .collect();
+        self.fresh_queue_ack = next_ack;
     }
 
     fn apply_queued_user_messages_folded(
@@ -70,56 +268,36 @@ impl App {
         preflight_cleaned: Option<String>,
     ) {
         let folded_ids = queue_item_ids.iter().copied().collect::<HashSet<_>>();
-        let suppresses_fresh_optimistic = match self.fresh_queue_ack {
-            FreshQueueAck::SuppressId(id) => folded_ids.contains(&id),
-            FreshQueueAck::AwaitingAck => !queue_item_ids.is_empty(),
-            FreshQueueAck::None | FreshQueueAck::FoldedBeforeAck(_) => false,
+        self.retained_user_submission_ids
+            .retain(|id| !folded_ids.contains(id));
+        self.remember_folded_queue_item_ids(queue_item_ids.iter().copied());
+        let folded_before_ack_id = match self.fresh_queue_ack {
+            FreshQueueAck::AwaitingAck(id) if folded_ids.contains(&id) => Some(id),
+            _ => None,
         };
-        let folded_before_ack_id = matches!(self.fresh_queue_ack, FreshQueueAck::AwaitingAck)
-            .then(|| queue_item_ids.first().copied())
-            .flatten();
 
         self.queue.retain(|item| !folded_ids.contains(&item.id));
 
-        let mut stamped_existing = false;
-        if suppresses_fresh_optimistic {
-            for entry in self.history.iter_mut().rev() {
-                if let HistoryEntry::User {
-                    seq: s @ None,
-                    cleaned,
-                    preflight_pending,
-                    persist_failed,
-                    ..
-                } = entry
-                {
-                    *s = seq;
-                    if preflight_cleaned.is_some() {
-                        *cleaned = preflight_cleaned.clone();
-                    }
-                    *preflight_pending = false;
-                    *persist_failed = false;
-                    stamped_existing = true;
-                    break;
-                }
-            }
-        }
-        if !stamped_existing {
-            self.history.push(HistoryEntry::User {
-                text: display_text
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(text),
-                cleaned: preflight_cleaned,
-                expanded: false,
-                timestamp: chrono::Local::now(),
-                seq,
-                preflight_pending: false,
-                persist_failed: false,
-            });
+        let reconciled = reconcile_folded_user_history(
+            &mut self.history,
+            &folded_ids,
+            text,
+            display_text,
+            seq,
+            preflight_cleaned,
+        );
+        if reconciled.inserted && !reconciled.replaced_optimistic {
             self.push_tag_call_entries(&tag_expansions);
         }
-        self.fresh_queue_ack = folded_before_ack_id
-            .map(FreshQueueAck::FoldedBeforeAck)
-            .unwrap_or(FreshQueueAck::None);
+        self.fresh_queue_ack = match self.fresh_queue_ack {
+            FreshQueueAck::AwaitingAck(id) if folded_before_ack_id == Some(id) => {
+                FreshQueueAck::FoldedBeforeAck(id)
+            }
+            FreshQueueAck::SuppressId(id) if folded_ids.contains(&id) => FreshQueueAck::None,
+            // An unrelated fold must not steal or clear another in-flight
+            // submission's exact UUID correlation.
+            other => other,
+        };
     }
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
@@ -194,13 +372,18 @@ impl App {
                     }
                 }
             }
-            TurnEvent::DaemonLinkReconnected => {
+            TurnEvent::DaemonLinkReconnected { active_model_state } => {
+                self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
                 }
             }
+            TurnEvent::DaemonLinkResynced { active_model_state } => {
+                self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
+            }
             TurnEvent::DaemonLinkTerminal { error } => {
+                self.cancel_model_controls_for_terminal_link();
                 self.daemon_link = None;
                 self.daemon_draining = false;
                 self.finalize_pending();
@@ -215,7 +398,7 @@ impl App {
                 self.maybe_prompt_resume_repair(state);
             }
             TurnEvent::HistoryReplay { entries } => {
-                self.history.extend(wire_history_to_entries(entries));
+                reconcile_history_replay(&mut self.history, entries);
             }
             TurnEvent::QueueUpdated { queue } => {
                 self.reconcile_queue_update(queue);
@@ -274,6 +457,20 @@ impl App {
                             ..
                         } => (false, Some(user_message.clone()), 0, None, None),
                     };
+                // Every applied result carries daemon-authoritative state for
+                // this live worker epoch. Apply it independently of local
+                // request ownership: another client may have saved the same
+                // generation as the default, correcting divergence without a
+                // generation increment. Local payload release and notices
+                // remain selection-id gated below.
+                if let Some(active_state) = applied_state.as_ref() {
+                    self.apply_active_model_state(
+                        active_state.selection.clone(),
+                        active_state.default_selection.clone(),
+                        active_state.diverged,
+                        active_state.generation,
+                    );
+                }
                 let matching = self
                     .pending_model_selection
                     .as_ref()
@@ -288,8 +485,15 @@ impl App {
                             && (!applied || generation >= pending.minimum_generation)
                     });
                 let pending = matching
-                    .then(|| self.pending_model_selection.take())
+                    .then(|| self.clear_pending_model_selection(Some(selection_id)))
                     .flatten();
+                // Rejections preserve the exact wire payload before any UI
+                // recovery path can reopen overlays or otherwise mutate state.
+                let pending = if applied {
+                    pending
+                } else {
+                    pending.map(|pending| self.preserve_failed_model_selection(pending))
+                };
                 let trigger = pending.as_ref().map(|selection| selection.trigger);
                 let requested = pending
                     .as_ref()
@@ -306,17 +510,9 @@ impl App {
                         "model selection terminal result received by tui"
                     );
                 }
-                let mut queued = pending.and_then(|selection| selection.queued_submission);
+                let queued = pending.and_then(|selection| selection.queued_submission);
                 if !matching {
                     return;
-                }
-                if let Some(active_state) = applied_state {
-                    self.apply_active_model_state(
-                        active_state.selection,
-                        active_state.default_selection,
-                        active_state.diverged,
-                        active_state.generation,
-                    );
                 }
                 if applied && let Some(default_update) = default_update {
                     match default_update {
@@ -336,9 +532,6 @@ impl App {
                     }
                 }
                 if !applied {
-                    if self.retry_model_submission.is_none() {
-                        self.retry_model_submission = queued.take();
-                    }
                     let message = user_message.unwrap_or_else(|| {
                         format!("Could not switch to `{provider}/{model}`; keeping the confirmed model active.")
                     });
@@ -464,14 +657,37 @@ impl App {
             }
             TurnEvent::UserMessageRecorded {
                 seq,
+                client_submission_ids,
                 preflight_cleaned,
             } => {
-                self.fresh_queue_ack = FreshQueueAck::None;
-                // Stamp the assigned `session_events.seq` onto the most
-                // recent still-unstamped user row (pushed optimistically on
-                // submit, before the timeline write completed) so it becomes
-                // pinnable (`pinned-messages`). Newest-first so re-attaches
-                // never back-fill an older row. When the turn was preflighted
+                self.retained_user_submission_ids
+                    .retain(|id| !client_submission_ids.contains(id));
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if client_submission_ids.contains(&id) => {
+                        // The durable record can overtake the per-request queue
+                        // response just like the fold event can. Continue to
+                        // suppress that exact stale response snapshot.
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if client_submission_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+                // A queued fold emits its authoritative fold event and then a
+                // `UserMessageRecorded` event for the same database row. The
+                // fold handler has already created/stamped that row, so the
+                // second signal must not consume a different optimistic row.
+                if self.history.iter().any(
+                    |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
+                ) {
+                    return;
+                }
+                // Stamp the assigned `session_events.seq` onto only the
+                // optimistic row named by this v6 event's client ids. Text or
+                // transcript position cannot safely correlate concurrent
+                // submissions. When the turn was preflighted
                 // (implementation note), also record the cleaned
                 // body so the row renders the cleaned text + `⚙ preflighted`
                 // chip while the reveal shows the original typed input.
@@ -479,10 +695,14 @@ impl App {
                     if let HistoryEntry::User {
                         seq: s @ None,
                         cleaned,
+                        optimistic_submission_id,
                         preflight_pending,
                         persist_failed,
                         ..
                     } = entry
+                        && !*persist_failed
+                        && optimistic_submission_id
+                            .is_some_and(|id| client_submission_ids.contains(&id))
                     {
                         *s = Some(seq);
                         if preflight_cleaned.is_some() {
@@ -496,33 +716,48 @@ impl App {
                         // guard-tripped — original, no chip).
                         *preflight_pending = false;
                         *persist_failed = false;
+                        *optimistic_submission_id = None;
                         break;
                     }
                 }
             }
-            TurnEvent::SessionPersistFailed { error } => {
-                self.end_working_span();
-                self.reconnect = None;
-                self.fresh_queue_ack = FreshQueueAck::None;
-                for entry in self.history.iter_mut().rev() {
+            TurnEvent::SessionPersistFailed {
+                client_submission_id,
+                error,
+            } => {
+                self.retained_user_submission_ids
+                    .insert(client_submission_id);
+                let mut owns_working_span = false;
+                for entry in self.history.iter_mut() {
                     if let HistoryEntry::User {
                         seq: None,
+                        optimistic_submission_id: Some(id),
                         preflight_pending,
-                        persist_failed,
                         ..
                     } = entry
+                        && *id == client_submission_id
                     {
                         *preflight_pending = false;
-                        *persist_failed = true;
+                        owns_working_span = true;
                         break;
                     }
                 }
-                let summary = format!("session persist failed; message was dropped: {error}");
-                self.history.push(HistoryEntry::InferenceError {
-                    detail: summary.clone(),
-                    summary,
-                    expanded: false,
-                });
+                if owns_working_span {
+                    self.end_working_span();
+                    self.reconnect = None;
+                    if matches!(
+                        self.fresh_queue_ack,
+                        FreshQueueAck::AwaitingAck(id)
+                            | FreshQueueAck::SuppressId(id)
+                            | FreshQueueAck::FoldedBeforeAck(id)
+                            if id == client_submission_id
+                    ) {
+                        self.fresh_queue_ack = FreshQueueAck::None;
+                    }
+                }
+                self.push_plain(format!(
+                    "Session persistence failed before accepting message {client_submission_id}; the exact payload remains retained for retry: {error}"
+                ));
             }
             TurnEvent::SessionDriverFailed { error } => {
                 self.end_working_span();
@@ -531,10 +766,14 @@ impl App {
                 for entry in self.history.iter_mut().rev() {
                     if let HistoryEntry::User {
                         seq: None,
+                        optimistic_submission_id,
                         preflight_pending,
                         persist_failed,
                         ..
                     } = entry
+                        && !*persist_failed
+                        && optimistic_submission_id
+                            .is_none_or(|id| !self.retained_user_submission_ids.contains(&id))
                     {
                         *preflight_pending = false;
                         *persist_failed = true;
@@ -548,22 +787,35 @@ impl App {
                     expanded: false,
                 });
             }
-            TurnEvent::UserMessageDispatchFailed { error } => {
-                self.end_working_span();
-                self.reconnect = None;
-                self.fresh_queue_ack = FreshQueueAck::None;
-                for entry in self.history.iter_mut().rev() {
+            TurnEvent::UserMessageDispatchFailed {
+                error,
+                optimistic_submission_id,
+            } => {
+                self.retained_user_submission_ids
+                    .remove(&optimistic_submission_id);
+                let mut owns_working_span = false;
+                for entry in self.history.iter_mut() {
                     if let HistoryEntry::User {
+                        optimistic_submission_id: Some(id),
                         seq: None,
                         preflight_pending,
                         persist_failed,
                         ..
                     } = entry
+                        && *id == optimistic_submission_id
                     {
                         *preflight_pending = false;
                         *persist_failed = true;
+                        owns_working_span = true;
                         break;
                     }
+                }
+                self.queue
+                    .retain(|item| item.id != optimistic_submission_id);
+                if owns_working_span {
+                    self.end_working_span();
+                    self.reconnect = None;
+                    self.fresh_queue_ack = FreshQueueAck::None;
                 }
                 let summary = format!("message was not sent: {error}");
                 self.history.push(HistoryEntry::InferenceError {
@@ -573,23 +825,136 @@ impl App {
                 });
                 self.show_toast(format!("Message was not sent: {error}"), ToastKind::Error);
             }
+            TurnEvent::UserMessageDispatchRetained {
+                error,
+                optimistic_submission_id,
+            } => {
+                self.retained_user_submission_ids
+                    .insert(optimistic_submission_id);
+                let mut owns_working_span = false;
+                for entry in self.history.iter_mut() {
+                    if let HistoryEntry::User {
+                        optimistic_submission_id: Some(id),
+                        seq: None,
+                        preflight_pending,
+                        persist_failed,
+                        ..
+                    } = entry
+                        && *id == optimistic_submission_id
+                    {
+                        *preflight_pending = false;
+                        *persist_failed = false;
+                        owns_working_span = true;
+                        break;
+                    }
+                }
+                if owns_working_span {
+                    self.end_working_span();
+                    self.reconnect = None;
+                    if matches!(
+                        self.fresh_queue_ack,
+                        FreshQueueAck::AwaitingAck(id)
+                            | FreshQueueAck::SuppressId(id)
+                            | FreshQueueAck::FoldedBeforeAck(id)
+                            if id == optimistic_submission_id
+                    ) {
+                        self.fresh_queue_ack = FreshQueueAck::None;
+                    }
+                }
+                self.push_plain(format!(
+                    "Message was not accepted and its exact payload was retained for retry: {error}"
+                ));
+                self.show_toast("Message retained for retry", ToastKind::Warning);
+            }
+            TurnEvent::UserMessageDispatchRestored {
+                optimistic_submission_id,
+                text,
+                display_text,
+                tag_expansions,
+            } => {
+                let exists = self.history.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::User {
+                            optimistic_submission_id: Some(id),
+                            ..
+                        } if *id == optimistic_submission_id
+                    )
+                });
+                if !exists {
+                    self.history.push(HistoryEntry::User {
+                        text: display_text
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(text),
+                        cleaned: None,
+                        expanded: false,
+                        timestamp: chrono::Local::now(),
+                        seq: None,
+                        optimistic_submission_id: Some(optimistic_submission_id),
+                        preflight_pending: false,
+                        persist_failed: false,
+                    });
+                    self.push_tag_call_entries(&tag_expansions);
+                }
+                self.retained_user_submission_ids
+                    .insert(optimistic_submission_id);
+            }
             // Preflight is actually running for the just-submitted message
             // (implementation note): mark the most
             // recent optimistically-shown user row so its border slot hosts the
             // animated `Preflight…` indicator until the message resolves. The
             // row was already pushed on submit (skipped/disabled passes never
             // emit this event, so they show instantly with no indicator).
-            TurnEvent::PreflightStarted => {
-                for entry in self.history.iter_mut().rev() {
+            TurnEvent::PreflightStarted {
+                client_submission_ids,
+            } => {
+                for entry in self.history.iter_mut() {
                     if let HistoryEntry::User {
                         seq: None,
+                        optimistic_submission_id: Some(id),
                         preflight_pending,
+                        persist_failed,
                         ..
                     } = entry
+                        && !*persist_failed
+                        && client_submission_ids.contains(id)
                     {
                         *preflight_pending = true;
-                        break;
                     }
+                }
+            }
+            TurnEvent::UserMessagesTerminated {
+                client_submission_ids,
+                disposition,
+            } => {
+                let terminal_ids = client_submission_ids
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                self.retained_user_submission_ids
+                    .retain(|id| !terminal_ids.contains(id));
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.queue.retain(|item| !terminal_ids.contains(&item.id));
+                let removed =
+                    remove_correlated_optimistic_user_history(&mut self.history, &terminal_ids)
+                        .is_some();
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+                if removed
+                    && matches!(
+                        disposition,
+                        cockpit_core::daemon::proto::UserMessageTerminalDisposition::PreflightRejected
+                    )
+                {
+                    self.end_working_span();
+                    self.reconnect = None;
                 }
             }
             // The just-submitted message was blocked by the prompt-injection
@@ -598,15 +963,16 @@ impl App {
             // indicator on it) so the block/override UX stands alone. Newest
             // unstamped user row — the same one `PreflightStarted` /
             // `UserMessageRecorded` reconcile.
-            TurnEvent::UserMessageRetracted => {
-                self.fresh_queue_ack = FreshQueueAck::None;
-                self.end_working_span();
-                if let Some(idx) = self
-                    .history
+            TurnEvent::UserMessageRetracted {
+                client_submission_ids,
+            } => {
+                let ids = client_submission_ids
                     .iter()
-                    .rposition(|e| matches!(e, HistoryEntry::User { seq: None, .. }))
-                {
-                    self.history.remove(idx);
+                    .copied()
+                    .collect::<HashSet<_>>();
+                if remove_correlated_optimistic_user_history(&mut self.history, &ids).is_some() {
+                    self.end_working_span();
+                    self.reconnect = None;
                 }
             }
             TurnEvent::ToolStart {
@@ -1095,22 +1461,11 @@ impl App {
             } => {
                 // A `question` tool blocked the agent (GOALS §3b). Open
                 // the answering dialog over the composer. The
-                // anti-misfire lockout arms with the configured delay on the
-                // genuine composer→dialog edge and attach rehydration. Queue
-                // advancement is immediately interactive because the composer
-                // never regains focus between dialogs. A same-id re-raise only
-                // updates queue metadata for the visible dialog.
-                let lockout = match reason {
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Initial => {
-                        self.dialog_lockout()
-                    }
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
-                        crate::tui::dialog::DialogState::NO_LOCKOUT
-                    }
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
-                        self.rehydrated_dialog_lockout()
-                    }
-                };
+                // anti-misfire lockout arms only after a recent main-composer
+                // edit. Attach rehydration follows that same rule. Queue
+                // advancement is immediately interactive because the user did
+                // not type again between dialogs. A same-id re-raise only updates
+                // queue metadata for the visible dialog.
                 // Attention: a permission/approval prompt vs an agent question
                 // (implementation note). Classify off the
                 // `permission` flag on any constituent `Single` — an approval
@@ -1149,6 +1504,21 @@ impl App {
                     }
                     return;
                 }
+                // Consume recent-composer protection only for an interrupt that
+                // is actually about to replace the foreground composer. A
+                // background notification or duplicate same-id re-raise must
+                // not disarm the next visible approval.
+                let lockout = match reason {
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Initial => {
+                        self.dialog_lockout()
+                    }
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+                        crate::tui::dialog::DialogState::NO_LOCKOUT
+                    }
+                    cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
+                        self.rehydrated_dialog_lockout()
+                    }
+                };
                 self.question_dialog = Some(
                     crate::tui::dialog::question::QuestionDialog::new(
                         interrupt_id,
@@ -1249,11 +1619,16 @@ impl App {
                 // message in injection/relevance order. UI-only — the body
                 // rides the user message on the wire (wire-vs-user split).
                 let row = HistoryEntry::SkillAutoInjected { name, reason };
-                match self
-                    .history
-                    .iter()
-                    .rposition(|e| matches!(e, HistoryEntry::User { seq: None, .. }))
-                {
+                match self.history.iter().rposition(|e| {
+                    matches!(
+                        e,
+                        HistoryEntry::User {
+                            seq: None,
+                            persist_failed: false,
+                            ..
+                        }
+                    )
+                }) {
                     Some(idx) => self.history.insert(idx, row),
                     None => self.history.push(row),
                 }
@@ -1590,7 +1965,6 @@ impl App {
         let provider = selection.provider.clone();
         let model = selection.model.clone();
         self.active_model_selection = Some(selection);
-        self.default_model_selection = default_selection.clone();
         self.launch.provider_line = format!("{provider} / {model}");
         self.launch.active_model = Some((provider, model));
         self.launch.active_model_diverged = diverged;
@@ -1659,11 +2033,34 @@ impl App {
             ..
         } = snapshot;
         self.config_snapshot = super::HeldConfig::from_view(generation, true, extended, providers);
-        self.has_no_providers_at_startup = self.config_snapshot.providers.providers.is_empty();
         self.apply_tui_config_from_snapshot();
         self.refresh_active_model_projection();
-        if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+        // Config pushes are global to the attached session. A snapshot caused
+        // by an unrelated writer while the add-model settings dialog remains
+        // open must update the held config, but must not consume the causal
+        // reopen marker or rebuild the hidden picker underneath the dialog.
+        if !self.dialog.is_active()
+            && let Some(provider) = self.reopen_model_picker_after_settings.take()
+        {
             self.open_model_picker_for_provider(&provider);
+            if let (Some(draft), Overlay::ModelPicker(picker)) = (
+                self.reopen_model_picker_draft_after_settings.take(),
+                &mut self.overlay,
+            ) {
+                picker.restore_requested_selection(&draft);
+            }
+        }
+        if let Some(provider) = self.refresh_reopened_model_picker_after_settings.take()
+            && matches!(self.overlay, Overlay::ModelPicker(_))
+        {
+            let draft = match &self.overlay {
+                Overlay::ModelPicker(picker) => picker.draft_active_model().cloned(),
+                _ => None,
+            };
+            self.open_model_picker_for_provider(&provider);
+            if let (Some(draft), Overlay::ModelPicker(picker)) = (draft, &mut self.overlay) {
+                picker.restore_requested_selection(&draft);
+            }
         }
     }
 
@@ -2025,6 +2422,7 @@ pub(super) fn wire_history_to_entries(
                 ts_ms,
                 seq,
                 origin_principal,
+                ..
             } => {
                 if let Some(origin) = origin_principal.filter(|origin| !origin.trim().is_empty()) {
                     let line = format!(
@@ -2044,6 +2442,7 @@ pub(super) fn wire_history_to_entries(
                         expanded: false,
                         timestamp: local_from_ts_ms(ts_ms),
                         seq: (seq != 0).then_some(seq),
+                        optimistic_submission_id: None,
                         preflight_pending: false,
                         persist_failed: false,
                     });

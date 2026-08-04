@@ -1,6 +1,7 @@
-use super::wire_history_to_entries;
+use super::{App, wire_history_to_entries};
 use crate::tui::history::{HistoryEntry, ToolCallState};
 use cockpit_core::daemon::proto::HistoryEntry as Wire;
+use cockpit_core::engine::TurnEvent;
 use serde_json::json;
 
 #[test]
@@ -11,6 +12,7 @@ fn replayed_user_row_uses_display_text() {
         tag_expansions: Vec::new(),
         ts_ms: 1_700_000_000_000,
         seq: 1,
+        client_submission_ids: Vec::new(),
         origin_principal: None,
     }]);
     assert!(matches!(
@@ -24,6 +26,7 @@ fn replayed_user_row_uses_display_text() {
         tag_expansions: Vec::new(),
         ts_ms: 1_700_000_000_000,
         seq: 2,
+        client_submission_ids: Vec::new(),
         origin_principal: None,
     }]);
     assert!(matches!(
@@ -37,6 +40,7 @@ fn replayed_user_row_uses_display_text() {
         tag_expansions: Vec::new(),
         ts_ms: 1_700_000_000_000,
         seq: 3,
+        client_submission_ids: Vec::new(),
         origin_principal: None,
     }]);
     assert!(matches!(
@@ -58,6 +62,7 @@ fn replayed_user_row_renders_tag_entries() {
         }],
         ts_ms: 1_700_000_000_000,
         seq: 1,
+        client_submission_ids: Vec::new(),
         origin_principal: None,
     }]);
     assert_eq!(entries.len(), 2);
@@ -65,6 +70,76 @@ fn replayed_user_row_renders_tag_entries() {
         &entries[1],
         HistoryEntry::Plain { line } if line == "  → read(src/lib.rs) ✓ 142 lines"
     ));
+}
+
+#[test]
+fn same_session_replay_replaces_multi_id_optimistic_rows_in_place() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(temp.path()), false);
+    let first_id = uuid::Uuid::new_v4();
+    let second_id = uuid::Uuid::new_v4();
+    for (id, text) in [(first_id, "first"), (second_id, "second")] {
+        app.history.push(HistoryEntry::User {
+            text: text.to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            optimistic_submission_id: Some(id),
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        app.history.push(HistoryEntry::Plain {
+            line: format!("  → read({text}.rs) ✓ 1 line"),
+        });
+    }
+
+    app.apply_event(TurnEvent::HistoryReplay {
+        entries: vec![Wire::User {
+            text: "first\n\nsecond".into(),
+            display_text: Some("first + second".into()),
+            tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "combined.rs".into(),
+                detail: "2 lines".into(),
+                ok: true,
+            }],
+            ts_ms: 1_700_000_000_000,
+            seq: 17,
+            client_submission_ids: vec![first_id, second_id],
+            origin_principal: None,
+        }],
+    });
+
+    let user_rows = app
+        .history
+        .iter()
+        .filter(|entry| matches!(entry, HistoryEntry::User { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "replay must replace, not duplicate, A+B"
+    );
+    assert!(matches!(
+        user_rows[0],
+        HistoryEntry::User {
+            text,
+            seq: Some(17),
+            optimistic_submission_id: None,
+            ..
+        } if text == "first + second"
+    ));
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(
+                |entry| matches!(entry, HistoryEntry::Plain { line } if line.starts_with("  → "))
+            )
+            .count(),
+        1,
+        "optimistic tag rows are replaced by canonical replay metadata"
+    );
 }
 
 /// REGRESSION (implementation note): the wire→TUI
@@ -81,6 +156,7 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
             tag_expansions: Vec::new(),
             ts_ms: 1_700_000_000_000,
             seq: 1,
+            client_submission_ids: Vec::new(),
             origin_principal: None,
         },
         Wire::Assistant {
@@ -222,6 +298,7 @@ fn inference_error_snapshot_converts_in_order_collapsed() {
             tag_expansions: Vec::new(),
             ts_ms: 1_700_000_000_000,
             seq: 1,
+            client_submission_ids: Vec::new(),
             origin_principal: None,
         },
         Wire::InferenceError {
@@ -235,6 +312,7 @@ fn inference_error_snapshot_converts_in_order_collapsed() {
             tag_expansions: Vec::new(),
             ts_ms: 1_700_000_001_000,
             seq: 2,
+            client_submission_ids: Vec::new(),
             origin_principal: None,
         },
     ]);
@@ -263,6 +341,7 @@ fn steer_user_snapshot_converts_to_provenance_row() {
         tag_expansions: Vec::new(),
         ts_ms: 1_700_000_000_000,
         seq: 7,
+        client_submission_ids: Vec::new(),
         origin_principal: Some("local:tester".into()),
     }]);
 
@@ -285,6 +364,7 @@ fn active_subagent_snapshot_converts_to_running_row() {
             tag_expansions: Vec::new(),
             ts_ms: 1_700_000_000_000,
             seq: 1,
+            client_submission_ids: Vec::new(),
             origin_principal: None,
         },
         Wire::Subagent {

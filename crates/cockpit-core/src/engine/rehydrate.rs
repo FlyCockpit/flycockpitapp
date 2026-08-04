@@ -420,10 +420,17 @@ fn history_snapshot_from_events_conn(
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default();
+                let client_submission_ids = ev
+                    .data
+                    .get("client_submission_ids")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
                 snapshot.push(proto::HistoryEntry::User {
                     text,
                     display_text,
                     tag_expansions,
+                    client_submission_ids,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                     origin_principal: ev.origin_principal.clone(),
@@ -771,10 +778,17 @@ fn subagent_history_entries_from_events(
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default();
+                let client_submission_ids = ev
+                    .data
+                    .get("client_submission_ids")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
                 snapshot.push(proto::HistoryEntry::User {
                     text,
                     display_text,
                     tag_expansions,
+                    client_submission_ids,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                     origin_principal: ev.origin_principal.clone(),

@@ -17,6 +17,134 @@ fn trusted_load_for_cwd(root: &std::path::Path) -> ExtendedConfig {
 }
 
 #[test]
+fn extended_replacement_is_invisible_until_commit_and_drop_preserves_destination() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, b"{\"name\":\"before\"}\n").unwrap();
+    let replacement = b"{\n  \"name\": \"after\"\n}\n";
+
+    let prepared = crate::config::files::prepare_atomic_write(&path, replacement).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"{\"name\":\"before\"}\n");
+    drop(prepared);
+    assert_eq!(std::fs::read(&path).unwrap(), b"{\"name\":\"before\"}\n");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+    let prepared = crate::config::files::prepare_atomic_write(&path, replacement).unwrap();
+    prepared.commit().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn extended_write_reloads_sibling_fields_inside_mutation_lock() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, r#"{"future":{"version":1}}"#).unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.name = Some("updated".to_string());
+
+    std::fs::write(
+        &path,
+        r#"{"future":{"version":2},"tui":{"thinking":"verbose"}}"#,
+    )
+    .unwrap();
+    doc.write(&cfg).unwrap();
+
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(raw["future"]["version"], 2);
+    assert_eq!(raw["tui"]["thinking"], "verbose");
+    assert_eq!(raw["name"], "updated");
+}
+
+#[test]
+fn raw_path_removal_reloads_and_preserves_concurrent_sibling_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"future":{"version":1},"tui":{"vim_mode":"enabled","thinking":"verbose"}}"#,
+    )
+    .unwrap();
+    let mut stale = ExtendedConfigDoc::load(&path).unwrap();
+
+    std::fs::write(
+        &path,
+        r#"{"future":{"version":2},"tui":{"vim_mode":"enabled","thinking":"verbose"}}"#,
+    )
+    .unwrap();
+    assert!(
+        stale
+            .remove_raw_path_and_save(&["tui", "vim_mode"])
+            .unwrap()
+    );
+
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(raw["future"]["version"], 2);
+    assert!(raw["tui"].get("vim_mode").is_none());
+    assert_eq!(raw["tui"]["thinking"], "verbose");
+}
+
+#[cfg(unix)]
+#[test]
+fn extended_write_repairs_product_owned_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_dir = tmp.path().join("home/.cockpit");
+    std::fs::create_dir(&config_dir).unwrap();
+    let path = config_dir.join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.name = Some("private".to_string());
+    doc.write(&cfg).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(config_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn extended_write_preserves_explicit_shared_parent_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = shared.join("cockpit.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    env.set_cockpit_config(&path);
+
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.name = Some("private file".to_string());
+    doc.write(&cfg).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(shared).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn skills_write_approval_defaults_on() {
     assert!(SkillsConfig::default().write_approval);
     assert!(

@@ -67,6 +67,7 @@ pub struct CapturedRequest {
 struct ScriptedTurn {
     turn: Turn,
     usage: Option<Usage>,
+    delay: Duration,
 }
 
 #[derive(Debug)]
@@ -132,6 +133,7 @@ impl ScriptedProviderBuilder {
         self.turns.push(ScriptedTurn {
             turn: t,
             usage: None,
+            delay: Duration::ZERO,
         });
         self
     }
@@ -142,6 +144,17 @@ impl ScriptedProviderBuilder {
             panic!("with_usage requires a preceding turn");
         };
         turn.usage = Some(u);
+        self
+    }
+
+    /// Delay the most recently appended response after its request has been
+    /// captured. This gives concurrency tests a deterministic window to stage
+    /// input at a real in-flight inference boundary.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        let Some(turn) = self.turns.last_mut() else {
+            panic!("with_delay requires a preceding turn");
+        };
+        turn.delay = delay;
         self
     }
 
@@ -324,6 +337,13 @@ async fn handle_connection(
         .await;
         return;
     };
+
+    if !turn.delay.is_zero() {
+        tokio::select! {
+            _ = tokio::time::sleep(turn.delay) => {}
+            _ = shutdown_rx.recv() => return,
+        }
+    }
 
     match &turn.turn {
         Turn::HttpError { status, body } => {

@@ -168,7 +168,9 @@ pub enum DriverControl {
     /// shared session config snapshot and re-resolve current frame params.
     /// Used after `RefreshConfig` so `/model-settings` edits affect the
     /// running session without a second model switch.
-    RefreshPromptCacheRetention,
+    /// Repin the worker's changed config snapshot and publish every
+    /// active-model-derived correction without advancing selection generation.
+    RefreshConfigDerivedState,
     /// Set a session-only root delegation recursion override (`/quick`).
     /// Root delegation still obeys existing allowed-target and per-agent
     /// max-depth policy; this only overrides the default enabled/depth values.
@@ -188,13 +190,17 @@ pub enum DriverControl {
     /// key). On an unconfigured/bad target it **fails loudly** via
     /// [`TurnEvent::Notice`] and keeps the current model active (never a silent
     /// no-op). The daemon-owned transaction always writes the session row and
-    /// writes config only when `persist_as_default` explicitly requests a
-    /// future-session default; failures restore the prior live model.
+    /// writes config only when `persist_as_default` explicitly replaces the
+    /// future-session default or `initialize_default_if_missing` wins the
+    /// daemon-side first-default race. Model-build/session-persistence
+    /// failures keep the prior live model; a default-write failure leaves the
+    /// successful session selection in place and is reported independently.
     SetActiveModel {
         selection_id: uuid::Uuid,
         provider: String,
         model: String,
         persist_as_default: bool,
+        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,
@@ -211,6 +217,7 @@ pub enum DriverControl {
         provider: String,
         model: String,
         persist_as_default: bool,
+        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,
@@ -534,6 +541,16 @@ enum StackUnwindReason {
         class: crate::engine::model::InferenceErrorClass,
         phase: String,
     },
+}
+
+const USER_MESSAGE_EVENT_WRITE_ATTEMPTS: usize = 3;
+const DURABLE_SUBMISSION_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserMessageRecordOutcome {
+    Recorded(i64),
+    Untracked,
+    RetryRequired,
 }
 
 impl StackUnwindReason {
@@ -868,6 +885,12 @@ pub struct Driver {
     test_fail_next_active_model_config_write: bool,
     #[cfg(test)]
     test_fail_next_model_switch_audit_record: bool,
+    #[cfg(test)]
+    test_fail_next_user_message_event_write: bool,
+    #[cfg(test)]
+    test_fail_all_user_message_event_writes: bool,
+    #[cfg(test)]
+    test_reject_next_submission_preflight: bool,
     /// Hermetic compact-utility inference seam. Tests capture invocation mode,
     /// prompt, and revision history without opening a socket.
     #[cfg(test)]
@@ -1358,6 +1381,12 @@ impl Driver {
             #[cfg(test)]
             test_fail_next_model_switch_audit_record: self.test_fail_next_model_switch_audit_record,
             #[cfg(test)]
+            test_fail_next_user_message_event_write: self.test_fail_next_user_message_event_write,
+            #[cfg(test)]
+            test_fail_all_user_message_event_writes: self.test_fail_all_user_message_event_writes,
+            #[cfg(test)]
+            test_reject_next_submission_preflight: self.test_reject_next_submission_preflight,
+            #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
             #[cfg(test)]
             test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
@@ -1655,6 +1684,12 @@ impl Driver {
             #[cfg(test)]
             test_fail_next_model_switch_audit_record: false,
             #[cfg(test)]
+            test_fail_next_user_message_event_write: false,
+            #[cfg(test)]
+            test_fail_all_user_message_event_writes: false,
+            #[cfg(test)]
+            test_reject_next_submission_preflight: false,
+            #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
             #[cfg(test)]
             test_compaction_apply_trace: None,
@@ -1761,7 +1796,10 @@ impl Driver {
         match self.build_live_model_for_running(&running, &provider, &model) {
             Ok(new_model) => {
                 let llm_mode = self.effective_llm_mode_for(&provider, &model);
-                let refreshed = self.replace_frame_model(active_idx, Arc::new(new_model), llm_mode);
+                let new_model = Arc::new(new_model);
+                let selection = self.active_selection_for_model(&new_model);
+                let refreshed =
+                    self.replace_frame_model(active_idx, new_model, llm_mode, &selection);
                 self.stack[active_idx].agent = Arc::new(refreshed);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -1800,7 +1838,8 @@ impl Driver {
     ) {
         let model = self.stack[active_idx].agent.model.clone();
         let llm_mode = self.stack[active_idx].agent.llm_mode;
-        match self.try_rebuild_frame_with_model(active_idx, model.clone(), llm_mode) {
+        let selection = self.active_selection_for_model(&model);
+        match self.try_rebuild_frame_with_model(active_idx, model.clone(), llm_mode, &selection) {
             Ok(rebuilt) => {
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
@@ -1809,7 +1848,8 @@ impl Driver {
             }
             Err(e) if active_idx == 0 => {
                 tracing::warn!(error = %e, "refreshing root tool surface from config fell back to default Build");
-                let rebuilt = self.rebuild_frame_with_model(active_idx, model, llm_mode);
+                let rebuilt =
+                    self.rebuild_frame_with_model(active_idx, model, llm_mode, &selection);
                 self.stack[active_idx].agent = Arc::new(rebuilt);
                 self.schedule
                     .set_agent(self.stack[active_idx].agent.clone());
@@ -1957,7 +1997,7 @@ impl Driver {
     ) {
         self.schedule.set_config_handle(config.clone());
         self.config = config;
-        self.refresh_prompt_cache_retention_from_config();
+        self.refresh_prompt_cache_retention_from_session();
     }
 
     /// Refresh the driver's config handle from the layered config on disk for
@@ -3188,9 +3228,9 @@ impl Driver {
         crate::engine::is_at_safe_compaction_boundary(false, false, false)
     }
 
-    /// Run an out-of-band control request against the **foreground**
-    /// agent (top of stack) — never a hardcoded root. Scope == current
-    /// conversational agent (GOALS §3b).
+    /// Run an out-of-band control request at an idle driver boundary. Each
+    /// control owns its scope: conversational controls target the foreground
+    /// frame, while session model selection updates the durable root frame.
     #[cfg(test)]
     async fn run_control(&mut self, control: DriverControl, tx: &mpsc::Sender<TurnEvent>) {
         let (queue_update_tx, _queue_update_rx) = tokio::sync::watch::channel::<
@@ -3358,11 +3398,13 @@ impl Driver {
                     self.emit_longcache_state(tx).await;
                 }
             }
-            DriverControl::RefreshPromptCacheRetention => {
-                self.refresh_prompt_cache_retention_from_config();
+            DriverControl::RefreshConfigDerivedState => {
+                self.repin_config_for_turn();
+                self.refresh_prompt_cache_retention_from_session();
                 if self.prompt_cache_retention_override.is_some() {
                     self.emit_longcache_state(tx).await;
                 }
+                self.emit_active_model_state_correction(tx).await;
             }
             DriverControl::SetDelegationRecursion {
                 enabled,
@@ -3387,6 +3429,7 @@ impl Driver {
                 provider,
                 model,
                 persist_as_default,
+                initialize_default_if_missing,
                 trigger,
                 reasoning_effort,
                 thinking_mode,
@@ -3404,7 +3447,10 @@ impl Driver {
                     .set_active_model_live(
                         selection_id,
                         target,
-                        persist_as_default,
+                        swap::DefaultModelWriteIntent::from_flags(
+                            persist_as_default,
+                            initialize_default_if_missing,
+                        ),
                         None,
                         trigger,
                         tx,
@@ -3419,6 +3465,7 @@ impl Driver {
                 provider,
                 model,
                 persist_as_default,
+                initialize_default_if_missing,
                 trigger,
                 reasoning_effort,
                 thinking_mode,
@@ -3436,7 +3483,10 @@ impl Driver {
                     .set_active_model_live(
                         selection_id,
                         target,
-                        persist_as_default,
+                        swap::DefaultModelWriteIntent::from_flags(
+                            persist_as_default,
+                            initialize_default_if_missing,
+                        ),
                         Some(swap::ModelSelectionTerminal {
                             deadline,
                             claimed: &terminal_claimed,
@@ -4406,43 +4456,155 @@ impl Driver {
         self.goal_idle_intervention_code = Some("agent_failed_to_progress_after_continue");
     }
 
-    async fn record_queued_user_fold(
+    async fn record_user_message_event(
+        &mut self,
+        agent: Option<&str>,
+        origin_principal: Option<&str>,
+        data: &serde_json::Value,
+        receipts: &[crate::engine::message::ClientSubmissionReceipt],
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> UserMessageRecordOutcome {
+        for attempt in 0..USER_MESSAGE_EVENT_WRITE_ATTEMPTS {
+            #[cfg(test)]
+            let result = if self.test_fail_all_user_message_event_writes {
+                Err(anyhow::anyhow!(
+                    "test injected persistent user-message event write failure"
+                ))
+            } else if self.test_fail_next_user_message_event_write {
+                self.test_fail_next_user_message_event_write = false;
+                Err(anyhow::anyhow!(
+                    "test injected user-message event write failure"
+                ))
+            } else {
+                self.session
+                    .record_event_with_origin(
+                        crate::db::session_log::SessionEventKind::UserMessage,
+                        agent,
+                        None,
+                        origin_principal,
+                        data,
+                    )
+                    .await
+            };
+            #[cfg(not(test))]
+            let result = self
+                .session
+                .record_event_with_origin(
+                    crate::db::session_log::SessionEventKind::UserMessage,
+                    agent,
+                    None,
+                    origin_principal,
+                    data,
+                )
+                .await;
+
+            match result {
+                Ok(seq) => return UserMessageRecordOutcome::Recorded(seq),
+                Err(error) if receipts.is_empty() => {
+                    tracing::warn!(%error, "record user_message event failed");
+                    return UserMessageRecordOutcome::Untracked;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        receipt_count = receipts.len(),
+                        attempt = attempt + 1,
+                        max_attempts = USER_MESSAGE_EVENT_WRITE_ATTEMPTS,
+                        "durable client-submission receipt write failed before inference"
+                    );
+                    if attempt == 0 {
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: "Saving the accepted message failed; inference has not started and the exact payload will be retried."
+                                    .to_string(),
+                            })
+                            .await;
+                    }
+                    if attempt + 1 < USER_MESSAGE_EVENT_WRITE_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+        UserMessageRecordOutcome::RetryRequired
+    }
+
+    async fn record_terminal_client_submissions(
         &self,
+        receipts: &[crate::engine::message::ClientSubmissionReceipt],
+        disposition: crate::db::session_log::ClientSubmissionTerminalDisposition,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        if receipts.is_empty() {
+            return true;
+        }
+        match self
+            .session
+            .record_terminal_client_submissions(receipts, disposition)
+            .await
+        {
+            Ok(()) => {
+                let _ = tx
+                    .send(TurnEvent::UserMessagesTerminated {
+                        client_submission_ids: receipts.iter().map(|receipt| receipt.id).collect(),
+                        disposition: disposition.into(),
+                    })
+                    .await;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    receipt_count = receipts.len(),
+                    disposition = disposition.as_str(),
+                    "terminal client-submission receipt write failed"
+                );
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: "Saving the terminal message disposition failed; retained accepted payloads remain held for a later retry."
+                            .to_string(),
+                    })
+                    .await;
+                false
+            }
+        }
+    }
+
+    async fn record_queued_user_fold(
+        &mut self,
         folded: &UserSubmission,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> Option<i64> {
+    ) -> std::result::Result<Option<i64>, ()> {
         if folded.queue_item_ids.is_empty() {
-            return None;
+            return Ok(None);
         }
         let target = folded
             .queue_target
             .clone()
             .unwrap_or_else(|| self.active_queue_target());
-        let data = user_message_event_data(
-            &folded.text,
-            folded.display_text.as_deref(),
-            &folded.tag_expansions,
-            folded.job_id.as_deref(),
-            &folded.queue_item_ids,
-            Some(&target),
-            folded.preflight_cleaned.as_deref(),
-        );
+        let data = user_message_event_data(UserMessageEventData {
+            text: &folded.text,
+            display_text: folded.display_text.as_deref(),
+            tag_expansions: &folded.tag_expansions,
+            job_id: folded.job_id.as_deref(),
+            queue_item_ids: &folded.queue_item_ids,
+            client_submissions: &folded.client_submissions,
+            queue_target: Some(&target),
+            preflight_cleaned: folded.preflight_cleaned.as_deref(),
+        });
         let seq = match self
-            .session
-            .record_event_with_origin(
-                crate::db::session_log::SessionEventKind::UserMessage,
+            .record_user_message_event(
                 Some(target.agent.as_str()),
-                None,
                 folded.origin_principal.as_deref(),
                 &data,
+                &folded.client_submissions,
+                tx,
             )
             .await
         {
-            Ok(seq) => Some(seq),
-            Err(e) => {
-                tracing::warn!(error = %e, "record queued user fold event failed");
-                None
-            }
+            UserMessageRecordOutcome::Recorded(seq) => Some(seq),
+            UserMessageRecordOutcome::Untracked => None,
+            UserMessageRecordOutcome::RetryRequired => return Err(()),
         };
         let _ = tx
             .send(TurnEvent::QueuedUserMessagesFolded {
@@ -4455,33 +4617,59 @@ impl Driver {
                 preflight_cleaned: folded.preflight_cleaned.clone(),
             })
             .await;
-        seq
+        Ok(seq)
     }
 
     async fn prepare_queued_user_submission(
         &mut self,
-        submission: UserSubmission,
+        mut submission: UserSubmission,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<UserSubmission> {
+        if matches!(
+            submission.pending_terminal_disposition,
+            Some(crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected)
+        ) {
+            self.settle_preflight_rejection(submission, input_rx, tx)
+                .await;
+            return None;
+        }
         // Defensive for callers outside the main dequeue branch: no
         // foreground preparation may overlap unfinished shadow utility work.
         self.preempt_shadow_brief_for_foreground().await;
         self.preempt_self_improvement_review_for_foreground();
         if self.preflight_will_run(&submission.text) {
-            let _ = tx.send(TurnEvent::PreflightStarted).await;
+            let _ = tx
+                .send(TurnEvent::PreflightStarted {
+                    client_submission_ids: submission
+                        .client_submissions
+                        .iter()
+                        .map(|receipt| receipt.id)
+                        .collect(),
+                })
+                .await;
         }
         let (injection, preflight) = tokio::join!(
             self.injection_check_only(&submission.text),
             self.run_preflight(&submission.text),
         );
-        if let Some((threshold, outcome)) = injection
-            && !self.apply_injection_outcome(threshold, outcome, tx).await
-        {
-            let _ = tx.send(TurnEvent::UserMessageRetracted).await;
-            self.emit_context_projection(tx).await;
-            let turn_id = self.current_lifecycle_turn_id.take();
-            let reason = self.take_idle_reason().await;
-            let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
+        #[cfg(test)]
+        let rejected_for_test = std::mem::take(&mut self.test_reject_next_submission_preflight);
+        #[cfg(not(test))]
+        let rejected_for_test = false;
+        let injection_rejected = if rejected_for_test {
+            true
+        } else if let Some((threshold, outcome)) = injection {
+            !self.apply_injection_outcome(threshold, outcome, tx).await
+        } else {
+            false
+        };
+        if injection_rejected {
+            submission.pending_terminal_disposition = Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected,
+            );
+            self.settle_preflight_rejection(submission, input_rx, tx)
+                .await;
             return None;
         }
         let (raw_text, cleaned_for_display, forced_skill) = self
@@ -4499,8 +4687,52 @@ impl Driver {
             job_id: submission.job_id,
             preflight_cleaned: cleaned_for_display,
             queue_item_ids: submission.queue_item_ids,
+            client_submissions: submission.client_submissions,
             queue_target: submission.queue_target,
+            pending_terminal_disposition: None,
         })
+    }
+
+    async fn settle_preflight_rejection(
+        &mut self,
+        mut submission: UserSubmission,
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let client_submission_ids = submission
+            .client_submissions
+            .iter()
+            .map(|receipt| receipt.id)
+            .collect();
+        if !self
+            .record_terminal_client_submissions(
+                &submission.client_submissions,
+                crate::db::session_log::ClientSubmissionTerminalDisposition::PreflightRejected,
+                tx,
+            )
+            .await
+        {
+            submission.pending_terminal_disposition = Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected,
+            );
+            input_rx
+                .requeue_front_after(
+                    submission,
+                    self.active_queue_target(),
+                    DURABLE_SUBMISSION_RETRY_BACKOFF,
+                )
+                .await;
+            return;
+        }
+        let _ = tx
+            .send(TurnEvent::UserMessageRetracted {
+                client_submission_ids,
+            })
+            .await;
+        self.emit_context_projection(tx).await;
+        let turn_id = self.current_lifecycle_turn_id.take();
+        let reason = self.take_idle_reason().await;
+        let _ = tx.send(TurnEvent::AgentIdle { turn_id, reason }).await;
     }
 
     async fn requeue_command_submission_for_boundary(
@@ -4538,17 +4770,32 @@ impl Driver {
             return Ok(());
         }
 
-        let last_index = submissions.len() - 1;
-        let mut leading_history = Vec::with_capacity(last_index);
+        let mut pending = std::collections::VecDeque::from(submissions);
+        let last = pending
+            .pop_back()
+            .expect("non-empty batch has a final turn");
+        let mut leading_history = Vec::with_capacity(pending.len());
         let mut leading_queue_item_ids = Vec::new();
-        let mut last = None;
-        for (idx, submission) in submissions.into_iter().enumerate() {
-            if idx == last_index {
-                last = Some(submission);
-                break;
+        while let Some(submission) = pending.pop_front() {
+            if self.record_queued_user_fold(&submission, tx).await.is_err() {
+                if let Some(top) = self.stack.last_mut() {
+                    top.history.extend(leading_history);
+                }
+                pending.push_front(submission);
+                pending.push_back(last);
+                while let Some(submission) = pending.pop_back() {
+                    input_rx
+                        .requeue_front_after(
+                            submission,
+                            self.active_queue_target(),
+                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                        )
+                        .await;
+                }
+                input_rx.finish(&leading_queue_item_ids).await;
+                return Ok(());
             }
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
-            self.record_queued_user_fold(&submission, tx).await;
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
                 text: submission.text,
@@ -4560,10 +4807,11 @@ impl Driver {
                 job_id: None,
                 preflight_cleaned: None,
                 queue_item_ids: Vec::new(),
+                client_submissions: Vec::new(),
                 queue_target: None,
+                pending_terminal_disposition: None,
             }));
         }
-        let last = last.expect("non-empty queued batch has a final user turn");
         let result = self
             .run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
             .await;
@@ -4592,7 +4840,9 @@ impl Driver {
                 }
                 FoldedSubmission::User(submission) => {
                     let queue_item_ids = submission.queue_item_ids.clone();
-                    let Some(prepared) = self.prepare_queued_user_submission(*submission, tx).await
+                    let Some(prepared) = self
+                        .prepare_queued_user_submission(*submission, input_rx, tx)
+                        .await
                     else {
                         input_rx.finish(&queue_item_ids).await;
                         self.run_prepared_queued_user_batch(
@@ -4660,13 +4910,26 @@ impl Driver {
         &self,
         model: &crate::engine::model::Model,
     ) -> Option<String> {
+        let selection = self.active_selection_for_model(model);
+        self.resolve_prompt_cache_retention_for_selection(model, &selection)
+    }
+
+    fn resolve_prompt_cache_retention_for_selection(
+        &self,
+        model: &crate::engine::model::Model,
+        selection: &crate::config::providers::ActiveModelRef,
+    ) -> Option<String> {
+        let selection_preference = (selection.provider == model.provider_id()
+            && selection.model == model.model_id_ref())
+        .then_some(selection.prompt_cache_retention)
+        .flatten();
         self.live_providers_config()
             .ok()?
             .resolve_prompt_cache_retention(
                 model.provider_id(),
                 model.model_id_ref(),
                 self.prompt_cache_retention_override
-                    .or(self.prompt_cache_retention_preference),
+                    .or(selection_preference),
             )
             .map(str::to_string)
     }
@@ -4697,12 +4960,14 @@ impl Driver {
             .await;
     }
 
-    fn refresh_prompt_cache_retention_from_config(&mut self) {
-        self.prompt_cache_retention_preference =
-            self.live_providers_config().ok().and_then(|cfg| {
+    fn refresh_prompt_cache_retention_from_session(&mut self) {
+        self.prompt_cache_retention_preference = match self.session.active_model_ref() {
+            Some(active) => active.prompt_cache_retention,
+            None => self.live_providers_config().ok().and_then(|cfg| {
                 cfg.active_model
                     .and_then(|active| active.prompt_cache_retention)
-            });
+            }),
+        };
         for idx in 0..self.stack.len() {
             let retention = self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
             Arc::make_mut(&mut self.stack[idx].agent)
@@ -4713,23 +4978,25 @@ impl Driver {
 
     /// Re-load a foreground frame under `new_model` (live model switch),
     /// preserving its name and applying the caller's re-resolved LLM mode. The
-    /// new model's reasoning params are
-    /// re-resolved from the config's active-model thinking mode so a switch to a
-    /// model with different reasoning controls sends the right vendor params (and
-    /// drops a prior model's params that the new one would reject — priority #1),
-    /// while the session-scoped `prompt_cache_key` is carried across unchanged.
+    /// new model's reasoning and cache preferences are resolved from the
+    /// daemon-authoritative session/request selection. Provider config supplies
+    /// capabilities and wire mappings, but its default selection must not leak
+    /// into a session-only choice. The session-scoped `prompt_cache_key` is
+    /// carried across unchanged.
     fn replace_frame_model(
         &self,
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
+        selection: &crate::config::providers::ActiveModelRef,
     ) -> Agent {
         let mut refreshed = (*self.stack[frame_idx].agent).clone();
-        // Re-resolve the new model's reasoning params from the (freshly-written)
-        // config's active-model thinking mode; fall back to none when the config
-        // can't be read or no mode is selected.
-        let additional_params = self.resolve_thinking_params_for(&new_model);
-        let prompt_cache_retention = self.resolve_prompt_cache_retention_for(&new_model);
+        // Resolve preferences from the daemon-authoritative session selection.
+        // The providers config supplies capabilities and wire mappings only;
+        // its default selection must never override a session-only choice.
+        let additional_params = self.resolve_thinking_params_for_selection(&new_model, selection);
+        let prompt_cache_retention =
+            self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         refreshed.model = new_model;
         refreshed.llm_mode = llm_mode;
         refreshed.params = crate::engine::model::ModelParams {
@@ -4747,10 +5014,12 @@ impl Driver {
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
+        selection: &crate::config::providers::ActiveModelRef,
     ) -> (String, crate::engine::builtin::SpawnArgs) {
         let name = self.stack[frame_idx].agent.name.clone();
-        let additional_params = self.resolve_thinking_params_for(&new_model);
-        let prompt_cache_retention = self.resolve_prompt_cache_retention_for(&new_model);
+        let additional_params = self.resolve_thinking_params_for_selection(&new_model, selection);
+        let prompt_cache_retention =
+            self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         // Every frame on `self.stack` is foreground/user-facing: index 0 is the
         // root primary, and deeper frames are interactive subagents. One-shot
         // noninteractive delegations run off-stack, so rebuilding a stack frame
@@ -4775,8 +5044,9 @@ impl Driver {
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
+        selection: &crate::config::providers::ActiveModelRef,
     ) -> Result<Agent> {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode);
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection);
         crate::engine::builtin::load(&name, &args)
     }
 
@@ -4785,8 +5055,9 @@ impl Driver {
         frame_idx: usize,
         new_model: Arc<crate::engine::model::Model>,
         llm_mode: crate::config::extended::LlmMode,
+        selection: &crate::config::providers::ActiveModelRef,
     ) -> Agent {
-        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode);
+        let (name, args) = self.rebuild_frame_args(frame_idx, new_model, llm_mode, selection);
         // `builtin::load` honors a user override of a bundled primary; fall back
         // to the same agent name's default build on a load failure so the swap
         // never strands the session without a primary.
@@ -4810,12 +5081,62 @@ impl Driver {
     /// rich reasoning-effort capability first, falling back to the legacy
     /// active-model thinking mode (implementation note) only
     /// when the model has no typed capability.
+    #[cfg(test)]
     fn resolve_thinking_params_for(
         &self,
         model: &crate::engine::model::Model,
     ) -> Option<serde_json::Value> {
+        let selection = self.active_selection_for_model(model);
+        self.resolve_thinking_params_for_selection(model, &selection)
+    }
+
+    fn resolve_thinking_params_for_selection(
+        &self,
+        model: &crate::engine::model::Model,
+        selection: &crate::config::providers::ActiveModelRef,
+    ) -> Option<serde_json::Value> {
+        if selection.provider != model.provider_id() || selection.model != model.model_id_ref() {
+            return None;
+        }
         let providers = self.live_providers_config().ok()?;
+        let mut providers = providers;
+        providers.active_model = Some(selection.clone());
         model.resolve_reasoning_params(&providers)
+    }
+
+    fn active_selection_for_model(
+        &self,
+        model: &crate::engine::model::Model,
+    ) -> crate::config::providers::ActiveModelRef {
+        if let Some(selection) = self.session.active_model_ref() {
+            return if selection.provider == model.provider_id()
+                && selection.model == model.model_id_ref()
+            {
+                selection
+            } else {
+                crate::config::providers::ActiveModelRef {
+                    provider: model.provider_id().to_string(),
+                    model: model.model_id_ref().to_string(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                }
+            };
+        }
+
+        self.live_providers_config()
+            .ok()
+            .and_then(|providers| providers.active_model)
+            .filter(|selection| {
+                selection.provider == model.provider_id() && selection.model == model.model_id_ref()
+            })
+            .unwrap_or_else(|| crate::config::providers::ActiveModelRef {
+                provider: model.provider_id().to_string(),
+                model: model.model_id_ref().to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            })
     }
 
     /// Consume the deferred agent-swap identity marker (`agent-swap-
@@ -5919,7 +6240,24 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> usize {
         self.unwind_stack_to_root(reason, tx).await;
-        discard_pending_input(input_rx).await
+        let Some(staged) = input_rx.stage_discard_pending().await else {
+            return 0;
+        };
+        let dropped = staged.ids().len();
+        let receipts = input_rx.accepted_receipts(staged.ids()).await;
+        if !self
+            .record_terminal_client_submissions(
+                &receipts,
+                crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled,
+                tx,
+            )
+            .await
+        {
+            return 0;
+        }
+        input_rx.commit_staged_removal(staged).await;
+        tracing::info!(dropped, "discarded queued user messages on cancel");
+        dropped
     }
 
     async fn run_parent_tool_result(
@@ -5997,10 +6335,12 @@ impl Driver {
         // time prelude) and are reattached when the prompt `Message` is
         // built. Non-vision callers already folded images into `text` and
         // pass none here (composer-paste-handling).
+        let submission_kind = submission.kind;
         let images = submission.images;
         let user_text = submission.text;
         let display_text = submission.display_text;
         let tag_expansions = submission.tag_expansions;
+        let origin_principal = submission.origin_principal;
         let raw_user_text = user_text.clone();
         // A user-issued skill slash command (`/<skill-name>` / `/skill <name>`,
         // implementation note): the skill body loads via a
@@ -6041,32 +6381,35 @@ impl Driver {
         // Additive, optional `data.job_id` on async-result deliveries
         // (implementation note) — no exporter schema bump.
         let queue_item_ids = submission.queue_item_ids.clone();
+        let client_submissions = submission.client_submissions.clone();
         let queue_target = submission.queue_target.clone();
-        let event_data = user_message_event_data(
-            &user_text,
-            display_text.as_deref(),
-            &tag_expansions,
-            job_id.as_deref(),
-            &queue_item_ids,
-            queue_target.as_ref(),
-            preflight_cleaned.as_deref(),
-        );
+        let pending_terminal_disposition = submission.pending_terminal_disposition;
+        let event_data = user_message_event_data(UserMessageEventData {
+            text: &user_text,
+            display_text: display_text.as_deref(),
+            tag_expansions: &tag_expansions,
+            job_id: job_id.as_deref(),
+            queue_item_ids: &queue_item_ids,
+            client_submissions: &client_submissions,
+            queue_target: queue_target.as_ref(),
+            preflight_cleaned: preflight_cleaned.as_deref(),
+        });
+        let active_agent = self.active_agent().to_string();
         match self
-            .session
-            .record_event_with_origin(
-                crate::db::session_log::SessionEventKind::UserMessage,
-                Some(self.active_agent()),
-                None,
-                submission.origin_principal.as_deref(),
+            .record_user_message_event(
+                Some(active_agent.as_str()),
+                origin_principal.as_deref(),
                 &event_data,
+                &client_submissions,
+                tx,
             )
             .await
         {
-            // Carry the assigned `seq` (the message's stable id) back to the
-            // client so it can stamp the already-pushed user history row,
-            // letting a pin reference this message by id (`pinned-messages`).
-            // UI/DB-only — the seq never enters the model's context.
-            Ok(seq) => {
+            UserMessageRecordOutcome::Recorded(seq) => {
+                // Carry the assigned `seq` (the message's stable id) back to the
+                // client so it can stamp the already-pushed user history row,
+                // letting a pin reference this message by id (`pinned-messages`).
+                // UI/DB-only — the seq never enters the model's context.
                 if !queue_item_ids.is_empty() {
                     let _ = tx
                         .send(TurnEvent::QueuedUserMessagesFolded {
@@ -6085,12 +6428,41 @@ impl Driver {
                 let _ = tx
                     .send(TurnEvent::UserMessageRecorded {
                         seq,
+                        client_submission_ids: client_submissions
+                            .iter()
+                            .map(|receipt| receipt.id)
+                            .collect(),
                         preflight_cleaned: preflight_cleaned.clone(),
                     })
                     .await;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "record user_message event failed");
+            UserMessageRecordOutcome::Untracked => {}
+            UserMessageRecordOutcome::RetryRequired => {
+                if let Some(top) = self.stack.last_mut() {
+                    top.history.extend(leading_history);
+                }
+                input_rx
+                    .requeue_front_after(
+                        UserSubmission {
+                            kind: submission_kind,
+                            text: user_text,
+                            display_text,
+                            tag_expansions,
+                            images,
+                            forced_skill,
+                            origin_principal,
+                            job_id,
+                            preflight_cleaned,
+                            queue_item_ids,
+                            client_submissions,
+                            queue_target,
+                            pending_terminal_disposition,
+                        },
+                        self.active_queue_target(),
+                        DURABLE_SUBMISSION_RETRY_BACKOFF,
+                    )
+                    .await;
+                return Ok(());
             }
         }
 
@@ -6200,7 +6572,9 @@ impl Driver {
                 job_id: None,
                 preflight_cleaned: None,
                 queue_item_ids: Vec::new(),
+                client_submissions: Vec::new(),
                 queue_target: None,
+                pending_terminal_disposition: None,
             })
         } else {
             crate::engine::message::build_user_message(UserSubmission {
@@ -6218,7 +6592,9 @@ impl Driver {
                 job_id: None,
                 preflight_cleaned: None,
                 queue_item_ids: Vec::new(),
+                client_submissions: Vec::new(),
                 queue_target: None,
+                pending_terminal_disposition: None,
             })
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -6479,13 +6855,28 @@ impl Driver {
                                 next_prompt = last_tool_result;
                             }
                             UserSubmissionKind::User => {
-                                let Some(prepared) =
-                                    self.prepare_queued_user_submission(queued, tx).await
+                                let Some(prepared) = self
+                                    .prepare_queued_user_submission(queued, input_rx, tx)
+                                    .await
                                 else {
                                     input_rx.finish(&queue_item_ids).await;
                                     return Ok(());
                                 };
-                                self.record_queued_user_fold(&prepared, tx).await;
+                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                                    input_rx
+                                        .requeue_front_after(
+                                            prepared,
+                                            self.active_queue_target(),
+                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                                        )
+                                        .await;
+                                    if let Some(frame) = self.stack.last_mut() {
+                                        let _ = frame.history.pop();
+                                    }
+                                    next_prompt = last_tool_result;
+                                    continue;
+                                }
+                                input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
@@ -6499,7 +6890,9 @@ impl Driver {
                                         job_id: None,
                                         preflight_cleaned: None,
                                         queue_item_ids: Vec::new(),
+                                        client_submissions: Vec::new(),
                                         queue_target: None,
+                                        pending_terminal_disposition: None,
                                     });
                             }
                         }
@@ -6546,13 +6939,24 @@ impl Driver {
                                 continue;
                             }
                             UserSubmissionKind::User => {
-                                let Some(prepared) =
-                                    self.prepare_queued_user_submission(queued, tx).await
+                                let Some(prepared) = self
+                                    .prepare_queued_user_submission(queued, input_rx, tx)
+                                    .await
                                 else {
                                     input_rx.finish(&queue_item_ids).await;
-                                    continue;
+                                    return Ok(());
                                 };
-                                self.record_queued_user_fold(&prepared, tx).await;
+                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                                    input_rx
+                                        .requeue_front_after(
+                                            prepared,
+                                            self.active_queue_target(),
+                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                                        )
+                                        .await;
+                                    return Ok(());
+                                }
+                                input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
@@ -6566,7 +6970,9 @@ impl Driver {
                                         job_id: None,
                                         preflight_cleaned: None,
                                         queue_item_ids: Vec::new(),
+                                        client_submissions: Vec::new(),
                                         queue_target: None,
+                                        pending_terminal_disposition: None,
                                     });
                                 continue;
                             }

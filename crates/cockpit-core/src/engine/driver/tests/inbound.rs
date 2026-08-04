@@ -8,15 +8,16 @@ fn user_message_event_data_includes_display_fields() {
         detail: "142 lines".into(),
         ok: true,
     }];
-    let data = user_message_event_data(
-        "<file path=\"src/lib.rs\">expanded</file>",
-        Some("review @src/lib.rs"),
-        &expansions,
-        None,
-        &[],
-        None,
-        None,
-    );
+    let data = user_message_event_data(UserMessageEventData {
+        text: "<file path=\"src/lib.rs\">expanded</file>",
+        display_text: Some("review @src/lib.rs"),
+        tag_expansions: &expansions,
+        job_id: None,
+        queue_item_ids: &[],
+        client_submissions: &[],
+        queue_target: None,
+        preflight_cleaned: None,
+    });
 
     assert!(data["text"].as_str().unwrap().starts_with("<file"));
     assert_eq!(data["display_text"], "review @src/lib.rs");

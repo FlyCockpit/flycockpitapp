@@ -27,7 +27,7 @@ impl App {
         if was_btw_dialog {
             if let Some(Ok(runner)) = self.btw_pane.as_ref().and_then(|pane| pane.runner.as_ref()) {
                 let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_tx.clone(),
+                    runner.attached_request_binding(),
                     request,
                 );
             }
@@ -94,19 +94,19 @@ impl App {
         let submission = cockpit_core::engine::message::UserSubmission::compact_notice();
         self.ensure_agent_runner();
         let span_orphaned = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
+            Some(Ok(runner)) => match runner.try_send_input(submission) {
                 Ok(_) => {
                     self.current_session_persisted = true;
                     false
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(agent_runner::InputNotDelivered::QueueFull) => {
                     self.history.push(HistoryEntry::CommandError {
                         line: "engine: input queue full — wait for the current turn to finish"
                             .to_string(),
                     });
                     true
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(agent_runner::InputNotDelivered::RunnerClosed) => {
                     self.history.push(HistoryEntry::CommandError {
                         line: "engine: driver task has exited".to_string(),
                     });
@@ -148,13 +148,17 @@ impl App {
     /// event stream + input channel move onto the resumed session, and the
     /// daemon marks it viewed on attach (clearing its unread state).
     pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {
+        if self.has_pending_session_switch_action() {
+            self.report_session_switch_busy("/resume");
+            return;
+        }
         self.cancel_outgoing_turn_if_busy();
 
         // Resuming another session from inside a side conversation: discard the
         // ephemeral fork first (no orphan). The resume below then overwrites
         // the restored main view with the resumed session's.
         if self.side_conversation.is_some() {
-            self.end_side_conversation(false);
+            self.discard_side_conversation_for_replacement(true);
         }
 
         let switch_task = match self.agent_runner.as_ref() {
@@ -167,15 +171,20 @@ impl App {
             _ => None,
         };
         if let Some(switch_task) = switch_task {
-            self.async_actions.start(
+            let start = self.async_actions.start(
                 AsyncActionKind::Internal("session.resume"),
-                AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
+                Self::session_switch_action_policy(),
                 async move {
                     switch_task
                         .await
                         .map(|outcome| AsyncActionPayload::SessionSwitched(Box::new(outcome)))
                 },
             );
+            debug_assert!(matches!(start, AsyncActionStart::Started(_)));
+            self.begin_session_switch_submission_target(agent_runner::SessionTarget::Resume {
+                session_id,
+                since_seq: None,
+            });
             return;
         }
 
@@ -355,10 +364,9 @@ impl App {
                         return;
                     }
                 };
-                self.push_plain("/resume: fork pending".to_string());
-                self.async_actions.start_blocking(
+                let start = self.async_actions.start_blocking(
                     AsyncActionKind::DaemonRpc("fork.create"),
-                    AsyncActionPolicy::Replace(AsyncActionKey::new("fork.create")),
+                    AsyncActionPolicy::Dedupe(AsyncActionKey::new("fork.create")),
                     move || {
                         let fork_point_turn_id = Some(seq.to_string());
                         let (session_id, short_id) = agent_runner::fork_session_blocking(
@@ -372,10 +380,21 @@ impl App {
                             socket,
                             session_id,
                             short_id,
+                            fork_point_seq: Some(seq),
                             seed_composer: None,
                         })
                     },
                 );
+                match start {
+                    AsyncActionStart::Started(_) => {
+                        self.push_plain("/resume: fork pending".to_string());
+                    }
+                    AsyncActionStart::Existing(_) => {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: "/resume: fork creation already pending".to_string(),
+                        });
+                    }
+                }
             }
             Some("repair") => {
                 self.push_plain("/resume: applying explicit synthetic repair.".to_string());
@@ -384,7 +403,7 @@ impl App {
                     cockpit_core::daemon::proto::Request::RepairResume {
                         session_id: pending.state.session_id,
                     },
-                    ControlApplied::None,
+                    ControlApplied::RepairResume,
                 );
             }
             Some("export") => {

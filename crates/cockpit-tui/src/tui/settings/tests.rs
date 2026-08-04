@@ -275,9 +275,14 @@ fn save_extended_repairs_private_config_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
+    let _env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_dir = tmp.path().join("home/.cockpit");
+    std::fs::create_dir(&config_dir).unwrap();
+    let config_path = config_dir.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    let mut d = SettingsDialog::open(config_path);
     std::fs::set_permissions(&d.extended_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     d.extended.redact.denylist = vec!["secret-value".to_string()];
     d.save_extended().unwrap();
@@ -287,9 +292,38 @@ fn save_extended_repairs_private_config_permissions() {
         .permissions()
         .mode()
         & 0o777;
-    let dir_mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(file_mode, 0o600);
     assert_eq!(dir_mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn save_extended_preserves_explicit_shared_parent_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let env = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let shared_parent = tmp.path().join("shared");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config_path = shared_parent.join("cockpit.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    env.set_cockpit_config(&config_path);
+
+    let mut dialog = SettingsDialog::open(config_path.clone());
+    dialog.extended.redact.denylist = vec!["secret-value".to_string()];
+    dialog.save_extended().unwrap();
+
+    let file_mode = std::fs::metadata(config_path).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(shared_parent)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600);
+    assert_eq!(dir_mode, 0o755);
 }
 
 #[test]

@@ -10,17 +10,18 @@
 //! the boundary so the TUI rendering paths don't need to know they
 //! talk to a daemon.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Notify, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
 use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
-use cockpit_core::daemon::image_upload::upload_submission_images;
+use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
 use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Response};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
@@ -40,19 +41,196 @@ pub struct UsageCounts {
 /// Handle the TUI keeps to talk to the engine (now via the daemon).
 pub struct AttachedRequest {
     pub request: Request,
+    pub intended_session_id: Uuid,
+    pub intended_attachment_epoch: u64,
     pub response_tx: oneshot::Sender<Result<Response, String>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AttachedRequestBinding {
+    sender: mpsc::Sender<AttachedRequest>,
+    intended_session_id: Uuid,
+    intended_attachment_epoch: u64,
+}
+
+impl AttachedRequestBinding {
+    pub(crate) fn new(
+        sender: mpsc::Sender<AttachedRequest>,
+        intended_session_id: Uuid,
+        intended_attachment_epoch: u64,
+    ) -> Self {
+        Self {
+            sender,
+            intended_session_id,
+            intended_attachment_epoch,
+        }
+    }
+
+    pub(crate) async fn request(&self, request: Request) -> Result<Response, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(AttachedRequest {
+                request,
+                intended_session_id: self.intended_session_id,
+                intended_attachment_epoch: self.intended_attachment_epoch,
+                response_tx,
+            })
+            .await
+            .map_err(|_| "daemon client task has stopped".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "daemon client dropped reply channel".to_string())?
+    }
 }
 
 pub struct ControlRequest {
     pub request: Request,
+    pub intended_session_id: Uuid,
+    pub intended_attachment_epoch: u64,
     pub response_tx: oneshot::Sender<Result<Response, String>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundUserSubmission {
+    pub(crate) submission: cockpit_core::engine::message::UserSubmission,
+    pub(crate) optimistic_submission_id: Uuid,
+    pub(crate) intended_session_id: Uuid,
+    pub(crate) intended_attachment_epoch: u64,
+}
+
+pub(crate) enum RunnerInput {
+    Submission(Box<BoundUserSubmission>),
+    /// Dispatcher-internal release of an already retained submission. It must
+    /// bypass the "later submission joins behind retained work" gate.
+    RetainedRetry(Box<BoundUserSubmission>),
+    /// Submissions accepted while an in-process attach was pending. The
+    /// whole ordered batch occupies one bounded-channel slot; once received,
+    /// the dispatcher owns every exact payload and drains them in FIFO order.
+    SubmissionBatch(Vec<BoundUserSubmission>),
+    /// FIFO fence used by an explicit session switch. Once the dispatcher
+    /// acknowledges this item, every submission accepted before the switch
+    /// was requested has reached a terminal dispatch outcome on its original
+    /// attachment.
+    Flush(oneshot::Sender<()>),
+}
+
+enum UserSubmissionDispatchOutcome {
+    Delivered(Box<BoundUserSubmission>),
+    StaleAttachment(Box<BoundUserSubmission>),
+    Rejected {
+        error: String,
+        optimistic_submission_id: Uuid,
+        session_id: Uuid,
+        // Keep session transitions excluded until the failure event has been
+        // enqueued. Otherwise a transport failure from the old attachment can
+        // race a completed switch and mark the replacement session's newest
+        // optimistic message as failed.
+        transition_guard: OwnedMutexGuard<()>,
+    },
+    Retained {
+        error: String,
+        bound: Box<BoundUserSubmission>,
+        transition_guard: OwnedMutexGuard<()>,
+    },
+    Ambiguous {
+        error: String,
+        bound: Box<BoundUserSubmission>,
+        transition_guard: OwnedMutexGuard<()>,
+    },
+}
+
+enum UserSubmissionSendError {
+    Rejected(String),
+    NotAccepted(String),
+    Ambiguous(String),
+}
+
+fn classify_image_upload_error(error: ImageUploadError) -> UserSubmissionSendError {
+    match error {
+        ImageUploadError::Usage(message) => UserSubmissionSendError::Rejected(message),
+        ImageUploadError::Daemon(message) | ImageUploadError::Transport(message) => {
+            UserSubmissionSendError::Ambiguous(message)
+        }
+    }
+}
+
+fn classify_user_message_response(
+    response: Result<Response, proto::ErrorPayload>,
+) -> Result<Vec<proto::QueueItem>, UserSubmissionSendError> {
+    match response {
+        Ok(Response::UserMessageQueued { queue, .. }) => Ok(queue),
+        Ok(_) => Err(UserSubmissionSendError::Ambiguous(
+            "daemon returned an unexpected response to send_user_message".to_string(),
+        )),
+        Err(error) => match error.code {
+            proto::ErrorCode::UserMessageNotAccepted => {
+                Err(UserSubmissionSendError::NotAccepted(error.message))
+            }
+            proto::ErrorCode::UserMessageTerminated => {
+                Err(UserSubmissionSendError::Rejected(error.message))
+            }
+            proto::ErrorCode::Internal | proto::ErrorCode::Shutdown => {
+                Err(UserSubmissionSendError::Ambiguous(error.message))
+            }
+            _ => Err(UserSubmissionSendError::Rejected(error.message)),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputNotDelivered {
+    QueueFull,
+    RunnerClosed,
+}
+
+impl std::ops::Deref for BoundUserSubmission {
+    type Target = cockpit_core::engine::message::UserSubmission;
+
+    fn deref(&self) -> &Self::Target {
+        &self.submission
+    }
+}
+
+#[cfg(test)]
+impl From<cockpit_core::engine::message::UserSubmission> for BoundUserSubmission {
+    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+        Self {
+            submission,
+            optimistic_submission_id: Uuid::new_v4(),
+            intended_session_id: Uuid::nil(),
+            intended_attachment_epoch: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<cockpit_core::engine::message::UserSubmission> for RunnerInput {
+    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+        Self::Submission(Box::new(submission.into()))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for RunnerInput {
+    type Target = BoundUserSubmission;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Submission(bound) => bound,
+            Self::RetainedRetry(bound) => bound,
+            Self::SubmissionBatch(_) => {
+                panic!("test expected one user submission, found a submission batch")
+            }
+            Self::Flush(_) => panic!("test expected a user submission, found a flush marker"),
+        }
+    }
 }
 
 pub struct AgentRunner {
     /// Send user submissions here (text + any pasted image parts). Each
     /// becomes one `SendUserMessage` request; the daemon's queue-folding
     /// (GOALS §1c) is performed inside the worker, not here.
-    pub input_tx: mpsc::Sender<cockpit_core::engine::message::UserSubmission>,
+    pub(crate) input_tx: mpsc::Sender<RunnerInput>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
     pub record_tx: mpsc::Sender<Request>,
     /// Response-bearing control requests from TUI commands. Kept separate
@@ -83,6 +261,12 @@ pub struct AgentRunner {
     /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
     /// attach, before the `sessions` row is persisted.
     pub(crate) session_id_state: Arc<Mutex<uuid::Uuid>>,
+    pub(crate) attachment_epoch: Arc<AtomicU64>,
+    /// Post-apply session identity for the input dispatcher. The transport
+    /// epoch advances before App adopts a switch snapshot, so recovery must
+    /// not infer the new destination from that earlier signal.
+    pub(crate) submission_session_tx: watch::Sender<Uuid>,
+    pub(crate) awaiting_durable: Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
     /// This session's 6-char display id (GOALS §17b). The TUI captures
     /// it as the predecessor short-id when this session spawns a
     /// `/compact` handoff, so the fresh session can draw a "compacted
@@ -155,6 +339,13 @@ impl Drop for ClientTasks {
 }
 
 impl AgentRunner {
+    /// Retry exact submissions retained after a deterministic pre-acceptance
+    /// rejection. Reusing the attachment watch gives the dispatcher a
+    /// lossless, coalescing wake without another bounded channel.
+    pub(crate) fn retry_retained_user_submissions(&self) {
+        self.submission_session_tx.send_replace(self.session_id());
+    }
+
     #[cfg(test)]
     pub(crate) fn stub_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> Self {
         let (input_tx, _input_rx) = mpsc::channel(8);
@@ -164,11 +355,21 @@ impl AgentRunner {
     #[cfg(test)]
     pub(crate) fn stub_with_channels(
         control_tx: mpsc::Sender<ControlRequest>,
-        input_tx: mpsc::Sender<cockpit_core::engine::message::UserSubmission>,
+        input_tx: mpsc::Sender<RunnerInput>,
     ) -> Self {
+        Self::stub_with_channels_and_submission_watch(control_tx, input_tx).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_with_channels_and_submission_watch(
+        control_tx: mpsc::Sender<ControlRequest>,
+        input_tx: mpsc::Sender<RunnerInput>,
+    ) -> (Self, watch::Receiver<Uuid>) {
         let (record_tx, _record_rx) = mpsc::channel(1);
         let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-        Self {
+        let session_id = uuid::Uuid::new_v4();
+        let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let runner = Self {
             input_tx,
             record_tx,
             control_tx,
@@ -180,7 +381,10 @@ impl AgentRunner {
             skill_inventory_names: Arc::new(Mutex::new(None)),
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            session_id_state: Arc::new(Mutex::new(session_id)),
+            attachment_epoch: Arc::new(AtomicU64::new(0)),
+            submission_session_tx,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -196,7 +400,8 @@ impl AgentRunner {
             attach_context: None,
             last_applied_seq: None,
             client_tasks: ClientTasks::default(),
-        }
+        };
+        (runner, submission_session_rx)
     }
     /// Stop this runner's socket-side client tasks. This intentionally sends no
     /// daemon request: abandoning a TUI handle must not cancel or discard the
@@ -216,6 +421,123 @@ impl AgentRunner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub fn attachment_epoch(&self) -> u64 {
+        self.attachment_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn attached_request_binding(&self) -> AttachedRequestBinding {
+        AttachedRequestBinding::new(
+            self.attached_request_tx.clone(),
+            self.session_id(),
+            self.attachment_epoch(),
+        )
+    }
+
+    pub(crate) fn try_send_input(
+        &self,
+        submission: cockpit_core::engine::message::UserSubmission,
+    ) -> Result<(), InputNotDelivered> {
+        self.try_send_optimistic_input(submission, Uuid::new_v4())
+            .map_err(|(outcome, _submission)| outcome)
+    }
+
+    pub(crate) fn try_send_optimistic_input(
+        &self,
+        submission: cockpit_core::engine::message::UserSubmission,
+        optimistic_submission_id: Uuid,
+    ) -> Result<
+        (),
+        (
+            InputNotDelivered,
+            Box<cockpit_core::engine::message::UserSubmission>,
+        ),
+    > {
+        let bound = BoundUserSubmission {
+            submission,
+            optimistic_submission_id,
+            intended_session_id: self.session_id(),
+            intended_attachment_epoch: self.attachment_epoch(),
+        };
+        self.input_tx
+            .try_send(RunnerInput::Submission(Box::new(bound)))
+            .map_err(|error| {
+                let (outcome, input) = match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(input) => {
+                        (InputNotDelivered::QueueFull, input)
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(input) => {
+                        (InputNotDelivered::RunnerClosed, input)
+                    }
+                };
+                let RunnerInput::Submission(bound) = input else {
+                    unreachable!("try_send_optimistic_input only sends one submission")
+                };
+                (outcome, Box::new(bound.submission))
+            })
+    }
+
+    /// Transfer submissions staged by App during a session switch into the
+    /// dispatcher without consuming one bounded-channel slot per message.
+    /// `switch_session_task` has already placed and observed a FIFO flush
+    /// marker before Attach begins, so the channel has room for this single
+    /// post-switch item even when the batch is larger than its capacity.
+    pub(crate) fn try_send_session_switch_inputs(
+        &self,
+        submissions: Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
+    ) -> Result<
+        (),
+        (
+            InputNotDelivered,
+            Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
+        ),
+    > {
+        if submissions.is_empty() {
+            return Ok(());
+        }
+        let intended_session_id = self.session_id();
+        let intended_attachment_epoch = self.attachment_epoch();
+        let mut bound = submissions
+            .into_iter()
+            .map(
+                |(optimistic_submission_id, submission)| BoundUserSubmission {
+                    submission,
+                    optimistic_submission_id,
+                    intended_session_id,
+                    intended_attachment_epoch,
+                },
+            )
+            .collect::<Vec<_>>();
+        let input = if bound.len() == 1 {
+            RunnerInput::Submission(Box::new(bound.pop().expect("one bound submission")))
+        } else {
+            RunnerInput::SubmissionBatch(bound)
+        };
+        self.input_tx.try_send(input).map_err(|error| {
+            let (outcome, input) = match error {
+                tokio::sync::mpsc::error::TrySendError::Full(input) => {
+                    (InputNotDelivered::QueueFull, input)
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(input) => {
+                    (InputNotDelivered::RunnerClosed, input)
+                }
+            };
+            let submissions = match input {
+                RunnerInput::Submission(bound) => {
+                    vec![(bound.optimistic_submission_id, bound.submission)]
+                }
+                RunnerInput::RetainedRetry(_) => {
+                    unreachable!("retained retries are dispatcher-internal")
+                }
+                RunnerInput::SubmissionBatch(bound) => bound
+                    .into_iter()
+                    .map(|bound| (bound.optimistic_submission_id, bound.submission))
+                    .collect(),
+                RunnerInput::Flush(_) => unreachable!("only submissions are transferred"),
+            };
+            (outcome, submissions)
+        })
+    }
+
     pub fn can_switch_session(&self) -> bool {
         self.current_client.is_some()
             && self.attach_context.is_some()
@@ -227,9 +549,32 @@ impl AgentRunner {
         target: SessionTarget,
     ) -> impl std::future::Future<Output = Result<SessionSwitchOutcome, String>> + Send + 'static
     {
+        self.switch_session_task_inner(target, false)
+    }
+
+    /// `/new` stages cancellation of an outgoing busy turn until after the
+    /// replacement Attach succeeds. The old client is still available at
+    /// that point; cancelling through App after adoption would incorrectly
+    /// target the new session.
+    pub fn switch_new_session_task(
+        &self,
+        cancel_outgoing_turn_after_attach: bool,
+    ) -> impl std::future::Future<Output = Result<SessionSwitchOutcome, String>> + Send + 'static
+    {
+        self.switch_session_task_inner(SessionTarget::New, cancel_outgoing_turn_after_attach)
+    }
+
+    fn switch_session_task_inner(
+        &self,
+        target: SessionTarget,
+        cancel_outgoing_turn_after_attach: bool,
+    ) -> impl std::future::Future<Output = Result<SessionSwitchOutcome, String>> + Send + 'static
+    {
         let current_client = self.current_client.clone();
         let attach_context = self.attach_context.clone();
         let last_applied_seq = self.last_applied_seq.clone();
+        let socket = self.socket.clone();
+        let input_tx = self.input_tx.clone();
         async move {
             let Some(current_client) = current_client else {
                 return Err("runner has no attached daemon client".to_string());
@@ -240,7 +585,27 @@ impl AgentRunner {
             let Some(_last_applied_seq) = last_applied_seq else {
                 return Err("runner has no session sequence state".to_string());
             };
-            switch_session_inner(current_client, attach_context, target).await
+            // This marker is ordered with user submissions in the same FIFO.
+            // Wait before taking the transition gate so accepted old-session
+            // work cannot be stranded merely because the switch task won the
+            // scheduler race against the input dispatcher.
+            flush_accepted_user_submissions(&input_tx).await?;
+            // The daemon can emit events for the old attachment until its
+            // Attach response is received. Keep event application and the
+            // authoritative response in one ordering domain: queued old
+            // events are drained by App while this guard is still held.
+            let transition_gate = attach_context.read().await.transition_gate.clone();
+            let transition_guard = transition_gate.lock_owned().await;
+            let mut outcome = switch_session_inner(
+                current_client,
+                attach_context,
+                socket,
+                target,
+                cancel_outgoing_turn_after_attach,
+            )
+            .await?;
+            outcome.transition_guard = Some(transition_guard);
+            Ok(outcome)
         }
     }
 
@@ -262,7 +627,22 @@ impl AgentRunner {
         self.paused_work = outcome.paused_work.clone();
         self.repair_required = outcome.repair_required.clone();
         self.btw_fork = outcome.btw_fork.clone();
+        acknowledge_history_receipts(&self.awaiting_durable, outcome.session_id, &outcome.history);
+        self.submission_session_tx.send_replace(outcome.session_id);
     }
+}
+
+async fn flush_accepted_user_submissions(
+    input_tx: &mpsc::Sender<RunnerInput>,
+) -> Result<(), String> {
+    let (flushed_tx, flushed_rx) = oneshot::channel();
+    input_tx
+        .send(RunnerInput::Flush(flushed_tx))
+        .await
+        .map_err(|_| "session input dispatcher stopped before switch".to_string())?;
+    flushed_rx
+        .await
+        .map_err(|_| "session input dispatcher stopped before flush".to_string())
 }
 
 fn push_turn_event(events: &Arc<Mutex<Vec<TurnEvent>>>, notify: &Arc<Notify>, event: TurnEvent) {
@@ -280,11 +660,496 @@ pub(crate) fn drain_turn_events(events: &Arc<Mutex<Vec<TurnEvent>>>) -> Vec<Turn
     std::mem::take(&mut *guard)
 }
 
+async fn dispatch_control_request_for_current_attachment<F, Fut>(
+    control_request: ControlRequest,
+    session_id_state: &Arc<Mutex<Uuid>>,
+    attachment_epoch: &Arc<AtomicU64>,
+    transition_gate: Arc<AsyncMutex<()>>,
+    send: F,
+) where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, String>>,
+{
+    let _transition_guard = transition_gate.lock_owned().await;
+    let current_session_id = *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current_epoch = attachment_epoch.load(Ordering::Acquire);
+    if control_request.intended_session_id != current_session_id
+        || control_request.intended_attachment_epoch != current_epoch
+    {
+        let _ = control_request.response_tx.send(Err(
+            "request belongs to a session attachment that has been replaced; retry".to_string(),
+        ));
+        return;
+    }
+    let response = send(control_request.request).await;
+    let _ = control_request.response_tx.send(response);
+}
+
+async fn dispatch_attached_request_for_current_attachment<F, Fut>(
+    attached_request: AttachedRequest,
+    session_id_state: &Arc<Mutex<Uuid>>,
+    attachment_epoch: &Arc<AtomicU64>,
+    transition_gate: Arc<AsyncMutex<()>>,
+    send: F,
+) where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, String>>,
+{
+    let _transition_guard = transition_gate.lock_owned().await;
+    let current_session_id = *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current_epoch = attachment_epoch.load(Ordering::Acquire);
+    if attached_request.intended_session_id != current_session_id
+        || attached_request.intended_attachment_epoch != current_epoch
+    {
+        let _ = attached_request.response_tx.send(Err(
+            "request belongs to a session attachment that has been replaced; retry".to_string(),
+        ));
+        return;
+    }
+    let response = send(attached_request.request).await;
+    let _ = attached_request.response_tx.send(response);
+}
+
+async fn dispatch_user_submission_for_current_attachment<F, Fut>(
+    bound: BoundUserSubmission,
+    session_id_state: &Arc<Mutex<Uuid>>,
+    attachment_epoch: &Arc<AtomicU64>,
+    transition_gate: Arc<AsyncMutex<()>>,
+    send: F,
+) -> UserSubmissionDispatchOutcome
+where
+    F: FnOnce(Uuid, cockpit_core::engine::message::UserSubmission) -> Fut,
+    Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
+{
+    let transition_guard = transition_gate.lock_owned().await;
+    let current_session_id = *session_id_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current_epoch = attachment_epoch.load(Ordering::Acquire);
+    if bound.intended_session_id != current_session_id {
+        return UserSubmissionDispatchOutcome::StaleAttachment(Box::new(bound));
+    }
+    // Reconnecting the same session creates a fresh attachment epoch, but it
+    // does not change the submission's destination. Dispatch under the
+    // transition gate using the current client rather than dropping exact
+    // image/tag/display/skill payloads accepted just before the reconnect.
+    let _reattached_same_session = bound.intended_attachment_epoch != current_epoch;
+    let optimistic_submission_id = bound.optimistic_submission_id;
+    match send(optimistic_submission_id, bound.submission.clone()).await {
+        Ok(()) => UserSubmissionDispatchOutcome::Delivered(Box::new(bound)),
+        Err(UserSubmissionSendError::Rejected(error)) => UserSubmissionDispatchOutcome::Rejected {
+            error,
+            optimistic_submission_id,
+            session_id: bound.intended_session_id,
+            transition_guard,
+        },
+        Err(UserSubmissionSendError::NotAccepted(error)) => {
+            UserSubmissionDispatchOutcome::Retained {
+                error,
+                bound: Box::new(bound),
+                transition_guard,
+            }
+        }
+        Err(UserSubmissionSendError::Ambiguous(error)) => {
+            UserSubmissionDispatchOutcome::Ambiguous {
+                error,
+                bound: Box::new(bound),
+                transition_guard,
+            }
+        }
+    }
+}
+
+fn record_user_submission_dispatch_outcome(
+    outcome: UserSubmissionDispatchOutcome,
+    events: &Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: &Arc<Notify>,
+    deferred: &mut HashMap<Uuid, VecDeque<BoundUserSubmission>>,
+    retained: &mut HashMap<Uuid, VecDeque<BoundUserSubmission>>,
+    awaiting_durable: &Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+) -> Option<Uuid> {
+    match outcome {
+        UserSubmissionDispatchOutcome::Delivered(bound) => {
+            let session_id = bound.intended_session_id;
+            let mut awaiting = awaiting_durable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let queue = awaiting.entry(session_id).or_default();
+            queue.retain(|pending| {
+                pending.optimistic_submission_id != bound.optimistic_submission_id
+            });
+            queue.push_back(*bound);
+            return Some(session_id);
+        }
+        UserSubmissionDispatchOutcome::StaleAttachment(bound) => {
+            let intended_session_id = bound.intended_session_id;
+            deferred
+                .entry(intended_session_id)
+                .or_default()
+                .push_back(*bound);
+            push_turn_event(
+                events,
+                event_notify,
+                TurnEvent::Notice {
+                    text: format!(
+                        "A message accepted for session {} was retained and will be sent when that session is attached again.",
+                        &intended_session_id.to_string()[..8]
+                    ),
+                },
+            );
+        }
+        UserSubmissionDispatchOutcome::Rejected {
+            error,
+            optimistic_submission_id,
+            session_id,
+            transition_guard,
+        } => {
+            push_turn_event(
+                events,
+                event_notify,
+                TurnEvent::UserMessageDispatchFailed {
+                    error,
+                    optimistic_submission_id,
+                },
+            );
+            drop(transition_guard);
+            return Some(session_id);
+        }
+        UserSubmissionDispatchOutcome::Retained {
+            error,
+            bound,
+            transition_guard,
+        } => {
+            let optimistic_submission_id = bound.optimistic_submission_id;
+            tracing::warn!(%error, client_submission_id = %optimistic_submission_id,
+                "send_user_message was not accepted; retaining exact payload until a state-change retry");
+            retained
+                .entry(bound.intended_session_id)
+                .or_default()
+                .push_front(*bound);
+            push_turn_event(
+                events,
+                event_notify,
+                TurnEvent::UserMessageDispatchRetained {
+                    error,
+                    optimistic_submission_id,
+                },
+            );
+            drop(transition_guard);
+        }
+        UserSubmissionDispatchOutcome::Ambiguous {
+            error,
+            bound,
+            transition_guard,
+        } => {
+            tracing::warn!(%error, client_submission_id = %bound.optimistic_submission_id,
+                "send_user_message outcome ambiguous; retaining exact payload for idempotent retry");
+            deferred
+                .entry(bound.intended_session_id)
+                .or_default()
+                .push_back(*bound);
+            drop(transition_guard);
+        }
+    }
+    None
+}
+
+fn release_next_retained(
+    retained: &mut HashMap<Uuid, VecDeque<BoundUserSubmission>>,
+    session_id: Uuid,
+) -> Option<BoundUserSubmission> {
+    let queue = retained.get_mut(&session_id)?;
+    let next = queue.pop_front();
+    if queue.is_empty() {
+        retained.remove(&session_id);
+    }
+    next
+}
+
+struct UserSubmissionDispatcherContext {
+    session_id_state: Arc<Mutex<Uuid>>,
+    attachment_epoch: Arc<AtomicU64>,
+    transition_gate: Arc<AsyncMutex<()>>,
+    events: Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: Arc<Notify>,
+    submission_session_rx: watch::Receiver<Uuid>,
+    attachment_ready_rx: mpsc::UnboundedReceiver<Uuid>,
+    awaiting_durable: Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+}
+
+fn take_awaiting_durable_submissions(
+    awaiting_durable: &Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+    session_id: Uuid,
+) -> VecDeque<BoundUserSubmission> {
+    awaiting_durable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&session_id)
+        .unwrap_or_default()
+}
+
+fn acknowledge_durable_submissions(
+    awaiting_durable: &Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+    session_id: Uuid,
+    ids: &[Uuid],
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut awaiting = awaiting_durable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(queue) = awaiting.get_mut(&session_id) else {
+        return;
+    };
+    queue.retain(|bound| !ids.contains(&bound.optimistic_submission_id));
+    if queue.is_empty() {
+        awaiting.remove(&session_id);
+    }
+}
+
+fn push_restored_submission_event(
+    bound: &BoundUserSubmission,
+    events: &Arc<Mutex<Vec<TurnEvent>>>,
+    event_notify: &Arc<Notify>,
+) {
+    push_turn_event(
+        events,
+        event_notify,
+        TurnEvent::UserMessageDispatchRestored {
+            optimistic_submission_id: bound.optimistic_submission_id,
+            text: bound.submission.text.clone(),
+            display_text: bound.submission.display_text.clone(),
+            tag_expansions: bound.submission.tag_expansions.clone(),
+        },
+    );
+}
+
+async fn run_user_submission_dispatcher<F, Fut>(
+    mut input_rx: mpsc::Receiver<RunnerInput>,
+    mut context: UserSubmissionDispatcherContext,
+    send: F,
+) where
+    F: Fn(Uuid, cockpit_core::engine::message::UserSubmission) -> Fut + Clone,
+    Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
+{
+    enum DispatcherWake {
+        Input(Option<RunnerInput>),
+        AttachmentChanged,
+        AttachmentReady(Option<Uuid>),
+        RetryAmbiguous,
+    }
+
+    let mut deferred: HashMap<Uuid, VecDeque<BoundUserSubmission>> = HashMap::new();
+    let mut retained: HashMap<Uuid, VecDeque<BoundUserSubmission>> = HashMap::new();
+    let mut ready = VecDeque::new();
+    let mut retry_ambiguous_at: Option<tokio::time::Instant> = None;
+    loop {
+        let input = if let Some(input) = ready.pop_front() {
+            Some(input)
+        } else {
+            let wake = tokio::select! {
+                input = input_rx.recv() => DispatcherWake::Input(input),
+                changed = context.submission_session_rx.changed() => {
+                    if changed.is_err() {
+                        DispatcherWake::Input(input_rx.recv().await)
+                    } else {
+                        DispatcherWake::AttachmentChanged
+                    }
+                }
+                session_id = context.attachment_ready_rx.recv() => {
+                    DispatcherWake::AttachmentReady(session_id)
+                }
+                _ = async {
+                    match retry_ambiguous_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => DispatcherWake::RetryAmbiguous,
+            };
+            match wake {
+                DispatcherWake::Input(input) => input,
+                DispatcherWake::AttachmentChanged => {
+                    // This watch is updated only after App has applied the
+                    // switch snapshot and replaced session_id_state.
+                    let current_session_id = *context.submission_session_rx.borrow_and_update();
+                    let awaiting = take_awaiting_durable_submissions(
+                        &context.awaiting_durable,
+                        current_session_id,
+                    );
+                    let mut released_ambiguous = !awaiting.is_empty();
+                    ready.extend(
+                        awaiting
+                            .into_iter()
+                            .map(|bound| RunnerInput::RetainedRetry(Box::new(bound))),
+                    );
+                    if let Some(recovered) = deferred.remove(&current_session_id) {
+                        released_ambiguous = !recovered.is_empty();
+                        ready.extend(
+                            recovered
+                                .into_iter()
+                                .map(|bound| RunnerInput::RetainedRetry(Box::new(bound))),
+                        );
+                        push_turn_event(
+                            &context.events,
+                            &context.event_notify,
+                            TurnEvent::Notice {
+                                text: format!(
+                                    "Sending retained message{} for reattached session {}.",
+                                    if ready.len() == 1 { "" } else { "s" },
+                                    &current_session_id.to_string()[..8]
+                                ),
+                            },
+                        );
+                    }
+                    if !released_ambiguous
+                        && let Some(recovered) =
+                            release_next_retained(&mut retained, current_session_id)
+                    {
+                        ready.push_back(RunnerInput::RetainedRetry(Box::new(recovered)));
+                    }
+                    continue;
+                }
+                DispatcherWake::AttachmentReady(Some(current_session_id)) => {
+                    let awaiting = take_awaiting_durable_submissions(
+                        &context.awaiting_durable,
+                        current_session_id,
+                    );
+                    ready.extend(
+                        awaiting
+                            .into_iter()
+                            .map(|bound| RunnerInput::RetainedRetry(Box::new(bound))),
+                    );
+                    if let Some(recovered) = deferred.remove(&current_session_id) {
+                        ready.extend(
+                            recovered
+                                .into_iter()
+                                .map(|bound| RunnerInput::RetainedRetry(Box::new(bound))),
+                        );
+                    }
+                    continue;
+                }
+                DispatcherWake::AttachmentReady(None) => continue,
+                DispatcherWake::RetryAmbiguous => {
+                    retry_ambiguous_at = None;
+                    let current_session_id = *context.submission_session_rx.borrow();
+                    if let Some(recovered) = deferred.remove(&current_session_id) {
+                        ready.extend(
+                            recovered
+                                .into_iter()
+                                .map(|bound| RunnerInput::RetainedRetry(Box::new(bound))),
+                        );
+                    }
+                    continue;
+                }
+            }
+        };
+        let Some(input) = input else {
+            break;
+        };
+        let (bound, joins_retained, restoring) = match input {
+            RunnerInput::Submission(bound) => (bound, true, false),
+            RunnerInput::RetainedRetry(bound) => (bound, false, true),
+            RunnerInput::SubmissionBatch(batch) => {
+                ready.extend(
+                    batch
+                        .into_iter()
+                        .map(|bound| RunnerInput::Submission(Box::new(bound))),
+                );
+                continue;
+            }
+            RunnerInput::Flush(flushed_tx) => {
+                let _ = flushed_tx.send(());
+                continue;
+            }
+        };
+        if restoring {
+            push_restored_submission_event(&bound, &context.events, &context.event_notify);
+        }
+        // Once an ambiguous A is retained, later B submissions for the same
+        // session join its FIFO instead of overtaking it. Flush markers remain
+        // processable, so a session switch cannot deadlock behind retries.
+        if deferred.contains_key(&bound.intended_session_id) {
+            deferred
+                .entry(bound.intended_session_id)
+                .or_default()
+                .push_back(*bound);
+            continue;
+        }
+        // A later send is an explicit retry opportunity for a deterministic
+        // pre-acceptance rejection. Preserve FIFO: retained A is attempted
+        // before the newly arrived B, and if A is rejected again B joins the
+        // retained queue rather than overtaking it.
+        if joins_retained && retained.contains_key(&bound.intended_session_id) {
+            let session_id = bound.intended_session_id;
+            retained.entry(session_id).or_default().push_back(*bound);
+            let recovered = release_next_retained(&mut retained, session_id)
+                .expect("retained queue contains the earlier submission");
+            ready.push_front(RunnerInput::RetainedRetry(Box::new(recovered)));
+            continue;
+        }
+        let send = send.clone();
+        let outcome = dispatch_user_submission_for_current_attachment(
+            *bound,
+            &context.session_id_state,
+            &context.attachment_epoch,
+            context.transition_gate.clone(),
+            send,
+        )
+        .await;
+        let unblocked_session = record_user_submission_dispatch_outcome(
+            outcome,
+            &context.events,
+            &context.event_notify,
+            &mut deferred,
+            &mut retained,
+            &context.awaiting_durable,
+        );
+        if let Some(session_id) = unblocked_session
+            && !deferred.contains_key(&session_id)
+            && let Some(next) = release_next_retained(&mut retained, session_id)
+        {
+            ready.push_front(RunnerInput::RetainedRetry(Box::new(next)));
+        }
+        if !deferred.is_empty() && retry_ambiguous_at.is_none() {
+            retry_ambiguous_at = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+        }
+    }
+}
+
+async fn lock_current_client_epoch(
+    transition_gate: Arc<AsyncMutex<()>>,
+    client_epoch_rx: &watch::Receiver<u64>,
+    expected_epoch: u64,
+) -> Option<OwnedMutexGuard<()>> {
+    let guard = transition_gate.lock_owned().await;
+    (*client_epoch_rx.borrow() == expected_epoch).then_some(guard)
+}
+
+fn advance_attachment_epoch(context: &AttachRequestContext) -> u64 {
+    let previous = context
+        .attachment_epoch
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            Some(epoch.saturating_add(1))
+        })
+        .expect("attachment epoch update is infallible");
+    let next_epoch = previous.saturating_add(1);
+    context.client_epoch_tx.send_replace(next_epoch);
+    next_epoch
+}
+
 #[derive(Clone)]
 pub(crate) struct AttachRequestContext {
     project_root: String,
     no_sandbox: bool,
     env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire,
+    transition_gate: Arc<AsyncMutex<()>>,
+    client_epoch_tx: watch::Sender<u64>,
+    attachment_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +1161,7 @@ pub enum SessionTarget {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionSwitchOutcome {
     pub target: SessionTarget,
     pub session_id: Uuid,
@@ -313,6 +1178,9 @@ pub struct SessionSwitchOutcome {
     pub btw_fork: Option<proto::BtwForkInfo>,
     pub daemon_version: String,
     pub daemon_compatible: bool,
+    /// Held from before the switch Attach request until App has drained all
+    /// queued old-epoch events and applied this authoritative snapshot.
+    pub(crate) transition_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[derive(Clone)]
@@ -334,6 +1202,7 @@ struct IncomingEventContext<'a> {
     active_agent_path: &'a Arc<Mutex<Vec<String>>>,
     primary_agent: &'a Arc<Mutex<String>>,
     last_applied_seq: &'a Arc<Mutex<Option<i64>>>,
+    awaiting_durable: &'a Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
 }
 
 struct ClientEventState {
@@ -347,6 +1216,9 @@ struct ClientEventState {
     session_id_state: Arc<Mutex<Uuid>>,
     skill_refresh_tx: watch::Sender<u64>,
     skill_refresh_generation: u64,
+    transition_gate: Arc<AsyncMutex<()>>,
+    awaiting_durable: Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+    attachment_ready_tx: mpsc::UnboundedSender<Uuid>,
 }
 
 struct AbortOnDrop(AbortHandle);
@@ -369,12 +1241,14 @@ struct ReconnectAttach {
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
+    active_model_state: Option<proto::ActiveModelState>,
 }
 
 struct AttachedPayload {
     history: Vec<proto::HistoryEntry>,
     paused_work: Vec<proto::PausedWorkSummary>,
     repair_required: Option<proto::ResumeRepairState>,
+    active_model_state: Option<proto::ActiveModelState>,
 }
 
 enum ReconnectAttachError {
@@ -537,6 +1411,7 @@ impl ClientEventState {
             active_agent_path: &self.active_agent_path,
             primary_agent: &self.primary_agent,
             last_applied_seq: &self.last_applied_seq,
+            awaiting_durable: &self.awaiting_durable,
         }
     }
 
@@ -553,15 +1428,6 @@ impl ClientEventState {
         let session_id = self.session_id();
         let incoming = self.incoming_context(session_id);
         apply_incoming_event(event, &incoming);
-    }
-
-    async fn handle_event(&mut self, client: &DaemonClient, event: proto::Event) -> bool {
-        let client = client.clone();
-        self.handle_event_with_resync(event, move |session_id, attach_snapshot, last| {
-            let client = client.clone();
-            async move { resync_attach_payload(&client, session_id, &attach_snapshot, &last).await }
-        })
-        .await
     }
 
     async fn handle_event_with_resync<F, Fut>(&mut self, event: proto::Event, resync: F) -> bool
@@ -596,10 +1462,27 @@ impl ClientEventState {
             return true;
         }
         let attach_snapshot = self.attach_context.read().await.clone();
-        match resync(session_id, attach_snapshot, self.last_applied_seq.clone()).await {
+        match resync(
+            session_id,
+            attach_snapshot.clone(),
+            self.last_applied_seq.clone(),
+        )
+        .await
+        {
             Ok(attached) => {
+                // A successful re-attach is a new isolation epoch even when
+                // the daemon and session id are unchanged. Advance before
+                // exposing its authoritative snapshot so all old queued
+                // outbound work is rejected when this transition gate opens.
+                advance_attachment_epoch(&attach_snapshot);
                 let incoming = self.incoming_context(session_id);
-                apply_attached_payload(attached, &incoming);
+                let active_model_state = apply_attached_payload(attached, &incoming);
+                let _ = self.attachment_ready_tx.send(session_id);
+                push_turn_event(
+                    &self.events,
+                    &self.event_notify,
+                    TurnEvent::DaemonLinkResynced { active_model_state },
+                );
             }
             Err(ReconnectAttachError::Retriable(error)) => {
                 tracing::debug!(
@@ -634,20 +1517,63 @@ fn should_refresh_skill_inventory(event: &proto::Event) -> bool {
 async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
+    socket: PathBuf,
     target: SessionTarget,
+    cancel_outgoing_turn_after_attach: bool,
 ) -> Result<SessionSwitchOutcome, String> {
-    let current_client = current_client.read().await.clone();
-    let client_protocol_version = current_client.negotiated().version;
-    switch_session_with_attach_request(
-        attach_context,
+    // A successful Attach starts a new event epoch even when it resumes the
+    // same session id. Adopt a fresh client so the old connection cannot feed
+    // pre-Attach events into the new epoch.
+    let outgoing_client = current_client.read().await.clone();
+    let replacement_client = DaemonClient::connect(&socket)
+        .await
+        .map_err(|error| format!("connect replacement session client: {error:#}"))?;
+    let client_protocol_version = replacement_client.negotiated().version;
+    let request_client = replacement_client.clone();
+    let outcome = switch_session_with_attach_request(
+        attach_context.clone(),
         target,
         client_protocol_version,
-        move |request| {
-            let current_client = current_client.clone();
-            async move { current_client.request(request).await }
-        },
+        move |request| async move { request_client.request(request).await },
     )
-    .await
+    .await?;
+    cancel_outgoing_turn_after_successful_attach(
+        cancel_outgoing_turn_after_attach,
+        move || async move { outgoing_client.request(Request::CancelTurn).await },
+    )
+    .await;
+    *current_client.write().await = replacement_client;
+    let context = attach_context.read().await;
+    advance_attachment_epoch(&context);
+    Ok(outcome)
+}
+
+async fn cancel_outgoing_turn_after_successful_attach<F, Fut>(requested: bool, send: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<std::result::Result<Response, ErrorPayload>>>,
+{
+    if !requested {
+        return;
+    }
+    match send().await {
+        Ok(Ok(Response::Ack)) => {}
+        Ok(Ok(other)) => {
+            tracing::warn!(
+                ?other,
+                "unexpected response cancelling outgoing /new session turn"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?error,
+                "daemon rejected outgoing /new session turn cancellation"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not cancel outgoing /new session turn after replacement attach");
+        }
+    }
 }
 
 async fn switch_session_with_attach_request<F, Fut>(
@@ -767,6 +1693,7 @@ fn session_switch_outcome_from_attached(
         btw_fork: attached.btw_fork,
         daemon_version: attached.daemon_version,
         daemon_compatible: attached.daemon_compatible,
+        transition_guard: None,
     }
 }
 
@@ -1035,8 +1962,7 @@ fn try_spawn_inner(
         daemon_compatible,
     ) = attached;
 
-    let (input_tx, mut input_rx) =
-        mpsc::channel::<cockpit_core::engine::message::UserSubmission>(32);
+    let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let (control_tx, mut control_rx) = mpsc::channel::<ControlRequest>(32);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel::<AttachedRequest>(32);
@@ -1058,12 +1984,21 @@ fn try_spawn_inner(
     ));
     let session_id_state = Arc::new(Mutex::new(session_id));
     let current_client = Arc::new(RwLock::new(client));
+    let transition_gate = Arc::new(AsyncMutex::new(()));
+    let attachment_epoch = Arc::new(AtomicU64::new(0));
+    let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+    let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+    let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+    let (client_epoch_tx, mut client_epoch_rx) = watch::channel(0_u64);
     let attach_context = Arc::new(RwLock::new(AttachRequestContext {
         project_root: cwd.to_string_lossy().into_owned(),
         no_sandbox,
         env_snapshot: cockpit_core::env_snapshot::capture_tui_shell_env()
             .0
             .to_wire(),
+        transition_gate: transition_gate.clone(),
+        client_epoch_tx,
+        attachment_epoch: attachment_epoch.clone(),
     }));
     let mut client_tasks = ClientTasks::default();
 
@@ -1071,64 +2006,62 @@ fn try_spawn_inner(
     // attachments first, then forward refs in SendUserMessage.
     {
         let current_client = current_client.clone();
+        let session_id_state = session_id_state.clone();
+        let attachment_epoch = attachment_epoch.clone();
+        let transition_gate = transition_gate.clone();
         let events = events.clone();
         let event_notify = event_notify.clone();
-        client_tasks.push(tokio::spawn(async move {
-            while let Some(sub) = input_rx.recv().await {
-                let client = current_client.read().await.clone();
-                let refs = match upload_submission_images(&client, &sub.images).await {
-                    Ok(refs) => refs,
-                    Err(error) => {
-                        push_turn_event(
-                            &events,
-                            &event_notify,
-                            TurnEvent::UserMessageDispatchFailed {
-                                error: error.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                match client
-                    .request(Request::SendUserMessage {
-                        text: sub.text,
-                        display_text: sub.display_text,
-                        tag_expansions: sub.tag_expansions,
-                        image_refs: refs,
-                        forced_skill: sub.forced_skill,
-                    })
-                    .await
-                {
-                    Ok(Ok(Response::UserMessageQueued { queue, .. })) => {
-                        push_turn_event(
-                            &events,
-                            &event_notify,
-                            TurnEvent::QueueUpdated {
-                                queue: queue.into_iter().map(queue_item_from_proto).collect(),
-                            },
-                        );
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        push_turn_event(
-                            &events,
-                            &event_notify,
-                            TurnEvent::UserMessageDispatchFailed { error: e.message },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "send_user_message transport failed");
-                        push_turn_event(
-                            &events,
-                            &event_notify,
-                            TurnEvent::UserMessageDispatchFailed {
-                                error: e.to_string(),
-                            },
-                        );
+        client_tasks.push(tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state,
+                attachment_epoch,
+                transition_gate,
+                events: events.clone(),
+                event_notify: event_notify.clone(),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: awaiting_durable.clone(),
+            },
+            move |client_submission_id, sub| {
+                let current_client = current_client.clone();
+                let events = events.clone();
+                let event_notify = event_notify.clone();
+                async move {
+                    let client = current_client.read().await.clone();
+                    let refs = upload_submission_images(&client, &sub.images)
+                        .await
+                        .map_err(classify_image_upload_error)?;
+                    match client
+                        .request(Request::SendUserMessage {
+                            client_submission_id,
+                            text: sub.text,
+                            display_text: sub.display_text,
+                            tag_expansions: sub.tag_expansions,
+                            image_refs: refs,
+                            forced_skill: sub.forced_skill,
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            let queue = classify_user_message_response(response)?;
+                            push_turn_event(
+                                &events,
+                                &event_notify,
+                                TurnEvent::QueueUpdated {
+                                    queue: queue.into_iter().map(queue_item_from_proto).collect(),
+                                },
+                            );
+                            Ok(())
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = ?error, "send_user_message transport failed");
+                            Err(UserSubmissionSendError::Ambiguous(error.to_string()))
+                        }
                     }
                 }
-            }
-        }));
+            },
+        )));
     }
 
     // Outbound: fire-and-forget autocomplete usage records.
@@ -1148,14 +2081,28 @@ fn try_spawn_inner(
     // telemetry, so a saturated usage channel cannot drop operator commands.
     {
         let current_client = current_client.clone();
+        let session_id_state = session_id_state.clone();
+        let attachment_epoch = attachment_epoch.clone();
+        let transition_gate = transition_gate.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(control_request) = control_rx.recv().await {
-                let client = current_client.read().await.clone();
-                let response = client
-                    .request_ok(control_request.request)
-                    .await
-                    .map_err(|e| format!("daemon request: {e}"));
-                let _ = control_request.response_tx.send(response);
+                dispatch_control_request_for_current_attachment(
+                    control_request,
+                    &session_id_state,
+                    &attachment_epoch,
+                    transition_gate.clone(),
+                    |request| {
+                        let current_client = current_client.clone();
+                        async move {
+                            let client = current_client.read().await.clone();
+                            client
+                                .request_ok(request)
+                                .await
+                                .map_err(|e| format!("daemon request: {e}"))
+                        }
+                    },
+                )
+                .await;
             }
         }));
     }
@@ -1165,14 +2112,28 @@ fn try_spawn_inner(
     // per-client daemon state, not in the socket path.
     {
         let current_client = current_client.clone();
+        let session_id_state = session_id_state.clone();
+        let attachment_epoch = attachment_epoch.clone();
+        let transition_gate = transition_gate.clone();
         client_tasks.push(tokio::spawn(async move {
             while let Some(attached_request) = attached_request_rx.recv().await {
-                let client = current_client.read().await.clone();
-                let response = client
-                    .request_ok(attached_request.request)
-                    .await
-                    .map_err(|e| format!("daemon request: {e}"));
-                let _ = attached_request.response_tx.send(response);
+                dispatch_attached_request_for_current_attachment(
+                    attached_request,
+                    &session_id_state,
+                    &attachment_epoch,
+                    transition_gate.clone(),
+                    |request| {
+                        let current_client = current_client.clone();
+                        async move {
+                            let client = current_client.read().await.clone();
+                            client
+                                .request_ok(request)
+                                .await
+                                .map_err(|e| format!("daemon request: {e}"))
+                        }
+                    },
+                )
+                .await;
             }
         }));
     }
@@ -1196,6 +2157,8 @@ fn try_spawn_inner(
         let attach_context = attach_context.clone();
         let session_id_state = session_id_state.clone();
         let skill_refresh_tx = skill_refresh_tx.clone();
+        let awaiting_durable = awaiting_durable.clone();
+        let attachment_ready_tx = attachment_ready_tx.clone();
         let driver = LocalReconnectDriver {
             socket: socket.clone(),
         };
@@ -1224,19 +2187,70 @@ fn try_spawn_inner(
                 session_id_state: session_id_state.clone(),
                 skill_refresh_tx,
                 skill_refresh_generation: 0,
+                transition_gate: transition_gate.clone(),
+                awaiting_durable: awaiting_durable.clone(),
+                attachment_ready_tx: attachment_ready_tx.clone(),
             };
             let mut saw_draining = false;
             loop {
+                let client_epoch = *client_epoch_rx.borrow_and_update();
                 let client = current_client.read().await.clone();
-                while let Some(event) = client.next_event().await {
+                let mut attachment_replaced = false;
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        changed = client_epoch_rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            attachment_replaced = true;
+                            break;
+                        }
+                        event = client.next_event() => event,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let Some(_transition_guard) = lock_current_client_epoch(
+                        event_state.transition_gate.clone(),
+                        &client_epoch_rx,
+                        client_epoch,
+                    )
+                    .await
+                    else {
+                        attachment_replaced = true;
+                        break;
+                    };
                     if matches!(event, proto::Event::DaemonDraining { .. }) {
                         saw_draining = true;
                     } else if saw_draining {
                         saw_draining = false;
                     }
-                    if !event_state.handle_event(&client, event).await {
+                    let resync_driver = driver.clone();
+                    let resync_current_client = current_client.clone();
+                    if !event_state
+                        .handle_event_with_resync(
+                            event,
+                            move |session_id, attach_snapshot, last| async move {
+                                let attached = reconnect_and_attach(
+                                    &resync_driver,
+                                    session_id,
+                                    &attach_snapshot,
+                                    &last,
+                                )
+                                .await?;
+                                let (new_client, payload) = split_reconnect_attached(attached);
+                                *resync_current_client.write().await = new_client;
+                                Ok(payload)
+                            },
+                        )
+                        .await
+                    {
                         return;
                     }
+                }
+                if attachment_replaced {
+                    continue;
                 }
                 if !client.is_socket_backed() {
                     return;
@@ -1254,6 +2268,8 @@ fn try_spawn_inner(
                 let mut backoff = ReconnectBackoff::new();
                 loop {
                     tokio::time::sleep(backoff.next_delay()).await;
+                    let transition_gate = event_state.transition_gate.clone();
+                    let _transition_guard = transition_gate.lock_owned().await;
                     let attach_snapshot = attach_context.read().await.clone();
                     let session_id = *session_id_state
                         .lock()
@@ -1275,14 +2291,18 @@ fn try_spawn_inner(
                                 active_agent_path: &active_agent_path,
                                 primary_agent: &primary_agent,
                                 last_applied_seq: &last_applied_seq,
+                                awaiting_durable: &awaiting_durable,
                             };
-                            let new_client = apply_reconnect_attached(attached, &incoming);
+                            let (new_client, payload) = split_reconnect_attached(attached);
                             *current_client.write().await = new_client;
+                            advance_attachment_epoch(&attach_snapshot);
+                            let active_model_state = apply_attached_payload(payload, &incoming);
+                            let _ = attachment_ready_tx.send(session_id);
                             saw_draining = false;
                             push_turn_event(
                                 &events,
                                 &event_notify,
-                                TurnEvent::DaemonLinkReconnected,
+                                TurnEvent::DaemonLinkReconnected { active_model_state },
                             );
                             break;
                         }
@@ -1326,6 +2346,9 @@ fn try_spawn_inner(
         foreground_target: foreground_target.map(queue_target_from_proto),
         active_model_state,
         session_id_state,
+        attachment_epoch,
+        submission_session_tx,
+        awaiting_durable: awaiting_durable.clone(),
         short_id,
         project_id,
         usage,
@@ -1353,11 +2376,15 @@ pub fn send_control_request(
     events: &Arc<Mutex<Vec<TurnEvent>>>,
     event_notify: &Arc<Notify>,
     request_id: ControlRequestId,
+    intended_session_id: Uuid,
+    intended_attachment_epoch: u64,
     req: Request,
 ) -> Result<(), ControlRequestNotDelivered> {
     let (response_tx, response_rx) = oneshot::channel();
     match control_tx.try_send(ControlRequest {
         request: req,
+        intended_session_id,
+        intended_attachment_epoch,
         response_tx,
     }) {
         Ok(()) => {
@@ -1522,27 +2549,13 @@ fn local_guidance_estimate(
 /// Run one request-response RPC over the runner's already-attached daemon
 /// client. Unlike socket helpers, this preserves daemon-side per-client
 /// attached session state.
-pub fn attached_request_tx_blocking(
-    attached_request_tx: mpsc::Sender<AttachedRequest>,
+pub(crate) fn attached_request_tx_blocking(
+    binding: AttachedRequestBinding,
     req: Request,
 ) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| {
-        runtime.block_on(async move {
-            let (response_tx, response_rx) = oneshot::channel();
-            attached_request_tx
-                .send(AttachedRequest {
-                    request: req,
-                    response_tx,
-                })
-                .await
-                .map_err(|_| "daemon client task has stopped".to_string())?;
-            response_rx
-                .await
-                .map_err(|_| "daemon client dropped reply channel".to_string())?
-        })
-    })
+    tokio::task::block_in_place(|| runtime.block_on(async move { binding.request(req).await }))
 }
 
 /// Run one blocking daemon request against an already-running daemon and
@@ -1862,6 +2875,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SessionPersistFailed { session_id, .. }
         | SessionDriverFailed { session_id, .. }
         | PreflightStarted { session_id, .. }
+        | UserMessagesTerminated { session_id, .. }
         | UserMessageRetracted { session_id, .. }
         | Notice { session_id, .. }
         | SkillAutoInjected { session_id, .. }
@@ -1949,6 +2963,7 @@ async fn reconnect_and_attach(
         history: payload.history,
         paused_work: payload.paused_work,
         repair_required: payload.repair_required,
+        active_model_state: payload.active_model_state,
     })
 }
 
@@ -2007,11 +3022,13 @@ fn attach_payload_from_response(
             history,
             paused_work,
             repair_required,
+            active_model_state,
             ..
         }) => Ok(AttachedPayload {
             history,
             paused_work,
             repair_required: repair_required.map(|repair| *repair),
+            active_model_state,
         }),
         Ok(other) => Err(ReconnectAttachError::Terminal(format!(
             "reconnect attach returned unexpected response: {other:?}"
@@ -2027,47 +3044,52 @@ fn attach_payload_from_response(
     }
 }
 
-fn apply_reconnect_attached(
-    attached: ReconnectAttach,
-    ctx: &IncomingEventContext<'_>,
-) -> DaemonClient {
+fn split_reconnect_attached(attached: ReconnectAttach) -> (DaemonClient, AttachedPayload) {
     let client = attached.client;
-    apply_attached_payload(
-        AttachedPayload {
-            history: attached.history,
-            paused_work: attached.paused_work,
-            repair_required: attached.repair_required,
-        },
-        ctx,
-    );
-    client
+    let payload = AttachedPayload {
+        history: attached.history,
+        paused_work: attached.paused_work,
+        repair_required: attached.repair_required,
+        active_model_state: attached.active_model_state,
+    };
+    (client, payload)
 }
 
-fn apply_attached_payload(attached: AttachedPayload, ctx: &IncomingEventContext<'_>) {
-    if let Some(repair) = attached.repair_required {
+fn apply_attached_payload(
+    attached: AttachedPayload,
+    ctx: &IncomingEventContext<'_>,
+) -> Option<proto::ActiveModelState> {
+    let AttachedPayload {
+        history,
+        paused_work,
+        repair_required,
+        active_model_state,
+    } = attached;
+    acknowledge_history_receipts(ctx.awaiting_durable, ctx.session_id, &history);
+    if let Some(repair) = repair_required {
         push_turn_event(
             ctx.events,
             ctx.event_notify,
             TurnEvent::ResumeRepairRequired { state: repair },
         );
     }
-    if !attached.paused_work.is_empty() {
+    if !paused_work.is_empty() {
         push_turn_event(
             ctx.events,
             ctx.event_notify,
             TurnEvent::PausedWorkAvailable {
                 session_id: ctx.session_id,
-                items: attached.paused_work,
+                items: paused_work,
             },
         );
     }
-    if !attached.history.is_empty() {
-        let max_seq = attached.history.iter().filter_map(history_entry_seq).max();
+    if !history.is_empty() {
+        let max_seq = history.iter().filter_map(history_entry_seq).max();
         if let Some(max_seq) = max_seq {
             apply_incoming_event(
                 proto::Event::HistoryReplay {
                     session_id: ctx.session_id,
-                    entries: attached.history,
+                    entries: history,
                     max_seq,
                 },
                 ctx,
@@ -2076,12 +3098,11 @@ fn apply_attached_payload(attached: AttachedPayload, ctx: &IncomingEventContext<
             push_turn_event(
                 ctx.events,
                 ctx.event_notify,
-                TurnEvent::HistoryReplay {
-                    entries: attached.history,
-                },
+                TurnEvent::HistoryReplay { entries: history },
             );
         }
     }
+    active_model_state
 }
 
 fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
@@ -2090,6 +3111,7 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
     if !is_global_event(&event) && event_session(&event) != Some(ctx.session_id) {
         return;
     }
+    acknowledge_event_receipts(ctx.awaiting_durable, ctx.session_id, &event);
     let event_session_id = event_session(&event);
 
     if let proto::Event::HistoryReplay {
@@ -2143,6 +3165,46 @@ fn apply_incoming_event(event: proto::Event, ctx: &IncomingEventContext<'_>) {
     }
 }
 
+fn acknowledge_history_receipts(
+    awaiting_durable: &Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+    session_id: Uuid,
+    history: &[proto::HistoryEntry],
+) {
+    for entry in history {
+        if let proto::HistoryEntry::User {
+            client_submission_ids,
+            ..
+        } = entry
+        {
+            acknowledge_durable_submissions(awaiting_durable, session_id, client_submission_ids);
+        }
+    }
+}
+
+fn acknowledge_event_receipts(
+    awaiting_durable: &Arc<Mutex<HashMap<Uuid, VecDeque<BoundUserSubmission>>>>,
+    session_id: Uuid,
+    event: &proto::Event,
+) {
+    let ids = match event {
+        proto::Event::UserMessageRecorded {
+            client_submission_ids,
+            ..
+        } => client_submission_ids,
+        proto::Event::QueuedUserMessagesFolded { queue_item_ids, .. } => queue_item_ids,
+        proto::Event::UserMessagesTerminated {
+            client_submission_ids,
+            ..
+        } => client_submission_ids,
+        proto::Event::HistoryReplay { entries, .. } => {
+            acknowledge_history_receipts(awaiting_durable, session_id, entries);
+            return;
+        }
+        _ => return,
+    };
+    acknowledge_durable_submissions(awaiting_durable, session_id, ids);
+}
+
 fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     use proto::Event::*;
     Some(match event {
@@ -2192,10 +3254,12 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         UserMessageRecorded {
             seq,
+            client_submission_ids,
             preflight_cleaned,
             ..
         } => TurnEvent::UserMessageRecorded {
             seq,
+            client_submission_ids,
             preflight_cleaned,
         },
         QueuedUserMessagesFolded {
@@ -2249,10 +3313,35 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             prompt_cache_retention,
             outcome,
         },
-        SessionPersistFailed { error, .. } => TurnEvent::SessionPersistFailed { error },
+        SessionPersistFailed {
+            client_submission_id,
+            error,
+            ..
+        } => TurnEvent::SessionPersistFailed {
+            client_submission_id,
+            error,
+        },
         SessionDriverFailed { error, .. } => TurnEvent::SessionDriverFailed { error },
-        PreflightStarted { .. } => TurnEvent::PreflightStarted,
-        UserMessageRetracted { .. } => TurnEvent::UserMessageRetracted,
+        PreflightStarted {
+            client_submission_ids,
+            ..
+        } => TurnEvent::PreflightStarted {
+            client_submission_ids,
+        },
+        UserMessagesTerminated {
+            client_submission_ids,
+            disposition,
+            ..
+        } => TurnEvent::UserMessagesTerminated {
+            client_submission_ids,
+            disposition,
+        },
+        UserMessageRetracted {
+            client_submission_ids,
+            ..
+        } => TurnEvent::UserMessageRetracted {
+            client_submission_ids,
+        },
         Notice { text, .. } | LspNotice { text } => TurnEvent::Notice { text },
         EnvDriftWarning { diff, policy, .. } => TurnEvent::Notice {
             text: format!(
@@ -2766,8 +3855,31 @@ fn queue_target_from_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn complete_test_submission() -> cockpit_core::engine::message::UserSubmission {
+        cockpit_core::engine::message::UserSubmission {
+            kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            text: "wire text with expanded tag and image sentinel".to_string(),
+            display_text: Some("visible @src/lib.rs [image]".to_string()),
+            tag_expansions: vec![proto::TagExpansionMeta {
+                tool: "read".to_string(),
+                path: "src/lib.rs".to_string(),
+                detail: "expanded source".to_string(),
+                ok: true,
+            }],
+            images: vec![vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3]],
+            forced_skill: Some("review".to_string()),
+            origin_principal: Some("flycockpit:test-user".to_string()),
+            job_id: Some("job-123".to_string()),
+            preflight_cleaned: Some("cleaned wire text".to_string()),
+            queue_item_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            client_submissions: Vec::new(),
+            pending_terminal_disposition: None,
+            queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        }
+    }
 
     #[test]
     fn protocol_mismatch_message_names_daemon_restart() {
@@ -2895,6 +4007,9 @@ mod tests {
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
+            transition_gate: Arc::new(AsyncMutex::new(())),
+            client_epoch_tx: watch::channel(0).0,
+            attachment_epoch: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -2940,6 +4055,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let active_agent = Arc::new(Mutex::new("Build".to_string()));
         let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
+        let (attachment_ready_tx, _attachment_ready_rx) = mpsc::unbounded_channel();
         (
             ClientEventState {
                 events: events.clone(),
@@ -2952,6 +4068,9 @@ mod tests {
                 session_id_state: Arc::new(Mutex::new(session_id)),
                 skill_refresh_tx,
                 skill_refresh_generation: 0,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+                attachment_ready_tx,
             },
             events,
         )
@@ -2967,6 +4086,998 @@ mod tests {
                 task_call_id: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn event_read_before_switch_gate_is_rejected_after_epoch_changes() {
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let switch_guard = transition_gate.clone().lock_owned().await;
+        let (epoch_tx, epoch_rx) = watch::channel(9_u64);
+
+        // Model an event already removed from the old client's stream and now
+        // waiting to enter the App queue behind the switch's transition gate.
+        let limbo_event =
+            tokio::spawn(
+                async move { lock_current_client_epoch(transition_gate, &epoch_rx, 9).await },
+            );
+        tokio::task::yield_now().await;
+        epoch_tx.send_modify(|epoch| *epoch = 10);
+        drop(switch_guard);
+
+        assert!(
+            limbo_event.await.unwrap().is_none(),
+            "an event read under the old attachment epoch must never enter the new epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_control_from_old_attachment_is_rejected_without_sending() {
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let (response_tx, response_rx) = oneshot::channel();
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_in_request = sent.clone();
+
+        dispatch_control_request_for_current_attachment(
+            ControlRequest {
+                request: Request::Prune,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 3,
+                response_tx,
+            },
+            &session_id_state,
+            &attachment_epoch,
+            transition_gate,
+            move |_request| async move {
+                sent_in_request.store(true, Ordering::Release);
+                Ok(Response::Ack)
+            },
+        )
+        .await;
+
+        assert!(!sent.load(Ordering::Acquire));
+        let error = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("attachment that has been replaced"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_lag_resync_rejects_queued_old_attached_request_without_sending() {
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let attach_context = test_attach_context("/tmp/project");
+        let (attachment_epoch, transition_gate) = {
+            let context = attach_context.read().await;
+            context.attachment_epoch.store(12, Ordering::Release);
+            (
+                context.attachment_epoch.clone(),
+                context.transition_gate.clone(),
+            )
+        };
+        let transition_guard = transition_gate.clone().lock_owned().await;
+        let (response_tx, response_rx) = oneshot::channel();
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_in_request = sent.clone();
+
+        let dispatch = tokio::spawn({
+            let session_id_state = session_id_state.clone();
+            let attachment_epoch = attachment_epoch.clone();
+            let transition_gate = transition_gate.clone();
+            async move {
+                dispatch_attached_request_for_current_attachment(
+                    AttachedRequest {
+                        request: Request::Prune,
+                        intended_session_id: session_id,
+                        intended_attachment_epoch: 12,
+                        response_tx,
+                    },
+                    &session_id_state,
+                    &attachment_epoch,
+                    transition_gate,
+                    move |_request| async move {
+                        sent_in_request.store(true, Ordering::Release);
+                        Ok(Response::Ack)
+                    },
+                )
+                .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let (skill_refresh_tx, _skill_refresh_rx) = watch::channel(0);
+        let (mut event_state, _events) = test_event_state(
+            session_id,
+            attach_context,
+            Arc::new(Mutex::new(None)),
+            skill_refresh_tx,
+        );
+        assert!(
+            event_state
+                .handle_event_with_resync(
+                    proto::Event::EventStreamLagged {
+                        session_id: Some(session_id),
+                        dropped: 1,
+                    },
+                    move |session_id, _attach_context, _last| async move {
+                        attach_payload_from_response(Ok(attached_response(session_id, Vec::new())))
+                    },
+                )
+                .await
+        );
+        assert_eq!(attachment_epoch.load(Ordering::Acquire), 13);
+        drop(transition_guard);
+        dispatch.await.unwrap();
+
+        assert!(!sent.load(Ordering::Acquire));
+        let error = response_rx.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("attachment that has been replaced"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_switch_flushes_every_previously_accepted_submission_before_attach() {
+        let old_session_id = Uuid::new_v4();
+        let (input_tx, mut input_rx) = mpsc::channel(2);
+        for text in ["held first", "queued second"] {
+            input_tx
+                .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                    submission: cockpit_core::engine::message::UserSubmission::text(
+                        text.to_string(),
+                    ),
+                    optimistic_submission_id: Uuid::new_v4(),
+                    intended_session_id: old_session_id,
+                    intended_attachment_epoch: 7,
+                })))
+                .await
+                .unwrap();
+        }
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let worker_delivered = delivered.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(input) = input_rx.recv().await {
+                match input {
+                    RunnerInput::Submission(bound) => {
+                        worker_delivered.lock().unwrap().push(bound.submission.text)
+                    }
+                    RunnerInput::RetainedRetry(_) => {
+                        panic!("retained retry cannot enter the public input channel")
+                    }
+                    RunnerInput::SubmissionBatch(batch) => worker_delivered
+                        .lock()
+                        .unwrap()
+                        .extend(batch.into_iter().map(|bound| bound.submission.text)),
+                    RunnerInput::Flush(flushed_tx) => {
+                        let _ = flushed_tx.send(());
+                        break;
+                    }
+                }
+            }
+        });
+
+        flush_accepted_user_submissions(&input_tx).await.unwrap();
+        worker.await.unwrap();
+        assert_eq!(
+            &*delivered.lock().unwrap(),
+            &["held first", "queued second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_drains_sixty_four_complete_batched_submissions_in_order() {
+        let session_id = Uuid::new_v4();
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let (_attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                attachment_epoch,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                events: Arc::new(Mutex::new(Vec::new())),
+                event_notify: Arc::new(Notify::new()),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+            },
+            move |_client_submission_id, submission| {
+                let sent_tx = sent_tx.clone();
+                async move {
+                    sent_tx.send(submission).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        let mut expected = Vec::new();
+        let mut batch = Vec::new();
+        for index in 0..64 {
+            let mut submission = complete_test_submission();
+            submission.text = format!("wire-{index}");
+            submission.display_text = Some(format!("display-{index}"));
+            expected.push(serde_json::to_value(&submission).unwrap());
+            batch.push(BoundUserSubmission {
+                submission,
+                optimistic_submission_id: Uuid::new_v4(),
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            });
+        }
+        input_tx
+            .send(RunnerInput::SubmissionBatch(batch))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        for _ in 0..64 {
+            let submission = tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+                .await
+                .expect("dispatcher must drain the retained batch")
+                .expect("dispatcher remains live");
+            delivered.push(serde_json::to_value(submission).unwrap());
+        }
+        assert_eq!(delivered, expected);
+        assert!(matches!(
+            sent_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(input_tx);
+        drop(submission_session_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_ack_retains_exact_submission_until_durable_receipt_and_reconnect_retries_it() {
+        let session_id = Uuid::new_v4();
+        let client_submission_id = Uuid::new_v4();
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let (_submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let (attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let submission = complete_test_submission();
+        let expected = serde_json::to_value(&submission).unwrap();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                attachment_epoch,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                events: events.clone(),
+                event_notify: Arc::new(Notify::new()),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: awaiting_durable.clone(),
+            },
+            move |id, submission| {
+                let sent_tx = sent_tx.clone();
+                async move {
+                    sent_tx
+                        .send((id, serde_json::to_value(submission).unwrap()))
+                        .unwrap();
+                    Ok(())
+                }
+            },
+        ));
+
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission,
+                optimistic_submission_id: client_submission_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+                .await
+                .unwrap(),
+            Some((client_submission_id, expected.clone()))
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let retained = awaiting_durable
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .and_then(|queue| queue.front().cloned());
+                if let Some(retained) = retained {
+                    assert_eq!(retained.optimistic_submission_id, client_submission_id);
+                    assert_eq!(serde_json::to_value(retained.submission).unwrap(), expected);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue ACK retains the complete payload");
+
+        attachment_ready_tx.send(session_id).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+                .await
+                .expect("reattach retries an unconfirmed ACK")
+                .expect("dispatcher remains live"),
+            (client_submission_id, expected)
+        );
+        assert!(drain_turn_events(&events).iter().any(|event| {
+            matches!(
+                event,
+                TurnEvent::UserMessageDispatchRestored {
+                    optimistic_submission_id,
+                    text,
+                    display_text,
+                    tag_expansions,
+                } if *optimistic_submission_id == client_submission_id
+                    && text == "wire text with expanded tag and image sentinel"
+                    && display_text.as_deref() == Some("visible @src/lib.rs [image]")
+                    && !tag_expansions.is_empty()
+            )
+        }));
+
+        acknowledge_durable_submissions(&awaiting_durable, session_id, &[client_submission_id]);
+        assert!(
+            awaiting_durable.lock().unwrap().get(&session_id).is_none(),
+            "the durable record/fold receipt is the release boundary"
+        );
+
+        drop(input_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[test]
+    fn session_switch_history_releases_durable_tracker_before_destination_is_published() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (mut runner, mut submission_session_rx) =
+            AgentRunner::stub_with_channels_and_submission_watch(control_tx, input_tx);
+        runner.last_applied_seq = Some(Arc::new(Mutex::new(Some(0))));
+
+        let destination = Uuid::new_v4();
+        let receipt_id = Uuid::new_v4();
+        let mut retained = complete_test_submission();
+        retained.text = "exact retained wire text".to_string();
+        runner.awaiting_durable.lock().unwrap().insert(
+            destination,
+            VecDeque::from([BoundUserSubmission {
+                submission: retained,
+                optimistic_submission_id: receipt_id,
+                intended_session_id: destination,
+                intended_attachment_epoch: 7,
+            }]),
+        );
+        let outcome = SessionSwitchOutcome {
+            target: SessionTarget::Resume {
+                session_id: destination,
+                since_seq: None,
+            },
+            session_id: destination,
+            short_id: "dest01".to_string(),
+            active_agent: "Build".to_string(),
+            active_agent_path: vec!["Build".to_string()],
+            last_applied_seq: Some(41),
+            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            active_model_state: None,
+            project_id: "project".to_string(),
+            history: vec![proto::HistoryEntry::User {
+                text: "exact retained wire text".to_string(),
+                display_text: Some("visible retained draft".to_string()),
+                tag_expansions: Vec::new(),
+                client_submission_ids: vec![receipt_id],
+                ts_ms: 1,
+                seq: 41,
+                origin_principal: None,
+            }],
+            paused_work: Vec::new(),
+            repair_required: None,
+            btw_fork: None,
+            daemon_version: "test".to_string(),
+            daemon_compatible: true,
+            transition_guard: None,
+        };
+
+        runner.apply_session_switch_outcome(&outcome);
+
+        assert!(
+            runner
+                .awaiting_durable
+                .lock()
+                .unwrap()
+                .get(&destination)
+                .is_none(),
+            "the authoritative attach history must clear receipts before the dispatcher wakes"
+        );
+        assert!(submission_session_rx.has_changed().unwrap());
+        assert_eq!(*submission_session_rx.borrow_and_update(), destination);
+    }
+
+    #[test]
+    fn every_terminal_disposition_releases_only_its_exact_retained_submission() {
+        for disposition in [
+            proto::UserMessageTerminalDisposition::Removed,
+            proto::UserMessageTerminalDisposition::Cancelled,
+            proto::UserMessageTerminalDisposition::PreflightRejected,
+        ] {
+            let session_id = Uuid::new_v4();
+            let terminal_id = Uuid::new_v4();
+            let still_pending_id = Uuid::new_v4();
+            let awaiting = Arc::new(Mutex::new(HashMap::from([(
+                session_id,
+                VecDeque::from([
+                    BoundUserSubmission {
+                        submission: complete_test_submission(),
+                        optimistic_submission_id: terminal_id,
+                        intended_session_id: session_id,
+                        intended_attachment_epoch: 2,
+                    },
+                    BoundUserSubmission {
+                        submission: complete_test_submission(),
+                        optimistic_submission_id: still_pending_id,
+                        intended_session_id: session_id,
+                        intended_attachment_epoch: 2,
+                    },
+                ]),
+            )])));
+
+            acknowledge_event_receipts(
+                &awaiting,
+                session_id,
+                &proto::Event::UserMessagesTerminated {
+                    session_id,
+                    client_submission_ids: vec![terminal_id],
+                    disposition,
+                },
+            );
+
+            let retained = awaiting.lock().unwrap();
+            let queue = retained.get(&session_id).expect("B stays retained");
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].optimistic_submission_id, still_pending_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_success_response_retries_same_id_and_payload_without_overtaking_or_blocking_flush()
+     {
+        let session_id = Uuid::new_v4();
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let (_attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(4);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(Mutex::new(HashMap::<Uuid, serde_json::Value>::new()));
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let first_response_dropped = Arc::new(AtomicBool::new(false));
+        let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                attachment_epoch,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                events: events.clone(),
+                event_notify: Arc::new(Notify::new()),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+            },
+            {
+                let attempts = attempts.clone();
+                let accepted = accepted.clone();
+                let execution_count = execution_count.clone();
+                let first_response_dropped = first_response_dropped.clone();
+                move |client_submission_id, submission| {
+                    let attempts = attempts.clone();
+                    let accepted = accepted.clone();
+                    let execution_count = execution_count.clone();
+                    let first_response_dropped = first_response_dropped.clone();
+                    let attempt_tx = attempt_tx.clone();
+                    async move {
+                        let payload = serde_json::to_value(submission).unwrap();
+                        attempts
+                            .lock()
+                            .unwrap()
+                            .push((client_submission_id, payload.clone()));
+                        attempt_tx.send(client_submission_id).unwrap();
+                        let mut accepted = accepted.lock().unwrap();
+                        match accepted.entry(client_submission_id) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(payload);
+                                execution_count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            std::collections::hash_map::Entry::Occupied(entry) => {
+                                assert_eq!(entry.get(), &payload, "retry payload must be exact");
+                            }
+                        }
+                        if !first_response_dropped.swap(true, Ordering::SeqCst) {
+                            classify_user_message_response(Ok(Response::Ack)).map(|_| ())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        ));
+
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let first = complete_test_submission();
+        let first_value = serde_json::to_value(&first).unwrap();
+        let mut second = complete_test_submission();
+        second.text = "second wire payload".to_string();
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission: first,
+                optimistic_submission_id: first_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(first_id)
+        );
+
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission: second,
+                optimistic_submission_id: second_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            flush_accepted_user_submissions(&input_tx),
+        )
+        .await
+        .expect("flush must not deadlock behind an ambiguous retry")
+        .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(first_id),
+            "A must retry before B"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(second_id),
+            "B must remain FIFO behind ambiguous A"
+        );
+        assert_eq!(execution_count.load(Ordering::SeqCst), 2);
+        {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(attempts.len(), 3);
+            assert_eq!(attempts[0].0, first_id);
+            assert_eq!(attempts[1].0, first_id);
+            assert_eq!(attempts[0].1, first_value);
+            assert_eq!(attempts[1].1, first_value);
+        }
+        assert!(
+            drain_turn_events(&events)
+                .iter()
+                .all(|event| !matches!(event, TurnEvent::UserMessageDispatchFailed { .. })),
+            "ambiguous transport loss must retain, not fail, the optimistic row"
+        );
+        drop(input_tx);
+        drop(submission_session_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deterministic_rejection_waits_without_spinning_then_retries_exact_fifo_on_wake() {
+        let session_id = Uuid::new_v4();
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let (_attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(4);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(Mutex::new(Vec::<(Uuid, serde_json::Value)>::new()));
+        let accept_first = Arc::new(AtomicBool::new(false));
+        let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                attachment_epoch,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                events: events.clone(),
+                event_notify: Arc::new(Notify::new()),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+            },
+            {
+                let attempts = attempts.clone();
+                let accept_first = accept_first.clone();
+                move |client_submission_id, submission| {
+                    let attempts = attempts.clone();
+                    let accept_first = accept_first.clone();
+                    let attempt_tx = attempt_tx.clone();
+                    async move {
+                        attempts.lock().unwrap().push((
+                            client_submission_id,
+                            serde_json::to_value(submission).unwrap(),
+                        ));
+                        attempt_tx.send(client_submission_id).unwrap();
+                        if client_submission_id == first_id && !accept_first.load(Ordering::Acquire)
+                        {
+                            Err(UserSubmissionSendError::NotAccepted(
+                                "repair required".to_string(),
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        ));
+
+        let first = complete_test_submission();
+        let first_value = serde_json::to_value(&first).unwrap();
+        let mut second = complete_test_submission();
+        second.text = "later wire payload".to_string();
+        let second_value = serde_json::to_value(&second).unwrap();
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission: first,
+                optimistic_submission_id: first_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(attempt_rx.recv().await, Some(first_id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), attempt_rx.recv())
+                .await
+                .is_err(),
+            "a deterministic rejection must not timer-spin"
+        );
+
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission: second,
+                optimistic_submission_id: second_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            attempt_rx.recv().await,
+            Some(first_id),
+            "later B retries retained A first"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), attempt_rx.recv())
+                .await
+                .is_err(),
+            "a still-rejected A must stop with B retained behind it"
+        );
+
+        accept_first.store(true, Ordering::Release);
+        submission_session_tx.send_replace(session_id);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(first_id),
+            "the explicit state-change wake retries A"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(second_id),
+            "B is released only after A succeeds"
+        );
+
+        {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(
+                attempts.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![first_id, first_id, first_id, second_id]
+            );
+            for (_, payload) in attempts.iter().take(3) {
+                assert_eq!(
+                    payload, &first_value,
+                    "every A retry payload is byte-equivalent"
+                );
+            }
+            assert_eq!(attempts[3].1, second_value);
+        }
+        assert_eq!(
+            drain_turn_events(&events)
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::UserMessageDispatchRetained { .. }))
+                .count(),
+            2,
+            "each rejected attempt is visible without becoming terminal"
+        );
+
+        drop(input_tx);
+        drop(submission_session_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_image_upload_failure_is_terminal_and_does_not_block_fifo() {
+        let session_id = Uuid::new_v4();
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let (submission_session_tx, submission_session_rx) = watch::channel(session_id);
+        let (_attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(2);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
+        let failed_id = Uuid::new_v4();
+        let delivered_id = Uuid::new_v4();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: Arc::new(Mutex::new(session_id)),
+                attachment_epoch,
+                transition_gate: Arc::new(AsyncMutex::new(())),
+                events: events.clone(),
+                event_notify: Arc::new(Notify::new()),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+            },
+            move |client_submission_id, _submission| {
+                let delivered_tx = delivered_tx.clone();
+                async move {
+                    if client_submission_id == failed_id {
+                        return Err(classify_image_upload_error(ImageUploadError::Usage(
+                            "image is too large".to_string(),
+                        )));
+                    }
+                    delivered_tx.send(client_submission_id).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+
+        input_tx
+            .send(RunnerInput::SubmissionBatch(vec![
+                BoundUserSubmission {
+                    submission: complete_test_submission(),
+                    optimistic_submission_id: failed_id,
+                    intended_session_id: session_id,
+                    intended_attachment_epoch: 4,
+                },
+                BoundUserSubmission {
+                    submission: cockpit_core::engine::message::UserSubmission::text("next payload"),
+                    optimistic_submission_id: delivered_id,
+                    intended_session_id: session_id,
+                    intended_attachment_epoch: 4,
+                },
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), delivered_rx.recv())
+                .await
+                .expect("permanent failure must not wedge the session FIFO"),
+            Some(delivered_id)
+        );
+        assert!(matches!(
+            drain_turn_events(&events).as_slice(),
+            [TurnEvent::UserMessageDispatchFailed {
+                error,
+                optimistic_submission_id,
+            }] if error == "image is too large" && *optimistic_submission_id == failed_id
+        ));
+
+        drop(input_tx);
+        drop(submission_session_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[test]
+    fn uncertain_image_upload_failures_remain_ambiguous() {
+        for error in [
+            ImageUploadError::Daemon("daemon unavailable".to_string()),
+            ImageUploadError::Transport("socket closed".to_string()),
+        ] {
+            assert!(matches!(
+                classify_image_upload_error(error),
+                UserSubmissionSendError::Ambiguous(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn same_session_reconnect_rebinds_and_delivers_the_complete_submission() {
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let attachment_epoch = Arc::new(AtomicU64::new(8));
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let expected = complete_test_submission();
+        let expected_value = serde_json::to_value(&expected).unwrap();
+        let (sent_tx, sent_rx) = oneshot::channel();
+
+        let outcome = dispatch_user_submission_for_current_attachment(
+            BoundUserSubmission {
+                submission: expected,
+                optimistic_submission_id: Uuid::new_v4(),
+                intended_session_id: session_id,
+                intended_attachment_epoch: 7,
+            },
+            &session_id_state,
+            &attachment_epoch,
+            transition_gate,
+            move |_client_submission_id, submission| async move {
+                sent_tx.send(submission).unwrap();
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            UserSubmissionDispatchOutcome::Delivered { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(sent_rx.await.unwrap()).unwrap(),
+            expected_value
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_session_defers_exact_payload_until_original_session_reattaches() {
+        let old_session_id = Uuid::new_v4();
+        let replacement_session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(replacement_session_id));
+        let attachment_epoch = Arc::new(AtomicU64::new(8));
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let (submission_session_tx, submission_session_rx) = watch::channel(replacement_session_id);
+        let (_attachment_ready_tx, attachment_ready_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(2);
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let expected = complete_test_submission();
+        let expected_value = serde_json::to_value(&expected).unwrap();
+        let dispatcher = tokio::spawn(run_user_submission_dispatcher(
+            input_rx,
+            UserSubmissionDispatcherContext {
+                session_id_state: session_id_state.clone(),
+                attachment_epoch: attachment_epoch.clone(),
+                transition_gate,
+                events: events.clone(),
+                event_notify: notify.clone(),
+                submission_session_rx,
+                attachment_ready_rx,
+                awaiting_durable: Arc::new(Mutex::new(HashMap::new())),
+            },
+            move |_client_submission_id, submission| {
+                let sent_tx = sent_tx.clone();
+                async move {
+                    sent_tx.send(submission).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+
+        input_tx
+            .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
+                submission: expected,
+                optimistic_submission_id: Uuid::new_v4(),
+                intended_session_id: old_session_id,
+                intended_attachment_epoch: 7,
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("dispatcher reports attachment-scoped retention");
+        assert!(matches!(
+            sent_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            drain_turn_events(&events).as_slice(),
+            [TurnEvent::Notice { text }] if text.contains("was retained")
+        ));
+
+        // Mirror AgentRunner::apply_session_switch_outcome ordering: update
+        // the applied identity first, then publish the recovery wake. The
+        // earlier transport-epoch signal is deliberately not involved.
+        *session_id_state.lock().unwrap() = old_session_id;
+        attachment_epoch.store(9, Ordering::Release);
+        submission_session_tx.send_replace(old_session_id);
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+            .await
+            .expect("reattach releases retained payload")
+            .expect("dispatcher remains live");
+        assert_eq!(serde_json::to_value(delivered).unwrap(), expected_value);
+        assert!(matches!(
+            sent_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            drain_turn_events(&events)
+                .iter()
+                .all(|event| { !matches!(event, TurnEvent::UserMessageDispatchFailed { .. }) })
+        );
+
+        drop(input_tx);
+        dispatcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_submission_failure_is_enqueued_before_session_transition_can_continue() {
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let attachment_epoch = Arc::new(AtomicU64::new(4));
+        let transition_gate = Arc::new(AsyncMutex::new(()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+
+        let optimistic_submission_id = Uuid::new_v4();
+        let outcome = dispatch_user_submission_for_current_attachment(
+            BoundUserSubmission {
+                submission: cockpit_core::engine::message::UserSubmission::text(
+                    "current payload".to_string(),
+                ),
+                optimistic_submission_id,
+                intended_session_id: session_id,
+                intended_attachment_epoch: 4,
+            },
+            &session_id_state,
+            &attachment_epoch,
+            transition_gate.clone(),
+            |_client_submission_id, _submission| async {
+                Err(UserSubmissionSendError::Rejected(
+                    "transport stopped".to_string(),
+                ))
+            },
+        )
+        .await;
+        assert!(transition_gate.try_lock().is_err());
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
+
+        let _ = record_user_submission_dispatch_outcome(
+            outcome,
+            &events,
+            &notify,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &awaiting_durable,
+        );
+        assert!(transition_gate.try_lock().is_ok());
+        assert!(matches!(
+            drain_turn_events(&events).as_slice(),
+            [TurnEvent::UserMessageDispatchFailed {
+                error,
+                optimistic_submission_id: failed_id,
+            }] if error == "transport stopped" && *failed_id == optimistic_submission_id
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3106,6 +5217,13 @@ mod tests {
     async fn lag_marker_triggers_since_seq_reattach() {
         let session_id = Uuid::new_v4();
         let attach_context = test_attach_context("/tmp/project");
+        let (attachment_epoch, mut client_epoch_rx) = {
+            let context = attach_context.read().await;
+            (
+                context.attachment_epoch.clone(),
+                context.client_epoch_tx.subscribe(),
+            )
+        };
         let (skill_refresh_tx, _rx) = watch::channel(0);
         let last_applied_seq = Arc::new(Mutex::new(Some(4)));
         let (mut state, events) = test_event_state(
@@ -3165,12 +5283,85 @@ mod tests {
                 .await
         );
         assert_eq!(current_last_applied_seq(&last_applied_seq), Some(5));
+        assert_eq!(attachment_epoch.load(Ordering::Acquire), 1);
+        client_epoch_rx
+            .changed()
+            .await
+            .expect("successful lag re-attach must publish a new client epoch");
+        assert_eq!(*client_epoch_rx.borrow_and_update(), 1);
         let drained = drain_turn_events(&events);
         assert!(matches!(
             drained.as_slice(),
-            [TurnEvent::HistoryReplay { entries }]
+            [TurnEvent::HistoryReplay { entries }, TurnEvent::DaemonLinkResynced { active_model_state: None }]
                 if matches!(entries.as_slice(), [proto::HistoryEntry::Assistant { text, seq: 5, .. }] if text == "replayed")
         ));
+    }
+
+    #[tokio::test]
+    async fn local_reconnect_attach_retains_authoritative_active_model_snapshot() {
+        let session_id = Uuid::new_v4();
+        let expected = proto::ActiveModelState {
+            selection: cockpit_config::providers::ActiveModelRef {
+                provider: "local".to_string(),
+                model: "reconnected".to_string(),
+                reasoning_effort: Some(cockpit_config::providers::ActiveReasoningEffort {
+                    value: "high".to_string(),
+                }),
+                thinking_mode: Some(cockpit_config::providers::ThinkingMode::High),
+                prompt_cache_retention: Some(
+                    cockpit_config::providers::PromptCacheRetention::Extended,
+                ),
+            },
+            default_selection: None,
+            diverged: true,
+            generation: 0,
+        };
+        let mut response = attached_response(session_id, Vec::new());
+        let Response::Attached {
+            active_model_state, ..
+        } = &mut response
+        else {
+            unreachable!("attached_response always returns Attached")
+        };
+        *active_model_state = Some(expected.clone());
+        let attach_context = AttachRequestContext {
+            project_root: "/tmp/project".to_string(),
+            no_sandbox: false,
+            env_snapshot: cockpit_core::env_snapshot::EnvSnapshotWire {
+                source: cockpit_core::env_snapshot::EnvSnapshotSource::TuiShell,
+                digest: String::new(),
+                vars: std::collections::HashMap::new(),
+            },
+            transition_gate: Arc::new(AsyncMutex::new(())),
+            client_epoch_tx: watch::channel(0).0,
+            attachment_epoch: Arc::new(AtomicU64::new(0)),
+        };
+        let last_applied_seq = Arc::new(Mutex::new(Some(9)));
+
+        let payload = request_attach_payload(
+            session_id,
+            &attach_context,
+            &last_applied_seq,
+            proto::PROTOCOL_VERSION,
+            |request| async move {
+                assert!(matches!(
+                    request,
+                    Request::Attach {
+                        session_id: Some(actual),
+                        since_seq: Some(9),
+                        ..
+                    } if actual == session_id
+                ));
+                Ok(Ok(response))
+            },
+        )
+        .await;
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(_) => panic!("reconnect attach snapshot must parse"),
+        };
+
+        assert_eq!(payload.active_model_state, Some(expected));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3213,8 +5404,13 @@ mod tests {
         let drained = drain_turn_events(&events);
         assert!(!drained.iter().any(|event| matches!(
             event,
-            TurnEvent::DaemonLinkReconnecting { .. } | TurnEvent::DaemonLinkReconnected
+            TurnEvent::DaemonLinkReconnecting { .. } | TurnEvent::DaemonLinkReconnected { .. }
         )));
+        assert!(
+            drained
+                .iter()
+                .any(|event| matches!(event, TurnEvent::DaemonLinkResynced { .. }))
+        );
         assert!(
             drained
                 .iter()
@@ -3249,6 +5445,9 @@ mod tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            attachment_epoch: Arc::new(AtomicU64::new(0)),
+            submission_session_tx: watch::channel(uuid::Uuid::nil()).0,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -3394,6 +5593,9 @@ mod tests {
                 digest: String::new(),
                 vars: std::collections::HashMap::new(),
             },
+            transition_gate: Arc::new(AsyncMutex::new(())),
+            client_epoch_tx: watch::channel(0).0,
+            attachment_epoch: Arc::new(AtomicU64::new(0)),
         }));
         let last_applied_seq = Arc::new(Mutex::new(Some(9)));
         let session_id_state = Arc::new(Mutex::new(initial_session_id));
@@ -3469,6 +5671,37 @@ mod tests {
             }
             other => panic!("expected one attach request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn successful_new_attach_cancels_the_outgoing_turn_exactly_once_when_requested() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        cancel_outgoing_turn_after_successful_attach(true, move || {
+            captured.lock().unwrap().push(Request::CancelTurn);
+            async { Ok(Ok(Response::Ack)) }
+        })
+        .await;
+
+        assert!(matches!(
+            requests.lock().unwrap().as_slice(),
+            [Request::CancelTurn]
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_new_attach_does_not_cancel_the_outgoing_session() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_request = called.clone();
+
+        cancel_outgoing_turn_after_successful_attach(false, move || {
+            called_in_request.store(true, Ordering::Release);
+            async { Ok(Ok(Response::Ack)) }
+        })
+        .await;
+
+        assert!(!called.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3547,6 +5780,7 @@ mod tests {
         let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
         let primary_agent = Arc::new(Mutex::new("Build".to_string()));
         let last_applied_seq = Arc::new(Mutex::new(None));
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
         let incoming = IncomingEventContext {
             session_id,
             events: &events,
@@ -3555,6 +5789,7 @@ mod tests {
             active_agent_path: &active_agent_path,
             primary_agent: &primary_agent,
             last_applied_seq: &last_applied_seq,
+            awaiting_durable: &awaiting_durable,
         };
 
         apply_incoming_event(
@@ -3708,6 +5943,7 @@ mod tests {
         let active_agent_path = Arc::new(Mutex::new(vec!["Build".to_string()]));
         let primary_agent = Arc::new(Mutex::new("Build".to_string()));
         let last = Arc::new(Mutex::new(Some(5)));
+        let awaiting_durable = Arc::new(Mutex::new(HashMap::new()));
         let incoming = IncomingEventContext {
             session_id: sid,
             events: &events,
@@ -3716,6 +5952,7 @@ mod tests {
             active_agent_path: &active_agent_path,
             primary_agent: &primary_agent,
             last_applied_seq: &last,
+            awaiting_durable: &awaiting_durable,
         };
 
         apply_incoming_event(

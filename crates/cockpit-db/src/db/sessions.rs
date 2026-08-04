@@ -2834,6 +2834,14 @@ mod tests {
         let mut parent = db.new_session_row("p", "/proj", "Build").await.unwrap();
         parent.provider = Some("anthropic".to_string());
         parent.model = Some("opus-4-7".to_string());
+        let model_selection = serde_json::json!({
+            "provider": "anthropic",
+            "model": "opus-4-7",
+            "reasoning_effort": { "value": "high" },
+            "thinking_mode": "high",
+            "prompt_cache_retention": "extended"
+        });
+        parent.model_selection_json = Some(model_selection.to_string());
         parent.redaction_table_json = Some(
             r#"{"entries":[["fork-secret","$TEST"]],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
                 .to_string(),
@@ -2860,6 +2868,15 @@ mod tests {
         );
         assert_eq!(fork.provider.as_deref(), Some("anthropic"));
         assert_eq!(fork.model.as_deref(), Some("opus-4-7"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                fork.model_selection_json
+                    .as_deref()
+                    .expect("fork inherits complete model selection")
+            )
+            .unwrap(),
+            model_selection
+        );
         assert_eq!(fork.redaction_table_json, parent.redaction_table_json);
         assert_eq!(
             fork.model_system_prompt_snapshot_json,

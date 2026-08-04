@@ -26,6 +26,50 @@ fn set_prompt_cache_retention_capability(
     }
 }
 
+fn set_reasoning_effort_capability(
+    cfg: &mut crate::config::providers::ProvidersConfig,
+    provider: &str,
+    model: &str,
+) {
+    use crate::config::providers::{
+        CapabilitySource, CapabilityValue, ModelCapabilities, ModelEntry,
+        ReasoningEffortCapability, ReasoningEffortRequestMapping,
+    };
+
+    let capability = ReasoningEffortCapability {
+        values: vec![CapabilityValue {
+            value: "xhigh".to_string(),
+            label: None,
+            description: None,
+        }],
+        default: None,
+        request_mapping: Some(ReasoningEffortRequestMapping::JsonField {
+            field: "reasoning_effort".to_string(),
+            values: std::collections::BTreeMap::from([(
+                "xhigh".to_string(),
+                serde_json::json!("xhigh"),
+            )]),
+        }),
+        source: Some(CapabilitySource::Live),
+    };
+    let entry = cfg
+        .providers
+        .get_mut(provider)
+        .expect("provider exists in model-switch harness");
+    if let Some(model_entry) = entry.models.iter_mut().find(|entry| entry.id == model) {
+        model_entry.capabilities.reasoning_effort = Some(capability);
+    } else {
+        entry.models.push(ModelEntry {
+            id: model.to_string(),
+            capabilities: ModelCapabilities {
+                reasoning_effort: Some(capability),
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        });
+    }
+}
+
 fn edit_model_switch_config(
     driver: &mut Driver,
     edit: impl FnOnce(&mut crate::config::providers::ProvidersConfig),
@@ -96,8 +140,8 @@ fn retention_extended_maps_to_24h_only_when_capability_supported() {
 }
 
 #[tokio::test]
-async fn session_override_wins_over_persisted_retention_preference() {
-    use crate::config::providers::{CapabilityStatus, PromptCacheRetention};
+async fn session_selection_wins_over_config_default_retention() {
+    use crate::config::providers::{ActiveModelRef, CapabilityStatus, PromptCacheRetention};
 
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -114,16 +158,22 @@ async fn session_override_wins_over_persisted_retention_preference() {
             .prompt_cache_retention = Some(PromptCacheRetention::Extended);
     });
     driver
-        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .session
+        .set_active_model_ref(ActiveModelRef {
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: Some(PromptCacheRetention::Default),
+        })
+        .unwrap();
+    driver
+        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
         .await;
+    drain_until_active_model_state(&mut rx);
     assert_eq!(
-        driver.stack[0]
-            .agent
-            .params
-            .prompt_cache_retention
-            .as_deref(),
-        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE),
-        "persisted extended preference applies when no session override is set"
+        driver.stack[0].agent.params.prompt_cache_retention, None,
+        "the session's explicit default-retention choice wins over the configured default"
     );
     let background = driver.spawn_args(false);
     assert_eq!(
@@ -133,20 +183,6 @@ async fn session_override_wins_over_persisted_retention_preference() {
     assert_eq!(
         background.params.prompt_cache_key, None,
         "background/utility spawns must not inherit the foreground cache key"
-    );
-
-    edit_model_switch_config(&mut driver, |cfg| {
-        cfg.active_model
-            .as_mut()
-            .expect("active model exists")
-            .prompt_cache_retention = Some(PromptCacheRetention::Default);
-    });
-    driver
-        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
-        .await;
-    assert_eq!(
-        driver.stack[0].agent.params.prompt_cache_retention, None,
-        "persisted default omits the wire key"
     );
 
     driver
@@ -184,7 +220,7 @@ async fn session_override_wins_over_persisted_retention_preference() {
         .await;
     assert_eq!(
         driver.stack[0].agent.params.prompt_cache_retention, None,
-        "clearing the session override returns to the persisted default"
+        "clearing /longcache returns to the durable session preference"
     );
     match rx.try_recv().expect("longcache emits off state") {
         TurnEvent::LongcacheState { enabled, supported } => {
@@ -194,6 +230,16 @@ async fn session_override_wins_over_persisted_retention_preference() {
         other => panic!("expected LongcacheState, got {other:?}"),
     }
 
+    driver
+        .session
+        .set_active_model_ref(ActiveModelRef {
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: Some(PromptCacheRetention::Extended),
+        })
+        .unwrap();
     edit_model_switch_config(&mut driver, |cfg| {
         cfg.active_model
             .as_mut()
@@ -201,22 +247,25 @@ async fn session_override_wins_over_persisted_retention_preference() {
             .prompt_cache_retention = None;
     });
     driver
-        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
         .await;
+    drain_until_active_model_state(&mut rx);
     assert_eq!(
-        driver.prompt_cache_retention_preference, None,
-        "absent persisted preference is inherited as provider default"
+        driver.prompt_cache_retention_preference,
+        Some(PromptCacheRetention::Extended),
+        "config refresh retains the durable session preference"
     );
     assert_eq!(
-        driver.stack[0].agent.params.prompt_cache_retention, None,
-        "neither override nor persisted preference omits retention"
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(PromptCacheRetention::EXTENDED_WIRE_VALUE),
+        "session extended retention remains active when the configured default differs"
     );
 
     edit_model_switch_config(&mut driver, |cfg| {
-        cfg.active_model
-            .as_mut()
-            .expect("active model exists")
-            .prompt_cache_retention = Some(PromptCacheRetention::Extended);
         set_prompt_cache_retention_capability(
             cfg,
             "provider-a",
@@ -225,11 +274,12 @@ async fn session_override_wins_over_persisted_retention_preference() {
         );
     });
     driver
-        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
         .await;
+    drain_until_active_model_state(&mut rx);
     assert_eq!(
         driver.stack[0].agent.params.prompt_cache_retention, None,
-        "unknown capability suppresses persisted extended retention"
+        "unknown capability suppresses the session's extended retention"
     );
 
     edit_model_switch_config(&mut driver, |cfg| {
@@ -241,12 +291,58 @@ async fn session_override_wins_over_persisted_retention_preference() {
         );
     });
     driver
-        .run_control(DriverControl::RefreshPromptCacheRetention, &tx)
+        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
         .await;
+    drain_until_active_model_state(&mut rx);
     assert_eq!(
         driver.stack[0].agent.params.prompt_cache_retention, None,
-        "unsupported capability suppresses persisted extended retention"
+        "unsupported capability suppresses the session's extended retention"
     );
+}
+
+#[tokio::test]
+async fn config_refresh_emits_same_generation_full_default_and_divergence_correction() {
+    use crate::config::providers::{
+        ActiveModelRef, ActiveReasoningEffort, PromptCacheRetention, ThinkingMode,
+    };
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let corrected_default = ActiveModelRef {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        reasoning_effort: Some(ActiveReasoningEffort {
+            value: "high".into(),
+        }),
+        thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: Some(PromptCacheRetention::Extended),
+    };
+    edit_model_switch_config(&mut driver, |cfg| {
+        cfg.active_model = Some(corrected_default.clone());
+    });
+
+    driver
+        .run_control(DriverControl::RefreshConfigDerivedState, &tx)
+        .await;
+
+    match rx
+        .try_recv()
+        .expect("config refresh emits model correction")
+    {
+        TurnEvent::ActiveModelState {
+            selection,
+            default_selection,
+            diverged,
+            generation,
+        } => {
+            assert_eq!(selection.provider, "provider-a");
+            assert_eq!(selection.model, "model-a");
+            assert_eq!(default_selection, Some(corrected_default));
+            assert!(diverged);
+            assert_eq!(generation, 0, "config correction is not a model selection");
+        }
+        other => panic!("expected ActiveModelState, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -453,6 +549,7 @@ async fn live_model_switch_routes_next_request_to_new_model() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -521,6 +618,7 @@ async fn model_switch_carries_prompt_cache_retention() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -587,6 +685,7 @@ async fn llm_mode_reresolved_on_model_switch() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -628,6 +727,7 @@ async fn live_model_switch_commits_config_and_session_together() {
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: true,
+            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -667,6 +767,208 @@ async fn live_model_switch_commits_config_and_session_together() {
         other => panic!("expected successful default save, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn initialize_default_if_missing_does_not_replace_existing_default() {
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                initialize_default_if_missing: true,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_config_active_model(&driver, "provider-a", "model-a");
+    drain_until_active_model_state(&mut rx);
+    match rx.try_recv().expect("terminal selection result") {
+        TurnEvent::ModelSelectionResult {
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Applied {
+                    active_state,
+                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                },
+            ..
+        } => {
+            assert_eq!(active_state.selection.provider, "provider-b");
+            assert_eq!(
+                active_state
+                    .default_selection
+                    .as_ref()
+                    .map(|value| value.provider.as_str()),
+                Some("provider-a")
+            );
+            assert!(active_state.diverged);
+        }
+        other => panic!("expected conditional default no-op, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn initialize_default_if_missing_saves_first_successful_selection() {
+    let (mut driver, _tmp) = model_switch_driver();
+    edit_model_switch_config(&mut driver, |cfg| cfg.active_model = None);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: false,
+                initialize_default_if_missing: true,
+                trigger: crate::session::ModelSwitchTrigger::Picker,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    assert_config_active_model(&driver, "provider-b", "model-b");
+    drain_until_active_model_state(&mut rx);
+    match rx.try_recv().expect("terminal selection result") {
+        TurnEvent::ModelSelectionResult {
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Applied {
+                    active_state,
+                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                },
+            ..
+        } => {
+            assert_eq!(active_state.default_selection, Some(active_state.selection));
+            assert!(!active_state.diverged);
+        }
+        other => panic!("expected first-selection default save, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn concurrent_stale_workers_initialize_exactly_one_default() {
+    let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
+        model_switch_drivers_with_shared_disk_config_without_default();
+    let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
+    let (tx_b, mut rx_b) = mpsc::channel::<TurnEvent>(64);
+    let root = shared.path();
+
+    let a = run_control_with_trusted_project_config(
+        &mut driver_a,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            persist_as_default: false,
+            initialize_default_if_missing: true,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx_a,
+    );
+    let b = run_control_with_trusted_project_config(
+        &mut driver_b,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: false,
+            initialize_default_if_missing: true,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &tx_b,
+    );
+    tokio::join!(a, b);
+
+    let outcome_a = terminal_default_update(&mut rx_a);
+    let outcome_b = terminal_default_update(&mut rx_b);
+    assert_eq!(
+        [outcome_a, outcome_b]
+            .into_iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+                )
+            })
+            .count(),
+        1,
+        "only the first serialized initializer may save the default"
+    );
+    let active = crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
+        .unwrap()
+        .providers()
+        .active_model
+        .expect("one initializer persisted a default");
+    assert!(
+        (active.provider == "provider-a" && active.model == "model-a")
+            || (active.provider == "provider-b" && active.model == "model-b")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_explicit_replace_always_wins_over_stale_initializer() {
+    let (mut explicit_driver, mut initializing_driver, shared, _initializing_tmp) =
+        model_switch_drivers_with_shared_disk_config_without_default();
+    let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
+    let (initialize_tx, _initialize_rx) = mpsc::channel::<TurnEvent>(64);
+    let root = shared.path();
+
+    let explicit = run_control_with_trusted_project_config(
+        &mut explicit_driver,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            persist_as_default: true,
+            initialize_default_if_missing: false,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &explicit_tx,
+    );
+    let initialize = run_control_with_trusted_project_config(
+        &mut initializing_driver,
+        root,
+        DriverControl::SetActiveModel {
+            selection_id: uuid::Uuid::new_v4(),
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            persist_as_default: false,
+            initialize_default_if_missing: true,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        &initialize_tx,
+    );
+    tokio::join!(explicit, initialize);
+
+    assert_disk_config_active_model(root, "provider-a", "model-a");
+}
+
 #[tokio::test]
 async fn expired_model_selection_deadline_rejects_without_mutating_session() {
     let (mut driver, _tmp) = model_switch_driver();
@@ -683,6 +985,7 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -707,7 +1010,7 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
             ..
         } => {
             assert_eq!(actual, selection_id);
-            assert_eq!(diagnostic_code, "model_switch_rejected");
+            assert_eq!(diagnostic_code, "model_selection_deadline_exceeded");
         }
         other => panic!("expected deadline rejection, got {other:?}"),
     }
@@ -715,6 +1018,96 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
         rx.try_recv().is_err(),
         "deadline emits exactly one terminal result"
     );
+}
+
+#[tokio::test]
+async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation() {
+    use crate::config::providers::{ActiveModelRef, ActiveModelWriteMode, ConfigDoc};
+
+    let (mut driver, tmp) = model_switch_driver_with_disk_config();
+    let root = tmp.path();
+    let config_path = root.join(".cockpit/config.json");
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let held = crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+        ConfigDoc::prepare_effective_active_model_write(
+            root,
+            &config_path,
+            &ActiveModelRef {
+                provider: "provider-a".into(),
+                model: "model-a".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            ActiveModelWriteMode::Replace,
+        )
+        .unwrap()
+    });
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let selection_id = uuid::Uuid::new_v4();
+    let terminal_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+
+    crate::config::trust::scope_workspace_trust_policy(
+        policy,
+        driver.run_control(
+            DriverControl::SetActiveModelWithDeadline {
+                selection_id,
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(150),
+                terminal_claimed: terminal_claimed.clone(),
+                completion: completion_tx,
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                initialize_default_if_missing: false,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        ),
+    )
+    .await;
+    completion_rx.await.expect("driver completion signal");
+
+    assert!(terminal_claimed.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_disk_config_active_model(root, "provider-a", "model-a");
+    match rx.try_recv().expect("held lock deadline rejection") {
+        TurnEvent::ModelSelectionResult {
+            selection_id: actual,
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                    diagnostic_code, ..
+                },
+            ..
+        } => {
+            assert_eq!(actual, selection_id);
+            assert_eq!(diagnostic_code, "model_selection_deadline_exceeded");
+        }
+        other => panic!("expected deadline rejection, got {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "deadline must emit one terminal result"
+    );
+
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        driver.session.active_provider().as_deref(),
+        Some("provider-a")
+    );
+    assert_disk_config_active_model(root, "provider-a", "model-a");
 }
 
 #[tokio::test]
@@ -734,6 +1127,7 @@ async fn worker_terminal_claim_before_commit_prevents_late_model_mutation() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -756,10 +1150,10 @@ async fn worker_terminal_claim_before_commit_prevents_late_model_mutation() {
     );
 }
 
-/// A switch requested while a child frame is foregrounded is applied to that
-/// active frame and never to the parked root frame.
+/// A session model switch always updates the durable root while a foreground
+/// child retains its pinned model until it returns.
 #[tokio::test]
-async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
+async fn live_model_switch_from_subagent_frame_converges_session_and_parked_root() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     push_test_child(&mut driver, Vec::new());
@@ -771,6 +1165,7 @@ async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -780,16 +1175,21 @@ async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
         )
         .await;
 
-    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
-    assert_eq!(driver.stack[1].agent.model.provider_id(), "provider-b");
-    assert_eq!(driver.stack[1].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[1].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[1].agent.model.model_id_ref(), "model-a");
     assert_eq!(
         driver.session.active_provider().as_deref(),
         Some("provider-b")
     );
     assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
     assert_config_active_model(&driver, "provider-b", "model-b");
+
+    driver.stack.pop().expect("interactive child returns");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
 }
 
 /// Reasoning effort and thinking mode selected by the client survive the
@@ -798,6 +1198,9 @@ async fn live_model_switch_from_subagent_frame_applies_to_active_child() {
 async fn live_model_switch_persists_requested_reasoning_options() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_reasoning_effort_capability(cfg, "provider-b", "model-b");
+    });
 
     driver
         .run_control(
@@ -806,6 +1209,7 @@ async fn live_model_switch_persists_requested_reasoning_options() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some(crate::config::providers::ThinkingMode::High),
@@ -831,6 +1235,11 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         persisted.thinking_mode,
         Some(crate::config::providers::ThinkingMode::High)
     );
+    assert_eq!(
+        driver.stack[0].agent.params.additional_params,
+        Some(serde_json::json!({ "reasoning_effort": "xhigh" })),
+        "the committed default selection is applied to the live inference frame"
+    );
 
     let (cfg, _, _) = driver
         .test_providers_override
@@ -850,6 +1259,12 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         active.thinking_mode,
         Some(crate::config::providers::ThinkingMode::High)
     );
+    driver.refresh_active_frame_for_turn(&tx).await;
+    assert_eq!(
+        driver.stack[0].agent.params.additional_params,
+        Some(serde_json::json!({ "reasoning_effort": "xhigh" })),
+        "the first turn-boundary rebuild retains the committed rich selection"
+    );
 }
 
 #[tokio::test]
@@ -857,6 +1272,15 @@ async fn same_identity_preference_change_is_applied_and_persisted() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     let before = Arc::as_ptr(&driver.stack[0].agent);
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_reasoning_effort_capability(cfg, "provider-a", "model-a");
+        set_prompt_cache_retention_capability(
+            cfg,
+            "provider-a",
+            "model-a",
+            crate::config::providers::CapabilityStatus::Supported,
+        );
+    });
 
     driver
         .run_control(
@@ -865,10 +1289,13 @@ async fn same_identity_preference_change_is_applied_and_persisted() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: false,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some(crate::config::providers::ThinkingMode::High),
-                prompt_cache_retention: None,
+                prompt_cache_retention: Some(
+                    crate::config::providers::PromptCacheRetention::Extended,
+                ),
             },
             &tx,
         )
@@ -894,6 +1321,22 @@ async fn same_identity_preference_change_is_applied_and_persisted() {
         persisted.thinking_mode,
         Some(crate::config::providers::ThinkingMode::High)
     );
+    assert_eq!(
+        persisted.prompt_cache_retention,
+        Some(crate::config::providers::PromptCacheRetention::Extended)
+    );
+    assert_eq!(
+        driver.stack[0].agent.params.additional_params,
+        Some(serde_json::json!({ "reasoning_effort": "xhigh" }))
+    );
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(crate::config::providers::PromptCacheRetention::EXTENDED_WIRE_VALUE)
+    );
     let state = drain_until_active_model_state(&mut rx);
     match state {
         TurnEvent::ActiveModelState {
@@ -908,7 +1351,22 @@ async fn same_identity_preference_change_is_applied_and_persisted() {
         }
         other => panic!("expected ActiveModelState, got {other:?}"),
     }
-    assert_terminal_model_selection(&mut rx, true);
+    assert_terminal_model_selection(&mut rx, None);
+    driver.refresh_active_frame_for_turn(&tx).await;
+    assert_eq!(
+        driver.stack[0].agent.params.additional_params,
+        Some(serde_json::json!({ "reasoning_effort": "xhigh" })),
+        "session-only reasoning survives the first queued-turn rebuild"
+    );
+    assert_eq!(
+        driver.stack[0]
+            .agent
+            .params
+            .prompt_cache_retention
+            .as_deref(),
+        Some(crate::config::providers::PromptCacheRetention::EXTENDED_WIRE_VALUE),
+        "session-only cache retention survives the first queued-turn rebuild"
+    );
 }
 
 /// Switching to an unconfigured model surfaces a loud `Notice` error and
@@ -925,6 +1383,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
                 provider: "provider-c".into(), // never configured
                 model: "model-c".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -960,7 +1419,7 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
     assert_config_active_model(&driver, "provider-a", "model-a");
     assert_one_model_switch_event(&driver, "build_failed", true).await;
     drain_until_active_model_state(&mut rx);
-    assert_terminal_model_selection(&mut rx, false);
+    assert_terminal_model_selection(&mut rx, Some("model_selection_build_failed"));
 }
 
 /// A session-row persistence failure aborts before config commit and restores
@@ -978,6 +1437,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -998,7 +1458,7 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     assert_config_active_model(&driver, "provider-a", "model-a");
     assert_one_model_switch_event(&driver, "send_failed", true).await;
     drain_until_active_model_state(&mut rx);
-    assert_terminal_model_selection(&mut rx, false);
+    assert_terminal_model_selection(&mut rx, Some("model_selection_session_persist_failed"));
 }
 
 /// Saving the future default is a secondary outcome: a config write failure
@@ -1016,6 +1476,7 @@ async fn live_model_switch_config_write_failure_keeps_session_switch() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1071,6 +1532,7 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
                 provider: "provider-c".into(),
                 model: "model-c".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1116,6 +1578,7 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1187,6 +1650,7 @@ async fn live_model_switch_same_model_is_noop() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1214,6 +1678,7 @@ async fn live_model_switch_emits_active_model_state_event() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1259,6 +1724,7 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: true,
+            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -1323,7 +1789,10 @@ fn assert_notice_contains(rx: &mut mpsc::Receiver<TurnEvent>, expected: &str) {
     }
 }
 
-fn assert_terminal_model_selection(rx: &mut mpsc::Receiver<TurnEvent>, applied: bool) {
+fn assert_terminal_model_selection(
+    rx: &mut mpsc::Receiver<TurnEvent>,
+    rejection_code: Option<&str>,
+) {
     match rx
         .try_recv()
         .expect("a dispatch-accepted selection emits one terminal result")
@@ -1334,22 +1803,24 @@ fn assert_terminal_model_selection(rx: &mut mpsc::Receiver<TurnEvent>, applied: 
             ..
         } => {
             assert_eq!(selection_id, uuid::Uuid::nil());
-            match (applied, outcome) {
+            match (rejection_code, outcome) {
                 (
-                    true,
+                    None,
                     crate::daemon::proto::ModelSelectionOutcome::Applied { active_state, .. },
                 ) => {
                     assert_eq!(active_state.generation, 1);
                 }
                 (
-                    false,
+                    Some(expected_code),
                     crate::daemon::proto::ModelSelectionOutcome::Rejected {
                         diagnostic_code, ..
                     },
                 ) => {
-                    assert_eq!(diagnostic_code, "model_switch_rejected");
+                    assert_eq!(diagnostic_code, expected_code);
                 }
-                (expected, actual) => panic!("expected applied={expected}, got {actual:?}"),
+                (expected, actual) => {
+                    panic!("expected rejection code {expected:?}, got {actual:?}")
+                }
             }
         }
         other => panic!("expected ModelSelectionResult, got {other:?}"),
@@ -1365,6 +1836,19 @@ fn drain_until_active_model_state(rx: &mut mpsc::Receiver<TurnEvent>) -> TurnEve
     }
 }
 
+fn terminal_default_update(
+    rx: &mut mpsc::Receiver<TurnEvent>,
+) -> crate::daemon::proto::DefaultModelUpdateOutcome {
+    drain_until_active_model_state(rx);
+    match rx.try_recv().expect("terminal model-selection result") {
+        TurnEvent::ModelSelectionResult {
+            outcome: crate::daemon::proto::ModelSelectionOutcome::Applied { default_update, .. },
+            ..
+        } => default_update,
+        other => panic!("expected applied ModelSelectionResult, got {other:?}"),
+    }
+}
+
 fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
     let (mut driver, tmp) = model_switch_driver();
     write_two_model_config(tmp.path(), "provider-a", "model-a");
@@ -1377,6 +1861,27 @@ fn model_switch_driver_with_disk_config() -> (Driver, tempfile::TempDir) {
         driver.refresh_config_from_disk_for_tests();
     });
     (driver, tmp)
+}
+
+fn model_switch_drivers_with_shared_disk_config_without_default()
+-> (Driver, Driver, tempfile::TempDir, tempfile::TempDir) {
+    let (mut driver_a, shared) = model_switch_driver();
+    write_two_model_config(shared.path(), "provider-a", "model-a");
+    // An explicit null at the project layer masks any developer-global
+    // default, keeping this concurrent mutation test hermetic.
+    std::fs::write(
+        shared.path().join(".cockpit/config.json"),
+        r#"{"active_model":null}"#,
+    )
+    .unwrap();
+    driver_a.test_providers_override = None;
+    driver_a.refresh_config_from_disk_for_tests();
+
+    let (mut driver_b, driver_b_tmp) = model_switch_driver();
+    driver_b.cwd = shared.path().to_path_buf();
+    driver_b.test_providers_override = None;
+    driver_b.refresh_config_from_disk_for_tests();
+    (driver_a, driver_b, shared, driver_b_tmp)
 }
 
 async fn run_control_with_trusted_project_config(
@@ -1792,7 +2297,7 @@ async fn active_frame_refresh_updates_schedule_when_both_refreshes_fail() {
 }
 
 #[tokio::test]
-async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
+async fn model_switch_inside_subagent_frame_rebuilds_session_root_only() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     push_named_test_child(&mut driver, "builder");
@@ -1806,6 +2311,7 @@ async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
+                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1815,26 +2321,64 @@ async fn model_switch_inside_subagent_frame_rebuilds_that_frame() {
         )
         .await;
 
-    assert_eq!(
+    assert_ne!(
         Arc::as_ptr(&driver.stack[0].agent),
         root_before,
-        "explicit switch inside a subagent must leave the root frame untouched"
+        "session model selection must rebuild the durable root"
     );
-    assert_ne!(
+    assert_eq!(
         Arc::as_ptr(&driver.stack.last().unwrap().agent),
         child_before,
-        "explicit switch inside a subagent must rebuild the child frame"
+        "the foreground child must retain its pinned model until it returns"
     );
     let child = driver.stack.last().unwrap();
     assert_eq!(child.agent.name, "builder");
-    assert_eq!(child.agent.model.provider_id(), "provider-b");
-    assert_eq!(child.agent.model.model_id_ref(), "model-b");
-    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
+    assert_eq!(child.agent.model.provider_id(), "provider-a");
+    assert_eq!(child.agent.model.model_id_ref(), "model-a");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
 }
 
 #[tokio::test]
-async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
+async fn live_root_model_rebuild_never_inherits_foreground_child_config_path() {
+    let (mut driver, tmp) = model_switch_driver();
+    let root_config = tmp.path().join("root-config.toml");
+    let child_config = tmp.path().join("child-config.toml");
+    let mut root_agent = (*driver.stack[0].agent).clone();
+    root_agent.model = Arc::new(
+        (*root_agent.model)
+            .clone()
+            .with_config_path(root_config.clone()),
+    );
+    driver.stack[0].agent = Arc::new(root_agent);
+
+    push_named_test_child(&mut driver, "builder");
+    let child_index = driver.stack.len() - 1;
+    let mut child_agent = (*driver.stack[child_index].agent).clone();
+    child_agent.model = Arc::new(
+        (*child_agent.model)
+            .clone()
+            .with_config_path(child_config.clone()),
+    );
+    driver.stack[child_index].agent = Arc::new(child_agent);
+
+    let rebuilt = driver
+        .build_live_model(&crate::config::providers::ActiveModelRef {
+            provider: "provider-b".to_string(),
+            model: "model-b".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        })
+        .expect("root model rebuild succeeds");
+
+    assert_eq!(rebuilt.config_path(), Some(root_config.as_path()));
+    assert_ne!(rebuilt.config_path(), Some(child_config.as_path()));
+}
+
+#[tokio::test]
+async fn malformed_foreground_child_override_does_not_block_session_root_switch() {
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let policy = crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
@@ -1870,6 +2414,7 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
                     provider: "provider-b".into(),
                     model: "model-b".into(),
                     persist_as_default: true,
+                    initialize_default_if_missing: false,
                     trigger: crate::session::ModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -1879,7 +2424,7 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
             )
             .await;
 
-        assert_eq!(Arc::as_ptr(&driver.stack[0].agent), root_before);
+        assert_ne!(Arc::as_ptr(&driver.stack[0].agent), root_before);
         assert_eq!(
             Arc::as_ptr(&driver.stack.last().unwrap().agent),
             child_before
@@ -1893,13 +2438,15 @@ async fn model_switch_inside_subagent_frame_rebuild_failure_keeps_child() {
             driver.stack.last().unwrap().agent.model.model_id_ref(),
             child_model_before
         );
+        assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
+        assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+        assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
         let notices = drain_notices(&mut rx);
         assert!(
-            notices.iter().any(|notice| {
-                notice.contains("Model switch to `provider-b/model-b` failed")
-                    && notice.contains("Keeping the current model active")
-            }),
-            "model switch rebuild failure should be surfaced: {notices:?}"
+            notices
+                .iter()
+                .all(|notice| !notice.contains("Model switch to `provider-b/model-b` failed")),
+            "a malformed parked child override must not reject the root switch: {notices:?}"
         );
     })
     .await;

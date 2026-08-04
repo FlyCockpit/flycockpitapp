@@ -97,12 +97,14 @@ pub(super) async fn authorize_set_active_model(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let Request::SetActiveModel {
-        persist_as_default, ..
+        persist_as_default,
+        initialize_default_if_missing,
+        ..
     } = request
     else {
         unreachable!("authorize_set_active_model called for non-SetActiveModel request");
     };
-    if *persist_as_default {
+    if *persist_as_default || *initialize_default_if_missing {
         return Err(authorization_error(
             "saving the default model requires the local owner",
         ));
@@ -278,16 +280,37 @@ pub(super) async fn authorize_attach(
     let Request::Attach {
         session_id,
         project_root,
+        env_policy,
         ..
     } = request
     else {
         unreachable!("authorize_attach called for non-Attach request");
     };
 
+    if matches!(
+        env_policy,
+        crate::env_snapshot::EnvDriftPolicy::UpdateDaemon
+    ) {
+        return Err(authorization_error(
+            "updating the daemon environment baseline requires the local owner",
+        ));
+    }
+
     if let Some(session_id) = session_id {
         match ctx.db.get_session(*session_id).await {
             Ok(Some(row)) => match session_access_for_row(principal, &row) {
-                SessionAccess::Writer | SessionAccess::Readonly => Ok(()),
+                SessionAccess::Writer => Ok(()),
+                SessionAccess::Readonly => {
+                    let has_durable_model =
+                        persisted_row_has_active_model(&row).map_err(internal)?;
+                    if has_durable_model {
+                        Ok(())
+                    } else {
+                        Err(read_only_error(
+                            "recovering a session model requires write access to the session",
+                        ))
+                    }
+                }
                 SessionAccess::Owner => Ok(()),
                 SessionAccess::None => Err(authorization_error(
                     "remote principal cannot access this session",
@@ -309,6 +332,37 @@ pub(super) async fn authorize_attach(
         }
     } else {
         Ok(())
+    }
+}
+
+/// Mirror session hydration's accepted durable model representation without
+/// constructing a worker. The structured selection is authoritative and must
+/// agree with its indexed projections. A genuinely model-less row would make
+/// worker startup recover and persist a model, which a read-only attach must
+/// never trigger; projection-only or malformed structured state is corruption.
+fn persisted_row_has_active_model(row: &crate::db::sessions::SessionRow) -> Result<bool> {
+    match row.model_selection_json.as_deref() {
+        Some(raw) => {
+            let selection = serde_json::from_str::<crate::config::providers::ActiveModelRef>(raw)
+                .context(
+                "decoding persisted session model selection during attach authorization",
+            )?;
+            if row.provider.as_deref() != Some(selection.provider.as_str())
+                || row.model.as_deref() != Some(selection.model.as_str())
+            {
+                anyhow::bail!(
+                    "persisted session model projections disagree with model_selection_json"
+                );
+            }
+            Ok(true)
+        }
+        None => {
+            anyhow::ensure!(
+                row.provider.is_none() && row.model.is_none(),
+                "persisted session model projections require model_selection_json"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -490,8 +544,17 @@ pub(super) async fn authorize_shared_custom(
         Request::Attach {
             session_id,
             project_root,
+            env_policy,
             ..
         } => {
+            if matches!(
+                env_policy,
+                crate::env_snapshot::EnvDriftPolicy::UpdateDaemon
+            ) {
+                return Err(authorization_error(
+                    "updating the daemon environment baseline requires the local owner",
+                ));
+            }
             if let Some(session_id) = session_id {
                 match ctx.db.get_session(*session_id).await {
                     Ok(Some(row)) => match session_access_for_row(principal, &row) {
@@ -571,9 +634,11 @@ pub(super) async fn authorize_shared_custom(
             }
         }
         Request::SetActiveModel {
-            persist_as_default, ..
+            persist_as_default,
+            initialize_default_if_missing,
+            ..
         } => {
-            if *persist_as_default {
+            if *persist_as_default || *initialize_default_if_missing {
                 Err(authorization_error(
                     "saving the default model requires the local owner",
                 ))

@@ -3,14 +3,25 @@ import { z } from "zod";
 export const PROTOCOL_VERSION = 6 as const;
 
 export const uuidSchema = z.string().uuid();
+const clientSubmissionIdSchema = uuidSchema.refine(
+  (value) => value !== "00000000-0000-0000-0000-000000000000",
+  { message: "client_submission_id must not be nil" },
+);
+export function createClientSubmissionId() {
+  return globalThis.crypto.randomUUID();
+}
 export const requestIdSchema = uuidSchema;
+export const thinkingModeSchema = z.enum(["off", "low", "medium", "high"]);
+export type ThinkingMode = z.infer<typeof thinkingModeSchema>;
+export const promptCacheRetentionSchema = z.enum(["default", "extended"]);
+export type PromptCacheRetention = z.infer<typeof promptCacheRetentionSchema>;
 export const activeModelRefSchema = z
   .object({
     provider: z.string().min(1),
     model: z.string().min(1),
     reasoning_effort: z.object({ value: z.string().min(1) }).optional(),
-    thinking_mode: z.enum(["off", "low", "medium", "high"]).optional(),
-    prompt_cache_retention: z.enum(["default", "extended"]).optional(),
+    thinking_mode: thinkingModeSchema.optional(),
+    prompt_cache_retention: promptCacheRetentionSchema.optional(),
   })
   .passthrough();
 export type ActiveModelRef = z.infer<typeof activeModelRefSchema>;
@@ -20,6 +31,8 @@ export const activeModelStateSchema = z
     selection: activeModelRefSchema,
     default_selection: activeModelRefSchema.nullable().optional(),
     diverged: z.boolean(),
+    // Monotonic only inside one attachment/worker epoch. An attach snapshot
+    // is authoritative generation zero, so clients reset before merging it.
     generation: z.number().int().nonnegative(),
   })
   .passthrough();
@@ -174,7 +187,7 @@ const requestParamSchemas = {
       no_sandbox: z.boolean().optional(),
       interactive: z.boolean().optional(),
       initial_model: activeModelRefSchema.optional(),
-      model_override: z.string().optional(),
+      model_override: activeModelRefSchema.optional(),
       client_protocol_version: z.number().int().nonnegative().optional(),
       env_snapshot: z.unknown().optional(),
       env_policy: envDriftPolicySchema.optional(),
@@ -249,6 +262,7 @@ const requestParamSchemas = {
   resume_paused_work: z.object({ session_id: uuidSchema }).strict(),
   send_user_message: z
     .object({
+      client_submission_id: clientSubmissionIdSchema,
       text: z.string(),
       display_text: optionalStringSchema,
       tag_expansions: z.array(passthroughObjectSchema).optional(),
@@ -270,12 +284,16 @@ const requestParamSchemas = {
       provider: z.string().min(1),
       model: z.string().min(1),
       trigger: activeModelSwitchTriggerSchema.optional(),
-      reasoning_effort: z.string().optional(),
-      thinking_mode: z.enum(["off", "low", "medium", "high"]).optional(),
-      prompt_cache_retention: z.enum(["default", "extended"]).optional(),
+      reasoning_effort: z.string().min(1).optional(),
+      thinking_mode: thinkingModeSchema.optional(),
+      prompt_cache_retention: promptCacheRetentionSchema.optional(),
       persist_as_default: z.boolean(),
+      initialize_default_if_missing: z.boolean(),
     })
-    .strict(),
+    .strict()
+    .refine((value) => !(value.persist_as_default && value.initialize_default_if_missing), {
+      message: "persist_as_default and initialize_default_if_missing cannot both be true",
+    }),
   set_agent: z.object({ name: z.string().min(1) }).strict(),
   share_session: z.object({ session_id: uuidSchema, shared: z.boolean() }).strict(),
   stats_rollup: z
@@ -372,6 +390,7 @@ export const responseNameSchema = z.enum([
   "sessions",
   "stats_rollup",
   "subagent_history_page",
+  "user_message_queued",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -412,6 +431,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       text: z.string(),
       display_text: z.string().optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
+      client_submission_ids: z.array(uuidSchema).optional(),
       ts_ms: z.number().int().optional(),
       seq: z.number().int().optional(),
       origin_principal: z.string().optional(),
@@ -522,6 +542,131 @@ const liveStatusWireSchema = z
     processing: z.boolean(),
   })
   .passthrough();
+export const queueTargetSchema = z
+  .object({
+    id: z.string(),
+    agent: z.string(),
+    depth: z.number().int().nonnegative(),
+    task_call_id: z.string().optional(),
+  })
+  .passthrough();
+export type QueueTarget = z.infer<typeof queueTargetSchema>;
+export const queueItemSchema = z
+  .object({
+    id: uuidSchema,
+    status: z.enum(["queued", "folding"]),
+    text: z.string(),
+    display_text: z.string().optional(),
+    target: queueTargetSchema,
+  })
+  .passthrough();
+export type QueueItem = z.infer<typeof queueItemSchema>;
+export const resumeRepairActionSchema = z.enum([
+  "open_read_only",
+  "fork_from_last_provider_valid_turn",
+  "repair_synthetic_tool_results",
+  "export_debug_bundle",
+  "cancel",
+]);
+export type ResumeRepairAction = z.infer<typeof resumeRepairActionSchema>;
+export const resumeRepairStateSchema = z
+  .object({
+    session_id: uuidSchema,
+    short_id: z.string(),
+    provider: z.string(),
+    model: z.string(),
+    wire_api: z.string(),
+    failure_kind: z.string().min(1),
+    failing_tool_call_ids: z.array(z.string()),
+    safe_last_turn_seq: z.number().int().optional(),
+    suggested_actions: z.array(resumeRepairActionSchema),
+    detail: z.string(),
+  })
+  .passthrough();
+export type ResumeRepairState = z.infer<typeof resumeRepairStateSchema>;
+export const pausedWorkSummarySchema = z
+  .object({
+    session_id: uuidSchema,
+    active_agent: z.string(),
+    project_root: projectRootSchema,
+    reason: z.string(),
+    pending_tool_count: z.number().int(),
+    daemon_version: z.string(),
+    client_version: z.string().optional(),
+    updated_at: z.number().int(),
+  })
+  .passthrough();
+export type PausedWorkSummary = z.infer<typeof pausedWorkSummarySchema>;
+export const activeSubagentSchema = z
+  .object({
+    parent: z.string(),
+    child: z.string(),
+    task_call_id: z.string(),
+    label: z.string(),
+  })
+  .passthrough();
+export type ActiveSubagent = z.infer<typeof activeSubagentSchema>;
+export const envSnapshotMetaSchema = z
+  .object({
+    source: z.enum(["daemon_start", "tui_shell", "tui_process_fallback", "explicit_cli"]),
+    digest: z.string(),
+    key_count: z.number().int().nonnegative(),
+    path_entry_count: z.number().int().nonnegative(),
+  })
+  .passthrough();
+export type EnvSnapshotMeta = z.infer<typeof envSnapshotMetaSchema>;
+export const envDiffSummarySchema = z
+  .object({
+    baseline_digest: z.string(),
+    candidate_digest: z.string(),
+    added_keys: z.number().int().nonnegative(),
+    removed_keys: z.number().int().nonnegative(),
+    changed_keys: z.number().int().nonnegative(),
+    changed_secret_keys: z.array(z.string()),
+    path_added: z.array(z.string()),
+    path_removed: z.array(z.string()),
+  })
+  .passthrough();
+export type EnvDiffSummary = z.infer<typeof envDiffSummarySchema>;
+export const btwForkInfoSchema = z
+  .object({
+    session_id: uuidSchema,
+    parent_session_id: uuidSchema,
+    short_id: z.string().optional(),
+    tangent: z.boolean(),
+    created_at: z.number().int(),
+    message_count: z.number().int().nonnegative(),
+  })
+  .passthrough();
+export type BtwForkInfo = z.infer<typeof btwForkInfoSchema>;
+export const attachedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    short_id: z.string(),
+    project_root: projectRootSchema,
+    project_id: z.string(),
+    active_agent: z.string(),
+    active_agent_path: z.array(z.string()).optional(),
+    foreground_target: queueTargetSchema.optional(),
+    active_subagent: activeSubagentSchema.optional(),
+    active_model_state: activeModelStateSchema.optional(),
+    history: z.array(historyEntryWireSchema),
+    paused_work: z.array(pausedWorkSummarySchema),
+    repair_required: resumeRepairStateSchema.optional(),
+    daemon_version: z.string(),
+    compatible: z.boolean(),
+    env_baseline: envSnapshotMetaSchema.optional(),
+    env_session: envSnapshotMetaSchema.optional(),
+    env_drift: envDiffSummarySchema.optional(),
+    env_policy_applied: envDriftPolicySchema,
+    btw_fork: btwForkInfoSchema.optional(),
+  })
+  .passthrough();
+export type AttachedData = z.infer<typeof attachedDataSchema>;
+export const userMessageQueuedResultSchema = z
+  .object({ item: queueItemSchema, queue: z.array(queueItemSchema) })
+  .passthrough();
+export type UserMessageQueuedResult = z.infer<typeof userMessageQueuedResultSchema>;
 const statsRollupWireSchema = z
   .object({
     project_id: z.string().nullable(),
@@ -538,19 +683,7 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
-  responseVariant(
-    "attached",
-    z
-      .object({
-        session_id: uuidSchema,
-        short_id: z.string(),
-        project_root: projectRootSchema,
-        project_id: z.string(),
-        active_agent: z.string(),
-        history: z.array(historyEntryWireSchema),
-      })
-      .passthrough(),
-  ),
+  responseVariant("attached", attachedDataSchema),
   responseVariant(
     "sessions",
     z.object({ sessions: z.array(sessionSummaryWireSchema) }).passthrough(),
@@ -651,6 +784,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     "session_live_status",
     z.object({ statuses: z.array(liveStatusWireSchema) }).passthrough(),
   ),
+  responseVariant("user_message_queued", userMessageQueuedResultSchema),
 ]);
 export type ResponseEnvelope = z.infer<typeof responseEnvelopeSchema>;
 
@@ -743,6 +877,7 @@ export const knownEventKindSchema = z.enum([
   "usage",
   "user_message_recorded",
   "user_message_retracted",
+  "user_messages_terminated",
   "waiting_for_lock",
 ]);
 export type KnownEventKind = z.infer<typeof knownEventKindSchema>;
@@ -784,7 +919,55 @@ const eventStreamLaggedDataSchema = z
     dropped: z.number().int().nonnegative(),
   })
   .passthrough();
-const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
+const userMessageRecordedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    seq: z.number().int(),
+    client_submission_ids: z.array(uuidSchema),
+    preflight_cleaned: z.string().nullable().optional(),
+  })
+  .passthrough();
+export const userMessageTerminalDispositionSchema = z.enum([
+  "removed",
+  "cancelled",
+  "preflight_rejected",
+]);
+export const userMessagesTerminatedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    client_submission_ids: z.array(uuidSchema),
+    disposition: userMessageTerminalDispositionSchema,
+  })
+  .passthrough();
+export type UserMessagesTerminatedData = z.infer<typeof userMessagesTerminatedDataSchema>;
+const correlatedPreflightDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    client_submission_ids: z.array(uuidSchema),
+  })
+  .passthrough();
+export const queuedUserMessagesFoldedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    text: z.string(),
+    display_text: z.string().optional(),
+    tag_expansions: z.array(passthroughObjectSchema).optional(),
+    queue_item_ids: z.array(uuidSchema),
+    target: queueTargetSchema,
+    seq: z.number().int().optional(),
+    preflight_cleaned: z.string().optional(),
+  })
+  .passthrough();
+export type QueuedUserMessagesFoldedData = z.infer<typeof queuedUserMessagesFoldedDataSchema>;
+export const sessionPersistFailedDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    client_submission_id: uuidSchema,
+    error: z.string(),
+  })
+  .passthrough();
+export type SessionPersistFailedData = z.infer<typeof sessionPersistFailedDataSchema>;
+export const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("not_requested") }).passthrough(),
   z.object({ status: z.literal("saved") }).passthrough(),
   z
@@ -795,8 +978,9 @@ const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
     })
     .passthrough(),
 ]);
+export type DefaultModelUpdateOutcome = z.infer<typeof defaultModelUpdateOutcomeSchema>;
 
-const modelSelectionOutcomeSchema = z.discriminatedUnion("status", [
+export const modelSelectionOutcomeSchema = z.discriminatedUnion("status", [
   z
     .object({
       status: z.literal("applied"),
@@ -812,16 +996,21 @@ const modelSelectionOutcomeSchema = z.discriminatedUnion("status", [
     })
     .passthrough(),
 ]);
+export type ModelSelectionOutcome = z.infer<typeof modelSelectionOutcomeSchema>;
 
-const modelSelectionResultDataSchema = z
+export const modelSelectionResultDataSchema = z
   .object({
     session_id: uuidSchema,
     selection_id: uuidSchema,
     provider: z.string().min(1),
     model: z.string().min(1),
+    reasoning_effort: z.string().min(1).optional(),
+    thinking_mode: thinkingModeSchema.optional(),
+    prompt_cache_retention: promptCacheRetentionSchema.optional(),
     outcome: modelSelectionOutcomeSchema,
   })
   .passthrough();
+export type ModelSelectionResultData = z.infer<typeof modelSelectionResultDataSchema>;
 
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
@@ -830,6 +1019,12 @@ const structuredEventDataSchemas = {
   interrupt_raised: interruptRaisedDataSchema,
   model_selection_result: modelSelectionResultDataSchema,
   interrupt_resolved: interruptResolvedDataSchema,
+  preflight_started: correlatedPreflightDataSchema,
+  queued_user_messages_folded: queuedUserMessagesFoldedDataSchema,
+  session_persist_failed: sessionPersistFailedDataSchema,
+  user_message_recorded: userMessageRecordedDataSchema,
+  user_message_retracted: correlatedPreflightDataSchema,
+  user_messages_terminated: userMessagesTerminatedDataSchema,
 } as const satisfies Partial<Record<KnownEventKind, z.ZodTypeAny>>;
 
 function validateKnownEventData(event: KnownEventKind, data: unknown, ctx: z.RefinementCtx) {
@@ -923,17 +1118,7 @@ export type FsEntry = z.infer<typeof fsEntrySchema>;
 export const listSessionsResultSchema = z
   .object({ sessions: z.array(sessionSummarySchema) })
   .passthrough();
-export const attachResultSchema = z
-  .object({
-    session_id: uuidSchema,
-    short_id: z.string(),
-    project_root: projectRootSchema,
-    project_id: z.string(),
-    active_agent: z.string(),
-    active_model_state: activeModelStateSchema.nullable().optional(),
-    history: z.array(historyEntrySchema),
-  })
-  .passthrough();
+export const attachResultSchema = attachedDataSchema;
 export const ackResultSchema = z.unknown();
 export const sessionMessagesResultSchema = z
   .object({
@@ -1003,6 +1188,9 @@ export function parseListSessionsResult(value: unknown) {
 }
 export function parseAttachResult(value: unknown) {
   return attachResultSchema.parse(value);
+}
+export function parseUserMessageQueuedResult(value: unknown) {
+  return userMessageQueuedResultSchema.parse(value);
 }
 export function parseSessionMessagesResult(value: unknown) {
   return sessionMessagesResultSchema.parse(value);

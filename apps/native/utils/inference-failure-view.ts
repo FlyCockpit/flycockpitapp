@@ -44,6 +44,8 @@ export type ActiveModelInput = {
 };
 
 export type ActiveModelState = {
+  selection: ActiveModelRef;
+  defaultSelection: ActiveModelRef | null;
   provider: string;
   model: string;
   configProvider: string | null;
@@ -120,6 +122,8 @@ export function activeModelReducer(
   const selection = input.selection;
   const defaultSelection = input.default_selection;
   return {
+    selection: selection ?? { provider: "Unknown provider", model: "Unknown model" },
+    defaultSelection: defaultSelection ?? null,
     provider: displayValue(selection?.provider, "Unknown provider"),
     model: displayValue(selection?.model, "Unknown model"),
     configProvider: defaultSelection?.provider ?? null,

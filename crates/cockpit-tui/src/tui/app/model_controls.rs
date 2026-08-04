@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const MODEL_SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl App {
     pub(super) fn swap_primary_agent(&mut self, name: &str) {
         if cockpit_core::agents::is_hidden_primary(name) {
@@ -114,7 +116,10 @@ impl App {
         requested: Option<&cockpit_config::providers::ActiveModelRef>,
     ) {
         let expired = self.expire_stale_model_selection();
-        let requested = requested.or(expired.as_ref());
+        let requested = requested.cloned().or(expired).or_else(|| {
+            self.current_model_selection_retry()
+                .map(|retry| retry.requested.clone())
+        });
         self.footer_selection = None;
         self.footer_agent_picker = None;
         self.footer_mode_picker = None;
@@ -127,7 +132,7 @@ impl App {
         ) {
             Ok(mut picker) => {
                 picker.set_config_drift(self.model_picker_drift());
-                if let Some(requested) = requested {
+                if let Some(requested) = requested.as_ref() {
                     picker.restore_requested_selection(requested);
                 }
                 self.overlay = Overlay::ModelPicker(picker);
@@ -138,25 +143,25 @@ impl App {
         }
     }
 
-    fn expire_stale_model_selection(
+    pub(super) fn expire_stale_model_selection(
         &mut self,
     ) -> Option<cockpit_config::providers::ActiveModelRef> {
         let expired = self
             .pending_model_selection
             .as_ref()
-            .is_some_and(|pending| {
-                pending.started_at.elapsed() >= std::time::Duration::from_secs(60)
-            });
+            .is_some_and(|pending| pending.started_at.elapsed() >= MODEL_SELECTION_TIMEOUT);
         if !expired {
             return None;
         }
-        let pending = self
+        let selection_id = self
             .pending_model_selection
-            .take()
+            .as_ref()
+            .expect("expired pending selection exists")
+            .selection_id;
+        let pending = self
+            .clear_pending_model_selection(Some(selection_id))
             .expect("expired pending selection exists");
-        if self.retry_model_submission.is_none() {
-            self.retry_model_submission = pending.queued_submission;
-        }
+        let pending = self.preserve_failed_model_selection(pending);
         self.push_plain(
             "The previous model selection timed out. Choose a model to retry; your queued message is retained."
                 .to_string(),
@@ -352,6 +357,8 @@ impl App {
     }
 
     pub(super) fn close_model_picker(&mut self, accepted: bool) {
+        self.refresh_reopened_model_picker_after_settings = None;
+        self.reopen_model_picker_draft_after_settings = None;
         if !accepted {
             self.submit_after_model_selection = false;
         }
@@ -369,17 +376,20 @@ impl App {
             self.submit_after_model_selection = false;
         }
         if let Some((active, explicitly_persist_as_default)) = selected {
-            let persist_as_default =
-                explicitly_persist_as_default || self.default_model_selection.is_none();
+            let persist_as_default = explicitly_persist_as_default;
+            let initialize_default_if_missing = !explicitly_persist_as_default;
             let provider = active.provider.clone();
             let model = active.model.clone();
             if self.notify_active_model_selected(
                 active,
                 persist_as_default,
+                initialize_default_if_missing,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             ) {
                 let scope = if persist_as_default {
                     " for this session and saving it as the default"
+                } else if initialize_default_if_missing {
+                    " for this session (and as the default if none is configured)"
                 } else {
                     " for this session"
                 };
@@ -396,6 +406,7 @@ impl App {
         &mut self,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
+        initialize_default_if_missing: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) -> bool {
         let provider = active.provider.clone();
@@ -405,7 +416,13 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.request_model_selection("/model", active, persist_as_default, trigger)
+        self.request_model_selection(
+            "/model",
+            active,
+            persist_as_default,
+            initialize_default_if_missing,
+            trigger,
+        )
     }
 
     pub(super) fn request_model_selection(
@@ -413,12 +430,40 @@ impl App {
         label: &str,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
+        initialize_default_if_missing: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) -> bool {
+        if self.has_pending_session_switch_action() {
+            self.show_model_selection_error(
+                &active,
+                trigger,
+                format!(
+                    "{label}: session switch in progress; retry after the new session is attached"
+                ),
+            );
+            return false;
+        }
+        // Every model-selection entry point shares the same stale-request
+        // expiry. A hung daemon must not leave `/quick`, footer cycling, or a
+        // picker recommit blocked until the user happens to reopen `/model`.
+        self.expire_stale_model_selection();
         if self.pending_model_selection.is_some() {
             let message =
                 "Another model selection is still in progress; wait for it to finish.".to_string();
             self.show_model_selection_error(&active, trigger, message);
+            return false;
+        }
+        if let Some(retry) = self.current_model_selection_retry()
+            && retry.requested != active
+            && !matches!(
+                trigger,
+                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
+            )
+        {
+            self.push_plain(format!(
+                "A failed {:?} selection for {}/{} and its queued message are waiting for retry; open `/model` to retry it or explicitly choose a replacement.",
+                retry.trigger, retry.requested.provider, retry.requested.model
+            ));
             return false;
         }
         if !matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
@@ -439,6 +484,9 @@ impl App {
             }
         }
         let selection_id = uuid::Uuid::new_v4();
+        let queued_submission = self
+            .take_current_model_selection_retry()
+            .and_then(|retry| retry.queued_submission);
         self.pending_model_selection = Some(super::PendingModelSelection {
             session_id: self.launch.session_id,
             selection_id,
@@ -446,14 +494,22 @@ impl App {
             trigger,
             minimum_generation: self.active_model_state_generation,
             started_at: std::time::Instant::now(),
-            queued_submission: self.retry_model_submission.take(),
+            queued_submission,
         });
         self.send_daemon_request(
             label,
-            active_model_request(selection_id, active, persist_as_default, trigger),
+            active_model_request(
+                selection_id,
+                active,
+                persist_as_default,
+                initialize_default_if_missing,
+                trigger,
+            ),
             ControlApplied::ModelSelection { selection_id },
         );
-        true
+        self.pending_model_selection
+            .as_ref()
+            .is_some_and(|pending| pending.selection_id == selection_id)
     }
     pub(super) fn show_model_selection_error(
         &mut self,
@@ -486,6 +542,7 @@ impl App {
                 let model = active.model.clone();
                 if self.notify_active_model_selected(
                     active,
+                    false,
                     false,
                     cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
                 ) {
@@ -625,6 +682,7 @@ impl App {
                 "/quick",
                 active,
                 false,
+                false,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
             );
         }
@@ -667,7 +725,17 @@ impl App {
         applied: ControlApplied,
     ) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
-            self.report_control_not_delivered(label, ControlRequestNotDelivered::NoRunner);
+            let message =
+                Self::control_not_delivered_message(label, ControlRequestNotDelivered::NoRunner);
+            let selection_id = match applied {
+                ControlApplied::ModelSelection { selection_id } => Some(selection_id),
+                _ => None,
+            };
+            if let Some(pending) = self.clear_pending_model_selection(selection_id) {
+                self.show_failed_model_selection(pending, message);
+            } else {
+                self.push_plain(message);
+            }
             return;
         };
         self.next_control_request_seq = self.next_control_request_seq.saturating_add(1);
@@ -684,6 +752,8 @@ impl App {
             &runner.events,
             &runner.event_notify,
             request_id,
+            runner.session_id(),
+            runner.attachment_epoch(),
             req,
         );
         if let Err(reason) = result {
@@ -736,7 +806,7 @@ impl App {
         }
     }
 
-    fn clear_pending_model_selection(
+    pub(super) fn clear_pending_model_selection(
         &mut self,
         selection_id: Option<uuid::Uuid>,
     ) -> Option<super::PendingModelSelection> {
@@ -744,7 +814,92 @@ impl App {
         if Some(pending.selection_id) != selection_id {
             return None;
         }
+        let selection_id = pending.selection_id;
+        self.pending_control_requests.retain(|_, request| {
+            !matches!(
+                request.applied,
+                ControlApplied::ModelSelection {
+                    selection_id: pending_id
+                } if pending_id == selection_id
+            )
+        });
         self.pending_model_selection.take()
+    }
+
+    pub(super) fn preserve_failed_model_selection(
+        &mut self,
+        mut pending: super::PendingModelSelection,
+    ) -> super::PendingModelSelection {
+        self.retry_model_selections
+            .entry(pending.session_id)
+            .or_insert_with(|| super::ModelSelectionRetry {
+                session_id: pending.session_id,
+                requested: pending.requested.clone(),
+                trigger: pending.trigger,
+                queued_submission: pending.queued_submission.take(),
+            });
+        pending
+    }
+
+    pub(super) fn current_model_selection_retry(&self) -> Option<&super::ModelSelectionRetry> {
+        let session_id = self.launch.session_id;
+        self.retry_model_selections
+            .get(&session_id)
+            .filter(|retry| retry.session_id == session_id)
+    }
+
+    pub(super) fn take_current_model_selection_retry(
+        &mut self,
+    ) -> Option<super::ModelSelectionRetry> {
+        let session_id = self.launch.session_id;
+        self.retry_model_selections
+            .remove(&session_id)
+            .filter(|retry| retry.session_id == session_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_current_model_selection_retry(
+        &mut self,
+        mut retry: super::ModelSelectionRetry,
+    ) {
+        retry.session_id = self.launch.session_id;
+        self.retry_model_selections
+            .insert(self.launch.session_id, retry);
+    }
+
+    /// Start a fresh runner/session model-state epoch. Every pending model
+    /// control belongs to the runner being replaced, even when the daemon
+    /// reattached to the same durable session id. Preserve its exact held
+    /// submission for an explicit retry and remove request bookkeeping that
+    /// can no longer receive a meaningful ACK.
+    pub(super) fn cancel_model_controls_for_runner_epoch(
+        &mut self,
+    ) -> Option<super::PendingModelSelection> {
+        let pending = self
+            .pending_model_selection
+            .take()
+            .map(|pending| self.preserve_failed_model_selection(pending));
+        self.pending_control_requests
+            .retain(|_, request| !matches!(request.applied, ControlApplied::ModelSelection { .. }));
+        pending
+    }
+
+    pub(super) fn cancel_model_controls_for_terminal_link(&mut self) {
+        if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
+            tracing::warn!(
+                session_id = ?pending.session_id,
+                selection_id = %pending.selection_id,
+                provider = %pending.requested.provider,
+                model = %pending.requested.model,
+                trigger = ?pending.trigger,
+                generation = pending.minimum_generation,
+                "model selection cancelled because the daemon link terminated"
+            );
+            self.push_plain(
+                "The daemon connection ended during model selection; your complete selection, draft, and exact queued message were retained for retry."
+                    .to_string(),
+            );
+        }
     }
 
     fn show_failed_model_selection(
@@ -752,6 +907,7 @@ impl App {
         pending: super::PendingModelSelection,
         message: String,
     ) {
+        let pending = self.preserve_failed_model_selection(pending);
         self.show_model_selection_error(&pending.requested, pending.trigger, message);
     }
 
@@ -786,7 +942,9 @@ impl App {
                     job_id: None,
                     preflight_cleaned: None,
                     queue_item_ids: Vec::new(),
+                    client_submissions: Vec::new(),
                     queue_target: None,
+                    pending_terminal_disposition: None,
                 };
                 self.dispatch_optimistic_user_submission(
                     kickoff,
@@ -811,6 +969,11 @@ impl App {
                 self.push_plain(format!(
                     "/pin-context: pinned (survives /compact verbatim): {text}"
                 ));
+            }
+            ControlApplied::RepairResume => {
+                if let Some(Ok(runner)) = self.agent_runner.as_ref() {
+                    runner.retry_retained_user_submissions();
+                }
             }
         }
     }
@@ -838,33 +1001,23 @@ impl App {
         }
     }
 
-    /// The anti-misfire lockout to stamp on a question dialog about to be
-    /// installed (implementation note). Returns the
-    /// configured `lockout_ms` only on the genuine composer→dialog edge —
-    /// the composer has actually been the active input surface since the
-    /// last dialog closed (`composer_active_since_dialog`) — and
-    /// [`Duration::ZERO`] (immediately answerable) for a direct
-    /// continuation, where one dialog succeeds another without the composer
-    /// ever regaining focus (including the same resolve/poll cycle). Either
-    /// way the composer is now displaced, so the flag is consumed; a render
-    /// pass with no dialog re-arms it.
+    /// Arm anti-misfire protection only when the user edited the composer
+    /// within the configured lockout window. The timestamp is consumed by
+    /// the first dialog, so queued approvals remain immediately answerable
+    /// until the user types again.
     pub(super) fn dialog_lockout(&mut self) -> Duration {
-        let lockout = if self.composer_active_since_dialog {
-            Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms)
-        } else {
-            crate::tui::dialog::DialogState::NO_LOCKOUT
-        };
-        self.composer_active_since_dialog = false;
-        lockout
+        let configured = Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms);
+        self.last_composer_edit_at
+            .take()
+            .filter(|edited_at| edited_at.elapsed() <= configured)
+            .map(|_| configured)
+            .unwrap_or(crate::tui::dialog::DialogState::NO_LOCKOUT)
     }
 
-    /// Full lockout for a daemon-authoritative interrupt restored after
-    /// attach/reconnect. Unlike FIFO queue advancement, rehydration can put a
-    /// dialog under input that was intended for the composer or another
-    /// surface, so it deliberately starts a new anti-misfire window.
+    /// Rehydration follows the same recent-edit rule. An authoritative attach
+    /// alone is not evidence that a keystroke is in flight.
     pub(super) fn rehydrated_dialog_lockout(&mut self) -> Duration {
-        self.composer_active_since_dialog = false;
-        Duration::from_millis(self.config_snapshot.extended.dialog.lockout_ms)
+        self.dialog_lockout()
     }
 }
 
@@ -872,6 +1025,7 @@ fn active_model_request(
     selection_id: uuid::Uuid,
     active: cockpit_config::providers::ActiveModelRef,
     persist_as_default: bool,
+    initialize_default_if_missing: bool,
     trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
 ) -> cockpit_core::daemon::proto::Request {
     cockpit_core::daemon::proto::Request::SetActiveModel {
@@ -879,6 +1033,7 @@ fn active_model_request(
         provider: active.provider,
         model: active.model,
         persist_as_default,
+        initialize_default_if_missing,
         trigger,
         reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
         thinking_mode: active.thinking_mode,

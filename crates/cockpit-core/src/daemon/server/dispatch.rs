@@ -18,6 +18,117 @@ pub(super) async fn handle_request(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_send_user_message(
+    state: &mut MutableClientState,
+    ctx: &Arc<DaemonContext>,
+    client_submission_id: Uuid,
+    text: String,
+    display_text: Option<String>,
+    tag_expansions: Vec<proto::TagExpansionMeta>,
+    image_refs: Vec<proto::ImageAttachmentRef>,
+    forced_skill: Option<String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(scheduler) = &ctx.scheduler {
+        scheduler.record_user_activity().await;
+    }
+    if ctx.shutdown.is_draining() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: "daemon is shutting down; not accepting new messages".into(),
+        });
+    }
+    let session_id = require_attached(state)?.handle.session_id;
+    let handle = require_attached(state)?.handle.clone();
+    let origin_principal = state.principal.tag();
+    let wire_fingerprint = user_message_wire_fingerprint(
+        &text,
+        display_text.as_deref(),
+        &tag_expansions,
+        &image_refs,
+        forced_skill.as_deref(),
+    );
+    let mut requires_content_check = false;
+    if !image_refs.is_empty() {
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::ProbeUserMessage {
+                client_submission_id,
+                wire_fingerprint: wire_fingerprint.clone(),
+                origin_principal: origin_principal.clone(),
+                respond_to: probe_tx,
+            })
+            .await
+            .map_err(internal)?;
+        match probe_rx.await.map_err(internal)?? {
+            UserMessageProbeResult::Duplicate { item, queue } => {
+                return Ok(Response::UserMessageQueued { item, queue });
+            }
+            UserMessageProbeResult::Conflict => {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "client_submission_id {client_submission_id} was already used by a different principal"
+                    ),
+                });
+            }
+            UserMessageProbeResult::Unknown => {}
+            UserMessageProbeResult::ContentCheckRequired => requires_content_check = true,
+        }
+    }
+    let images = match claim_message_image_refs(
+        state,
+        session_id,
+        client_submission_id,
+        &image_refs,
+    ) {
+        Ok(images) => images,
+        Err(_) if requires_content_check => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "client_submission_id {client_submission_id} was already used for a different payload"
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+    let mut submission = crate::engine::message::UserSubmission {
+        kind: crate::engine::message::UserSubmissionKind::User,
+        text,
+        display_text,
+        tag_expansions,
+        images,
+        forced_skill,
+        origin_principal: origin_principal.clone(),
+        job_id: None,
+        preflight_cleaned: None,
+        queue_item_ids: Vec::new(),
+        client_submissions: Vec::new(),
+        queue_target: None,
+        pending_terminal_disposition: None,
+    };
+    let fingerprint = submission.client_fingerprint();
+    submission
+        .client_submissions
+        .push(crate::engine::message::ClientSubmissionReceipt {
+            id: client_submission_id,
+            fingerprint,
+            wire_fingerprint,
+            origin_principal,
+        });
+    handle
+        .send_work(SessionWork::UserMessage {
+            submission: Box::new(submission),
+            respond_to,
+        })
+        .await
+        .map_err(internal)?;
+    let (item, queue) = response_rx.await.map_err(internal)??;
+    Ok(Response::UserMessageQueued { item, queue })
+}
+
 pub(super) async fn handle_serialized_request(
     request: Request,
     state: &mut MutableClientState,
@@ -25,6 +136,7 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
+    validate_request_semantics(&request)?;
     debug_assert_eq!(shared.principal, state.principal);
     prune_expired_attachments(state);
     let request_kind = principal::request_kind(&request);
@@ -140,50 +252,24 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::SendUserMessage {
+            client_submission_id,
             text,
             display_text,
             tag_expansions,
             image_refs,
             forced_skill,
         } => {
-            if let Some(scheduler) = &ctx.scheduler {
-                scheduler.record_user_activity().await;
-            }
-            // New-user-work gate (`daemon-graceful-drain-shutdown.md`): once
-            // a drain begins, reject new turns with a short notice rather
-            // than silently dropping or queuing them. In-flight turns keep
-            // running; this only stops *new* work from starting.
-            if ctx.shutdown.is_draining() {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Shutdown,
-                    message: "daemon is shutting down; not accepting new messages".into(),
-                });
-            }
-            let session_id = require_attached(state)?.handle.session_id;
-            let images = consume_image_refs(state, session_id, &image_refs)?;
-            let att = require_attached(state)?;
-            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
-            att.handle
-                .send_work(SessionWork::UserMessage {
-                    submission: Box::new(crate::engine::message::UserSubmission {
-                        kind: crate::engine::message::UserSubmissionKind::User,
-                        text,
-                        display_text,
-                        tag_expansions,
-                        images,
-                        forced_skill,
-                        origin_principal: state.principal.tag(),
-                        job_id: None,
-                        preflight_cleaned: None,
-                        queue_item_ids: Vec::new(),
-                        queue_target: None,
-                    }),
-                    respond_to,
-                })
-                .await
-                .map_err(internal)?;
-            let (item, queue) = response_rx.await.map_err(internal)?;
-            Ok(Response::UserMessageQueued { item, queue })
+            Box::pin(handle_send_user_message(
+                state,
+                ctx,
+                client_submission_id,
+                text,
+                display_text,
+                tag_expansions,
+                image_refs,
+                forced_skill,
+            ))
+            .await
         }
 
         Request::SteerDelegation {
@@ -250,7 +336,7 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            let result = response_rx.await.map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessageResult {
                 applied: result.applied,
                 reason: result.reason,
@@ -268,7 +354,7 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            let result = response_rx.await.map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessageResult {
                 applied: result.applied,
                 reason: result.reason,
@@ -286,7 +372,7 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            let result = response_rx.await.map_err(internal)?;
+            let result = response_rx.await.map_err(internal)??;
             Ok(Response::RemoveQueuedUserMessagesResult {
                 applied: result.applied,
                 reason: result.reason,
@@ -1019,9 +1105,16 @@ pub(super) async fn handle_serialized_request(
                     .config_write_target_for_provider(&att.handle.project_root, &provider)
             })
             .ok_or_else(|| bad_request("no cockpit config found"))?;
-            let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-            doc.write_model_favorite(&provider, &model, favorite)
-                .map_err(internal)?;
+            // Trust selects the concrete provider layer above. The blocking
+            // mutation uses only that path (it does not rediscover layers),
+            // so no task-local trust state is needed inside this thread.
+            tokio::task::spawn_blocking(move || {
+                let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
+                doc.write_model_favorite(&provider, &model, favorite)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
             crate::daemon::config_refresh::refresh_session_config(
                 &ctx.db,
                 ctx.config_source(),
@@ -1038,6 +1131,7 @@ pub(super) async fn handle_serialized_request(
             provider,
             model,
             persist_as_default,
+            initialize_default_if_missing,
             trigger,
             reasoning_effort,
             thinking_mode,
@@ -1052,6 +1146,7 @@ pub(super) async fn handle_serialized_request(
                     provider,
                     model,
                     persist_as_default,
+                    initialize_default_if_missing,
                     trigger: active_model_trigger_from_proto(trigger),
                     reasoning_effort,
                     thinking_mode,
@@ -1518,6 +1613,7 @@ pub(super) async fn handle_concurrent_request(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    validate_request_semantics(&request)?;
     let request_kind = principal::request_kind(&request);
     let audit_path = request_audit_path(&request);
     let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
@@ -1895,6 +1991,15 @@ pub(super) async fn handle_concurrent_request(
             message: format!("request `{request_kind}` is not marked concurrent"),
         }),
     }
+}
+
+fn validate_request_semantics(request: &Request) -> std::result::Result<(), ErrorPayload> {
+    request
+        .validate_semantics()
+        .map_err(|message| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("invalid {} request: {message}", request.wire_tag()),
+        })
 }
 
 pub(super) async fn attached_trust_policy(
@@ -2372,7 +2477,7 @@ pub(super) async fn attach(
     initial_model: Option<crate::config::providers::ActiveModelRef>,
     no_sandbox: bool,
     interactive: bool,
-    model_override: Option<String>,
+    model_override: Option<crate::config::providers::ActiveModelRef>,
     client_protocol_version: u32,
     env_snapshot: Option<EnvSnapshotWire>,
     env_policy: EnvDriftPolicy,
@@ -2420,7 +2525,17 @@ pub(super) async fn attach(
     // policy, while every newly-created/resumed worker reads through SQLite
     // after winning its start claim. Thus a trust flip affects the next worker
     // creation and never retroactively mutates a running session.
-    let client_snapshot = env_snapshot.map(EnvSnapshot::from_wire);
+    // An environment snapshot is process-authority input: it influences
+    // provider credential expansion, subprocess PATH lookup, and redaction.
+    // Remote principals may attach to sessions but never supply that ambient
+    // authority. Authorization rejects the global UpdateDaemon mutation; this
+    // dispatch boundary also ignores every non-owner snapshot/policy so a
+    // future authz regression cannot inject values into a cold worker.
+    let (client_snapshot, env_policy) = if principal.is_owner() {
+        (env_snapshot.map(EnvSnapshot::from_wire), env_policy)
+    } else {
+        (None, EnvDriftPolicy::Daemon)
+    };
     let (session_env, env_baseline_meta, env_session_meta, env_drift, env_policy_applied) =
         select_session_env(ctx, client_snapshot, env_policy)?;
 
@@ -2431,7 +2546,7 @@ pub(super) async fn attach(
             project_root,
             initial_model,
             client_no_sandbox,
-            model_override.as_deref(),
+            model_override.as_ref(),
             session_env,
         )
         .await
@@ -2441,7 +2556,6 @@ pub(super) async fn attach(
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
     let config_snapshot = handle.config_snapshot();
-    let providers_cfg = config_snapshot.providers.clone();
     let extended_cfg = config_snapshot.extended.clone();
 
     if session_id.is_none()
@@ -2496,17 +2610,9 @@ pub(super) async fn attach(
     // persist) and has no `sessions` row yet, so `get_session` would miss.
     let project_id = handle.project_id();
     let short_id = handle.short_id();
-    let session_active = handle.active_model_selection();
-    let config_active = providers_cfg.active_model.as_ref();
-    let active_model_state = session_active.map(|selection| {
-        let default_selection = config_active.cloned();
-        let diverged = default_selection.as_ref() != Some(&selection);
-        proto::ActiveModelState {
-            selection,
-            default_selection,
-            diverged,
-            generation: 0,
-        }
+    let active_model_state = handle.authoritative_active_model_state().map(|mut state| {
+        state.generation = 0;
+        state
     });
 
     state.pending_uploads.clear();

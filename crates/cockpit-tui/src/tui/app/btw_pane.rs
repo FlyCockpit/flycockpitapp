@@ -11,7 +11,14 @@ use cockpit_core::engine::message::{
     QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission,
 };
 
-use super::{App, new_pending, wire_history_to_entries};
+use super::{
+    App, FreshQueueAck,
+    events::{
+        reconcile_folded_user_history, reconcile_history_replay,
+        remove_correlated_optimistic_user_history,
+    },
+    new_pending, wire_history_to_entries,
+};
 
 pub(super) const BTW_MIN_AUX_WIDTH: u16 = 30;
 pub(super) const BTW_THREE_REGION_MIN_WIDTH: u16 = 120;
@@ -65,16 +72,20 @@ pub(super) struct BtwPane {
     pub history: Vec<HistoryEntry>,
     pub pending: Option<PendingMsg>,
     pub queue: Vec<QueuedUserMessage>,
+    fresh_queue_ack: FreshQueueAck,
+    folded_queue_item_ids: std::collections::HashSet<Uuid>,
+    folded_queue_item_order: std::collections::VecDeque<Uuid>,
     pub focused: bool,
     pub zoomed: bool,
     pub hidden_streaming: bool,
     pub history_scroll_offset: usize,
     pub body_rect: Option<Rect>,
     pub input_rect: Option<Rect>,
-    pub last_message_dispatched: Option<String>,
 }
 
 impl BtwPane {
+    const FOLDED_QUEUE_TOMBSTONE_CAPACITY: usize = 1024;
+
     pub(super) fn new(info: proto::BtwForkInfo, vim_enabled: bool) -> Self {
         Self {
             info,
@@ -83,14 +94,51 @@ impl BtwPane {
             history: Vec::new(),
             pending: None,
             queue: Vec::new(),
+            fresh_queue_ack: FreshQueueAck::None,
+            folded_queue_item_ids: std::collections::HashSet::new(),
+            folded_queue_item_order: std::collections::VecDeque::new(),
             focused: false,
             zoomed: false,
             hidden_streaming: false,
             history_scroll_offset: 0,
             body_rect: None,
             input_rect: None,
-            last_message_dispatched: None,
         }
+    }
+
+    fn remember_folded_queue_item_ids(&mut self, ids: impl IntoIterator<Item = Uuid>) {
+        for id in ids {
+            if self.folded_queue_item_ids.insert(id) {
+                self.folded_queue_item_order.push_back(id);
+            }
+        }
+        while self.folded_queue_item_order.len() > Self::FOLDED_QUEUE_TOMBSTONE_CAPACITY {
+            if let Some(expired) = self.folded_queue_item_order.pop_front() {
+                self.folded_queue_item_ids.remove(&expired);
+            }
+        }
+    }
+
+    fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
+        let contains_tracked = |id| queue.iter().any(|item| item.id == id);
+        let (suppress_id, next_ack) = match self.fresh_queue_ack {
+            FreshQueueAck::AwaitingAck(id) if contains_tracked(id) => {
+                (Some(id), FreshQueueAck::SuppressId(id))
+            }
+            FreshQueueAck::SuppressId(id) => (Some(id), FreshQueueAck::SuppressId(id)),
+            FreshQueueAck::FoldedBeforeAck(id) if contains_tracked(id) => {
+                (Some(id), FreshQueueAck::None)
+            }
+            FreshQueueAck::FoldedBeforeAck(id) => (Some(id), FreshQueueAck::FoldedBeforeAck(id)),
+            FreshQueueAck::None | FreshQueueAck::AwaitingAck(_) => (None, self.fresh_queue_ack),
+        };
+        self.queue = queue
+            .into_iter()
+            .filter(|item| {
+                !self.folded_queue_item_ids.contains(&item.id) && suppress_id != Some(item.id)
+            })
+            .collect();
+        self.fresh_queue_ack = next_ack;
     }
 
     #[cfg(test)]
@@ -134,10 +182,10 @@ impl BtwPane {
     pub(super) fn apply_event(&mut self, event: TurnEvent, strip_inline_think: bool) {
         match event {
             TurnEvent::HistoryReplay { entries } => {
-                self.history.extend(wire_history_to_entries(entries));
+                reconcile_history_replay(&mut self.history, entries);
             }
             TurnEvent::QueueUpdated { queue } => {
-                self.queue = queue;
+                self.reconcile_queue_update(queue);
             }
             TurnEvent::QueuedUserMessagesFolded {
                 text,
@@ -151,36 +199,118 @@ impl BtwPane {
                     .iter()
                     .copied()
                     .collect::<std::collections::HashSet<_>>();
+                self.remember_folded_queue_item_ids(queue_item_ids.iter().copied());
+                let folded_before_ack_id = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if folded_ids.contains(&id) => Some(id),
+                    _ => None,
+                };
                 self.queue.retain(|item| !folded_ids.contains(&item.id));
-                self.history.push(HistoryEntry::User {
-                    text: display_text
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or(text),
-                    cleaned: preflight_cleaned,
-                    expanded: false,
-                    timestamp: chrono::Local::now(),
+                reconcile_folded_user_history(
+                    &mut self.history,
+                    &folded_ids,
+                    text,
+                    display_text,
                     seq,
-                    preflight_pending: false,
-                    persist_failed: false,
-                });
+                    preflight_cleaned,
+                );
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if folded_before_ack_id == Some(id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if folded_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
             }
             TurnEvent::UserMessageRecorded {
                 seq,
+                client_submission_ids,
                 preflight_cleaned,
             } => {
-                let text = self
-                    .last_message_dispatched
-                    .clone()
-                    .unwrap_or_else(|| "btw message".to_string());
-                self.history.push(HistoryEntry::User {
-                    text,
-                    cleaned: preflight_cleaned,
-                    expanded: false,
-                    timestamp: chrono::Local::now(),
-                    seq: Some(seq),
-                    preflight_pending: false,
-                    persist_failed: false,
-                });
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if client_submission_ids.contains(&id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if client_submission_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+                if self.history.iter().any(
+                    |entry| matches!(entry, HistoryEntry::User { seq: Some(existing), .. } if *existing == seq),
+                ) {
+                    return;
+                }
+                for entry in self.history.iter_mut() {
+                    if let HistoryEntry::User {
+                        seq: row_seq @ None,
+                        cleaned,
+                        optimistic_submission_id,
+                        preflight_pending,
+                        persist_failed,
+                        ..
+                    } = entry
+                        && optimistic_submission_id
+                            .is_some_and(|id| client_submission_ids.contains(&id))
+                    {
+                        *row_seq = Some(seq);
+                        *cleaned = preflight_cleaned;
+                        *preflight_pending = false;
+                        *persist_failed = false;
+                        *optimistic_submission_id = None;
+                        break;
+                    }
+                }
+            }
+            TurnEvent::PreflightStarted {
+                client_submission_ids,
+            } => {
+                for entry in &mut self.history {
+                    if let HistoryEntry::User {
+                        seq: None,
+                        optimistic_submission_id: Some(id),
+                        preflight_pending,
+                        persist_failed,
+                        ..
+                    } = entry
+                        && !*persist_failed
+                        && client_submission_ids.contains(id)
+                    {
+                        *preflight_pending = true;
+                    }
+                }
+            }
+            TurnEvent::UserMessagesTerminated {
+                client_submission_ids,
+                ..
+            } => {
+                let terminal_ids = client_submission_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.queue.retain(|item| !terminal_ids.contains(&item.id));
+                remove_correlated_optimistic_user_history(&mut self.history, &terminal_ids);
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::UserMessageRetracted {
+                client_submission_ids,
+            } => {
+                let ids = client_submission_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                remove_correlated_optimistic_user_history(&mut self.history, &ids);
             }
             TurnEvent::ThinkingStarted { agent, .. } => {
                 self.finalize_pending();
@@ -241,13 +371,74 @@ impl BtwPane {
                     expanded: false,
                 });
             }
-            TurnEvent::UserMessageDispatchFailed { error } => {
+            TurnEvent::UserMessageDispatchFailed {
+                error,
+                optimistic_submission_id,
+            } => {
                 self.finalize_pending();
+                for entry in self.history.iter_mut() {
+                    if let HistoryEntry::User {
+                        optimistic_submission_id: Some(id),
+                        seq: None,
+                        preflight_pending,
+                        persist_failed,
+                        ..
+                    } = entry
+                        && *id == optimistic_submission_id
+                    {
+                        *preflight_pending = false;
+                        *persist_failed = true;
+                        break;
+                    }
+                }
+                self.queue
+                    .retain(|item| item.id != optimistic_submission_id);
+                let summary = format!("message was not sent: {error}");
                 self.history.push(HistoryEntry::InferenceError {
-                    summary: error.clone(),
-                    detail: error,
+                    summary: summary.clone(),
+                    detail: summary,
                     expanded: false,
                 });
+            }
+            TurnEvent::UserMessageDispatchRetained {
+                error,
+                optimistic_submission_id,
+            } => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!(
+                        "Message {optimistic_submission_id} was not accepted and was retained for retry: {error}"
+                    ),
+                });
+            }
+            TurnEvent::UserMessageDispatchRestored {
+                optimistic_submission_id,
+                text,
+                display_text,
+                ..
+            } => {
+                let exists = self.history.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::User {
+                            optimistic_submission_id: Some(id),
+                            ..
+                        } if *id == optimistic_submission_id
+                    )
+                });
+                if !exists {
+                    self.history.push(HistoryEntry::User {
+                        text: display_text
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(text),
+                        cleaned: None,
+                        expanded: false,
+                        timestamp: chrono::Local::now(),
+                        seq: None,
+                        optimistic_submission_id: Some(optimistic_submission_id),
+                        preflight_pending: false,
+                        persist_failed: false,
+                    });
+                }
             }
             TurnEvent::AgentIdle { .. } => {
                 self.finalize_pending();
@@ -293,13 +484,27 @@ impl BtwPane {
             job_id: None,
             preflight_cleaned: None,
             queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
             queue_target: None,
+            pending_terminal_disposition: None,
         };
+        let client_submission_id = Uuid::new_v4();
         runner
-            .input_tx
-            .try_send(submission)
+            .try_send_optimistic_input(submission, client_submission_id)
             .map_err(|_| "btw message could not be sent".to_string())?;
-        self.last_message_dispatched = Some(text);
+        self.history.push(HistoryEntry::User {
+            text: text.clone(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            optimistic_submission_id: Some(client_submission_id),
+            preflight_pending: false,
+            persist_failed: false,
+        });
+        self.queue
+            .push(optimistic_queue_item(client_submission_id, text));
+        self.fresh_queue_ack = FreshQueueAck::AwaitingAck(client_submission_id);
         Ok(())
     }
 
@@ -322,9 +527,11 @@ impl BtwPane {
                 if text.is_empty() {
                     return BtwFocusedKeyOutcome::Consumed;
                 }
-                self.composer.clear();
                 match self.send_text(text) {
-                    Ok(()) => BtwFocusedKeyOutcome::Consumed,
+                    Ok(()) => {
+                        self.composer.clear();
+                        BtwFocusedKeyOutcome::Consumed
+                    }
                     Err(error) => BtwFocusedKeyOutcome::Error(error),
                 }
             }
@@ -555,9 +762,9 @@ pub(super) fn compose_aux_layout(
     }
 }
 
-fn optimistic_queue_item(text: String) -> QueuedUserMessage {
+fn optimistic_queue_item(id: Uuid, text: String) -> QueuedUserMessage {
     QueuedUserMessage {
-        id: Uuid::new_v4(),
+        id,
         status: QueueItemStatus::Queued,
         text: text.clone(),
         display_text: Some(text),
@@ -603,8 +810,8 @@ impl App {
                 }
             }
         };
-        let attached_request_tx = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_tx.clone(),
+        let attached_request = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.attached_request_binding(),
             _ => unreachable!("runner checked above"),
         };
 
@@ -618,7 +825,7 @@ impl App {
                     tangent: mode.tangent(),
                 },
             };
-            match agent_runner::attached_request_tx_blocking(attached_request_tx.clone(), request) {
+            match agent_runner::attached_request_tx_blocking(attached_request.clone(), request) {
                 Ok(Response::Ack) => {
                     self.close_btw_pane();
                 }
@@ -662,7 +869,6 @@ impl App {
             if let Some(question) = question
                 && let Err(error) = pane.send_text(question.clone())
             {
-                pane.queue.push(optimistic_queue_item(question));
                 pane.history.push(HistoryEntry::InferenceError {
                     summary: error.clone(),
                     detail: error,
@@ -805,6 +1011,54 @@ mod tests {
                 sandbox_escalation: None,
             }],
         }
+    }
+
+    #[test]
+    fn btw_same_session_replay_replaces_correlated_optimistic_row() {
+        let mut pane = BtwPane::new(info(false), false);
+        let id = Uuid::new_v4();
+        pane.history.push(HistoryEntry::User {
+            text: "optimistic".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: None,
+            optimistic_submission_id: Some(id),
+            preflight_pending: false,
+            persist_failed: false,
+        });
+
+        pane.apply_event(
+            TurnEvent::HistoryReplay {
+                entries: vec![proto::HistoryEntry::User {
+                    text: "authoritative wire".to_string(),
+                    display_text: Some("authoritative".to_string()),
+                    tag_expansions: Vec::new(),
+                    ts_ms: 1,
+                    seq: 9,
+                    client_submission_ids: vec![id],
+                    origin_principal: None,
+                }],
+            },
+            false,
+        );
+
+        assert_eq!(
+            pane.history
+                .iter()
+                .filter(|entry| matches!(entry, HistoryEntry::User { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            pane.history.first(),
+            Some(HistoryEntry::User {
+                text,
+                seq: Some(9),
+                optimistic_submission_id: None,
+                ..
+            }) if text == "authoritative"
+        ));
     }
 
     fn interrupt(session_id: Uuid, description: &str, permission: bool) -> TurnEvent {
@@ -1035,7 +1289,8 @@ mod tests {
             let side = info(false);
             let mut app = App::new(None, false);
             app.open_btw_pane_from_info(side.clone(), false);
-            app.composer_active_since_dialog = true;
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert_eq!(app.composer.text(), "x");
 
             app.handle_btw_interrupt(interrupt_with_reason(
                 side.session_id,
@@ -1094,8 +1349,8 @@ mod tests {
     #[test]
     fn btw_pane_queue_and_navigation() {
         let mut pane = BtwPane::new(info(false), false);
-        let item = optimistic_queue_item("queued".to_string());
-        let id = item.id;
+        let id = Uuid::new_v4();
+        let item = optimistic_queue_item(id, "queued".to_string());
         pane.apply_event(TurnEvent::QueueUpdated { queue: vec![item] }, true);
         assert_eq!(pane.queue.len(), 1);
         pane.apply_event(
@@ -1114,6 +1369,209 @@ mod tests {
         assert!(
             matches!(pane.history.last(), Some(HistoryEntry::User { text, seq, .. }) if text == "queued" && *seq == Some(9))
         );
+    }
+
+    #[test]
+    fn btw_rapid_submissions_and_fold_record_pairs_reconcile_exactly_once() {
+        let mut pane = BtwPane::new(info(false), false);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        for (id, text) in [(a, "A"), (b, "B")] {
+            pane.history.push(HistoryEntry::User {
+                text: text.to_string(),
+                cleaned: None,
+                expanded: false,
+                timestamp: chrono::Local::now(),
+                seq: None,
+                optimistic_submission_id: Some(id),
+                preflight_pending: false,
+                persist_failed: false,
+            });
+            pane.queue.push(optimistic_queue_item(id, text.to_string()));
+        }
+
+        // Interleave B's durable signals ahead of A. Positional correlation
+        // would stamp/render the wrong text; UUID correlation must not.
+        pane.apply_event(
+            TurnEvent::QueuedUserMessagesFolded {
+                text: "wire B".to_string(),
+                display_text: Some("B".to_string()),
+                tag_expansions: Vec::new(),
+                queue_item_ids: vec![b],
+                target: QueueTarget::root("btw"),
+                seq: Some(20),
+                preflight_cleaned: None,
+            },
+            true,
+        );
+        pane.apply_event(
+            TurnEvent::UserMessageRecorded {
+                seq: 20,
+                client_submission_ids: vec![b],
+                preflight_cleaned: None,
+            },
+            true,
+        );
+        pane.apply_event(
+            TurnEvent::QueuedUserMessagesFolded {
+                text: "wire A".to_string(),
+                display_text: Some("A".to_string()),
+                tag_expansions: Vec::new(),
+                queue_item_ids: vec![a],
+                target: QueueTarget::root("btw"),
+                seq: Some(21),
+                preflight_cleaned: None,
+            },
+            true,
+        );
+        pane.apply_event(
+            TurnEvent::UserMessageRecorded {
+                seq: 21,
+                client_submission_ids: vec![a],
+                preflight_cleaned: None,
+            },
+            true,
+        );
+
+        let rows = pane
+            .history
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::User { text, seq, .. } => Some((text.as_str(), *seq)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![("A", Some(21)), ("B", Some(20))]);
+        assert!(pane.queue.is_empty());
+    }
+
+    #[test]
+    fn btw_multi_id_fold_is_canonical_and_delayed_ack_cannot_resurrect_rows() {
+        let mut pane = BtwPane::new(info(false), false);
+        let first_id = Uuid::from_u128(301);
+        let second_id = Uuid::from_u128(302);
+        for (id, text) in [
+            (first_id, "optimistic first"),
+            (second_id, "optimistic second"),
+        ] {
+            pane.history.push(HistoryEntry::User {
+                text: text.to_string(),
+                cleaned: None,
+                expanded: false,
+                timestamp: chrono::Local::now(),
+                seq: None,
+                optimistic_submission_id: Some(id),
+                preflight_pending: false,
+                persist_failed: false,
+            });
+            pane.queue.push(optimistic_queue_item(id, text.to_string()));
+        }
+        pane.fresh_queue_ack = FreshQueueAck::AwaitingAck(second_id);
+
+        pane.apply_event(
+            TurnEvent::QueuedUserMessagesFolded {
+                text: "expanded first\n\nexpanded second".to_string(),
+                display_text: Some("canonical first\n\ncanonical second".to_string()),
+                tag_expansions: Vec::new(),
+                queue_item_ids: vec![first_id, second_id],
+                target: QueueTarget::root("btw"),
+                seq: Some(30),
+                preflight_cleaned: None,
+            },
+            true,
+        );
+
+        let rows = pane
+            .history
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::User {
+                    text,
+                    seq,
+                    optimistic_submission_id,
+                    ..
+                } => Some((text.as_str(), *seq, *optimistic_submission_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![("canonical first\n\ncanonical second", Some(30), None)]
+        );
+        assert_eq!(
+            pane.fresh_queue_ack,
+            FreshQueueAck::FoldedBeforeAck(second_id)
+        );
+
+        let unrelated_id = Uuid::from_u128(303);
+        pane.apply_event(
+            TurnEvent::QueueUpdated {
+                queue: vec![
+                    optimistic_queue_item(first_id, "late first".to_string()),
+                    optimistic_queue_item(second_id, "late second".to_string()),
+                    optimistic_queue_item(unrelated_id, "still queued".to_string()),
+                ],
+            },
+            true,
+        );
+        assert_eq!(
+            pane.queue.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![unrelated_id],
+            "fold tombstones and the delayed-ACK state suppress all already-recorded items"
+        );
+        assert_eq!(pane.fresh_queue_ack, FreshQueueAck::None);
+    }
+
+    #[test]
+    fn btw_dispatch_failure_marks_only_the_correlated_optimistic_submission() {
+        let mut pane = BtwPane::new(info(false), false);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        for (id, text) in [(a, "A"), (b, "B")] {
+            pane.history.push(HistoryEntry::User {
+                text: text.to_string(),
+                cleaned: None,
+                expanded: false,
+                timestamp: chrono::Local::now(),
+                seq: None,
+                optimistic_submission_id: Some(id),
+                preflight_pending: true,
+                persist_failed: false,
+            });
+            pane.queue.push(optimistic_queue_item(id, text.to_string()));
+        }
+
+        pane.apply_event(
+            TurnEvent::UserMessageDispatchFailed {
+                error: "definite rejection".to_string(),
+                optimistic_submission_id: a,
+            },
+            true,
+        );
+
+        let rows = pane
+            .history
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::User {
+                    text,
+                    preflight_pending,
+                    persist_failed,
+                    ..
+                } => Some((text.as_str(), *preflight_pending, *persist_failed)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![("A", false, true), ("B", true, false)]);
+        assert_eq!(
+            pane.queue.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![b]
+        );
+        assert!(matches!(
+            pane.history.last(),
+            Some(HistoryEntry::InferenceError { summary, .. })
+                if summary.contains("definite rejection")
+        ));
     }
 
     #[test]

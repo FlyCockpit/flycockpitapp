@@ -616,6 +616,7 @@ fn failed_user_entry_has_no_chip_target() {
         expanded: false,
         timestamp: fixed_ts(),
         seq: None,
+        optimistic_submission_id: None,
         preflight_pending: false,
         persist_failed: true,
     };

@@ -1,5 +1,95 @@
 use super::*;
 
+struct DefaultModelUpdateResult {
+    outcome: crate::daemon::proto::DefaultModelUpdateOutcome,
+    authoritative_selection: Option<crate::config::providers::ActiveModelRef>,
+}
+
+impl DefaultModelUpdateResult {
+    fn not_requested(
+        authoritative_selection: Option<crate::config::providers::ActiveModelRef>,
+    ) -> Self {
+        Self {
+            outcome: crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            authoritative_selection,
+        }
+    }
+
+    fn write_failed(
+        target: &crate::config::providers::ActiveModelRef,
+        error: &anyhow::Error,
+        authoritative_selection: Option<crate::config::providers::ActiveModelRef>,
+    ) -> Self {
+        Self {
+            outcome: crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
+                user_message: format!(
+                    "Using `{}/{}` for this session, but could not save it as the default — {error:#}.",
+                    target.provider, target.model
+                ),
+                diagnostic_code: "default_model_write_failed".to_string(),
+            },
+            authoritative_selection,
+        }
+    }
+
+    fn from_prepared_commit(
+        target: &crate::config::providers::ActiveModelRef,
+        intent: DefaultModelWriteIntent,
+        authoritative_before_commit: Option<crate::config::providers::ActiveModelRef>,
+        committed: Result<crate::config::providers::ActiveModelWriteResult>,
+    ) -> Self {
+        match committed {
+            Ok(result) => Self {
+                outcome: match intent {
+                    DefaultModelWriteIntent::InitializeIfMissing if !result.wrote => {
+                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+                    }
+                    DefaultModelWriteIntent::Replace
+                    | DefaultModelWriteIntent::InitializeIfMissing => {
+                        crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+                    }
+                    DefaultModelWriteIntent::None => unreachable!("handled during prepare"),
+                },
+                authoritative_selection: result.authoritative_selection,
+            },
+            Err(error) => Self::write_failed(target, &error, authoritative_before_commit),
+        }
+    }
+}
+
+enum PreparedDefaultModelUpdate {
+    Immediate(DefaultModelUpdateResult),
+    Production {
+        write: Box<crate::config::providers::PreparedActiveModelWrite>,
+        intent: DefaultModelWriteIntent,
+        authoritative_before_commit: Option<crate::config::providers::ActiveModelRef>,
+    },
+    #[cfg(test)]
+    Test(DefaultModelWriteIntent),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultModelWriteIntent {
+    None,
+    Replace,
+    InitializeIfMissing,
+}
+
+impl DefaultModelWriteIntent {
+    pub(super) fn from_flags(
+        persist_as_default: bool,
+        initialize_default_if_missing: bool,
+    ) -> Self {
+        if persist_as_default {
+            Self::Replace
+        } else if initialize_default_if_missing {
+            Self::InitializeIfMissing
+        } else {
+            Self::None
+        }
+    }
+}
+
 /// Deadline and exactly-once terminal-claim state for a timed model request.
 pub(super) struct ModelSelectionTerminal<'a> {
     pub(super) deadline: std::time::Instant,
@@ -17,6 +107,36 @@ enum ModelSelectionCommitClaim {
 struct ModelSelectionTerminalEmission<'a> {
     claimed: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
     owned: bool,
+}
+
+struct ModelSelectionRejection {
+    user_message: String,
+    diagnostic_code: &'static str,
+}
+
+impl ModelSelectionRejection {
+    fn deadline() -> Self {
+        Self {
+            user_message:
+                "Model selection timed out before it could be committed; retry from /model."
+                    .to_string(),
+            diagnostic_code: "model_selection_deadline_exceeded",
+        }
+    }
+
+    fn failure(
+        target: &crate::config::providers::ActiveModelRef,
+        error: &str,
+        diagnostic_code: &'static str,
+    ) -> Self {
+        Self {
+            user_message: format!(
+                "Could not switch to `{}/{}` — {error}. Keeping the confirmed model active.",
+                target.provider, target.model
+            ),
+            diagnostic_code,
+        }
+    }
 }
 
 fn claim_model_selection_commit(
@@ -62,7 +182,7 @@ impl Driver {
         &mut self,
         selection_id: uuid::Uuid,
         target: crate::config::providers::ActiveModelRef,
-        persist_as_default: bool,
+        default_write: DefaultModelWriteIntent,
         terminal: Option<ModelSelectionTerminal<'_>>,
         trigger: crate::session::ModelSwitchTrigger,
         tx: &mpsc::Sender<TurnEvent>,
@@ -84,8 +204,8 @@ impl Driver {
             self.emit_model_selection_result(
                 selection_id,
                 &target,
-                false,
-                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                DefaultModelUpdateResult::not_requested(None),
+                Some(ModelSelectionRejection::deadline()),
                 ModelSelectionTerminalEmission {
                     claimed: terminal_claimed,
                     owned: false,
@@ -102,12 +222,17 @@ impl Driver {
         let old_session_model = old_session_selection
             .as_ref()
             .map(|value| value.model.clone());
-        let Some(active_idx) = self.active_frame_index() else {
+        if self.stack.is_empty() {
             self.emit_model_selection_result(
                 selection_id,
                 &target,
-                false,
-                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                DefaultModelUpdateResult::not_requested(None),
+                Some(ModelSelectionRejection {
+                    user_message: format!(
+                        "Could not switch to `{provider}/{model}` because no root agent frame is available; retry after reattaching."
+                    ),
+                    diagnostic_code: "model_selection_no_active_frame",
+                }),
                 ModelSelectionTerminalEmission {
                     claimed: terminal_claimed,
                     owned: false,
@@ -116,15 +241,42 @@ impl Driver {
             )
             .await;
             return false;
-        };
-        let current = &self.stack[active_idx].agent.model;
-        let old_llm_mode = self.stack[active_idx].agent.llm_mode;
+        }
+        // ActiveModelRef is durable session/root state. Interactive child
+        // frames may temporarily own the foreground, but changing only that
+        // child would leave the parked resumable root split from the session
+        // row and the state announced to clients.
+        let root_idx = 0;
+        let current = &self.stack[root_idx].agent.model;
+        let old_llm_mode = self.stack[root_idx].agent.llm_mode;
         let old_prompt_cache_retention_preference = self.prompt_cache_retention_preference;
         self.prompt_cache_retention_preference = target.prompt_cache_retention;
         if current.provider_id() == provider
             && current.model_id_ref() == model
             && old_session_selection.as_ref() == Some(&target)
         {
+            let prepared_default = match self
+                .prepare_default_model(&target, default_write, deadline)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(rejection) => {
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                    self.emit_model_selection_result(
+                        selection_id,
+                        &target,
+                        DefaultModelUpdateResult::not_requested(None),
+                        Some(rejection),
+                        ModelSelectionTerminalEmission {
+                            claimed: terminal_claimed,
+                            owned: false,
+                        },
+                        tx,
+                    )
+                    .await;
+                    return false;
+                }
+            };
             let terminal_owned = match claim_model_selection_commit(terminal.as_ref()) {
                 ModelSelectionCommitClaim::Untimed => false,
                 ModelSelectionCommitClaim::Owned => true,
@@ -137,8 +289,8 @@ impl Driver {
                     self.emit_model_selection_result(
                         selection_id,
                         &target,
-                        false,
-                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                        DefaultModelUpdateResult::not_requested(None),
+                        Some(ModelSelectionRejection::deadline()),
                         ModelSelectionTerminalEmission {
                             claimed: terminal_claimed,
                             owned: false,
@@ -149,28 +301,18 @@ impl Driver {
                     return false;
                 }
             };
-            let mut default_update = if persist_as_default {
+            let default_update = self.commit_prepared_default_model(&target, prepared_default);
+            if matches!(
+                default_update.outcome,
                 crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-            } else {
-                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-            };
-            if persist_as_default && self.live_config_active_model().as_ref() != Some(&target) {
-                if let Err(e) = self.write_active_model_config(&target) {
-                    let user_message = format!(
-                        "Using `{provider}/{model}` for this session, but could not save it as the default — {e:#}."
-                    );
-                    default_update = crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
-                        user_message: user_message.clone(),
-                        diagnostic_code: "default_model_write_failed".to_string(),
-                    };
-                } else {
-                    for idx in 0..self.stack.len() {
-                        let retention =
-                            self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
-                        Arc::make_mut(&mut self.stack[idx].agent)
-                            .params
-                            .prompt_cache_retention = retention;
-                    }
+            ) && default_update.authoritative_selection.as_ref() == Some(&target)
+            {
+                for idx in 0..self.stack.len() {
+                    let retention =
+                        self.resolve_prompt_cache_retention_for(&self.stack[idx].agent.model);
+                    Arc::make_mut(&mut self.stack[idx].agent)
+                        .params
+                        .prompt_cache_retention = retention;
                 }
             }
             self.record_model_switch_audit(crate::session::ModelSwitchAudit {
@@ -183,15 +325,22 @@ impl Driver {
                 error: None,
             })
             .await;
-            self.emit_active_model_state(tx).await;
+            let saved_default = matches!(
+                &default_update.outcome,
+                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+            )
+            .then(|| target.clone())
+            .or_else(|| default_update.authoritative_selection.clone());
+            self.emit_active_model_state_with_default(tx, saved_default)
+                .await;
             if self.prompt_cache_retention_override.is_some() {
                 self.emit_longcache_state(tx).await;
             }
             self.emit_model_selection_result(
                 selection_id,
                 &target,
-                true,
                 default_update,
+                None,
                 ModelSelectionTerminalEmission {
                     claimed: terminal_claimed,
                     owned: terminal_owned,
@@ -231,8 +380,12 @@ impl Driver {
                 self.emit_model_selection_result(
                     selection_id,
                     &target,
-                    false,
-                    crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                    DefaultModelUpdateResult::not_requested(None),
+                    Some(ModelSelectionRejection::failure(
+                        &target,
+                        &error,
+                        "model_selection_build_failed",
+                    )),
                     ModelSelectionTerminalEmission {
                         claimed: terminal_claimed,
                         owned: false,
@@ -245,10 +398,11 @@ impl Driver {
         };
         let llm_mode = self.effective_llm_mode_for(provider, model);
         let rebuilt =
-            match self.try_rebuild_frame_with_model(active_idx, new_model.clone(), llm_mode) {
+            match self.try_rebuild_frame_with_model(root_idx, new_model.clone(), llm_mode, &target)
+            {
                 Ok(agent) => Arc::new(agent),
-                Err(_) if active_idx == 0 => {
-                    Arc::new(self.rebuild_frame_with_model(active_idx, new_model, llm_mode))
+                Err(_) if root_idx == 0 => {
+                    Arc::new(self.rebuild_frame_with_model(root_idx, new_model, llm_mode, &target))
                 }
                 Err(e) => {
                     let error = format!("{e:#}");
@@ -275,8 +429,12 @@ impl Driver {
                     self.emit_model_selection_result(
                         selection_id,
                         &target,
-                        false,
-                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                        DefaultModelUpdateResult::not_requested(None),
+                        Some(ModelSelectionRejection::failure(
+                            &target,
+                            &error,
+                            "model_selection_rebuild_failed",
+                        )),
                         ModelSelectionTerminalEmission {
                             claimed: terminal_claimed,
                             owned: false,
@@ -287,6 +445,28 @@ impl Driver {
                     return false;
                 }
             };
+        let prepared_default = match self
+            .prepare_default_model(&target, default_write, deadline)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(rejection) => {
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                self.emit_model_selection_result(
+                    selection_id,
+                    &target,
+                    DefaultModelUpdateResult::not_requested(None),
+                    Some(rejection),
+                    ModelSelectionTerminalEmission {
+                        claimed: terminal_claimed,
+                        owned: false,
+                    },
+                    tx,
+                )
+                .await;
+                return false;
+            }
+        };
         let terminal_owned = match claim_model_selection_commit(terminal.as_ref()) {
             ModelSelectionCommitClaim::Untimed => false,
             ModelSelectionCommitClaim::Owned => true,
@@ -299,8 +479,8 @@ impl Driver {
                 self.emit_model_selection_result(
                     selection_id,
                     &target,
-                    false,
-                    crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                    DefaultModelUpdateResult::not_requested(None),
+                    Some(ModelSelectionRejection::deadline()),
                     ModelSelectionTerminalEmission {
                         claimed: terminal_claimed,
                         owned: false,
@@ -338,8 +518,12 @@ impl Driver {
             self.emit_model_selection_result(
                 selection_id,
                 &target,
-                false,
-                crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                DefaultModelUpdateResult::not_requested(None),
+                Some(ModelSelectionRejection::failure(
+                    &target,
+                    &error,
+                    "model_selection_session_persist_failed",
+                )),
                 ModelSelectionTerminalEmission {
                     claimed: terminal_claimed,
                     owned: terminal_owned,
@@ -349,22 +533,7 @@ impl Driver {
             .await;
             return false;
         }
-        let default_update = if !persist_as_default {
-            crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-        } else {
-            match self.write_active_model_config(&target) {
-                Ok(()) => crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
-                Err(e) => {
-                    let user_message = format!(
-                        "Using `{provider}/{model}` for this session, but could not save it as the default — {e:#}."
-                    );
-                    crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
-                        user_message,
-                        diagnostic_code: "default_model_write_failed".to_string(),
-                    }
-                }
-            }
-        };
+        let default_update = self.commit_prepared_default_model(&target, prepared_default);
         self.record_model_switch_audit(crate::session::ModelSwitchAudit {
             from_provider: old_session_provider.as_deref(),
             from_model: old_session_model.as_deref(),
@@ -375,9 +544,12 @@ impl Driver {
             error: None,
         })
         .await;
-        self.stack[active_idx].agent = rebuilt;
-        self.schedule
-            .set_agent(self.stack[active_idx].agent.clone());
+        self.stack[root_idx].agent = rebuilt;
+        // A foreground child remains the schedule authority until it returns.
+        // The rebuilt root becomes active naturally at the next root boundary.
+        if self.active_frame_index() == Some(root_idx) {
+            self.schedule.set_agent(self.stack[root_idx].agent.clone());
+        }
         if old_llm_mode != llm_mode {
             let _ = tx.send(TurnEvent::LlmModeChanged { mode: llm_mode }).await;
         }
@@ -385,15 +557,22 @@ impl Driver {
         // The model changed, so the prefix cache key changes — refresh the
         // prunable projection the chrome shows (cache-cold reflects the bust).
         self.emit_context_projection(tx).await;
-        self.emit_active_model_state(tx).await;
+        let saved_default = matches!(
+            &default_update.outcome,
+            crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+        )
+        .then(|| target.clone())
+        .or_else(|| default_update.authoritative_selection.clone());
+        self.emit_active_model_state_with_default(tx, saved_default)
+            .await;
         if self.prompt_cache_retention_override.is_some() {
             self.emit_longcache_state(tx).await;
         }
         self.emit_model_selection_result(
             selection_id,
             &target,
-            true,
             default_update,
+            None,
             ModelSelectionTerminalEmission {
                 claimed: terminal_claimed,
                 owned: terminal_owned,
@@ -408,8 +587,8 @@ impl Driver {
         &self,
         selection_id: uuid::Uuid,
         target: &crate::config::providers::ActiveModelRef,
-        applied: bool,
-        default_update: crate::daemon::proto::DefaultModelUpdateOutcome,
+        default_update: DefaultModelUpdateResult,
+        rejection: Option<ModelSelectionRejection>,
         terminal: ModelSelectionTerminalEmission<'_>,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
@@ -420,6 +599,7 @@ impl Driver {
         {
             return;
         }
+        let applied = rejection.is_none();
         tracing::info!(
             session_id = %self.session.id,
             %selection_id,
@@ -432,10 +612,14 @@ impl Driver {
         // Config-watch refresh is asynchronous. A successful write is already
         // authoritative for this terminal result even if the worker's live
         // snapshot still contains the prior default for a few milliseconds.
-        let terminal_default_selection = match &default_update {
-            crate::daemon::proto::DefaultModelUpdateOutcome::Saved => Some(target.clone()),
-            _ => self.live_config_active_model(),
-        };
+        let terminal_default_selection = default_update.authoritative_selection.or_else(|| {
+            matches!(
+                &default_update.outcome,
+                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+            )
+            .then(|| target.clone())
+            .or_else(|| self.live_config_active_model())
+        });
         let terminal_diverged = terminal_default_selection.as_ref() != Some(target);
         let _ = tx
             .send(TurnEvent::ModelSelectionResult {
@@ -446,9 +630,14 @@ impl Driver {
                     .reasoning_effort
                     .as_ref()
                     .map(|effort| effort.value.clone()),
-                thinking_mode: target.thinking_mode.map(|mode| mode.as_str().to_string()),
+                thinking_mode: target.thinking_mode,
                 prompt_cache_retention: target.prompt_cache_retention,
-                outcome: if applied {
+                outcome: if let Some(rejection) = rejection {
+                    crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                        user_message: rejection.user_message,
+                        diagnostic_code: rejection.diagnostic_code.to_string(),
+                    }
+                } else {
                     crate::daemon::proto::ModelSelectionOutcome::Applied {
                         active_state: crate::daemon::proto::ModelSelectionActiveState {
                             selection: target.clone(),
@@ -456,15 +645,7 @@ impl Driver {
                             diverged: terminal_diverged,
                             generation: self.active_model_state_generation,
                         },
-                        default_update,
-                    }
-                } else {
-                    crate::daemon::proto::ModelSelectionOutcome::Rejected {
-                        user_message: format!(
-                            "Could not switch to `{}/{}`; keeping the confirmed model active.",
-                            target.provider, target.model
-                        ),
-                        diagnostic_code: "model_switch_rejected".to_string(),
+                        default_update: default_update.outcome,
                     }
                 },
             })
@@ -484,10 +665,10 @@ impl Driver {
         &self,
         active: &crate::config::providers::ActiveModelRef,
     ) -> Result<crate::engine::model::Model> {
-        let running = self.stack[self.active_frame_index().expect("stack never empty")]
-            .agent
-            .model
-            .clone();
+        // Model selection is session/root state. A foreground child may be
+        // pinned to a different provider or config layer, and must never lend
+        // those runtime details to a rebuilt root model.
+        let running = self.stack[0].agent.model.clone();
         self.build_live_model_for_running_with_active(&running, active)
     }
 
@@ -543,28 +724,201 @@ impl Driver {
         self.live_providers_config().ok()?.active_model
     }
 
-    fn write_active_model_config(
+    fn authoritative_config_active_model(
+        &self,
+    ) -> Option<crate::config::providers::ActiveModelRef> {
+        #[cfg(test)]
+        if let Some((providers, _, _)) = &self.test_providers_override {
+            return providers.active_model.clone();
+        }
+        crate::daemon::config_source::load_effective_providers_for_atomic_mutation(&self.cwd)
+            .active_model
+    }
+
+    async fn prepare_default_model(
+        &mut self,
+        target: &crate::config::providers::ActiveModelRef,
+        intent: DefaultModelWriteIntent,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<PreparedDefaultModelUpdate, ModelSelectionRejection> {
+        if matches!(intent, DefaultModelWriteIntent::None) {
+            return Ok(PreparedDefaultModelUpdate::Immediate(
+                DefaultModelUpdateResult {
+                    outcome: crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+                    authoritative_selection: self.live_config_active_model(),
+                },
+            ));
+        }
+
+        #[cfg(test)]
+        if self.test_providers_override.is_some() || self.test_fail_next_active_model_config_write {
+            return Ok(PreparedDefaultModelUpdate::Test(intent));
+        }
+
+        // Acquire the cross-process lock, resolve the effective layered
+        // default, serialize, and fsync a private temp file before terminal
+        // ownership is claimed. Lock acquisition polls a cancellation flag:
+        // after a deadline we cancel and join the blocking task before
+        // returning, so timed-out attempts cannot remain queued and later
+        // monopolize the global config lock.
+        let cwd = self.cwd.clone();
+        let target_for_write = target.clone();
+        let trust_policy = crate::config::trust::current_workspace_trust_policy();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prepare_cancelled = std::sync::Arc::clone(&cancelled);
+        let mut prepare = tokio::task::spawn_blocking(move || {
+            let write = || {
+                let path = crate::config::dirs::most_specific_config_write_target(&cwd)
+                    .context("no cockpit config found — run `/settings` to create one")?;
+                let mode = match intent {
+                    DefaultModelWriteIntent::Replace => {
+                        crate::config::providers::ActiveModelWriteMode::Replace
+                    }
+                    DefaultModelWriteIntent::InitializeIfMissing => {
+                        crate::config::providers::ActiveModelWriteMode::InitializeIfMissing
+                    }
+                    DefaultModelWriteIntent::None => unreachable!("handled above"),
+                };
+                crate::config::providers::ConfigDoc::prepare_effective_active_model_write_cancellable(
+                    &cwd,
+                    &path,
+                    &target_for_write,
+                    mode,
+                    &prepare_cancelled,
+                )
+            };
+            match trust_policy {
+                Some(policy) => crate::config::trust::with_workspace_trust_policy(policy, write),
+                None => write(),
+            }
+        });
+        let prepared = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut prepare)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    // `spawn_blocking` tasks are not cancelled when their
+                    // join handle is dropped. Await the cooperatively
+                    // cancelled waiter so no orphan can acquire this lock
+                    // after the deadline. Any prepared plan that won the
+                    // boundary race is dropped here without committing.
+                    if let Err(error) = prepare.await {
+                        tracing::warn!(
+                            %error,
+                            "joining cancelled active-model config mutation preparation"
+                        );
+                    }
+                    return Err(ModelSelectionRejection::deadline());
+                }
+            }
+        } else {
+            prepare.await
+        };
+        let prepared = match prepared {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "joining active-model config mutation preparation: {error}"
+            )),
+        };
+
+        Ok(match prepared {
+            Ok(write) => {
+                let authoritative_before_commit =
+                    write.authoritative_selection_before_commit().cloned();
+                PreparedDefaultModelUpdate::Production {
+                    write: Box::new(write),
+                    intent,
+                    authoritative_before_commit,
+                }
+            }
+            Err(error) => {
+                PreparedDefaultModelUpdate::Immediate(DefaultModelUpdateResult::write_failed(
+                    target,
+                    &error,
+                    self.authoritative_config_active_model(),
+                ))
+            }
+        })
+    }
+
+    fn commit_prepared_default_model(
+        &mut self,
+        target: &crate::config::providers::ActiveModelRef,
+        prepared: PreparedDefaultModelUpdate,
+    ) -> DefaultModelUpdateResult {
+        match prepared {
+            PreparedDefaultModelUpdate::Immediate(result) => result,
+            PreparedDefaultModelUpdate::Production {
+                write,
+                intent,
+                authoritative_before_commit,
+            } => DefaultModelUpdateResult::from_prepared_commit(
+                target,
+                intent,
+                authoritative_before_commit,
+                (*write).commit(),
+            ),
+            #[cfg(test)]
+            PreparedDefaultModelUpdate::Test(intent) => {
+                self.update_default_model_for_test(target, intent)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn update_default_model_for_test(
+        &mut self,
+        target: &crate::config::providers::ActiveModelRef,
+        intent: DefaultModelWriteIntent,
+    ) -> DefaultModelUpdateResult {
+        let current = self.authoritative_config_active_model();
+        let should_write = match intent {
+            DefaultModelWriteIntent::Replace => current.as_ref() != Some(target),
+            DefaultModelWriteIntent::InitializeIfMissing => current.is_none(),
+            DefaultModelWriteIntent::None => unreachable!("handled above"),
+        };
+        if !should_write {
+            return DefaultModelUpdateResult {
+                outcome: match intent {
+                    DefaultModelWriteIntent::Replace => {
+                        crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+                    }
+                    DefaultModelWriteIntent::InitializeIfMissing => {
+                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+                    }
+                    DefaultModelWriteIntent::None => unreachable!("handled above"),
+                },
+                authoritative_selection: current,
+            };
+        }
+
+        match self.write_active_model_config_for_test(target) {
+            Ok(()) => DefaultModelUpdateResult {
+                outcome: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                authoritative_selection: Some(target.clone()),
+            },
+            Err(error) => DefaultModelUpdateResult::write_failed(target, &error, current),
+        }
+    }
+
+    #[cfg(test)]
+    fn write_active_model_config_for_test(
         &mut self,
         active: &crate::config::providers::ActiveModelRef,
     ) -> Result<()> {
-        #[cfg(test)]
         if self.test_fail_next_active_model_config_write {
             self.test_fail_next_active_model_config_write = false;
             anyhow::bail!("test injected active model config write failure");
         }
-        #[cfg(test)]
         if let Some((providers, provider, model)) = self.test_providers_override.as_mut() {
             providers.active_model = Some(active.clone());
             *provider = active.provider.clone();
             *model = active.model.clone();
             return Ok(());
         }
-        // `active_model` is a cross-provider resolution default, not provider configuration.
-        // It belongs in the canonical config layer, never a provider sidecar.
-        let path = crate::config::dirs::most_specific_config_write_target(&self.cwd)
-            .context("no cockpit config found — run `/settings` to create one")?;
-        let mut doc = crate::config::providers::ConfigDoc::load(&path)?;
-        doc.write_active_model(Some(active))
+        unreachable!("test config write helper requires an override or injected failure")
     }
 
     fn persist_active_model_session(
@@ -611,8 +965,36 @@ impl Driver {
     }
 
     async fn emit_active_model_state(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        self.emit_active_model_state_with_default(tx, None).await;
+    }
+
+    pub(in crate::engine::driver) async fn emit_active_model_state_correction(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        self.emit_active_model_state_for_generation(tx, None).await;
+    }
+
+    async fn emit_active_model_state_with_default(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+        default_selection_override: Option<crate::config::providers::ActiveModelRef>,
+    ) {
         self.active_model_state_generation = self.active_model_state_generation.saturating_add(1);
-        let default_selection = self.live_config_active_model();
+        self.emit_active_model_state_for_generation(tx, default_selection_override)
+            .await;
+    }
+
+    async fn emit_active_model_state_for_generation(
+        &self,
+        tx: &mpsc::Sender<TurnEvent>,
+        default_selection_override: Option<crate::config::providers::ActiveModelRef>,
+    ) {
+        // A config-watch refresh trails a successful default write. Use the
+        // just-written value for this state emission so clients never briefly
+        // render a false divergence before the terminal result arrives.
+        let default_selection =
+            default_selection_override.or_else(|| self.live_config_active_model());
         let selection = self.session.active_model_ref().unwrap_or_else(|| {
             crate::config::providers::ActiveModelRef {
                 provider: self.stack[0].agent.model.provider_id().to_string(),
@@ -963,5 +1345,44 @@ impl Driver {
             tracing::warn!(error = %e, "set_active_agent on handoff failed");
         }
         next_prompt
+    }
+}
+
+#[cfg(test)]
+mod default_model_commit_tests {
+    use super::*;
+
+    fn selection(provider: &str, model: &str) -> crate::config::providers::ActiveModelRef {
+        crate::config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }
+    }
+
+    #[test]
+    fn failed_prepared_commit_retains_old_authoritative_default_and_divergence() {
+        let old = selection("provider-a", "model-a");
+        let target = selection("provider-b", "model-b");
+
+        let result = DefaultModelUpdateResult::from_prepared_commit(
+            &target,
+            DefaultModelWriteIntent::Replace,
+            Some(old.clone()),
+            Err(anyhow::anyhow!("injected atomic replacement failure")),
+        );
+
+        assert!(matches!(
+            result.outcome,
+            crate::daemon::proto::DefaultModelUpdateOutcome::Failed { .. }
+        ));
+        assert_eq!(result.authoritative_selection, Some(old));
+        assert_ne!(
+            result.authoritative_selection.as_ref(),
+            Some(&target),
+            "the terminal active state must remain diverged after commit failure"
+        );
     }
 }

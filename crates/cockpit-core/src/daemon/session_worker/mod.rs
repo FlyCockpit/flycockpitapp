@@ -45,6 +45,17 @@ use crate::session::Session;
 /// event-stream contract); a client that lags has to reattach to
 /// re-sync.
 pub(crate) const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Tokio worker stack size required by the session-worker turn loop.
+///
+/// The first `send_user_message` poll overflows Tokio's 2 MiB default in
+/// debug builds even though the worker futures are boxed at their spawn
+/// boundaries: the limiting factor is poll-stack depth, not future size.
+/// Measurements on Linux x86_64 found 2 MiB failed and 2.5 MiB passed, but
+/// repeated full-workspace stress remained flaky at 4 MiB. Production and
+/// live-worker integration tests therefore share this 8 MiB ceiling.
+pub const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 const LOCK_SNAPSHOT_WORK_LIMIT: usize = 4;
 static LOCK_SNAPSHOT_WORK: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -460,7 +471,7 @@ use self::helpers::queue_target_to_proto;
 
 pub use handle::{
     InteractiveClientGuard, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
-    SessionWorkerHandle, TurnOutcome, spawn,
+    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;

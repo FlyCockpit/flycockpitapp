@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cockpit_config::extended::LlmMode;
 use tokio::sync::mpsc;
@@ -91,6 +92,31 @@ fn snapshot_from_tree(cwd: &Path, generation: u64) -> cockpit_core::daemon::prot
     })
 }
 
+fn marked_snapshot(
+    cwd: &Path,
+    session_id: uuid::Uuid,
+    generation: u64,
+    provider_id: &str,
+    lockout_ms: u64,
+    context_tokens: u32,
+) -> cockpit_core::daemon::proto::ConfigSnapshot {
+    let mut snapshot = snapshot_from_tree(cwd, generation);
+    snapshot.session_id = session_id;
+    snapshot.extended.dialog.lockout_ms = lockout_ms;
+    let mut provider = snapshot
+        .providers
+        .providers
+        .remove("p")
+        .expect("fixture provider");
+    provider.entry.models[0].capabilities.context_tokens = Some(context_tokens);
+    snapshot.providers.providers.clear();
+    snapshot
+        .providers
+        .providers
+        .insert(provider_id.to_string(), provider);
+    snapshot
+}
+
 /// A minimal attached runner so `resync_config_after_local_write` takes the
 /// daemon-signal path (no disk read) instead of the detached bootstrap refresh.
 fn stub_runner() -> AgentRunner {
@@ -111,6 +137,9 @@ fn stub_runner() -> AgentRunner {
         foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
         usage: UsageCounts::default(),
@@ -368,6 +397,162 @@ fn stale_config_snapshot_push_is_ignored() {
         app.config_snapshot.extended.dialog.lockout_ms, 12345,
         "stale value must not be applied"
     );
+}
+
+#[derive(Clone, Copy)]
+enum ConfigEpochPath {
+    SessionReplacement,
+    SameSessionReconnect,
+}
+
+fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    write_fixture_tree(tmp.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime_guard = runtime.enter();
+    let mut app = app_for_tree(tmp.path());
+    let old_session_id = uuid::Uuid::new_v4();
+    let new_session_id = match path {
+        ConfigEpochPath::SessionReplacement => uuid::Uuid::new_v4(),
+        ConfigEpochPath::SameSessionReconnect => old_session_id,
+    };
+    app.launch.session_id = Some(old_session_id);
+
+    app.apply_config_snapshot(marked_snapshot(
+        tmp.path(),
+        old_session_id,
+        9,
+        "old-provider",
+        9009,
+        900_009,
+    ));
+    assert_eq!(app.config_snapshot.generation, 9);
+    assert!(
+        !app.has_no_providers_at_startup,
+        "the launch-time provider-setup latch starts false for this configured tree"
+    );
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("old-provider")
+    );
+    assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 9009);
+    assert_eq!(
+        app.config_snapshot
+            .providers
+            .resolve_capabilities("old-provider", "a")
+            .context_tokens,
+        Some(900_009)
+    );
+
+    match path {
+        ConfigEpochPath::SessionReplacement => {
+            let runner = stub_runner();
+            *runner.session_id_state.lock().unwrap() = new_session_id;
+            app.adopt_runner(Ok(runner));
+        }
+        ConfigEpochPath::SameSessionReconnect => {
+            app.agent_runner = Some(Ok(stub_runner()));
+            app.apply_event(cockpit_core::engine::TurnEvent::DaemonLinkReconnected {
+                active_model_state: None,
+            });
+        }
+    }
+
+    // No state from the previous worker may survive while the new worker's
+    // generation-zero attach snapshot is in flight.
+    assert_eq!(app.config_snapshot.generation, 0);
+    assert!(!app.config_snapshot.from_daemon);
+    assert!(app.config_snapshot.providers.providers.is_empty());
+    assert!(
+        !app.has_no_providers_at_startup,
+        "an empty epoch seed must not masquerade as a provider-less process launch"
+    );
+    app.maybe_open_add_provider_wizard();
+    assert!(
+        !app.dialog.is_active(),
+        "the temporary seed must not open first-run provider setup"
+    );
+    assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 9009);
+    app.last_composer_edit_at = Some(Instant::now() - Duration::from_secs(2));
+    assert_eq!(
+        app.rehydrated_dialog_lockout(),
+        Duration::from_millis(9009),
+        "an interrupt arriving before authoritative generation zero must use the last confirmed presentation lockout"
+    );
+
+    app.apply_config_snapshot(marked_snapshot(
+        tmp.path(),
+        new_session_id,
+        0,
+        "attached-provider",
+        1000,
+        100_000,
+    ));
+    assert!(app.config_snapshot.from_daemon);
+    assert_eq!(app.config_snapshot.generation, 0);
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("attached-provider")
+    );
+    assert!(
+        !app.config_snapshot
+            .providers
+            .providers
+            .contains_key("old-provider")
+    );
+    assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 1000);
+    assert_eq!(
+        app.config_snapshot
+            .providers
+            .resolve_capabilities("attached-provider", "a")
+            .context_tokens,
+        Some(100_000)
+    );
+
+    app.apply_config_snapshot(marked_snapshot(
+        tmp.path(),
+        new_session_id,
+        1,
+        "updated-provider",
+        1001,
+        100_001,
+    ));
+    assert_eq!(app.config_snapshot.generation, 1);
+    assert!(
+        app.config_snapshot
+            .providers
+            .providers
+            .contains_key("updated-provider")
+    );
+    assert!(
+        !app.config_snapshot
+            .providers
+            .providers
+            .contains_key("attached-provider")
+    );
+    assert_eq!(app.config_snapshot.extended.dialog.lockout_ms, 1001);
+    assert_eq!(
+        app.config_snapshot
+            .providers
+            .resolve_capabilities("updated-provider", "a")
+            .context_tokens,
+        Some(100_001)
+    );
+}
+
+#[test]
+fn session_replacement_starts_new_config_snapshot_epoch() {
+    assert_config_epoch_reset_accepts_authoritative_zero(ConfigEpochPath::SessionReplacement);
+}
+
+#[test]
+fn same_session_reconnect_starts_new_config_snapshot_epoch() {
+    assert_config_epoch_reset_accepts_authoritative_zero(ConfigEpochPath::SameSessionReconnect);
 }
 
 // ---- Criterion 6: no optimistic self-write render --------------------------

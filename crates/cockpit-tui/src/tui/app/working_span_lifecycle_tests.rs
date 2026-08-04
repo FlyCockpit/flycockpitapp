@@ -158,8 +158,22 @@ fn retracted_message_clears_span_without_finish() {
     let mut app = app();
     app.begin_working_span();
     let turn = app.prediction_state.turn();
+    let client_submission_id = uuid::Uuid::new_v4();
+    app.history.push(crate::tui::history::HistoryEntry::User {
+        text: "blocked".to_string(),
+        cleaned: None,
+        expanded: false,
+        timestamp: chrono::Local::now(),
+        seq: None,
+        optimistic_submission_id: Some(client_submission_id),
+        preflight_pending: true,
+        persist_failed: false,
+    });
 
-    app.apply_event(TurnEvent::UserMessageRetracted);
+    app.apply_event(TurnEvent::UserMessagesTerminated {
+        client_submission_ids: vec![client_submission_id],
+        disposition: cockpit_core::daemon::proto::UserMessageTerminalDisposition::PreflightRejected,
+    });
 
     assert!(!app.busy);
     assert!(app.span_started_at.is_none());

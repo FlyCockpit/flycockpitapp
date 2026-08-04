@@ -16,7 +16,7 @@ use cockpit_db::db::session_log::{SessionEventContext, SessionEventKind};
 // bounds archive resource use.
 const MAX_IMPORT_ENTRIES: usize = 16_384;
 const MAX_IMPORT_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-const EXPORT_SCHEMA: &str = "cockpit-session-export/1";
+const EXPORT_SCHEMA: &str = "cockpit-session-export/2";
 
 #[derive(Debug, Clone)]
 struct ImportedSession {
@@ -24,8 +24,7 @@ struct ImportedSession {
     parent_source_id: Option<Uuid>,
     short_id: Option<String>,
     fork_point_turn_id: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
+    active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     active_agent: String,
     started_at: i64,
     ended_at: Option<i64>,
@@ -295,8 +294,14 @@ fn restore_archive_conn(
             row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
             row.short_id = session.short_id;
             row.fork_point_turn_id = session.fork_point_turn_id;
-            row.provider = session.provider;
-            row.model = session.model;
+            if let Some(active_model) = session.active_model {
+                row.provider = Some(active_model.provider.clone());
+                row.model = Some(active_model.model.clone());
+                row.model_selection_json = Some(
+                    serde_json::to_string(&active_model)
+                        .context("encoding imported session active model")?,
+                );
+            }
             row.started_at = session.started_at;
             row.last_active_at = session.started_at;
             row.ended_at = session.ended_at;
@@ -1100,8 +1105,14 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
             object.get("fork_point_turn_id"),
             "fork_point_turn_id",
         )?,
-        provider: optional_string(object.get("provider"), "provider")?,
-        model: optional_string(object.get("model"), "model")?,
+        active_model: match object.get("active_model") {
+            Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone())
+                    .context("decoding import manifest session active_model")?,
+            ),
+            None => bail!("import manifest session lacks active_model"),
+        },
         active_agent: required_string(object, "active_agent", "import manifest session")?,
         started_at: required_i64(object, "started_at", "import manifest session")?,
         ended_at: optional_i64(object.get("ended_at"), "ended_at")?,
@@ -1285,8 +1296,10 @@ mod tests {
             "short_id": "export",
             "parent_session_id": parent,
             "fork_point_turn_id": null,
-            "provider": "test-provider",
-            "model": "test-model",
+            "active_model": {
+                "provider": "test-provider",
+                "model": "test-model",
+            },
             "active_agent": "Build",
             "started_at": 100,
             "ended_at": null,
@@ -1443,6 +1456,24 @@ mod tests {
         assert_eq!(restored.ended_at, Some(777));
         assert_eq!(restored.title.as_deref(), Some("Restored title"));
         assert_eq!(restored.short_id.as_deref(), Some("child1"));
+        assert_eq!(restored.provider.as_deref(), Some("test-provider"));
+        assert_eq!(restored.model.as_deref(), Some("test-model"));
+        assert_eq!(
+            serde_json::from_str::<cockpit_config::config::providers::ActiveModelRef>(
+                restored
+                    .model_selection_json
+                    .as_deref()
+                    .expect("imported active model is durable"),
+            )
+            .unwrap(),
+            cockpit_config::config::providers::ActiveModelRef {
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }
+        );
         let events = db.list_session_events(child).await.unwrap();
         assert!(
             events
@@ -1465,6 +1496,48 @@ mod tests {
                 .to_string()
                 .contains("unsupported session export schema")
         );
+    }
+
+    #[test]
+    fn import_rejects_flat_v1_export_shape() {
+        let id = Uuid::new_v4();
+        let flat = json!({
+            "session_id": id,
+            "short_id": "export",
+            "parent_session_id": null,
+            "fork_point_turn_id": null,
+            "provider": "test-provider",
+            "model": "test-model",
+            "active_agent": "Build",
+            "started_at": 100,
+            "ended_at": null,
+            "title": "Old export",
+        });
+        let bytes =
+            archive_bytes_with_schema("cockpit-session-export/1", vec![flat], vec![], false);
+        let error = read_archive_bytes(&bytes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported session export schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn import_preserves_null_active_model_without_projections() {
+        let db = Db::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let mut without_model = session(id, None);
+        without_model["active_model"] = Value::Null;
+        let archive =
+            read_archive_bytes(&archive_bytes(vec![without_model], vec![], false)).unwrap();
+
+        import_archive(&db, archive, false).await.unwrap();
+
+        let restored = db.get_session(id).await.unwrap().unwrap();
+        assert!(restored.provider.is_none());
+        assert!(restored.model.is_none());
+        assert!(restored.model_selection_json.is_none());
     }
 
     #[test]
@@ -1570,10 +1643,25 @@ mod tests {
         use cockpit_db::db::inference_calls::InferenceCallRow;
 
         let source = Db::open_in_memory().unwrap();
+        let active_model = cockpit_config::config::providers::ActiveModelRef {
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            reasoning_effort: Some(cockpit_config::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(cockpit_config::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(
+                cockpit_config::config::providers::PromptCacheRetention::Extended,
+            ),
+        };
+        let row_active_model = active_model.clone();
         let row = source
-            .transaction(|conn| {
-                let row =
+            .transaction(move |conn| {
+                let mut row =
                     Db::build_new_session_row_conn(conn, "round-trip", "/tmp/round-trip", "Build")?;
+                row.provider = Some(row_active_model.provider.clone());
+                row.model = Some(row_active_model.model.clone());
+                row.model_selection_json = Some(serde_json::to_string(&row_active_model)?);
                 Db::insert_session_row_conn(conn, &row)
             })
             .await
@@ -1643,5 +1731,18 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM inference_calls WHERE session_id = ?1", [source_id.to_string()], |r| r.get(0))?,
         ))).await.unwrap();
         assert_eq!(destination_counts, source_counts);
+        let restored = destination.get_session(source_id).await.unwrap().unwrap();
+        assert_eq!(restored.provider.as_deref(), Some("test-provider"));
+        assert_eq!(restored.model.as_deref(), Some("test-model"));
+        assert_eq!(
+            serde_json::from_str::<cockpit_config::config::providers::ActiveModelRef>(
+                restored
+                    .model_selection_json
+                    .as_deref()
+                    .expect("round-tripped active model is durable"),
+            )
+            .unwrap(),
+            active_model
+        );
     }
 }

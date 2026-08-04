@@ -277,6 +277,7 @@ pub(crate) async fn attach_send_pump(
     };
     let project_root = cwd.to_string_lossy().into_owned();
     let requested_session = options.session;
+    let model_override = parse_model_override(options.model_override, requested_session.is_some())?;
     let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
         crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
     );
@@ -284,21 +285,22 @@ pub(crate) async fn attach_send_pump(
     // Attach a fresh session. `no_sandbox` (sandboxing part 2) makes this
     // noninteractive session start unsandboxed unless the daemon was
     // launched `--no-sandbox` (which wins). `model_override` (`--model`, the
-    // plan executor passes the plan's pinned model) overrides every spawned
+    // plan executor passes the plan's pinned model) is both the authoritative
+    // initial session selection and the pin that overrides every spawned
     // agent's frontmatter model for this session's run.
     let attached = match client
         .request(Request::Attach {
             session_id: requested_session,
             since_seq: None,
             project_root: Some(project_root),
-            initial_model: None,
+            initial_model: model_override.clone(),
             no_sandbox,
             // A streamed run has no UI to answer an interrupt — a
             // non-interactive attach. The loop guard treats the session as
             // headless and auto-rejects a back-to-back repeat (with the
             // guidance error) rather than blocking.
             interactive: false,
-            model_override: options.model_override.map(str::to_string),
+            model_override,
             client_protocol_version: client.negotiated().version,
             env_snapshot: Some(env_snapshot.to_wire()),
             env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
@@ -401,6 +403,7 @@ pub(crate) async fn attach_send_pump(
         // Send the user message.
         client
             .request_ok(Request::SendUserMessage {
+                client_submission_id: uuid::Uuid::new_v4(),
                 text: prompt,
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -438,6 +441,35 @@ pub(crate) async fn attach_send_pump(
         submitted_message,
     )
     .await
+}
+
+fn parse_model_override(
+    raw: Option<&str>,
+    resuming: bool,
+) -> Result<Option<cockpit_core::config::providers::ActiveModelRef>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if resuming {
+        return Err(RunUsageError(
+            "--model cannot be combined with --continue or --session; resume first and change the durable session model explicitly"
+                .to_string(),
+        )
+        .into());
+    }
+    let (provider, model) =
+        cockpit_core::config::provider::split_provider_model(raw).ok_or_else(|| {
+            RunUsageError(format!(
+                "invalid --model `{raw}`; expected provider/model-id"
+            ))
+        })?;
+    Ok(Some(cockpit_core::config::providers::ActiveModelRef {
+        provider,
+        model,
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }))
 }
 
 fn resolve_run_cwd(cwd: Option<&Path>, project_alias: Option<&Path>) -> Result<PathBuf> {
@@ -1358,6 +1390,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SessionPersistFailed { session_id, .. }
         | SessionDriverFailed { session_id, .. }
         | PreflightStarted { session_id, .. }
+        | UserMessagesTerminated { session_id, .. }
         | UserMessageRetracted { session_id, .. }
         | Notice { session_id, .. }
         | SkillAutoInjected { session_id, .. }
@@ -1528,6 +1561,29 @@ mod tests {
     }
 
     #[test]
+    fn model_override_is_a_complete_new_session_selection() {
+        let selection = parse_model_override(Some(" openai/gpt-5 "), false)
+            .unwrap()
+            .expect("model override");
+        assert_eq!(selection.provider, "openai");
+        assert_eq!(selection.model, "gpt-5");
+        assert_eq!(selection.reasoning_effort, None);
+        assert_eq!(selection.thinking_mode, None);
+        assert_eq!(selection.prompt_cache_retention, None);
+    }
+
+    #[test]
+    fn model_override_rejects_malformed_or_resumed_session_use() {
+        let malformed = parse_model_override(Some("missing-provider"), false).unwrap_err();
+        assert!(malformed.downcast_ref::<RunUsageError>().is_some());
+        assert!(malformed.to_string().contains("expected provider/model-id"));
+
+        let resumed = parse_model_override(Some("openai/gpt-5"), true).unwrap_err();
+        assert!(resumed.downcast_ref::<RunUsageError>().is_some());
+        assert!(resumed.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
     fn attachment_limits_and_daemon_bad_requests_are_usage_errors() {
         let paths = (0..=proto::MAX_IMAGES_PER_USER_MESSAGE)
             .map(|index| PathBuf::from(format!("unread-image-{index}.png")))
@@ -1555,6 +1611,7 @@ mod tests {
             session_id,
             seq: 1,
             preflight_cleaned: None,
+            client_submission_ids: Vec::new(),
         });
         outcome.observe(&proto::Event::AgentIdle {
             session_id,
@@ -1573,6 +1630,7 @@ mod tests {
             session_id,
             seq: 1,
             preflight_cleaned: None,
+            client_submission_ids: Vec::new(),
         });
         outcome.observe(&proto::Event::ThinkingStarted {
             session_id,
@@ -1598,6 +1656,7 @@ mod tests {
             session_id,
             seq: 1,
             preflight_cleaned: None,
+            client_submission_ids: Vec::new(),
         });
         outcome.observe(&proto::Event::ThinkingStarted {
             session_id,
@@ -1767,6 +1826,7 @@ mod tests {
                 session_id,
                 seq: 42,
                 preflight_cleaned: None,
+                client_submission_ids: Vec::new(),
             },
             true,
         )

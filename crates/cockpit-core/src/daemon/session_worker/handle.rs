@@ -47,6 +47,10 @@ pub struct SessionWorkerHandle {
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     pub(super) config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    /// Last daemon-authoritative model state emitted by this worker. Updated
+    /// before the corresponding broadcast so a later attach cannot fall back
+    /// to a config snapshot that still lags a successful default write.
+    authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
 }
 
 const RECENT_TURN_COMPLETION_CAPACITY: usize = 64;
@@ -680,7 +684,7 @@ impl SessionWorkerHandle {
             sealed_values: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(LiveState::default()),
             interactive_clients: Arc::new(AtomicUsize::new(0)),
-            session,
+            session: session.clone(),
             sandbox_notice_armed: Arc::new(AtomicBool::new(false)),
             sandbox_unavailable_notice: Arc::new(RwLock::new(None)),
             locks,
@@ -691,6 +695,10 @@ impl SessionWorkerHandle {
                 0,
                 crate::config::providers::ProvidersConfig::default(),
                 crate::config::extended::ExtendedConfig::default(),
+            ))),
+            authoritative_active_model_state: Arc::new(RwLock::new(initial_active_model_state(
+                &session,
+                &crate::config::providers::ProvidersConfig::default(),
             ))),
         };
         (handle, work_rx)
@@ -1121,10 +1129,32 @@ impl SessionWorkerHandle {
 
     /// The session's complete active selection. This is the daemon-owned
     /// resume source, not a projection reconstructed from config defaults.
+    #[cfg(test)]
     pub(crate) fn active_model_selection(
         &self,
     ) -> Option<crate::config::providers::ActiveModelRef> {
         self.session.active_model_ref()
+    }
+
+    /// Latest worker-authoritative state for attach hydration. Callers must
+    /// subscribe to events before reading this value; attach then restamps the
+    /// returned state into its new generation epoch.
+    pub(crate) fn authoritative_active_model_state(&self) -> Option<proto::ActiveModelState> {
+        self.authoritative_active_model_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_authoritative_active_model_state_for_tests(
+        &self,
+        state: proto::ActiveModelState,
+    ) {
+        *self
+            .authoritative_active_model_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
     }
 
     /// Broadcast the session's current gitignore read-allowlist over the
@@ -1282,10 +1312,30 @@ impl SessionWorkerHandle {
 
 /// Work items a client can ask the worker to perform.
 #[derive(Debug)]
+pub enum UserMessageProbeResult {
+    Unknown,
+    ContentCheckRequired,
+    Duplicate {
+        item: proto::QueueItem,
+        queue: Vec<proto::QueueItem>,
+    },
+    Conflict,
+}
+
+#[derive(Debug)]
 pub enum SessionWork {
+    ProbeUserMessage {
+        client_submission_id: Uuid,
+        wire_fingerprint: String,
+        origin_principal: Option<String>,
+        respond_to:
+            oneshot::Sender<std::result::Result<UserMessageProbeResult, proto::ErrorPayload>>,
+    },
     UserMessage {
         submission: Box<crate::engine::message::UserSubmission>,
-        respond_to: oneshot::Sender<(proto::QueueItem, Vec<proto::QueueItem>)>,
+        respond_to: oneshot::Sender<
+            std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
+        >,
     },
     SteerDelegation {
         task_call_id: String,
@@ -1296,15 +1346,21 @@ pub enum SessionWork {
     },
     RemoveQueuedUserMessage {
         queue_item_id: Uuid,
-        respond_to: oneshot::Sender<proto::RemoveQueuedUserMessageResult>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
+        >,
     },
     RemoveNewestQueuedUserMessage {
         target_id: Option<String>,
-        respond_to: oneshot::Sender<proto::RemoveQueuedUserMessageResult>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
+        >,
     },
     RemoveEditableQueuedUserMessages {
         target_id: Option<String>,
-        respond_to: oneshot::Sender<proto::RemoveQueuedUserMessagesResult>,
+        respond_to: oneshot::Sender<
+            std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
+        >,
     },
     RepublishQueue,
     Cancel,
@@ -1327,6 +1383,7 @@ pub enum SessionWork {
         provider: String,
         model: String,
         persist_as_default: bool,
+        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,
@@ -1531,6 +1588,10 @@ pub fn spawn(
     let env_overlay = Arc::new(RwLock::new(env_snapshot.into_vars()));
     let repair_required = Arc::new(RwLock::new(None));
     let foreground = Arc::new(Mutex::new(LiveForegroundState::new(initial_agent.clone())));
+    let authoritative_active_model_state = Arc::new(RwLock::new(initial_active_model_state(
+        &session,
+        &config_snapshot.providers,
+    )));
     let config_snapshot = Arc::new(RwLock::new(config_snapshot));
 
     let handle = SessionWorkerHandle {
@@ -1553,6 +1614,7 @@ pub fn spawn(
         repair_required: repair_required.clone(),
         foreground: foreground.clone(),
         config_snapshot: config_snapshot.clone(),
+        authoritative_active_model_state: authoritative_active_model_state.clone(),
     };
 
     handle.probe_sandbox_unavailable();
@@ -1564,6 +1626,7 @@ pub fn spawn(
     // `abort()` a worker whose provider call hung past the grace deadline.
     let join = tokio::spawn(async move {
         let _cleanup = WorkerCleanupGuard(cleanup);
+        let worker_trust_policy = trust_policy.clone();
         let worker = Box::pin(run_worker(
             session,
             locks,
@@ -1572,6 +1635,7 @@ pub fn spawn(
             model_override,
             thinking_params,
             project_root,
+            worker_trust_policy,
             work_rx,
             event_tx,
             turn_completions,
@@ -1583,6 +1647,7 @@ pub fn spawn(
             repair_required,
             foreground,
             config_snapshot,
+            authoritative_active_model_state,
             lsp,
             resource_scheduler,
             scheduler,
@@ -1592,4 +1657,20 @@ pub fn spawn(
     });
 
     (handle, join)
+}
+
+fn initial_active_model_state(
+    session: &Session,
+    providers: &crate::config::providers::ProvidersConfig,
+) -> Option<proto::ActiveModelState> {
+    session.active_model_ref().map(|selection| {
+        let default_selection = providers.active_model.clone();
+        let diverged = default_selection.as_ref() != Some(&selection);
+        proto::ActiveModelState {
+            selection,
+            default_selection,
+            diverged,
+            generation: 0,
+        }
+    })
 }

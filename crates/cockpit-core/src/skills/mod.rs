@@ -339,24 +339,26 @@ pub fn validate_skill_package_write_for_paths(
     cfg: &SkillsConfig,
     content: &str,
 ) -> Result<Option<SkillPackageWriteValidation>> {
-    if requested_path
+    let contains_parent_traversal = requested_path
         .components()
-        .any(|component| component == std::path::Component::ParentDir)
-    {
+        .any(|component| component == std::path::Component::ParentDir);
+    let requested_target = package_target_for_path_with_skill(requested_path, cwd, cfg);
+    if contains_parent_traversal {
+        let effective_target = package_target_for_path_with_skill(effective_path, cwd, cfg);
         let raw_absolute = if requested_path.is_absolute() {
             requested_path.to_path_buf()
         } else {
             cwd.join(requested_path)
         };
-        if resolve_scan_dirs(cwd, cfg)
+        let begins_in_scan_dir = resolve_scan_dirs(cwd, cfg)
             .iter()
-            .any(|scan_dir| raw_absolute.starts_with(scan_dir))
-        {
+            .any(|scan_dir| raw_absolute.starts_with(scan_dir));
+        if begins_in_scan_dir || requested_target.is_some() || effective_target.is_some() {
             anyhow::bail!("skill package writes cannot contain parent traversal segments");
         }
     }
 
-    if let Some((target, _)) = package_target_for_path_with_skill(requested_path, cwd, cfg) {
+    if let Some((target, _)) = requested_target {
         ensure_no_skill_symlink(&target)?;
     }
     validate_skill_package_write(effective_path, cwd, cfg, content)
@@ -1877,6 +1879,107 @@ mod tests {
         let cfg = skills_cfg(vec!["skills"], false);
 
         assert!(package_target_for_path(&lookalike.join("SKILL.md"), tmp.path(), &cfg).is_none());
+    }
+
+    #[test]
+    fn managed_skill_write_rejects_traversal_that_normalizes_into_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let effective = scan.join("target/references/a.md");
+        let relative = Path::new("outside/../.agents/skills/target/references/a.md");
+        let absolute = tmp
+            .path()
+            .join("unrelated/../.agents/skills/target/references/a.md");
+
+        for requested in [relative, absolute.as_path()] {
+            let error = crate::config::trust::with_workspace_trust_policy(
+                trusted_policy(tmp.path()),
+                || {
+                    validate_skill_package_write_for_paths(
+                        requested,
+                        &effective,
+                        tmp.path(),
+                        &cfg,
+                        "reference",
+                    )
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("parent traversal"), "{error:#}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_skill_write_rejects_outside_symlink_then_parent_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let references = scan.join("target/references");
+        std::fs::create_dir_all(&references).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&references, outside.join("into-managed")).unwrap();
+
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let requested = outside.join("into-managed/../SKILL.md");
+        let effective = scan.join("target/SKILL.md");
+        let error =
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+                validate_skill_package_write_for_paths(
+                    &requested,
+                    &effective,
+                    tmp.path(),
+                    &cfg,
+                    "replacement",
+                )
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("parent traversal"), "{error:#}");
+    }
+
+    #[test]
+    fn ordinary_write_with_parent_segment_is_not_treated_as_skill_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let requested = Path::new("outside/../plain.md");
+        let effective = tmp.path().join("plain.md");
+
+        let validation =
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(tmp.path()), || {
+                validate_skill_package_write_for_paths(
+                    requested,
+                    &effective,
+                    tmp.path(),
+                    &cfg,
+                    "ordinary",
+                )
+            })
+            .unwrap();
+
+        assert!(validation.is_none());
     }
 
     #[test]

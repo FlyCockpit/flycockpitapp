@@ -6,6 +6,7 @@ import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { t
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
 import {
+  activeModelStateSchema,
   clientEnvelopeSchema,
   commandDetailSchema,
   errorEnvelopeSchema,
@@ -13,6 +14,8 @@ import {
   grantKindSchema,
   interruptQuestionSchema,
   knownEventEnvelopeSchema,
+  modelSelectionOutcomeSchema,
+  modelSelectionResultDataSchema,
   PROTOCOL_VERSION,
   resolveResponseSchema,
   responseEnvelopeSchema,
@@ -111,6 +114,155 @@ describe("cockpit-proto daemon wire schemas", () => {
           agent: "builder",
           description: "bad interrupt",
           question: { kind: "single", data: { prompt: "Missing options" } },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      eventEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "session_persist_failed",
+        data: {
+          session_id: "11111111-1111-4111-8111-111111111111",
+          error: "missing exact submission identity",
+        },
+      }).success,
+    ).toBe(false);
+    const folded = eventsFixture.queued_user_messages_folded;
+    expect(
+      eventEnvelopeSchema.safeParse({
+        ...folded,
+        data: { ...folded.data, queue_item_ids: ["not-a-uuid"] },
+      }).success,
+    ).toBe(false);
+    expect(
+      eventEnvelopeSchema.safeParse({
+        ...folded,
+        data: { ...folded.data, target: { ...folded.data.target, depth: -1 } },
+      }).success,
+    ).toBe(false);
+    const { text: _text, ...foldedWithoutText } = folded.data;
+    expect(eventEnvelopeSchema.safeParse({ ...folded, data: foldedWithoutText }).success).toBe(
+      false,
+    );
+  });
+
+  it("locks the v6 nested active-model shape and terminal outcome variants", () => {
+    expect(
+      eventEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "active_model_state",
+        data: {
+          session_id: "11111111-1111-4111-8111-111111111111",
+          provider: "openai",
+          model: "removed-v5-shape",
+          diverged: false,
+          generation: 1,
+        },
+      }).success,
+    ).toBe(false);
+
+    const activeState = {
+      selection: {
+        provider: "openai",
+        model: "gpt-5",
+        reasoning_effort: { value: "high" },
+        thinking_mode: "high",
+        prompt_cache_retention: "extended",
+      },
+      default_selection: {
+        provider: "openai",
+        model: "gpt-5",
+        reasoning_effort: { value: "high" },
+        thinking_mode: "high",
+        prompt_cache_retention: "extended",
+      },
+      diverged: false,
+      generation: 3,
+    } as const;
+    const { generation: _generation, ...missingGeneration } = activeState;
+    expect(activeModelStateSchema.safeParse(missingGeneration).success).toBe(false);
+    const outcomes = [
+      {
+        status: "applied",
+        active_state: activeState,
+        default_update: { status: "not_requested" },
+      },
+      {
+        status: "applied",
+        active_state: activeState,
+        default_update: {
+          status: "failed",
+          user_message: "Session changed, but the default write failed.",
+          diagnostic_code: "default_model_write_failed",
+        },
+      },
+      {
+        status: "rejected",
+        user_message: "The model could not be built.",
+        diagnostic_code: "model_selection_build_failed",
+      },
+    ];
+    for (const outcome of outcomes) {
+      expect(modelSelectionOutcomeSchema.safeParse(outcome).success).toBe(true);
+    }
+
+    expect(
+      modelSelectionResultDataSchema.safeParse({
+        session_id: "11111111-1111-4111-8111-111111111111",
+        selection_id: "22222222-2222-4222-8222-222222222222",
+        provider: "openai",
+        model: "gpt-5",
+        reasoning_effort: "high",
+        thinking_mode: "turbo",
+        prompt_cache_retention: "extended",
+        outcome: outcomes[2],
+      }).success,
+    ).toBe(false);
+
+    expect(
+      clientEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "req",
+        id: "22222222-2222-4222-8222-222222222222",
+        request: "set_active_model",
+        params: {
+          selection_id: "11111111-1111-4111-8111-111111111111",
+          provider: "openai",
+          model: "gpt-5",
+          reasoning_effort: "",
+          persist_as_default: false,
+          initialize_default_if_missing: false,
+        },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      clientEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "req",
+        id: "22222222-2222-4222-8222-222222222222",
+        request: "set_active_model",
+        params: {
+          selection_id: "11111111-1111-4111-8111-111111111111",
+          provider: "openai",
+          model: "gpt-5",
+          persist_as_default: true,
+          initialize_default_if_missing: true,
+        },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      clientEnvelopeSchema.safeParse({
+        v: PROTOCOL_VERSION,
+        kind: "req",
+        id: "22222222-2222-4222-8222-222222222222",
+        request: "send_user_message",
+        params: {
+          client_submission_id: "00000000-0000-0000-0000-000000000000",
+          text: "hello",
         },
       }).success,
     ).toBe(false);

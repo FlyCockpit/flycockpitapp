@@ -11,14 +11,32 @@ use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
 use super::{
-    App, ControlApplied, FirstRunFlow, LocalChoiceSelection, Overlay, StartupModal, TranscriptFind,
+    App, ControlApplied, DispatchOutcome, FirstRunFlow, LocalChoiceSelection,
+    OptimisticSubmissionState, Overlay, PendingSessionSwitchSubmission, StartupModal,
+    TranscriptFind,
 };
+use crate::tui::agent_runner;
 use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let composer_before = self.composer.text().to_string();
+        let exit = self.handle_key_inner(key);
+        let clears_or_recalls_without_editing =
+            matches!(key.code, KeyCode::Esc | KeyCode::Up | KeyCode::Down)
+                || (key.code == KeyCode::Enter
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT));
+        if self.composer.text() != composer_before && !clears_or_recalls_without_editing {
+            self.last_composer_edit_at = Some(Instant::now());
+        }
+        exit
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
         if is_btw_focus_toggle(&key)
             && let Some(pane) = self.btw_pane.as_mut()
         {
@@ -431,10 +449,25 @@ impl App {
                 // updates when it arrives (no optimistic render of the written
                 // value). Detached, this refreshes the bootstrap snapshot once.
                 self.resync_config_after_local_write();
-                if !matches!(self.agent_runner.as_ref(), Some(Ok(_)))
-                    && let Some(provider) = self.reopen_model_picker_after_settings.take()
-                {
+                // Closing is itself terminal for the attached add-model
+                // flow. The daemon may suppress an unchanged snapshot on
+                // cancel, so never make picker restoration depend on a push.
+                // If a changed snapshot already restored it, the marker is
+                // gone and this is a no-op.
+                if let Some(provider) = self.reopen_model_picker_after_settings.take() {
                     self.open_model_picker_for_provider(&provider);
+                    if let (Some(draft), Overlay::ModelPicker(picker)) = (
+                        self.reopen_model_picker_draft_after_settings.take(),
+                        &mut self.overlay,
+                    ) {
+                        picker.restore_requested_selection(&draft);
+                    }
+                    // A save may close before the daemon's changed snapshot
+                    // arrives. Keep a refresh marker only while this picker
+                    // remains open; the correlated/newer snapshot rebuilds
+                    // its inventory without unexpectedly reopening a picker
+                    // the user has since dismissed.
+                    self.refresh_reopened_model_picker_after_settings = Some(provider);
                 }
             } else if let Some(req) = self.dialog.take_daemon_request() {
                 self.send_daemon_request("/settings", req, ControlApplied::None);
@@ -455,10 +488,12 @@ impl App {
                 if should_close {
                     let accepted = picker.is_done();
                     let add_model_provider = picker.take_add_model_provider();
+                    let add_model_draft = picker.draft_active_model().cloned();
                     self.overlay = Overlay::ModelPicker(picker);
                     if let Some(provider) = add_model_provider {
                         self.overlay = Overlay::None;
                         self.reopen_model_picker_after_settings = Some(provider.clone());
+                        self.reopen_model_picker_draft_after_settings = add_model_draft;
                         self.dialog = Dialog::open_provider_models(&self.launch.cwd, &provider);
                     } else {
                         self.close_model_picker(accepted);
@@ -2044,17 +2079,20 @@ impl App {
                 let _ = confirmed_model;
             }
             ModelReadiness::WaitingForModelSelection(selection_id) => {
-                if self
+                let expired = self
                     .pending_model_selection
                     .as_ref()
                     .is_some_and(|pending| {
                         pending.selection_id == selection_id
-                            && pending.started_at.elapsed() >= std::time::Duration::from_secs(60)
-                    })
-                {
-                    self.push_plain(
-                        "Model selection is still pending after 60 seconds; open `/model` to retry. Your draft will be retained.".to_string(),
-                    );
+                            && pending.started_at.elapsed()
+                                >= super::model_controls::MODEL_SELECTION_TIMEOUT
+                    });
+                if expired {
+                    let requested = self
+                        .expire_stale_model_selection()
+                        .expect("stale model selection was just observed");
+                    self.open_model_picker_highlighting(Some(&requested));
+                    return false;
                 }
             }
             ModelReadiness::NeedsProvider => {
@@ -2069,6 +2107,22 @@ impl App {
                 self.open_missing_model_setup(MissingModelReason::MissingProvider(provider));
                 return false;
             }
+        }
+
+        if self
+            .pending_model_selection
+            .as_ref()
+            .is_some_and(|pending| pending.queued_submission.is_some())
+        {
+            // The direct model-selection hold is intentionally one deep.
+            // Reject another submit before assembling its wire payload: tag
+            // tracking, git blocks, images, and paste placeholders still
+            // belong to the visible composer and must remain untouched.
+            self.push_plain(
+                "A message is already waiting for the model switch; send again after it is released."
+                    .to_string(),
+            );
+            return false;
         }
 
         // Build the paste-side wire from the live (untrimmed) buffer +
@@ -2154,19 +2208,11 @@ impl App {
             job_id: None,
             preflight_cleaned: None,
             queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
             queue_target: None,
+            pending_terminal_disposition: None,
         };
         if let Some(pending) = self.pending_model_selection.as_mut() {
-            if pending.queued_submission.is_some() {
-                // The direct model-selection hold is intentionally one deep.
-                // Further input follows the normal busy-message rules rather
-                // than silently replacing the first exact submission.
-                self.push_plain(
-                    "A message is already waiting for the model switch; send again after it is released."
-                        .to_string(),
-                );
-                return false;
-            }
             let status = format!(
                 "Switching to {}/{}; message will send when ready.",
                 pending.requested.provider, pending.requested.model
@@ -2194,12 +2240,10 @@ impl App {
         // can't be handed off. The busy/queue path didn't start a span,
         // so it must never tear one down.
         let was_busy = self.busy;
-        let fresh_tag_expansions = if was_busy {
-            self.queue.push(optimistic_queue_item_with_display(
-                wire.clone(),
-                Some(submitted.clone()),
-            ));
-            Vec::new()
+        let optimistic_queue_item = if was_busy {
+            let item = optimistic_queue_item_with_display(wire.clone(), Some(submitted.clone()));
+            self.queue.push(item.clone());
+            Some(item)
         } else {
             // Fresh human message: start a new working span (resets the
             // cumulative clock and re-rolls the working line) and render
@@ -2210,6 +2254,11 @@ impl App {
             self.prompt_history.push(submitted.clone());
             self.prompt_history_cursor = 0;
             self.staged_draft = None;
+            None
+        };
+        let fresh_tag_expansions = if was_busy {
+            Vec::new()
+        } else {
             tag_expansions.clone()
         };
         let owns_working_span = !was_busy;
@@ -2223,35 +2272,61 @@ impl App {
                 &fresh_tag_expansions,
             );
         } else {
+            let optimistic_queue_item = optimistic_queue_item
+                .expect("busy submissions always create an optimistic queue item");
+            let optimistic_submission_id = optimistic_queue_item.id;
             if self.has_pending_session_switch_action() {
-                self.queue_pending_session_switch_submission(
+                self.queue_pending_session_switch_submission_with_optimistic_state(
                     submission,
                     "engine",
-                    0,
                     false,
-                    Some(wire.clone()),
+                    OptimisticSubmissionState {
+                        id: optimistic_submission_id,
+                        tag_entries: 0,
+                        history: Vec::new(),
+                        queue_item: Some(optimistic_queue_item),
+                    },
                 );
             } else {
                 self.ensure_agent_runner();
-                match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => {
-                        if runner.input_tx.try_send(submission).is_err() {
-                            let summary = "engine: queued message could not be sent".to_string();
-                            self.history.push(HistoryEntry::InferenceError {
-                                detail: summary.clone(),
-                                summary,
-                                expanded: false,
-                            });
+                let intended_session_id = self
+                    .agent_runner
+                    .as_ref()
+                    .and_then(|runner| runner.as_ref().ok())
+                    .map(agent_runner::AgentRunner::session_id)
+                    .or(self.launch.session_id);
+                let (outcome, undelivered_submission) = match self.agent_runner.as_ref() {
+                    Some(Ok(runner)) => match runner
+                        .try_send_optimistic_input(submission, optimistic_submission_id)
+                    {
+                        Ok(()) => {
+                            self.current_session_persisted = true;
+                            (DispatchOutcome::Sent, None)
                         }
-                    }
-                    Some(Err(_)) | None => {
-                        let summary = "engine: queued message could not be sent".to_string();
-                        self.history.push(HistoryEntry::InferenceError {
-                            detail: summary.clone(),
-                            summary,
-                            expanded: false,
-                        });
-                    }
+                        Err((agent_runner::InputNotDelivered::QueueFull, submission)) => {
+                            (DispatchOutcome::QueueFull, Some(*submission))
+                        }
+                        Err((agent_runner::InputNotDelivered::RunnerClosed, submission)) => {
+                            (DispatchOutcome::DriverClosed, Some(*submission))
+                        }
+                    },
+                    Some(Err(_)) => (DispatchOutcome::RunnerFailed, Some(submission)),
+                    None => (DispatchOutcome::NoRunner, Some(submission)),
+                };
+                if let Some(submission) = undelivered_submission {
+                    self.retain_pre_dispatch_submission(
+                        intended_session_id,
+                        PendingSessionSwitchSubmission {
+                            submission,
+                            optimistic_submission_id,
+                            error_prefix: "engine".to_string(),
+                            optimistic_tag_entries: 0,
+                            owns_working_span: false,
+                            optimistic_history: Vec::new(),
+                            optimistic_queue_item: Some(optimistic_queue_item),
+                        },
+                        outcome,
+                    );
                 }
             }
         }
@@ -2510,13 +2585,13 @@ impl App {
     }
 
     fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
-        let attached_request_tx = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_tx.clone(),
+        let attached_request = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.attached_request_binding(),
             _ => return QueueEditOutcome::NotConnected,
         };
         self.remove_editable_queued_messages_with(|| {
             crate::tui::agent_runner::attached_request_tx_blocking(
-                attached_request_tx,
+                attached_request,
                 Request::RemoveEditableQueuedUserMessages { target_id: None },
             )
         })
@@ -2736,6 +2811,7 @@ impl App {
         match crate::clipboard::read_image_as_png() {
             Ok(Some(png)) => {
                 self.insert_image_block(png);
+                self.last_composer_edit_at = Some(Instant::now());
                 return;
             }
             Ok(None) => {}
@@ -2747,6 +2823,8 @@ impl App {
         if data.is_empty() {
             return;
         }
+
+        self.last_composer_edit_at = Some(Instant::now());
 
         // Re-paste-to-expand: cursor at a text block's right edge + the
         // paste equals that block's stored content → expand in place.
@@ -3813,7 +3891,7 @@ mod queued_message_edit_tests {
     use cockpit_core::daemon::proto::{
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
-    use cockpit_core::engine::message::{QueueItemStatus as EngineQueueItemStatus, UserSubmission};
+    use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -3821,7 +3899,7 @@ mod queued_message_edit_tests {
     fn runner_with_attached_request_tx(
         attached_request_tx: mpsc::Sender<AttachedRequest>,
     ) -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+        let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = mpsc::channel(1);
         AgentRunner {
@@ -3837,6 +3915,9 @@ mod queued_message_edit_tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -4224,7 +4305,6 @@ mod paste_routing_tests {
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
-    use cockpit_core::engine::message::UserSubmission;
     use cockpit_db::pins::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
@@ -4295,7 +4375,9 @@ mod paste_routing_tests {
         );
     }
 
-    fn runner_with_input_tx(input_tx: mpsc::Sender<UserSubmission>) -> AgentRunner {
+    fn runner_with_input_tx(
+        input_tx: mpsc::Sender<crate::tui::agent_runner::RunnerInput>,
+    ) -> AgentRunner {
         let (record_tx, _record_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = mpsc::channel(1);
         let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
@@ -4312,6 +4394,9 @@ mod paste_routing_tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),

@@ -74,7 +74,7 @@ use slash::{
 };
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::pending;
 use std::io::{Read, Write, stdout};
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
-    AsyncActionRunner,
+    AsyncActionRunner, AsyncActionStart,
 };
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
@@ -320,6 +320,19 @@ pub(crate) struct QueuedModelSubmission {
     pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
 }
 
+pub(crate) struct ModelSelectionRetry {
+    /// Durable session attachment that owns this retry. Retry payloads are
+    /// never transferable between conversations, even while another session
+    /// is temporarily attached to the same runner.
+    pub session_id: Option<uuid::Uuid>,
+    /// The exact full selection that failed, including every inference
+    /// preference. It remains paired with the optional held wire submission
+    /// so a later unrelated quick/cycle choice cannot silently consume it.
+    pub requested: cockpit_config::providers::ActiveModelRef,
+    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    pub queued_submission: Option<QueuedModelSubmission>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApplied {
     None,
@@ -346,6 +359,7 @@ pub(crate) enum ControlApplied {
     PinContext {
         text: String,
     },
+    RepairResume,
 }
 
 #[derive(Debug, Clone)]
@@ -656,7 +670,7 @@ enum TerminalCleanupCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FreshQueueAck {
     None,
-    AwaitingAck,
+    AwaitingAck(uuid::Uuid),
     SuppressId(uuid::Uuid),
     FoldedBeforeAck(uuid::Uuid),
 }
@@ -1221,10 +1235,57 @@ pub(super) enum DispatchOutcome {
 
 pub(super) struct PendingSessionSwitchSubmission {
     pub submission: cockpit_core::engine::message::UserSubmission,
+    /// Stable client-local identity shared by the exact wire payload and its
+    /// optimistic transcript or queue row.
+    pub optimistic_submission_id: uuid::Uuid,
     pub error_prefix: String,
     pub optimistic_tag_entries: usize,
     pub owns_working_span: bool,
-    pub queued_text: Option<String>,
+    /// Exact optimistic transcript rows created for this staged submission.
+    /// A successful `/new` clears the outgoing view, then replays only these
+    /// new-session rows; a failed attach leaves the originals untouched.
+    pub optimistic_history: Vec<HistoryEntry>,
+    /// Busy-turn submissions render in the queue rather than history. Keep
+    /// their optimistic row across a successful transactional `/new` reset.
+    pub optimistic_queue_item: Option<QueuedUserMessage>,
+}
+
+pub(super) struct RetainedPreDispatchSubmission {
+    /// A recovered bounded-channel send may only be retried against the
+    /// durable session it originally targeted. `None` means the failed send
+    /// happened before any session id existed; it binds once to the first
+    /// successfully created runner and is never guessed across replacements.
+    pub intended_session_id: Option<uuid::Uuid>,
+    pub pending: PendingSessionSwitchSubmission,
+}
+
+pub(super) struct RetainedSessionSwitchSubmissions {
+    /// `None` is possible only for synthetic/tests that stage without first
+    /// claiming a switch. Production entries are always target-bound.
+    pub target: Option<agent_runner::SessionTarget>,
+    /// Ephemeral fork targets are discarded after a failed attach. Bind their
+    /// submissions to the next explicit retry of the same user intent instead
+    /// of leaving them keyed to an unreachable session UUID.
+    pub retry_intent: Option<EphemeralSessionSwitchIntent>,
+    pub submissions: Vec<PendingSessionSwitchSubmission>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EphemeralSessionSwitchIntent {
+    Fork {
+        parent_session_id: uuid::Uuid,
+        fork_point_seq: Option<i64>,
+    },
+    Side {
+        parent_session_id: uuid::Uuid,
+    },
+}
+
+pub(super) struct OptimisticSubmissionState {
+    pub id: uuid::Uuid,
+    pub tag_entries: usize,
+    pub history: Vec<HistoryEntry>,
+    pub queue_item: Option<QueuedUserMessage>,
 }
 
 impl DispatchOutcome {
@@ -1523,9 +1584,6 @@ pub struct App {
     /// Complete daemon-confirmed session selection. Quick edits modify this
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
-    /// Daemon-confirmed configured default, retained even when it equals the
-    /// session selection so first-selection defaulting never relies on drift.
-    pub(super) default_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
 
     pub(super) composer: Composer,
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
@@ -1561,6 +1619,19 @@ pub struct App {
     /// flight. They are held locally until the new daemon attachment is
     /// accepted, so they cannot be sent to the outgoing session.
     pub(super) pending_session_switch_submissions: Vec<PendingSessionSwitchSubmission>,
+    /// Target currently being attached. It binds staged user input to the
+    /// intended replacement session instead of whichever runner happens to
+    /// remain after a failed switch.
+    pub(super) pending_session_switch_target: Option<agent_runner::SessionTarget>,
+    /// Semantic retry binding for an ephemeral target whose UUID changes when
+    /// a failed `/fork` or `/side` attach is retried.
+    pub(super) pending_ephemeral_session_switch_intent: Option<EphemeralSessionSwitchIntent>,
+    /// Exact payloads from failed replacement attaches, retained by target
+    /// until that same target is retried successfully.
+    pub(super) retained_session_switch_submissions: Vec<RetainedSessionSwitchSubmissions>,
+    /// Exact payloads rejected before the runner dispatcher accepted
+    /// ownership. These are safe to retry only on their original session.
+    pub(super) retained_pre_dispatch_submissions: Vec<RetainedPreDispatchSubmission>,
     /// Current queue-edit foreground target. Seeded from the daemon attach
     /// snapshot and kept current by `ForegroundInputTarget` events. `None`
     /// means the client lacks enough information to mark any queue item as
@@ -1570,6 +1641,16 @@ pub struct App {
     /// still acknowledges them through the queue API, so the originating TUI
     /// suppresses that one daemon queue item until the row is recorded.
     pub(super) fresh_queue_ack: FreshQueueAck,
+    /// Bounded exact-id tombstones for queue items already folded into the
+    /// transcript. Queue broadcasts and per-request response snapshots travel
+    /// independently, so either can arrive late; a tombstoned UUID must never
+    /// be resurrected as pending work.
+    pub(super) folded_queue_item_ids: HashSet<uuid::Uuid>,
+    pub(super) folded_queue_item_order: VecDeque<uuid::Uuid>,
+    /// Exact submissions the dispatcher still owns for a future retry.
+    /// This makes reconciliation independent of whether a terminal worker
+    /// broadcast or the request response reaches App first.
+    pub(super) retained_user_submission_ids: HashSet<uuid::Uuid>,
     /// Submitted user messages (excluding queued ones). Used for Up/Down
     /// shell-style history navigation in the composer.
     pub(super) prompt_history: Vec<String>,
@@ -1660,21 +1741,11 @@ pub struct App {
     pub(super) question_dialog_btw: bool,
     /// A side-pane interrupt waiting behind the currently visible main dialog.
     pub(super) pending_btw_interrupt: Option<TurnEvent>,
-    /// Whether the composer has genuinely been the user's active input
-    /// surface since the last question dialog closed
-    /// (implementation note). Set true by a render pass
-    /// that found no `question_dialog`, and consumed (set false) when a
-    /// dialog is installed. The anti-misfire lockout arms with the full
-    /// configured delay only when this is true at install time
-    /// (the genuine composer→dialog edge); a follow-up dialog installed
-    /// while this is still false — including the same-cycle "dialog A
-    /// resolved, dialog B installed before any composer render" handoff —
-    /// opens immediately answerable (zero lockout). It is a render-driven
-    /// signal precisely so the instantaneous `None→Some` flip on
-    /// `question_dialog` during one resolve/poll cycle cannot masquerade as
-    /// a fresh edge. Starts `true` (a cold dialog from the idle composer
-    /// arms normally).
-    pub(super) composer_active_since_dialog: bool,
+    /// Last user-driven edit of the main composer. The approval/question
+    /// anti-misfire delay is armed only while this timestamp is recent, then
+    /// consumed by the first dialog. Merely rendering or focusing an empty
+    /// composer never forces a lockout between queued approvals.
+    pub(super) last_composer_edit_at: Option<Instant>,
     /// In-flight `/init` awaiting the user's update/overwrite/cancel
     /// choice. Set when the target file already exists; the question
     /// dialog open at that moment is this local prompt (not a daemon
@@ -1869,6 +1940,10 @@ pub struct App {
     /// history spills to scrollback before the welcome header is
     /// reprinted above the viewport).
     pub(super) pending_new_session: bool,
+    /// A successful transactional `/new` has committed its in-memory view
+    /// reset and needs the event loop's terminal handle to invalidate the
+    /// alt-screen buffers. Attach failures never set this latch.
+    pub(super) new_session_terminal_clear_pending: bool,
     /// Provider-reported usage from the most recent round-trip. Anchors
     /// the live context counter (see `context_tokens`): the displayed
     /// value is this total plus a local estimate of everything streamed
@@ -1983,10 +2058,14 @@ pub struct App {
     /// Exact send intent retained after a rejected/expired model selection.
     /// The next picker selection adopts it so git blocks, tag expansions,
     /// images, and display text survive recovery without being rebuilt.
-    pub(super) retry_model_submission: Option<QueuedModelSubmission>,
-    /// Provider whose model editor was opened from the picker. The picker is
-    /// restored only after the daemon publishes the refreshed inventory.
+    pub(super) retry_model_selections: HashMap<Option<uuid::Uuid>, ModelSelectionRetry>,
+    /// Provider whose model editor was opened from the picker. Closing the
+    /// editor restores the picker immediately; a later daemon snapshot may
+    /// refresh that still-open picker's inventory exactly once.
     pub(super) reopen_model_picker_after_settings: Option<String>,
+    pub(super) reopen_model_picker_draft_after_settings:
+        Option<cockpit_config::providers::ActiveModelRef>,
+    pub(super) refresh_reopened_model_picker_after_settings: Option<String>,
     /// A send opened the model picker; after a confirmed choice, rerun the
     /// untouched composer through the normal submit path and hold it behind
     /// the correlated model transaction.
@@ -2983,13 +3062,11 @@ impl App {
         let initial_agent_path = vec![launch.agent_name.clone()];
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
-        let default_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
             launch,
             config_snapshot,
             active_model_state_generation: 0,
             active_model_selection,
-            default_model_selection,
             composer,
             vim_setting,
             thinking_setting,
@@ -2999,8 +3076,15 @@ impl App {
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
             pending_session_switch_submissions: Vec::new(),
+            pending_session_switch_target: None,
+            pending_ephemeral_session_switch_intent: None,
+            retained_session_switch_submissions: Vec::new(),
+            retained_pre_dispatch_submissions: Vec::new(),
             foreground_input_target: None,
             fresh_queue_ack: FreshQueueAck::None,
+            folded_queue_item_ids: HashSet::new(),
+            folded_queue_item_order: VecDeque::new(),
+            retained_user_submission_ids: HashSet::new(),
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
             staged_draft: None,
@@ -3026,7 +3110,7 @@ impl App {
             question_dialog: None,
             question_dialog_btw: false,
             pending_btw_interrupt: None,
-            composer_active_since_dialog: true,
+            last_composer_edit_at: None,
             pending_local_choice: None,
             daemon_connected: daemon_state.connected,
             daemonless: daemon_state.daemonless,
@@ -3083,6 +3167,7 @@ impl App {
             slash_menu_cache: std::cell::RefCell::new(None),
             slash_cycle_stem: None,
             pending_new_session: false,
+            new_session_terminal_clear_pending: false,
             last_usage: None,
             estimate_at_last_usage: 0,
             history_estimate_cache: Cell::new(None),
@@ -3115,8 +3200,10 @@ impl App {
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,
-            retry_model_submission: None,
+            retry_model_selections: HashMap::new(),
             reopen_model_picker_after_settings: None,
+            reopen_model_picker_draft_after_settings: None,
+            refresh_reopened_model_picker_after_settings: None,
             submit_after_model_selection: false,
             next_control_request_seq: 0,
             elided_event_ids: std::collections::HashSet::new(),
@@ -3302,7 +3389,7 @@ impl App {
         if self.btw_pane.is_some() {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_tx.clone(),
+                    runner.attached_request_binding(),
                     cockpit_core::daemon::proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id(),
                     },
@@ -3387,18 +3474,6 @@ impl App {
                 terminal.draw(|frame| self.render(frame))?;
                 self.startup_first_paint_timing.log_after_draw();
                 crate::tui::links::emit_osc8(&self.link_registry, self.hyperlinks)?;
-                // The composer is the user's active input surface this frame iff
-                // no question dialog is displacing it
-                // (implementation note). A render with no
-                // dialog means the composer has genuinely been usable, so the
-                // next dialog opened from here arms the full anti-misfire
-                // lockout. This render-driven mark is what makes the signal
-                // robust to the same-cycle `None→Some` handoff: a follow-up
-                // dialog installed before any composer render keeps the flag
-                // false and opens immediately answerable.
-                if self.question_dialog.is_none() {
-                    self.composer_active_since_dialog = true;
-                }
                 self.sync_cursor_shape();
             }
 
@@ -3469,6 +3544,8 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        changed |= self.retry_pending_session_switch_submissions();
+        changed |= self.retry_retained_pre_dispatch_submissions();
         changed |= self.drain_prediction();
         self.sync_prediction_ghost();
         self.sync_active_agent();

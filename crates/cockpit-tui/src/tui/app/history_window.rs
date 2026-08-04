@@ -54,6 +54,10 @@ impl<'a> IntoIterator for &'a HistoryWindow {
 }
 
 impl HistoryWindow {
+    pub(super) fn as_slice(&self) -> &[HistoryEntry] {
+        &self.log
+    }
+
     pub(super) fn from_history_page(
         entries: Vec<HistoryEntry>,
         older_cursor: Option<i64>,

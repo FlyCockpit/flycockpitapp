@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::daemon::client::DaemonClient;
+use crate::daemon::client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths};
 
@@ -127,15 +127,15 @@ pub async fn restart_skewed_daemon_if_idle_with_cooldown(
 }
 
 async fn read_skew_kind(socket: &Path) -> Result<SkewKind> {
-    let result = match DaemonClient::connect(socket)
-        .await?
-        .request(Request::DaemonStatus)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) if is_protocol_mismatch_message(&error.to_string()) => {
+    let client = match DaemonClient::connect(socket).await {
+        Ok(client) => client,
+        Err(error) if is_protocol_version_mismatch(&error) => {
             return Ok(SkewKind::IncompatibleProtocol);
         }
+        Err(error) => return Err(error),
+    };
+    let result = match client.request(Request::DaemonStatus).await {
+        Ok(result) => result,
         Err(error) => return Err(error),
     };
     let response = match result {
@@ -160,17 +160,17 @@ async fn attempt_restart_if_idle(
     skew_reason: Option<String>,
 ) -> Result<SkewRestartOutcome> {
     let old_pid = daemon::daemon_pid(paths);
-    let result = match DaemonClient::connect(&paths.socket)
-        .await?
-        .request(Request::RestartIfIdle)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) if is_protocol_mismatch_message(&error.to_string()) => {
+    let client = match DaemonClient::connect(&paths.socket).await {
+        Ok(client) => client,
+        Err(error) if is_protocol_version_mismatch(&error) => {
             return Ok(SkewRestartOutcome::NoticeOnly {
                 reason: skew_reason,
             });
         }
+        Err(error) => return Err(error),
+    };
+    let result = match client.request(Request::RestartIfIdle).await {
+        Ok(result) => result,
         Err(error) => return Err(error),
     };
     let response = match result {
@@ -239,11 +239,6 @@ impl SkewKind {
 
 fn is_protocol_mismatch_error(error: &proto::ErrorPayload) -> bool {
     error.code == proto::ErrorCode::ProtocolVersion
-        || error.message.contains("wire protocol version mismatch")
-}
-
-fn is_protocol_mismatch_message(message: &str) -> bool {
-    message.contains("wire protocol version mismatch")
 }
 
 fn is_unsupported_restart_request(error: &proto::ErrorPayload) -> bool {

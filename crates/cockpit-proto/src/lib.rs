@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! { "v": 1, "kind": "req"|"res"|"evt"|"err", ... }
+//! { "v": 6, "kind": "req"|"res"|"evt"|"err", ... }
 //! ```
 //!
 //! - **`req`** — client → daemon. Carries a uuid `id` the daemon
@@ -890,7 +890,7 @@ fn default_client_protocol_version() -> u32 {
 mod event;
 pub use event::{
     AuthFailureKind, DefaultModelUpdateOutcome, Event, InferenceErrorClass,
-    ModelSelectionActiveState, ModelSelectionOutcome,
+    ModelSelectionActiveState, ModelSelectionOutcome, UserMessageTerminalDisposition,
 };
 
 // ---- Errors ----------------------------------------------------------------
@@ -935,6 +935,14 @@ pub enum ErrorCode {
     LockConflict,
     /// Workspace trust is unset or explicitly refuses access.
     WorkspaceTrust,
+    /// A user message was deterministically rejected before entering the
+    /// driver queue. Retrying the exact client submission id and payload is
+    /// safe after the reported session condition is resolved.
+    UserMessageNotAccepted,
+    /// This exact client submission id reached a durable terminal disposition
+    /// (removed, cancelled, or rejected by preflight) and must never be
+    /// executed by a later worker epoch.
+    UserMessageTerminated,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -971,6 +979,8 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "hash_mismatch" => Self::HashMismatch,
             "lock_conflict" => Self::LockConflict,
             "workspace_trust" => Self::WorkspaceTrust,
+            "user_message_not_accepted" => Self::UserMessageNotAccepted,
+            "user_message_terminated" => Self::UserMessageTerminated,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -994,6 +1004,8 @@ impl std::fmt::Display for ErrorCode {
             Self::HashMismatch => "hash_mismatch",
             Self::LockConflict => "lock_conflict",
             Self::WorkspaceTrust => "workspace_trust",
+            Self::UserMessageNotAccepted => "user_message_not_accepted",
+            Self::UserMessageTerminated => "user_message_terminated",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -1029,6 +1041,9 @@ pub enum HistoryEntry {
         display_text: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tag_expansions: Vec<TagExpansionMeta>,
+        /// Stable client submission ids represented by this durable row.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        client_submission_ids: Vec<Uuid>,
         /// `session_events.ts_ms` of this message (epoch millis) — the wall
         /// clock the TUI stamps on the restored row so a resumed transcript
         /// shows the original send time, not the resume time.
@@ -2176,6 +2191,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "sessions",
         "stats_rollup",
         "subagent_history_page",
+        "user_message_queued",
     ];
 
     #[test]
@@ -2227,7 +2243,13 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             errors.values().any(|value| value.get("id").is_none()),
             "errors.json must include an out-of-band err frame with id omitted"
         );
-        for code in ["authorization", "protocol_version", "bad_request"] {
+        for code in [
+            "authorization",
+            "protocol_version",
+            "bad_request",
+            "user_message_not_accepted",
+            "user_message_terminated",
+        ] {
             assert!(
                 errors.values().any(|value| value
                     .pointer("/error/code")
@@ -2511,6 +2533,18 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 None,
                 ErrorCode::BadRequest,
                 "malformed daemon frame",
+            ),
+            (
+                "user_message_not_accepted_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::UserMessageNotAccepted,
+                "user message was not accepted by the session driver",
+            ),
+            (
+                "user_message_terminated_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::UserMessageTerminated,
+                "user message reached a durable terminal disposition",
             ),
         ] {
             generated.insert(
@@ -3124,12 +3158,95 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-5",
                 "persist_as_default": false,
+                "initialize_default_if_missing": false,
                 "thinking_mode": "turbo"
             }
         });
 
         let error = serde_json::from_value::<Request>(raw)
             .expect_err("unknown thinking mode must fail at the wire boundary");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn set_active_model_rejects_empty_reasoning_effort_during_deserialization() {
+        let raw = json!({
+            "request": "set_active_model",
+            "params": {
+                "selection_id": "11111111-1111-4111-8111-111111111111",
+                "provider": "openai",
+                "model": "gpt-5",
+                "persist_as_default": false,
+                "initialize_default_if_missing": false,
+                "reasoning_effort": ""
+            }
+        });
+
+        let error = serde_json::from_value::<Request>(raw)
+            .expect_err("empty reasoning effort must fail at the wire boundary");
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn set_active_model_rejects_empty_provider_or_model_during_deserialization() {
+        for (field, provider, model) in [("provider", "", "gpt-5"), ("model", "openai", "")] {
+            let raw = json!({
+                "request": "set_active_model",
+                "params": {
+                    "selection_id": "11111111-1111-4111-8111-111111111111",
+                    "provider": provider,
+                    "model": model,
+                    "persist_as_default": false,
+                    "initialize_default_if_missing": false
+                }
+            });
+
+            let error = serde_json::from_value::<Request>(raw)
+                .expect_err("empty model identity must fail at the wire boundary");
+            assert!(
+                error.to_string().contains("must not be empty"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_model_state_rejects_removed_flat_v5_shape() {
+        let raw = json!({
+            "event": "active_model_state",
+            "data": {
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "provider": "openai",
+                "model": "gpt-5",
+                "diverged": false,
+                "generation": 1
+            }
+        });
+
+        serde_json::from_value::<Event>(raw)
+            .expect_err("protocol v6 must reject the removed flat active-model shape");
+    }
+
+    #[test]
+    fn model_selection_result_rejects_unknown_thinking_mode() {
+        let raw = json!({
+            "event": "model_selection_result",
+            "data": {
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "selection_id": "22222222-2222-4222-8222-222222222222",
+                "provider": "openai",
+                "model": "gpt-5",
+                "thinking_mode": "turbo",
+                "outcome": {
+                    "status": "rejected",
+                    "user_message": "invalid selection",
+                    "diagnostic_code": "invalid_selection"
+                }
+            }
+        });
+
+        let error = serde_json::from_value::<Event>(raw)
+            .expect_err("unknown result thinking mode must fail at the wire boundary");
         assert!(error.to_string().contains("unknown variant"));
     }
 
@@ -3186,6 +3303,7 @@ mod tests {
         let env = Envelope::request(
             Uuid::new_v4(),
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -3245,6 +3363,7 @@ mod tests {
         let env = Envelope::request(
             Uuid::new_v4(),
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),

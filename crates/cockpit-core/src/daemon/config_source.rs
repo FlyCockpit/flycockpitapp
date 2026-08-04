@@ -165,6 +165,15 @@ impl ConfigSource {
     }
 }
 
+/// Re-read the effective provider metadata inside a serialized config
+/// mutation's read/decide/write critical section. Ordinary session work must
+/// use `SessionConfigHandle`; this narrow mutation seam exists because a
+/// worker snapshot can become stale between an explicit/conditional default
+/// request and the write that resolves it.
+pub(crate) fn load_effective_providers_for_atomic_mutation(cwd: &Path) -> ProvidersConfig {
+    crate::config::providers::ConfigDoc::load_effective(cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

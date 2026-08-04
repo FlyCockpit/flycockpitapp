@@ -1,3 +1,5 @@
+import { createClientSubmissionId } from "@flycockpit/cockpit-protocol";
+import { shouldRetainUserMessageSubmission } from "@flycockpit/cockpit-protocol/client";
 import { Button } from "@flycockpit/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@flycockpit/ui/components/card";
 import {
@@ -30,7 +32,7 @@ import {
   ShieldAlert,
   WifiOff,
 } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
 import { useShallow } from "zustand/react/shallow";
@@ -54,10 +56,14 @@ import {
 } from "@/lib/session-visibility";
 import { statsRollupToView } from "@/lib/stats-rollup-view";
 import {
+  isCurrentWebComposerAttempt,
+  isWebAttachmentReady,
   type SessionDetail,
   type SessionPagingState,
   useRemoteSessionsStore,
+  type WebComposerRetrySubmission,
   type WebHistoryEntry,
+  WebSessionCreatedWithSetupError,
   type WebSessionSummary,
 } from "@/stores/remote-sessions";
 import { friendly } from "@/utils/friendly-error";
@@ -89,6 +95,7 @@ function ProjectSessionPage() {
   useRemoteInstanceConnection(instanceId, tokenData);
   const {
     remote,
+    attach,
     sendMessage,
     resolveInterrupt,
     renameSession,
@@ -100,6 +107,7 @@ function ProjectSessionPage() {
   } = useRemoteSessionsStore(
     useShallow((state) => ({
       remote: state.instances[instanceId],
+      attach: state.attach,
       sendMessage: state.sendMessage,
       resolveInterrupt: state.resolveInterrupt,
       renameSession: state.renameSession,
@@ -130,7 +138,40 @@ function ProjectSessionPage() {
     remote?.statsRollupByProject[projectId],
     detail?.usage?.totalTokens,
   );
-  const [message, setMessage] = useState("");
+  const [messagesBySession, setMessagesBySession] = useState<Record<string, string>>({});
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [retrySubmissionsBySession, setRetrySubmissionsBySession] = useState<
+    Record<string, WebComposerRetrySubmission | undefined>
+  >({});
+  const latestSubmitAttempt = useRef(0);
+  const selectedSessionIdRef = useRef(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
+  const message = selectedSessionId ? (messagesBySession[selectedSessionId] ?? "") : "";
+  const retryCandidate = selectedSessionId
+    ? retrySubmissionsBySession[selectedSessionId]
+    : undefined;
+  const retrySubmission =
+    retryCandidate &&
+    !detail?.history.some(
+      (entry) =>
+        entry.kind === "user_message" &&
+        entry.clientSubmissionIds?.includes(retryCandidate.params.client_submission_id),
+    )
+      ? retryCandidate
+      : undefined;
+  const setSessionMessage = (sessionId: string, value: string | ((current: string) => string)) => {
+    setMessagesBySession((current) => {
+      const previous = current[sessionId] ?? "";
+      const next = typeof value === "function" ? value(previous) : value;
+      return { ...current, [sessionId]: next };
+    });
+  };
+  const setSessionRetry = (sessionId: string, submission: WebComposerRetrySubmission | null) => {
+    setRetrySubmissionsBySession((current) => ({
+      ...current,
+      [sessionId]: submission ?? undefined,
+    }));
+  };
   const [renameTitle, setRenameTitle] = useState("");
   const loadOlderSelectedHistory = useCallback(
     () => (selectedSessionId ? loadOlderHistory(instanceId, selectedSessionId) : Promise.resolve()),
@@ -155,18 +196,59 @@ function ProjectSessionPage() {
   const canShareSessions = viewerMode === "owner";
   const readOnly = viewerMode === "agent_readonly";
   const offline = remote?.status !== "connected";
+  const attachmentReady = isWebAttachmentReady(remote, selectedSessionId);
+  const attachmentFailure =
+    remote?.attachment.phase === "failed" && remote.attachment.sessionId === selectedSessionId
+      ? remote.attachment
+      : null;
   const draining = remote?.draining ?? null;
-  const composerDisabled = offline || !!draining || !canWriteSessions;
+  const repairRequired = detail?.repairRequired;
+  const composerDisabled =
+    offline ||
+    !attachmentReady ||
+    !!draining ||
+    !canWriteSessions ||
+    Boolean(repairRequired) ||
+    sendingMessage;
 
   async function submitMessage() {
     const text = message.trim();
     if (!selectedSessionId || !text || composerDisabled) return;
-    setMessage("");
+    const sessionId = selectedSessionId;
+    const attempt = ++latestSubmitAttempt.current;
+    const submission = (retrySubmission?.sessionId === sessionId &&
+    retrySubmission.params.text === text
+      ? retrySubmission.params
+      : undefined) ?? {
+      client_submission_id: createClientSubmissionId(),
+      text,
+    };
+    setSessionMessage(sessionId, "");
+    setSendingMessage(true);
     try {
-      await sendMessage(instanceId, selectedSessionId, text);
-    } catch {
-      toast.error(t("instances:remote.sendFailed"));
-      setMessage(text);
+      await sendMessage(instanceId, sessionId, submission);
+      // A queue response is only an in-memory daemon acknowledgment. Keep an
+      // exact retry candidate until a durable history receipt proves that this
+      // UUID was recorded.
+    } catch (error) {
+      const currentAttempt = isCurrentWebComposerAttempt({
+        currentSessionId: selectedSessionIdRef.current,
+        attemptedSessionId: sessionId,
+        latestAttempt: latestSubmitAttempt.current,
+        attempt,
+      });
+      if (currentAttempt) {
+        toast.error(t("instances:remote.sendFailed"));
+      }
+      // Restore and retain against the attempted session even if the user
+      // switched elsewhere before the transport outcome arrived.
+      setSessionMessage(sessionId, (current) => current || text);
+      setSessionRetry(
+        sessionId,
+        shouldRetainUserMessageSubmission(error) ? { sessionId, params: submission } : null,
+      );
+    } finally {
+      setSendingMessage(false);
     }
   }
 
@@ -270,6 +352,29 @@ function ProjectSessionPage() {
         </aside>
 
         <main className="flex min-h-0 flex-col">
+          {attachmentFailure ? (
+            <div className="flex items-start justify-between gap-3 border-b bg-destructive/5 px-4 py-3 text-sm">
+              <div className="flex min-w-0 items-start gap-2">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+                <div className="min-w-0">
+                  <div className="font-medium">{t("instances:remote.attachmentFailed")}</div>
+                  {attachmentFailure.error ? (
+                    <p className="truncate text-muted-foreground">{attachmentFailure.error}</p>
+                  ) : null}
+                </div>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  if (selectedSessionId) void attach(instanceId, selectedSessionId);
+                }}
+              >
+                {t("instances:remote.retryAttachment")}
+              </Button>
+            </div>
+          ) : null}
           {detail ? (
             <>
               <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
@@ -352,9 +457,9 @@ function ProjectSessionPage() {
                   paging={detail.paging}
                   onLoadOlder={transcriptPaging.loadOlderWithAnchor}
                   interruptFocus={search.interrupt}
-                  readOnly={!canWriteSessions}
+                  readOnly={!canWriteSessions || !attachmentReady || Boolean(repairRequired)}
                   onResolve={(interruptId, selection) =>
-                    canWriteSessions
+                    canWriteSessions && attachmentReady && !repairRequired
                       ? resolveInterrupt(instanceId, {
                           sessionId: detail.summary.sessionId,
                           interruptId,
@@ -381,13 +486,21 @@ function ProjectSessionPage() {
                     className="min-h-[52px] flex-1 text-base"
                     value={message}
                     disabled={composerDisabled}
-                    onChange={(event) => setMessage(event.target.value)}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (selectedSessionId) {
+                        setSessionMessage(selectedSessionId, value);
+                        if (retrySubmission && retrySubmission.params.text !== value.trim()) {
+                          setSessionRetry(selectedSessionId, null);
+                        }
+                      }
+                    }}
                     placeholder={
                       offline
                         ? t("instances:remote.composerOffline")
                         : draining
                           ? t("instances:remote.composerDraining")
-                          : readOnly
+                          : readOnly || repairRequired
                             ? t("instances:remote.composerReadOnly")
                             : t("instances:remote.composerPlaceholder")
                     }
@@ -503,7 +616,8 @@ function SessionStateNotices({
   const { t } = useTranslation("instances");
   const waitingLocks = Object.values(detail.waitingLocks);
   const pausedItems = detail.pausedWork?.items ?? [];
-  const hasNotices = detail.sandboxUnavailable || waitingLocks.length || pausedItems.length;
+  const hasNotices =
+    detail.repairRequired || detail.sandboxUnavailable || waitingLocks.length || pausedItems.length;
   if (!hasNotices) return null;
 
   async function copyFixCommand(command: string) {
@@ -525,6 +639,12 @@ function SessionStateNotices({
 
   return (
     <div className="mb-2 space-y-2">
+      {detail.repairRequired ? (
+        <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <p className="text-muted-foreground">{detail.repairRequired.detail}</p>
+        </div>
+      ) : null}
       {detail.sandboxUnavailable ? (
         <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm">
           <div className="flex items-start gap-2">
@@ -1307,20 +1427,34 @@ function NewSessionDialog({
   const [model, setModel] = useState("");
 
   async function submit() {
+    const selectedProvider = provider.trim();
+    const selectedModel = model.trim();
     try {
       const result = await createSession(instanceId, {
         projectRoot,
         title: title || undefined,
         agent,
-        initialModel: provider && model ? { provider, model } : undefined,
+        initialModel:
+          selectedProvider && selectedModel
+            ? { provider: selectedProvider, model: selectedModel }
+            : undefined,
       });
       setOpen(false);
       setTitle("");
       setProvider("");
       setModel("");
       onCreated(result.summary.sessionId);
-    } catch {
-      toast.error(t("remote.createFailed"));
+    } catch (error) {
+      if (error instanceof WebSessionCreatedWithSetupError) {
+        setOpen(false);
+        setTitle("");
+        setProvider("");
+        setModel("");
+        onCreated(error.session.summary.sessionId);
+        toast.error(t("remote.createSetupFailed"));
+      } else {
+        toast.error(t("remote.createFailed"));
+      }
     }
   }
 
@@ -1359,7 +1493,7 @@ function NewSessionDialog({
           <Button
             type="button"
             className="w-full"
-            disabled={Boolean(provider) !== Boolean(model)}
+            disabled={Boolean(provider.trim()) !== Boolean(model.trim())}
             onClick={() => void submit()}
           >
             {t("remote.createSession")}

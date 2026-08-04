@@ -1,8 +1,45 @@
 use super::*;
 
 impl App {
+    pub(super) fn session_switch_action_key() -> AsyncActionKey {
+        AsyncActionKey::new("session.switch")
+    }
+
+    /// All in-process attaches mutate the runner's shared transport before
+    /// App can adopt their authoritative snapshot. Keep that interval a
+    /// single, non-replaceable transaction: a later switch request may reuse
+    /// the pending action, but must never abort it and start another attach.
+    pub(super) fn session_switch_action_policy() -> AsyncActionPolicy {
+        AsyncActionPolicy::Dedupe(Self::session_switch_action_key())
+    }
+
+    /// Session-switch calls all run on App's single event-loop thread. This
+    /// keyed preflight is therefore also the claim: no other caller can pass
+    /// it before this caller synchronously installs its action. The pending
+    /// entry remains keyed even when its future has completed but App has not
+    /// adopted the result yet, preserving that especially important window.
+    pub(super) fn session_switch_in_progress(&self) -> bool {
+        self.async_actions
+            .has_pending_key(&Self::session_switch_action_key())
+    }
+
+    pub(super) fn report_session_switch_busy(&mut self, command: &str) {
+        self.history.push(HistoryEntry::CommandError {
+            line: format!(
+                "{command}: another session change is still finishing; retry when it completes"
+            ),
+        });
+    }
+
     pub(super) fn reset_session_live_state(&mut self) {
+        // Session reset begins a new runner epoch. Cancel model controls
+        // before clearing general request bookkeeping so a held exact wire
+        // submission cannot be stranded if the attach later fails.
+        self.cancel_model_controls_for_epoch_change(None);
         self.queue.clear();
+        self.folded_queue_item_ids.clear();
+        self.folded_queue_item_order.clear();
+        self.retained_user_submission_ids.clear();
         self.pending = None;
         self.pending_render_cache = None;
         self.prunable_tokens = 0;
@@ -47,30 +84,70 @@ impl App {
         &mut self,
         mut clear_terminal: impl FnMut() -> Result<()>,
     ) -> Result<bool> {
+        let changed = self.clear_terminal_after_committed_new_session(&mut clear_terminal);
         if !self.pending_new_session {
-            return Ok(false);
+            return Ok(changed);
+        }
+        if self.has_pending_session_switch_action() {
+            self.pending_new_session = false;
+            self.report_session_switch_busy("/new");
+            return Ok(true);
         }
         self.pending_new_session = false;
 
-        self.cancel_outgoing_turn_if_busy();
-
-        // `/new` from inside a side conversation: discard the ephemeral fork
-        // first (no orphan), then proceed to open a fresh session. We don't
-        // restore the main session's view — `/new` is clearing everything
-        // anyway — but the discard must still fire and the chrome flag clear.
-        if self.side_conversation.is_some() {
-            self.end_side_conversation(false);
+        let switch_task = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) if runner.can_switch_session() => {
+                Some(runner.switch_new_session_task(self.busy))
+            }
+            _ => None,
+        };
+        if let Some(switch_task) = switch_task {
+            let start = self.async_actions.start(
+                AsyncActionKind::Internal("session.switch"),
+                Self::session_switch_action_policy(),
+                async move {
+                    switch_task
+                        .await
+                        .map(|outcome| AsyncActionPayload::SessionSwitched(Box::new(outcome)))
+                },
+            );
+            debug_assert!(matches!(start, AsyncActionStart::Started(_)));
+            self.begin_session_switch_submission_target(agent_runner::SessionTarget::New);
+        } else {
+            // Without a replaceable attachment there is no old durable
+            // runner/view transaction to protect. Commit the local reset
+            // immediately and let the normal display/first-submit attach
+            // create a fresh session from `session_id: None`.
+            self.commit_new_session_without_swappable_runner();
+            self.clear_terminal_after_committed_new_session(&mut clear_terminal);
         }
+        Ok(true)
+    }
 
-        // Alt-screen mode: the chat pane is the whole canvas, and
-        // there's no terminal scrollback to spill into. Clearing
-        // history makes the chat pane empty — that's the "new
-        // session" visual.
+    fn clear_terminal_after_committed_new_session(
+        &mut self,
+        clear_terminal: &mut impl FnMut() -> Result<()>,
+    ) -> bool {
+        if !self.new_session_terminal_clear_pending {
+            return false;
+        }
+        self.new_session_terminal_clear_pending = false;
+        // `Terminal::clear` invalidates ratatui's buffers on success, but
+        // crossterm may fail its cursor-position probe. The in-memory commit
+        // is already complete, so terminal cleanup is always best-effort.
+        if let Err(error) = clear_terminal() {
+            tracing::warn!(error = %error, "terminal clear after /new failed; continuing with redraw");
+        }
+        true
+    }
+
+    fn reset_new_session_view(&mut self) {
         self.finalize_pending();
-
-        // Reset transcript state.
         self.history.clear();
         self.reset_session_live_state();
+        self.history_render_versions.clear();
+        self.history_render_fingerprints.clear();
+        self.history_render_cache_clear();
         self.clickable_rows.clear();
         self.box_rows.clear();
         self.hovered_affordance = None;
@@ -78,61 +155,78 @@ impl App {
         self.affordance_scroll_regions.clear();
         self.chat_row_meta.clear();
         self.chat_area = None;
+        self.chat_geometry = render::ChatGeometry::default();
+        self.mark_chat_geometry_dirty_from(0);
+        self.chat_find_lines.clear();
+        self.chat_find_lines_query = None;
+        self.transcript_find = None;
         self.chat_text_grid.clear();
         self.chat_cont_rows.clear();
         self.selection = None;
-        // No client-side config re-read on a session swap: the swapped-in
-        // session's attach delivers a fresh `ConfigSnapshot`
-        // (`tui-config-single-source`), which replaces the held one.
 
-        let switch_task = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) if runner.can_switch_session() => {
-                Some(runner.switch_session_task(agent_runner::SessionTarget::New))
-            }
-            _ => None,
-        };
-        if let Some(switch_task) = switch_task {
-            self.async_actions.start(
-                AsyncActionKind::Internal("session.switch"),
-                AsyncActionPolicy::Replace(AsyncActionKey::new("session.switch")),
-                async move {
-                    switch_task
-                        .await
-                        .map(|outcome| AsyncActionPayload::SessionSwitched(Box::new(outcome)))
-                },
-            );
-        } else {
-            // No live runner exists, so the next submit/attach path still
-            // creates a fresh session with `session_id: None`.
-            self.agent_runner.take();
-            self.reset_display_attach_backoff();
-        }
-        // The fresh session is deferred-persistence until its first message
-        // (session-id-display-and-lazy-persist).
-        self.current_session_persisted = false;
-
-        // Reset the autocomplete tally so the next attach re-seeds it
-        // fresh (additive merge would otherwise double-count). The
-        // daemon re-fetch picks up everything recorded this session.
+        // The next attach supplies the authoritative config and usage
+        // snapshots; clearing additive tallies prevents double-counting.
         self.usage_models.clear();
         self.usage_slash.clear();
         self.usage_tags.clear();
         self.project_id = None;
         self.pending_usage.clear();
-        // Clear the provider usage so the fresh-chat instruction-file
-        // estimate re-triggers on the new (empty) session.
         self.last_usage = None;
         self.estimate_at_last_usage = 0;
+        self.current_session_persisted = false;
+        self.new_session_terminal_clear_pending = true;
+    }
 
-        // Repaint the cleared canvas on the next draw. `Terminal::clear`
-        // invalidates ratatui's buffers on success, but crossterm may fail
-        // its cursor-position probe. That UI cleanup must never abort the
-        // already-completed fresh-session state transition.
-        if let Err(error) = clear_terminal() {
-            tracing::warn!(error = %error, "terminal clear after /new failed; continuing with redraw");
+    fn commit_new_session_without_swappable_runner(&mut self) {
+        self.cancel_outgoing_turn_if_busy();
+        if self.side_conversation.is_some() {
+            self.discard_side_conversation_for_replacement(false);
         }
+        self.reset_new_session_view();
+        self.agent_runner.take();
+        self.launch.session_id = None;
+        self.launch.session_short_id = None;
+        self.foreground_input_target = None;
+        self.reset_display_attach_backoff();
+    }
 
-        Ok(true)
+    /// Commit a successful `/new` while the switch outcome still owns the
+    /// runner transition guard. Old events are drained first; only optimistic
+    /// rows created for submissions staged during the attach survive the
+    /// outgoing-view reset.
+    pub(super) fn commit_new_session_switch_outcome(
+        &mut self,
+        outcome: agent_runner::SessionSwitchOutcome,
+    ) {
+        debug_assert!(matches!(outcome.target, agent_runner::SessionTarget::New));
+        self.drain_agent_events();
+        self.cancel_older_history_page_request();
+        let staged_history = self
+            .pending_session_switch_submissions
+            .iter()
+            .flat_map(|pending| pending.optimistic_history.iter().cloned())
+            .collect::<Vec<_>>();
+        let staged_queue = self
+            .pending_session_switch_submissions
+            .iter()
+            .filter_map(|pending| pending.optimistic_queue_item.clone())
+            .collect::<Vec<_>>();
+        let owns_working_span = self
+            .pending_session_switch_submissions
+            .iter()
+            .any(|pending| pending.owns_working_span);
+
+        self.reset_new_session_view();
+        self.history.extend(staged_history);
+        self.queue.extend(staged_queue);
+        self.adopt_session_switch_identity(&outcome);
+        self.current_session_persisted = false;
+        if self.side_conversation.is_some() {
+            self.discard_side_conversation_for_replacement(false);
+        }
+        if owns_working_span {
+            self.begin_working_span();
+        }
     }
 
     pub(super) fn apply_session_switch_outcome(
@@ -154,23 +248,28 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         current_session_persisted: bool,
     ) {
+        self.drain_agent_events();
         self.cancel_older_history_page_request();
+        self.adopt_session_switch_identity(&outcome);
+        self.current_session_persisted = current_session_persisted;
+    }
+
+    /// Adopt the daemon's completed attach as one ordered identity change.
+    /// App's old-epoch controls/config/model state must be cancelled before
+    /// AgentRunner publishes the new submission binding. The outcome retains
+    /// its transition guard for this entire synchronous adoption.
+    fn adopt_session_switch_identity(&mut self, outcome: &agent_runner::SessionSwitchOutcome) {
+        self.start_model_state_epoch(
+            Some(outcome.session_id),
+            outcome.active_model_state.as_ref(),
+        );
         if let Some(Ok(runner)) = &mut self.agent_runner {
-            runner.apply_session_switch_outcome(&outcome);
+            runner.apply_session_switch_outcome(outcome);
         }
         self.launch.session_id = Some(outcome.session_id);
-        self.launch.session_short_id = Some(outcome.short_id);
-        self.project_id = Some(outcome.project_id);
-        self.foreground_input_target = outcome.foreground_target;
-        if let Some(state) = outcome.active_model_state {
-            self.apply_active_model_state(
-                state.selection,
-                state.default_selection,
-                state.diverged,
-                state.generation,
-            );
-        }
-        self.current_session_persisted = current_session_persisted;
+        self.launch.session_short_id = Some(outcome.short_id.clone());
+        self.project_id = Some(outcome.project_id.clone());
+        self.foreground_input_target = outcome.foreground_target.clone();
     }
 
     fn apply_session_switch_outcome_inner(
@@ -178,6 +277,7 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         resume_chrome: bool,
     ) {
+        self.drain_agent_events();
         self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })
             .then(|| wire_history_to_entries(outcome.history.clone()));
@@ -187,27 +287,32 @@ impl App {
         let btw_fork = outcome.btw_fork.clone();
         let daemon_version = outcome.daemon_version.clone();
         let daemon_compatible = outcome.daemon_compatible;
-        if let Some(Ok(runner)) = &mut self.agent_runner {
-            runner.apply_session_switch_outcome(&outcome);
-        }
         if let Some(restored) = resume_history {
+            let staged_history = self
+                .pending_session_switch_submissions
+                .iter()
+                .flat_map(|pending| pending.optimistic_history.iter().cloned())
+                .collect::<Vec<_>>();
+            let staged_queue = self
+                .pending_session_switch_submissions
+                .iter()
+                .filter_map(|pending| pending.optimistic_queue_item.clone())
+                .collect::<Vec<_>>();
+            let owns_working_span = self
+                .pending_session_switch_submissions
+                .iter()
+                .any(|pending| pending.owns_working_span);
             self.history.clear();
             self.reset_session_live_state();
             self.history.extend(restored);
+            self.history.extend(staged_history);
+            self.queue.extend(staged_queue);
+            if owns_working_span {
+                self.begin_working_span();
+            }
             self.current_session_persisted = true;
         }
-        self.launch.session_id = Some(outcome.session_id);
-        self.launch.session_short_id = Some(outcome.short_id.clone());
-        self.project_id = Some(outcome.project_id);
-        self.foreground_input_target = outcome.foreground_target;
-        if let Some(state) = outcome.active_model_state {
-            self.apply_active_model_state(
-                state.selection,
-                state.default_selection,
-                state.diverged,
-                state.generation,
-            );
-        }
+        self.adopt_session_switch_identity(&outcome);
         match outcome.target {
             agent_runner::SessionTarget::New => {
                 self.current_session_persisted = false;

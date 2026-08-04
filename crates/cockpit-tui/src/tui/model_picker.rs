@@ -356,9 +356,15 @@ impl ModelPickerDialog {
         self.error.as_deref()
     }
 
-    #[cfg(test)]
-    pub fn draft_active_model(&self) -> Option<&ActiveModelRef> {
+    pub(crate) fn draft_active_model(&self) -> Option<&ActiveModelRef> {
         self.cfg.active_model.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_model(&self, provider: &str, model: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.provider_id == provider && entry.model_id == model)
     }
 
     fn filtered_indices(&self) -> Vec<usize> {

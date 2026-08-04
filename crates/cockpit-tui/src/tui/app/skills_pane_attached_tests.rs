@@ -3,7 +3,6 @@ use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageC
 use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionResult};
 use crate::tui::skills_pane::{SkillsPaneFetchResult, SkillsPaneSource};
 use cockpit_core::daemon::proto::{Request, Response, SkillSummary};
-use cockpit_core::engine::message::UserSubmission;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,7 +56,7 @@ fn open_skills_pane_trusted(app: &mut App, tmp: &tempfile::TempDir) {
 fn runner_with_attached_request_tx(
     attached_request_tx: mpsc::Sender<AttachedRequest>,
 ) -> AgentRunner {
-    let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+    let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (control_tx, _control_rx) = mpsc::channel(1);
     AgentRunner {
@@ -73,6 +72,9 @@ fn runner_with_attached_request_tx(
         foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
         usage: UsageCounts::default(),

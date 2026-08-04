@@ -814,7 +814,9 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         job_id: None,
         preflight_cleaned: None,
         queue_item_ids: Vec::new(),
+        client_submissions: Vec::new(),
         queue_target: None,
+        pending_terminal_disposition: None,
     });
     assert!(
         crate::engine::rehydrate::heal_live_history(&mut history, &prompt).is_empty(),

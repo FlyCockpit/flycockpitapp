@@ -92,6 +92,8 @@ describe("active model state", () => {
 
   it("produces divergence view state only when the daemon reports divergence", () => {
     const diverged: ActiveModelState = {
+      selection: { provider: "openai", model: "gpt-4o" },
+      defaultSelection: { provider: "openai", model: "gpt-5" },
       provider: "openai",
       model: "gpt-4o",
       configProvider: "openai",

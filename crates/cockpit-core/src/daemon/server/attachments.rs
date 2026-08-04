@@ -18,6 +18,9 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) {
     state
         .ready_attachments
         .retain(|_, attachment| now.duration_since(attachment.created_at) <= ttl);
+    crate::sync::lock_or_recover(&state.upload_accounting)
+        .consumed_message_attachments
+        .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
 }
 
 pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
@@ -30,6 +33,42 @@ pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     crate::intel::hex_lower(&digest)
+}
+
+pub(super) fn user_message_wire_fingerprint(
+    text: &str,
+    display_text: Option<&str>,
+    tag_expansions: &[proto::TagExpansionMeta],
+    image_refs: &[proto::ImageAttachmentRef],
+    forced_skill: Option<&str>,
+) -> String {
+    fn part(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            None => part(hasher, b"none"),
+            Some(value) => {
+                part(hasher, b"some");
+                part(hasher, value.as_bytes());
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    part(&mut hasher, b"user");
+    part(&mut hasher, text.as_bytes());
+    optional_part(&mut hasher, display_text);
+    part(
+        &mut hasher,
+        &serde_json::to_vec(tag_expansions).unwrap_or_default(),
+    );
+    for image_ref in image_refs {
+        part(&mut hasher, image_ref.id.as_bytes());
+    }
+    optional_part(&mut hasher, forced_skill);
+    crate::intel::hex_lower(&hasher.finalize())
 }
 
 pub(super) async fn validate_png_attachment(
@@ -227,6 +266,7 @@ pub(super) async fn finish_attachment_upload(
     }
 }
 
+#[cfg(test)]
 pub(super) fn consume_image_refs(
     state: &mut MutableClientState,
     session_id: Uuid,
@@ -281,4 +321,141 @@ pub(super) fn consume_image_refs(
         })
         .collect();
     Ok(images)
+}
+
+/// Atomically bind a message's single-use image refs to its client UUID and
+/// return their bytes.
+///
+/// Moving ready refs into the consumed map before the first await prevents a
+/// competing UUID from racing worker acceptance or reusing a ref after an
+/// ambiguous/lost worker response. The bytes remain TTL-scoped and resolvable
+/// only by this exact UUID, so the worker can still perform its authoritative
+/// durable/in-memory fingerprint check on every retry.
+pub(super) fn claim_message_image_refs(
+    state: &mut MutableClientState,
+    session_id: Uuid,
+    client_submission_id: Uuid,
+    refs: &[proto::ImageAttachmentRef],
+) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
+    validate_image_ref_shape(refs)?;
+
+    let origin_principal = state.principal.tag();
+    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    let mut total = 0usize;
+    let mut images = Vec::with_capacity(refs.len());
+    for image_ref in refs {
+        let attachment = if let Some(attachment) = state.ready_attachments.get(&image_ref.id) {
+            attachment
+        } else if let Some(consumed) = accounting.consumed_message_attachments.get(&image_ref.id) {
+            if consumed.client_submission_id != client_submission_id
+                || consumed.origin_principal != origin_principal
+            {
+                return Err(bad_request(
+                    "unknown, expired, or already consumed image ref",
+                ));
+            }
+            &consumed.attachment
+        } else {
+            return Err(bad_request(
+                "unknown, expired, or already consumed image ref",
+            ));
+        };
+        validate_message_attachment(attachment, session_id, &mut total)?;
+        images.push(attachment.bytes.clone());
+    }
+
+    // Validation above is all-or-nothing. Move only after every ref and the
+    // aggregate size have passed, with no await between validation and bind.
+    let newly_consumed: Vec<_> = refs
+        .iter()
+        .filter(|image_ref| state.ready_attachments.contains_key(&image_ref.id))
+        .collect();
+    let newly_consumed_bytes: usize = newly_consumed
+        .iter()
+        .filter_map(|image_ref| state.ready_attachments.get(&image_ref.id))
+        .map(|attachment| attachment.bytes.len())
+        .sum();
+    if accounting.pending.len()
+        + accounting.consumed_message_attachments.len()
+        + newly_consumed.len()
+        > state.upload_limits.global_uploads
+    {
+        return Err(bad_request(format!(
+            "too many retained or pending message attachments: daemon has {} retained and {} pending, adding {} exceeds limit {}",
+            accounting.consumed_message_attachments.len(),
+            accounting.pending.len(),
+            newly_consumed.len(),
+            state.upload_limits.global_uploads
+        )));
+    }
+    let retained_bytes = accounting.consumed_bytes();
+    let pending_bytes = accounting.pending_bytes();
+    if retained_bytes
+        .saturating_add(pending_bytes)
+        .saturating_add(newly_consumed_bytes)
+        > state.upload_limits.global_bytes
+    {
+        return Err(bad_request(format!(
+            "retained and pending message attachments exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
+            retained_bytes, pending_bytes, newly_consumed_bytes, state.upload_limits.global_bytes
+        )));
+    }
+    for image_ref in refs {
+        if let Some(attachment) = state.ready_attachments.remove(&image_ref.id) {
+            accounting.consumed_message_attachments.insert(
+                image_ref.id,
+                ConsumedMessageAttachment {
+                    client_submission_id,
+                    origin_principal: origin_principal.clone(),
+                    consumed_at: Instant::now(),
+                    attachment,
+                },
+            );
+        }
+    }
+    Ok(images)
+}
+
+fn validate_image_ref_shape(
+    refs: &[proto::ImageAttachmentRef],
+) -> std::result::Result<(), ErrorPayload> {
+    if refs.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
+        return Err(bad_request(format!(
+            "too many images: {} exceeds {} image limit",
+            refs.len(),
+            proto::MAX_IMAGES_PER_USER_MESSAGE
+        )));
+    }
+    let mut seen = HashSet::new();
+    for image_ref in refs {
+        if !seen.insert(image_ref.id) {
+            return Err(bad_request("duplicate image ref in user message"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_message_attachment(
+    attachment: &ReadyAttachment,
+    session_id: Uuid,
+    total: &mut usize,
+) -> std::result::Result<(), ErrorPayload> {
+    if attachment.session_id != session_id {
+        return Err(bad_request("image ref belongs to a different session"));
+    }
+    if attachment.mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
+        return Err(bad_request("image ref has unsupported MIME"));
+    }
+    if attachment.purpose != proto::AttachmentPurpose::UserMessageImage {
+        return Err(bad_request("image ref has unsupported purpose"));
+    }
+    *total += attachment.bytes.len();
+    if *total > proto::MAX_TOTAL_IMAGE_BYTES {
+        return Err(bad_request(format!(
+            "total image data is too large: {} bytes exceeds {} byte limit",
+            *total,
+            proto::MAX_TOTAL_IMAGE_BYTES
+        )));
+    }
+    Ok(())
 }

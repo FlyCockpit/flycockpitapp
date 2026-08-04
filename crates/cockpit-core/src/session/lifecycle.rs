@@ -245,19 +245,26 @@ impl Session {
             }
         };
         let model_selection = match row.model_selection_json.as_deref() {
-            Some(raw) => Some(
-                serde_json::from_str(raw).context("decoding persisted session model selection")?,
-            ),
-            None => match (row.provider.as_ref(), row.model.as_ref()) {
-                (Some(provider), Some(model)) => Some(crate::config::providers::ActiveModelRef {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    reasoning_effort: None,
-                    thinking_mode: None,
-                    prompt_cache_retention: None,
-                }),
-                _ => None,
-            },
+            Some(raw) => {
+                let selection =
+                    serde_json::from_str::<crate::config::providers::ActiveModelRef>(raw)
+                        .context("decoding persisted session model selection")?;
+                if row.provider.as_deref() != Some(selection.provider.as_str())
+                    || row.model.as_deref() != Some(selection.model.as_str())
+                {
+                    anyhow::bail!(
+                        "persisted session model projections disagree with model_selection_json"
+                    );
+                }
+                Some(selection)
+            }
+            None => {
+                anyhow::ensure!(
+                    row.provider.is_none() && row.model.is_none(),
+                    "persisted session model projections require model_selection_json"
+                );
+                None
+            }
         };
         Ok(Self {
             id: row.session_id,

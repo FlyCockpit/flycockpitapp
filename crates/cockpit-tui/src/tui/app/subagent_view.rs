@@ -360,6 +360,7 @@ impl App {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         });

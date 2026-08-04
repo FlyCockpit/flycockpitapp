@@ -84,6 +84,11 @@ pub enum HistoryEntry {
         /// `UserMessageRecorded` event stamps it (the row is pushed
         /// optimistically on submit, before the timeline write completes).
         seq: Option<i64>,
+        /// Client-local identity assigned while this row is optimistic.
+        /// Persisted/replayed rows have `None`. The id survives a transactional
+        /// `/new` replay and correlates client-side dispatch failures without
+        /// guessing from text or transcript position.
+        optimistic_submission_id: Option<uuid::Uuid>,
         /// Request preflight (implementation note) is
         /// running for this optimistically-shown row: the top-border slot hosts
         /// the animated `Preflight…` indicator (reusing the busy/Thinking

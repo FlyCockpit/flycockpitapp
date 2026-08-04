@@ -87,6 +87,27 @@ async fn get_test_session(db: &crate::db::Db, session_id: Uuid) -> SessionRow {
         .unwrap()
 }
 
+async fn set_test_session_active_model(
+    db: &Db,
+    session_id: Uuid,
+    selection: &crate::config::providers::ActiveModelRef,
+) {
+    let provider = selection.provider.clone();
+    let model = selection.model.clone();
+    let selection_json = serde_json::to_string(selection).unwrap();
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE sessions
+                SET provider = ?1, model = ?2, model_selection_json = ?3
+              WHERE session_id = ?4",
+            rusqlite::params![provider, model, selection_json, session_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 /// Read a named file out of a zip byte buffer.
 fn read_zip_entry(bytes: &[u8], name: &str) -> Option<String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).unwrap();
@@ -2602,10 +2623,10 @@ async fn export_older_events_without_new_fields_still_parse() {
         bash["data"].get("exit_code").is_none(),
         "older export carries no exit_code key"
     );
-    // Schema is still /1 — no version bump for the additive change.
+    // The pre-release export contract is the intentional breaking /2 shape.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/1");
+    assert_eq!(manifest["schema"], "cockpit-session-export/2");
 }
 
 #[tokio::test]
@@ -2686,11 +2707,191 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     // Manifest round-trips and lists the session.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bytes, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/1");
+    assert_eq!(manifest["schema"], "cockpit-session-export/2");
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],
         json!(target.short_id.clone().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn bundle_export_reloads_a_stale_caller_target_inside_its_snapshot() {
+    let db = Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", "/proj", "builder").await;
+    let before = manifest_active_model("provider-before", "model-before");
+    set_test_session_active_model(&db, session.session_id, &before).await;
+    let stale_target = get_test_session(&db, session.session_id).await;
+
+    let after = manifest_active_model("provider-after", "model-after");
+    set_test_session_active_model(&db, session.session_id, &after).await;
+
+    let bundle = build_bundle_zip_bytes(&db, &stale_target, false, true)
+        .await
+        .expect("export reloads its target by session id");
+    let manifest: Value =
+        serde_json::from_str(&read_zip_entry(&bundle.bytes, "manifest.json").unwrap()).unwrap();
+    let expected = serde_json::to_value(&after).unwrap();
+    assert_eq!(manifest["target"]["active_model"], expected);
+    assert_eq!(manifest["sessions"][0]["active_model"], expected);
+}
+
+/// Bundle discovery and the later event/manifest queries must share one WAL
+/// read snapshot. The independent writer commits an active-model update and a
+/// pair of events only after discovery has completed; an export assembled
+/// from separate implicit transactions would expose some or all of that new
+/// state alongside the old bundle rows.
+#[tokio::test]
+async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("snapshot.db");
+    let db = Db::open(&db_path).unwrap();
+    let session = create_test_session(
+        &db,
+        "p",
+        tmp.path().to_str().expect("temporary path is UTF-8"),
+        "builder",
+    )
+    .await;
+    let session_id = session.session_id;
+    let before = manifest_active_model("provider-before", "model-before");
+    set_test_session_active_model(&db, session_id, &before).await;
+    db.insert_session_event(
+        session_id,
+        SessionEventKind::Notice,
+        Some("builder"),
+        None,
+        &json!({"text": "before-snapshot"}),
+    )
+    .await
+    .unwrap();
+
+    // Open the second connection before the export transaction so connection
+    // setup/migrations are outside the synchronization window.
+    let writer_db = Db::open(&db_path).unwrap();
+    let after = manifest_active_model("provider-after", "model-after");
+    let after_provider = after.provider.clone();
+    let after_model = after.model.clone();
+    let after_json = serde_json::to_string(&after).unwrap();
+    let (start_writer_tx, start_writer_rx) = std::sync::mpsc::sync_channel(0);
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(0);
+    let writer = std::thread::spawn(move || {
+        start_writer_rx
+            .recv()
+            .expect("export should release the coordinated writer");
+        let result = writer_db
+            .blocking_for_sync_cli(move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE sessions
+                        SET provider = ?1, model = ?2, model_selection_json = ?3
+                      WHERE session_id = ?4",
+                    rusqlite::params![
+                        after_provider,
+                        after_model,
+                        after_json,
+                        session_id.to_string(),
+                    ],
+                )?;
+                for text in ["after-snapshot-one", "after-snapshot-two"] {
+                    Db::insert_session_event_json_conn(
+                        &tx,
+                        session_id,
+                        SessionEventKind::Notice,
+                        Some("writer"),
+                        None,
+                        Default::default(),
+                        2,
+                        &serde_json::to_string(&json!({"text": text}))?,
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .map_err(|error| format!("{error:#}"));
+        writer_done_tx
+            .send(result)
+            .expect("export should await the coordinated writer result");
+    });
+
+    let db_for_files = db.clone();
+    let exported = db
+        .read(move |conn| {
+            assemble_bundle_snapshot_conn_with_after_collect(
+                &db_for_files,
+                conn,
+                session_id,
+                ExportBundleOptions {
+                    include_generated_artifacts: false,
+                    include_sensitive: true,
+                },
+                &test_export_env(),
+                move || {
+                    start_writer_tx
+                        .send(())
+                        .context("releasing coordinated export writer")?;
+                    writer_done_rx
+                        .recv()
+                        .context("receiving coordinated export writer result")?
+                        .map_err(anyhow::Error::msg)
+                },
+            )
+        })
+        .await
+        .expect("snapshot export succeeds while an independent WAL writer commits");
+    writer.join().expect("coordinated writer thread joins");
+
+    let manifest: Value =
+        serde_json::from_str(&read_zip_entry(&exported.bytes, "manifest.json").unwrap()).unwrap();
+    let before_json = serde_json::to_value(&before).unwrap();
+    assert_eq!(manifest["target"]["active_model"], before_json);
+    let exported_session = manifest["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == session_id.to_string())
+        .expect("target appears in sessions");
+    assert_eq!(exported_session["active_model"], before_json);
+    assert_eq!(
+        manifest["target"]["active_model"], exported_session["active_model"],
+        "the complete ActiveModelRef must come from the same snapshot"
+    );
+
+    let events: Vec<Value> =
+        serde_json::from_str(&read_zip_entry(&exported.bytes, "events.json").unwrap()).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["text"] == "before-snapshot"),
+        "the pre-snapshot event is exported"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event["data"]["text"] != "after-snapshot-one"
+                && event["data"]["text"] != "after-snapshot-two"
+        }),
+        "neither half of the writer's post-snapshot event pair may leak into the archive"
+    );
+
+    let live_target = get_test_session(&db, session_id).await;
+    assert_eq!(
+        session_active_model(&live_target).unwrap(),
+        Some(after.clone()),
+        "the independent writer committed after the export snapshot began"
+    );
+    let live_events = db.list_session_events(session_id).await.unwrap();
+    assert_eq!(
+        live_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.data.get("text").and_then(Value::as_str),
+                    Some("after-snapshot-one" | "after-snapshot-two")
+                )
+            })
+            .count(),
+        2,
+        "both post-snapshot events committed atomically"
     );
 }
 
@@ -3323,16 +3524,28 @@ async fn manifest_has_version_and_session_date() {
     assert_eq!(manifest["include_generated_artifacts"], true);
 }
 
-fn write_manifest_active_model_config(root: &Path, provider: &str, model: &str) {
+fn manifest_active_model(provider: &str, model: &str) -> crate::config::providers::ActiveModelRef {
+    crate::config::providers::ActiveModelRef {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+            value: "high".to_string(),
+        }),
+        thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+        prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+    }
+}
+
+fn write_manifest_active_model_config(
+    root: &Path,
+    active_model: &crate::config::providers::ActiveModelRef,
+) {
     let config_dir = root.join(".cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.json"),
         serde_json::to_string(&json!({
-            "active_model": {
-                "provider": provider,
-                "model": model,
-            },
+            "active_model": active_model,
         }))
         .unwrap(),
     )
@@ -3358,10 +3571,11 @@ async fn build_zip_with_config_override(
 #[tokio::test]
 async fn export_manifest_includes_session_and_config_active_model() {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_manifest_active_model_config(tmp.path(), "provider-a", "model-a");
+    let active_model = manifest_active_model("provider-a", "model-a");
+    write_manifest_active_model_config(tmp.path(), &active_model);
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-    session.set_active_model("provider-a", "model-a").unwrap();
+    session.set_active_model_ref(active_model.clone()).unwrap();
 
     let target = get_test_session(&db, session.id).await;
     let bundle = collect_bundle(&db, session.id).await.unwrap();
@@ -3376,23 +3590,35 @@ async fn export_manifest_includes_session_and_config_active_model() {
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
     assert_eq!(
-        manifest["target"]["session_model"],
-        json!({"provider": "provider-a", "model": "model-a"})
+        manifest["target"]["active_model"],
+        serde_json::to_value(&active_model).unwrap()
     );
     assert_eq!(
         manifest["target"]["config_active_model"],
-        json!({"provider": "provider-a", "model": "model-a"})
+        serde_json::to_value(&active_model).unwrap()
     );
+    assert_eq!(
+        manifest["sessions"][0]["active_model"],
+        serde_json::to_value(&active_model).unwrap()
+    );
+    assert!(manifest["target"].get("provider").is_none());
+    assert!(manifest["target"].get("model").is_none());
+    assert!(manifest["target"].get("session_model").is_none());
     assert_eq!(manifest["target"]["active_model_diverged"], false);
 }
 
 #[tokio::test]
 async fn export_manifest_flags_active_model_divergence() {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_manifest_active_model_config(tmp.path(), "provider-b", "model-b");
+    let session_active_model = manifest_active_model("provider-a", "model-a");
+    let mut config_active_model = session_active_model.clone();
+    config_active_model.thinking_mode = Some(crate::config::providers::ThinkingMode::Low);
+    write_manifest_active_model_config(tmp.path(), &config_active_model);
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-    session.set_active_model("provider-a", "model-a").unwrap();
+    session
+        .set_active_model_ref(session_active_model.clone())
+        .unwrap();
 
     let target = get_test_session(&db, session.id).await;
     let bundle = collect_bundle(&db, session.id).await.unwrap();
@@ -3407,22 +3633,23 @@ async fn export_manifest_flags_active_model_divergence() {
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
     assert_eq!(
-        manifest["target"]["session_model"],
-        json!({"provider": "provider-a", "model": "model-a"})
+        manifest["target"]["active_model"],
+        serde_json::to_value(&session_active_model).unwrap()
     );
     assert_eq!(
         manifest["target"]["config_active_model"],
-        json!({"provider": "provider-b", "model": "model-b"})
+        serde_json::to_value(&config_active_model).unwrap()
     );
     assert_eq!(manifest["target"]["active_model_diverged"], true);
 }
 
 #[tokio::test]
-async fn export_manifest_active_model_without_config_is_null() {
+async fn export_manifest_active_model_without_config_is_divergent() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-    session.set_active_model("provider-a", "model-a").unwrap();
+    let active_model = manifest_active_model("provider-a", "model-a");
+    session.set_active_model_ref(active_model.clone()).unwrap();
 
     let target = get_test_session(&db, session.id).await;
     let bundle = collect_bundle(&db, session.id).await.unwrap();
@@ -3437,11 +3664,47 @@ async fn export_manifest_active_model_without_config_is_null() {
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
 
     assert_eq!(
-        manifest["target"]["session_model"],
-        json!({"provider": "provider-a", "model": "model-a"})
+        manifest["target"]["active_model"],
+        serde_json::to_value(active_model).unwrap()
     );
     assert!(manifest["target"]["config_active_model"].is_null());
-    assert_eq!(manifest["target"]["active_model_diverged"], false);
+    assert_eq!(manifest["target"]["active_model_diverged"], true);
+}
+
+#[tokio::test]
+async fn export_rejects_provider_model_only_session_rows() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session_id = session.id;
+    session.persist_if_needed().unwrap();
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE sessions SET provider = ?1, model = ?2, model_selection_json = NULL WHERE session_id = ?3",
+            rusqlite::params!["legacy-provider", "legacy-model", session_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let target = get_test_session(&db, session_id).await;
+    let bundle = collect_bundle(&db, session_id).await.unwrap();
+    let mut env = test_export_env();
+    env.insert(
+        crate::config::dirs::COCKPIT_CONFIG_ENV.to_string(),
+        tmp.path()
+            .join(".cockpit/missing-config.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let error =
+        trusted_build_zip_with_options(&db, &target, &bundle, ExportBundleOptions::default(), &env)
+            .await
+            .unwrap_err();
+
+    let error = format!("{error:#}");
+    assert!(error.contains("require model_selection_json"), "{error}");
 }
 
 /// The `config/` folder holds the deep-merged effective config plus raw

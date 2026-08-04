@@ -426,5 +426,39 @@
     "kind": "res",
     "response": "subagent_history_page",
     "v": 6
+  },
+  "user_message_queued": {
+    "data": {
+      "item": {
+        "display_text": "queued @src/lib.rs",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "queued",
+        "target": {
+          "agent": "Build",
+          "depth": 1,
+          "id": "root",
+          "task_call_id": "task-parent"
+        },
+        "text": "queued text"
+      },
+      "queue": [
+        {
+          "display_text": "queued @src/lib.rs",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "status": "queued",
+          "target": {
+            "agent": "Build",
+            "depth": 1,
+            "id": "root",
+            "task_call_id": "task-parent"
+          },
+          "text": "queued text"
+        }
+      ]
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "user_message_queued",
+    "v": 6
   }
 }

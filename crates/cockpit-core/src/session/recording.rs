@@ -551,6 +551,28 @@ impl Session {
             .await
     }
 
+    pub async fn record_terminal_client_submissions(
+        &self,
+        receipts: &[crate::engine::message::ClientSubmissionReceipt],
+        disposition: crate::db::session_log::ClientSubmissionTerminalDisposition,
+    ) -> Result<()> {
+        let receipts = receipts
+            .iter()
+            .map(
+                |receipt| crate::db::session_log::ClientSubmissionTerminalReceipt {
+                    client_submission_id: receipt.id,
+                    fingerprint: receipt.fingerprint.clone(),
+                    wire_fingerprint: receipt.wire_fingerprint.clone(),
+                    origin_principal: receipt.origin_principal.clone(),
+                    disposition,
+                },
+            )
+            .collect();
+        self.db
+            .insert_client_submission_terminal_receipts(self.id, receipts)
+            .await
+    }
+
     async fn record_event_with_origin_and_frame(
         &self,
         kind: crate::db::session_log::SessionEventKind,

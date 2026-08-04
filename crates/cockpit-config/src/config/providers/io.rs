@@ -1,11 +1,65 @@
 use super::*;
 
+/// How an atomic active-model mutation should treat an existing effective
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveModelWriteMode {
+    /// Replace the effective default, even when one already exists.
+    Replace,
+    /// Write only when the effective layered config has no default.
+    InitializeIfMissing,
+}
+
+/// Result of an atomic active-model mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveModelWriteResult {
+    /// The effective default after the locked mutation completes.
+    pub authoritative_selection: Option<ActiveModelRef>,
+    /// Whether this caller wrote the concrete config layer.
+    pub wrote: bool,
+}
+
+/// A fully prepared active-model default mutation.
+///
+/// The cross-process config lock is already held, the effective layered
+/// default has been resolved, and any replacement bytes have been written and
+/// synced to a private temporary file. [`Self::commit`] performs only the
+/// final atomic replacement while retaining that lock. Dropping an uncommitted
+/// plan removes its temporary file and leaves config unchanged.
+pub struct PreparedActiveModelWrite {
+    _lock: ConfigMutationLock,
+    pending_write: Option<PreparedAtomicWrite>,
+    authoritative_selection_before_commit: Option<ActiveModelRef>,
+    result: ActiveModelWriteResult,
+}
+
+impl PreparedActiveModelWrite {
+    /// The effective default while the mutation lock was acquired, before a
+    /// pending replacement is committed.
+    pub fn authoritative_selection_before_commit(&self) -> Option<&ActiveModelRef> {
+        self.authoritative_selection_before_commit.as_ref()
+    }
+
+    /// The effective default after a successful commit.
+    pub fn authoritative_selection(&self) -> Option<&ActiveModelRef> {
+        self.result.authoritative_selection.as_ref()
+    }
+
+    pub fn commit(mut self) -> Result<ActiveModelWriteResult> {
+        if let Some(write) = self.pending_write.take() {
+            write.commit()?;
+        }
+        Ok(self.result)
+    }
+}
+
 /// Read+write a provider config layer while preserving fields cockpit
 /// doesn't model. Global provider metadata lives in `config.json`; provider
 /// entries live in sibling `providers/*.json` files.
 pub struct ConfigDoc {
     pub path: PathBuf,
     pub(crate) raw: Value,
+    pub(crate) originally_loaded_providers: BTreeMap<String, ProviderEntry>,
 }
 
 thread_local! {
@@ -57,6 +111,7 @@ impl ConfigDoc {
         Self {
             path: PathBuf::new(),
             raw: merged,
+            originally_loaded_providers: BTreeMap::new(),
         }
         .providers()
     }
@@ -81,7 +136,13 @@ impl ConfigDoc {
                 anyhow::bail!("expected config.json root to be an object, found {other:?}")
             }
         };
-        Ok(Self { path, raw })
+        let mut providers = ProvidersConfig::default();
+        load_provider_files_into_config(&path, &mut providers);
+        Ok(Self {
+            path,
+            raw,
+            originally_loaded_providers: providers.providers,
+        })
     }
 
     /// Extract the typed view of layer-wide provider metadata plus provider
@@ -114,7 +175,7 @@ impl ConfigDoc {
             cfg.category_defaults = parsed;
         }
         if !self.path.as_os_str().is_empty() {
-            load_provider_files_into_config(&self.path, &mut cfg);
+            cfg.providers.clone_from(&self.originally_loaded_providers);
         } else if let Some(map) = self.raw.get("providers").and_then(Value::as_object) {
             for (id, v) in map {
                 if let Some(obj) = v.as_object()
@@ -143,50 +204,153 @@ impl ConfigDoc {
 
     /// Replace the typed provider layer and persist to disk.
     pub fn write(&mut self, cfg: &ProvidersConfig) -> Result<()> {
+        let originally_loaded = self.providers();
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        current.set_layer_metadata_raw(
+            cfg,
+            originally_loaded.on_unlisted_models_fetch != cfg.on_unlisted_models_fetch,
+            originally_loaded.active_model != cfg.active_model,
+            originally_loaded.category_defaults != cfg.category_defaults,
+        )?;
+        current.persist_raw_unlocked()?;
+        current.merge_provider_files_unlocked(&self.originally_loaded_providers, &cfg.providers)?;
+        self.refresh_from_disk_unlocked()
+    }
+
+    fn set_layer_metadata_raw(
+        &mut self,
+        cfg: &ProvidersConfig,
+        replace_unlisted_policy: bool,
+        replace_active_model: bool,
+        replace_category_defaults: bool,
+    ) -> Result<()> {
         let obj = self.raw.as_object_mut().expect("root is an object");
         obj.remove("providers");
-        match cfg.on_unlisted_models_fetch {
-            Some(v) => {
-                let s = serde_json::to_value(v).context("serializing on_unlisted_models_fetch")?;
-                obj.insert("on_unlisted_models_fetch".to_string(), s);
-            }
-            None => {
-                obj.remove("on_unlisted_models_fetch");
-            }
-        }
-        match &cfg.active_model {
-            Some(active) => {
-                let s = serde_json::to_value(active).context("serializing active_model")?;
-                obj.insert("active_model".to_string(), s);
-            }
-            None => {
-                obj.remove("active_model");
+        if replace_unlisted_policy {
+            match cfg.on_unlisted_models_fetch {
+                Some(v) => {
+                    let s =
+                        serde_json::to_value(v).context("serializing on_unlisted_models_fetch")?;
+                    obj.insert("on_unlisted_models_fetch".to_string(), s);
+                }
+                None => {
+                    obj.remove("on_unlisted_models_fetch");
+                }
             }
         }
-        if cfg.category_defaults.is_empty() {
-            obj.remove("category_defaults");
-        } else {
-            let value = serde_json::to_value(&cfg.category_defaults)
-                .context("serializing category_defaults")?;
-            obj.insert("category_defaults".to_string(), value);
+        if replace_active_model {
+            match serialize_active_model(cfg.active_model.as_ref())? {
+                Some(active) => {
+                    obj.insert("active_model".to_string(), active);
+                }
+                None => {
+                    obj.remove("active_model");
+                }
+            }
         }
-        self.persist_raw()?;
-        self.replace_provider_files(&cfg.providers)?;
+        if replace_category_defaults {
+            if cfg.category_defaults.is_empty() {
+                obj.remove("category_defaults");
+            } else {
+                let value = serde_json::to_value(&cfg.category_defaults)
+                    .context("serializing category_defaults")?;
+                obj.insert("category_defaults".to_string(), value);
+            }
+        }
         Ok(())
     }
 
     pub fn write_active_model(&mut self, active: Option<&ActiveModelRef>) -> Result<()> {
-        let obj = self.raw.as_object_mut().expect("root is an object");
-        match active {
-            Some(active) => {
-                let value = serde_json::to_value(active).context("serializing active_model")?;
-                obj.insert("active_model".to_string(), value);
-            }
-            None => {
-                obj.remove("active_model");
-            }
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        current.set_active_model_raw(active)?;
+        current.persist_raw_unlocked()?;
+        self.refresh_from_disk_unlocked()
+    }
+
+    /// Atomically reload the effective layered config, decide whether to
+    /// initialize or replace its default, and persist the concrete write
+    /// target. The OS lock spans the complete reload/check/write sequence and
+    /// is shared by independent cockpit processes.
+    pub fn write_effective_active_model_atomically(
+        cwd: &Path,
+        write_target: &Path,
+        requested: &ActiveModelRef,
+        mode: ActiveModelWriteMode,
+    ) -> Result<ActiveModelWriteResult> {
+        Self::prepare_effective_active_model_write(cwd, write_target, requested, mode)?.commit()
+    }
+
+    /// Prepare the complete blocking portion of an effective-default write
+    /// while holding the shared cross-process mutation lock. Callers with a
+    /// deadline can run this in a blocking task before claiming terminal
+    /// ownership, then call [`PreparedActiveModelWrite::commit`] only after
+    /// the surrounding session transaction is ready to commit.
+    pub fn prepare_effective_active_model_write(
+        cwd: &Path,
+        write_target: &Path,
+        requested: &ActiveModelRef,
+        mode: ActiveModelWriteMode,
+    ) -> Result<PreparedActiveModelWrite> {
+        let write_target = config_path_for_layer_path(write_target);
+        let lock = ConfigMutationLock::acquire(&write_target)?;
+        Self::prepare_effective_active_model_write_locked(cwd, write_target, requested, mode, lock)
+    }
+
+    /// Like [`Self::prepare_effective_active_model_write`], but abandons a
+    /// contended cross-process lock when `cancelled` becomes true. The caller
+    /// must still join the blocking task after cancellation; this method
+    /// guarantees that join does not wait for the current lock owner.
+    pub fn prepare_effective_active_model_write_cancellable(
+        cwd: &Path,
+        write_target: &Path,
+        requested: &ActiveModelRef,
+        mode: ActiveModelWriteMode,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<PreparedActiveModelWrite> {
+        let write_target = config_path_for_layer_path(write_target);
+        let lock = ConfigMutationLock::acquire_cancellable(&write_target, cancelled)?;
+        Self::prepare_effective_active_model_write_locked(cwd, write_target, requested, mode, lock)
+    }
+
+    fn prepare_effective_active_model_write_locked(
+        cwd: &Path,
+        write_target: PathBuf,
+        requested: &ActiveModelRef,
+        mode: ActiveModelWriteMode,
+        lock: ConfigMutationLock,
+    ) -> Result<PreparedActiveModelWrite> {
+        let current = Self::load_effective(cwd).active_model;
+        let should_write = match mode {
+            ActiveModelWriteMode::Replace => current.as_ref() != Some(requested),
+            ActiveModelWriteMode::InitializeIfMissing => current.is_none(),
+        };
+        if !should_write {
+            return Ok(PreparedActiveModelWrite {
+                _lock: lock,
+                pending_write: None,
+                authoritative_selection_before_commit: current.clone(),
+                result: ActiveModelWriteResult {
+                    authoritative_selection: current,
+                    wrote: false,
+                },
+            });
         }
-        self.persist_raw()
+
+        let mut doc = Self::load(&write_target)?;
+        doc.set_active_model_raw(Some(requested))?;
+        let pretty = serde_json::to_string_pretty(&doc.raw).context("serializing config.json")?;
+        let pending_write = prepare_atomic_write(&write_target, format!("{pretty}\n").as_bytes())?;
+        Ok(PreparedActiveModelWrite {
+            _lock: lock,
+            pending_write: Some(pending_write),
+            authoritative_selection_before_commit: current,
+            result: ActiveModelWriteResult {
+                authoritative_selection: Some(requested.clone()),
+                wrote: true,
+            },
+        })
     }
 
     pub fn write_provider_models(
@@ -197,6 +361,7 @@ impl ConfigDoc {
         model_catalog: ProviderModelCatalog,
         last_model_fetch: Option<ModelFetchStatus>,
     ) -> Result<()> {
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         provider.insert(
             "models".to_string(),
@@ -232,14 +397,17 @@ impl ConfigDoc {
                 provider.remove("last_model_fetch");
             }
         }
-        self.persist_provider_raw(provider_id, provider)
+        self.persist_provider_raw_unlocked(provider_id, provider)?;
+        self.refresh_from_disk_unlocked()
     }
 
     pub fn write_unlisted_models_policy(
         &mut self,
         on_unlisted_models_fetch: Option<OnUnlistedModelsFetch>,
     ) -> Result<()> {
-        let obj = self.raw.as_object_mut().expect("root is an object");
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        let obj = current.raw.as_object_mut().expect("root is an object");
         match on_unlisted_models_fetch {
             Some(v) => {
                 let value =
@@ -250,7 +418,8 @@ impl ConfigDoc {
                 obj.remove("on_unlisted_models_fetch");
             }
         }
-        self.persist_raw()
+        current.persist_raw_unlocked()?;
+        self.refresh_from_disk_unlocked()
     }
 
     pub fn write_model_favorite(
@@ -259,6 +428,7 @@ impl ConfigDoc {
         model_id: &str,
         favorite: bool,
     ) -> Result<()> {
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         let models = provider
             .entry("models".to_string())
@@ -284,7 +454,8 @@ impl ConfigDoc {
             model.insert("favorite".to_string(), Value::Bool(favorite));
             models.push(Value::Object(model));
         }
-        self.persist_provider_raw(provider_id, provider)
+        self.persist_provider_raw_unlocked(provider_id, provider)?;
+        self.refresh_from_disk_unlocked()
     }
 
     pub fn write_model_wizard_fields(
@@ -292,6 +463,7 @@ impl ConfigDoc {
         provider_id: &str,
         model: &ModelEntry,
     ) -> Result<()> {
+        let _lock = ConfigMutationLock::acquire(&self.path)?;
         let mut provider = self.provider_raw_object(provider_id)?;
         let models = provider
             .entry("models".to_string())
@@ -330,15 +502,27 @@ impl ConfigDoc {
             }
             models.push(Value::Object(model_obj));
         }
-        self.persist_provider_raw(provider_id, provider)
+        self.persist_provider_raw_unlocked(provider_id, provider)?;
+        self.refresh_from_disk_unlocked()
     }
 
-    fn persist_raw(&self) -> Result<()> {
+    fn persist_raw_unlocked(&self) -> Result<()> {
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         atomic_write(&self.path, format!("{pretty}\n").as_bytes())?;
+        Ok(())
+    }
+
+    fn set_active_model_raw(&mut self, active: Option<&ActiveModelRef>) -> Result<()> {
+        let obj = self.raw.as_object_mut().expect("root is an object");
+        match active {
+            Some(active) => {
+                let value = serde_json::to_value(active).context("serializing active_model")?;
+                obj.insert("active_model".to_string(), value);
+            }
+            None => {
+                obj.remove("active_model");
+            }
+        }
         Ok(())
     }
 
@@ -365,101 +549,196 @@ impl ConfigDoc {
         Ok(Map::new())
     }
 
-    fn persist_provider_raw(&self, provider_id: &str, provider: Map<String, Value>) -> Result<()> {
+    fn persist_provider_raw_unlocked(
+        &self,
+        provider_id: &str,
+        provider: Map<String, Value>,
+    ) -> Result<()> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let pretty = serde_json::to_string_pretty(&Value::Object(provider))
             .context("serializing provider")?;
         atomic_write(&path, format!("{pretty}\n").as_bytes())?;
         Ok(())
     }
 
-    fn replace_provider_files(&self, providers: &BTreeMap<String, ProviderEntry>) -> Result<()> {
-        let dir = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(PROVIDERS_DIR);
-        if dir.exists() {
-            for entry in std::fs::read_dir(&dir)
-                .with_context(|| format!("reading providers directory {}", dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                let Some(id) = provider_id_from_file_name(&path) else {
-                    continue;
-                };
-                if !providers.contains_key(&id) {
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            return Err(e).with_context(|| format!("removing {}", path.display()));
+    fn merge_provider_files_unlocked(
+        &self,
+        originally_loaded: &BTreeMap<String, ProviderEntry>,
+        requested: &BTreeMap<String, ProviderEntry>,
+    ) -> Result<()> {
+        for id in originally_loaded.keys() {
+            if requested.contains_key(id) {
+                continue;
+            }
+            let path = provider_file_path_for_config(&self.path, id)?;
+            remove_file_nofollow(&path)
+                .with_context(|| format!("removing provider config {}", path.display()))?;
+        }
+
+        for (id, requested_entry) in requested {
+            validate_provider_id_for_filename(id)?;
+            let original_entry = originally_loaded.get(id);
+            let requested_raw = serialize_json_object(requested_entry, "provider")?;
+            let original_raw = original_entry
+                .map(|entry| serialize_json_object(entry, "provider"))
+                .transpose()?;
+            if original_raw.as_ref() == Some(&requested_raw) {
+                continue;
+            }
+
+            let provider_path = provider_file_path_for_config(&self.path, id)?;
+            let provider_exists = provider_path.exists();
+            let mut raw = self.provider_raw_object(id)?;
+            match original_entry {
+                Some(_) if provider_exists => {
+                    merge_changed_provider_fields(
+                        &mut raw,
+                        original_raw.as_ref().expect("serialized original provider"),
+                        &requested_raw,
+                    );
+                }
+                Some(_) => {
+                    raw = requested_raw;
+                }
+                None => {
+                    for key in PROVIDER_SKIPPED_KEYS {
+                        if !requested_raw.contains_key(*key) {
+                            raw.remove(*key);
                         }
+                    }
+                    for (key, value) in requested_raw {
+                        raw.insert(key, value);
                     }
                 }
             }
+            self.persist_provider_raw_unlocked(id, raw)?;
         }
-        for (id, entry) in providers {
-            validate_provider_id_for_filename(id)?;
-            let mut raw = self.provider_raw_object(id)?;
-            let serialized = serde_json::to_value(entry).context("serializing provider")?;
-            let Value::Object(serialized) = serialized else {
-                unreachable!("ProviderEntry serializes to object");
-            };
-            for key in PROVIDER_SKIPPED_KEYS {
-                if !serialized.contains_key(*key) {
-                    raw.remove(*key);
-                }
-            }
-            for (key, value) in serialized {
-                raw.insert(key, value);
-            }
-            self.persist_provider_raw(id, raw)?;
-        }
+        Ok(())
+    }
+
+    fn refresh_from_disk_unlocked(&mut self) -> Result<()> {
+        let refreshed = Self::load(&self.path)?;
+        self.raw = refreshed.raw;
+        self.originally_loaded_providers = refreshed.originally_loaded_providers;
         Ok(())
     }
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let tmp_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
-    let mut tmp = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .with_context(|| format!("creating temporary file {}", tmp_path.display()))?;
-    std::io::Write::write_all(&mut tmp, contents)
-        .with_context(|| format!("writing temporary file {}", tmp_path.display()))?;
-    tmp.sync_all()
-        .with_context(|| format!("syncing temporary file {}", tmp_path.display()))?;
-    drop(tmp);
-    if let Err(error) = std::fs::rename(&tmp_path, path) {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("removing old {}", path.display()))?;
-                std::fs::rename(&tmp_path, path)
-                    .with_context(|| format!("replacing {}", path.display()))?;
-                return Ok(());
+fn serialize_active_model(active: Option<&ActiveModelRef>) -> Result<Option<Value>> {
+    active
+        .map(|active| serde_json::to_value(active).context("serializing active_model"))
+        .transpose()
+}
+
+fn serialize_json_object<T: Serialize>(value: &T, label: &str) -> Result<Map<String, Value>> {
+    let serialized = serde_json::to_value(value).with_context(|| format!("serializing {label}"))?;
+    let Value::Object(serialized) = serialized else {
+        unreachable!("{label} serializes to an object");
+    };
+    Ok(serialized)
+}
+
+fn merge_changed_provider_fields(
+    current: &mut Map<String, Value>,
+    original: &Map<String, Value>,
+    requested: &Map<String, Value>,
+) {
+    apply_changed_object_fields(current, original, requested, Some("models"));
+    merge_changed_models(current, original.get("models"), requested.get("models"));
+}
+
+fn apply_changed_object_fields(
+    current: &mut Map<String, Value>,
+    original: &Map<String, Value>,
+    requested: &Map<String, Value>,
+    excluded_key: Option<&str>,
+) {
+    let keys = original
+        .keys()
+        .chain(requested.keys())
+        .filter(|key| excluded_key != Some(key.as_str()))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in keys {
+        if original.get(&key) == requested.get(&key) {
+            continue;
+        }
+        match requested.get(&key) {
+            Some(value) => {
+                current.insert(key, value.clone());
+            }
+            None => {
+                current.remove(&key);
             }
         }
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error).with_context(|| format!("replacing {}", path.display()));
     }
-    let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
-    Ok(())
+}
+
+fn merge_changed_models(
+    current_provider: &mut Map<String, Value>,
+    original: Option<&Value>,
+    requested: Option<&Value>,
+) {
+    if original == requested {
+        return;
+    }
+    let original = models_by_id(original);
+    let requested = models_by_id(requested);
+    let current_models = current_provider
+        .entry("models".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !current_models.is_array() {
+        *current_models = Value::Array(Vec::new());
+    }
+    let current_models = current_models
+        .as_array_mut()
+        .expect("models reset to array");
+
+    current_models.retain(|model| {
+        let Some(id) = model
+            .as_object()
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return true;
+        };
+        original.contains_key(id) == requested.contains_key(id) || !original.contains_key(id)
+    });
+
+    for (id, requested_model) in requested {
+        let original_model = original.get(&id);
+        if original_model == Some(&requested_model) {
+            continue;
+        }
+        let current_model = current_models.iter_mut().find_map(|model| {
+            let model = model.as_object_mut()?;
+            (model.get("id").and_then(Value::as_str) == Some(id.as_str())).then_some(model)
+        });
+        if let Some(current_model) = current_model {
+            let empty = Map::new();
+            apply_changed_object_fields(
+                current_model,
+                original_model.unwrap_or(&empty),
+                &requested_model,
+                None,
+            );
+        } else {
+            current_models.push(Value::Object(requested_model));
+        }
+    }
+}
+
+fn models_by_id(value: Option<&Value>) -> BTreeMap<String, Map<String, Value>> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let model = model.as_object()?;
+            let id = model.get("id")?.as_str()?.to_string();
+            Some((id, model.clone()))
+        })
+        .collect()
 }
 
 pub fn is_xai_grok_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
@@ -671,4 +950,27 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_write_publishes_only_at_commit_and_replaces_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("config.json");
+        std::fs::write(&destination, b"old contents").unwrap();
+
+        let prepared = prepare_atomic_write(&destination, b"new contents").unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old contents");
+
+        prepared.commit().unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new contents");
+        assert_eq!(
+            std::fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "the committed temporary replacement must not remain beside the destination"
+        );
+    }
 }

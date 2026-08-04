@@ -1,11 +1,14 @@
 import {
   type AttachResult,
   activeModelStateSchema,
+  createClientSubmissionId,
   type EventEnvelope,
   eventEnvelopeSchema,
   type HistoryEntry,
   type InterruptQuestion,
+  modelSelectionResultDataSchema,
 } from "@flycockpit/cockpit-protocol";
+import type { SendUserMessageParams } from "@flycockpit/cockpit-protocol/client";
 import { daemonStateReducer, emptyNativeDaemonState, type NativeDaemonState } from "./daemon-state";
 import {
   type ActiveModelState,
@@ -250,15 +253,13 @@ export function nativeAttachRuntimeState(
   attach: AttachResult,
   previousDaemonState: NativeDaemonState = emptyNativeDaemonState,
 ): NativeAttachRuntimeState {
-  const raw = attach as AttachResult & { paused_work?: unknown };
   const activeModelInput = activeModelInputFromRecord(attach.active_model_state);
-  const pausedWork = Array.isArray(raw.paused_work)
-    ? raw.paused_work.filter((item) => item && typeof item === "object")
-    : [];
+  const pausedWork = attach.paused_work;
   return {
     daemonState: {
       ...previousDaemonState,
       pausedWork: pausedWork.length ? { sessionId: attach.session_id, items: pausedWork } : null,
+      repairRequired: attach.repair_required ?? null,
     },
     activeModel: activeModelInput ? activeModelReducer(null, activeModelInput) : null,
     llmMode: null,
@@ -339,6 +340,155 @@ export function appendOptimisticUserMessage(
   ]);
 }
 
+export type RetainedUserMessageSubmission = {
+  sessionId: string;
+  params: SendUserMessageParams;
+};
+
+export type RetainedUserMessageSubmissions = Map<string, RetainedUserMessageSubmission>;
+
+export type RetainedUserMessageSubmissionsBySession = Readonly<
+  Record<string, RetainedUserMessageSubmission | undefined>
+>;
+
+export function restoreRetainedUserMessagesAfterAttach(
+  history: NativeHistoryEntry[],
+  sessionId: string,
+  retained: ReadonlyMap<string, RetainedUserMessageSubmission>,
+) {
+  let next = history;
+  for (const submission of retained.values()) {
+    if (submission.sessionId !== sessionId) continue;
+    const id = pendingUserPrefix + submission.params.client_submission_id;
+    if (next.some((entry) => entry.id === id)) continue;
+    next = appendOptimisticUserMessage(
+      next,
+      submission.params.display_text ?? submission.params.text,
+      submission.params.client_submission_id,
+    );
+  }
+  return next;
+}
+
+export function reconcileAcceptedRetrySubmissions(
+  retries: RetainedUserMessageSubmissionsBySession,
+  acceptedIds: readonly string[],
+) {
+  if (acceptedIds.length === 0) {
+    return { retries, accepted: [] as RetainedUserMessageSubmission[] };
+  }
+  const acceptedIdsSet = new Set(acceptedIds);
+  const accepted: RetainedUserMessageSubmission[] = [];
+  const next = { ...retries };
+  for (const [sessionId, retry] of Object.entries(retries)) {
+    if (!retry || !acceptedIdsSet.has(retry.params.client_submission_id)) continue;
+    accepted.push(retry);
+    delete next[sessionId];
+  }
+  return { retries: accepted.length > 0 ? next : retries, accepted };
+}
+
+export function clearAcceptedRetryDrafts(
+  messages: Readonly<Record<string, string>>,
+  accepted: readonly RetainedUserMessageSubmission[],
+) {
+  const next = { ...messages };
+  let changed = false;
+  for (const retry of accepted) {
+    if ((next[retry.sessionId] ?? "").trim() !== retry.params.text) continue;
+    next[retry.sessionId] = "";
+    changed = true;
+  }
+  return changed ? next : messages;
+}
+
+export function prepareUserMessageSubmission(
+  sessionId: string,
+  text: string,
+  explicitRetry: RetainedUserMessageSubmission | undefined,
+) {
+  if (explicitRetry?.sessionId === sessionId && explicitRetry.params.text === text) {
+    return { submission: explicitRetry, isRetry: true };
+  }
+  return {
+    submission: {
+      sessionId,
+      params: { client_submission_id: createClientSubmissionId(), text },
+    },
+    isRetry: false,
+  };
+}
+
+export function retainUserMessageSubmission(
+  retained: RetainedUserMessageSubmissions,
+  submission: RetainedUserMessageSubmission,
+) {
+  const id = submission.params.client_submission_id;
+  const exact = retained.get(id);
+  if (exact) return exact;
+  retained.set(id, submission);
+  return submission;
+}
+
+export function forgetUserMessageSubmission(
+  retained: RetainedUserMessageSubmissions,
+  clientSubmissionId: string,
+) {
+  retained.delete(clientSubmissionId);
+}
+
+export function clientSubmissionIdsFromHistory(entries: readonly HistoryEntry[]) {
+  return entries.flatMap((entry) =>
+    entry.role === "user" ? (entry.client_submission_ids ?? []) : [],
+  );
+}
+
+export function acceptedClientSubmissionIdsFromEvent(
+  raw: unknown,
+  selectedSessionId: string | null,
+) {
+  const parsed = eventEnvelopeSchema.safeParse(raw);
+  if (!parsed.success || ("__unknown" in parsed.data && parsed.data.__unknown)) return [];
+  const event = parsed.data;
+  const sessionId = sessionIdFromEvent(event);
+  if (sessionId && selectedSessionId && sessionId !== selectedSessionId) return [];
+  const data = eventDataRecord(event);
+  if (!data) return [];
+  if (event.event === "user_message_recorded") {
+    return Array.isArray(data.client_submission_ids)
+      ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event === "queued_user_messages_folded") {
+    return Array.isArray(data.queue_item_ids)
+      ? data.queue_item_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event === "user_messages_terminated" || event.event === "user_message_retracted") {
+    return Array.isArray(data.client_submission_ids)
+      ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event !== "history_replay" || !Array.isArray(data.entries)) return [];
+  return data.entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    if (record.role !== "user" || !Array.isArray(record.client_submission_ids)) return [];
+    return record.client_submission_ids.filter((id): id is string => typeof id === "string");
+  });
+}
+
+export function isCurrentUserMessageSubmission(
+  currentSessionId: string | null,
+  latestClientSubmissionId: string | null,
+  submission: RetainedUserMessageSubmission,
+) {
+  return (
+    currentSessionId === submission.sessionId &&
+    latestClientSubmissionId === submission.params.client_submission_id
+  );
+}
+
 export function removeOptimisticUserMessage(
   history: NativeHistoryEntry[],
   localId: string,
@@ -348,13 +498,25 @@ export function removeOptimisticUserMessage(
 
 export function reconcileRecordedUserMessage(
   history: NativeHistoryEntry[],
-  data: { seq?: number; preflight_cleaned?: string | null },
+  data: {
+    seq?: number;
+    preflight_cleaned?: string | null;
+    client_submission_ids?: string[];
+    text?: string;
+    display_text?: string;
+  },
 ): NativeHistoryEntry[] {
   const pending = history.find(
-    (entry) => entry.kind === "user_message" && entry.id.startsWith(pendingUserPrefix),
+    (entry) =>
+      entry.kind === "user_message" &&
+      data.client_submission_ids?.some((id) => entry.id === pendingUserPrefix + id),
   );
-  const text = data.preflight_cleaned || (pending?.kind === "user_message" ? pending.text : null);
-  if (!text) return history;
+  const text =
+    data.display_text ??
+    data.preflight_cleaned ??
+    data.text ??
+    (pending?.kind === "user_message" ? pending.text : null);
+  if (text === undefined || text === null) return history;
   const seq = typeof data.seq === "number" ? data.seq : nextLocalSeq(history);
   const recorded: NativeHistoryEntry = {
     id: entryId("user", seq),
@@ -363,7 +525,9 @@ export function reconcileRecordedUserMessage(
     text,
   };
   return upsertHistory(
-    history.filter((entry) => entry.id !== pending?.id),
+    history.filter(
+      (entry) => !data.client_submission_ids?.some((id) => entry.id === pendingUserPrefix + id),
+    ),
     recorded,
   );
 }
@@ -403,12 +567,35 @@ export function reduceNativeSessionEvent(
   if (event.event === "active_model_state") {
     const data = eventDataRecord(event);
     if (!data) return { state, warning: eventWarning(event.event) };
+    const activeModel = activeModelInputFromRecord(data);
+    if (!activeModel) return { state, warning: eventWarning(event.event) };
+    if (
+      state.activeModel &&
+      typeof activeModel.generation === "number" &&
+      activeModel.generation < state.activeModel.generation
+    ) {
+      return { state };
+    }
     return {
       state: {
         ...state,
-        activeModel: activeModelReducer(state.activeModel ?? null, {
-          ...activeModelInputFromRecord(data),
-        }),
+        activeModel: activeModelReducer(state.activeModel ?? null, activeModel),
+      },
+    };
+  }
+
+  if (event.event === "model_selection_result") {
+    const parsedResult = modelSelectionResultDataSchema.safeParse(event.data);
+    if (!parsedResult.success) return { state, warning: eventWarning(event.event) };
+    if (parsedResult.data.outcome.status === "rejected") return { state };
+    const activeModel = activeModelInputFromRecord(parsedResult.data.outcome.active_state);
+    if (!activeModel) return { state, warning: eventWarning(event.event) };
+    // Terminal applied results may correct default/divergence fields at the
+    // same generation after a successful default save.
+    return {
+      state: {
+        ...state,
+        activeModel: activeModelReducer(state.activeModel ?? null, activeModel),
       },
     };
   }
@@ -474,6 +661,28 @@ export function reduceNativeSessionEvent(
     };
   }
 
+  if (event.event === "queued_user_messages_folded") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    return {
+      state: {
+        ...state,
+        history: reconcileRecordedUserMessage(state.history, {
+          seq: typeof data.seq === "number" ? data.seq : undefined,
+          client_submission_ids: Array.isArray(data.queue_item_ids)
+            ? data.queue_item_ids.filter((id): id is string => typeof id === "string")
+            : [],
+          text: typeof data.text === "string" ? data.text : undefined,
+          display_text: typeof data.display_text === "string" ? data.display_text : undefined,
+          preflight_cleaned:
+            typeof data.preflight_cleaned === "string" || data.preflight_cleaned === null
+              ? data.preflight_cleaned
+              : undefined,
+        }),
+      },
+    };
+  }
+
   if (event.event === "user_message_recorded") {
     const data = eventDataRecord(event);
     if (!data) return { state, warning: eventWarning(event.event) };
@@ -482,11 +691,39 @@ export function reduceNativeSessionEvent(
         ...state,
         history: reconcileRecordedUserMessage(state.history, {
           seq: typeof data.seq === "number" ? data.seq : undefined,
+          client_submission_ids: Array.isArray(data.client_submission_ids)
+            ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+            : [],
           preflight_cleaned:
             typeof data.preflight_cleaned === "string" || data.preflight_cleaned === null
               ? data.preflight_cleaned
               : undefined,
         }),
+      },
+    };
+  }
+
+  if (event.event === "session_persist_failed") {
+    // The matching optimistic row remains visible and its exact wire payload stays
+    // retained by the caller for a retry. In particular, do not disturb any other
+    // in-flight submission when one durable write fails.
+    return { state };
+  }
+
+  if (event.event === "user_messages_terminated" || event.event === "user_message_retracted") {
+    const data = eventDataRecord(event);
+    if (!data || !Array.isArray(data.client_submission_ids)) {
+      return { state, warning: eventWarning(event.event) };
+    }
+    const terminalIds = data.client_submission_ids.filter(
+      (id): id is string => typeof id === "string",
+    );
+    return {
+      state: {
+        ...state,
+        history: state.history.filter(
+          (entry) => !terminalIds.some((id) => entry.id === pendingUserPrefix + id),
+        ),
       },
     };
   }

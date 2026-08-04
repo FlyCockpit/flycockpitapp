@@ -12,6 +12,7 @@ fn push_optimistic(app: &mut App, text: &str) {
         expanded: false,
         timestamp: chrono::Local::now(),
         seq: None,
+        optimistic_submission_id: None,
         preflight_pending: false,
         persist_failed: false,
     });

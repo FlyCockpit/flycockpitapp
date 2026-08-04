@@ -83,6 +83,336 @@ fn test_session_handle() -> SessionWorkerHandle {
 }
 
 #[tokio::test]
+async fn terminal_receipt_write_failure_returns_promptly_and_holds_the_exact_queue_item() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    db.write(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER fail_terminal_receipt
+             BEFORE INSERT ON client_submission_terminal_receipts
+             BEGIN
+               SELECT RAISE(FAIL, 'injected persistent terminal receipt failure');
+             END;",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (updates_tx, _updates_rx) = watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let target = crate::engine::message::QueueTarget::root("Build");
+    let id = Uuid::new_v4();
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: "consumed-fingerprint".into(),
+        wire_fingerprint: "wire-fingerprint".into(),
+        origin_principal: Some("flycockpit:user-1".into()),
+    };
+    let expected_receipt = receipt.clone();
+    let original = crate::engine::message::UserSubmission {
+        text: "exact wire text".into(),
+        display_text: Some("visible composer text".into()),
+        images: vec![vec![7, 8, 9]],
+        forced_skill: Some("review".into()),
+        origin_principal: receipt.origin_principal.clone(),
+        queue_item_ids: vec![id],
+        client_submissions: vec![receipt.clone()],
+        queue_target: Some(target.clone()),
+        ..Default::default()
+    };
+    let (_, _, inserted) = queue
+        .push_idempotent(receipt, original.clone(), target)
+        .await;
+    assert_eq!(inserted, crate::engine::message::IdempotentPush::Inserted);
+    let (_, staged, _) = queue.stage_remove(id).await.unwrap();
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        persist_staged_terminal_removal(
+            &session,
+            &queue,
+            staged.expect("queued item is staged"),
+            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed,
+        ),
+    )
+    .await
+    .expect("a persistent receipt failure must not monopolize the worker")
+    .expect_err("injected trigger rejects the terminal receipt");
+    assert_eq!(error.code, proto::ErrorCode::Internal);
+    assert!(error.message.contains("remains held"), "{}", error.message);
+    assert_eq!(
+        queue
+            .snapshot()
+            .await
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![id],
+        "the failed removal keeps the exact item visible while holding execution"
+    );
+    assert_eq!(
+        serde_json::to_value(queue.pending_submission(id).await.unwrap()).unwrap(),
+        serde_json::to_value(original).unwrap(),
+        "the failure hold retains the complete wire payload"
+    );
+    assert_eq!(
+        queue.accepted_receipts(&[id]).await,
+        vec![expected_receipt],
+        "the failure hold retains the exact idempotency receipt for a safe retry"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), queue.recv())
+            .await
+            .is_err(),
+        "a persistent receipt failure must not release the payload into execution"
+    );
+
+    let (_, staged, _) = queue
+        .stage_remove(id)
+        .await
+        .expect("the same removal can retry its held claim");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        persist_staged_terminal_removal(
+            &session,
+            &queue,
+            staged.expect("held removal returns its original claim"),
+            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed,
+        ),
+    )
+    .await
+    .expect("a repeated persistent failure remains prompt")
+    .expect_err("the trigger remains active for the first retry");
+
+    db.write(|conn| {
+        conn.execute_batch("DROP TRIGGER fail_terminal_receipt;")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (_, staged, _) = queue.stage_remove(id).await.unwrap();
+    let (removed, snapshot, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        persist_staged_terminal_removal(
+            &session,
+            &queue,
+            staged.expect("held item can be removed again"),
+            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed,
+        ),
+    )
+    .await
+    .expect("subsequent worker work remains serviceable")
+    .expect("receipt write succeeds after the injected failure is removed");
+    assert_eq!(
+        removed.iter().map(|item| item.id).collect::<Vec<_>>(),
+        vec![id]
+    );
+    assert!(snapshot.is_empty());
+    assert!(
+        db.client_submission_terminal_receipt(session.id, id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the retry commits the durable terminal receipt"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), queue.close())
+        .await
+        .expect("queue shutdown remains serviceable after the failed receipt write");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), queue.recv())
+            .await
+            .expect("closed held queue receiver exits promptly")
+            .is_none()
+    );
+}
+
+#[test]
+fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        session
+            .set_active_model("lmstudio", "session-model")
+            .unwrap();
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_terminal_receipt_live_worker
+             BEFORE INSERT ON client_submission_terminal_receipts
+             BEGIN
+               SELECT RAISE(FAIL, 'injected persistent live-worker terminal receipt failure');
+             END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut providers = lmstudio_test_providers();
+        providers.providers.get_mut("lmstudio").unwrap().url = format!("http://{address}/v1");
+        let redact = Arc::new(RedactionTable::empty());
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        let (handle, join) = spawn(
+            session.clone(),
+            Arc::new(LockManager::in_memory(db.clone())),
+            redact,
+            model,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            false,
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            Arc::new(StdMutex::new(None)),
+            None,
+            trusted_test_policy(tmp.path()),
+            None,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            SessionConfigSnapshot::new(0, providers, extended.clone()),
+        );
+        let mut events = handle.subscribe();
+
+        async fn enqueue(
+            handle: &SessionWorkerHandle,
+            mut submission: crate::engine::message::UserSubmission,
+        ) -> (Uuid, Vec<proto::QueueItem>) {
+            let id = Uuid::new_v4();
+            let fingerprint = submission.client_fingerprint();
+            submission.queue_item_ids = vec![id];
+            submission.client_submissions = vec![crate::engine::message::ClientSubmissionReceipt {
+                id,
+                fingerprint: fingerprint.clone(),
+                wire_fingerprint: format!("wire-{fingerprint}"),
+                origin_principal: submission.origin_principal.clone(),
+            }];
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::UserMessage {
+                    submission: Box::new(submission),
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            let (item, queue) = tokio::time::timeout(std::time::Duration::from_secs(2), response)
+                .await
+                .expect("live worker acknowledges accepted message")
+                .expect("worker response channel remains open")
+                .expect("message is accepted");
+            assert_eq!(item.id, id);
+            (id, queue)
+        }
+
+        let _ = enqueue(
+            &handle,
+            crate::engine::message::UserSubmission::text("active blocking turn"),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap().event,
+                    proto::Event::ThinkingStarted { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first message reaches the live driver");
+
+        let second = crate::engine::message::UserSubmission {
+            text: "second exact wire text".into(),
+            display_text: Some("second visible text".into()),
+            images: vec![vec![1, 2, 3, 4]],
+            forced_skill: Some("review".into()),
+            origin_principal: Some("flycockpit:user-1".into()),
+            ..Default::default()
+        };
+        let (second_id, _) = enqueue(&handle, second).await;
+        let (third_id, queue) = enqueue(
+            &handle,
+            crate::engine::message::UserSubmission::text("third queued message"),
+        )
+        .await;
+        assert_eq!(
+            queue.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![second_id, third_id],
+            "the live driver leaves the later submissions in FIFO order"
+        );
+
+        async fn remove_exact(handle: &SessionWorkerHandle, id: Uuid) -> proto::ErrorPayload {
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::RemoveQueuedUserMessage {
+                    queue_item_id: id,
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), response)
+                .await
+                .expect("persistent receipt failure returns promptly")
+                .expect("removal response channel remains open")
+                .expect_err("the active trigger rejects the terminal receipt")
+        }
+
+        for _ in 0..2 {
+            let error = remove_exact(&handle, second_id).await;
+            assert_eq!(error.code, proto::ErrorCode::Internal);
+            assert!(error.message.contains("remains held"), "{}", error.message);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let user_messages = db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "user_message")
+            .count();
+        assert_eq!(
+            user_messages, 1,
+            "held second and third payloads cannot race into the live driver"
+        );
+        assert!(
+            db.client_submission_terminal_receipt(session.id, second_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Shutdown {
+                pause_for_resume: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("persistent receipt failure cannot monopolize worker shutdown")
+            .expect("live worker does not panic");
+        provider_server.abort();
+    });
+}
+
+#[tokio::test]
 async fn deleting_sealed_value_evicts_live_injection_cache() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
@@ -791,6 +1121,161 @@ async fn absent_scheduler_is_not_an_error() {
         .await
         .expect("worker shuts down")
         .expect("worker task does not panic");
+}
+
+#[tokio::test]
+async fn worker_driver_respects_attached_ignore_config_policy() {
+    let env_root = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(env_root.path()).await;
+    let project = env_root.path().join("trusted-project");
+    std::fs::create_dir_all(&project).unwrap();
+    write_model_config(&project);
+    let user_cockpit = env_root.path().join("home/.config/cockpit");
+    std::fs::create_dir_all(user_cockpit.join("providers")).unwrap();
+    std::fs::write(
+        user_cockpit.join("config.json"),
+        r#"{"active_model":{"provider":"lmstudio","model":"session-model"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        user_cockpit.join("providers/lmstudio.json"),
+        r#"{
+              "url": "http://localhost:1/v1",
+              "models": [
+                {"id": "session-model"},
+                {"id": "assistant-model"}
+              ]
+            }"#,
+    )
+    .unwrap();
+
+    crate::config::trust::clear_runtime_policy_for_tests();
+    let trust_root = crate::config::trust::resolve_trust_root(&project).unwrap();
+    crate::config::trust::set_runtime_policy(
+        trust_root.clone(),
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    );
+    let attached_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: trust_root,
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+    };
+
+    let db = Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), project.clone(), "Build").unwrap());
+    session
+        .set_active_model("lmstudio", "session-model")
+        .unwrap();
+    let providers = lmstudio_test_providers();
+    let redact = Arc::new(RedactionTable::empty());
+    let model =
+        Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    let (handle, join) = spawn(
+        session,
+        Arc::new(LockManager::in_memory(db)),
+        redact,
+        model,
+        None,
+        None,
+        project.clone(),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        Arc::new(StdMutex::new(None)),
+        None,
+        attached_policy,
+        None,
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        SessionConfigSnapshot::new(0, providers, extended.clone()),
+    );
+    let mut events = handle.subscribe();
+    let selection_id = Uuid::new_v4();
+    handle
+        .send_work(SessionWork::SetActiveModel {
+            selection_id,
+            selection_deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            provider: "lmstudio".to_string(),
+            model: "assistant-model".to_string(),
+            persist_as_default: true,
+            initialize_default_if_missing: false,
+            trigger: crate::session::ModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        })
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let proto::Event::ModelSelectionResult {
+                selection_id: event_selection_id,
+                outcome,
+                ..
+            } = events.recv().await.unwrap().event
+                && event_selection_id == selection_id
+            {
+                break outcome;
+            }
+        }
+    })
+    .await
+    .expect("worker emits the terminal model-selection result");
+    let proto::ModelSelectionOutcome::Applied {
+        active_state,
+        default_update,
+    } = outcome
+    else {
+        panic!("attached trusted-project save should apply, got {outcome:?}");
+    };
+    assert_eq!(
+        default_update,
+        proto::DefaultModelUpdateOutcome::Saved,
+        "the spawned driver must persist under the attached policy, not the global policy"
+    );
+    assert_eq!(active_state.selection.model, "assistant-model");
+    assert_eq!(
+        active_state
+            .default_selection
+            .as_ref()
+            .map(|model| model.model.as_str()),
+        Some("assistant-model")
+    );
+    assert!(!active_state.diverged);
+
+    let project_active =
+        crate::config::providers::ConfigDoc::load(&project.join(".cockpit").join("config.json"))
+            .unwrap()
+            .providers()
+            .active_model
+            .expect("ignored project config retains its original default");
+    assert_eq!(project_active.provider, "lmstudio");
+    assert_eq!(project_active.model, "session-model");
+    let user_active = crate::config::providers::ConfigDoc::load(&user_cockpit.join("config.json"))
+        .unwrap()
+        .providers()
+        .active_model
+        .expect("user-layer default is persisted");
+    assert_eq!(user_active.provider, "lmstudio");
+    assert_eq!(user_active.model, "assistant-model");
+
+    handle
+        .send_work(SessionWork::Shutdown {
+            pause_for_resume: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .expect("worker shuts down")
+        .expect("worker task does not panic");
+    crate::config::trust::clear_runtime_policy_for_tests();
 }
 
 #[tokio::test]

@@ -445,10 +445,9 @@ impl App {
             }
         };
 
-        self.push_plain("/fork: pending".to_string());
-        self.async_actions.start_blocking(
+        let start = self.async_actions.start_blocking(
             super::AsyncActionKind::DaemonRpc("fork.create"),
-            super::AsyncActionPolicy::Replace(super::AsyncActionKey::new("fork.create")),
+            super::AsyncActionPolicy::Dedupe(super::AsyncActionKey::new("fork.create")),
             move || {
                 let fork_point_turn_id = Some(seq.to_string());
                 let (session_id, short_id) = super::agent_runner::fork_session_blocking(
@@ -462,10 +461,21 @@ impl App {
                     socket,
                     session_id,
                     short_id,
+                    fork_point_seq: Some(seq),
                     seed_composer,
                 })
             },
         );
+        match start {
+            super::AsyncActionStart::Started(_) => {
+                self.push_plain("/fork: pending".to_string());
+            }
+            super::AsyncActionStart::Existing(_) => {
+                self.history.push(HistoryEntry::CommandError {
+                    line: "/fork: fork creation already pending".to_string(),
+                });
+            }
+        }
     }
 
     /// Pin the message under the pick-mode arrow (enter) and exit the mode.
@@ -875,6 +885,9 @@ mod tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -912,6 +925,7 @@ mod tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq,
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         }
@@ -1100,6 +1114,7 @@ mod tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: Some(77),
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         });
@@ -1125,6 +1140,70 @@ mod tests {
         assert!(app.history.iter().any(|entry| {
             matches!(entry, HistoryEntry::Plain { line } if line == "/fork: pending")
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_fork_creation_keeps_completed_undrained_action_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let mut agent_runner = runner();
+        agent_runner.socket = tmp.path().join("missing.sock");
+        app.agent_runner = Some(Ok(agent_runner));
+        app.current_session_persisted = true;
+        app.history.push(HistoryEntry::User {
+            text: "seed me".to_string(),
+            cleaned: None,
+            expanded: false,
+            timestamp: chrono::Local::now(),
+            seq: Some(77),
+            optimistic_submission_id: None,
+            preflight_pending: false,
+            persist_failed: false,
+        });
+
+        let notify = app.async_actions.notifier();
+        app.fork_for_seq(77);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("fork creation completed");
+        let first_ids = app.async_actions.pending_ids();
+
+        // The transport failure has completed, but the TUI has deliberately
+        // not drained it yet. Reissuing must keep that result adoptable.
+        app.fork_for_seq(77);
+
+        assert_eq!(app.async_actions.pending_ids(), first_ids);
+        assert!(app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::CommandError { line }
+                if line == "/fork: fork creation already pending"
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_side_creation_keeps_completed_undrained_action_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = test_app(tmp.path());
+        let mut agent_runner = runner();
+        agent_runner.socket = tmp.path().join("missing.sock");
+        app.agent_runner = Some(Ok(agent_runner));
+        app.current_session_persisted = true;
+
+        let notify = app.async_actions.notifier();
+        app.enter_side_conversation();
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("side creation completed");
+        let first_ids = app.async_actions.pending_ids();
+
+        app.enter_side_conversation();
+
+        assert_eq!(app.async_actions.pending_ids(), first_ids);
+        assert!(app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::CommandError { line }
+                if line == "/side: side-conversation creation already pending"
+        )));
     }
 
     /// Only User/Agent messages WITH a resolved `seq` are pinnable; tool

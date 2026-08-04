@@ -1,6 +1,848 @@
 use super::*;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+const PRIVATE_ATOMIC_WRITE_UMASK_CHILD: &str = "COCKPIT_TEST_PRIVATE_ATOMIC_WRITE_UMASK_CHILD";
+
+#[cfg(unix)]
+#[test]
+fn provider_atomic_writes_are_private_under_a_permissive_umask() {
+    if let Some(root) = std::env::var_os(PRIVATE_ATOMIC_WRITE_UMASK_CHILD) {
+        run_private_atomic_write_umask_case(Path::new(&root));
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let child_root = tmp.path().join("child");
+    let test_name = std::thread::current()
+        .name()
+        .expect("test thread has a name")
+        .to_string();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(PRIVATE_ATOMIC_WRITE_UMASK_CHILD, &child_root)
+        .output()
+        .expect("spawn isolated umask regression test");
+    assert!(
+        output.status.success(),
+        "isolated umask regression test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        child_root.join("home/.cockpit/config.json").is_file(),
+        "the isolated child test must have executed"
+    );
+}
+
+#[cfg(unix)]
+fn run_private_atomic_write_umask_case(root: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct UmaskRestore(libc::mode_t);
+
+    impl Drop for UmaskRestore {
+        fn drop(&mut self) {
+            // SAFETY: This test runs as the only selected test in a child
+            // process, and restores the original process-global umask.
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    std::fs::create_dir_all(root).unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(root);
+    // SAFETY: The parent invokes this exact test in a dedicated child process,
+    // so no sibling test can observe this deliberately permissive umask.
+    let _umask = UmaskRestore(unsafe { libc::umask(0o000) });
+
+    let config_path = root.join("home/.cockpit/config.json");
+    let provider_path = provider_file_path_for_config(&config_path, "private-provider").unwrap();
+    let mut doc = ConfigDoc::load(&config_path).unwrap();
+    let mut cfg = ProvidersConfig {
+        active_model: Some(ActiveModelRef {
+            provider: "private-provider".into(),
+            model: "first-model".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }),
+        ..Default::default()
+    };
+    cfg.providers.insert(
+        "private-provider".into(),
+        ProviderEntry {
+            url: "https://private.example.test/v1".into(),
+            ..Default::default()
+        },
+    );
+
+    doc.write(&cfg).unwrap();
+    assert_private_mode(&config_path, 0o600);
+    assert_private_mode(&provider_path, 0o600);
+    assert_private_mode(config_path.parent().unwrap(), 0o700);
+    assert_private_mode(provider_path.parent().unwrap(), 0o700);
+
+    // Existing product-owned config directories and files must be repaired,
+    // not merely protected when they are first created.
+    for path in [&config_path, &provider_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    for path in [
+        config_path.parent().unwrap(),
+        provider_path.parent().unwrap(),
+    ] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    cfg.active_model.as_mut().unwrap().model = "second-model".into();
+    cfg.providers.get_mut("private-provider").unwrap().favorite = Some(true);
+
+    doc.write(&cfg).unwrap();
+    assert_private_mode(&config_path, 0o600);
+    assert_private_mode(&provider_path, 0o600);
+    assert_private_mode(config_path.parent().unwrap(), 0o700);
+    assert_private_mode(provider_path.parent().unwrap(), 0o700);
+
+    let shared_parent = root.join("shared");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let explicit_config = shared_parent.join("explicit-config.json");
+    env.set_cockpit_config(&explicit_config);
+    let mut explicit_doc = ConfigDoc::load(&explicit_config).unwrap();
+    explicit_doc.write(&cfg).unwrap();
+    assert_private_mode(&explicit_config, 0o600);
+    assert_private_mode(&shared_parent, 0o777);
+
+    // Basename resemblance does not grant ownership to an explicit override.
+    let explicit_dot_cockpit = root.join("shared-project/.cockpit");
+    std::fs::create_dir_all(&explicit_dot_cockpit).unwrap();
+    std::fs::set_permissions(
+        &explicit_dot_cockpit,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let explicit_named_like_default = explicit_dot_cockpit.join("custom.json");
+    env.set_cockpit_config(&explicit_named_like_default);
+    let mut explicit_named_doc = ConfigDoc::load(&explicit_named_like_default).unwrap();
+    explicit_named_doc.write(&cfg).unwrap();
+    assert_private_mode(&explicit_named_like_default, 0o600);
+    assert_private_mode(&explicit_dot_cockpit, 0o755);
+
+    cfg.active_model.as_mut().unwrap().model = "third-model".into();
+    explicit_doc.write(&cfg).unwrap();
+    assert_private_mode(&explicit_config, 0o600);
+    assert_private_mode(&shared_parent, 0o777);
+
+    // The production helpers use per-create modes and must not alter the
+    // process-global umask as part of their normal path.
+    // SAFETY: this entire case runs alone in the dedicated child process.
+    let observed_umask = unsafe { libc::umask(0o000) };
+    unsafe {
+        libc::umask(observed_umask);
+    }
+    assert_eq!(
+        observed_umask, 0o000,
+        "config writes changed the process umask"
+    );
+}
+
+#[cfg(unix)]
+fn assert_private_mode(path: &Path, expected: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let actual = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(actual, expected, "unexpected mode for {}", path.display());
+}
+
+#[test]
+fn active_model_ref_rejects_empty_wire_identity_and_reasoning_effort() {
+    for (field, value) in [
+        (
+            "provider",
+            serde_json::json!({ "provider": "", "model": "gpt-5" }),
+        ),
+        (
+            "model",
+            serde_json::json!({ "provider": "openai", "model": "" }),
+        ),
+        (
+            "reasoning_effort",
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5",
+                "reasoning_effort": { "value": "" }
+            }),
+        ),
+    ] {
+        let error = serde_json::from_value::<ActiveModelRef>(value)
+            .expect_err("empty active-model fields must fail deserialization");
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "{field}: {error}"
+        );
+    }
+
+    let selection: ActiveModelRef = serde_json::from_value(serde_json::json!({
+        "provider": "openai",
+        "model": "gpt-5",
+        "reasoning_effort": { "value": "high" },
+        "thinking_mode": "high",
+        "prompt_cache_retention": "extended"
+    }))
+    .expect("complete nonempty selection should deserialize");
+    assert_eq!(selection.provider, "openai");
+    assert_eq!(selection.model, "gpt-5");
+    assert_eq!(
+        selection
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| effort.value.as_str()),
+        Some("high")
+    );
+}
+
+#[test]
+fn typed_active_model_ref_validation_matches_wire_validation() {
+    for selection in [
+        ActiveModelRef {
+            provider: String::new(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        ActiveModelRef {
+            provider: "openai".to_string(),
+            model: String::new(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+        ActiveModelRef {
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: String::new(),
+            }),
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+    ] {
+        assert!(selection.validate().is_err());
+    }
+}
+
+#[test]
+fn capability_value_rejects_empty_advertised_value() {
+    let error = serde_json::from_value::<CapabilityValue>(serde_json::json!({ "value": "" }))
+        .expect_err("empty advertised capability values must fail deserialization");
+    assert!(error.to_string().contains("must not be empty"), "{error}");
+}
+
+#[test]
+fn atomic_first_default_initialization_has_one_winner_across_file_handles() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_path = tmp.path().join("atomic-config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"active_model":null,"unknown":{"preserve":"yes"}}"#,
+    )
+    .unwrap();
+    env.set_cockpit_config(&config_path);
+
+    let selections = [
+        ActiveModelRef {
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: "high".into(),
+            }),
+            thinking_mode: Some(ThinkingMode::High),
+            prompt_cache_retention: Some(PromptCacheRetention::Extended),
+        },
+        ActiveModelRef {
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        },
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles = selections
+        .iter()
+        .cloned()
+        .map(|selection| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let config_path = config_path.clone();
+            let cwd = tmp.path().to_path_buf();
+            std::thread::spawn(move || {
+                barrier.wait();
+                ConfigDoc::write_effective_active_model_atomically(
+                    &cwd,
+                    &config_path,
+                    &selection,
+                    ActiveModelWriteMode::InitializeIfMissing,
+                )
+                .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results.iter().filter(|result| result.wrote).count(),
+        1,
+        "exactly one independently opened lock handle may initialize"
+    );
+    let raw: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(raw["unknown"]["preserve"], "yes");
+    let final_selection: ActiveModelRef =
+        serde_json::from_value(raw["active_model"].clone()).unwrap();
+    assert!(selections.contains(&final_selection));
+    assert!(
+        results
+            .iter()
+            .all(|result| { result.authoritative_selection.as_ref() == Some(&final_selection) })
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let lock_dir = tmp.path().join("state/cockpit/config-locks");
+        assert_eq!(
+            std::fs::metadata(&lock_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let lock_files = std::fs::read_dir(&lock_dir)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(lock_files.len(), 1);
+        assert_eq!(
+            lock_files[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn config_namespace_lock_intersects_home_and_project_targets() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let home_config = tmp.path().join("home/.config/cockpit/config.json");
+    let project_root = tmp.path().join("workspace");
+    let project_config = project_root.join(".cockpit/config.json");
+    std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::write(&home_config, "{}").unwrap();
+    std::fs::write(&project_config, "{}").unwrap();
+
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(&project_root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let held_home_lock = crate::config::files::ConfigMutationLock::acquire(&home_config).unwrap();
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_ready = std::sync::Arc::clone(&ready);
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let project = project_config.clone();
+    let cwd = project_root.clone();
+    let handle = std::thread::spawn(move || {
+        worker_ready.wait();
+        let result = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+            ConfigDoc::write_effective_active_model_atomically(
+                &cwd,
+                &project,
+                &ActiveModelRef {
+                    provider: "project-provider".into(),
+                    model: "project-model".into(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                },
+                ActiveModelWriteMode::InitializeIfMissing,
+            )
+        });
+        completed_tx.send(result).unwrap();
+    });
+
+    ready.wait();
+    assert!(
+        matches!(
+            completed_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a project writer must remain blocked while a distinct home-layer lock is held"
+    );
+    drop(held_home_lock);
+    let result = completed_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("project writer completed after the namespace lock was released")
+        .unwrap();
+    assert!(result.wrote);
+    handle.join().unwrap();
+}
+
+#[test]
+fn cancelled_active_model_lock_waiter_exits_before_owner_releases_lock() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let root = tmp.path().join("workspace");
+    let config = root.join(".cockpit/config.json");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "{}").unwrap();
+
+    let held = crate::config::files::ConfigMutationLock::acquire(&config).unwrap();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = std::sync::Arc::clone(&cancelled);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let worker_root = root.clone();
+    let worker_config = config.clone();
+    let handle = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = ConfigDoc::prepare_effective_active_model_write_cancellable(
+            &worker_root,
+            &worker_config,
+            &ActiveModelRef {
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            ActiveModelWriteMode::Replace,
+            &worker_cancelled,
+        )
+        .map(drop);
+        completed_tx.send(result).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    let error = completed_rx
+        .recv_timeout(std::time::Duration::from_millis(250))
+        .expect("cancelled waiter exits while the original lock remains held")
+        .expect_err("cancelled waiter must not acquire the lock");
+    assert!(error.to_string().contains("cancelled"));
+    handle.join().unwrap();
+    drop(held);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_prepared_active_model_commit_preserves_precommit_authority() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let workspace = tmp.path().to_path_buf();
+    let config = workspace.join("config.json");
+    let old = ActiveModelRef {
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let target = ActiveModelRef {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        reasoning_effort: Some(ActiveReasoningEffort {
+            value: "high".into(),
+        }),
+        thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: Some(PromptCacheRetention::Extended),
+    };
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({ "active_model": old })).unwrap(),
+    )
+    .unwrap();
+    env.set_cockpit_config(&config);
+
+    let prepared = ConfigDoc::prepare_effective_active_model_write(
+        &workspace,
+        &config,
+        &target,
+        ActiveModelWriteMode::Replace,
+    )
+    .unwrap();
+    assert_eq!(prepared.authoritative_selection_before_commit(), Some(&old));
+    assert_eq!(prepared.authoritative_selection(), Some(&target));
+
+    let parent = config.parent().unwrap();
+    let original_permissions = std::fs::metadata(parent).unwrap().permissions();
+    let mut read_only = original_permissions.clone();
+    read_only.set_mode(original_permissions.mode() & !0o222);
+    std::fs::set_permissions(parent, read_only).unwrap();
+    let commit = prepared.commit();
+    std::fs::set_permissions(parent, original_permissions).unwrap();
+
+    assert!(
+        commit.is_err(),
+        "atomic replacement must fail without directory write access"
+    );
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ActiveModelRef>(raw["active_model"].clone()).unwrap(),
+        old
+    );
+}
+
+#[test]
+fn stale_project_initialization_keeps_concurrently_established_home_default() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let home_config = tmp.path().join("home/.config/cockpit/config.json");
+    let project_root = tmp.path().join("workspace");
+    let project_config = project_root.join(".cockpit/config.json");
+    std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::write(&home_config, r#"{"home_opaque":true}"#).unwrap();
+    std::fs::write(&project_config, r#"{"project_opaque":true}"#).unwrap();
+
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(&project_root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let stale_observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let home_committed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let project_handle = {
+        let cwd = project_root.clone();
+        let target = project_config.clone();
+        let trust_policy = trust_policy.clone();
+        let stale_observed = std::sync::Arc::clone(&stale_observed);
+        let home_committed = std::sync::Arc::clone(&home_committed);
+        std::thread::spawn(move || {
+            crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                assert_eq!(ConfigDoc::load_effective(&cwd).active_model, None);
+                stale_observed.wait();
+                home_committed.wait();
+                ConfigDoc::write_effective_active_model_atomically(
+                    &cwd,
+                    &target,
+                    &ActiveModelRef {
+                        provider: "stale-project-provider".into(),
+                        model: "stale-project-model".into(),
+                        reasoning_effort: None,
+                        thinking_mode: Some(ThinkingMode::Low),
+                        prompt_cache_retention: None,
+                    },
+                    ActiveModelWriteMode::InitializeIfMissing,
+                )
+                .unwrap()
+            })
+        })
+    };
+
+    stale_observed.wait();
+    let home_selection = ActiveModelRef {
+        provider: "home-provider".into(),
+        model: "home-model".into(),
+        reasoning_effort: Some(ActiveReasoningEffort {
+            value: "high".into(),
+        }),
+        thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: Some(PromptCacheRetention::Extended),
+    };
+    let home_result =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ConfigDoc::write_effective_active_model_atomically(
+                &project_root,
+                &home_config,
+                &home_selection,
+                ActiveModelWriteMode::InitializeIfMissing,
+            )
+            .unwrap()
+        });
+    assert!(home_result.wrote);
+    home_committed.wait();
+
+    let project_result = project_handle.join().unwrap();
+    assert!(!project_result.wrote);
+    assert_eq!(
+        project_result.authoritative_selection,
+        Some(home_selection.clone())
+    );
+    let project_raw: Value =
+        serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
+    assert_eq!(project_raw["project_opaque"], true);
+    assert!(project_raw.get("active_model").is_none());
+    let _trust = crate::config::trust::enter_workspace_trust_policy(trust_policy);
+    assert_eq!(
+        ConfigDoc::load_effective(&project_root).active_model,
+        Some(home_selection)
+    );
+}
+
+#[test]
+fn atomic_first_default_serializes_home_and_project_layers() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let home_config = tmp.path().join("home/.config/cockpit/config.json");
+    let project_root = tmp.path().join("workspace");
+    let project_config = project_root.join(".cockpit/config.json");
+    std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::write(&home_config, r#"{"home_opaque":"preserved"}"#).unwrap();
+    std::fs::write(&project_config, r#"{"project_opaque":"preserved"}"#).unwrap();
+
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(&project_root).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let selections = [
+        ActiveModelRef {
+            provider: "home-provider".into(),
+            model: "home-model".into(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: "high".into(),
+            }),
+            thinking_mode: Some(ThinkingMode::High),
+            prompt_cache_retention: Some(PromptCacheRetention::Extended),
+        },
+        ActiveModelRef {
+            provider: "project-provider".into(),
+            model: "project-model".into(),
+            reasoning_effort: None,
+            thinking_mode: Some(ThinkingMode::Low),
+            prompt_cache_retention: Some(PromptCacheRetention::Default),
+        },
+    ];
+    let targets = [home_config.clone(), project_config.clone()];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles = selections
+        .iter()
+        .cloned()
+        .zip(targets.iter().cloned())
+        .map(|(selection, target)| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let cwd = project_root.clone();
+            let trust_policy = trust_policy.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                    ConfigDoc::write_effective_active_model_atomically(
+                        &cwd,
+                        &target,
+                        &selection,
+                        ActiveModelWriteMode::InitializeIfMissing,
+                    )
+                    .unwrap()
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        results.iter().filter(|result| result.wrote).count(),
+        1,
+        "different effective layers must participate in one initialization transaction"
+    );
+    let _trust = crate::config::trust::enter_workspace_trust_policy(trust_policy);
+    let effective = ConfigDoc::load_effective(&project_root)
+        .active_model
+        .expect("one caller established the effective default");
+    assert!(selections.contains(&effective));
+    assert!(
+        results
+            .iter()
+            .all(|result| result.authoritative_selection.as_ref() == Some(&effective)),
+        "the loser must observe the winner from the other effective layer"
+    );
+
+    let home_raw: Value = serde_json::from_slice(&std::fs::read(&home_config).unwrap()).unwrap();
+    let project_raw: Value =
+        serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
+    assert_eq!(home_raw["home_opaque"], "preserved");
+    assert_eq!(project_raw["project_opaque"], "preserved");
+    assert_eq!(
+        [
+            home_raw.get("active_model"),
+            project_raw.get("active_model"),
+        ]
+        .into_iter()
+        .filter(Option::is_some)
+        .count(),
+        1,
+        "the losing layer must not shadow the inherited winner"
+    );
+
+    let lock_files = std::fs::read_dir(tmp.path().join("state/cockpit/config-locks"))
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        lock_files.len(),
+        1,
+        "home and project mutations must resolve to one stable namespace lock"
+    );
+    assert_eq!(
+        lock_files[0].file_name(),
+        std::ffi::OsStr::new("effective-config.lock")
+    );
+}
+
+#[test]
+fn stale_ordinary_provider_writes_preserve_atomic_default_unless_explicitly_changed() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let config_path = tmp.path().join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"active_model":null,"unknown":{"before":true}}"#,
+    )
+    .unwrap();
+    write_provider_file(
+        &config_path,
+        "provider-a",
+        r#"{
+            "url": "https://example.test/v1",
+            "opaque": { "preserve": true },
+            "models": [{ "id": "model-a", "name": "Model A" }]
+        }"#,
+    );
+    env.set_cockpit_config(&config_path);
+
+    let mut stale_full_doc = ConfigDoc::load(&config_path).unwrap();
+    let mut stale_full_cfg = stale_full_doc.providers();
+    stale_full_cfg.on_unlisted_models_fetch = Some(OnUnlistedModelsFetch::Keep);
+    stale_full_cfg.providers.get_mut("provider-a").unwrap().name = Some("Renamed Provider".into());
+    let mut stale_policy_doc = ConfigDoc::load(&config_path).unwrap();
+
+    let initialized = ActiveModelRef {
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        reasoning_effort: Some(ActiveReasoningEffort {
+            value: "high".into(),
+        }),
+        thinking_mode: Some(ThinkingMode::High),
+        prompt_cache_retention: Some(PromptCacheRetention::Extended),
+    };
+    let result = ConfigDoc::write_effective_active_model_atomically(
+        tmp.path(),
+        &config_path,
+        &initialized,
+        ActiveModelWriteMode::InitializeIfMissing,
+    )
+    .unwrap();
+    assert!(result.wrote);
+
+    let mut current: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    current["unknown_after_load"] = serde_json::json!({ "preserve": true });
+    std::fs::write(
+        &config_path,
+        format!("{}\n", serde_json::to_string_pretty(&current).unwrap()),
+    )
+    .unwrap();
+
+    stale_policy_doc
+        .write_unlisted_models_policy(Some(OnUnlistedModelsFetch::Ask))
+        .unwrap();
+    let after_policy = ConfigDoc::load(&config_path).unwrap();
+    assert_eq!(
+        after_policy.providers().active_model,
+        Some(initialized.clone())
+    );
+    assert_eq!(after_policy.raw["unknown_after_load"]["preserve"], true);
+
+    let mut favorite_doc = ConfigDoc::load(&config_path).unwrap();
+    favorite_doc
+        .write_model_favorite("provider-a", "model-a", true)
+        .unwrap();
+
+    stale_full_doc.write(&stale_full_cfg).unwrap();
+    let after_stale_full = ConfigDoc::load(&config_path).unwrap();
+    assert_eq!(
+        after_stale_full.providers().active_model,
+        Some(initialized.clone())
+    );
+    assert_eq!(
+        after_stale_full.providers().on_unlisted_models_fetch,
+        Some(OnUnlistedModelsFetch::Keep)
+    );
+    assert_eq!(after_stale_full.raw["unknown_after_load"]["preserve"], true);
+    let provider_after_stale_full = read_provider_file(&config_path, "provider-a");
+    assert_eq!(
+        provider_after_stale_full["models"][0]["favorite"], true,
+        "an unchanged favorite from a stale full save must preserve the newer value"
+    );
+    assert_eq!(provider_after_stale_full["name"], "Renamed Provider");
+    assert_eq!(provider_after_stale_full["opaque"]["preserve"], true);
+
+    let mut explicit_favorite_doc = ConfigDoc::load(&config_path).unwrap();
+    let mut explicit_favorite_cfg = explicit_favorite_doc.providers();
+    explicit_favorite_cfg
+        .providers
+        .get_mut("provider-a")
+        .unwrap()
+        .models
+        .iter_mut()
+        .find(|model| model.id == "model-a")
+        .unwrap()
+        .favorite = false;
+    explicit_favorite_doc.write(&explicit_favorite_cfg).unwrap();
+    let provider_after_explicit_favorite = read_provider_file(&config_path, "provider-a");
+    assert_eq!(
+        provider_after_explicit_favorite["models"][0].get("favorite"),
+        None,
+        "an explicit favorite edit must win when its locked write runs last"
+    );
+    assert_eq!(provider_after_explicit_favorite["opaque"]["preserve"], true);
+
+    let mut explicit_doc = ConfigDoc::load(&config_path).unwrap();
+    let mut explicit_cfg = explicit_doc.providers();
+    let explicitly_selected = ActiveModelRef {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        reasoning_effort: None,
+        thinking_mode: Some(ThinkingMode::Low),
+        prompt_cache_retention: None,
+    };
+    explicit_cfg.active_model = Some(explicitly_selected.clone());
+
+    let intervening = ActiveModelRef {
+        provider: "provider-c".into(),
+        model: "model-c".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: Some(PromptCacheRetention::Default),
+    };
+    ConfigDoc::write_effective_active_model_atomically(
+        tmp.path(),
+        &config_path,
+        &intervening,
+        ActiveModelWriteMode::Replace,
+    )
+    .unwrap();
+
+    explicit_doc.write(&explicit_cfg).unwrap();
+    let final_doc = ConfigDoc::load(&config_path).unwrap();
+    assert_eq!(
+        final_doc.providers().active_model,
+        Some(explicitly_selected),
+        "an explicit ordinary active-model edit wins after acquiring the shared lock"
+    );
+    assert_eq!(final_doc.raw["unknown_after_load"]["preserve"], true);
+}
+
 fn write_provider_file(config_path: &Path, provider_id: &str, json: &str) {
     let path = provider_file_path_for_config(config_path, provider_id).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -101,6 +943,7 @@ fn provider_default_resolvers_match_model_resolvers_without_overrides() {
 #[test]
 fn round_trips_a_provider_entry() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ConfigDoc::load(&path).unwrap();
@@ -210,6 +1053,7 @@ fn round_trips_a_provider_entry() {
 #[test]
 fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     write_provider_file(
@@ -292,6 +1136,7 @@ fn provider_write_removes_stale_skipped_optional_fields_but_keeps_empty_models()
 #[test]
 fn preserves_unknown_fields() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let path = tmp.path().join("config.json");
     std::fs::write(
         &path,
@@ -329,10 +1174,12 @@ fn malformed_provider_metadata_and_inline_provider_entries_warn_on_drop() {
             "active_model": { "model": "missing-provider" },
             "category_defaults": { "cheap_code": { "provider": "p" } }
         }),
+        originally_loaded_providers: BTreeMap::new(),
     };
     let inline_doc = ConfigDoc {
         path: PathBuf::new(),
         raw: serde_json::json!({ "providers": { "bad": 42 } }),
+        originally_loaded_providers: BTreeMap::new(),
     };
 
     let logs = capture_warn_logs(|| {
@@ -723,6 +1570,7 @@ fn providers_from_paths_merges_model_arrays_by_id_without_dropping_home_models()
 #[test]
 fn raw_provider_model_write_preserves_layered_provider_fields() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let home = tmp.path().join("home").join("config.json");
     let project = tmp.path().join("project").join("config.json");
     std::fs::create_dir_all(home.parent().unwrap()).unwrap();
@@ -796,6 +1644,7 @@ fn raw_provider_model_write_preserves_layered_provider_fields() {
 #[test]
 fn raw_model_favorite_write_is_partial_model_override() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let home = tmp.path().join("home").join("config.json");
     let project = tmp.path().join("project").join("config.json");
     std::fs::create_dir_all(home.parent().unwrap()).unwrap();

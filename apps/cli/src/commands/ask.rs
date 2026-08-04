@@ -42,11 +42,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     session.set_sandbox_enabled(true);
     session.set_approval_mode(extended.default_approval_mode);
     session.set_shell_compression(extended.shell_compression);
-    if let Some(active) = providers.active_model.as_ref() {
-        session
-            .set_active_model_ref(active.clone())
-            .context("recording active model for docs ask session")?;
-    }
+    seed_docs_session_active_model(&session, providers.active_model.as_ref())?;
 
     let redact = Arc::new(
         crate::redact::RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env.vars())
@@ -116,6 +112,18 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         None,
     )
     .await
+}
+
+fn seed_docs_session_active_model(
+    session: &Session,
+    active: Option<&crate::config::providers::ActiveModelRef>,
+) -> Result<()> {
+    if let Some(active) = active {
+        session
+            .set_active_model_ref(active.clone())
+            .context("recording active model for docs ask session")?;
+    }
+    Ok(())
 }
 
 fn read_stdin() -> Result<String> {
@@ -193,5 +201,24 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&brief).unwrap();
         assert_eq!(value["package"], "cargo:tokio");
         assert_eq!(value["question"], "how do tasks work?");
+    }
+
+    #[test]
+    fn docs_ask_session_seeds_complete_active_model_selection() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(db, std::path::PathBuf::from("/docs"), "docs").unwrap();
+        let selection = crate::config::providers::ActiveModelRef {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-7".to_string(),
+            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+        };
+
+        seed_docs_session_active_model(&session, Some(&selection)).unwrap();
+
+        assert_eq!(session.active_model_ref(), Some(selection));
     }
 }

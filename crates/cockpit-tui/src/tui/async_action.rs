@@ -22,7 +22,7 @@ pub enum AsyncActionKind {
     Internal(&'static str),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AsyncActionPayload {
     Unit,
     Text(String),
@@ -48,6 +48,7 @@ pub enum AsyncActionPayload {
         socket: std::path::PathBuf,
         session_id: uuid::Uuid,
         short_id: String,
+        fork_point_seq: Option<i64>,
         seed_composer: Option<String>,
     },
     NoteRecorded {
@@ -171,7 +172,7 @@ pub enum AsyncActionPayload {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AsyncActionResult {
     pub id: AsyncActionId,
     pub kind: AsyncActionKind,
@@ -287,6 +288,12 @@ impl AsyncActionRunner {
 
     pub fn has_pending_kind(&self, kind: &AsyncActionKind) -> bool {
         self.pending.values().any(|pending| &pending.kind == kind)
+    }
+
+    pub fn has_pending_key(&self, key: &AsyncActionKey) -> bool {
+        self.keyed
+            .get(key)
+            .is_some_and(|id| self.pending.contains_key(id))
     }
 
     pub fn has_pending_other_than(&self, kind: &AsyncActionKind) -> bool {
@@ -700,6 +707,45 @@ mod tests {
         tx.send(()).unwrap();
         assert_eq!(wait_for_results(&mut runner).await.len(), 1);
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_dedupe_retains_completed_action_until_result_is_drained() {
+        let mut runner = AsyncActionRunner::default();
+        let key = AsyncActionKey::new("blocking-create");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let first_starts = Arc::clone(&starts);
+        let notify = runner.notifier();
+
+        let first = runner.start_blocking(
+            AsyncActionKind::Blocking("blocking-create"),
+            AsyncActionPolicy::Dedupe(key.clone()),
+            move || {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                Ok(AsyncActionPayload::Text("created".to_string()))
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("blocking action completed");
+
+        // Completion is queued, but the action remains registered until the
+        // UI drains and adopts it. A repeated creation must not supersede it.
+        let second_starts = Arc::clone(&starts);
+        let second = runner.start_blocking(
+            AsyncActionKind::Blocking("blocking-create"),
+            AsyncActionPolicy::Dedupe(key),
+            move || {
+                second_starts.fetch_add(1, Ordering::SeqCst);
+                Ok(AsyncActionPayload::Text("orphan".to_string()))
+            },
+        );
+
+        assert_eq!(second, AsyncActionStart::Existing(first.id()));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let results = runner.drain_completed();
+        assert_eq!(results.len(), 1);
+        assert_text_payload(&results[0], "created");
     }
 
     #[tokio::test]

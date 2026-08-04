@@ -10,7 +10,6 @@ use crate::tui::agent_runner::{
 use crate::tui::history::HistoryEntry;
 use cockpit_core::config::extended::ApprovalMode;
 use cockpit_core::daemon::proto::{Request, Response};
-use cockpit_core::engine::message::UserSubmission;
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
@@ -28,7 +27,7 @@ fn runner_with_channels(
     control_tx: mpsc::Sender<ControlRequest>,
     events: Arc<Mutex<Vec<TurnEvent>>>,
 ) -> AgentRunner {
-    let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+    let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
         input_tx,
@@ -43,6 +42,9 @@ fn runner_with_channels(
         foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
         usage: UsageCounts::default(),
@@ -100,6 +102,8 @@ fn dummy_control_request() -> ControlRequest {
     let (response_tx, _response_rx) = oneshot::channel();
     ControlRequest {
         request: Request::Prune,
+        intended_session_id: uuid::Uuid::nil(),
+        intended_attachment_epoch: 0,
         response_tx,
     }
 }
@@ -415,6 +419,32 @@ async fn control_request_acks_preserve_send_order() {
             "/pin-context: pinned (survives /compact verbatim): second",
         ]
     );
+}
+
+#[tokio::test]
+async fn successful_repair_resume_ack_wakes_retained_submission_retry() {
+    let mut app = app();
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let (input_tx, _input_rx) = mpsc::channel(1);
+    let (runner, mut retry_rx) =
+        AgentRunner::stub_with_channels_and_submission_watch(control_tx, input_tx);
+    let session_id = runner.session_id();
+    app.agent_runner = Some(Ok(runner));
+
+    app.send_daemon_request(
+        "/resume",
+        Request::RepairResume { session_id },
+        ControlApplied::RepairResume,
+    );
+    let control = control_rx.recv().await.expect("repair control request");
+    control.response_tx.send(Ok(Response::Ack)).unwrap();
+    drain_control_events(&mut app).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), retry_rx.changed())
+        .await
+        .expect("successful repair ACK wakes retained submissions")
+        .expect("retry watch remains open");
+    assert_eq!(*retry_rx.borrow_and_update(), session_id);
 }
 
 #[tokio::test]

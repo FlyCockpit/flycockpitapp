@@ -3002,11 +3002,8 @@ fn remove_project_shadow_path(
 ) -> Result<bool, String> {
     let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(project_config)
         .map_err(|e| e.to_string())?;
-    let removed = doc.remove_raw_path(path);
-    if removed {
-        doc.save_raw().map_err(|e| e.to_string())?;
-    }
-    Ok(removed)
+    doc.remove_raw_path_and_save(path)
+        .map_err(|e| e.to_string())
 }
 
 fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {

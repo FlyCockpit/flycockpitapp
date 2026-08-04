@@ -3,13 +3,23 @@
     "data": {
       "default_selection": {
         "model": "gpt-5",
-        "provider": "openai"
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
       },
       "diverged": false,
       "generation": 3,
       "selection": {
         "model": "gpt-5",
-        "provider": "openai"
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
       },
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
@@ -686,13 +696,23 @@
         "active_state": {
           "default_selection": {
             "model": "gpt-5",
-            "provider": "openai"
+            "prompt_cache_retention": "extended",
+            "provider": "openai",
+            "reasoning_effort": {
+              "value": "high"
+            },
+            "thinking_mode": "high"
           },
           "diverged": false,
           "generation": 3,
           "selection": {
             "model": "gpt-5",
-            "provider": "openai"
+            "prompt_cache_retention": "extended",
+            "provider": "openai",
+            "reasoning_effort": {
+              "value": "high"
+            },
+            "thinking_mode": "high"
           }
         },
         "default_update": {
@@ -700,9 +720,12 @@
         },
         "status": "applied"
       },
+      "prompt_cache_retention": "extended",
       "provider": "openai",
+      "reasoning_effort": "high",
       "selection_id": "11111111-1111-4111-8111-111111111111",
-      "session_id": "11111111-1111-4111-8111-111111111111"
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "thinking_mode": "high"
     },
     "event": "model_selection_result",
     "kind": "evt",
@@ -757,6 +780,7 @@
   },
   "preflight_started": {
     "data": {
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "preflight_started",
@@ -1026,6 +1050,7 @@
   },
   "session_persist_failed": {
     "data": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
       "error": "error-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
@@ -1223,6 +1248,7 @@
   },
   "user_message_recorded": {
     "data": {
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "preflight_cleaned": "preflight_cleaned-fixture",
       "seq": 7,
       "session_id": "11111111-1111-4111-8111-111111111111"
@@ -1233,9 +1259,20 @@
   },
   "user_message_retracted": {
     "data": {
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "event": "user_message_retracted",
+    "kind": "evt",
+    "v": 6
+  },
+  "user_messages_terminated": {
+    "data": {
+      "client_submission_ids": ["11111111-1111-4111-8111-111111111111"],
+      "disposition": "preflight_rejected",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "event": "user_messages_terminated",
     "kind": "evt",
     "v": 6
   },

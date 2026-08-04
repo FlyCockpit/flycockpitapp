@@ -484,7 +484,11 @@ pub struct RunArgs {
     pub agent_file: Option<PathBuf>,
 
     /// Override the model: `provider/model-id`.
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        conflicts_with_all = ["continue_session", "session"]
+    )]
     pub model: Option<String>,
 
     /// Continue the workspace's most recent session by last-message time.
@@ -1710,6 +1714,33 @@ mod tests {
         assert_eq!(args.session.as_deref(), Some(id.as_str()));
         assert_eq!(args.message, ["follow up"]);
         assert_eq!(args.output_format(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn run_model_conflicts_with_session_resume_flags() {
+        let session = uuid::Uuid::new_v4().to_string();
+        for args in [
+            vec![
+                "cockpit",
+                "run",
+                "hi",
+                "--model",
+                "p/m",
+                "--continue-session",
+            ],
+            vec![
+                "cockpit",
+                "run",
+                "hi",
+                "--model",
+                "p/m",
+                "--session",
+                session.as_str(),
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

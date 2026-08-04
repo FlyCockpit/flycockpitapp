@@ -82,6 +82,7 @@ fn copy_selection_prefers_single_user_message_markdown_source() {
         expanded: false,
         timestamp: chrono::Local::now(),
         seq: None,
+        optimistic_submission_id: None,
         preflight_pending: false,
         persist_failed: false,
     }]
@@ -149,6 +150,7 @@ fn copy_selection_cross_message_falls_back_to_plaintext() {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         },

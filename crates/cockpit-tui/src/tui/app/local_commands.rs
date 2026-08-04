@@ -58,94 +58,242 @@ impl App {
     }
 
     pub(super) fn has_pending_session_switch_action(&self) -> bool {
-        self.async_actions
-            .has_pending_kind(&AsyncActionKind::Internal("session.switch"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.resume"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.fork"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.side"))
-            || self
-                .async_actions
-                .has_pending_kind(&AsyncActionKind::Internal("session.side.return"))
+        self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
     }
 
+    fn session_switch_targets_match(
+        left: agent_runner::SessionTarget,
+        right: agent_runner::SessionTarget,
+    ) -> bool {
+        match (left, right) {
+            (agent_runner::SessionTarget::New, agent_runner::SessionTarget::New) => true,
+            (
+                agent_runner::SessionTarget::Resume {
+                    session_id: left, ..
+                },
+                agent_runner::SessionTarget::Resume {
+                    session_id: right, ..
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    pub(super) fn begin_session_switch_submission_target(
+        &mut self,
+        target: agent_runner::SessionTarget,
+    ) {
+        debug_assert!(self.pending_session_switch_target.is_none());
+        debug_assert!(self.pending_ephemeral_session_switch_intent.is_none());
+        self.pending_session_switch_target = Some(target);
+        if let Some(index) = self
+            .retained_session_switch_submissions
+            .iter()
+            .position(|retained| {
+                retained.retry_intent.is_none()
+                    && retained.target.is_some_and(|retained_target| {
+                        Self::session_switch_targets_match(retained_target, target)
+                    })
+            })
+        {
+            let mut retained = self.retained_session_switch_submissions.remove(index);
+            self.pending_session_switch_submissions
+                .append(&mut retained.submissions);
+        }
+    }
+
+    pub(super) fn begin_ephemeral_session_switch_submission_target(
+        &mut self,
+        target: agent_runner::SessionTarget,
+        retry_intent: EphemeralSessionSwitchIntent,
+    ) {
+        debug_assert!(self.pending_session_switch_target.is_none());
+        debug_assert!(self.pending_ephemeral_session_switch_intent.is_none());
+        self.pending_session_switch_target = Some(target);
+        self.pending_ephemeral_session_switch_intent = Some(retry_intent);
+        if let Some(index) = self
+            .retained_session_switch_submissions
+            .iter()
+            .position(|retained| retained.retry_intent == Some(retry_intent))
+        {
+            let mut retained = self.retained_session_switch_submissions.remove(index);
+            self.pending_session_switch_submissions
+                .append(&mut retained.submissions);
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn queue_pending_session_switch_submission(
         &mut self,
         submission: cockpit_core::engine::message::UserSubmission,
         error_prefix: &str,
         optimistic_tag_entries: usize,
         owns_working_span: bool,
-        queued_text: Option<String>,
+    ) {
+        self.queue_pending_session_switch_submission_with_optimistic_state(
+            submission,
+            error_prefix,
+            owns_working_span,
+            OptimisticSubmissionState {
+                id: uuid::Uuid::new_v4(),
+                tag_entries: optimistic_tag_entries,
+                history: Vec::new(),
+                queue_item: None,
+            },
+        );
+    }
+
+    pub(super) fn queue_pending_session_switch_submission_with_optimistic_state(
+        &mut self,
+        submission: cockpit_core::engine::message::UserSubmission,
+        error_prefix: &str,
+        owns_working_span: bool,
+        optimistic: OptimisticSubmissionState,
     ) {
         self.pending_session_switch_submissions
             .push(PendingSessionSwitchSubmission {
                 submission,
+                optimistic_submission_id: optimistic.id,
                 error_prefix: error_prefix.to_string(),
-                optimistic_tag_entries,
+                optimistic_tag_entries: optimistic.tag_entries,
                 owns_working_span,
-                queued_text,
+                optimistic_history: optimistic.history,
+                optimistic_queue_item: optimistic.queue_item,
             });
     }
 
     pub(super) fn flush_pending_session_switch_submissions(&mut self) {
-        let pending = std::mem::take(&mut self.pending_session_switch_submissions);
-        for pending in pending {
-            let outcome = match self.agent_runner.as_ref() {
-                Some(Ok(runner)) => match runner.input_tx.try_send(pending.submission.clone()) {
-                    Ok(_) => {
-                        self.current_session_persisted = true;
-                        if pending.owns_working_span {
-                            self.fresh_queue_ack = FreshQueueAck::AwaitingAck;
-                        }
-                        DispatchOutcome::Sent
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        DispatchOutcome::QueueFull
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        DispatchOutcome::DriverClosed
-                    }
-                },
-                Some(Err(_)) => DispatchOutcome::RunnerFailed,
-                None => DispatchOutcome::NoRunner,
-            };
-            if outcome != DispatchOutcome::Sent {
-                self.reconcile_pending_session_switch_submission(pending, outcome);
+        let mut pending = std::mem::take(&mut self.pending_session_switch_submissions);
+        if pending.is_empty() {
+            self.pending_session_switch_target = None;
+            self.pending_ephemeral_session_switch_intent = None;
+            return;
+        }
+        let submissions = pending
+            .iter_mut()
+            .map(|pending| {
+                (
+                    pending.optimistic_submission_id,
+                    std::mem::take(&mut pending.submission),
+                )
+            })
+            .collect();
+        let result = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.try_send_session_switch_inputs(submissions),
+            Some(Err(_)) => Err((agent_runner::InputNotDelivered::RunnerClosed, submissions)),
+            None => Err((agent_runner::InputNotDelivered::RunnerClosed, submissions)),
+        };
+        match result {
+            Ok(()) => {
+                self.pending_session_switch_target = None;
+                self.pending_ephemeral_session_switch_intent = None;
+                self.current_session_persisted = true;
+                if let Some(pending) = pending.iter().find(|pending| pending.owns_working_span) {
+                    self.fresh_queue_ack =
+                        FreshQueueAck::AwaitingAck(pending.optimistic_submission_id);
+                }
+            }
+            Err((agent_runner::InputNotDelivered::QueueFull, submissions)) => {
+                // A switch task's FIFO flush normally guarantees capacity for
+                // the single batch item. If a synthetic runner or future
+                // producer violates that invariant, retain every payload and
+                // retry on the next App tick; capacity alone is never a
+                // delivery failure.
+                for (pending, (optimistic_submission_id, submission)) in
+                    pending.iter_mut().zip(submissions)
+                {
+                    debug_assert_eq!(pending.optimistic_submission_id, optimistic_submission_id);
+                    pending.submission = submission;
+                }
+                self.pending_session_switch_submissions = pending;
+            }
+            Err((agent_runner::InputNotDelivered::RunnerClosed, submissions)) => {
+                for (pending, (optimistic_submission_id, submission)) in
+                    pending.iter_mut().zip(submissions)
+                {
+                    debug_assert_eq!(pending.optimistic_submission_id, optimistic_submission_id);
+                    pending.submission = submission;
+                }
+                self.retain_failed_session_switch_submissions(
+                    pending,
+                    DispatchOutcome::DriverClosed,
+                );
             }
         }
     }
 
+    /// Retry only the exceptional backpressure case from the lossless
+    /// post-switch batch transfer. Returns whether the pending count changed.
+    pub(super) fn retry_pending_session_switch_submissions(&mut self) -> bool {
+        if self.session_switch_in_progress() || self.pending_session_switch_submissions.is_empty() {
+            return false;
+        }
+        let before = self.pending_session_switch_submissions.len();
+        self.flush_pending_session_switch_submissions();
+        self.pending_session_switch_submissions.len() != before
+    }
+
     pub(super) fn fail_pending_session_switch_submissions(&mut self) {
         let pending = std::mem::take(&mut self.pending_session_switch_submissions);
-        for pending in pending {
-            self.reconcile_pending_session_switch_submission(
-                pending,
-                DispatchOutcome::SessionSwitching,
-            );
+        self.retain_failed_session_switch_submissions(pending, DispatchOutcome::SessionSwitching);
+    }
+
+    fn retain_failed_session_switch_submissions(
+        &mut self,
+        pending: Vec<PendingSessionSwitchSubmission>,
+        outcome: DispatchOutcome,
+    ) {
+        let target = self.pending_session_switch_target.take();
+        let retry_intent = self.pending_ephemeral_session_switch_intent.take();
+        if pending.is_empty() {
+            return;
+        }
+        for submission in &pending {
+            self.reconcile_pending_session_switch_submission(submission, outcome);
+        }
+        if let Some(group) = self
+            .retained_session_switch_submissions
+            .iter_mut()
+            .find(|group| {
+                if let Some(retry_intent) = retry_intent {
+                    group.retry_intent == Some(retry_intent)
+                } else {
+                    group.retry_intent.is_none() && group.target == target
+                }
+            })
+        {
+            group.target = target;
+            group.submissions.extend(pending);
+        } else {
+            self.retained_session_switch_submissions
+                .push(RetainedSessionSwitchSubmissions {
+                    target,
+                    retry_intent,
+                    submissions: pending,
+                });
         }
     }
 
     fn reconcile_pending_session_switch_submission(
         &mut self,
-        pending: PendingSessionSwitchSubmission,
+        pending: &PendingSessionSwitchSubmission,
         outcome: DispatchOutcome,
     ) {
-        if let Some(queued_text) = pending.queued_text
-            && let Some(pos) = self.queue.iter().position(|item| item.text == queued_text)
+        if pending.optimistic_queue_item.is_some()
+            && let Some(pos) = self
+                .queue
+                .iter()
+                .position(|item| item.id == pending.optimistic_submission_id)
         {
             self.queue.remove(pos);
         }
         if pending.owns_working_span {
             self.fresh_queue_ack = FreshQueueAck::None;
-            self.reconcile_failed_dispatch(
+            self.reconcile_failed_dispatch_by_id(
                 outcome,
                 &pending.error_prefix,
                 pending.optimistic_tag_entries,
+                pending.optimistic_submission_id,
             );
             if outcome.span_orphaned() {
                 self.end_working_span();
@@ -158,6 +306,89 @@ impl App {
                 expanded: false,
             });
         }
+    }
+
+    pub(super) fn retain_pre_dispatch_submission(
+        &mut self,
+        intended_session_id: Option<uuid::Uuid>,
+        pending: PendingSessionSwitchSubmission,
+        outcome: DispatchOutcome,
+    ) {
+        self.reconcile_pending_session_switch_submission(&pending, outcome);
+        self.retained_pre_dispatch_submissions
+            .push(RetainedPreDispatchSubmission {
+                intended_session_id,
+                pending,
+            });
+    }
+
+    /// Retry app-owned payloads only after the same durable session has an
+    /// accepting dispatcher again. A full channel blocks later payloads for
+    /// that attachment so FIFO order cannot be inverted.
+    pub(super) fn retry_retained_pre_dispatch_submissions(&mut self) -> bool {
+        if self.session_switch_in_progress() || self.retained_pre_dispatch_submissions.is_empty() {
+            return false;
+        }
+        let current_session_id = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.session_id(),
+            _ => return false,
+        };
+        let retained = std::mem::take(&mut self.retained_pre_dispatch_submissions);
+        let mut remaining = Vec::with_capacity(retained.len());
+        let mut current_attachment_blocked = false;
+        let mut changed = false;
+        for mut retained in retained {
+            if retained.intended_session_id.is_none() {
+                retained.intended_session_id = Some(current_session_id);
+            }
+            if retained.intended_session_id != Some(current_session_id)
+                || current_attachment_blocked
+            {
+                remaining.push(retained);
+                continue;
+            }
+            let submission = std::mem::take(&mut retained.pending.submission);
+            let result = match self.agent_runner.as_ref() {
+                Some(Ok(runner)) => runner.try_send_optimistic_input(
+                    submission,
+                    retained.pending.optimistic_submission_id,
+                ),
+                _ => unreachable!("runner checked before retry loop"),
+            };
+            match result {
+                Ok(()) => {
+                    changed = true;
+                    self.current_session_persisted = true;
+                    if retained.pending.owns_working_span {
+                        if let Some(HistoryEntry::User { persist_failed, .. }) =
+                            self.history.iter_mut().rev().find(|entry| {
+                                matches!(
+                                    entry,
+                                    HistoryEntry::User {
+                                        optimistic_submission_id: Some(id),
+                                        ..
+                                    } if *id == retained.pending.optimistic_submission_id
+                                )
+                            })
+                        {
+                            *persist_failed = false;
+                        }
+                        if !self.busy {
+                            self.begin_working_span();
+                        }
+                        self.fresh_queue_ack =
+                            FreshQueueAck::AwaitingAck(retained.pending.optimistic_submission_id);
+                    }
+                }
+                Err((_outcome, submission)) => {
+                    retained.pending.submission = *submission;
+                    current_attachment_blocked = true;
+                    remaining.push(retained);
+                }
+            }
+        }
+        self.retained_pre_dispatch_submissions = remaining;
+        changed
     }
 
     pub(super) fn resolve_local_choice(&mut self, selection: LocalChoiceSelection) {
@@ -230,70 +461,137 @@ impl App {
             submission.tag_expansions = tag_expansions.to_vec();
         }
         self.lock_pending_agent_switch_log();
+        let optimistic_submission_id = uuid::Uuid::new_v4();
+        let optimistic_history_start = self.history.len();
         self.history.push(HistoryEntry::User {
             text: display,
             cleaned: None,
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: Some(optimistic_submission_id),
             preflight_pending: false,
             persist_failed: false,
         });
         self.push_tag_call_entries(tag_expansions);
+        let optimistic_history = self
+            .history
+            .iter()
+            .skip(optimistic_history_start)
+            .cloned()
+            .collect();
         if self.has_pending_session_switch_action() {
-            self.queue_pending_session_switch_submission(
+            self.queue_pending_session_switch_submission_with_optimistic_state(
                 submission,
                 error_prefix,
-                tag_expansions.len(),
                 owns_working_span,
-                None,
+                OptimisticSubmissionState {
+                    id: optimistic_submission_id,
+                    tag_entries: tag_expansions.len(),
+                    history: optimistic_history,
+                    queue_item: None,
+                },
             );
             return DispatchOutcome::Sent;
         }
         self.ensure_agent_runner();
-        let outcome = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
+        let intended_session_id = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(agent_runner::AgentRunner::session_id)
+            .or(self.launch.session_id);
+        let (outcome, undelivered_submission) = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => match runner
+                .try_send_optimistic_input(submission, optimistic_submission_id)
+            {
                 Ok(_) => {
                     self.current_session_persisted = true;
                     if owns_working_span {
-                        self.fresh_queue_ack = FreshQueueAck::AwaitingAck;
+                        self.fresh_queue_ack = FreshQueueAck::AwaitingAck(optimistic_submission_id);
                     }
-                    DispatchOutcome::Sent
+                    (DispatchOutcome::Sent, None)
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => DispatchOutcome::QueueFull,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    DispatchOutcome::DriverClosed
+                Err((agent_runner::InputNotDelivered::QueueFull, submission)) => {
+                    (DispatchOutcome::QueueFull, Some(*submission))
+                }
+                Err((agent_runner::InputNotDelivered::RunnerClosed, submission)) => {
+                    (DispatchOutcome::DriverClosed, Some(*submission))
                 }
             },
-            Some(Err(_)) => DispatchOutcome::RunnerFailed,
-            None => DispatchOutcome::NoRunner,
+            Some(Err(_)) => (DispatchOutcome::RunnerFailed, Some(submission)),
+            None => (DispatchOutcome::NoRunner, Some(submission)),
         };
-        if outcome != DispatchOutcome::Sent {
+        if let Some(submission) = undelivered_submission {
             if owns_working_span {
                 self.fresh_queue_ack = FreshQueueAck::None;
             }
-            self.reconcile_failed_dispatch(outcome, error_prefix, tag_expansions.len());
-        }
-        if owns_working_span && outcome.span_orphaned() {
-            self.end_working_span();
+            self.retain_pre_dispatch_submission(
+                intended_session_id,
+                PendingSessionSwitchSubmission {
+                    submission,
+                    optimistic_submission_id,
+                    error_prefix: error_prefix.to_string(),
+                    optimistic_tag_entries: tag_expansions.len(),
+                    owns_working_span,
+                    optimistic_history,
+                    optimistic_queue_item: None,
+                },
+                outcome,
+            );
         }
         outcome
     }
 
+    #[cfg(test)]
     pub(super) fn reconcile_failed_dispatch(
         &mut self,
         outcome: DispatchOutcome,
         error_prefix: &str,
         optimistic_tag_entries: usize,
     ) {
-        if let Some(idx) = self.history.iter().rposition(|entry| {
+        let Some(optimistic_submission_id) = self.history.iter().rev().find_map(|entry| {
+            if let HistoryEntry::User {
+                optimistic_submission_id: Some(id),
+                seq: None,
+                persist_failed: false,
+                ..
+            } = entry
+            {
+                Some(*id)
+            } else {
+                None
+            }
+        }) else {
+            self.history.push(HistoryEntry::CommandError {
+                line: failed_dispatch_line(error_prefix, outcome),
+            });
+            return;
+        };
+        self.reconcile_failed_dispatch_by_id(
+            outcome,
+            error_prefix,
+            optimistic_tag_entries,
+            optimistic_submission_id,
+        );
+    }
+
+    fn reconcile_failed_dispatch_by_id(
+        &mut self,
+        outcome: DispatchOutcome,
+        error_prefix: &str,
+        optimistic_tag_entries: usize,
+        optimistic_submission_id: uuid::Uuid,
+    ) {
+        if let Some(idx) = self.history.iter().position(|entry| {
             matches!(
                 entry,
                 HistoryEntry::User {
+                    optimistic_submission_id: Some(id),
                     seq: None,
                     persist_failed: false,
                     ..
-                }
+                } if *id == optimistic_submission_id
             )
         }) {
             for _ in 0..optimistic_tag_entries {
@@ -394,22 +692,12 @@ impl App {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             unreachable!("goal_session_id checks the attached runner first");
         };
-        let attached_request_tx = runner.attached_request_tx.clone();
+        let attached_request = runner.attached_request_binding();
         self.async_actions.start(
             AsyncActionKind::DaemonRpc(kind),
             AsyncActionPolicy::AllowConcurrent,
             async move {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                attached_request_tx
-                    .send(crate::tui::agent_runner::AttachedRequest {
-                        request,
-                        response_tx,
-                    })
-                    .await
-                    .map_err(|_| "daemon client task has stopped".to_string())?;
-                let response = response_rx
-                    .await
-                    .map_err(|_| "daemon client dropped reply channel".to_string())??;
+                let response = attached_request.request(request).await?;
                 match response {
                     cockpit_core::daemon::proto::Response::GoalStatus { goal: Some(goal) } => {
                         let budget = goal
@@ -485,7 +773,9 @@ impl App {
             job_id: None,
             preflight_cleaned: None,
             queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
             queue_target: None,
+            pending_terminal_disposition: None,
         };
         self.dispatch_optimistic_user_submission(display, submission, "/skill", true, &[]);
     }

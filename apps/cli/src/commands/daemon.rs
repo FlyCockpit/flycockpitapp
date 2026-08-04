@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::DaemonCommand;
-use crate::daemon::client::DaemonClient;
+use crate::daemon::client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths, DaemonStatus};
 
@@ -308,7 +308,7 @@ struct RunningJsonStatus {
 async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
     let client = match DaemonClient::connect(socket).await {
         Ok(client) => client,
-        Err(error) if is_wire_protocol_mismatch(&error.to_string()) => {
+        Err(error) if is_protocol_version_mismatch(&error) => {
             return RunningStatusVersionRead::ProtocolMismatch;
         }
         Err(error) => return RunningStatusVersionRead::ReadFailed(error.to_string()),
@@ -341,10 +341,6 @@ async fn read_daemon_versions(socket: &Path) -> RunningStatusVersionRead {
 
 fn is_protocol_mismatch_status_error(error: &proto::ErrorPayload) -> bool {
     error.code == proto::ErrorCode::ProtocolVersion
-}
-
-fn is_wire_protocol_mismatch(message: &str) -> bool {
-    message.contains("wire protocol version mismatch")
 }
 
 fn render_running_status(
@@ -498,7 +494,6 @@ mod tests {
     };
     use crate::daemon::proto;
     use crate::daemon::{self, DaemonStatus};
-    use std::time::Duration;
 
     #[test]
     fn stale_and_not_running_note_mentions_ephemeral_tui_without_discovery() {
@@ -543,7 +538,7 @@ mod tests {
     fn restart_fallback_release_wait_uses_default_grace_when_override_cannot_be_forwarded() {
         assert_eq!(
             restart_release_timeout_for_stop_path(Some(0), true),
-            Duration::from_secs(2)
+            daemon::restart_release_timeout(Some(0))
         );
         assert_eq!(
             restart_release_timeout_for_stop_path(Some(0), false),

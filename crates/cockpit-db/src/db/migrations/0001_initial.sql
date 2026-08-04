@@ -627,6 +627,24 @@ CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
 CREATE INDEX idx_sevents_session_trust_seq ON session_events (session_id, model_trust, seq)
   WHERE model_trust IS NOT NULL;
 
+-- Durable idempotency tombstones for accepted client submissions that never
+-- become user_message events. A removed, cancelled, or preflight-rejected
+-- UUID must remain terminal across worker/daemon restarts; otherwise an
+-- ambiguous exact retry could execute work the user already discarded.
+CREATE TABLE client_submission_terminal_receipts (
+    session_id          TEXT NOT NULL,
+    client_submission_id TEXT NOT NULL,
+    fingerprint         TEXT NOT NULL,
+    wire_fingerprint    TEXT NOT NULL,
+    origin_principal    TEXT,
+    disposition         TEXT NOT NULL CHECK (disposition IN (
+        'removed', 'cancelled', 'preflight_rejected'
+    )),
+    created_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (session_id, client_submission_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
 -- Large compaction records spill out of the inline event JSON as one canonical
 -- payload (brief + handoff + serialized tail). The `session_compacted` event
 -- remains authoritative and carries this opaque, session-scoped id.

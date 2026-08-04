@@ -20,6 +20,7 @@ const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelSelectionActiveState {
     pub selection: cockpit_config::config::providers::ActiveModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_selection: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub diverged: bool,
     pub generation: u64,
@@ -50,6 +51,29 @@ pub enum ModelSelectionOutcome {
         user_message: String,
         diagnostic_code: String,
     },
+}
+
+/// Durable terminal disposition for one or more accepted client submissions.
+/// Once emitted, the correlated ids must never be replayed by a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageTerminalDisposition {
+    Removed,
+    Cancelled,
+    PreflightRejected,
+}
+
+impl From<cockpit_db::db::session_log::ClientSubmissionTerminalDisposition>
+    for UserMessageTerminalDisposition
+{
+    fn from(disposition: cockpit_db::db::session_log::ClientSubmissionTerminalDisposition) -> Self {
+        use cockpit_db::db::session_log::ClientSubmissionTerminalDisposition as Db;
+        match disposition {
+            Db::Removed => Self::Removed,
+            Db::Cancelled => Self::Cancelled,
+            Db::PreflightRejected => Self::PreflightRejected,
+        }
+    }
 }
 
 /// Why a turn's inference failed.
@@ -588,7 +612,7 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking_mode: Option<String>,
+        thinking_mode: Option<cockpit_config::config::providers::ThinkingMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_cache_retention: Option<PromptCacheRetention>,
         outcome: ModelSelectionOutcome,
@@ -676,6 +700,9 @@ pub enum Event {
     UserMessageRecorded {
         session_id: Uuid,
         seq: i64,
+        /// Client-generated ids folded into this durable user row. Ordinary
+        /// local/system injections carry an empty list.
+        client_submission_ids: Vec<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preflight_cleaned: Option<String>,
     },
@@ -696,11 +723,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preflight_cleaned: Option<String>,
     },
-    /// Deferred session persistence failed before inference started. The
-    /// server dropped the message; clients should clear optimistic busy state
-    /// and show the full error chain.
+    /// Deferred session persistence failed before inference started, so the
+    /// worker did not accept this exact message. Originating clients should
+    /// retain the complete UUID/payload for a state-change retry.
     SessionPersistFailed {
         session_id: Uuid,
+        /// Exact client submission rejected before it reached the driver.
+        /// Clients must correlate by this id rather than transcript order
+        /// because multiple optimistic submissions may be in flight.
+        client_submission_id: Uuid,
         error: String,
     },
 
@@ -722,6 +753,16 @@ pub enum Event {
     /// until the message resolves. UI-only — never enters the model's context.
     PreflightStarted {
         session_id: Uuid,
+        client_submission_ids: Vec<Uuid>,
+    },
+
+    /// Accepted client submissions reached a durable terminal outcome without
+    /// entering session history. Clients must retire the exact retained wire
+    /// requests and remove only the correlated optimistic rows.
+    UserMessagesTerminated {
+        session_id: Uuid,
+        client_submission_ids: Vec<Uuid>,
+        disposition: UserMessageTerminalDisposition,
     },
 
     /// The just-submitted message was retracted before send because the
@@ -730,6 +771,7 @@ pub enum Event {
     /// block/override UX stands alone. UI-only.
     UserMessageRetracted {
         session_id: Uuid,
+        client_submission_ids: Vec<Uuid>,
     },
 
     /// A non-blocking system notice (warn chip) for the transcript.
@@ -1387,6 +1429,7 @@ macro_rules! event_variants {
             (Event::SessionPersistFailed { .. }, "session_persist_failed");
             (Event::SessionDriverFailed { .. }, "session_driver_failed");
             (Event::PreflightStarted { .. }, "preflight_started");
+            (Event::UserMessagesTerminated { .. }, "user_messages_terminated");
             (Event::UserMessageRetracted { .. }, "user_message_retracted");
             (Event::Notice { .. }, "notice");
             (Event::LspNotice { .. }, "lsp_notice");

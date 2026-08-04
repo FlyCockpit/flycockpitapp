@@ -1,4 +1,9 @@
-import type { HistoryEntry, InterruptOption, SessionSummary } from "@flycockpit/cockpit-protocol";
+import {
+  type HistoryEntry,
+  type InterruptOption,
+  type SessionSummary,
+} from "@flycockpit/cockpit-protocol";
+import { shouldRetainUserMessageSubmission } from "@flycockpit/cockpit-protocol/client";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams } from "expo-router";
@@ -21,12 +26,24 @@ import {
   type RiskTone,
   resolveFromSelection,
 } from "@/utils/interrupt-view";
+import { NativeAttachCoordinator } from "@/utils/session-attach";
 import {
+  acceptedClientSubmissionIdsFromEvent,
   appendOptimisticUserMessage,
+  clearAcceptedRetryDrafts,
+  clientSubmissionIdsFromHistory,
+  forgetUserMessageSubmission,
+  isCurrentUserMessageSubmission,
   type NativeHistoryEntry,
   nativeAttachRuntimeState,
+  prepareUserMessageSubmission,
+  type RetainedUserMessageSubmission,
+  type RetainedUserMessageSubmissions,
+  reconcileAcceptedRetrySubmissions,
   reduceNativeSessionEvent,
   removeOptimisticUserMessage,
+  restoreRetainedUserMessagesAfterAttach,
+  retainUserMessageSubmission,
   toNativeHistoryEntry,
   warnNativeSessionEvent,
 } from "@/utils/session-events";
@@ -79,9 +96,16 @@ export default function ProjectSessions() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialSession ?? null);
   const [history, setHistory] = useState<NativeHistoryEntry[]>([]);
-  const [message, setMessage] = useState("");
+  const [messagesBySession, setMessagesBySession] = useState<Record<string, string>>({});
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [retrySubmissionsBySession, setRetrySubmissionsBySession] = useState<
+    Record<string, RetainedUserMessageSubmission | undefined>
+  >({});
+  const retrySubmissionsRef = useRef<Record<string, RetainedUserMessageSubmission | undefined>>({});
   const [interruptDrafts, setInterruptDrafts] = useState<Record<string, InterruptDraft>>({});
   const [busy, setBusy] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+  const [attachingSessionId, setAttachingSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [daemonState, setDaemonState] = useState(emptyNativeDaemonState);
   const [activeModel, setActiveModel] = useState<ReturnType<typeof activeModelView> | null>(null);
@@ -91,31 +115,87 @@ export default function ProjectSessions() {
   const daemonStateRef = useRef(emptyNativeDaemonState);
   const activeModelStateRef = useRef<Parameters<typeof activeModelView>[0]>(null);
   const llmModeRef = useRef<string | null>(null);
-  const optimisticMessageCounterRef = useRef(0);
+  const pendingUserSubmissionsRef = useRef<RetainedUserMessageSubmissions>(new Map());
+  const latestSubmitIdRef = useRef<string | null>(null);
+  const sessionListRequestRef = useRef(0);
+  const attachCoordinatorRef = useRef(new NativeAttachCoordinator());
+  const attachLifecycleRef = useRef<{
+    client: object | null;
+    connectionEpoch: number;
+  }>({ client: null, connectionEpoch: 0 });
+  const lastAutoAttachRef = useRef<{ client: object; connectionEpoch: number } | null>(null);
 
-  const handleSessionEvent = useCallback((raw: unknown) => {
-    const result = reduceNativeSessionEvent(
-      {
-        history: historyRef.current,
-        selectedSessionId: selectedSessionRef.current,
-        daemonState: daemonStateRef.current,
-        activeModel: activeModelStateRef.current,
-        llmMode: llmModeRef.current,
-      },
-      raw,
-    );
-    warnNativeSessionEvent(result);
-    historyRef.current = result.state.history;
-    daemonStateRef.current = result.state.daemonState ?? emptyNativeDaemonState;
-    activeModelStateRef.current = result.state.activeModel ?? null;
-    llmModeRef.current = result.state.llmMode ?? null;
-    setHistory(result.state.history);
-    setDaemonState(daemonStateRef.current);
-    setActiveModel(activeModelView(activeModelStateRef.current, llmModeRef.current));
-    setLlmMode(llmModeRef.current);
+  const message = selectedSessionId ? (messagesBySession[selectedSessionId] ?? "") : "";
+  const retrySubmission = selectedSessionId
+    ? retrySubmissionsBySession[selectedSessionId]
+    : undefined;
+  const setSessionMessage = (sessionId: string, value: string | ((current: string) => string)) => {
+    setMessagesBySession((current) => {
+      const previous = current[sessionId] ?? "";
+      const next = typeof value === "function" ? value(previous) : value;
+      return { ...current, [sessionId]: next };
+    });
+  };
+  const setSessionRetry = (sessionId: string, submission: RetainedUserMessageSubmission | null) => {
+    const next = {
+      ...retrySubmissionsRef.current,
+      [sessionId]: submission ?? undefined,
+    };
+    retrySubmissionsRef.current = next;
+    setRetrySubmissionsBySession(next);
+  };
+
+  const reconcileAcceptedRetryDrafts = useCallback((acceptedIds: string[]) => {
+    const reconciled = reconcileAcceptedRetrySubmissions(retrySubmissionsRef.current, acceptedIds);
+    if (reconciled.retries !== retrySubmissionsRef.current) {
+      retrySubmissionsRef.current = reconciled.retries;
+      setRetrySubmissionsBySession(reconciled.retries);
+    }
+    if (reconciled.accepted.length > 0) {
+      setMessagesBySession((current) => clearAcceptedRetryDrafts(current, reconciled.accepted));
+    }
   }, []);
 
-  const { client, status, tokenQuery } = useNativeRemoteClient(instanceId, handleSessionEvent);
+  const handleSessionEvent = useCallback(
+    (raw: unknown) => {
+      const acceptedIds = acceptedClientSubmissionIdsFromEvent(raw, selectedSessionRef.current);
+      for (const id of acceptedIds) {
+        forgetUserMessageSubmission(pendingUserSubmissionsRef.current, id);
+      }
+      reconcileAcceptedRetryDrafts(acceptedIds);
+      const result = reduceNativeSessionEvent(
+        {
+          history: historyRef.current,
+          selectedSessionId: selectedSessionRef.current,
+          daemonState: daemonStateRef.current,
+          activeModel: activeModelStateRef.current,
+          llmMode: llmModeRef.current,
+        },
+        raw,
+      );
+      warnNativeSessionEvent(result);
+      historyRef.current = result.state.history;
+      daemonStateRef.current = result.state.daemonState ?? emptyNativeDaemonState;
+      activeModelStateRef.current = result.state.activeModel ?? null;
+      llmModeRef.current = result.state.llmMode ?? null;
+      setHistory(result.state.history);
+      setDaemonState(daemonStateRef.current);
+      setActiveModel(activeModelView(activeModelStateRef.current, llmModeRef.current));
+      setLlmMode(llmModeRef.current);
+    },
+    [reconcileAcceptedRetryDrafts],
+  );
+
+  const { client, status, connectionEpoch, tokenQuery } = useNativeRemoteClient(
+    instanceId,
+    handleSessionEvent,
+  );
+  const clientRef = useRef(client);
+  const statusRef = useRef(status);
+  const connectionEpochRef = useRef(connectionEpoch);
+  clientRef.current = client;
+  statusRef.current = status;
+  connectionEpochRef.current = connectionEpoch;
 
   useEffect(() => {
     selectedSessionRef.current = selectedSessionId;
@@ -125,41 +205,57 @@ export default function ProjectSessions() {
     () => history.filter((entry) => entry.kind === "interrupt" && !entry.interrupt.resolved),
     [history],
   );
+  const attachmentReadyFor = (sessionId: string) => {
+    const currentClient = clientRef.current;
+    return Boolean(
+      currentClient &&
+        statusRef.current === "connected" &&
+        attachCoordinatorRef.current.isReady(currentClient, connectionEpochRef.current, sessionId),
+    );
+  };
+  const selectedAttachmentReady = selectedSessionId ? attachmentReadyFor(selectedSessionId) : false;
   const modelView = activeModel ?? activeModelView(activeModelStateRef.current, llmMode);
+  const uiBusy = busy || loadingSessions || attachingSessionId !== null;
   const sendDisabled = composerSendDisabled({
     message,
-    busy,
+    busy: uiBusy || sendingMessage || !selectedAttachmentReady,
     draining: daemonState.draining,
+    repairRequired: daemonState.repairRequired,
   });
 
-  const loadSessions = async () => {
-    if (!client) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await client.listSessions({ project_id: projectId });
-      setSessions(result.sessions);
-      const nextSession = selectedSessionId ?? result.sessions[0]?.session_id ?? null;
-      setSelectedSessionId(nextSession);
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Could not load sessions.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const attach = async (sessionId: string) => {
-    if (!client) return;
-    setBusy(true);
+    const attachClient = clientRef.current;
+    const attachEpoch = connectionEpochRef.current;
+    if (!attachClient || statusRef.current !== "connected") return;
+    const coordinator = attachCoordinatorRef.current;
+    if (!coordinator.needsAttach(attachClient, attachEpoch, sessionId)) return;
+    const attempt = coordinator.begin(attachClient, attachEpoch, sessionId);
+    const attemptIsCurrent = () =>
+      statusRef.current === "connected" &&
+      coordinator.isCurrent(attempt, clientRef.current, connectionEpochRef.current);
+
+    setAttachingSessionId(sessionId);
     setError(null);
     try {
-      const result = await client.attach({ session_id: sessionId, interactive: true });
-      setSelectedSessionId(sessionId);
-      selectedSessionRef.current = sessionId;
-      const nextHistory = result.history.map((entry: HistoryEntry, index: number) =>
-        toNativeHistoryEntry(entry, index),
+      const result = await attachClient.attach({ session_id: sessionId, interactive: true });
+      if (!attemptIsCurrent()) return;
+      const acceptedIds = clientSubmissionIdsFromHistory(result.history);
+      const nextHistory = restoreRetainedUserMessagesAfterAttach(
+        result.history.map((entry: HistoryEntry, index: number) =>
+          toNativeHistoryEntry(entry, index),
+        ),
+        sessionId,
+        pendingUserSubmissionsRef.current,
       );
       const runtime = nativeAttachRuntimeState(result, daemonStateRef.current);
+      if (!coordinator.markApplied(attempt, clientRef.current, connectionEpochRef.current)) return;
+
+      for (const id of acceptedIds) {
+        forgetUserMessageSubmission(pendingUserSubmissionsRef.current, id);
+      }
+      reconcileAcceptedRetryDrafts(acceptedIds);
+      setSelectedSessionId(sessionId);
+      selectedSessionRef.current = sessionId;
       historyRef.current = nextHistory;
       daemonStateRef.current = runtime.daemonState;
       activeModelStateRef.current = runtime.activeModel;
@@ -168,33 +264,164 @@ export default function ProjectSessions() {
       setDaemonState(runtime.daemonState);
       setActiveModel(activeModelView(runtime.activeModel, runtime.llmMode));
       setLlmMode(runtime.llmMode);
+      const pending = [...pendingUserSubmissionsRef.current.values()].filter(
+        (submission) => submission.sessionId === sessionId,
+      );
+      for (const submission of pending) {
+        if (!attemptIsCurrent()) return;
+        const id = submission.params.client_submission_id;
+        if (!pendingUserSubmissionsRef.current.has(id)) continue;
+        try {
+          await attachClient.sendUserMessage(submission.params);
+        } catch (replayError) {
+          if (!attemptIsCurrent()) return;
+          if (
+            shouldRetainUserMessageSubmission(replayError) &&
+            pendingUserSubmissionsRef.current.has(id)
+          ) {
+            setSessionMessage(sessionId, (current) => current || submission.params.text);
+            setSessionRetry(sessionId, submission);
+            break;
+          }
+          forgetUserMessageSubmission(pendingUserSubmissionsRef.current, id);
+          if (retrySubmissionsRef.current[sessionId]?.params.client_submission_id === id) {
+            setSessionRetry(sessionId, null);
+          }
+          const withoutRejected = removeOptimisticUserMessage(historyRef.current, id);
+          historyRef.current = withoutRejected;
+          setHistory(withoutRejected);
+        }
+      }
     } catch (attachError) {
-      setError(attachError instanceof Error ? attachError.message : "Could not attach session.");
+      if (attemptIsCurrent()) {
+        setError(attachError instanceof Error ? attachError.message : "Could not attach session.");
+      }
     } finally {
-      setBusy(false);
+      if (coordinator.finish(attempt, clientRef.current, connectionEpochRef.current)) {
+        setAttachingSessionId(null);
+      }
+    }
+  };
+
+  const loadSessions = async () => {
+    const loadClient = clientRef.current;
+    const loadEpoch = connectionEpochRef.current;
+    if (!loadClient || statusRef.current !== "connected") return;
+    const requestId = ++sessionListRequestRef.current;
+    setLoadingSessions(true);
+    setError(null);
+    try {
+      const result = await loadClient.listSessions({ project_id: projectId });
+      if (
+        loadClient !== clientRef.current ||
+        loadEpoch !== connectionEpochRef.current ||
+        requestId !== sessionListRequestRef.current ||
+        statusRef.current !== "connected"
+      )
+        return;
+      setSessions(result.sessions);
+      const nextSession = selectedSessionRef.current ?? result.sessions[0]?.session_id ?? null;
+      setSelectedSessionId(nextSession);
+      selectedSessionRef.current = nextSession;
+      if (nextSession) void attach(nextSession);
+    } catch (loadError) {
+      if (
+        loadClient === clientRef.current &&
+        loadEpoch === connectionEpochRef.current &&
+        requestId === sessionListRequestRef.current
+      ) {
+        setError(loadError instanceof Error ? loadError.message : "Could not load sessions.");
+      }
+    } finally {
+      if (
+        loadClient === clientRef.current &&
+        loadEpoch === connectionEpochRef.current &&
+        requestId === sessionListRequestRef.current
+      ) {
+        setLoadingSessions(false);
+      }
     }
   };
 
   const sendMessage = async () => {
-    if (!client || !selectedSessionId || !message.trim()) return;
+    if (
+      !client ||
+      !selectedSessionId ||
+      !message.trim() ||
+      sendingMessage ||
+      !attachmentReadyFor(selectedSessionId) ||
+      daemonState.repairRequired
+    )
+      return;
+    const sessionId = selectedSessionId;
     const text = message.trim();
-    setMessage("");
-    optimisticMessageCounterRef.current += 1;
-    const optimisticId = String(optimisticMessageCounterRef.current);
-    const nextHistory = appendOptimisticUserMessage(historyRef.current, text, optimisticId);
-    historyRef.current = nextHistory;
-    setHistory(nextHistory);
-    try {
-      await client.sendUserMessage({ text });
-    } catch (sendError) {
-      setError(sendError instanceof Error ? sendError.message : "Could not send message.");
-      setMessage(text);
-      const historyWithoutOptimistic = removeOptimisticUserMessage(
+    setSessionMessage(sessionId, "");
+    setSendingMessage(true);
+    const prepared = prepareUserMessageSubmission(
+      sessionId,
+      text,
+      retrySubmission?.sessionId === sessionId && retrySubmission.params.text === text
+        ? retrySubmission
+        : undefined,
+    );
+    const submission = retainUserMessageSubmission(
+      pendingUserSubmissionsRef.current,
+      prepared.submission,
+    );
+    const isRetry = prepared.isRetry || submission !== prepared.submission;
+    latestSubmitIdRef.current = submission.params.client_submission_id;
+    if (!isRetry) {
+      const nextHistory = appendOptimisticUserMessage(
         historyRef.current,
-        optimisticId,
+        submission.params.display_text ?? submission.params.text,
+        submission.params.client_submission_id,
       );
-      historyRef.current = historyWithoutOptimistic;
-      setHistory(historyWithoutOptimistic);
+      historyRef.current = nextHistory;
+      setHistory(nextHistory);
+    }
+    try {
+      await client.sendUserMessage(submission.params);
+      // Queue ACK is not durable. Keep the exact request until the daemon's
+      // recorded/fold event or a later attach snapshot carries its receipt.
+    } catch (sendError) {
+      const isCurrentSubmission = isCurrentUserMessageSubmission(
+        selectedSessionRef.current,
+        latestSubmitIdRef.current,
+        submission,
+      );
+      const retainable = shouldRetainUserMessageSubmission(sendError);
+      if (
+        retainable &&
+        !pendingUserSubmissionsRef.current.has(submission.params.client_submission_id)
+      ) {
+        // A durable fold/record/attach receipt won the race with the
+        // ambiguous transport result, so acceptance is authoritative.
+        setSessionRetry(sessionId, null);
+        return;
+      }
+      if (isCurrentSubmission) {
+        setError(sendError instanceof Error ? sendError.message : "Could not send message.");
+      }
+      setSessionMessage(sessionId, (current) => current || text);
+      if (retainable) {
+        setSessionRetry(sessionId, submission);
+      } else {
+        forgetUserMessageSubmission(
+          pendingUserSubmissionsRef.current,
+          submission.params.client_submission_id,
+        );
+        setSessionRetry(sessionId, null);
+        if (isCurrentSubmission) {
+          const historyWithoutOptimistic = removeOptimisticUserMessage(
+            historyRef.current,
+            submission.params.client_submission_id,
+          );
+          historyRef.current = historyWithoutOptimistic;
+          setHistory(historyWithoutOptimistic);
+        }
+      }
+    } finally {
+      setSendingMessage(false);
     }
   };
 
@@ -211,7 +438,9 @@ export default function ProjectSessions() {
 
   const pasteClipboard = async () => {
     const text = await Clipboard.getStringAsync();
-    if (text) setMessage((current) => (current ? current + "\n" : "") + text);
+    if (text && selectedSessionId) {
+      setSessionMessage(selectedSessionId, (current) => (current ? current + "\n" : "") + text);
+    }
   };
 
   const copyFixCommand = async () => {
@@ -220,7 +449,8 @@ export default function ProjectSessions() {
   };
 
   const resumePausedWork = async () => {
-    if (!client || !daemonState.pausedWork) return;
+    if (!client || !daemonState.pausedWork || !attachmentReadyFor(daemonState.pausedWork.sessionId))
+      return;
     setBusy(true);
     setError(null);
     try {
@@ -235,7 +465,8 @@ export default function ProjectSessions() {
   };
 
   const cancelPausedWork = async () => {
-    if (!client || !daemonState.pausedWork) return;
+    if (!client || !daemonState.pausedWork || !attachmentReadyFor(daemonState.pausedWork.sessionId))
+      return;
     setBusy(true);
     setError(null);
     try {
@@ -267,7 +498,7 @@ export default function ProjectSessions() {
   };
 
   const resolveInterrupt = async (interruptId: string, selection: InterruptSelection) => {
-    if (!client || !selectedSessionId) return;
+    if (!client || !selectedSessionId || !attachmentReadyFor(selectedSessionId)) return;
     const interrupt = unresolvedInterrupts.find(
       (entry) => entry.kind === "interrupt" && entry.interrupt.interruptId === interruptId,
     );
@@ -293,13 +524,30 @@ export default function ProjectSessions() {
   };
 
   useEffect(() => {
+    const previous = attachLifecycleRef.current;
+    const lifecycleChanged =
+      previous.client !== client || previous.connectionEpoch !== connectionEpoch;
+    if (lifecycleChanged || status !== "connected") {
+      sessionListRequestRef.current += 1;
+      setLoadingSessions(false);
+      attachCoordinatorRef.current.invalidate();
+      setAttachingSessionId(null);
+    }
+    attachLifecycleRef.current = { client, connectionEpoch };
+  }, [client, connectionEpoch, status]);
+
+  useEffect(() => {
     if (status === "connected" && sessions.length === 0) loadSessions();
   }, [status, sessions.length]);
 
   useEffect(() => {
-    if (status === "connected" && selectedSessionId && history.length === 0)
-      attach(selectedSessionId);
-  }, [status, selectedSessionId, history.length]);
+    if (!client || status !== "connected" || connectionEpoch === 0) return;
+    const previous = lastAutoAttachRef.current;
+    if (previous?.client === client && previous.connectionEpoch === connectionEpoch) return;
+    lastAutoAttachRef.current = { client, connectionEpoch };
+    const sessionId = selectedSessionRef.current;
+    if (sessionId) void attach(sessionId);
+  }, [client, status, connectionEpoch]);
 
   return (
     <Container className="p-6">
@@ -339,18 +587,21 @@ export default function ProjectSessions() {
           <Text className="text-muted text-sm mt-1">{daemonState.draining.copy}</Text>
         </Surface>
       ) : null}
-      {busy ? <Spinner /> : null}
+      {uiBusy ? <Spinner /> : null}
 
       <View className="gap-3 mb-5">
         <View className="flex-row items-center justify-between">
           <Text className="text-foreground text-xl font-semibold">Sessions</Text>
-          <Button onPress={loadSessions} isDisabled={!client || busy}>
+          <Button onPress={loadSessions} isDisabled={!client || uiBusy}>
             <Button.Label>Refresh</Button.Label>
           </Button>
         </View>
         {sessions.map((session) => (
           <Card key={session.session_id} variant="secondary" className="p-4">
-            <Button onPress={() => attach(session.session_id)}>
+            <Button
+              onPress={() => attach(session.session_id)}
+              isDisabled={!client || status !== "connected" || uiBusy}
+            >
               <Button.Label>{formatSessionTitle(session)}</Button.Label>
             </Button>
             <Text className="text-muted text-sm mt-2">{sessionActivityLabel(session)}</Text>
@@ -366,7 +617,7 @@ export default function ProjectSessions() {
               <InterruptCard
                 key={entry.id}
                 entry={entry}
-                busy={busy}
+                busy={uiBusy || !selectedAttachmentReady}
                 draft={
                   interruptDrafts[entry.interrupt.interruptId] ?? { text: "", selectedIds: [] }
                 }
@@ -406,13 +657,26 @@ export default function ProjectSessions() {
                 {daemonState.pausedWork.items.length === 1 ? "" : "s"} need a decision.
               </Text>
               <View className="flex-row gap-2 mt-3">
-                <Button onPress={resumePausedWork} isDisabled={busy}>
+                <Button
+                  onPress={resumePausedWork}
+                  isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
+                >
                   <Button.Label>Resume</Button.Label>
                 </Button>
-                <Button onPress={cancelPausedWork} isDisabled={busy}>
+                <Button
+                  onPress={cancelPausedWork}
+                  isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
+                >
                   <Button.Label>Cancel</Button.Label>
                 </Button>
               </View>
+            </Surface>
+          ) : null}
+
+          {daemonState.repairRequired ? (
+            <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
+              <Text className="text-foreground font-semibold">Read-only recovery</Text>
+              <Text className="text-muted text-sm mt-1">{daemonState.repairRequired.detail}</Text>
             </Surface>
           ) : null}
 
@@ -420,9 +684,17 @@ export default function ProjectSessions() {
             <TextField>
               <Input
                 value={message}
-                onChangeText={setMessage}
+                onChangeText={(value) => {
+                  if (selectedSessionId) {
+                    setSessionMessage(selectedSessionId, value);
+                    if (retrySubmission && retrySubmission.params.text !== value.trim()) {
+                      setSessionRetry(selectedSessionId, null);
+                    }
+                  }
+                }}
                 placeholder="Message Flycockpit"
                 multiline
+                isDisabled={sendingMessage || Boolean(daemonState.repairRequired)}
               />
             </TextField>
             <View className="flex-row flex-wrap gap-2 mt-3">

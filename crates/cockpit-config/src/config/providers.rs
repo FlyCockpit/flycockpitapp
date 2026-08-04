@@ -55,7 +55,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::config::extended::{ComputerUseMode, LlmMode, TextEmbeddedRecovery};
+use crate::config::files::{
+    ConfigMutationLock, PreparedAtomicWrite, atomic_write, prepare_atomic_write,
+    remove_file_nofollow,
+};
 use crate::config::merge::deep_merge_value;
+
+fn deserialize_nonempty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("string must not be empty"));
+    }
+    Ok(value)
+}
 
 const PROVIDERS_DIR: &str = "providers";
 const PROVIDER_SKIPPED_KEYS: &[&str] = &[
@@ -222,7 +237,10 @@ pub use fetch_status::{
     ProviderModelFetchDisplayState, format_model_fetch_age, model_fetch_reason_display,
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
 };
-pub use io::{ConfigDoc, is_xai_grok_provider};
+pub use io::{
+    ActiveModelWriteMode, ActiveModelWriteResult, ConfigDoc, PreparedActiveModelWrite,
+    is_xai_grok_provider,
+};
 
 pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count};
 
@@ -264,7 +282,9 @@ pub struct ProvidersConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveModelRef {
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub provider: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ActiveReasoningEffort>,
@@ -272,6 +292,31 @@ pub struct ActiveModelRef {
     pub thinking_mode: Option<ThinkingMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+}
+
+impl ActiveModelRef {
+    /// Validate invariants that Serde enforces at the wire/config boundary.
+    ///
+    /// The fields remain public because this is also a configuration DTO, so
+    /// in-process protocol clients can construct a value without running its
+    /// deserializer. Callers accepting typed values across a trust boundary
+    /// must use this check before applying them.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.provider.is_empty() {
+            return Err("active model provider must not be empty");
+        }
+        if self.model.is_empty() {
+            return Err("active model model must not be empty");
+        }
+        if self
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(|effort| effort.value.is_empty())
+        {
+            return Err("active model reasoning effort must not be empty");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -333,6 +378,7 @@ impl ModelAvailability {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveReasoningEffort {
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub value: String,
 }
 
@@ -1086,6 +1132,7 @@ impl PromptCacheRetention {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityValue {
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,

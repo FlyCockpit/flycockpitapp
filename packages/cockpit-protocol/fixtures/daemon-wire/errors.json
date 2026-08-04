@@ -24,5 +24,23 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "err",
     "v": 6
+  },
+  "user_message_not_accepted_paired": {
+    "error": {
+      "code": "user_message_not_accepted",
+      "message": "user message was not accepted by the session driver"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
+  "user_message_terminated_paired": {
+    "error": {
+      "code": "user_message_terminated",
+      "message": "user message reached a durable terminal disposition"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
   }
 }

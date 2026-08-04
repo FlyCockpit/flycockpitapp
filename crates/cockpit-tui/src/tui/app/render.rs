@@ -416,6 +416,7 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             seq,
             preflight_pending,
             persist_failed,
+            ..
         } => {
             hash_len(&mut hasher, text);
             cleaned.hash(&mut hasher);
@@ -5468,6 +5469,7 @@ mod render_history_spacing_tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         }
@@ -5480,6 +5482,7 @@ mod render_history_spacing_tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: Some(seq),
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         }
@@ -5496,6 +5499,7 @@ mod render_history_spacing_tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: None,
             preflight_pending: true,
             persist_failed: false,
         }
@@ -9474,6 +9478,7 @@ mod render_history_spacing_tests {
             expanded: false,
             timestamp: chrono::Local::now(),
             seq: None,
+            optimistic_submission_id: None,
             preflight_pending: false,
             persist_failed: false,
         });

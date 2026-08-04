@@ -3046,14 +3046,13 @@ mod tests {
     };
     use crate::tui::history::HistoryEntry;
     use cockpit_core::daemon::proto::{GoalStatus, GoalSummary, Request, Response};
-    use cockpit_core::engine::message::UserSubmission;
 
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
         app.daemon_prompt = None;
         app.dialog = crate::tui::settings::Dialog::None;
-        let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+        let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
         let (record_tx, _record_rx) = mpsc::channel::<Request>(1);
         let (control_tx, _control_rx) = mpsc::channel::<ControlRequest>(1);
         let (attached_request_tx, attached_request_rx) = mpsc::channel::<AttachedRequest>(8);
@@ -3070,6 +3069,9 @@ mod tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            awaiting_durable: Default::default(),
             short_id: "goal01".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),

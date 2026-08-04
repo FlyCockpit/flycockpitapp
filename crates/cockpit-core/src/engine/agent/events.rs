@@ -71,7 +71,7 @@ pub enum TurnEvent {
         provider: String,
         model: String,
         reasoning_effort: Option<String>,
-        thinking_mode: Option<String>,
+        thinking_mode: Option<crate::config::providers::ThinkingMode>,
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
         outcome: crate::daemon::proto::ModelSelectionOutcome,
     },
@@ -110,8 +110,18 @@ pub enum TurnEvent {
     },
     /// The TUI lost its daemon socket and is retrying the local link.
     DaemonLinkReconnecting { restarting: bool, attempt: u32 },
-    /// The TUI reattached to the daemon after a socket drop.
-    DaemonLinkReconnected,
+    /// The TUI reattached to the daemon after a socket drop. The attach
+    /// snapshot starts a new worker-local model-generation epoch even when
+    /// the durable session id is unchanged.
+    DaemonLinkReconnected {
+        active_model_state: Option<crate::daemon::proto::ActiveModelState>,
+    },
+    /// An event-stream lag marker triggered an authoritative attach resync on
+    /// the existing socket. No reconnect chrome is shown, but the attach
+    /// snapshot still starts a fresh client-side model-generation epoch.
+    DaemonLinkResynced {
+        active_model_state: Option<crate::daemon::proto::ActiveModelState>,
+    },
     /// Reattach reached a terminal attach error and will not retry.
     DaemonLinkTerminal { error: String },
     /// Reattach found durable paused work that needs a local decision.
@@ -177,6 +187,7 @@ pub enum TurnEvent {
     /// GOALS §14). `None` when preflight didn't run / was a no-op / fell back.
     UserMessageRecorded {
         seq: i64,
+        client_submission_ids: Vec<uuid::Uuid>,
         preflight_cleaned: Option<String>,
     },
     /// One or more daemon-queued user messages were drained and folded into
@@ -192,15 +203,42 @@ pub enum TurnEvent {
         preflight_cleaned: Option<String>,
     },
     /// Deferred session persistence failed before inference started. UI-only:
-    /// the optimistic user row stays visible, but the working span must clear.
-    SessionPersistFailed { error: String },
+    /// the exact optimistic row stays retryable, but its working span clears.
+    SessionPersistFailed {
+        client_submission_id: uuid::Uuid,
+        error: String,
+    },
     /// The session driver died while the worker was serving. UI-only:
     /// the optimistic user row stays visible, but the working span must clear.
     SessionDriverFailed { error: String },
     /// The daemon rejected a user-message dispatch before it reached the
     /// session worker, for example while uploading image attachments. UI-only:
     /// the optimistic user row stays visible, but the working span must clear.
-    UserMessageDispatchFailed { error: String },
+    UserMessageDispatchFailed {
+        error: String,
+        /// TUI-local identity of the exact optimistic submission rejected by
+        /// the client-side transport. This is never serialized onto the
+        /// daemon wire; it lets the originating client reconcile identical
+        /// or interleaved optimistic rows without relying on their position.
+        optimistic_submission_id: uuid::Uuid,
+    },
+    /// The daemon deterministically rejected a message before accepting it.
+    /// The dispatcher retains the complete payload under this exact id and
+    /// retries only after a state-change signal or a later same-session send.
+    UserMessageDispatchRetained {
+        error: String,
+        optimistic_submission_id: uuid::Uuid,
+    },
+    /// A client-owned exact submission is about to be retried after its
+    /// session is reattached. UI-only and never serialized: the originating
+    /// TUI recreates the optimistic row if an attach snapshot replaced its
+    /// in-memory transcript before the payload became durable.
+    UserMessageDispatchRestored {
+        optimistic_submission_id: uuid::Uuid,
+        text: String,
+        display_text: Option<String>,
+        tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
+    },
     /// A tool call started. `args` are post-repair.
     ToolStart {
         agent: String,
@@ -662,7 +700,16 @@ pub enum TurnEvent {
     /// model-facing text is still only the resolved body (the wire-vs-user
     /// split, GOALS §14). A disabled/skipped pass emits nothing — the row shows
     /// instantly with no indicator.
-    PreflightStarted,
+    PreflightStarted {
+        client_submission_ids: Vec<uuid::Uuid>,
+    },
+
+    /// Exact accepted submissions that reached a durable terminal outcome
+    /// without being recorded in the transcript.
+    UserMessagesTerminated {
+        client_submission_ids: Vec<uuid::Uuid>,
+        disposition: crate::daemon::proto::UserMessageTerminalDisposition,
+    },
 
     /// The just-submitted message was retracted before it was sent — the
     /// prompt-injection guard blocked it (`apply_injection_outcome` returned
@@ -670,5 +717,7 @@ pub enum TurnEvent {
     /// in place of the resolved-message event; the TUI removes the
     /// optimistically-shown user row (and any `Preflight…` indicator on it) so
     /// the injection-block / override UX stands alone. UI-only.
-    UserMessageRetracted,
+    UserMessageRetracted {
+        client_submission_ids: Vec<uuid::Uuid>,
+    },
 }

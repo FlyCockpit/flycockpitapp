@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
@@ -77,17 +78,46 @@ pub struct UserSubmission {
     /// GOALS §14). `None` when preflight didn't run / was a no-op / fell back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_cleaned: Option<String>,
-    /// Queue item ids that were drained to produce this submission. Empty for
-    /// direct, non-queued driver calls. Folded queued submissions keep every id
-    /// in FIFO order so UI/export consumers can correlate the visible row with
-    /// the daemon queue item(s) that became model context.
+    /// Queue item ids that were drained to produce this submission. A v6
+    /// `SendUserMessage` seeds this with its required client submission id;
+    /// the queue preserves that UUID as its canonical item/idempotency key.
+    /// Empty for direct, non-queued driver calls. Folded submissions keep every
+    /// id in FIFO order for exact UI/export correlation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue_item_ids: Vec<Uuid>,
+    /// Client idempotency receipts carried unchanged from daemon acceptance to
+    /// the durable user event. Empty for internal/system submissions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_submissions: Vec<ClientSubmissionReceipt>,
     /// Queue target captured when the daemon accepted the queued message. All
     /// items in one fold are drained for the same target, so the folded
     /// submission carries the first target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_target: Option<QueueTarget>,
+    /// Internal retry phase for an accepted submission whose terminal
+    /// preflight disposition could not yet be made durable. This is queue
+    /// state, not wire state: on retry the driver must persist the disposition
+    /// without re-running injection detection or request preflight.
+    #[serde(skip)]
+    pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingSubmissionTerminalDisposition {
+    PreflightRejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientSubmissionReceipt {
+    pub id: Uuid,
+    /// Canonical fingerprint of consumed content, including image bytes.
+    pub fingerprint: String,
+    /// Canonical fingerprint of the original wire request, including ordered
+    /// image-ref ids. This permits an exact retry to be acknowledged after
+    /// attachment bytes expire or the daemon restarts.
+    pub wire_fingerprint: String,
+    /// Stable principal scope for the idempotency key (`None` for owner).
+    pub origin_principal: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,28 +171,88 @@ struct QueuedSubmission {
     id: Uuid,
     submission: UserSubmission,
     target: QueueTarget,
+    not_before: Option<tokio::time::Instant>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StagedRemovalScope {
+    Exact(Uuid),
+    NewestFor(String),
+    EditableFor(String),
+    AllPending,
+}
+
+/// Opaque claim over queued submissions that are blocked from execution but
+/// are not terminal until their durable receipts commit.
+#[derive(Debug, Clone)]
+pub struct StagedQueueRemoval {
+    ids: Vec<Uuid>,
+    removed: Vec<QueuedUserMessage>,
+    scope: StagedRemovalScope,
+}
+
+impl StagedQueueRemoval {
+    pub fn ids(&self) -> &[Uuid] {
+        &self.ids
+    }
+
+    pub fn removed(&self) -> &[QueuedUserMessage] {
+        &self.removed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueRemovalInProgress;
 
 #[derive(Debug, Default)]
 struct UserSubmissionQueueState {
     pending: VecDeque<QueuedSubmission>,
+    /// Identity claim over queued payloads while their terminal receipts are
+    /// being persisted. Claimed payloads remain in `pending`, preserving their
+    /// exact contents and FIFO position across concurrent front requeues. Queue
+    /// consumers pause until the claim commits. A failed write deliberately
+    /// leaves the claim held so execution cannot beat the client's retry.
+    staged_removal: Option<StagedQueueRemoval>,
+    staged_removal_failed: bool,
     started: HashSet<Uuid>,
     started_targets: HashMap<Uuid, QueueTarget>,
+    /// Every id accepted during this worker epoch, including completed and
+    /// explicitly removed items. This closes the check/enqueue race for
+    /// idempotent retries; restart retries are resolved from durable events.
+    accepted: HashMap<Uuid, AcceptedClientSubmission>,
     closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedClientSubmission {
+    fingerprint: String,
+    wire_fingerprint: String,
+    origin_principal: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotentProbe {
+    Unknown,
+    ExactDuplicate,
+    ContentCheckRequired,
+    Conflict,
 }
 
 #[derive(Debug, Clone)]
 pub struct UserSubmissionQueue {
     inner: Arc<Mutex<UserSubmissionQueueState>>,
     notify: Arc<Notify>,
+    stage_updates: watch::Sender<u64>,
     updates: watch::Sender<Vec<QueuedUserMessage>>,
 }
 
 impl UserSubmissionQueue {
     pub fn new(updates: watch::Sender<Vec<QueuedUserMessage>>) -> Self {
+        let (stage_updates, _) = watch::channel(0);
         Self {
             inner: Arc::new(Mutex::new(UserSubmissionQueueState::default())),
             notify: Arc::new(Notify::new()),
+            stage_updates,
             updates,
         }
     }
@@ -173,24 +263,97 @@ impl UserSubmissionQueue {
         target: QueueTarget,
     ) -> (Uuid, Vec<QueuedUserMessage>) {
         let id = Uuid::new_v4();
+        let receipt = ClientSubmissionReceipt {
+            id,
+            fingerprint: id.to_string(),
+            wire_fingerprint: id.to_string(),
+            origin_principal: submission.origin_principal.clone(),
+        };
+        let (_, snapshot, _) = self.push_idempotent(receipt, submission, target).await;
+        (id, snapshot)
+    }
+
+    /// Accept a client-correlated submission exactly once in this worker
+    /// epoch. `inserted = false` acknowledges an earlier acceptance without
+    /// enqueuing a second inference.
+    pub async fn push_idempotent(
+        &self,
+        receipt: ClientSubmissionReceipt,
+        submission: UserSubmission,
+        target: QueueTarget,
+    ) -> (Uuid, Vec<QueuedUserMessage>, IdempotentPush) {
+        let id = receipt.id;
         let snapshot = {
             let mut state = self.inner.lock().await;
+            if let Some(existing) = state.accepted.get(&id) {
+                let outcome = if existing.origin_principal != receipt.origin_principal
+                    || existing.fingerprint != receipt.fingerprint
+                {
+                    IdempotentPush::Conflict
+                } else {
+                    IdempotentPush::Duplicate
+                };
+                return (id, snapshot_pending(&state), outcome);
+            }
+            state.accepted.insert(
+                id,
+                AcceptedClientSubmission {
+                    fingerprint: receipt.fingerprint,
+                    wire_fingerprint: receipt.wire_fingerprint,
+                    origin_principal: receipt.origin_principal,
+                },
+            );
             state.pending.push_back(QueuedSubmission {
                 id,
                 submission,
                 target,
+                not_before: None,
             });
             snapshot_pending(&state)
         };
         self.publish(snapshot.clone());
         self.notify.notify_one();
-        (id, snapshot)
+        (id, snapshot, IdempotentPush::Inserted)
+    }
+
+    pub async fn probe_idempotent(
+        &self,
+        id: Uuid,
+        wire_fingerprint: &str,
+        origin_principal: Option<&str>,
+    ) -> (IdempotentProbe, Vec<QueuedUserMessage>) {
+        let state = self.inner.lock().await;
+        let probe = match state.accepted.get(&id) {
+            None => IdempotentProbe::Unknown,
+            Some(existing) if existing.origin_principal.as_deref() != origin_principal => {
+                IdempotentProbe::Conflict
+            }
+            Some(existing) if existing.wire_fingerprint == wire_fingerprint => {
+                IdempotentProbe::ExactDuplicate
+            }
+            Some(_) => IdempotentProbe::ContentCheckRequired,
+        };
+        (probe, snapshot_pending(&state))
     }
 
     pub async fn requeue_front(
         &self,
+        submission: UserSubmission,
+        fallback_target: QueueTarget,
+    ) -> Vec<QueuedUserMessage> {
+        self.requeue_front_after(submission, fallback_target, std::time::Duration::ZERO)
+            .await
+    }
+
+    /// Requeue an exact started payload at the front while keeping it visible
+    /// to snapshots and terminal-removal controls. Consumers preserve FIFO but
+    /// do not receive it until `delay` elapses, so persistent storage failures
+    /// cannot create a hot loop that starves driver controls.
+    pub async fn requeue_front_after(
+        &self,
         mut submission: UserSubmission,
         fallback_target: QueueTarget,
+        delay: std::time::Duration,
     ) -> Vec<QueuedUserMessage> {
         let id = submission
             .queue_item_ids
@@ -207,6 +370,7 @@ impl UserSubmissionQueue {
                 id,
                 submission,
                 target,
+                not_before: (!delay.is_zero()).then(|| tokio::time::Instant::now() + delay),
             });
             snapshot_pending(&state)
         };
@@ -226,6 +390,218 @@ impl UserSubmissionQueue {
         }
     }
 
+    pub async fn snapshot(&self) -> Vec<QueuedUserMessage> {
+        let state = self.inner.lock().await;
+        snapshot_pending(&state)
+    }
+
+    #[cfg(test)]
+    pub async fn pending_submission(&self, id: Uuid) -> Option<UserSubmission> {
+        let state = self.inner.lock().await;
+        state
+            .pending
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.submission.clone())
+    }
+
+    pub async fn accepted_receipts(&self, ids: &[Uuid]) -> Vec<ClientSubmissionReceipt> {
+        let state = self.inner.lock().await;
+        ids.iter()
+            .filter_map(|id| {
+                state
+                    .accepted
+                    .get(id)
+                    .map(|accepted| ClientSubmissionReceipt {
+                        id: *id,
+                        fingerprint: accepted.fingerprint.clone(),
+                        wire_fingerprint: accepted.wire_fingerprint.clone(),
+                        origin_principal: accepted.origin_principal.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn stage_remove(
+        &self,
+        id: Uuid,
+    ) -> Result<
+        (
+            RemoveQueuedMessageResult,
+            Option<StagedQueueRemoval>,
+            Vec<QueuedUserMessage>,
+        ),
+        QueueRemovalInProgress,
+    > {
+        let mut state = self.inner.lock().await;
+        let scope = StagedRemovalScope::Exact(id);
+        if let Some(staged) = existing_stage_for_scope(&mut state, &scope)? {
+            let snapshot = snapshot_pending(&state);
+            return Ok((RemoveQueuedMessageResult::Removed, Some(staged), snapshot));
+        }
+        let (result, staged) =
+            if let Some(index) = state.pending.iter().position(|item| item.id == id) {
+                (
+                    RemoveQueuedMessageResult::Removed,
+                    Some(stage_pending_indices(&mut state, vec![index], scope)),
+                )
+            } else if state.started.contains(&id) {
+                (RemoveQueuedMessageResult::AlreadyStarted, None)
+            } else {
+                (RemoveQueuedMessageResult::NotFound, None)
+            };
+        let snapshot = snapshot_pending(&state);
+        Ok((result, staged, snapshot))
+    }
+
+    pub async fn stage_remove_newest_for(
+        &self,
+        target_id: &str,
+    ) -> Result<
+        (
+            RemoveQueuedMessageResult,
+            Option<StagedQueueRemoval>,
+            Vec<QueuedUserMessage>,
+        ),
+        QueueRemovalInProgress,
+    > {
+        let mut state = self.inner.lock().await;
+        let scope = StagedRemovalScope::NewestFor(target_id.to_string());
+        if let Some(staged) = existing_stage_for_scope(&mut state, &scope)? {
+            let snapshot = snapshot_pending(&state);
+            return Ok((RemoveQueuedMessageResult::Removed, Some(staged), snapshot));
+        }
+        let (result, staged) = if let Some(index) = state
+            .pending
+            .iter()
+            .rposition(|item| item.target.id == target_id)
+        {
+            (
+                RemoveQueuedMessageResult::Removed,
+                Some(stage_pending_indices(&mut state, vec![index], scope)),
+            )
+        } else if state
+            .started_targets
+            .values()
+            .any(|target| target.id == target_id)
+        {
+            (RemoveQueuedMessageResult::AlreadyStarted, None)
+        } else {
+            (RemoveQueuedMessageResult::NotFound, None)
+        };
+        let snapshot = snapshot_pending(&state);
+        Ok((result, staged, snapshot))
+    }
+
+    pub async fn stage_remove_editable_for(
+        &self,
+        target_id: &str,
+    ) -> Result<
+        (
+            RemoveQueuedMessageResult,
+            Option<StagedQueueRemoval>,
+            Vec<QueuedUserMessage>,
+        ),
+        QueueRemovalInProgress,
+    > {
+        let mut state = self.inner.lock().await;
+        let scope = StagedRemovalScope::EditableFor(target_id.to_string());
+        if let Some(staged) = existing_stage_for_scope(&mut state, &scope)? {
+            let snapshot = snapshot_pending(&state);
+            return Ok((RemoveQueuedMessageResult::Removed, Some(staged), snapshot));
+        }
+        let indices = state
+            .pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (item.target.id == target_id).then_some(index))
+            .collect::<Vec<_>>();
+        let has_started_target = state
+            .started_targets
+            .values()
+            .any(|target| target.id == target_id);
+        let result = if !indices.is_empty() {
+            if has_started_target {
+                RemoveQueuedMessageResult::AlreadyStarted
+            } else {
+                RemoveQueuedMessageResult::Removed
+            }
+        } else if has_started_target {
+            RemoveQueuedMessageResult::AlreadyStarted
+        } else {
+            RemoveQueuedMessageResult::NotFound
+        };
+        let staged =
+            (!indices.is_empty()).then(|| stage_pending_indices(&mut state, indices, scope));
+        let snapshot = snapshot_pending(&state);
+        Ok((result, staged, snapshot))
+    }
+
+    /// Hold every submission currently pending at a cancellation boundary.
+    /// A prior failed targeted removal is widened into this cancellation claim;
+    /// submissions accepted after the claim remain queued for the next turn.
+    pub async fn stage_discard_pending(&self) -> Option<StagedQueueRemoval> {
+        let mut stage_updates = self.stage_updates.subscribe();
+        loop {
+            let mut state = self.inner.lock().await;
+            if state.staged_removal.is_some() && !state.staged_removal_failed {
+                drop(state);
+                let _ = stage_updates.changed().await;
+                continue;
+            }
+            let indices = (0..state.pending.len()).collect::<Vec<_>>();
+            if indices.is_empty() {
+                state.staged_removal = None;
+                state.staged_removal_failed = false;
+                return None;
+            }
+            state.staged_removal = None;
+            state.staged_removal_failed = false;
+            return Some(stage_pending_indices(
+                &mut state,
+                indices,
+                StagedRemovalScope::AllPending,
+            ));
+        }
+    }
+
+    /// Keep a failed claim non-runnable while allowing the same removal or a
+    /// cancellation boundary to retry it. The phase transition wakes only
+    /// barrier waiters; queue consumers remain asleep and cannot execute it.
+    pub async fn mark_staged_removal_failed(&self, staged: &StagedQueueRemoval) {
+        {
+            let mut state = self.inner.lock().await;
+            assert_staged_removal(&state, staged);
+            state.staged_removal_failed = true;
+        }
+        self.stage_updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
+    }
+
+    /// Make a staged removal visible only after its terminal receipts are
+    /// durable. Consumers resume from the remaining queue at this boundary.
+    pub async fn commit_staged_removal(
+        &self,
+        staged: StagedQueueRemoval,
+    ) -> Vec<QueuedUserMessage> {
+        let snapshot = {
+            let mut state = self.inner.lock().await;
+            assert_staged_removal(&state, &staged);
+            let ids = staged.ids.iter().copied().collect::<HashSet<_>>();
+            state.pending.retain(|item| !ids.contains(&item.id));
+            state.staged_removal = None;
+            state.staged_removal_failed = false;
+            snapshot_pending(&state)
+        };
+        self.publish(snapshot.clone());
+        self.stage_updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
+        self.notify.notify_one();
+        snapshot
+    }
+
     /// Publish the current pending-queue snapshot without mutating it.
     ///
     /// Attach hydration uses this so a newly subscribed client learns the
@@ -240,6 +616,7 @@ impl UserSubmissionQueue {
         self.publish(snapshot);
     }
 
+    #[cfg(test)]
     pub async fn remove(&self, id: Uuid) -> (RemoveQueuedMessageResult, Vec<QueuedUserMessage>) {
         let (result, snapshot) = {
             let mut state = self.inner.lock().await;
@@ -264,6 +641,7 @@ impl UserSubmissionQueue {
         (result, snapshot)
     }
 
+    #[cfg(test)]
     pub async fn remove_newest_for(
         &self,
         target_id: &str,
@@ -310,6 +688,7 @@ impl UserSubmissionQueue {
         (result, removed, snapshot)
     }
 
+    #[cfg(test)]
     pub async fn remove_editable_for(
         &self,
         target_id: &str,
@@ -359,12 +738,19 @@ impl UserSubmissionQueue {
 
     pub async fn recv_for(&self, target_id: Option<&str>) -> Option<UserSubmission> {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
             match self.pop_one(target_id).await {
                 QueuePop::Item(submission) => return Some(*submission),
                 QueuePop::Closed => return None,
-                QueuePop::Empty => {}
+                QueuePop::Empty => notified.await,
+                QueuePop::Deferred(deadline) => {
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
             }
-            self.notify.notified().await;
         }
     }
 
@@ -377,7 +763,7 @@ impl UserSubmissionQueue {
         while into.len() < max {
             match self.pop_one(target_id).await {
                 QueuePop::Item(submission) => into.push(*submission),
-                QueuePop::Empty | QueuePop::Closed => break,
+                QueuePop::Empty | QueuePop::Closed | QueuePop::Deferred(_) => break,
             }
         }
     }
@@ -390,17 +776,38 @@ impl UserSubmissionQueue {
         }
     }
 
+    #[cfg(test)]
     pub async fn discard_pending(&self) -> usize {
-        let (dropped, snapshot) = {
+        self.discard_pending_with_receipts().await.0
+    }
+
+    #[cfg(test)]
+    pub async fn discard_pending_with_receipts(&self) -> (usize, Vec<ClientSubmissionReceipt>) {
+        let (dropped, receipts, snapshot) = {
             let mut state = self.inner.lock().await;
             let dropped = state.pending.len();
+            let receipts = state
+                .pending
+                .iter()
+                .filter_map(|item| {
+                    state
+                        .accepted
+                        .get(&item.id)
+                        .map(|accepted| ClientSubmissionReceipt {
+                            id: item.id,
+                            fingerprint: accepted.fingerprint.clone(),
+                            wire_fingerprint: accepted.wire_fingerprint.clone(),
+                            origin_principal: accepted.origin_principal.clone(),
+                        })
+                })
+                .collect();
             state.pending.clear();
-            (dropped, snapshot_pending(&state))
+            (dropped, receipts, snapshot_pending(&state))
         };
         if dropped > 0 {
             self.publish(snapshot);
         }
-        dropped
+        (dropped, receipts)
     }
 
     pub async fn close(&self) {
@@ -412,6 +819,12 @@ impl UserSubmissionQueue {
     async fn pop_one(&self, target_id: Option<&str>) -> QueuePop {
         let (item, snapshot) = {
             let mut state = self.inner.lock().await;
+            if state.closed {
+                return QueuePop::Closed;
+            }
+            if state.staged_removal.is_some() {
+                return QueuePop::Empty;
+            }
             let idx = match target_id {
                 Some(target_id) => state
                     .pending
@@ -426,6 +839,11 @@ impl UserSubmissionQueue {
                     QueuePop::Empty
                 };
             };
+            if let Some(not_before) = state.pending[idx].not_before
+                && not_before > tokio::time::Instant::now()
+            {
+                return QueuePop::Deferred(not_before);
+            }
             let Some(item) = state.pending.remove(idx) else {
                 return if state.closed {
                     QueuePop::Closed
@@ -439,7 +857,9 @@ impl UserSubmissionQueue {
         };
         self.publish(snapshot);
         let mut submission = item.submission;
-        submission.queue_item_ids.push(item.id);
+        if !submission.queue_item_ids.contains(&item.id) {
+            submission.queue_item_ids.push(item.id);
+        }
         submission.queue_target = Some(item.target);
         QueuePop::Item(Box::new(submission))
     }
@@ -449,9 +869,17 @@ impl UserSubmissionQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotentPush {
+    Inserted,
+    Duplicate,
+    Conflict,
+}
+
 enum QueuePop {
     Item(Box<UserSubmission>),
     Empty,
+    Deferred(tokio::time::Instant),
     Closed,
 }
 
@@ -461,6 +889,61 @@ fn snapshot_pending(state: &UserSubmissionQueueState) -> Vec<QueuedUserMessage> 
         .iter()
         .map(queued_message_from_submission)
         .collect()
+}
+
+fn stage_pending_indices(
+    state: &mut UserSubmissionQueueState,
+    indices: Vec<usize>,
+    scope: StagedRemovalScope,
+) -> StagedQueueRemoval {
+    debug_assert!(state.staged_removal.is_none());
+    let items = indices
+        .into_iter()
+        .map(|index| {
+            state
+                .pending
+                .get(index)
+                .expect("staged queue index came from the pending queue")
+        })
+        .collect::<Vec<_>>();
+    let ids = items.iter().map(|item| item.id).collect();
+    let messages = items
+        .iter()
+        .map(|item| queued_message_from_submission(item))
+        .collect();
+    let staged = StagedQueueRemoval {
+        ids,
+        removed: messages,
+        scope,
+    };
+    state.staged_removal = Some(staged.clone());
+    state.staged_removal_failed = false;
+    staged
+}
+
+fn assert_staged_removal(state: &UserSubmissionQueueState, staged: &StagedQueueRemoval) {
+    assert_eq!(
+        state
+            .staged_removal
+            .as_ref()
+            .map(|current| (&current.ids, &current.scope)),
+        Some((&staged.ids, &staged.scope)),
+        "staged queue removal ticket must match the queue claim"
+    );
+}
+
+fn existing_stage_for_scope(
+    state: &mut UserSubmissionQueueState,
+    scope: &StagedRemovalScope,
+) -> Result<Option<StagedQueueRemoval>, QueueRemovalInProgress> {
+    match state.staged_removal.clone() {
+        None => Ok(None),
+        Some(staged) if &staged.scope == scope && state.staged_removal_failed => {
+            state.staged_removal_failed = false;
+            Ok(Some(staged))
+        }
+        Some(_) => Err(QueueRemovalInProgress),
+    }
 }
 
 fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage {
@@ -515,6 +998,46 @@ impl UserSubmission {
             text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_string(),
             ..Self::default()
         }
+    }
+
+    /// Fingerprint the canonical consumed payload, including image bytes, but
+    /// excluding transport/queue metadata. Re-uploaded copies therefore match
+    /// while UUID reuse with changed text/display/tags/images/skill conflicts.
+    pub fn client_fingerprint(&self) -> String {
+        fn part(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        fn optional_part(hasher: &mut Sha256, value: Option<&str>) {
+            match value {
+                None => part(hasher, b"none"),
+                Some(value) => {
+                    part(hasher, b"some");
+                    part(hasher, value.as_bytes());
+                }
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        part(
+            &mut hasher,
+            match self.kind {
+                UserSubmissionKind::User => b"user",
+                UserSubmissionKind::Compact => b"compact",
+            },
+        );
+        part(&mut hasher, self.text.as_bytes());
+        optional_part(&mut hasher, self.display_text.as_deref());
+        part(
+            &mut hasher,
+            &serde_json::to_vec(&self.tag_expansions).unwrap_or_default(),
+        );
+        for image in &self.images {
+            part(&mut hasher, image);
+        }
+        optional_part(&mut hasher, self.forced_skill.as_deref());
+        crate::intel::hex_lower(&hasher.finalize())
     }
 
     /// True when there are no image parts — the common case, letting the
@@ -967,6 +1490,16 @@ mod tests {
         let (removed, snapshot) = queue.remove(second_id).await;
         assert_eq!(removed, RemoveQueuedMessageResult::Removed);
         assert_eq!(
+            queue
+                .accepted_receipts(&[second_id])
+                .await
+                .into_iter()
+                .map(|receipt| (receipt.id, receipt.fingerprint, receipt.wire_fingerprint,))
+                .collect::<Vec<_>>(),
+            vec![(second_id, second_id.to_string(), second_id.to_string(),)],
+            "removal keeps the exact accepted receipt available for durable tombstoning"
+        );
+        assert_eq!(
             snapshot.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![first_id, third_id]
         );
@@ -982,6 +1515,357 @@ mod tests {
         assert!(
             last.is_empty(),
             "draining publishes an empty queue snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_removal_holds_the_exact_payload_until_durable_commit() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let id = Uuid::new_v4();
+        let receipt = ClientSubmissionReceipt {
+            id,
+            fingerprint: "consumed-fingerprint".into(),
+            wire_fingerprint: "wire-fingerprint".into(),
+            origin_principal: Some("flycockpit:user-1".into()),
+        };
+        let original = UserSubmission {
+            text: format!("inspect {IMAGE_PART_SENTINEL}"),
+            display_text: Some("inspect screenshot".into()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "src/lib.rs".into(),
+                detail: "expanded source".into(),
+                ok: true,
+            }],
+            images: vec![vec![0, 1, 2, 3]],
+            forced_skill: Some("review".into()),
+            origin_principal: receipt.origin_principal.clone(),
+            queue_item_ids: vec![id],
+            client_submissions: vec![receipt.clone()],
+            queue_target: Some(target.clone()),
+            ..Default::default()
+        };
+        let (_, _, inserted) = queue
+            .push_idempotent(receipt, original.clone(), target)
+            .await;
+        assert_eq!(inserted, IdempotentPush::Inserted);
+
+        let (result, staged, snapshot) = queue.stage_remove(id).await.unwrap();
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        assert_eq!(
+            snapshot.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![id],
+            "the visible queue does not change before the terminal receipt commits"
+        );
+        let staged = staged.expect("queued item is staged");
+        assert_eq!(staged.ids(), &[id]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), queue.recv())
+                .await
+                .is_err(),
+            "a staged removal must not race into execution"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                queue
+                    .pending_submission(id)
+                    .await
+                    .expect("held payload remains in the queue")
+            )
+            .unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "the hold preserves wire text, display text, tags, images, skill, principal, and receipt"
+        );
+        queue.mark_staged_removal_failed(&staged).await;
+        let (_, retry, _) = queue
+            .stage_remove(id)
+            .await
+            .expect("retrying the same removal reclaims the hold");
+        assert_eq!(retry.as_ref().map(StagedQueueRemoval::ids), Some(&[id][..]));
+        let committed = queue.commit_staged_removal(staged).await;
+        assert!(committed.is_empty());
+        assert!(
+            queue.pending_submission(id).await.is_none(),
+            "only the durable commit releases the exact payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_removal_retry_and_front_requeue_preserve_fifo_order() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let root = QueueTarget::root("Build");
+        let child = QueueTarget::child("Review", 1, "task-1", "review");
+        let (root_first, _) = queue
+            .push(UserSubmission::text("root first"), root.clone())
+            .await;
+        let (child_first, _) = queue
+            .push(UserSubmission::text("child first"), child.clone())
+            .await;
+        let (root_newest, _) = queue
+            .push(UserSubmission::text("root newest"), root.clone())
+            .await;
+        let (child_newest, _) = queue
+            .push(UserSubmission::text("child newest"), child.clone())
+            .await;
+
+        let (result, staged, snapshot) = queue.stage_remove_newest_for(&root.id).await.unwrap();
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        let staged = staged.expect("newest root item is staged");
+        assert_eq!(staged.ids(), &[root_newest]);
+        assert_eq!(
+            snapshot.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![root_first, child_first, root_newest, child_newest]
+        );
+        let committed = queue.commit_staged_removal(staged).await;
+        assert_eq!(
+            committed.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![root_first, child_first, child_newest]
+        );
+
+        let (root_last, _) = queue
+            .push(UserSubmission::text("root last"), root.clone())
+            .await;
+        let started_child = queue
+            .recv_for(Some(&child.id))
+            .await
+            .expect("child item starts before the removal hold");
+        let (result, staged, snapshot) = queue.stage_remove_editable_for(&root.id).await.unwrap();
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
+        let staged = staged.expect("all editable root items are staged");
+        assert_eq!(staged.ids(), &[root_first, root_last]);
+        assert_eq!(
+            snapshot.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![root_first, child_newest, root_last]
+        );
+        let requeued = queue.requeue_front(started_child, child.clone()).await;
+        assert_eq!(
+            requeued.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![child_first, root_first, child_newest, root_last],
+            "front requeue preserves its normal FIFO semantics while removal is held"
+        );
+        queue.mark_staged_removal_failed(&staged).await;
+        assert!(
+            queue.stage_remove(child_newest).await.is_err(),
+            "a different removal cannot steal a failed hold"
+        );
+        let (_, retry, _) = queue
+            .stage_remove_editable_for(&root.id)
+            .await
+            .expect("the same editable removal can retry");
+        assert_eq!(
+            retry.as_ref().map(StagedQueueRemoval::ids),
+            Some(&[root_first, root_last][..])
+        );
+        let committed = queue.commit_staged_removal(staged).await;
+        assert_eq!(
+            committed.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![child_first, child_newest],
+            "identity commit removes only held items after the concurrent front requeue"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_cancel_hold_widens_to_newly_accepted_payloads() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let (first, _) = queue
+            .push(UserSubmission::text("first"), target.clone())
+            .await;
+        let staged = queue
+            .stage_discard_pending()
+            .await
+            .expect("first cancellation holds the pending queue");
+        assert_eq!(staged.ids(), &[first]);
+        queue.mark_staged_removal_failed(&staged).await;
+
+        let (second, _) = queue
+            .push(UserSubmission::text("accepted after failed cancel"), target)
+            .await;
+        let widened = queue
+            .stage_discard_pending()
+            .await
+            .expect("retrying cancellation widens the existing hold");
+        assert_eq!(widened.ids(), &[first, second]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), queue.recv())
+                .await
+                .is_err(),
+            "neither the original nor newly accepted payload can execute while held"
+        );
+        assert!(queue.commit_staged_removal(widened).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_an_in_progress_targeted_removal() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let (first, _) = queue
+            .push(UserSubmission::text("first"), target.clone())
+            .await;
+        let (second, _) = queue.push(UserSubmission::text("second"), target).await;
+        let (_, targeted, _) = queue.stage_remove(second).await.unwrap();
+        let targeted = targeted.expect("targeted receipt write owns the barrier");
+
+        let cancel_queue = queue.clone();
+        let mut cancellation = tokio::spawn(async move {
+            cancel_queue
+                .stage_discard_pending()
+                .await
+                .expect("remaining queue becomes the cancellation claim")
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut cancellation)
+                .await
+                .is_err(),
+            "cancellation cannot overwrite an in-progress removal ticket"
+        );
+
+        assert_eq!(
+            queue
+                .commit_staged_removal(targeted)
+                .await
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![first]
+        );
+        let cancellation = tokio::time::timeout(std::time::Duration::from_secs(1), cancellation)
+            .await
+            .expect("targeted commit releases the cancellation barrier")
+            .unwrap();
+        assert_eq!(cancellation.ids(), &[first]);
+        assert!(queue.commit_staged_removal(cancellation).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_submission_id_is_idempotent_for_identical_payload_and_rejects_reuse() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let id = Uuid::new_v4();
+        let original = UserSubmission {
+            text: format!("inspect {IMAGE_PART_SENTINEL}"),
+            display_text: Some("inspect pasted image".to_string()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "src/lib.rs".into(),
+                detail: "12 lines".into(),
+                ok: true,
+            }],
+            images: vec![vec![1, 2, 3, 4]],
+            forced_skill: Some("review".to_string()),
+            ..Default::default()
+        };
+        let fingerprint = original.client_fingerprint();
+        let receipt = |fingerprint: String| ClientSubmissionReceipt {
+            id,
+            fingerprint,
+            wire_fingerprint: "wire-original".to_string(),
+            origin_principal: None,
+        };
+
+        let (_, first_snapshot, first) = queue
+            .push_idempotent(
+                receipt(fingerprint.clone()),
+                original.clone(),
+                target.clone(),
+            )
+            .await;
+        assert_eq!(first, IdempotentPush::Inserted);
+        assert_eq!(
+            first_snapshot
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+
+        let (_, duplicate_snapshot, duplicate) = queue
+            .push_idempotent(
+                receipt(fingerprint.clone()),
+                original.clone(),
+                target.clone(),
+            )
+            .await;
+        assert_eq!(duplicate, IdempotentPush::Duplicate);
+        assert_eq!(duplicate_snapshot.len(), 1, "retry must not enqueue twice");
+        assert_eq!(
+            queue.probe_idempotent(id, "wire-original", None).await.0,
+            IdempotentProbe::ExactDuplicate
+        );
+        assert_eq!(
+            queue.probe_idempotent(id, "wire-reupload", None).await.0,
+            IdempotentProbe::ContentCheckRequired
+        );
+        assert_eq!(
+            queue
+                .probe_idempotent(id, "wire-original", Some("flycockpit:other"))
+                .await
+                .0,
+            IdempotentProbe::Conflict
+        );
+
+        let mut changed = original.clone();
+        changed.images[0].push(5);
+        let (_, conflict_snapshot, conflict) = queue
+            .push_idempotent(
+                receipt(changed.client_fingerprint()),
+                changed,
+                target.clone(),
+            )
+            .await;
+        assert_eq!(conflict, IdempotentPush::Conflict);
+        assert_eq!(
+            conflict_snapshot.len(),
+            1,
+            "conflict must not mutate the queue"
+        );
+
+        let delivered = queue.recv().await.expect("one accepted payload");
+        assert_eq!(delivered.text, original.text);
+        assert_eq!(delivered.images, original.images);
+        assert_eq!(delivered.queue_item_ids, vec![id]);
+        queue.finish(&[id]).await;
+
+        let (_, completed_retry_snapshot, completed_retry) = queue
+            .push_idempotent(receipt(fingerprint), original, target)
+            .await;
+        assert_eq!(completed_retry, IdempotentPush::Duplicate);
+        assert!(
+            completed_retry_snapshot.is_empty(),
+            "a retry after completion must acknowledge without new inference"
+        );
+    }
+
+    #[test]
+    fn client_fingerprint_distinguishes_absent_and_empty_optional_fields() {
+        let absent = UserSubmission::text("same wire text");
+
+        let mut empty_display = absent.clone();
+        empty_display.display_text = Some(String::new());
+        assert_ne!(
+            absent.client_fingerprint(),
+            empty_display.client_fingerprint(),
+            "display_text presence is part of the exact client payload"
+        );
+
+        let mut empty_skill = absent.clone();
+        empty_skill.forced_skill = Some(String::new());
+        assert_ne!(
+            absent.client_fingerprint(),
+            empty_skill.client_fingerprint(),
+            "forced_skill presence is part of the exact client payload"
+        );
+
+        assert_ne!(
+            empty_display.client_fingerprint(),
+            empty_skill.client_fingerprint(),
+            "option discriminants remain scoped to their payload fields"
         );
     }
 

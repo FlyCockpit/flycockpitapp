@@ -1728,6 +1728,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_rejects_divergent_model_selection_projections() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
+        row.provider = Some("projection-provider".to_string());
+        row.model = Some("projection-model".to_string());
+        row.model_selection_json = Some(
+            serde_json::json!({
+                "provider": "structured-provider",
+                "model": "structured-model",
+                "thinking_mode": "high"
+            })
+            .to_string(),
+        );
+        let row = db.insert_session_row(&row).await.unwrap();
+
+        let error = Session::resume(db, row.session_id)
+            .err()
+            .expect("divergent projections must not hydrate ambiguous model state")
+            .to_string();
+        assert!(error.contains("projections disagree"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_projection_only_model_state() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "Build").await.unwrap();
+        row.provider = Some("projection-provider".to_string());
+        row.model = Some("projection-model".to_string());
+        let row = db.insert_session_row(&row).await.unwrap();
+
+        let error = Session::resume(db, row.session_id)
+            .err()
+            .expect("projection-only state must not synthesize empty preferences")
+            .to_string();
+        assert!(error.contains("require model_selection_json"), "{error}");
+    }
+
+    #[tokio::test]
     async fn deferred_persist_carries_session_overrides() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();

@@ -25,14 +25,22 @@ pub(super) async fn drain_queue_limit(
 /// during the cancelled span never auto-start a fresh turn — the cancel
 /// returns the session to idle rather than silently rolling into the next
 /// queued message. Non-blocking: only what is already buffered is dropped.
+#[cfg(test)]
 pub(super) async fn discard_pending_input(
     rx: &crate::engine::message::UserSubmissionQueue,
 ) -> usize {
-    let dropped = rx.discard_pending().await;
+    discard_pending_input_with_receipts(rx).await.0
+}
+
+#[cfg(test)]
+pub(super) async fn discard_pending_input_with_receipts(
+    rx: &crate::engine::message::UserSubmissionQueue,
+) -> (usize, Vec<crate::engine::message::ClientSubmissionReceipt>) {
+    let (dropped, receipts) = rx.discard_pending_with_receipts().await;
     if dropped > 0 {
         tracing::info!(dropped, "discarded queued user messages on cancel");
     }
-    dropped
+    (dropped, receipts)
 }
 
 /// Header line for a late-arriving async-result delivery
@@ -50,15 +58,28 @@ pub(super) fn async_result_header(kind: &str, job_id: &str) -> String {
 /// optional `job_id` (implementation note) attributing it to
 /// its originating job. Additive to the existing `data` shape — no exporter
 /// schema bump; ordinary input omits the key entirely.
-pub(super) fn user_message_event_data(
-    text: &str,
-    display_text: Option<&str>,
-    tag_expansions: &[crate::daemon::proto::TagExpansionMeta],
-    job_id: Option<&str>,
-    queue_item_ids: &[uuid::Uuid],
-    queue_target: Option<&crate::engine::message::QueueTarget>,
-    preflight_cleaned: Option<&str>,
-) -> serde_json::Value {
+pub(super) struct UserMessageEventData<'a> {
+    pub(super) text: &'a str,
+    pub(super) display_text: Option<&'a str>,
+    pub(super) tag_expansions: &'a [crate::daemon::proto::TagExpansionMeta],
+    pub(super) job_id: Option<&'a str>,
+    pub(super) queue_item_ids: &'a [uuid::Uuid],
+    pub(super) client_submissions: &'a [crate::engine::message::ClientSubmissionReceipt],
+    pub(super) queue_target: Option<&'a crate::engine::message::QueueTarget>,
+    pub(super) preflight_cleaned: Option<&'a str>,
+}
+
+pub(super) fn user_message_event_data(input: UserMessageEventData<'_>) -> serde_json::Value {
+    let UserMessageEventData {
+        text,
+        display_text,
+        tag_expansions,
+        job_id,
+        queue_item_ids,
+        client_submissions,
+        queue_target,
+        preflight_cleaned,
+    } = input;
     let mut data = serde_json::json!({ "text": text });
     if let Some(display_text) = display_text {
         data["display_text"] = serde_json::Value::String(display_text.to_string());
@@ -78,6 +99,15 @@ pub(super) fn user_message_event_data(
         data["preflight_cleaned"] = preflight_cleaned
             .map(|text| serde_json::Value::String(text.to_string()))
             .unwrap_or(serde_json::Value::Null);
+    }
+    if !client_submissions.is_empty() {
+        data["client_submission_ids"] = serde_json::json!(
+            client_submissions
+                .iter()
+                .map(|receipt| receipt.id)
+                .collect::<Vec<_>>()
+        );
+        data["client_submissions"] = serde_json::json!(client_submissions);
     }
     data
 }

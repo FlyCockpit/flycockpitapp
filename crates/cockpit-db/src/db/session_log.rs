@@ -18,7 +18,7 @@
 //! [`TurnEvent`]: crate::engine::TurnEvent
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -266,6 +266,57 @@ pub struct SessionEventRow {
     pub llm_mode: Option<String>,
     pub model_trust: Option<String>,
     pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubmissionReceiptRow {
+    pub seq: i64,
+    pub fingerprint: String,
+    pub wire_fingerprint: String,
+    pub origin_principal: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientSubmissionTerminalDisposition {
+    Removed,
+    Cancelled,
+    PreflightRejected,
+}
+
+impl ClientSubmissionTerminalDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Cancelled => "cancelled",
+            Self::PreflightRejected => "preflight_rejected",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "removed" => Ok(Self::Removed),
+            "cancelled" => Ok(Self::Cancelled),
+            "preflight_rejected" => Ok(Self::PreflightRejected),
+            other => bail!("unknown client submission terminal disposition {other:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubmissionTerminalReceipt {
+    pub client_submission_id: Uuid,
+    pub fingerprint: String,
+    pub wire_fingerprint: String,
+    pub origin_principal: Option<String>,
+    pub disposition: ClientSubmissionTerminalDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubmissionTerminalReceiptRow {
+    pub fingerprint: String,
+    pub wire_fingerprint: String,
+    pub origin_principal: Option<String>,
+    pub disposition: ClientSubmissionTerminalDisposition,
 }
 
 /// Bounded page of session events strictly before a cursor, ordered by `seq`
@@ -560,6 +611,149 @@ impl Db {
     pub async fn list_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEventRow>> {
         self.read(move |conn| Self::list_session_events_conn(conn, session_id))
             .await
+    }
+
+    /// Return the durable user-message row for a client idempotency key.
+    /// One folded row can represent multiple accepted submissions.
+    pub async fn client_submission_receipt(
+        &self,
+        session_id: Uuid,
+        client_submission_id: Uuid,
+    ) -> Result<Option<ClientSubmissionReceiptRow>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT e.seq,
+                        json_extract(receipt.value, '$.fingerprint'),
+                        json_extract(receipt.value, '$.wire_fingerprint'),
+                        json_extract(receipt.value, '$.origin_principal')
+                   FROM session_events e,
+                        json_each(e.data_json, '$.client_submissions') receipt
+                  WHERE e.session_id = ?1
+                    AND e.type = 'user_message'
+                    AND json_extract(receipt.value, '$.id') = ?2
+                  LIMIT 1",
+                params![session_id.to_string(), client_submission_id.to_string()],
+                |row| {
+                    Ok(ClientSubmissionReceiptRow {
+                        seq: row.get(0)?,
+                        fingerprint: row.get(1)?,
+                        wire_fingerprint: row.get(2)?,
+                        origin_principal: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("looking up client submission id")
+        })
+        .await
+    }
+
+    /// Persist terminal accepted-submission dispositions atomically. Repeating
+    /// the exact batch is idempotent; reusing a UUID with different receipt
+    /// metadata or a different terminal disposition is an integrity error.
+    pub async fn insert_client_submission_terminal_receipts(
+        &self,
+        session_id: Uuid,
+        receipts: Vec<ClientSubmissionTerminalReceipt>,
+    ) -> Result<()> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        self.write(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin terminal client submission receipt tx")?;
+            for receipt in receipts {
+                let id = receipt.client_submission_id.to_string();
+                let disposition = receipt.disposition.as_str();
+                let inserted = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO client_submission_terminal_receipts
+                         (session_id, client_submission_id, fingerprint, wire_fingerprint,
+                          origin_principal, disposition, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            session_id.to_string(),
+                            id,
+                            receipt.fingerprint,
+                            receipt.wire_fingerprint,
+                            receipt.origin_principal,
+                            disposition,
+                            now_ms(),
+                        ],
+                    )
+                    .context("inserting terminal client submission receipt")?;
+                if inserted == 0 {
+                    let existing = tx
+                        .query_row(
+                            "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
+                               FROM client_submission_terminal_receipts
+                              WHERE session_id = ?1 AND client_submission_id = ?2",
+                            params![session_id.to_string(), id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, String>(3)?,
+                                ))
+                            },
+                        )
+                        .context("reading existing terminal client submission receipt")?;
+                    if existing.0 != receipt.fingerprint
+                        || existing.1 != receipt.wire_fingerprint
+                        || existing.2 != receipt.origin_principal
+                        || existing.3 != disposition
+                    {
+                        bail!(
+                            "client submission {} already has a different terminal receipt",
+                            receipt.client_submission_id
+                        );
+                    }
+                }
+            }
+            tx.commit()
+                .context("commit terminal client submission receipt tx")
+        })
+        .await
+    }
+
+    pub async fn client_submission_terminal_receipt(
+        &self,
+        session_id: Uuid,
+        client_submission_id: Uuid,
+    ) -> Result<Option<ClientSubmissionTerminalReceiptRow>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
+                   FROM client_submission_terminal_receipts
+                  WHERE session_id = ?1 AND client_submission_id = ?2",
+                params![session_id.to_string(), client_submission_id.to_string()],
+                |row| {
+                    let disposition = row.get::<_, String>(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        disposition,
+                    ))
+                },
+            )
+            .optional()
+            .context("looking up terminal client submission receipt")?
+            .map(
+                |(fingerprint, wire_fingerprint, origin_principal, disposition)| {
+                    Ok(ClientSubmissionTerminalReceiptRow {
+                        fingerprint,
+                        wire_fingerprint,
+                        origin_principal,
+                        disposition: ClientSubmissionTerminalDisposition::parse(&disposition)?,
+                    })
+                },
+            )
+            .transpose()
+        })
+        .await
     }
 
     pub fn list_session_events_conn(
@@ -977,6 +1171,142 @@ mod tests {
         assert_eq!(events[1].kind, "assistant_message");
         assert_eq!(events[1].call_id.as_deref(), Some("call-1"));
         assert_eq!(events[1].data, second);
+    }
+
+    #[tokio::test]
+    async fn client_submission_receipt_finds_exact_fold_member_and_fingerprint() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let seq = db
+            .insert_session_event(
+                session.session_id,
+                SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &json!({
+                    "text": "folded",
+                    "client_submission_ids": [first_id, second_id],
+                    "client_submissions": [
+                        {"id": first_id, "fingerprint": "sha-first", "wire_fingerprint": "wire-first", "origin_principal": null},
+                        {"id": second_id, "fingerprint": "sha-second", "wire_fingerprint": "wire-second", "origin_principal": "flycockpit:user-2"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.client_submission_receipt(session.session_id, second_id)
+                .await
+                .unwrap(),
+            Some(ClientSubmissionReceiptRow {
+                seq,
+                fingerprint: "sha-second".to_string(),
+                wire_fingerprint: "wire-second".to_string(),
+                origin_principal: Some("flycockpit:user-2".to_string()),
+            })
+        );
+        assert_eq!(
+            db.client_submission_receipt(session.session_id, Uuid::new_v4())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let other = db.create_session("p", "/y", "Build").await.unwrap();
+        assert_eq!(
+            db.client_submission_receipt(other.session_id, second_id)
+                .await
+                .unwrap(),
+            None,
+            "receipt lookup must remain session-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_client_submission_receipts_are_durable_idempotent_and_session_scoped() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let other = db.create_session("p", "/y", "Build").await.unwrap();
+        let id = Uuid::new_v4();
+        let terminal = ClientSubmissionTerminalReceipt {
+            client_submission_id: id,
+            fingerprint: "content-sha".to_string(),
+            wire_fingerprint: "wire-sha".to_string(),
+            origin_principal: Some("flycockpit:user-1".to_string()),
+            disposition: ClientSubmissionTerminalDisposition::Removed,
+        };
+
+        db.insert_client_submission_terminal_receipts(session.session_id, vec![terminal.clone()])
+            .await
+            .unwrap();
+        db.insert_client_submission_terminal_receipts(session.session_id, vec![terminal.clone()])
+            .await
+            .expect("an exact retry is idempotent");
+
+        assert_eq!(
+            db.client_submission_terminal_receipt(session.session_id, id)
+                .await
+                .unwrap(),
+            Some(ClientSubmissionTerminalReceiptRow {
+                fingerprint: "content-sha".to_string(),
+                wire_fingerprint: "wire-sha".to_string(),
+                origin_principal: Some("flycockpit:user-1".to_string()),
+                disposition: ClientSubmissionTerminalDisposition::Removed,
+            })
+        );
+        assert_eq!(
+            db.client_submission_terminal_receipt(other.session_id, id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let conflict = ClientSubmissionTerminalReceipt {
+            disposition: ClientSubmissionTerminalDisposition::Cancelled,
+            ..terminal
+        };
+        let error = db
+            .insert_client_submission_terminal_receipts(session.session_id, vec![conflict])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different terminal receipt"),
+            "{error:#}"
+        );
+        assert_eq!(
+            db.client_submission_terminal_receipt(session.session_id, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disposition,
+            ClientSubmissionTerminalDisposition::Removed,
+            "a conflicting retry must not mutate the committed tombstone"
+        );
+
+        let preflight_id = Uuid::new_v4();
+        db.insert_client_submission_terminal_receipts(
+            session.session_id,
+            vec![ClientSubmissionTerminalReceipt {
+                client_submission_id: preflight_id,
+                fingerprint: "preflight-content".to_string(),
+                wire_fingerprint: "preflight-wire".to_string(),
+                origin_principal: None,
+                disposition: ClientSubmissionTerminalDisposition::PreflightRejected,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.client_submission_terminal_receipt(session.session_id, preflight_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disposition,
+            ClientSubmissionTerminalDisposition::PreflightRejected
+        );
     }
 
     #[tokio::test]

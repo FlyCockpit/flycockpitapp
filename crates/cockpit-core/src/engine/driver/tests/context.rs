@@ -863,6 +863,8 @@ async fn manual_compact_cancels_shadow() {
 async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
     let cancel = tokio_util::sync::CancellationToken::new();
     let observed_cancel = cancel.clone();
     driver.shadow_brief_generation = 1;
@@ -877,7 +879,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
 
     let prepared = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        driver.prepare_queued_user_submission(UserSubmission::text("hello"), &tx),
+        driver.prepare_queued_user_submission(UserSubmission::text("hello"), &queue, &tx),
     )
     .await
     .expect("foreground preparation should not wait for the delayed shadow");
@@ -896,7 +898,7 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         brief: "ready".to_string(),
     }));
     let _ = driver
-        .prepare_queued_user_submission(UserSubmission::text("hello again"), &tx)
+        .prepare_queued_user_submission(UserSubmission::text("hello again"), &queue, &tx)
         .await;
     assert!(
         matches!(

@@ -1,5 +1,29 @@
 use super::*;
 
+fn deserialize_optional_nonempty_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_ref().is_some_and(String::is_empty) {
+        return Err(serde::de::Error::custom("string must not be empty"));
+    }
+    Ok(value)
+}
+
+fn deserialize_nonempty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("string must not be empty"));
+    }
+    Ok(value)
+}
+
 /// Client → daemon RPCs. The daemon answers each with a matching
 /// [`Response`] keyed by envelope id, or an [`ErrorPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,15 +69,13 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
-        /// Plan-level model override (prompt
-        /// `plan-duplication-and-model-override.md`): a `provider/model`
-        /// selector that overrides every spawned agent's frontmatter model
-        /// for this session's run. Set by `cockpit run --model` (the plan
-        /// executor passes the plan's pinned model). `None` leaves the
-        /// session on its active model + per-agent frontmatter. Ignored on
-        /// resume of an existing session. Defaults to `None`.
-        #[serde(default)]
-        model_override: Option<String>,
+        /// Plan-level model pin (prompt
+        /// `plan-duplication-and-model-override.md`). The complete selection
+        /// is also the new session's authoritative active model, while this
+        /// field makes the same model override every spawned agent's
+        /// frontmatter for the run. Ignored on resume of an existing session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_override: Option<cockpit_config::config::providers::ActiveModelRef>,
         #[serde(default = "default_client_protocol_version")]
         client_protocol_version: u32,
         /// Full client-side environment snapshot for sessions this attach
@@ -85,6 +107,11 @@ pub enum Request {
     /// and leave this empty — composer-paste-handling). The `text` may
     /// contain `IMAGE_PART_SENTINEL` markers, one per image, in order.
     SendUserMessage {
+        /// Stable, client-generated identity for this exact submission. The
+        /// daemon uses it as the queue item id and durable idempotency key, so
+        /// a retry after an ambiguous response/socket loss cannot execute the
+        /// message twice or reconcile the wrong optimistic transcript row.
+        client_submission_id: Uuid,
         text: String,
         /// User-facing transcript form. When absent, clients display `text`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,14 +639,25 @@ pub enum Request {
     /// Switch the attached session to a different model.
     SetActiveModel {
         selection_id: Uuid,
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
         provider: String,
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
         model: String,
         /// Persist this model as the resolution default after the live session
         /// switch commits. Session-only selection must not modify config.
         persist_as_default: bool,
+        /// Establish this selection as the default only if the daemon still
+        /// has no configured default at commit time. This is distinct from an
+        /// explicit default replacement and prevents stale clients from
+        /// overwriting a concurrently-added default.
+        initialize_default_if_missing: bool,
         #[serde(default)]
         trigger: ActiveModelSwitchTrigger,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonempty_string",
+            skip_serializing_if = "Option::is_none"
+        )]
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking_mode: Option<cockpit_config::config::providers::ThinkingMode>,
@@ -875,6 +913,89 @@ pub enum Request {
 
     #[serde(other)]
     Unknown,
+}
+
+impl Request {
+    /// Validate semantic invariants independently of Serde.
+    ///
+    /// Requests carried over an in-process transport are already typed and do
+    /// not pass through deserialization. The daemon calls this before
+    /// authorization or dispatch so those requests cannot bypass the strict
+    /// protocol-v6 active-model contract.
+    pub fn validate_semantics(&self) -> std::result::Result<(), String> {
+        fn validate_selection(
+            field: &str,
+            selection: &cockpit_config::config::providers::ActiveModelRef,
+        ) -> std::result::Result<(), String> {
+            selection
+                .validate()
+                .map_err(|error| format!("{field}: {error}"))
+        }
+
+        match self {
+            Self::Attach {
+                initial_model,
+                model_override,
+                ..
+            } => {
+                if let Some(selection) = initial_model {
+                    validate_selection("initial_model", selection)?;
+                }
+                if let Some(selection) = model_override {
+                    validate_selection("model_override", selection)?;
+                }
+            }
+            Self::CreateAssistantSession {
+                initial_model: Some(selection),
+                ..
+            } => validate_selection("initial_model", selection)?,
+            Self::SetModelFavorite {
+                provider, model, ..
+            } => {
+                if provider.is_empty() {
+                    return Err("provider must not be empty".to_string());
+                }
+                if model.is_empty() {
+                    return Err("model must not be empty".to_string());
+                }
+            }
+            Self::SetActiveModel {
+                provider,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                if provider.is_empty() {
+                    return Err("provider must not be empty".to_string());
+                }
+                if model.is_empty() {
+                    return Err("model must not be empty".to_string());
+                }
+                if reasoning_effort.as_ref().is_some_and(String::is_empty) {
+                    return Err("reasoning_effort must not be empty".to_string());
+                }
+                if let Self::SetActiveModel {
+                    persist_as_default: true,
+                    initialize_default_if_missing: true,
+                    ..
+                } = self
+                {
+                    return Err(
+                        "persist_as_default and initialize_default_if_missing cannot both be true"
+                            .to_string(),
+                    );
+                }
+            }
+            Self::SendUserMessage {
+                client_submission_id,
+                ..
+            } if client_submission_id.is_nil() => {
+                return Err("client_submission_id must not be nil".to_string());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 #[macro_export]
 macro_rules! request_variants {
@@ -1171,6 +1292,133 @@ pub enum AttachmentPurpose {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_model(
+        provider: &str,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> cockpit_config::config::providers::ActiveModelRef {
+        cockpit_config::config::providers::ActiveModelRef {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reasoning_effort: reasoning_effort.map(|value| {
+                cockpit_config::config::providers::ActiveReasoningEffort {
+                    value: value.to_string(),
+                }
+            }),
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }
+    }
+
+    #[test]
+    fn semantic_validation_covers_every_active_model_request_shape() {
+        let invalid = active_model("", "model", None);
+        let requests = [
+            Request::Attach {
+                session_id: None,
+                since_seq: None,
+                project_root: None,
+                initial_model: Some(invalid.clone()),
+                no_sandbox: false,
+                interactive: false,
+                model_override: None,
+                client_protocol_version: PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+            Request::Attach {
+                session_id: None,
+                since_seq: None,
+                project_root: None,
+                initial_model: None,
+                no_sandbox: false,
+                interactive: false,
+                model_override: Some(invalid.clone()),
+                client_protocol_version: PROTOCOL_VERSION,
+                env_snapshot: None,
+                env_policy: EnvDriftPolicy::Daemon,
+            },
+            Request::CreateAssistantSession {
+                name: "assistant".to_string(),
+                project_root: "/repo".to_string(),
+                initial_model: Some(invalid),
+                no_sandbox: false,
+                env_snapshot: None,
+            },
+            Request::SetModelFavorite {
+                provider: "provider".to_string(),
+                model: String::new(),
+                favorite: true,
+            },
+            Request::SetActiveModel {
+                selection_id: Uuid::nil(),
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                persist_as_default: false,
+                initialize_default_if_missing: false,
+                trigger: ActiveModelSwitchTrigger::Picker,
+                reasoning_effort: Some(String::new()),
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+        ];
+
+        for request in requests {
+            assert!(
+                request.validate_semantics().is_err(),
+                "{} accepted an invalid typed active-model value",
+                request.wire_tag()
+            );
+        }
+
+        let valid = Request::SetActiveModel {
+            selection_id: Uuid::nil(),
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            persist_as_default: false,
+            initialize_default_if_missing: false,
+            trigger: ActiveModelSwitchTrigger::Picker,
+            reasoning_effort: Some("high".to_string()),
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        valid
+            .validate_semantics()
+            .expect("complete active-model request should validate");
+    }
+
+    #[test]
+    fn semantic_validation_rejects_ambiguous_model_flags_and_nil_submission_id() {
+        let ambiguous = Request::SetActiveModel {
+            selection_id: Uuid::new_v4(),
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            persist_as_default: true,
+            initialize_default_if_missing: true,
+            trigger: ActiveModelSwitchTrigger::Picker,
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        assert_eq!(
+            ambiguous.validate_semantics().unwrap_err(),
+            "persist_as_default and initialize_default_if_missing cannot both be true"
+        );
+
+        let nil_submission = Request::SendUserMessage {
+            client_submission_id: Uuid::nil(),
+            text: "hello".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+        };
+        assert_eq!(
+            nil_submission.validate_semantics().unwrap_err(),
+            "client_submission_id must not be nil"
+        );
+    }
 
     macro_rules! command_tags {
         (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{

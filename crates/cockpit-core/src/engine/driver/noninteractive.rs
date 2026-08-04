@@ -955,6 +955,7 @@ impl Driver {
                 let Some(first) = user else {
                     return Ok(Message::user(""));
                 };
+                let queue_item_ids = first.queue_item_ids.clone();
                 if self
                     .requeue_command_submission_for_boundary(input_rx, first.clone())
                     .await
@@ -982,10 +983,24 @@ impl Driver {
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
-                let Some(prepared) = self.prepare_queued_user_submission(first, tx).await else {
+                let Some(prepared) = self
+                    .prepare_queued_user_submission(first, input_rx, tx)
+                    .await
+                else {
+                    input_rx.finish(&queue_item_ids).await;
                     return Ok(Message::user(""));
                 };
-                self.record_queued_user_fold(&prepared, tx).await;
+                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                    input_rx
+                        .requeue_front_after(
+                            prepared,
+                            self.active_queue_target(),
+                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                        )
+                        .await;
+                    return Ok(Message::user(""));
+                }
+                input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
@@ -997,7 +1012,9 @@ impl Driver {
                     job_id: None,
                     preflight_cleaned: None,
                     queue_item_ids: Vec::new(),
+                    client_submissions: Vec::new(),
                     queue_target: None,
+                    pending_terminal_disposition: None,
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -2719,6 +2736,7 @@ impl Driver {
                 let Some(first) = user else {
                     return Ok(Message::user(""));
                 };
+                let queue_item_ids = first.queue_item_ids.clone();
                 if self
                     .requeue_command_submission_for_boundary(input_rx, first.clone())
                     .await
@@ -2755,10 +2773,24 @@ impl Driver {
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
-                let Some(prepared) = self.prepare_queued_user_submission(first, tx).await else {
+                let Some(prepared) = self
+                    .prepare_queued_user_submission(first, input_rx, tx)
+                    .await
+                else {
+                    input_rx.finish(&queue_item_ids).await;
                     return Ok(Message::user(""));
                 };
-                self.record_queued_user_fold(&prepared, tx).await;
+                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
+                    input_rx
+                        .requeue_front_after(
+                            prepared,
+                            self.active_queue_target(),
+                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                        )
+                        .await;
+                    return Ok(Message::user(""));
+                }
+                input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
@@ -2770,7 +2802,9 @@ impl Driver {
                     job_id: None,
                     preflight_cleaned: None,
                     queue_item_ids: Vec::new(),
+                    client_submissions: Vec::new(),
                     queue_target: None,
+                    pending_terminal_disposition: None,
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {

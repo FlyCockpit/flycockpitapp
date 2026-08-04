@@ -62,6 +62,17 @@ pub fn connect_call_count() -> usize {
     CONNECT_CALLS.with(std::cell::Cell::get)
 }
 
+/// Whether a daemon connection failed because the peer's wire protocol is
+/// outside the supported range.
+///
+/// Keep this typed all the way through the `anyhow` boundary. Callers must not
+/// classify transport failures by matching human-readable error text.
+pub fn is_protocol_version_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<proto::ErrorPayload>()
+        .is_some_and(|payload| payload.code == proto::ErrorCode::ProtocolVersion)
+}
+
 /// Public handle. Cheap to clone: every clone shares the same
 /// background reader/writer task; only the event-stream subscription
 /// differs.
@@ -287,7 +298,7 @@ async fn negotiate_hello(
         return Ok(proto::NegotiatedProtocol::current());
     };
 
-    proto::NegotiatedProtocol::from_hello(&hello).map_err(|error| anyhow!(error.message))
+    proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
 }
 
 #[cfg(unix)]
@@ -1007,6 +1018,36 @@ mod tests {
             proto::PROTOCOL_VERSION + 1
         );
         assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiation_preserves_typed_protocol_version_mismatch() {
+        let (_dir, socket, listener) = bind_test_socket();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut daemon = ProtoStream::new(stream);
+            send_daemon_hello(
+                &mut daemon,
+                "0.1.incompatible",
+                proto::MIN_SUPPORTED_PROTOCOL_VERSION - 1,
+            )
+            .await;
+        });
+
+        let error = match DaemonClient::connect(&socket).await {
+            Ok(_) => panic!("an incompatible daemon hello must reject the connection"),
+            Err(error) => error,
+        };
+
+        assert!(is_protocol_version_mismatch(&error));
+        let payload = error
+            .downcast_ref::<proto::ErrorPayload>()
+            .expect("the typed protocol error must survive the anyhow boundary");
+        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
+        assert!(!is_protocol_version_mismatch(&anyhow!(
+            "wire protocol version mismatch in unrelated transport text"
+        )));
         server.await.unwrap();
     }
 

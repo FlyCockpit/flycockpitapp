@@ -842,7 +842,9 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     job_id: Some(job.id.clone()),
                     preflight_cleaned: None,
                     queue_item_ids: Vec::new(),
+                    client_submissions: Vec::new(),
                     queue_target: None,
+                    pending_terminal_disposition: None,
                 }),
                 respond_to,
             })
@@ -850,7 +852,8 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
             .context("dispatching scheduled prompt")?;
         let (queued_item, _) = response_rx
             .await
-            .context("scheduled prompt queue ack dropped")?;
+            .context("scheduled prompt queue ack dropped")?
+            .map_err(|error| anyhow::anyhow!(error.message))?;
         let expected_turn_id = queued_item.id.to_string();
         let completion = handle.watch_turn(&expected_turn_id);
         match tokio::time::timeout(RUN_PROMPT_TIMEOUT, completion).await {
@@ -1739,7 +1742,7 @@ mod tests {
             Some("daemon_scheduler")
         );
         respond_to
-            .send((
+            .send(Ok((
                 crate::daemon::proto::QueueItem {
                     id: turn_id,
                     status: crate::daemon::proto::QueueItemStatus::Queued,
@@ -1753,7 +1756,7 @@ mod tests {
                     },
                 },
                 Vec::new(),
-            ))
+            )))
             .expect("runner still waiting for queue ack");
     }
 

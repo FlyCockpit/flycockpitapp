@@ -54,10 +54,44 @@ describe("daemonStateReducer", () => {
       forced: true,
       copy: "The daemon is draining and has reached its grace deadline.",
     });
-    expect(composerSendDisabled({ message: "hello", busy: false, draining: state.draining })).toBe(
-      true,
-    );
-    expect(composerSendDisabled({ message: "hello", busy: false, draining: null })).toBe(false);
+    expect(
+      composerSendDisabled({
+        message: "hello",
+        busy: false,
+        draining: state.draining,
+        repairRequired: null,
+      }),
+    ).toBe(true);
+    expect(
+      composerSendDisabled({
+        message: "hello",
+        busy: false,
+        draining: null,
+        repairRequired: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("disables sends while the attached session requires repair", () => {
+    expect(
+      composerSendDisabled({
+        message: "hello",
+        busy: false,
+        draining: null,
+        repairRequired: {
+          session_id: sessionId,
+          short_id: "s1",
+          provider: "anthropic",
+          model: "claude-sonnet-4",
+          wire_api: "messages",
+          failure_kind: "orphan_tool_use",
+          failing_tool_call_ids: ["tool-1"],
+          safe_last_turn_seq: 8,
+          suggested_actions: ["open_read_only"],
+          detail: "Repair required before continuing.",
+        },
+      }),
+    ).toBe(true);
   });
 
   it("sets and clears waiting-for-lock indicators", () => {

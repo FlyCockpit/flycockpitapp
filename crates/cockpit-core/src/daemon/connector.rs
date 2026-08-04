@@ -1677,6 +1677,7 @@ mod tests {
             (
                 Event::SessionPersistFailed {
                     session_id,
+                    client_submission_id: Uuid::from_u128(1),
                     error: "persist failed".to_string(),
                 },
                 AttentionEventType::TurnError,
@@ -1728,6 +1729,7 @@ mod tests {
             },
             Event::SessionPersistFailed {
                 session_id,
+                client_submission_id: Uuid::from_u128(1),
                 error: "persist failed".to_string(),
             },
             Event::SessionDriverFailed {

@@ -65,6 +65,12 @@ use tokio::sync::broadcast;
 
 use crate::redact::RedactionTable;
 
+/// Extra time after the requested drain window for a stopped daemon to be
+/// scheduled, unwind its tasks, and release owned pid/socket metadata. This is
+/// deliberately separate from the user-selected drain grace: even a zero-
+/// grace shutdown still needs a bounded process-cleanup allowance under load.
+const RESTART_RELEASE_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+
 /// In-daemon event broadcast item. The wire schema remains proto::Event;
 /// the envelope pins the accumulated redaction table that was live when the
 /// event was emitted so each client can scrub with the correct snapshot.
@@ -885,7 +891,7 @@ pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
     let drain = grace_secs
         .map(Duration::from_secs)
         .unwrap_or(shutdown::SHUTDOWN_DRAIN_GRACE);
-    drain.saturating_add(Duration::from_secs(2))
+    drain.saturating_add(RESTART_RELEASE_CLEANUP_GRACE)
 }
 
 pub async fn wait_for_restart_release(
@@ -2499,10 +2505,16 @@ mod tests {
     fn restart_release_timeout_uses_default_drain_plus_cleanup_window() {
         assert_eq!(
             restart_release_timeout(None),
-            shutdown::SHUTDOWN_DRAIN_GRACE + Duration::from_secs(2)
+            shutdown::SHUTDOWN_DRAIN_GRACE + RESTART_RELEASE_CLEANUP_GRACE
         );
-        assert_eq!(restart_release_timeout(Some(0)), Duration::from_secs(2));
-        assert_eq!(restart_release_timeout(Some(7)), Duration::from_secs(9));
+        assert_eq!(
+            restart_release_timeout(Some(0)),
+            RESTART_RELEASE_CLEANUP_GRACE
+        );
+        assert_eq!(
+            restart_release_timeout(Some(7)),
+            Duration::from_secs(7) + RESTART_RELEASE_CLEANUP_GRACE
+        );
     }
 
     #[tokio::test]

@@ -60,7 +60,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             }]
         }
         TurnEvent::DaemonLinkReconnecting { .. }
-        | TurnEvent::DaemonLinkReconnected
+        | TurnEvent::DaemonLinkReconnected { .. }
+        | TurnEvent::DaemonLinkResynced { .. }
         | TurnEvent::DaemonLinkTerminal { .. }
         | TurnEvent::PausedWorkAvailable { .. }
         | TurnEvent::ResumeRepairRequired { .. }
@@ -95,11 +96,13 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         }
         TurnEvent::UserMessageRecorded {
             seq,
+            client_submission_ids,
             preflight_cleaned,
         } => {
             vec![Event::UserMessageRecorded {
                 session_id,
                 seq,
+                client_submission_ids,
                 preflight_cleaned,
             }]
         }
@@ -123,9 +126,14 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 preflight_cleaned,
             }]
         }
-        TurnEvent::SessionPersistFailed { error } => {
-            vec![Event::SessionPersistFailed { session_id, error }]
-        }
+        TurnEvent::SessionPersistFailed {
+            client_submission_id,
+            error,
+        } => vec![Event::SessionPersistFailed {
+            session_id,
+            client_submission_id,
+            error,
+        }],
         TurnEvent::SessionDriverFailed { error } => {
             vec![Event::SessionDriverFailed {
                 session_id,
@@ -134,11 +142,31 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             }]
         }
         TurnEvent::UserMessageDispatchFailed { .. } => vec![],
-        TurnEvent::PreflightStarted => {
-            vec![Event::PreflightStarted { session_id }]
+        TurnEvent::UserMessageDispatchRetained { .. }
+        | TurnEvent::UserMessageDispatchRestored { .. } => vec![],
+        TurnEvent::PreflightStarted {
+            client_submission_ids,
+        } => {
+            vec![Event::PreflightStarted {
+                session_id,
+                client_submission_ids,
+            }]
         }
-        TurnEvent::UserMessageRetracted => {
-            vec![Event::UserMessageRetracted { session_id }]
+        TurnEvent::UserMessagesTerminated {
+            client_submission_ids,
+            disposition,
+        } => vec![Event::UserMessagesTerminated {
+            session_id,
+            client_submission_ids,
+            disposition,
+        }],
+        TurnEvent::UserMessageRetracted {
+            client_submission_ids,
+        } => {
+            vec![Event::UserMessageRetracted {
+                session_id,
+                client_submission_ids,
+            }]
         }
         TurnEvent::Notice { text } => {
             vec![Event::Notice { session_id, text }]

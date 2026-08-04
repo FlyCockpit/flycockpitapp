@@ -44,23 +44,6 @@ use std::time::Instant;
 
 use crate::cli::{Cli, Command};
 
-/// Worker stack size for the tokio runtime, in place of tokio's 2 MiB
-/// default. Measured necessary (workspace-lints-and-dep-unification,
-/// 2026-07-19, Linux x86_64, debug profile): with the default 2 MiB stack,
-/// the daemon aborts with `thread 'tokio-rt-worker' has overflowed its
-/// stack` (SIGSEGV `SEGV_ACCERR` on the guard page, then SIGABRT) while
-/// polling the session-worker turn started by the first `send_user_message`
-/// of a session — reproducible via every `daemon_lifecycle_replay`
-/// integration test. The worker futures are already heap-allocated at their
-/// spawn boundaries (`Box::pin` in `daemon/session_worker/{handle,run}.rs`);
-/// the overflow is poll-stack depth, not future size. Probe runs
-/// (`thread_stack_size` at 2/2.5/3/4/8 MiB) show the suite fails at 2 MiB
-/// and passes at >= 2.5 MiB. Repeated full-workspace stress later still
-/// exposed load-dependent `daemon connection closed` replay failures at
-/// 4 MiB, so keep the measured 8 MiB ceiling for stable daemon integration
-/// coverage.
-const TOKIO_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
-
 pub mod manpages {
     use std::fs;
     use std::io;
@@ -284,6 +267,7 @@ pub mod integration {
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessage {
+                    client_submission_id: Uuid::new_v4(),
                     text: text.into(),
                     display_text,
                     tag_expansions: tag_expansions
@@ -594,7 +578,7 @@ pub fn main_entry() -> ExitCode {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
+        .thread_stack_size(cockpit_core::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
         .build();
     let result = match runtime {
         Ok(runtime) => runtime.block_on(async_main(launch_start)),

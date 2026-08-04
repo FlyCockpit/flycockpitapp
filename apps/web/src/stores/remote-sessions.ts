@@ -9,11 +9,21 @@ import type {
   GitStatusResult,
   HistoryPageResult,
   InterruptQuestion,
+  ResumeRepairState,
   HistoryEntry as WireHistoryEntry,
   SessionSummary as WireSessionSummary,
 } from "@flycockpit/cockpit-protocol";
-import { activeModelStateSchema, eventEnvelopeSchema } from "@flycockpit/cockpit-protocol";
-import { RemoteSessionClient } from "@flycockpit/cockpit-protocol/client";
+import {
+  activeModelStateSchema,
+  createClientSubmissionId,
+  eventEnvelopeSchema,
+  modelSelectionResultDataSchema,
+} from "@flycockpit/cockpit-protocol";
+import {
+  RemoteSessionClient,
+  type SendUserMessageParams,
+  shouldRetainUserMessageSubmission,
+} from "@flycockpit/cockpit-protocol/client";
 import { create } from "zustand";
 import {
   type AuthRecoveryView,
@@ -24,7 +34,7 @@ import {
 } from "@/lib/inference-failure-view";
 import { type InterruptSelection, resolveFromSelection } from "@/lib/interrupt-view";
 
-type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
+export type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 
 export type WebProjectRow = {
   projectId: string;
@@ -71,6 +81,7 @@ export type WebHistoryEntry =
       kind: "user_message" | "user_note" | "assistant_text" | "assistant_reasoning";
       text: string;
       actor?: { userId?: string; displayName?: string; origin?: string };
+      clientSubmissionIds?: string[];
     }
   | {
       id: string;
@@ -106,6 +117,8 @@ export type WebHistoryEntry =
     };
 
 export type WebActiveModelState = {
+  selection: ActiveModelRef;
+  defaultSelection?: ActiveModelRef;
   provider: string;
   model: string;
   configProvider?: string;
@@ -162,11 +175,30 @@ export type SessionDetail = {
   sandboxUnavailable?: WebSandboxUnavailable;
   waitingLocks: Record<string, WebWaitingLock>;
   pausedWork?: WebPausedWork;
+  repairRequired?: ResumeRepairState;
 };
 
-type InstanceRemoteState = {
+export class WebSessionCreatedWithSetupError extends Error {
+  constructor(
+    readonly session: SessionDetail,
+    setupError: unknown,
+  ) {
+    super(errorMessage(setupError));
+    this.name = "WebSessionCreatedWithSetupError";
+  }
+}
+
+export type WebAttachmentState = {
+  connectionEpoch: number;
+  phase: "detached" | "pending" | "applied" | "failed";
+  sessionId?: string;
+  error?: string;
+};
+
+export type InstanceRemoteState = {
   status: ConnectionStatus;
   statusDetail?: string;
+  attachment: WebAttachmentState;
   draining?: { forced: boolean };
   projects: WebProjectRow[];
   sessionsByProject: Record<string, WebSessionSummary[]>;
@@ -196,7 +228,11 @@ type RemoteSessionState = {
       initialModel?: ActiveModelRef;
     },
   ) => Promise<SessionDetail>;
-  sendMessage: (instanceId: string, sessionId: string, text: string) => Promise<void>;
+  sendMessage: (
+    instanceId: string,
+    sessionId: string,
+    input: string | SendUserMessageParams,
+  ) => Promise<void>;
   resolveInterrupt: (
     instanceId: string,
     input: {
@@ -248,10 +284,249 @@ const pendingAssistantSeq = Number.MAX_SAFE_INTEGER - 1;
 const pendingInterruptSeq = Number.MAX_SAFE_INTEGER;
 const warnedEventKinds = new Set<string>();
 const historyPageInFlight = new Set<string>();
+const pendingUserSubmissions = new Map<string, Map<string, SendUserMessageParams>>();
 const historyPageLimit = 100;
+
+type WebAttachAttempt = {
+  id: number;
+  client: RemoteSessionClient;
+  connectionEpoch: number;
+  sessionId?: string;
+};
+
+class WebAttachCoordinator {
+  private nextId = 0;
+  private current: WebAttachAttempt | null = null;
+
+  begin(
+    client: RemoteSessionClient,
+    connectionEpoch: number,
+    sessionId?: string,
+  ): WebAttachAttempt {
+    const attempt = {
+      id: ++this.nextId,
+      client,
+      connectionEpoch,
+      sessionId,
+    };
+    this.current = attempt;
+    return attempt;
+  }
+
+  bindSession(attempt: WebAttachAttempt, sessionId: string) {
+    if (attempt.id !== this.current?.id) return false;
+    attempt.sessionId = sessionId;
+    return true;
+  }
+
+  invalidate() {
+    this.nextId += 1;
+    this.current = null;
+  }
+
+  isCurrent(
+    attempt: WebAttachAttempt,
+    client: RemoteSessionClient | undefined,
+    connectionEpoch: number,
+  ) {
+    return (
+      attempt.id === this.current?.id &&
+      attempt.client === client &&
+      attempt.connectionEpoch === connectionEpoch
+    );
+  }
+
+  finish(
+    attempt: WebAttachAttempt,
+    client: RemoteSessionClient | undefined,
+    connectionEpoch: number,
+  ) {
+    if (!this.isCurrent(attempt, client, connectionEpoch)) return false;
+    this.current = null;
+    return true;
+  }
+}
+
+const webAttachCoordinators = new Map<string, WebAttachCoordinator>();
+
+function webAttachCoordinator(instanceId: string) {
+  let coordinator = webAttachCoordinators.get(instanceId);
+  if (!coordinator) {
+    coordinator = new WebAttachCoordinator();
+    webAttachCoordinators.set(instanceId, coordinator);
+  }
+  return coordinator;
+}
+
+export type WebComposerRetrySubmission = {
+  sessionId: string;
+  params: SendUserMessageParams;
+};
+
+export function matchingWebComposerRetry(
+  sessionId: string,
+  text: string,
+  retry?: WebComposerRetrySubmission | null,
+) {
+  return retry?.sessionId === sessionId && retry.params.text === text ? retry.params : null;
+}
+
+export function matchingWebComposerRetryForSession(
+  sessionId: string,
+  text: string,
+  retries: Readonly<Record<string, WebComposerRetrySubmission | undefined>>,
+) {
+  return matchingWebComposerRetry(sessionId, text, retries[sessionId]);
+}
+
+export function isCurrentWebComposerAttempt(input: {
+  currentSessionId: string | null;
+  attemptedSessionId: string;
+  latestAttempt: number;
+  attempt: number;
+}) {
+  return (
+    input.currentSessionId === input.attemptedSessionId && input.latestAttempt === input.attempt
+  );
+}
+
+function pendingUserSubmissionKey(instanceId: string, sessionId: string) {
+  return `${instanceId}:${sessionId}`;
+}
+
+function retainedUserSubmission(
+  retained: ReadonlyMap<string, SendUserMessageParams> | undefined,
+  input: string | SendUserMessageParams,
+) {
+  if (typeof input !== "string") {
+    const exact = retained?.get(input.client_submission_id);
+    return exact ? { submission: exact, isRetry: true } : { submission: input, isRetry: false };
+  }
+  return {
+    submission: { client_submission_id: createClientSubmissionId(), text: input },
+    isRetry: false,
+  };
+}
+
+function retainUserSubmission(key: string, submission: SendUserMessageParams) {
+  let retained = pendingUserSubmissions.get(key);
+  if (!retained) {
+    retained = new Map();
+    pendingUserSubmissions.set(key, retained);
+  }
+  const exact = retained.get(submission.client_submission_id);
+  if (exact) return exact;
+  retained.set(submission.client_submission_id, submission);
+  return submission;
+}
+
+function forgetUserSubmission(key: string, clientSubmissionId: string) {
+  const retained = pendingUserSubmissions.get(key);
+  if (!retained) return;
+  retained.delete(clientSubmissionId);
+  if (retained.size === 0) pendingUserSubmissions.delete(key);
+}
+
+async function replayPendingUserSubmissions(
+  client: RemoteSessionClient,
+  instanceId: string,
+  sessionId: string,
+  isCurrent: () => boolean,
+) {
+  const key = pendingUserSubmissionKey(instanceId, sessionId);
+  const snapshot = [...(pendingUserSubmissions.get(key)?.values() ?? [])];
+  const rejectedIds: string[] = [];
+  for (const submission of snapshot) {
+    if (!isCurrent()) return { current: false, rejectedIds };
+    if (!pendingUserSubmissions.get(key)?.has(submission.client_submission_id)) continue;
+    try {
+      await client.sendUserMessage(submission);
+    } catch (error) {
+      if (!isCurrent()) return { current: false, rejectedIds };
+      if (
+        shouldRetainUserMessageSubmission(error) &&
+        pendingUserSubmissions.get(key)?.has(submission.client_submission_id)
+      ) {
+        // Preserve FIFO when the destination is still temporarily unable to
+        // accept A; sending later B would overtake the exact retained request.
+        break;
+      }
+      forgetUserSubmission(key, submission.client_submission_id);
+      rejectedIds.push(submission.client_submission_id);
+    }
+  }
+  return { current: isCurrent(), rejectedIds };
+}
+
+function acceptedClientSubmissionIdsFromHistory(entries: readonly WireHistoryEntry[]) {
+  return entries.flatMap((entry) =>
+    entry.role === "user" ? (entry.client_submission_ids ?? []) : [],
+  );
+}
+
+function acceptedClientSubmissionIdsFromEvent(event: EventEnvelope) {
+  const data = eventData(event);
+  if (!data) return [];
+  if (event.event === "user_message_recorded") {
+    return Array.isArray(data.client_submission_ids)
+      ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event === "queued_user_messages_folded") {
+    return Array.isArray(data.queue_item_ids)
+      ? data.queue_item_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event === "user_messages_terminated" || event.event === "user_message_retracted") {
+    return Array.isArray(data.client_submission_ids)
+      ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+      : [];
+  }
+  if (event.event !== "history_replay" || !Array.isArray(data.entries)) return [];
+  return data.entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    if (record.role !== "user" || !Array.isArray(record.client_submission_ids)) return [];
+    return record.client_submission_ids.filter((id): id is string => typeof id === "string");
+  });
+}
+
+function forgetAcceptedUserSubmissions(
+  instanceId: string,
+  sessionId: string,
+  clientSubmissionIds: readonly string[],
+) {
+  const key = pendingUserSubmissionKey(instanceId, sessionId);
+  for (const id of clientSubmissionIds) forgetUserSubmission(key, id);
+}
+
+/// Apply one client event and retire any exact submissions that the daemon has
+/// durably recorded or terminated. Kept as one production helper so tests can
+/// verify UI reduction and reconnect-replay ownership together.
+export function applyRemoteSessionClientEvent(
+  instanceId: string,
+  existing: InstanceRemoteState,
+  event: unknown,
+) {
+  const parsedEvent = eventEnvelopeSchema.safeParse(event);
+  if (parsedEvent.success && !("__unknown" in parsedEvent.data)) {
+    const settledSessionId = sessionIdFromEvent(parsedEvent.data);
+    if (settledSessionId) {
+      forgetAcceptedUserSubmissions(
+        instanceId,
+        settledSessionId,
+        acceptedClientSubmissionIdsFromEvent(parsedEvent.data),
+      );
+    }
+  }
+  const result = reduceRemoteSessionEvent(existing, event);
+  warnUnhandledRemoteSessionEvent(result.warningKind);
+  return result.state;
+}
 
 const emptyInstance = (): InstanceRemoteState => ({
   status: "idle",
+  attachment: { connectionEpoch: 0, phase: "detached" },
   projects: [],
   sessionsByProject: {},
   detailsBySession: {},
@@ -354,9 +629,18 @@ function mergeHistorySnapshot(current: WebHistoryEntry[], snapshot: WebHistoryEn
   const nextSeq = nextSeqFromHistory(snapshot);
   const oldestSnapshotSeq = oldestSeqFromHistory(snapshot);
   const snapshotIds = new Set(snapshot.map((entry) => entry.id));
+  const recordedClientSubmissionIds = new Set(
+    snapshot.flatMap((entry) =>
+      entry.kind === "user_message" ? (entry.clientSubmissionIds ?? []) : [],
+    ),
+  );
   const preserved = current.filter(
     (entry) =>
       !snapshotIds.has(entry.id) &&
+      !(
+        entry.id.startsWith(pendingUserPrefix) &&
+        recordedClientSubmissionIds.has(entry.id.slice(pendingUserPrefix.length))
+      ) &&
       ((oldestSnapshotSeq !== null && entry.seq < oldestSnapshotSeq) || entry.seq >= nextSeq),
   );
   return mergeHistoryEntries(snapshot, preserved);
@@ -461,6 +745,7 @@ function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistory
       kind: "user_message",
       text: entry.display_text ?? entry.text,
       actor: { origin: entry.origin_principal ?? "daemon" },
+      clientSubmissionIds: entry.client_submission_ids ?? [],
     };
   }
   if (entry.role === "user_note") {
@@ -564,7 +849,7 @@ function attachSummary(
     updatedAt: current?.updatedAt ?? Date.now(),
     createdBy: current?.createdBy ?? null,
     agent: attach.active_agent,
-    model: activeModel ? `${activeModel.provider}/${activeModel.model}` : current?.model,
+    model: activeModel ? `${activeModel.provider}/${activeModel.model}` : undefined,
     sharedWithCollaborators: current?.sharedWithCollaborators ?? false,
   };
 }
@@ -579,13 +864,11 @@ export function mergeAttach(
   const attachedActiveModel = attach.active_model_state
     ? activeModelFromData(attach.active_model_state as Record<string, unknown>)
     : null;
-  const activeModel =
-    attachedActiveModel &&
-    (!current?.activeModel || attachedActiveModel.generation >= current.activeModel.generation)
-      ? attachedActiveModel
-      : current?.activeModel;
+  // Attach is a new live-worker epoch. Its snapshot is authoritative even
+  // when a previous connection cached a numerically higher generation.
+  const activeModel = attachedActiveModel ?? undefined;
   const summary = attachSummary(attach, activeModel, current?.summary);
-  return {
+  const attached = {
     ...existing,
     sessionsByProject: {
       ...existing.sessionsByProject,
@@ -607,10 +890,12 @@ export function mergeAttach(
         activeModel,
         sandboxUnavailable: current?.sandboxUnavailable,
         waitingLocks: current?.waitingLocks ?? {},
-        pausedWork: current?.pausedWork,
+        pausedWork: undefined,
+        repairRequired: attach.repair_required,
       },
     },
   };
+  return applyPausedWork(attached, summary.sessionId, attach.paused_work);
 }
 
 function upsertSession(sessions: WebSessionSummary[], summary: WebSessionSummary) {
@@ -768,6 +1053,8 @@ function activeModelFromData(data: Record<string, unknown>): WebActiveModelState
   if (!parsed.success) return null;
   const { selection, default_selection: defaultSelection, diverged, generation } = parsed.data;
   return {
+    selection,
+    defaultSelection: defaultSelection ?? undefined,
     provider: selection.provider,
     model: selection.model,
     configProvider: defaultSelection?.provider,
@@ -775,6 +1062,26 @@ function activeModelFromData(data: Record<string, unknown>): WebActiveModelState
     diverged,
     generation,
   };
+}
+
+function applyActiveModelState(
+  existing: InstanceRemoteState,
+  sessionId: string,
+  activeModel: WebActiveModelState,
+  acceptSameGeneration: boolean,
+) {
+  const current = existing.detailsBySession[sessionId]?.activeModel;
+  if (
+    current &&
+    (activeModel.generation < current.generation ||
+      (!acceptSameGeneration && activeModel.generation === current.generation))
+  ) {
+    return existing;
+  }
+  const state = updateDetail(existing, sessionId, (detail) => ({ ...detail, activeModel }));
+  return updateSessionSummary(state, sessionId, {
+    model: `${activeModel.provider}/${activeModel.model}`,
+  });
 }
 
 function applyPausedWork(existing: InstanceRemoteState, sessionId: string, items: unknown[]) {
@@ -855,12 +1162,48 @@ export function reduceRemoteSessionEvent(
     };
   }
 
+  if (event.event === "queued_user_messages_folded") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const clientSubmissionIds = Array.isArray(data.queue_item_ids)
+      ? data.queue_item_ids.filter((id): id is string => typeof id === "string")
+      : [];
+    return {
+      state: updateDetail(existing, sessionId, (detail) => {
+        const text =
+          stringField(data, "display_text") ??
+          stringField(data, "preflight_cleaned") ??
+          stringField(data, "text");
+        if (text === undefined || text === null) return detail;
+        const seq = numberField(data, "seq") ?? nextLocalSeq(detail.history);
+        const history = upsertHistory(
+          detail.history.filter(
+            (entry) => !clientSubmissionIds.some((id) => entry.id === pendingUserPrefix + id),
+          ),
+          {
+            id: "user:" + seq,
+            seq,
+            kind: "user_message",
+            text,
+            actor: { origin: "web" },
+            clientSubmissionIds,
+          },
+        );
+        return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+      }),
+    };
+  }
+
   if (event.event === "user_message_recorded") {
     if (!sessionId || !data) return { state: existing, warningKind: event.event };
     return {
       state: updateDetail(existing, sessionId, (detail) => {
+        const clientSubmissionIds = Array.isArray(data.client_submission_ids)
+          ? data.client_submission_ids.filter((id): id is string => typeof id === "string")
+          : [];
         const pending = detail.history.find(
-          (entry) => entry.kind === "user_message" && entry.id.startsWith(pendingUserPrefix),
+          (entry) =>
+            entry.kind === "user_message" &&
+            clientSubmissionIds.some((id) => entry.id === pendingUserPrefix + id),
         );
         const text =
           stringField(data, "preflight_cleaned") ??
@@ -868,11 +1211,44 @@ export function reduceRemoteSessionEvent(
         if (!text) return detail;
         const seq = numberField(data, "seq") ?? nextLocalSeq(detail.history);
         const history = upsertHistory(
-          detail.history.filter((entry) => entry.id !== pending?.id),
-          { id: "user:" + seq, seq, kind: "user_message", text, actor: { origin: "web" } },
+          detail.history.filter(
+            (entry) => !clientSubmissionIds.some((id) => entry.id === pendingUserPrefix + id),
+          ),
+          {
+            id: "user:" + seq,
+            seq,
+            kind: "user_message",
+            text,
+            actor: { origin: "web" },
+            clientSubmissionIds,
+          },
         );
         return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
       }),
+    };
+  }
+
+  if (event.event === "session_persist_failed") {
+    // Preserve the exact optimistic row for the identified submission. The send
+    // path retains its complete wire payload for retry and other in-flight rows
+    // must remain untouched.
+    return { state: existing };
+  }
+
+  if (event.event === "user_messages_terminated" || event.event === "user_message_retracted") {
+    if (!sessionId || !data || !Array.isArray(data.client_submission_ids)) {
+      return { state: existing, warningKind: event.event };
+    }
+    const terminalIds = data.client_submission_ids.filter(
+      (id): id is string => typeof id === "string",
+    );
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: detail.history.filter(
+          (entry) => !terminalIds.some((id) => entry.id === pendingUserPrefix + id),
+        ),
+      })),
     };
   }
 
@@ -979,11 +1355,23 @@ export function reduceRemoteSessionEvent(
     const activeModel = activeModelFromData(data);
     if (!activeModel) return { state: existing, warningKind: event.event };
     return {
-      state: updateDetail(existing, sessionId, (detail) =>
-        detail.activeModel && activeModel.generation <= detail.activeModel.generation
-          ? detail
-          : { ...detail, activeModel },
-      ),
+      // Config/default corrections do not advance the selection generation.
+      // Event order within a live attachment is authoritative, so accept an
+      // equal generation while continuing to reject genuinely older state.
+      state: applyActiveModelState(existing, sessionId, activeModel, true),
+    };
+  }
+
+  if (event.event === "model_selection_result") {
+    const parsedResult = modelSelectionResultDataSchema.safeParse(event.data);
+    if (!parsedResult.success) return { state: existing, warningKind: event.event };
+    if (parsedResult.data.outcome.status === "rejected") return { state: existing };
+    const activeModel = activeModelFromData(parsedResult.data.outcome.active_state);
+    if (!activeModel) return { state: existing, warningKind: event.event };
+    // The terminal result can correct default/divergence state without a
+    // selection-generation increment, so equality is accepted here.
+    return {
+      state: applyActiveModelState(existing, parsedResult.data.session_id, activeModel, true),
     };
   }
 
@@ -1075,6 +1463,39 @@ export function warnUnhandledRemoteSessionEvent(
 export function resetRemoteSessionEventWarningsForTests() {
   warnedEventKinds.clear();
   historyPageInFlight.clear();
+  pendingUserSubmissions.clear();
+  webAttachCoordinators.clear();
+}
+
+export function isWebAttachmentReady(
+  remote: InstanceRemoteState | undefined,
+  sessionId: string | null,
+) {
+  return (
+    remote?.status === "connected" &&
+    sessionId !== null &&
+    remote.attachment.phase === "applied" &&
+    remote.attachment.sessionId === sessionId
+  );
+}
+
+export function webAttachmentAfterConnectionStatus(
+  current: Pick<InstanceRemoteState, "attachment" | "status">,
+  status: ConnectionStatus,
+): WebAttachmentState {
+  if (status === "connected" && current.status !== "connected") {
+    return {
+      connectionEpoch: current.attachment.connectionEpoch + 1,
+      phase: "detached",
+    };
+  }
+  if (status !== "connected") {
+    return {
+      connectionEpoch: current.attachment.connectionEpoch,
+      phase: "detached",
+    };
+  }
+  return current.attachment;
 }
 
 export function addOptimisticUserMessage(
@@ -1093,6 +1514,17 @@ export function addOptimisticUserMessage(
     });
     return { ...detail, history };
   });
+}
+
+export function removeOptimisticUserMessage(
+  existing: InstanceRemoteState,
+  sessionId: string,
+  clientMessageId: string,
+): InstanceRemoteState {
+  return updateDetail(existing, sessionId, (detail) => ({
+    ...detail,
+    history: detail.history.filter((entry) => entry.id !== pendingUserPrefix + clientMessageId),
+  }));
 }
 
 export function updateSessionSharedWithCollaborators(
@@ -1136,6 +1568,33 @@ function projectIdForRoot(current: InstanceRemoteState, projectRoot: string) {
   );
 }
 
+function isCurrentWebAttachAttempt(
+  state: Pick<RemoteSessionState, "clients" | "instances">,
+  instanceId: string,
+  coordinator: WebAttachCoordinator,
+  attempt: WebAttachAttempt,
+) {
+  const remote = state.instances[instanceId];
+  return (
+    remote?.status === "connected" &&
+    coordinator.isCurrent(attempt, state.clients[instanceId], remote.attachment.connectionEpoch)
+  );
+}
+
+function attachedWebClient(
+  state: Pick<RemoteSessionState, "clients" | "instances">,
+  instanceId: string,
+  sessionId: string,
+) {
+  const remote = state.instances[instanceId];
+  const client = state.clients[instanceId];
+  return client && isWebAttachmentReady(remote, sessionId) ? client : undefined;
+}
+
+function attachmentNotReadyError() {
+  return new Error("The selected session attachment is not ready.");
+}
+
 export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) => ({
   instances: {},
   clients: {},
@@ -1145,31 +1604,49 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
   connect: (instanceId, tokenInfo) => {
     const current = get().clients[instanceId];
     if (current) return;
-    const client = new RemoteSessionClient({
+    const coordinator = webAttachCoordinator(instanceId);
+    coordinator.invalidate();
+    let client: RemoteSessionClient;
+    client = new RemoteSessionClient({
       instanceId,
       relayUrl: tokenInfo.relayUrl,
       token: tokenInfo.token,
       baseUrl: window.location.origin,
       onStatus: (status, statusDetail) => {
+        if (get().clients[instanceId] !== client) return;
         set((state) => ({
-          instances: setInstance(state.instances, instanceId, (current) => ({
-            ...current,
-            status,
-            statusDetail,
-          })),
+          ...state,
+          instances: setInstance(state.instances, instanceId, (current) => {
+            if (state.clients[instanceId] !== client) return current;
+            const attachment = webAttachmentAfterConnectionStatus(current, status);
+            if (attachment !== current.attachment) {
+              coordinator.invalidate();
+            }
+            return {
+              ...current,
+              status,
+              statusDetail,
+              attachment,
+            };
+          }),
         }));
       },
       onEvent: (event) => {
-        set((state) => {
-          const result = reduceRemoteSessionEvent(
-            state.instances[instanceId] ?? emptyInstance(),
-            event,
-          );
-          warnUnhandledRemoteSessionEvent(result.warningKind);
-          return {
-            instances: { ...state.instances, [instanceId]: result.state },
-          };
-        });
+        if (get().clients[instanceId] !== client) return;
+        set((state) => ({
+          ...state,
+          instances: {
+            ...state.instances,
+            [instanceId]:
+              state.clients[instanceId] === client
+                ? applyRemoteSessionClientEvent(
+                    instanceId,
+                    state.instances[instanceId] ?? emptyInstance(),
+                    event,
+                  )
+                : (state.instances[instanceId] ?? emptyInstance()),
+          },
+        }));
       },
     });
     set((state) => ({
@@ -1177,17 +1654,26 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
       instances: setInstance(state.instances, instanceId, (current) => ({
         ...current,
         status: "connecting",
+        attachment: {
+          connectionEpoch: current.attachment.connectionEpoch,
+          phase: "detached",
+        },
       })),
     }));
     client.connect();
   },
   disconnect: (instanceId) => {
     get().clients[instanceId]?.close();
+    webAttachCoordinator(instanceId).invalidate();
     set((state) => ({
       clients: { ...state.clients, [instanceId]: undefined },
       instances: setInstance(state.instances, instanceId, (current) => ({
         ...current,
         status: "offline",
+        attachment: {
+          connectionEpoch: current.attachment.connectionEpoch,
+          phase: "detached",
+        },
       })),
     }));
   },
@@ -1236,16 +1722,81 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }));
   },
   attach: async (instanceId, sessionId) => {
-    const result = await get().clients[instanceId]?.attach({
-      session_id: sessionId,
-      interactive: true,
-    });
-    if (!result) return;
+    const initial = get();
+    const client = initial.clients[instanceId];
+    const remote = initial.instances[instanceId];
+    if (!client || remote?.status !== "connected") return;
+
+    const connectionEpoch = remote.attachment.connectionEpoch;
+    const coordinator = webAttachCoordinator(instanceId);
+    const attempt = coordinator.begin(client, connectionEpoch, sessionId);
     set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) =>
-        mergeAttach(current, result),
-      ),
+      instances: setInstance(state.instances, instanceId, (current) => ({
+        ...current,
+        attachment: { connectionEpoch, phase: "pending", sessionId },
+      })),
     }));
+    const isCurrent = () => isCurrentWebAttachAttempt(get(), instanceId, coordinator, attempt);
+
+    try {
+      const result = await client.attach({
+        session_id: sessionId,
+        interactive: true,
+      });
+      if (!isCurrent()) return;
+      if (result.session_id !== sessionId) {
+        throw new Error("Instance attached a different session than requested.");
+      }
+      forgetAcceptedUserSubmissions(
+        instanceId,
+        result.session_id,
+        acceptedClientSubmissionIdsFromHistory(result.history),
+      );
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) =>
+          mergeAttach(current, result),
+        ),
+      }));
+
+      const replay = await replayPendingUserSubmissions(
+        client,
+        instanceId,
+        result.session_id,
+        isCurrent,
+      );
+      if (!replay.current || !isCurrent()) return;
+      if (!coordinator.finish(attempt, get().clients[instanceId], connectionEpoch)) return;
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) => {
+          const reconciled = replay.rejectedIds.reduce(
+            (next, id) => removeOptimisticUserMessage(next, result.session_id, id),
+            current,
+          );
+          return {
+            ...reconciled,
+            attachment: {
+              connectionEpoch,
+              phase: "applied",
+              sessionId: result.session_id,
+            },
+          };
+        }),
+      }));
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (!coordinator.finish(attempt, get().clients[instanceId], connectionEpoch)) return;
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) => ({
+          ...current,
+          attachment: {
+            connectionEpoch,
+            phase: "failed",
+            sessionId,
+            error: errorMessage(error),
+          },
+        })),
+      }));
+    }
   },
   loadOlderHistory: async (instanceId, sessionId) => {
     const client = get().clients[instanceId];
@@ -1292,51 +1843,216 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     }
   },
   createSession: async (instanceId, input) => {
-    const result = await get().clients[instanceId]?.attach({
-      project_root: input.projectRoot,
-      interactive: true,
-      initial_model: input.initialModel,
-    });
-    if (!result) throw new Error("Instance connection is not open.");
-    let created: SessionDetail | null = null;
+    const initial = get();
+    const client = initial.clients[instanceId];
+    const remote = initial.instances[instanceId];
+    if (!client || remote?.status !== "connected") {
+      throw new Error("Instance connection is not open.");
+    }
+    const previousSessionId =
+      remote.attachment.phase === "applied" ? remote.attachment.sessionId : undefined;
+    const connectionEpoch = remote.attachment.connectionEpoch;
+    const coordinator = webAttachCoordinator(instanceId);
+    const attempt = coordinator.begin(client, connectionEpoch);
     set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) => {
-        const next = mergeAttach(current, result);
-        created = next.detailsBySession[result.session_id] ?? null;
-        return next;
-      }),
+      instances: setInstance(state.instances, instanceId, (current) => ({
+        ...current,
+        attachment: { connectionEpoch, phase: "pending" },
+      })),
     }));
-    if (!created) throw new Error("Instance did not return a session.");
-    if (input.agent) await get().clients[instanceId]?.setAgent(input.agent);
-    if (input.title) await get().clients[instanceId]?.renameSession(result.session_id, input.title);
-    if (input.agent || input.title) {
+    const isCurrent = () => isCurrentWebAttachAttempt(get(), instanceId, coordinator, attempt);
+
+    try {
+      const result = await client.attach({
+        project_root: input.projectRoot,
+        interactive: true,
+        initial_model: input.initialModel,
+      });
+      if (!isCurrent() || !coordinator.bindSession(attempt, result.session_id)) {
+        throw new Error("Session creation was superseded by a newer attachment.");
+      }
+      forgetAcceptedUserSubmissions(
+        instanceId,
+        result.session_id,
+        acceptedClientSubmissionIdsFromHistory(result.history),
+      );
+      let created: SessionDetail | null = null;
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) => {
+          const next = mergeAttach(current, result);
+          created = next.detailsBySession[result.session_id] ?? null;
+          return {
+            ...next,
+            attachment: {
+              connectionEpoch,
+              phase: "pending",
+              sessionId: result.session_id,
+            },
+          };
+        }),
+      }));
+      if (!created) throw new Error("Instance did not return a session.");
+
+      const replay = await replayPendingUserSubmissions(
+        client,
+        instanceId,
+        result.session_id,
+        isCurrent,
+      );
+      if (!replay.current || !isCurrent()) {
+        throw new Error("Session creation was superseded by a newer attachment.");
+      }
+      let agentApplied = false;
+      let titleApplied = false;
+      try {
+        if (input.agent) {
+          await client.setAgent(input.agent);
+          if (!isCurrent()) {
+            throw new Error("Session creation was superseded by a newer attachment.");
+          }
+          agentApplied = true;
+        }
+        if (input.title) {
+          await client.renameSession(result.session_id, input.title);
+          if (!isCurrent()) {
+            throw new Error("Session creation was superseded by a newer attachment.");
+          }
+          titleApplied = true;
+        }
+      } catch (setupError) {
+        if (!isCurrent()) {
+          throw new Error("Session creation was superseded by a newer attachment.");
+        }
+        if (!coordinator.finish(attempt, get().clients[instanceId], connectionEpoch)) {
+          throw new Error("Session creation was superseded by a newer attachment.");
+        }
+        let attachedCreated: SessionDetail | null = null;
+        set((state) => ({
+          instances: setInstance(state.instances, instanceId, (current) => {
+            const reconciled = replay.rejectedIds.reduce(
+              (next, id) => removeOptimisticUserMessage(next, result.session_id, id),
+              current,
+            );
+            const updated = updateSessionSummary(reconciled, result.session_id, {
+              agent: agentApplied ? input.agent : created?.summary.agent,
+              title: titleApplied ? input.title : created?.summary.title,
+            });
+            const next = {
+              ...updated,
+              attachment: {
+                connectionEpoch,
+                phase: "applied" as const,
+                sessionId: result.session_id,
+              },
+            };
+            attachedCreated = next.detailsBySession[result.session_id] ?? created;
+            return next;
+          }),
+        }));
+        throw new WebSessionCreatedWithSetupError(attachedCreated ?? created, setupError);
+      }
+      if (input.agent || input.title || replay.rejectedIds.length > 0) {
+        set((state) => ({
+          instances: setInstance(state.instances, instanceId, (current) => {
+            const reconciled = replay.rejectedIds.reduce(
+              (next, id) => removeOptimisticUserMessage(next, result.session_id, id),
+              current,
+            );
+            return updateSessionSummary(reconciled, result.session_id, {
+              agent: input.agent ?? created?.summary.agent,
+              title: input.title ?? created?.summary.title,
+            });
+          }),
+        }));
+      }
+      if (!coordinator.finish(attempt, get().clients[instanceId], connectionEpoch)) {
+        throw new Error("Session creation was superseded by a newer attachment.");
+      }
+      set((state) => ({
+        instances: setInstance(state.instances, instanceId, (current) => ({
+          ...current,
+          attachment: {
+            connectionEpoch,
+            phase: "applied",
+            sessionId: result.session_id,
+          },
+        })),
+      }));
+      return created;
+    } catch (error) {
+      if (isCurrent()) {
+        coordinator.finish(attempt, get().clients[instanceId], connectionEpoch);
+        set((state) => ({
+          instances: setInstance(state.instances, instanceId, (current) => ({
+            ...current,
+            attachment: {
+              connectionEpoch,
+              phase: "failed",
+              sessionId: previousSessionId ?? attempt.sessionId,
+              error: errorMessage(error),
+            },
+          })),
+        }));
+        if (previousSessionId) {
+          await get().attach(instanceId, previousSessionId);
+        }
+      }
+      throw error;
+    }
+  },
+  sendMessage: async (instanceId, sessionId, input) => {
+    const client = attachedWebClient(get(), instanceId, sessionId);
+    if (!client) throw attachmentNotReadyError();
+    const repairRequired = get().instances[instanceId]?.detailsBySession[sessionId]?.repairRequired;
+    if (repairRequired) throw new Error(repairRequired.detail);
+    const key = pendingUserSubmissionKey(instanceId, sessionId);
+    const prepared = retainedUserSubmission(pendingUserSubmissions.get(key), input);
+    const submission = retainUserSubmission(key, prepared.submission);
+    const isRetry = prepared.isRetry || submission !== prepared.submission;
+    if (!isRetry) {
       set((state) => ({
         instances: setInstance(state.instances, instanceId, (current) =>
-          updateSessionSummary(current, result.session_id, {
-            agent: input.agent ?? created?.summary.agent,
-            title: input.title ?? created?.summary.title,
-          }),
+          addOptimisticUserMessage(
+            current,
+            sessionId,
+            submission.display_text ?? submission.text,
+            submission.client_submission_id,
+          ),
         ),
       }));
     }
-    return created;
-  },
-  sendMessage: async (instanceId, sessionId, text) => {
-    const clientMessageId = crypto.randomUUID();
-    set((state) => ({
-      instances: setInstance(state.instances, instanceId, (current) =>
-        addOptimisticUserMessage(current, sessionId, text, clientMessageId),
-      ),
-    }));
-    await get().clients[instanceId]?.sendUserMessage({ text });
+
+    try {
+      await client.sendUserMessage(submission);
+    } catch (error) {
+      const retainable = shouldRetainUserMessageSubmission(error);
+      if (retainable && !pendingUserSubmissions.get(key)?.has(submission.client_submission_id)) {
+        // A durable event/attach receipt won the race with the ambiguous
+        // transport result. Acceptance is authoritative; do not reopen retry.
+        return;
+      }
+      if (!retainable) {
+        forgetUserSubmission(key, submission.client_submission_id);
+        set((state) => ({
+          instances: setInstance(state.instances, instanceId, (current) =>
+            removeOptimisticUserMessage(current, sessionId, submission.client_submission_id),
+          ),
+        }));
+      }
+      throw error;
+    }
+    // `UserMessageQueued` is not durable. The live record/fold event or an
+    // authoritative attach snapshot releases this exact payload.
   },
   resolveInterrupt: async (instanceId, input) => {
+    const client = attachedWebClient(get(), instanceId, input.sessionId);
+    if (!client) throw attachmentNotReadyError();
     const detail = get().instances[instanceId]?.detailsBySession[input.sessionId];
     const entry = detail?.history.find(
       (entry) => entry.kind === "interrupt" && entry.interrupt.interruptId === input.interruptId,
     );
     if (entry?.kind !== "interrupt") return;
-    await get().clients[instanceId]?.resolveInterrupt(
+    await client.resolveInterrupt(
       input.interruptId,
       resolveFromSelection(entry.interrupt.question, input.selection),
     );
@@ -1385,13 +2101,13 @@ export const useRemoteSessionsStore = create<RemoteSessionState>()((set, get) =>
     await get().clients[instanceId]?.forkSession({ parent_session_id: sessionId });
   },
   resumePausedWork: async (instanceId, sessionId) => {
-    const client = get().clients[instanceId];
-    if (!client) throw new Error("Instance connection is not open.");
+    const client = attachedWebClient(get(), instanceId, sessionId);
+    if (!client) throw attachmentNotReadyError();
     await client.resumePausedWork(sessionId);
   },
   cancelPausedWork: async (instanceId, sessionId) => {
-    const client = get().clients[instanceId];
-    if (!client) throw new Error("Instance connection is not open.");
+    const client = attachedWebClient(get(), instanceId, sessionId);
+    if (!client) throw attachmentNotReadyError();
     await client.cancelPausedWork(sessionId);
   },
   listFiles: async (instanceId, input) => {

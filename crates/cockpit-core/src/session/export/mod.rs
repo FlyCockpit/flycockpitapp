@@ -387,26 +387,19 @@ pub async fn build_bundle_zip_bytes(
     include_sensitive: bool,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
-    let target = target.clone();
+    let target_id = target.session_id;
     db.read(move |conn| {
-        let bundle = collect_bundle_conn(conn, target.session_id)?;
         let env = process_env_map();
-        let bytes = build_zip_with_options_and_env_conn(
+        assemble_bundle_snapshot_conn(
             &db_for_files,
             conn,
-            &target,
-            &bundle,
+            target_id,
             ExportBundleOptions {
                 include_generated_artifacts,
                 include_sensitive,
             },
             &env,
-        )?;
-        let summary = BundleSummary {
-            session_count: bundle.len(),
-            byte_len: bytes.len(),
-        };
-        Ok(BundleBytes { bytes, summary })
+        )
     })
     .await
 }
@@ -467,27 +460,19 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
     }
 
     let db_for_files = db.clone();
-    let target = target.clone();
+    let target_id = target.session_id;
     let bundle = db.blocking_for_sync_cli(move |conn| {
-        collect_bundle_conn(conn, target.session_id).and_then(|bundle| {
-            let env = process_env_map();
-            let bytes = build_zip_with_options_and_env_conn(
-                &db_for_files,
-                conn,
-                &target,
-                &bundle,
-                ExportBundleOptions {
-                    include_generated_artifacts,
-                    include_sensitive,
-                },
-                &env,
-            )?;
-            let summary = BundleSummary {
-                session_count: bundle.len(),
-                byte_len: bytes.len(),
-            };
-            Ok(BundleBytes { bytes, summary })
-        })
+        let env = process_env_map();
+        assemble_bundle_snapshot_conn(
+            &db_for_files,
+            conn,
+            target_id,
+            ExportBundleOptions {
+                include_generated_artifacts,
+                include_sensitive,
+            },
+            &env,
+        )
     })?;
 
     if let Some(parent) = out_path.parent()
@@ -500,6 +485,58 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
+}
+
+/// Assemble every database-backed export entry under one deferred read
+/// transaction. On a WAL database this pins one snapshot without excluding
+/// concurrent writers. Reloading the target is deliberately the first query:
+/// callers resolve a session before reaching this function, and that row may
+/// have changed (or disappeared) before the export worker checks out its
+/// connection.
+fn assemble_bundle_snapshot_conn(
+    db: &Db,
+    conn: &Connection,
+    target_id: Uuid,
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
+) -> Result<BundleBytes> {
+    assemble_bundle_snapshot_conn_with_after_collect(db, conn, target_id, options, env, || Ok(()))
+}
+
+fn assemble_bundle_snapshot_conn_with_after_collect<F>(
+    db: &Db,
+    conn: &Connection,
+    target_id: Uuid,
+    options: ExportBundleOptions,
+    env: &HashMap<String, String>,
+    after_collect: F,
+) -> Result<BundleBytes>
+where
+    F: FnOnce() -> Result<()>,
+{
+    // `unchecked_transaction` accepts `&Connection`, which is required by the
+    // read-pool closure API. Its default DEFERRED behavior is important here:
+    // the first SELECT below establishes a WAL read snapshot while writers
+    // remain free to commit.
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting session export read snapshot")?;
+    let target = Db::get_session_conn(&tx, target_id)?
+        .with_context(|| format!("export target session `{target_id}` no longer exists"))?;
+    let bundle = collect_bundle_conn(&tx, target_id)?;
+
+    // Deterministic test seam for committing an independent WAL writer after
+    // bundle discovery but before the export's later event/manifest queries.
+    after_collect()?;
+
+    let bytes = build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env)?;
+    let summary = BundleSummary {
+        session_count: bundle.len(),
+        byte_len: bytes.len(),
+    };
+    tx.commit()
+        .context("finishing session export read snapshot")?;
+    Ok(BundleBytes { bytes, summary })
 }
 
 /// Resolve a user-supplied identifier to a session row. `Ok(Ok(row))` on
@@ -1066,7 +1103,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             })
     });
 
-    let manifest = build_manifest_conn(conn, target, bundle, options, env);
+    let manifest = build_manifest_conn(conn, target, bundle, options, env)?;
     let config_entries = collect_config_entries_with_env(
         target,
         options.include_generated_artifacts,
@@ -1252,37 +1289,37 @@ fn build_manifest_conn(
     bundle: &[SessionRow],
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
-) -> Value {
-    let session_model = session_active_model_value(&target.provider, &target.model);
-    let config_active_model = config_active_model_value(&target.project_root, env);
+) -> Result<Value> {
+    let active_model = session_active_model(target)?;
+    let config_active_model = config_active_model(&target.project_root, env);
     let active_model_diverged =
-        active_models_diverged(session_model.as_ref(), config_active_model.as_ref());
-    let sessions: Vec<Value> = bundle
+        active_models_diverged(active_model.as_ref(), config_active_model.as_ref());
+    let sessions = bundle
         .iter()
-        .map(|s| {
-            json!({
-                "session_id": s.session_id.to_string(),
-                "short_id": s.short_id,
-                "parent_session_id": s.parent_session_id.map(|p| p.to_string()),
-                "fork_point_turn_id": s.fork_point_turn_id,
-                "provider": s.provider,
-                "model": s.model,
-                "active_agent": s.active_agent,
-                "started_at": s.started_at,
-                "ended_at": s.ended_at,
-                "title": s.title,
-            })
+        .map(|session| {
+            let active_model = session_active_model(session)?;
+            Ok(json!({
+                "session_id": session.session_id.to_string(),
+                "short_id": session.short_id,
+                "parent_session_id": session.parent_session_id.map(|p| p.to_string()),
+                "fork_point_turn_id": session.fork_point_turn_id,
+                "active_model": active_model,
+                "active_agent": session.active_agent,
+                "started_at": session.started_at,
+                "ended_at": session.ended_at,
+                "title": session.title,
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<Value>>>()?;
 
     let mut manifest = json!({
-        "schema": "cockpit-session-export/1",
+        "schema": "cockpit-session-export/2",
         // The version of the cockpit binary producing THIS export — not
         // persisted per session, so a CLI export of an old session reflects
         // the exporting binary, not the one that created the session.
         "cockpit_version": env!("CARGO_PKG_VERSION"),
         "exporter_cockpit_version": env!("CARGO_PKG_VERSION"),
-        // The target/root session's date, derived from `started_at` (epoch
+        // The target/root session date, derived from started_at (epoch
         // seconds), as both ISO-8601 and the raw epoch for convenience.
         "session_date": iso8601_from_epoch(target.started_at),
         "session_started_at": target.started_at,
@@ -1291,9 +1328,7 @@ fn build_manifest_conn(
             "short_id": target.short_id,
             "project_id": target.project_id,
             "project_root": target.project_root,
-            "provider": target.provider,
-            "model": target.model,
-            "session_model": session_model,
+            "active_model": active_model,
             "config_active_model": config_active_model,
             "active_model_diverged": active_model_diverged,
             "title": target.title,
@@ -1312,26 +1347,50 @@ fn build_manifest_conn(
     {
         obj.insert("resume_repair_required".to_string(), repair);
     }
-    manifest
+    Ok(manifest)
 }
 
-fn session_active_model_value(provider: &Option<String>, model: &Option<String>) -> Option<Value> {
-    Some(json!({
-        "provider": provider.as_ref()?,
-        "model": model.as_ref()?,
-    }))
+fn session_active_model(
+    row: &SessionRow,
+) -> Result<Option<crate::config::providers::ActiveModelRef>> {
+    match (
+        row.model_selection_json.as_deref(),
+        row.provider.as_deref(),
+        row.model.as_deref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(raw), Some(provider), Some(model)) => {
+            let selection: crate::config::providers::ActiveModelRef = serde_json::from_str(raw)
+                .with_context(|| {
+                    format!(
+                        "decoding active model for exported session {}",
+                        row.session_id
+                    )
+                })?;
+            anyhow::ensure!(
+                selection.provider == provider && selection.model == model,
+                "session {} active-model projections disagree with model_selection_json",
+                row.session_id
+            );
+            Ok(Some(selection))
+        }
+        (None, _, _) => anyhow::bail!(
+            "session {} model projections require model_selection_json",
+            row.session_id
+        ),
+        _ => anyhow::bail!(
+            "session {} has inconsistent active-model projections",
+            row.session_id
+        ),
+    }
 }
 
-fn config_active_model_value(project_root: &str, env: &HashMap<String, String>) -> Option<Value> {
+fn config_active_model(
+    project_root: &str,
+    env: &HashMap<String, String>,
+) -> Option<crate::config::providers::ActiveModelRef> {
     let paths = config_file_paths_for_export(Path::new(project_root), env);
-    crate::config::providers::ConfigDoc::providers_from_paths(&paths)
-        .active_model
-        .map(|active| {
-            json!({
-                "provider": active.provider,
-                "model": active.model,
-            })
-        })
+    crate::config::providers::ConfigDoc::providers_from_paths(&paths).active_model
 }
 
 fn config_file_paths_for_export(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
@@ -1363,15 +1422,10 @@ fn config_file_paths_for_export(cwd: &Path, env: &HashMap<String, String>) -> Ve
 }
 
 fn active_models_diverged(
-    session_model: Option<&Value>,
-    config_active_model: Option<&Value>,
+    active_model: Option<&crate::config::providers::ActiveModelRef>,
+    config_active_model: Option<&crate::config::providers::ActiveModelRef>,
 ) -> bool {
-    let (Some(session_model), Some(config_active_model)) = (session_model, config_active_model)
-    else {
-        return false;
-    };
-    session_model.get("provider") != config_active_model.get("provider")
-        || session_model.get("model") != config_active_model.get("model")
+    active_model.is_some() && active_model != config_active_model
 }
 
 fn export_resume_repair_state_conn(conn: &Connection, target: &SessionRow) -> Option<Value> {

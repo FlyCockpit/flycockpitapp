@@ -6,7 +6,6 @@ use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCo
 use crate::tui::settings::Dialog;
 use cockpit_config::extended::LlmMode;
 use cockpit_core::daemon::proto::Request;
-use cockpit_core::engine::message::UserSubmission;
 use cockpit_core::engine::{ControlRequestId, ControlRequestOutcome, TurnEvent};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -44,7 +43,7 @@ fn app(tmp: &tempfile::TempDir) -> App {
 }
 
 fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunner {
-    let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(8);
+    let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(8);
     let (record_tx, _record_rx) = mpsc::channel(1);
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
@@ -60,6 +59,9 @@ fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunn
         foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
+        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
         usage: UsageCounts::default(),

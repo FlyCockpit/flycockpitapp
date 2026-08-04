@@ -1096,6 +1096,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         let mut state = state;
         let result = handle_request(
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "first turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -1158,7 +1159,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
     };
-    respond_to.send((item.clone(), vec![item])).unwrap();
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (state, first_response) = first.await.expect("first turn request joins");
     assert!(matches!(
         first_response.expect("first turn completes"),
@@ -1170,6 +1171,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         let mut state = state;
         handle_request(
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "second turn".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -1209,7 +1211,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
     };
-    respond_to.send((item.clone(), vec![item])).unwrap();
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     assert!(matches!(
         second
             .await
@@ -1387,24 +1389,303 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
         }],
     });
-    let request = |persist_as_default| Request::SetActiveModel {
+    let request = |persist_as_default, initialize_default_if_missing| Request::SetActiveModel {
         selection_id: Uuid::new_v4(),
         provider: "p".into(),
         model: "a".into(),
         persist_as_default,
+        initialize_default_if_missing,
         trigger: proto::ActiveModelSwitchTrigger::Picker,
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
     };
 
-    authorize_request(&request(false), &state, &ctx)
+    authorize_request(&request(false, false), &state, &ctx)
         .await
         .expect("session-only selection remains available to a writer");
-    let error = authorize_request(&request(true), &state, &ctx)
+    let error = authorize_request(&request(true, false), &state, &ctx)
         .await
         .expect_err("durable default mutation must remain owner-only");
     assert_eq!(error.code, ErrorCode::Authorization);
+    let error = authorize_request(&request(false, true), &state, &ctx)
+        .await
+        .expect_err("conditional default initialization must remain owner-only");
+    assert_eq!(error.code, ErrorCode::Authorization);
+}
+
+#[tokio::test]
+async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
+    for live in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let (owner_state, session_id, _work_rx) =
+            attached_state_with_worker_receiver(&ctx, tmp.path()).await;
+        // The shared attached-state fixture is intentionally modeled so the
+        // authorization matrix exercises the ordinary v6 path. This test is
+        // specifically about durable recovery, so establish the genuinely
+        // model-less row it claims to authorize before constructing remote
+        // principals. Authorization reads the durable row for both cold and
+        // live workers.
+        let model_less_session_id = session_id;
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE sessions
+                     SET provider = NULL, model = NULL, model_selection_json = NULL
+                     WHERE session_id = ?1",
+                    [model_less_session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+        if live {
+            let handle = owner_state
+                .attached
+                .as_ref()
+                .expect("test state is attached")
+                .handle
+                .clone();
+            let join = tokio::spawn(async move { std::future::pending::<()>().await });
+            ctx.registry.insert_test_worker(handle, join);
+        }
+        let recovery_selection = crate::config::providers::ActiveModelRef {
+            provider: "p".to_string(),
+            model: "recovery-model".to_string(),
+            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+                value: "high".to_string(),
+            }),
+            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+        };
+        let request = |initial_model| Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model,
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        };
+
+        for initial_model in [Some(recovery_selection.clone()), None] {
+            authorize_request(&request(initial_model), &owner_state, &ctx)
+                .await
+                .expect("local owner may recover a model-less session");
+        }
+
+        let root = tmp.path().to_string_lossy().into_owned();
+        let writer = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+            scope: crate::daemon::principal::PrincipalScope::Agent,
+            project_root: Some(root.clone()),
+        }]);
+        for initial_model in [Some(recovery_selection.clone()), None] {
+            authorize_request(&request(initial_model), &writer, &ctx)
+                .await
+                .expect("remote writer may recover a model-less session");
+        }
+
+        let readonly = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+            scope: crate::daemon::principal::PrincipalScope::AgentReadonly,
+            project_root: Some(root),
+        }]);
+        for initial_model in [Some(recovery_selection.clone()), None] {
+            let error = authorize_request(&request(initial_model), &readonly, &ctx)
+                .await
+                .expect_err("read-only attach cannot durably recover a session model");
+            assert_eq!(error.code, ErrorCode::ReadOnly, "live={live}");
+        }
+
+        let legacy_session_id = session_id;
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE sessions
+                     SET provider = 'legacy-provider', model = 'legacy-model',
+                         model_selection_json = NULL
+                     WHERE session_id = ?1",
+                    [legacy_session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for initial_model in [Some(recovery_selection.clone()), None] {
+            let error = authorize_request(&request(initial_model), &readonly, &ctx)
+                .await
+                .expect_err("projection-only session state must fail closed");
+            assert_eq!(error.code, ErrorCode::Internal, "live={live}");
+            assert!(error.message.contains("model_selection_json"));
+        }
+
+        let structured_json = serde_json::to_string(&recovery_selection).unwrap();
+        let structured_session_id = session_id;
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE sessions
+                     SET provider = ?1, model = ?2, model_selection_json = ?3
+                     WHERE session_id = ?4",
+                    rusqlite::params![
+                        "p",
+                        "recovery-model",
+                        structured_json,
+                        structured_session_id.to_string()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        authorize_request(&request(None), &readonly, &ctx)
+            .await
+            .expect("read-only attach may resume a fully modeled v6 session");
+        authorize_request(&request(Some(recovery_selection.clone())), &readonly, &ctx)
+            .await
+            .expect("initial_model is ignored when the durable v6 session already has a model");
+    }
+}
+
+#[tokio::test]
+async fn attach_update_daemon_environment_policy_requires_owner() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let request = Request::Attach {
+        session_id: None,
+        since_seq: None,
+        project_root: Some(tmp.path().to_string_lossy().into_owned()),
+        initial_model: None,
+        no_sandbox: false,
+        interactive: true,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: Some(
+            EnvSnapshot::new(
+                EnvSnapshotSource::ExplicitCli,
+                HashMap::from([("PATH".to_string(), "/untrusted/bin".to_string())]),
+            )
+            .to_wire(),
+        ),
+        env_policy: EnvDriftPolicy::UpdateDaemon,
+    };
+
+    authorize_request(&request, &owner_state(), &ctx)
+        .await
+        .expect("local owner may update the daemon environment baseline");
+    for scope in [
+        crate::daemon::principal::PrincipalScope::Agent,
+        crate::daemon::principal::PrincipalScope::AgentReadonly,
+    ] {
+        let remote = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+            scope,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+        }]);
+        let error = authorize_request(&request, &remote, &ctx)
+            .await
+            .expect_err("remote attach must not update daemon process authority");
+        assert_eq!(error.code, ErrorCode::Authorization);
+        assert!(error.message.contains("local owner"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
+    for live in [true, false] {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+        let baseline = EnvSnapshot::new(
+            EnvSnapshotSource::DaemonStart,
+            HashMap::from([("DAEMON_ONLY".to_string(), "trusted".to_string())]),
+        );
+        *ctx.env_baseline.write().unwrap() = baseline.clone();
+
+        if live {
+            ctx.registry
+                .live_handle(session_id)
+                .expect("test worker is live")
+                .set_env_overlay(HashMap::from([(
+                    "WORKER_ONLY".to_string(),
+                    "trusted".to_string(),
+                )]));
+        } else {
+            ctx.registry.forget(session_id);
+        }
+
+        let request = Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: Some(
+                EnvSnapshot::new(
+                    EnvSnapshotSource::ExplicitCli,
+                    HashMap::from([
+                        ("DAEMON_ONLY".to_string(), "replaced".to_string()),
+                        ("REMOTE_INJECTED".to_string(), "evil".to_string()),
+                    ]),
+                )
+                .to_wire(),
+            ),
+            env_policy: EnvDriftPolicy::Client,
+        };
+        let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "readonly-env-test".to_string(),
+            grants: vec![principal::PrincipalGrant {
+                scope: principal::PrincipalScope::AgentReadonly,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            }],
+        });
+
+        let response =
+            dispatch_authz_request_after(&ctx, principal, Vec::new(), None, None, request)
+                .await
+                .expect("read-only attach remains available");
+        let Response::Attached {
+            env_policy_applied, ..
+        } = response
+        else {
+            panic!("expected Attached response");
+        };
+        assert_eq!(env_policy_applied, EnvDriftPolicy::Daemon);
+        assert_eq!(ctx.env_baseline.read().unwrap().digest(), baseline.digest());
+
+        let handle = ctx
+            .registry
+            .live_handle(session_id)
+            .expect("worker remains live");
+        let overlay = handle.env_overlay();
+        let overlay = overlay.read().unwrap();
+        assert!(!overlay.contains_key("REMOTE_INJECTED"), "live={live}");
+        if live {
+            assert_eq!(
+                overlay.get("WORKER_ONLY").map(String::as_str),
+                Some("trusted")
+            );
+        } else {
+            assert_eq!(
+                overlay.get("DAEMON_ONLY").map(String::as_str),
+                Some("trusted")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1508,12 +1789,21 @@ async fn assistant_rpc_creates_session_via_registry() {
     };
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistants[0].name, "helper-bot");
+    let initial_model = crate::config::providers::ActiveModelRef {
+        provider: "lmstudio".to_string(),
+        model: "stub-model".to_string(),
+        reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+            value: "high".to_string(),
+        }),
+        thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+        prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+    };
 
     let response = handle_request(
         Request::CreateAssistantSession {
             name: "helper-bot".into(),
             project_root: project.path().to_string_lossy().into_owned(),
-            initial_model: None,
+            initial_model: Some(initial_model.clone()),
             no_sandbox: false,
             env_snapshot: None,
         },
@@ -1532,6 +1822,14 @@ async fn assistant_rpc_creates_session_via_registry() {
             .active_session_ids()
             .contains(&session.session_id),
         "created assistant session is live in the registry"
+    );
+    assert_eq!(
+        ctx.registry
+            .live_handle(session.session_id)
+            .expect("assistant worker handle")
+            .active_model_selection(),
+        Some(initial_model),
+        "assistant session retains the complete requested model selection"
     );
     assert!(
         ctx.db
@@ -1573,6 +1871,52 @@ async fn assistant_session_creation_is_atomic() {
     assert!(
         ctx.db.list_sessions(false, 100).await.unwrap().is_empty(),
         "failed assistant session creation must not persist a session row"
+    );
+}
+
+#[tokio::test]
+async fn typed_invalid_attach_model_is_rejected_before_any_mutation() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+
+    let error = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: None,
+            initial_model: Some(crate::config::providers::ActiveModelRef {
+                provider: String::new(),
+                model: "stub-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("typed requests must receive the same validation as wire requests");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("provider must not be empty"));
+    assert!(
+        state.attached.is_none(),
+        "invalid attach must remain detached"
+    );
+    assert!(
+        ctx.registry.active_session_ids().is_empty(),
+        "invalid attach must not register a worker"
+    );
+    assert!(
+        ctx.db.list_sessions(false, 100).await.unwrap().is_empty(),
+        "invalid attach must not persist a session"
     );
 }
 
@@ -2173,8 +2517,18 @@ async fn attach_history_is_scrubbed_only_for_non_owner() {
 /// the developer's `~/.config/cockpit`. Tests that want specific
 /// provider/model configs inject them through
 /// [`test_ctx_with_config_source`] instead.
+fn stub_active_model_ref() -> crate::config::providers::ActiveModelRef {
+    crate::config::providers::ActiveModelRef {
+        provider: "lmstudio".to_string(),
+        model: "stub-model".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    }
+}
+
 fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
-    use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+    use crate::config::providers::{ModelEntry, ProviderEntry};
 
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
@@ -2191,13 +2545,7 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
     crate::daemon::config_source::ConfigSource::fixed(
         crate::config::providers::ProvidersConfig {
             providers,
-            active_model: Some(ActiveModelRef {
-                provider: "lmstudio".to_string(),
-                model: "stub-model".to_string(),
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            }),
+            active_model: Some(stub_active_model_ref()),
             ..crate::config::providers::ProvidersConfig::default()
         },
         crate::config::extended::ExtendedConfig::default(),
@@ -3019,7 +3367,12 @@ async fn attached_state_with_worker_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            let mut row =
+                crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            let selection = stub_active_model_ref();
+            row.provider = Some(selection.provider.clone());
+            row.model = Some(selection.model.clone());
+            row.model_selection_json = Some(serde_json::to_string(&selection)?);
             crate::db::Db::insert_session_row_conn(conn, &row)
         })
         .await
@@ -4818,6 +5171,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             label: "child".into(),
         },
         "send_user_message" => Request::SendUserMessage {
+            client_submission_id: Uuid::new_v4(),
             text: "authz".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -5091,6 +5445,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
+            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -6233,7 +6588,12 @@ async fn live_worker_with_receiver(
                 crate::db::workspace_trust::WorkspaceTrustMode::Trust,
                 chrono::Utc::now().timestamp(),
             )?;
-            let row = crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            let mut row =
+                crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+            let selection = stub_active_model_ref();
+            row.provider = Some(selection.provider.clone());
+            row.model = Some(selection.model.clone());
+            row.model_selection_json = Some(serde_json::to_string(&selection)?);
             crate::db::Db::insert_session_row_conn(conn, &row)
         })
         .await
@@ -6339,6 +6699,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
+            client_submission_id: Uuid::new_v4(),
             text: "hello worker".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -6376,6 +6737,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
+            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -6441,7 +6803,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(submission.text, "hello worker");
                     let item = proto_queue_item(&submission.text);
-                    respond_to.send((item.clone(), vec![item])).unwrap();
+                    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
                 }
                 (
                     "steer_delegation",
@@ -6475,12 +6837,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(queue_item_id, Uuid::from_u128(1));
                     respond_to
-                        .send(proto::RemoveQueuedUserMessageResult {
+                        .send(Ok(proto::RemoveQueuedUserMessageResult {
                             applied: true,
                             reason: proto::RemoveQueuedUserMessageReason::Removed,
                             removed_item: Some(proto_queue_item("removed")),
                             queue: Vec::new(),
-                        })
+                        }))
                         .unwrap();
                 }
                 (
@@ -6492,12 +6854,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(target_id.as_deref(), Some("root"));
                     respond_to
-                        .send(proto::RemoveQueuedUserMessageResult {
+                        .send(Ok(proto::RemoveQueuedUserMessageResult {
                             applied: false,
                             reason: proto::RemoveQueuedUserMessageReason::NotFound,
                             removed_item: None,
                             queue: Vec::new(),
-                        })
+                        }))
                         .unwrap();
                 }
                 (
@@ -6509,12 +6871,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 ) => {
                     assert_eq!(target_id.as_deref(), Some("root"));
                     respond_to
-                        .send(proto::RemoveQueuedUserMessagesResult {
+                        .send(Ok(proto::RemoveQueuedUserMessagesResult {
                             applied: true,
                             reason: proto::RemoveQueuedUserMessageReason::Removed,
                             removed_items: vec![proto_queue_item("removed")],
                             queue: Vec::new(),
-                        })
+                        }))
                         .unwrap();
                 }
                 ("repair_resume", SessionWork::RepairResume { respond_to }) => {
@@ -6542,6 +6904,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         reasoning_effort,
                         thinking_mode,
                         persist_as_default: _,
+                        initialize_default_if_missing: _,
                         prompt_cache_retention,
                     },
                 ) => {
@@ -6705,6 +7068,89 @@ async fn assert_worker_delivery_happy(kind: &str) {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn send_user_message_propagates_exact_pre_acceptance_failure() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+    let client_submission_id = Uuid::new_v4();
+    let error = dispatch_attached_worker_request(
+        &ctx,
+        tmp.path(),
+        session_id,
+        work_rx,
+        Request::SendUserMessage {
+            client_submission_id,
+            text: "must remain retryable".to_string(),
+            display_text: Some("visible draft".to_string()),
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: Some("review".to_string()),
+        },
+        |work| {
+            let SessionWork::UserMessage {
+                submission,
+                respond_to,
+            } = work
+            else {
+                panic!("expected user message work");
+            };
+            assert_eq!(submission.client_submissions[0].id, client_submission_id);
+            assert_eq!(submission.text, "must remain retryable");
+            assert_eq!(submission.display_text.as_deref(), Some("visible draft"));
+            respond_to
+                .send(Err(ErrorPayload {
+                    code: ErrorCode::UserMessageNotAccepted,
+                    message: "resume repair is required".to_string(),
+                }))
+                .unwrap();
+        },
+    )
+    .await
+    .expect_err("a pre-acceptance worker failure cannot be a queued response");
+
+    assert_eq!(error.code, ErrorCode::UserMessageNotAccepted);
+    assert_eq!(error.message, "resume repair is required");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_queued_message_propagates_terminal_receipt_failure() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+    let queue_item_id = Uuid::new_v4();
+    let error = dispatch_attached_worker_request(
+        &ctx,
+        tmp.path(),
+        session_id,
+        work_rx,
+        Request::RemoveQueuedUserMessage { queue_item_id },
+        |work| {
+            let SessionWork::RemoveQueuedUserMessage {
+                queue_item_id: delivered_id,
+                respond_to,
+            } = work
+            else {
+                panic!("expected queued-message removal work");
+            };
+            assert_eq!(delivered_id, queue_item_id);
+            respond_to
+                .send(Err(ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "queued payload was restored; retry removal".to_string(),
+                }))
+                .unwrap();
+        },
+    )
+    .await
+    .expect_err("a durable receipt failure cannot acknowledge removal");
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.message, "queued payload was restored; retry removal");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn set_preflight_returns_preflight_state() {
     assert_worker_delivery_happy("set_preflight").await;
 }
@@ -6726,6 +7172,7 @@ async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
+            client_submission_id: Uuid::new_v4(),
             text: "detached".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -6759,6 +7206,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
+            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -7551,7 +7999,7 @@ async fn assert_auto_title_mutating_malformed() {
 fn minimal_import_archive_base64() -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
-        "schema": "cockpit-session-export/1",
+        "schema": "cockpit-session-export/2",
         "redacted": false,
         "target": {
             "project_id": "import-dispatch-test",
@@ -7562,8 +8010,10 @@ fn minimal_import_archive_base64() -> (Uuid, String) {
             "short_id": "import",
             "parent_session_id": null,
             "fork_point_turn_id": null,
-            "provider": "test-provider",
-            "model": "test-model",
+            "active_model": {
+                "provider": "test-provider",
+                "model": "test-model"
+            },
             "active_agent": "Build",
             "started_at": 100,
             "ended_at": null,
@@ -8655,6 +9105,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "hello".into(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -9244,6 +9695,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 provider: "openai".into(),
                 model: "gpt".into(),
                 persist_as_default: false,
+                initialize_default_if_missing: false,
                 trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -9893,6 +10345,463 @@ async fn finish_upload_for(
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::owner(),
+        ctx.terminal_host.clone(),
+    );
+    let attached = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(project.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: true,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::Attached { session_id, .. } = attached else {
+        panic!("expected Attached response");
+    };
+
+    let client_submission_id = Uuid::new_v4();
+    let text = "must remain removed";
+    let origin_principal = state.principal.tag();
+    let submission = crate::engine::message::UserSubmission {
+        kind: crate::engine::message::UserSubmissionKind::User,
+        text: text.to_string(),
+        display_text: None,
+        tag_expansions: Vec::new(),
+        images: Vec::new(),
+        forced_skill: None,
+        origin_principal: origin_principal.clone(),
+        job_id: None,
+        preflight_cleaned: None,
+        queue_item_ids: Vec::new(),
+        client_submissions: Vec::new(),
+        queue_target: None,
+        pending_terminal_disposition: None,
+    };
+    let fingerprint = submission.client_fingerprint();
+    let wire_fingerprint = user_message_wire_fingerprint(text, None, &[], &[], None);
+    ctx.db
+        .insert_client_submission_terminal_receipts(
+            session_id,
+            vec![crate::db::session_log::ClientSubmissionTerminalReceipt {
+                client_submission_id,
+                fingerprint,
+                wire_fingerprint,
+                origin_principal,
+                disposition: crate::db::session_log::ClientSubmissionTerminalDisposition::Removed,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let exact = handle_request(
+        Request::SendUserMessage {
+            client_submission_id,
+            text: text.to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a terminal exact UUID must never execute");
+    assert_eq!(exact.code, ErrorCode::UserMessageTerminated);
+    assert!(
+        exact.message.contains("terminal (removed)"),
+        "{}",
+        exact.message
+    );
+
+    let conflict = handle_request(
+        Request::SendUserMessage {
+            client_submission_id,
+            text: "different payload".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a terminal UUID cannot be reused for different content");
+    assert_eq!(conflict.code, ErrorCode::BadRequest);
+    assert!(
+        conflict.message.contains("different payload"),
+        "{}",
+        conflict.message
+    );
+    assert!(
+        ctx.db
+            .list_session_events(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "user_message"),
+        "terminal retries must not create a user turn"
+    );
+}
+
+#[test]
+fn image_submission_exact_retry_dedupes_before_reconsuming_ref() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(crate::daemon::session_worker::TOKIO_WORKER_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("production-equivalent image retry runtime");
+    runtime.block_on(Box::pin(image_submission_exact_retry_case()));
+}
+
+async fn image_submission_exact_retry_case() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+
+    // Attach through the production registry path so SendUserMessage reaches
+    // the real session worker's durable/in-memory idempotency check.
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::owner(),
+        ctx.terminal_host.clone(),
+    );
+    let attached = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(project.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: true,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("live worker attach");
+    let Response::Attached { session_id, .. } = attached else {
+        panic!("expected Attached response");
+    };
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let client_submission_id = Uuid::new_v4();
+    let request = |id, text: &str| Request::SendUserMessage {
+        client_submission_id: id,
+        text: text.to_string(),
+        display_text: Some("message with image".to_string()),
+        tag_expansions: vec![proto::TagExpansionMeta {
+            tool: "read".to_string(),
+            path: "image-test.png".to_string(),
+            detail: "expanded image context".to_string(),
+            ok: true,
+        }],
+        image_refs: vec![image_ref.clone()],
+        forced_skill: Some("image-skill".to_string()),
+    };
+
+    // Treat the first successful response as lost by intentionally discarding
+    // it. Dispatch binds the ref to this UUID before worker delivery, retaining
+    // the bytes for an exact retry while preventing every competing UUID.
+    let first = handle_request(
+        request(client_submission_id, "inspect this image"),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("first image submission accepted");
+    let Response::UserMessageQueued { item: first, .. } = first else {
+        panic!("expected queued first submission");
+    };
+    assert_eq!(first.id, client_submission_id);
+    assert!(!state.ready_attachments.contains_key(&image_ref.id));
+    assert_eq!(
+        crate::sync::lock_or_recover(&state.upload_accounting)
+            .consumed_message_attachments
+            .get(&image_ref.id)
+            .map(|consumed| consumed.client_submission_id),
+        Some(client_submission_id)
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if ctx
+                .db
+                .client_submission_receipt(session_id, client_submission_id)
+                .await
+                .expect("durable receipt lookup")
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the accepted submission becomes durable");
+    // Simulate either consumed-cache TTL expiry or a daemon process restart.
+    // The exact wire fingerprint is durable, so the retry must be acknowledged
+    // before dispatch needs the now-unavailable attachment bytes.
+    crate::sync::lock_or_recover(&state.upload_accounting)
+        .consumed_message_attachments
+        .clear();
+
+    // Drop the entire per-client attachment state, then reconnect. Neither the
+    // old client nor the daemon replay cache has the bytes now; the durable
+    // wire receipt alone must acknowledge the exact request.
+    drop(state);
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        ClientPrincipal::owner(),
+        ctx.terminal_host.clone(),
+    );
+    handle_request(
+        Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(project.path().to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: true,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("reconnect to live worker");
+
+    let retry = handle_request(
+        request(client_submission_id, "inspect this image"),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("exact retry with consumed ref is idempotently acknowledged");
+    let Response::UserMessageQueued { item: retry, .. } = retry else {
+        panic!("expected queued retry response");
+    };
+    assert_eq!(retry.id, client_submission_id);
+
+    // A re-upload gets a fresh ref id and therefore a different wire
+    // fingerprint. It must fall through to byte-based content comparison and
+    // still dedupe when the complete consumed payload is identical.
+    let reuploaded_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let reuploaded = handle_request(
+        Request::SendUserMessage {
+            client_submission_id,
+            text: "inspect this image".to_string(),
+            display_text: Some("message with image".to_string()),
+            tag_expansions: vec![proto::TagExpansionMeta {
+                tool: "read".to_string(),
+                path: "image-test.png".to_string(),
+                detail: "expanded image context".to_string(),
+                ok: true,
+            }],
+            image_refs: vec![reuploaded_ref.clone()],
+            forced_skill: Some("image-skill".to_string()),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("same bytes under a fresh ref dedupe by content");
+    assert!(matches!(reuploaded, Response::UserMessageQueued { .. }));
+    assert!(!state.ready_attachments.contains_key(&reuploaded_ref.id));
+
+    let conflict = handle_request(
+        request(client_submission_id, "different payload"),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("same UUID with a different fingerprint must conflict");
+    assert_eq!(conflict.code, ErrorCode::BadRequest);
+    assert!(conflict.message.contains("different payload"));
+
+    let consumed = handle_request(
+        request(Uuid::new_v4(), "inspect this image"),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a consumed ref must not be reusable by a new submission");
+    assert_eq!(consumed.code, ErrorCode::BadRequest);
+    assert!(consumed.message.contains("already consumed"));
+
+    let user_messages = ctx
+        .db
+        .list_session_events(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "user_message")
+        .count();
+    assert_eq!(user_messages, 1, "exact retry must not duplicate inference");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, _, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let first_id = Uuid::new_v4();
+    let request = |id| Request::SendUserMessage {
+        client_submission_id: id,
+        text: "ambiguous image delivery".to_string(),
+        display_text: None,
+        tag_expansions: Vec::new(),
+        image_refs: vec![image_ref.clone()],
+        forced_skill: None,
+    };
+
+    let first_ctx = ctx.clone();
+    let first_request = request(first_id);
+    let first = tokio::spawn(async move {
+        let result = handle_request(first_request, &mut state, &first_ctx).await;
+        (state, result)
+    });
+    let SessionWork::ProbeUserMessage { respond_to, .. } =
+        work_rx.recv().await.expect("first request probes worker")
+    else {
+        panic!("expected first ProbeUserMessage work");
+    };
+    respond_to
+        .send(Ok(UserMessageProbeResult::Unknown))
+        .unwrap();
+    let SessionWork::UserMessage {
+        submission,
+        respond_to,
+    } = work_rx.recv().await.expect("first request reaches worker")
+    else {
+        panic!("expected first UserMessage work");
+    };
+    assert_eq!(submission.client_submissions[0].id, first_id);
+
+    // Dropping the worker response after delivery creates a genuinely
+    // ambiguous outcome: dispatch cannot know whether the worker accepted and
+    // durably recorded the request. The image ref must remain bound.
+    drop(respond_to);
+    let (mut state, result) = first.await.unwrap();
+    let error = result.expect_err("lost worker response is ambiguous");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        crate::sync::lock_or_recover(&state.upload_accounting)
+            .consumed_message_attachments
+            .get(&image_ref.id)
+            .map(|consumed| consumed.client_submission_id),
+        Some(first_id)
+    );
+
+    let competing_ctx = ctx.clone();
+    let competing_request = request(Uuid::new_v4());
+    let competing = tokio::spawn(async move {
+        let result = handle_request(competing_request, &mut state, &competing_ctx).await;
+        (state, result)
+    });
+    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
+        .recv()
+        .await
+        .expect("competing request probes worker")
+    else {
+        panic!("expected competing ProbeUserMessage work");
+    };
+    respond_to
+        .send(Ok(UserMessageProbeResult::Unknown))
+        .unwrap();
+    let (mut state, competing) = competing.await.unwrap();
+    let competing =
+        competing.expect_err("competing UUID must not reuse an ambiguously delivered ref");
+    assert_eq!(competing.code, ErrorCode::BadRequest);
+    assert!(competing.message.contains("already consumed"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), work_rx.recv())
+            .await
+            .is_err(),
+        "competing UUID must be rejected before worker delivery"
+    );
+
+    let retry_ctx = ctx.clone();
+    let retry_request = request(first_id);
+    let retry = tokio::spawn(async move {
+        let result = handle_request(retry_request, &mut state, &retry_ctx).await;
+        (state, result)
+    });
+    let SessionWork::ProbeUserMessage { respond_to, .. } =
+        work_rx.recv().await.expect("same-UUID retry probes worker")
+    else {
+        panic!("expected retry ProbeUserMessage work");
+    };
+    respond_to
+        .send(Ok(UserMessageProbeResult::ContentCheckRequired))
+        .unwrap();
+    let SessionWork::UserMessage {
+        submission,
+        respond_to,
+    } = work_rx
+        .recv()
+        .await
+        .expect("same-UUID retry reaches worker")
+    else {
+        panic!("expected retry UserMessage work");
+    };
+    assert_eq!(submission.client_submissions[0].id, first_id);
+    assert_eq!(submission.images, vec![sample_png()]);
+    let item = proto::QueueItem {
+        id: first_id,
+        status: proto::QueueItemStatus::Folding,
+        text: submission.text.clone(),
+        display_text: submission.display_text.clone(),
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
+    let (_, retry_result) = retry.await.unwrap();
+    assert!(matches!(
+        retry_result.unwrap(),
+        Response::UserMessageQueued { .. }
+    ));
+}
+
 #[tokio::test]
 async fn attachment_upload_consumes_image_refs_exactly_once() {
     let ctx = test_ctx();
@@ -9909,6 +10818,47 @@ async fn attachment_upload_consumes_image_refs_exactly_once() {
         .expect_err("second consume must fail");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("already consumed"));
+}
+
+#[tokio::test]
+async fn consumed_image_ref_ttl_starts_when_submission_claims_it() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let ttl = std::time::Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
+    state
+        .ready_attachments
+        .get_mut(&image_ref.id)
+        .expect("ready attachment")
+        .created_at = Instant::now() - ttl + std::time::Duration::from_millis(1);
+
+    let claimed_at = Instant::now();
+    let client_submission_id = Uuid::new_v4();
+    let images = claim_message_image_refs(
+        &mut state,
+        session_id,
+        client_submission_id,
+        std::slice::from_ref(&image_ref),
+    )
+    .expect("near-expiry ready ref is claimable");
+    assert_eq!(images, vec![sample_png()]);
+    assert!(
+        crate::sync::lock_or_recover(&state.upload_accounting)
+            .consumed_message_attachments
+            .get(&image_ref.id)
+            .expect("claimed attachment retained")
+            .consumed_at
+            >= claimed_at
+    );
+
+    prune_expired_attachments(&mut state);
+    assert!(
+        crate::sync::lock_or_recover(&state.upload_accounting)
+            .consumed_message_attachments
+            .contains_key(&image_ref.id),
+        "claim refreshes replay TTL even when the upload itself was nearly expired"
+    );
 }
 
 #[tokio::test]
@@ -11366,6 +12316,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     provider: "openai".to_string(),
                     model: "gpt-5".to_string(),
                     persist_as_default: false,
+                    initialize_default_if_missing: false,
                     trigger: proto::ActiveModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -11380,6 +12331,7 @@ async fn serialized_requests_apply_in_receipt_order() {
             Envelope::request(
                 message_id,
                 Request::SendUserMessage {
+                    client_submission_id: Uuid::new_v4(),
                     text: "after model switch".to_string(),
                     display_text: None,
                     tag_expansions: Vec::new(),
@@ -11401,6 +12353,7 @@ async fn serialized_requests_apply_in_receipt_order() {
             reasoning_effort,
             thinking_mode,
             persist_as_default: _,
+            initialize_default_if_missing: _,
             prompt_cache_retention,
         } => {
             assert_eq!(provider, "openai");
@@ -11428,7 +12381,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                 display_text: None,
                 target: proto::QueueTarget::default(),
             };
-            respond_to.send((item.clone(), vec![item])).unwrap();
+            respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
         }
         other => panic!("expected UserMessage after model switch, got {other:?}"),
     }
@@ -12461,6 +13414,7 @@ async fn btw_concurrent_with_parent_turn() {
     let parent_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "parent work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -12511,6 +13465,7 @@ async fn btw_concurrent_with_parent_turn() {
     let btw_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessage {
+                client_submission_id: Uuid::new_v4(),
                 text: "btw work".to_string(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -12540,7 +13495,7 @@ async fn btw_concurrent_with_parent_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
     };
-    btw_respond.send((btw_item, Vec::new())).unwrap();
+    btw_respond.send(Ok((btw_item, Vec::new()))).unwrap();
     assert!(matches!(
         btw_request.await.unwrap().unwrap(),
         Response::UserMessageQueued { .. }
@@ -12553,7 +13508,7 @@ async fn btw_concurrent_with_parent_turn() {
         display_text: None,
         target: proto::QueueTarget::default(),
     };
-    parent_respond.send((parent_item, Vec::new())).unwrap();
+    parent_respond.send(Ok((parent_item, Vec::new()))).unwrap();
     assert!(matches!(
         parent_request.await.unwrap().unwrap(),
         Response::UserMessageQueued { .. }
@@ -12901,6 +13856,7 @@ async fn send_user_message_refused_while_draining() {
 
     let err = handle_request(
         Request::SendUserMessage {
+            client_submission_id: Uuid::new_v4(),
             text: "hi".into(),
             display_text: None,
             tag_expansions: Vec::new(),
@@ -13312,6 +14268,121 @@ async fn attach_resolves_model_from_injected_config_source() {
         }),
         "session active model must match the injected config source"
     );
+}
+
+#[tokio::test]
+async fn reconnect_attach_uses_authoritative_default_correction_before_config_watch() {
+    use crate::config::providers::{ActiveModelRef, ModelEntry, ProviderEntry};
+
+    let old_default = ActiveModelRef {
+        provider: "lmstudio".into(),
+        model: "old-default".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let selected = ActiveModelRef {
+        provider: "lmstudio".into(),
+        model: "selected-model".into(),
+        reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
+            value: "high".into(),
+        }),
+        thinking_mode: Some(crate::config::providers::ThinkingMode::High),
+        prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
+    };
+    let providers_cfg = crate::config::providers::ProvidersConfig {
+        providers: std::collections::BTreeMap::from([(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                models: vec![
+                    ModelEntry {
+                        id: old_default.model.clone(),
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: selected.model.clone(),
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        )]),
+        active_model: Some(old_default.clone()),
+        ..crate::config::providers::ProvidersConfig::default()
+    };
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers_cfg,
+        crate::config::extended::ExtendedConfig::default(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+
+    let mut first_client = MutableClientState::detached_for_test();
+    let first = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            initial_model: Some(selected.clone()),
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        },
+        &mut first_client,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::Attached { session_id, .. } = first else {
+        panic!("expected first attach");
+    };
+    let handle = first_client
+        .attached
+        .as_ref()
+        .expect("first client attached")
+        .handle
+        .clone();
+    handle.set_authoritative_active_model_state_for_tests(proto::ActiveModelState {
+        selection: selected.clone(),
+        default_selection: Some(selected.clone()),
+        diverged: false,
+        generation: 7,
+    });
+    assert_eq!(
+        handle.config_snapshot().providers.active_model,
+        Some(old_default),
+        "the config watcher intentionally remains stale for this regression"
+    );
+
+    let mut reconnect = MutableClientState::detached_for_test();
+    let response = handle_request(
+        attach_existing_request(session_id, tmp.path()),
+        &mut reconnect,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::Attached {
+        active_model_state: Some(active),
+        ..
+    } = response
+    else {
+        panic!("expected attached active-model state");
+    };
+    assert_eq!(active.selection, selected);
+    assert_eq!(active.default_selection, Some(selected));
+    assert!(!active.diverged);
+    assert_eq!(active.generation, 0, "attach starts a new client epoch");
 }
 
 #[tokio::test]
@@ -13838,6 +14909,7 @@ async fn history_redaction_scrubs_display_text_and_tag_expansions() {
                 detail: "fci_history_secret_12345 lines".to_string(),
                 ok: true,
             }],
+            client_submission_ids: Vec::new(),
             ts_ms: 0,
             seq: 1,
             origin_principal: Some("flycockpit:remote".to_string()),

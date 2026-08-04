@@ -289,6 +289,168 @@ pub(super) async fn forward_queue_updates(
     }
 }
 
+pub(super) async fn persist_staged_terminal_removal(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    staged: crate::engine::message::StagedQueueRemoval,
+    disposition: crate::db::session_log::ClientSubmissionTerminalDisposition,
+) -> std::result::Result<
+    (
+        Vec<crate::engine::message::QueuedUserMessage>,
+        Vec<crate::engine::message::QueuedUserMessage>,
+        Vec<crate::engine::message::ClientSubmissionReceipt>,
+    ),
+    proto::ErrorPayload,
+> {
+    let removed = staged.removed().to_vec();
+    let receipts = queue.accepted_receipts(staged.ids()).await;
+    if !receipts.is_empty()
+        && let Err(error) = session
+            .record_terminal_client_submissions(&receipts, disposition)
+            .await
+    {
+        queue.mark_staged_removal_failed(&staged).await;
+        tracing::warn!(
+            %error,
+            receipt_count = receipts.len(),
+            disposition = disposition.as_str(),
+            "terminal client-submission receipt write failed; exact queued payload remains held"
+        );
+        return Err(proto::ErrorPayload {
+            code: proto::ErrorCode::Internal,
+            message: "could not durably remove queued message; its exact payload remains held and will not execute; retry the same removal"
+                .to_string(),
+        });
+    }
+    let snapshot = queue.commit_staged_removal(staged).await;
+    Ok((removed, snapshot, receipts))
+}
+
+fn queue_removal_in_progress_error() -> proto::ErrorPayload {
+    proto::ErrorPayload {
+        code: proto::ErrorCode::Internal,
+        message: "a previous failed queue removal remains held; retry that same removal or cancel the queued work"
+            .to_string(),
+    }
+}
+
+fn send_terminal_receipts_event(
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: Uuid,
+    receipts: &[crate::engine::message::ClientSubmissionReceipt],
+    disposition: crate::db::session_log::ClientSubmissionTerminalDisposition,
+) {
+    if receipts.is_empty() {
+        return;
+    }
+    send_current_event(
+        event_tx,
+        redaction,
+        proto::Event::UserMessagesTerminated {
+            session_id,
+            client_submission_ids: receipts.iter().map(|receipt| receipt.id).collect(),
+            disposition: disposition.into(),
+        },
+    );
+}
+
+async fn probe_user_message(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    session_id: Uuid,
+    client_submission_id: Uuid,
+    wire_fingerprint: &str,
+    origin_principal: Option<&str>,
+) -> std::result::Result<UserMessageProbeResult, proto::ErrorPayload> {
+    let durable = session
+        .db
+        .client_submission_receipt(session_id, client_submission_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, %session_id, %client_submission_id,
+                "client submission probe failed; refusing ambiguous retry");
+            proto::ErrorPayload {
+                code: proto::ErrorCode::Internal,
+                message: "could not verify whether this message was already accepted; retry"
+                    .to_string(),
+            }
+        })?;
+
+    let terminal = if durable.is_none() {
+        session
+            .db
+            .client_submission_terminal_receipt(session_id, client_submission_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, %session_id, %client_submission_id,
+                    "terminal client submission probe failed; refusing ambiguous retry");
+                proto::ErrorPayload {
+                    code: proto::ErrorCode::Internal,
+                    message: "could not verify whether this message was already terminated; retry"
+                        .to_string(),
+                }
+            })?
+    } else {
+        None
+    };
+
+    let (probe, snapshot) = if let Some(receipt) = durable {
+        let probe = if receipt.origin_principal.as_deref() != origin_principal {
+            crate::engine::message::IdempotentProbe::Conflict
+        } else if receipt.wire_fingerprint == wire_fingerprint {
+            crate::engine::message::IdempotentProbe::ExactDuplicate
+        } else {
+            crate::engine::message::IdempotentProbe::ContentCheckRequired
+        };
+        (probe, queue.snapshot().await)
+    } else if let Some(receipt) = terminal {
+        if receipt.origin_principal.as_deref() != origin_principal {
+            return Ok(UserMessageProbeResult::Conflict);
+        }
+        if receipt.wire_fingerprint == wire_fingerprint {
+            return Err(proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageTerminated,
+                message: format!(
+                    "client_submission_id {client_submission_id} is terminal ({}) and will not be executed",
+                    receipt.disposition.as_str()
+                ),
+            });
+        }
+        (
+            crate::engine::message::IdempotentProbe::ContentCheckRequired,
+            queue.snapshot().await,
+        )
+    } else {
+        queue
+            .probe_idempotent(client_submission_id, wire_fingerprint, origin_principal)
+            .await
+    };
+    Ok(match probe {
+        crate::engine::message::IdempotentProbe::Unknown => UserMessageProbeResult::Unknown,
+        crate::engine::message::IdempotentProbe::ContentCheckRequired => {
+            UserMessageProbeResult::ContentCheckRequired
+        }
+        crate::engine::message::IdempotentProbe::Conflict => UserMessageProbeResult::Conflict,
+        crate::engine::message::IdempotentProbe::ExactDuplicate => {
+            let queue: Vec<proto::QueueItem> =
+                snapshot.into_iter().map(queue_item_to_proto).collect();
+            let item = queue
+                .iter()
+                .find(|item| item.id == client_submission_id)
+                .cloned()
+                .unwrap_or(proto::QueueItem {
+                    id: client_submission_id,
+                    status: proto::QueueItemStatus::Folding,
+                    text: String::new(),
+                    display_text: None,
+                    target: proto::QueueTarget::default(),
+                });
+            UserMessageProbeResult::Duplicate { item, queue }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_worker(
     session: Arc<Session>,
@@ -298,6 +460,7 @@ pub(super) async fn run_worker(
     model_override: Option<Arc<Model>>,
     thinking_params: Option<serde_json::Value>,
     project_root: PathBuf,
+    trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
@@ -309,6 +472,7 @@ pub(super) async fn run_worker(
     repair_required: Arc<RwLock<Option<proto::ResumeRepairState>>>,
     foreground: Arc<Mutex<LiveForegroundState>>,
     config_snapshot: Arc<RwLock<SessionConfigSnapshot>>,
+    authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
@@ -533,6 +697,7 @@ pub(super) async fn run_worker(
     let live_for_forward = live.clone();
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
     let session_for_forward = session.clone();
+    let authoritative_active_model_state_for_forward = authoritative_active_model_state.clone();
     // The lock authority + the interactive-client count, for the
     // `AgentIdle`-with-zero-clients release edge
     // (implementation note). When a turn finishes and no
@@ -542,6 +707,10 @@ pub(super) async fn run_worker(
     let interactive_clients_for_forward = interactive_clients.clone();
     let forward = tokio::spawn(async move {
         let send_event = |ev: proto::Event| {
+            update_authoritative_active_model_state(
+                &authoritative_active_model_state_for_forward,
+                &ev,
+            );
             // Per-session de-dupe (§6.5): the engine emits `SandboxUnavailable`
             // on every refused `bash` (the verdict is process-lifetime-cached,
             // so it recurs), but the user needs only one persistent notice.
@@ -954,19 +1123,22 @@ pub(super) async fn run_worker(
     // Spawn the driver loop.
     let driver_queue_for_loop = driver_input_queue.clone();
     let mut driver_handle = tokio::spawn(async move {
-        let driver_loop = Box::pin(driver.run_main_loop(
-            driver_queue_for_loop,
-            driver_control_rx,
-            &engine_event_tx,
-        ));
-        match driver_loop.await {
-            Ok(()) => DriverOutcome::Ok,
-            Err(e) => {
-                let error = format!("{e:#}");
-                tracing::error!(error = %error, "driver loop terminated with error");
-                DriverOutcome::Err(error)
+        crate::config::trust::scope_workspace_trust_policy(trust_policy, async move {
+            let driver_loop = Box::pin(driver.run_main_loop(
+                driver_queue_for_loop,
+                driver_control_rx,
+                &engine_event_tx,
+            ));
+            match driver_loop.await {
+                Ok(()) => DriverOutcome::Ok,
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    tracing::error!(error = %error, "driver loop terminated with error");
+                    DriverOutcome::Err(error)
+                }
             }
-        }
+        })
+        .await
     });
 
     // Main work loop.
@@ -1023,10 +1195,76 @@ pub(super) async fn run_worker(
                 .await;
             }
             WorkerInput::Work(work) => match work {
+                SessionWork::ProbeUserMessage {
+                    client_submission_id,
+                    wire_fingerprint,
+                    origin_principal,
+                    respond_to,
+                } => {
+                    let outcome = Box::pin(probe_user_message(
+                        &session,
+                        &driver_input_queue,
+                        session_id,
+                        client_submission_id,
+                        &wire_fingerprint,
+                        origin_principal.as_deref(),
+                    ))
+                    .await;
+                    let _ = respond_to.send(outcome);
+                }
                 SessionWork::UserMessage {
                     submission,
                     respond_to,
                 } => {
+                    let client_submission_id = submission
+                        .client_submissions
+                        .first()
+                        .map(|receipt| receipt.id)
+                        .expect("wire user submissions carry a client receipt");
+                    let receipt = submission
+                        .client_submissions
+                        .first()
+                        .expect("wire user submissions carry a client receipt");
+                    let terminal_receipt = match session
+                        .db
+                        .client_submission_terminal_receipt(session_id, receipt.id)
+                        .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "terminal client submission lookup failed; refusing ambiguous enqueue");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "could not verify whether this message was already terminated; retry"
+                                    .to_string(),
+                            }));
+                            continue;
+                        }
+                    };
+                    if let Some(terminal) = terminal_receipt {
+                        if terminal.origin_principal != receipt.origin_principal
+                            || terminal.fingerprint != receipt.fingerprint
+                        {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: format!(
+                                    "client_submission_id {} was already used for a different payload",
+                                    receipt.id
+                                ),
+                            }));
+                        } else {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageTerminated,
+                                message: format!(
+                                    "client_submission_id {} is terminal ({}) and will not be executed",
+                                    receipt.id,
+                                    terminal.disposition.as_str()
+                                ),
+                            }));
+                        }
+                        continue;
+                    }
                     if let Some(state) = repair_required
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1050,16 +1288,12 @@ pub(super) async fn run_worker(
                             },
                             NoticeSource::DaemonDirect,
                         );
-                        let _ = respond_to.send((
-                            proto::QueueItem {
-                                id: Uuid::nil(),
-                                status: proto::QueueItemStatus::Folding,
-                                text: String::new(),
-                                display_text: None,
-                                target: proto::QueueTarget::default(),
-                            },
-                            Vec::new(),
-                        ));
+                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                            code: proto::ErrorCode::UserMessageNotAccepted,
+                            message: format!(
+                                "session resume requires explicit repair before accepting message {client_submission_id}"
+                            ),
+                        }));
                         continue;
                     }
                     // Lazy persistence (session-id-display-and-lazy-persist): the
@@ -1078,18 +1312,18 @@ pub(super) async fn run_worker(
                             send_current_event(
                                 &event_tx,
                                 &redaction,
-                                proto::Event::SessionPersistFailed { session_id, error },
-                            );
-                            let _ = respond_to.send((
-                                proto::QueueItem {
-                                    id: Uuid::nil(),
-                                    status: proto::QueueItemStatus::Folding,
-                                    text: String::new(),
-                                    display_text: None,
-                                    target: proto::QueueTarget::default(),
+                                proto::Event::SessionPersistFailed {
+                                    session_id,
+                                    client_submission_id,
+                                    error: error.clone(),
                                 },
-                                Vec::new(),
-                            ));
+                            );
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageNotAccepted,
+                                message: format!(
+                                    "session persistence failed before accepting message {client_submission_id}: {error}"
+                                ),
+                            }));
                             continue;
                         }
                     }
@@ -1128,16 +1362,12 @@ pub(super) async fn run_worker(
                             &mut driver_failed,
                             "driver control channel closed".to_string(),
                         );
-                        let _ = respond_to.send((
-                            proto::QueueItem {
-                                id: Uuid::nil(),
-                                status: proto::QueueItemStatus::Folding,
-                                text: String::new(),
-                                display_text: None,
-                                target: proto::QueueTarget::default(),
-                            },
-                            Vec::new(),
-                        ));
+                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                            code: proto::ErrorCode::UserMessageNotAccepted,
+                            message: format!(
+                                "session driver became unavailable before accepting message {client_submission_id} while refreshing redaction"
+                            ),
+                        }));
                         break WorkerStop::DriverFailed;
                     }
                     let max_rounds = {
@@ -1157,23 +1387,84 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
-                        let _ = respond_to.send((
-                            proto::QueueItem {
-                                id: Uuid::nil(),
-                                status: proto::QueueItemStatus::Folding,
-                                text: String::new(),
-                                display_text: None,
-                                target: proto::QueueTarget::default(),
-                            },
-                            Vec::new(),
-                        ));
+                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                            code: proto::ErrorCode::UserMessageNotAccepted,
+                            message: format!(
+                                "session driver became unavailable before accepting message {client_submission_id} while applying round limits"
+                            ),
+                        }));
                         break WorkerStop::DriverFailed;
                     }
                     let target = foreground_input_target
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    let (id, snapshot) = driver_input_queue.push(*submission, target).await;
+                    let receipt = submission
+                        .client_submissions
+                        .first()
+                        .cloned()
+                        .expect("wire user submissions carry a client receipt");
+                    let durable_receipt = match session
+                        .db
+                        .client_submission_receipt(session_id, receipt.id)
+                        .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "client submission dedupe lookup failed; refusing ambiguous enqueue");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "could not verify whether this message was already accepted; retry"
+                                    .to_string(),
+                            }));
+                            continue;
+                        }
+                    };
+                    if let Some(durable_receipt) = durable_receipt {
+                        if durable_receipt.origin_principal != receipt.origin_principal
+                            || durable_receipt.fingerprint != receipt.fingerprint
+                        {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: format!(
+                                    "client_submission_id {} was already used for a different payload",
+                                    receipt.id
+                                ),
+                            }));
+                            continue;
+                        }
+                        let queue = driver_input_queue
+                            .snapshot()
+                            .await
+                            .into_iter()
+                            .map(queue_item_to_proto)
+                            .collect();
+                        let _ = respond_to.send(Ok((
+                            proto::QueueItem {
+                                id: receipt.id,
+                                status: proto::QueueItemStatus::Folding,
+                                text: submission.text.clone(),
+                                display_text: submission.display_text.clone(),
+                                target: queue_target_to_proto(target),
+                            },
+                            queue,
+                        )));
+                        continue;
+                    }
+                    let (id, snapshot, outcome) = driver_input_queue
+                        .push_idempotent(receipt, *submission, target)
+                        .await;
+                    if matches!(outcome, crate::engine::message::IdempotentPush::Conflict) {
+                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                            code: proto::ErrorCode::BadRequest,
+                            message: format!(
+                                "client_submission_id {} was already used for a different payload",
+                                id
+                            ),
+                        }));
+                        continue;
+                    }
                     let queue: Vec<proto::QueueItem> =
                         snapshot.into_iter().map(queue_item_to_proto).collect();
                     let item = queue.iter().find(|item| item.id == id).cloned().unwrap_or(
@@ -1185,7 +1476,7 @@ pub(super) async fn run_worker(
                             target: proto::QueueTarget::default(),
                         },
                     );
-                    let _ = respond_to.send((item, queue));
+                    let _ = respond_to.send(Ok((item, queue)));
                 }
                 SessionWork::SteerDelegation {
                     task_call_id,
@@ -1209,14 +1500,48 @@ pub(super) async fn run_worker(
                     queue_item_id,
                     respond_to,
                 } => {
-                    let (result, snapshot) = driver_input_queue.remove(queue_item_id).await;
+                    let (result, staged, mut snapshot) =
+                        match driver_input_queue.stage_remove(queue_item_id).await {
+                            Ok(staged) => staged,
+                            Err(_) => {
+                                let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                                continue;
+                            }
+                        };
+                    if let Some(staged) = staged {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
+                        let (_, committed_snapshot, receipts) =
+                            match persist_staged_terminal_removal(
+                                &session,
+                                &driver_input_queue,
+                                staged,
+                                disposition,
+                            )
+                            .await
+                            {
+                                Ok(committed) => committed,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(error));
+                                    continue;
+                                }
+                            };
+                        snapshot = committed_snapshot;
+                        send_terminal_receipts_event(
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                            &receipts,
+                            disposition,
+                        );
+                    }
                     let reason = remove_reason_to_proto(result);
-                    let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
+                    let _ = respond_to.send(Ok(proto::RemoveQueuedUserMessageResult {
                         applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
                         reason,
                         removed_item: None,
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                    });
+                    }));
                 }
                 SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
@@ -1229,15 +1554,50 @@ pub(super) async fn run_worker(
                             .id
                             .clone()
                     });
-                    let (result, removed_item, snapshot) =
-                        driver_input_queue.remove_newest_for(&target_id).await;
+                    let (result, staged, mut snapshot) =
+                        match driver_input_queue.stage_remove_newest_for(&target_id).await {
+                            Ok(staged) => staged,
+                            Err(_) => {
+                                let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                                continue;
+                            }
+                        };
+                    let mut removed_item = None;
+                    if let Some(staged) = staged {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
+                        let (mut removed, committed_snapshot, receipts) =
+                            match persist_staged_terminal_removal(
+                                &session,
+                                &driver_input_queue,
+                                staged,
+                                disposition,
+                            )
+                            .await
+                            {
+                                Ok(committed) => committed,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(error));
+                                    continue;
+                                }
+                            };
+                        snapshot = committed_snapshot;
+                        removed_item = removed.pop();
+                        send_terminal_receipts_event(
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                            &receipts,
+                            disposition,
+                        );
+                    }
                     let reason = remove_reason_to_proto(result);
-                    let _ = respond_to.send(proto::RemoveQueuedUserMessageResult {
+                    let _ = respond_to.send(Ok(proto::RemoveQueuedUserMessageResult {
                         applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
                         reason,
                         removed_item: removed_item.map(queue_item_to_proto),
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                    });
+                    }));
                 }
                 SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
@@ -1250,15 +1610,52 @@ pub(super) async fn run_worker(
                             .id
                             .clone()
                     });
-                    let (result, removed_items, snapshot) =
-                        driver_input_queue.remove_editable_for(&target_id).await;
+                    let (result, staged, mut snapshot) = match driver_input_queue
+                        .stage_remove_editable_for(&target_id)
+                        .await
+                    {
+                        Ok(staged) => staged,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(queue_removal_in_progress_error()));
+                            continue;
+                        }
+                    };
+                    let mut removed_items = Vec::new();
+                    if let Some(staged) = staged {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
+                        let (removed, committed_snapshot, receipts) =
+                            match persist_staged_terminal_removal(
+                                &session,
+                                &driver_input_queue,
+                                staged,
+                                disposition,
+                            )
+                            .await
+                            {
+                                Ok(committed) => committed,
+                                Err(error) => {
+                                    let _ = respond_to.send(Err(error));
+                                    continue;
+                                }
+                            };
+                        removed_items = removed;
+                        snapshot = committed_snapshot;
+                        send_terminal_receipts_event(
+                            &event_tx,
+                            &redaction,
+                            session_id,
+                            &receipts,
+                            disposition,
+                        );
+                    }
                     let reason = remove_reason_to_proto(result);
-                    let _ = respond_to.send(proto::RemoveQueuedUserMessagesResult {
+                    let _ = respond_to.send(Ok(proto::RemoveQueuedUserMessagesResult {
                         applied: !removed_items.is_empty(),
                         reason,
                         removed_items: removed_items.into_iter().map(queue_item_to_proto).collect(),
                         queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                    });
+                    }));
                 }
                 SessionWork::RepublishQueue => {
                     driver_input_queue.republish().await;
@@ -1273,6 +1670,35 @@ pub(super) async fn run_worker(
                     // is a no-op when no run is in flight. The driver then emits
                     // `AgentIdle`, clearing the TUI's busy state.
                     tracing::info!(session_id = %session_id, "cancel requested");
+                    if let Some(staged) = driver_input_queue.stage_discard_pending().await {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
+                        match persist_staged_terminal_removal(
+                            &session,
+                            &driver_input_queue,
+                            staged,
+                            disposition,
+                        )
+                        .await
+                        {
+                            Ok((_, _, receipts)) => send_terminal_receipts_event(
+                                &event_tx,
+                                &redaction,
+                                session_id,
+                                &receipts,
+                                disposition,
+                            ),
+                            Err(_) => send_current_event(
+                                &event_tx,
+                                &redaction,
+                                proto::Event::Notice {
+                                    session_id,
+                                    text: "Could not durably cancel queued messages; their exact payloads remain held. Retry cancellation after storage recovers."
+                                        .to_string(),
+                                },
+                            ),
+                        }
+                    }
                     cancel_handle.cancel();
                 }
                 SessionWork::ResolveInterrupt {
@@ -1543,6 +1969,7 @@ pub(super) async fn run_worker(
                     provider,
                     model,
                     persist_as_default,
+                    initialize_default_if_missing,
                     trigger,
                     reasoning_effort,
                     thinking_mode,
@@ -1559,7 +1986,7 @@ pub(super) async fn run_worker(
                                 provider,
                                 model,
                                 reasoning_effort,
-                                thinking_mode: thinking_mode.map(|mode| mode.as_str().to_string()),
+                                thinking_mode,
                                 prompt_cache_retention,
                                 outcome: proto::ModelSelectionOutcome::Rejected {
                                     user_message: "Model selection timed out before the daemon could apply it; retry from /model.".to_string(),
@@ -1578,8 +2005,7 @@ pub(super) async fn run_worker(
                     let rejected_provider = provider.clone();
                     let rejected_model = model.clone();
                     let rejected_reasoning_effort = reasoning_effort.clone();
-                    let rejected_thinking_mode =
-                        thinking_mode.map(|mode| mode.as_str().to_string());
+                    let rejected_thinking_mode = thinking_mode;
                     let rejected_prompt_cache_retention = prompt_cache_retention;
                     // Mid-session model switch (implementation note):
                     // route the new `(provider, model)` to the running driver. The
@@ -1602,6 +2028,7 @@ pub(super) async fn run_worker(
                             provider,
                             model,
                             persist_as_default,
+                            initialize_default_if_missing,
                             trigger,
                             reasoning_effort,
                             thinking_mode,
@@ -1680,7 +2107,7 @@ pub(super) async fn run_worker(
                     if changed
                         && !send_driver_control_or_fail(
                             &driver_control_tx,
-                            crate::engine::driver::DriverControl::RefreshPromptCacheRetention,
+                            crate::engine::driver::DriverControl::RefreshConfigDerivedState,
                             &event_tx,
                             &turn_completions,
                             &redaction,
@@ -2299,6 +2726,41 @@ pub(super) async fn run_worker(
         },
     );
     tracing::info!(session_id = %session_id, "session worker exited");
+}
+
+fn update_authoritative_active_model_state(
+    state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
+    event: &proto::Event,
+) {
+    let next = match event {
+        proto::Event::ActiveModelState {
+            selection,
+            default_selection,
+            diverged,
+            generation,
+            ..
+        } => Some(proto::ActiveModelState {
+            selection: selection.clone(),
+            default_selection: default_selection.clone(),
+            diverged: *diverged,
+            generation: *generation,
+        }),
+        proto::Event::ModelSelectionResult {
+            outcome: proto::ModelSelectionOutcome::Applied { active_state, .. },
+            ..
+        } => Some(proto::ActiveModelState {
+            selection: active_state.selection.clone(),
+            default_selection: active_state.default_selection.clone(),
+            diverged: active_state.diverged,
+            generation: active_state.generation,
+        }),
+        _ => None,
+    };
+    if let Some(next) = next {
+        *state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next);
+    }
 }
 
 pub(super) async fn shutdown_activity_snapshot(

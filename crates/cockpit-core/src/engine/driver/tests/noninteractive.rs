@@ -2366,15 +2366,16 @@ async fn delivery_event_data_carries_job_id_round_trip() {
     let session = driver.session.clone();
 
     // Async-result delivery: `data.job_id` present.
-    let delivery = user_message_event_data(
-        "[async result · loop · sched-abc]\nok",
-        None,
-        &[],
-        Some("sched-abc"),
-        &[],
-        None,
-        None,
-    );
+    let delivery = user_message_event_data(UserMessageEventData {
+        text: "[async result · loop · sched-abc]\nok",
+        display_text: None,
+        tag_expansions: &[],
+        job_id: Some("sched-abc"),
+        queue_item_ids: &[],
+        client_submissions: &[],
+        queue_target: None,
+        preflight_cleaned: None,
+    });
     session
         .record_event(
             crate::db::session_log::SessionEventKind::UserMessage,
@@ -2385,7 +2386,16 @@ async fn delivery_event_data_carries_job_id_round_trip() {
         .await
         .unwrap();
     // Ordinary user input: no `job_id` key.
-    let ordinary = user_message_event_data("hello", None, &[], None, &[], None, None);
+    let ordinary = user_message_event_data(UserMessageEventData {
+        text: "hello",
+        display_text: None,
+        tag_expansions: &[],
+        job_id: None,
+        queue_item_ids: &[],
+        client_submissions: &[],
+        queue_target: None,
+        preflight_cleaned: None,
+    });
     assert!(
         ordinary.get("job_id").is_none(),
         "ordinary input must omit data.job_id: {ordinary}"

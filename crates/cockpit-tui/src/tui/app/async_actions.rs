@@ -114,13 +114,37 @@ impl App {
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
-                        self.apply_session_switch_outcome(*outcome);
-                        self.flush_pending_session_switch_submissions();
+                        if label == "session.switch"
+                            && !matches!(outcome.target, agent_runner::SessionTarget::New)
+                        {
+                            self.history.push(HistoryEntry::CommandError {
+                                line: "/new: session switch returned the wrong target; old session preserved"
+                                    .to_string(),
+                            });
+                            self.fail_pending_session_switch_submissions();
+                        } else {
+                            if label == "session.switch" {
+                                self.commit_new_session_switch_outcome(*outcome);
+                            } else {
+                                self.apply_session_switch_outcome(*outcome);
+                            }
+                            self.flush_pending_session_switch_submissions();
+                        }
                     }
                     Ok(_) => {
-                        self.agent_runner =
-                            Some(Err("session switch returned unexpected payload".into()));
-                        self.fail_pending_session_switch_submissions();
+                        if label == "session.switch" {
+                            self.history.push(HistoryEntry::CommandError {
+                                line: "/new: session switch returned an unexpected response; old session preserved"
+                                    .to_string(),
+                            });
+                            self.fail_pending_session_switch_submissions();
+                        } else {
+                            self.history.push(HistoryEntry::CommandError {
+                                line: "/resume: session switch returned an unexpected response"
+                                    .to_string(),
+                            });
+                            self.fail_pending_session_switch_submissions();
+                        }
                     }
                     Err(error) => {
                         let command = if label == "session.resume" {
@@ -135,7 +159,9 @@ impl App {
                                 line: format!("{command}: daemon connection lost; reconnecting"),
                             });
                         } else {
-                            self.agent_runner = Some(Err(error.clone()));
+                            // Replacement Attach installs its new client only
+                            // after success. A rejected switch therefore leaves
+                            // the current attachment and its view retryable.
                             self.history.push(HistoryEntry::CommandError {
                                 line: format!("{command}: {error}"),
                             });
@@ -159,7 +185,9 @@ impl App {
                     }
                 }
                 Ok(_) => {
-                    self.agent_runner = Some(Err("fork switch returned unexpected payload".into()));
+                    self.history.push(HistoryEntry::CommandError {
+                        line: "/fork: session switch returned an unexpected response".to_string(),
+                    });
                     self.fail_pending_session_switch_submissions();
                 }
                 Err(error) => {
@@ -170,7 +198,8 @@ impl App {
                             line: "/fork: daemon connection lost; reconnecting".to_string(),
                         });
                     } else {
-                        self.agent_runner = Some(Err(error.clone()));
+                        // The unattached fork is discarded by the switch task;
+                        // the current session client was never replaced.
                         self.history.push(HistoryEntry::CommandError {
                             line: format!("/fork: could not attach to fork: {error}"),
                         });
@@ -224,30 +253,25 @@ impl App {
             },
             AsyncActionKind::Internal("session.side.return") => match result.payload {
                 Ok(AsyncActionPayload::SideSessionReturned(outcome)) => {
-                    self.apply_session_switch_outcome_preserving_history(
-                        *outcome,
-                        self.current_session_persisted,
-                    );
-                    self.flush_pending_session_switch_submissions();
+                    self.complete_side_conversation_return(*outcome);
                 }
                 Ok(_) => {
-                    self.agent_runner =
-                        Some(Err("side return switch returned unexpected payload".into()));
+                    self.history.push(HistoryEntry::CommandError {
+                        line: "/side: return produced an unexpected response; still in side conversation"
+                            .to_string(),
+                    });
                     self.fail_pending_session_switch_submissions();
                 }
                 Err(error) => {
-                    if reconnectable_session_switch_error(&error)
-                        && matches!(self.agent_runner, Some(Ok(_)))
-                    {
-                        self.history.push(HistoryEntry::CommandError {
-                            line: "/side: daemon connection lost; reconnecting".to_string(),
-                        });
+                    let line = if reconnectable_session_switch_error(&error) {
+                        "/side: daemon connection lost; reconnecting — still in side conversation"
+                            .to_string()
                     } else {
-                        self.agent_runner = Some(Err(error.clone()));
-                        self.history.push(HistoryEntry::CommandError {
-                            line: format!("/side: could not return to main session: {error}"),
-                        });
-                    }
+                        format!(
+                            "/side: could not return to main session: {error}; still in side conversation — retry `/side end`"
+                        )
+                    };
+                    self.history.push(HistoryEntry::CommandError { line });
                     self.fail_pending_session_switch_submissions();
                 }
             },
@@ -557,12 +581,21 @@ impl App {
             AsyncActionKind::DaemonRpc("fork.create") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    socket,
                     session_id,
                     short_id,
+                    fork_point_seq,
                     seed_composer,
                     ..
                 }) => {
-                    self.apply_fork_created(parent_session_id, session_id, short_id, seed_composer);
+                    self.apply_fork_created(
+                        parent_session_id,
+                        socket,
+                        session_id,
+                        short_id,
+                        fork_point_seq,
+                        seed_composer,
+                    );
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/fork: unexpected daemon response".to_string(),

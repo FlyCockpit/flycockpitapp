@@ -28,7 +28,15 @@
         "thinking_mode": "high"
       },
       "interactive": true,
-      "model_override": "model_override-fixture",
+      "model_override": {
+        "model": "gpt-5",
+        "prompt_cache_retention": "extended",
+        "provider": "openai",
+        "reasoning_effort": {
+          "value": "high"
+        },
+        "thinking_mode": "high"
+      },
       "no_sandbox": true,
       "project_root": "project_root-fixture",
       "session_id": "11111111-1111-4111-8111-111111111111",
@@ -498,6 +506,7 @@
   },
   "send_user_message": {
     "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
       "display_text": "display @fixture",
       "forced_skill": "forced_skill-fixture",
       "image_refs": [
@@ -534,9 +543,13 @@
   "set_active_model": {
     "params": {
       "model": "model-fixture",
-      "persist_as_default": false,
+      "initialize_default_if_missing": false,
+      "persist_as_default": true,
+      "prompt_cache_retention": "extended",
       "provider": "provider-fixture",
+      "reasoning_effort": "high",
       "selection_id": "11111111-1111-4111-8111-111111111111",
+      "thinking_mode": "high",
       "trigger": "daemon"
     },
     "request": "set_active_model"

@@ -126,6 +126,39 @@ fn message_content_text(message: &serde_json::Value) -> String {
     }
 }
 
+fn rich_client_submission(
+    text: &str,
+) -> (
+    uuid::Uuid,
+    UserSubmission,
+    crate::engine::message::ClientSubmissionReceipt,
+) {
+    let id = uuid::Uuid::new_v4();
+    let mut submission = UserSubmission {
+        text: text.into(),
+        display_text: Some(format!("display::{text}")),
+        tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+            tool: "read".into(),
+            path: "src/exact.rs".into(),
+            detail: "73 lines".into(),
+            ok: true,
+        }],
+        images: vec![vec![9, 8, 7, 6]],
+        forced_skill: Some("review".into()),
+        origin_principal: Some("flycockpit:exact-user".into()),
+        job_id: Some("job-exact-retry".into()),
+        ..Default::default()
+    };
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: format!("wire::{text}"),
+        origin_principal: submission.origin_principal.clone(),
+    };
+    submission.client_submissions.push(receipt.clone());
+    (id, submission, receipt)
+}
+
 fn write_max_primary_rounds_config(root: &std::path::Path, max_rounds: u32) {
     let cockpit = root.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
@@ -271,6 +304,567 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
         .find(|event| event.kind == "assistant_message")
         .expect("assistant_message event");
     assert_eq!(assistant.data["text"], "plain assistant reply");
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_submission_receipt_write_retries_before_the_only_inference() {
+    tokio::time::resume();
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("durably accepted".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let (queue, tx, mut rx) = event_harness();
+    let id = uuid::Uuid::new_v4();
+    let mut submission = UserSubmission::text("keep the complete accepted payload");
+    let fingerprint = submission.client_fingerprint();
+    submission.queue_item_ids = vec![id];
+    submission.client_submissions = vec![crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: fingerprint.clone(),
+        wire_fingerprint: "wire-receipt".to_string(),
+        origin_principal: None,
+    }];
+    driver.test_fail_next_user_message_event_write = true;
+
+    driver
+        .run_user_input(submission, &queue, &tx)
+        .await
+        .unwrap();
+
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        provider_posts(&provider).len(),
+        1,
+        "a transient receipt failure must never duplicate inference"
+    );
+    let recorded_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                TurnEvent::UserMessageRecorded {
+                    client_submission_ids,
+                    ..
+                } if client_submission_ids == &[id]
+            )
+        })
+        .expect("the retried event must become durable");
+    let thinking_index = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ThinkingStarted { .. }))
+        .expect("provider inference started");
+    assert!(recorded_index < thinking_index, "{events:?}");
+    assert!(events.iter().any(|event| {
+        matches!(event, TurnEvent::Notice { text } if text.contains("exact payload will be retried"))
+    }));
+
+    let durable = driver
+        .session
+        .db
+        .client_submission_receipt(driver.session.id, id)
+        .await
+        .unwrap()
+        .expect("restart dedupe must find the durable receipt");
+    assert_eq!(durable.fingerprint, fingerprint);
+    assert_eq!(durable.wire_fingerprint, "wire-receipt");
+    assert_eq!(durable.origin_principal, None);
+    assert_eq!(
+        session_events(&driver)
+            .await
+            .iter()
+            .filter(|event| event.kind == "user_message")
+            .count(),
+        1,
+        "retry must persist one canonical user event"
+    );
+}
+
+#[test]
+fn persistent_user_event_failure_defers_exact_payload_and_services_controls() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("must not run".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        driver.test_fail_all_user_message_event_writes = true;
+        let (queue, tx, mut rx) = event_harness();
+        let target = driver.active_queue_target();
+        let id = uuid::Uuid::new_v4();
+        let mut submission = UserSubmission {
+            text: "exact wire payload".into(),
+            display_text: Some("visible draft".into()),
+            tag_expansions: vec![crate::daemon::proto::TagExpansionMeta {
+                tool: "read".into(),
+                path: "src/lib.rs".into(),
+                detail: "42 lines".into(),
+                ok: true,
+            }],
+            images: vec![vec![1, 2, 3, 4]],
+            forced_skill: Some("review".into()),
+            origin_principal: Some("flycockpit:user-1".into()),
+            job_id: Some("job-exact".into()),
+            ..Default::default()
+        };
+        let receipt = crate::engine::message::ClientSubmissionReceipt {
+            id,
+            fingerprint: submission.client_fingerprint(),
+            wire_fingerprint: "wire-fingerprint".into(),
+            origin_principal: submission.origin_principal.clone(),
+        };
+        submission.client_submissions.push(receipt.clone());
+        let (_, _, outcome) = queue
+            .push_idempotent(receipt, submission.clone(), target.clone())
+            .await;
+        assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let run_queue = queue.clone();
+        let run_tx = tx.clone();
+        let run =
+            tokio::spawn(async move { driver.run_main_loop(run_queue, control_rx, &run_tx).await });
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(TurnEvent::Notice { text }) = rx.recv().await
+                    && text.contains("exact payload will be retried")
+                {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("persistent failure emits a bounded retry notice");
+        assert!(notice.contains("exact payload will be retried"), "{notice}");
+
+        control_tx.send(DriverControl::AbortForTest).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("a driver control is serviced while the payload is deferred")
+            .expect("driver task joins");
+        assert!(
+            result
+                .expect_err("test abort terminates the driver")
+                .to_string()
+                .contains("driver abort requested for test")
+        );
+        assert_eq!(provider_posts(&provider).len(), 0);
+
+        let mut expected = submission;
+        expected.queue_item_ids = vec![id];
+        expected.queue_target = Some(target);
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(2), queue.recv())
+            .await
+            .expect("deferred payload becomes runnable")
+            .expect("exact payload remains queued");
+        assert_eq!(
+            serde_json::to_value(retried).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "every wire/display/tag/image/skill/origin field survives the retry"
+        );
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_terminal_write_retry_does_not_rerun_preflight() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("must not run".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    driver
+        .session
+        .db
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_preflight_terminal_receipt
+                 BEFORE INSERT ON client_submission_terminal_receipts
+                 BEGIN
+                   SELECT RAISE(FAIL, 'persistent terminal receipt failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (queue, tx, mut rx) = event_harness();
+    let target = driver.active_queue_target();
+    let id = uuid::Uuid::new_v4();
+    let mut submission = UserSubmission::text("reject once only");
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: "reject-wire".into(),
+        origin_principal: None,
+    };
+    submission.client_submissions.push(receipt.clone());
+    queue.push_idempotent(receipt, submission, target).await;
+    driver.test_reject_next_submission_preflight = true;
+
+    let first = queue.recv().await.unwrap();
+    assert!(
+        driver
+            .prepare_queued_user_submission(first, &queue, &tx)
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        queue
+            .pending_submission(id)
+            .await
+            .and_then(|submission| submission.pending_terminal_disposition),
+        Some(crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected)
+    ));
+
+    let second = queue.recv().await.unwrap();
+    assert!(
+        driver
+            .prepare_queued_user_submission(second, &queue, &tx)
+            .await
+            .is_none(),
+        "the retry must settle the prior rejection rather than rerun the one-shot preflight"
+    );
+    assert_eq!(provider_posts(&provider).len(), 0);
+
+    driver
+        .session
+        .db
+        .write(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_preflight_terminal_receipt;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let third = queue.recv().await.unwrap();
+    assert!(
+        driver
+            .prepare_queued_user_submission(third, &queue, &tx)
+            .await
+            .is_none()
+    );
+    queue.finish(&[id]).await;
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::UserMessageRetracted { .. }))
+            .count(),
+        1,
+        "only the durable terminal transition retracts the accepted message"
+    );
+    assert!(queue.snapshot().await.is_empty());
+    assert_eq!(provider_posts(&provider).len(), 0);
+}
+
+#[test]
+fn later_batch_persist_failure_retains_recorded_history_and_recovers_fifo() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        const LEADING: &str = "queue-leading-a-7f91";
+        const RETRIED: &str = "queue-retry-b-8e02";
+        const FINAL: &str = "queue-final-c-9d13";
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("batch recovered".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        driver
+            .session
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_second_batch_user_event
+                 BEFORE INSERT ON session_events
+                 WHEN NEW.type = 'user_message'
+                   AND json_extract(NEW.data_json, '$.text') = 'queue-retry-b-8e02'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'persistent B failure');
+                 END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (queue, tx, _rx) = event_harness();
+        let target = driver.active_queue_target();
+        for text in [LEADING, RETRIED, FINAL] {
+            let id = uuid::Uuid::new_v4();
+            let mut submission = UserSubmission::text(text);
+            let receipt = crate::engine::message::ClientSubmissionReceipt {
+                id,
+                fingerprint: submission.client_fingerprint(),
+                wire_fingerprint: format!("wire-{text}"),
+                origin_principal: None,
+            };
+            submission.client_submissions.push(receipt.clone());
+            queue
+                .push_idempotent(receipt, submission, target.clone())
+                .await;
+        }
+        let mut first_batch = Vec::new();
+        queue
+            .drain_into_for(&mut first_batch, 3, Some(&target.id))
+            .await;
+        driver
+            .run_prepared_queued_user_batch(first_batch, &queue, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(provider_posts(&provider).len(), 0);
+        let after_failure = history_text(&driver.stack[0].history);
+        assert_eq!(after_failure.matches(LEADING).count(), 1, "{after_failure}");
+        assert_eq!(after_failure.matches(RETRIED).count(), 0, "{after_failure}");
+        assert_eq!(after_failure.matches(FINAL).count(), 0, "{after_failure}");
+        let durable_after_failure = session_events(&driver).await;
+        assert_eq!(
+            durable_after_failure
+                .iter()
+                .filter(|event| event.kind == "user_message" && event.data["text"] == LEADING)
+                .count(),
+            1
+        );
+
+        driver
+            .session
+            .db
+            .write(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_second_batch_user_event;")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let first_retried = queue.recv().await.unwrap();
+        assert_eq!(first_retried.text, RETRIED);
+        let mut recovered = vec![first_retried];
+        queue
+            .drain_into_for(&mut recovered, 3, Some(&target.id))
+            .await;
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            [RETRIED, FINAL]
+        );
+        driver
+            .run_prepared_queued_user_batch(recovered, &queue, &tx)
+            .await
+            .unwrap();
+
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 1);
+        let user_text = chat_messages(&posts[0])
+            .iter()
+            .filter(|message| message_role(message) == "user")
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(user_text.matches(LEADING).count(), 1, "{user_text}");
+        assert_eq!(user_text.matches(RETRIED).count(), 1, "{user_text}");
+        assert_eq!(user_text.matches(FINAL).count(), 1, "{user_text}");
+        let a = user_text
+            .find(LEADING)
+            .expect("leading message remains in context");
+        let b = user_text
+            .find(RETRIED)
+            .expect("failed message is retried next");
+        let c = user_text.find(FINAL).expect("final message remains last");
+        assert!(a < b && b < c, "{user_text}");
+        let durable = session_events(&driver).await;
+        for text in [LEADING, RETRIED, FINAL] {
+            assert_eq!(
+                durable
+                    .iter()
+                    .filter(|event| event.kind == "user_message" && event.data["text"] == text)
+                    .count(),
+                1,
+                "{text} must have one canonical durable event"
+            );
+        }
+        assert!(queue.snapshot().await.is_empty());
+    });
+}
+
+#[test]
+fn continue_fold_failure_restores_tool_result_and_defers_exact_payload() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        const QUEUED: &str = "continue-queued-exact-4bb2";
+        let mut provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::ToolCall {
+                id: "continue-read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "continue.txt" }),
+            })
+            .with_delay(std::time::Duration::from_millis(500))
+            .turn(Turn::Text("initial turn complete".into()))
+            .turn(Turn::Text("queued turn recovered".into()))
+            .start()
+            .await;
+        let (mut driver, tmp) = scripted_read_driver(&provider);
+        std::fs::write(tmp.path().join("continue.txt"), "continue-fixture-body").unwrap();
+        driver.test_fail_all_user_message_event_writes = true;
+        let (queue, tx, _rx) = event_harness();
+        let target = driver.active_queue_target();
+        let (id, submission, receipt) = rich_client_submission(QUEUED);
+        let expected = submission.clone();
+
+        let run = driver.run_user_input(UserSubmission::text("start continue path"), &queue, &tx);
+        let enqueue = async {
+            let _ = provider.next_request().await;
+            let (_, _, outcome) = queue
+                .push_idempotent(receipt, submission, target.clone())
+                .await;
+            assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+        };
+        let (result, ()) = tokio::join!(run, enqueue);
+        result.unwrap();
+
+        let posts = provider_posts(&provider);
+        assert_eq!(
+            posts.len(),
+            2,
+            "the failed queued fold must not start inference"
+        );
+        assert!(
+            !serde_json::to_string(&posts[1].body)
+                .unwrap()
+                .contains(QUEUED),
+            "the Continue retry must carry only the prior tool result"
+        );
+        let history = history_text(&driver.stack[0].history);
+        assert_eq!(
+            history.matches("continue-fixture-body").count(),
+            1,
+            "{history}"
+        );
+        assert_eq!(history.matches(QUEUED).count(), 0, "{history}");
+        assert!(
+            driver
+                .session
+                .db
+                .client_submission_receipt(driver.session.id, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the failed receipt must not be falsely marked finished"
+        );
+
+        let retried = queue.recv().await.unwrap();
+        let mut expected = expected;
+        expected.queue_item_ids = vec![id];
+        expected.queue_target = Some(target);
+        assert_eq!(
+            serde_json::to_value(&retried).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        driver.test_fail_all_user_message_event_writes = false;
+        driver.run_user_input(retried, &queue, &tx).await.unwrap();
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 3);
+        assert!(
+            serde_json::to_string(&posts[2].body)
+                .unwrap()
+                .contains(QUEUED)
+        );
+        assert!(
+            driver
+                .session
+                .db
+                .client_submission_receipt(driver.session.id, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn done_fold_failure_defers_exact_payload_without_second_inference() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        const QUEUED: &str = "done-queued-exact-6cc4";
+        let mut provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("initial done".into()))
+            .with_delay(std::time::Duration::from_millis(500))
+            .turn(Turn::Text("queued done recovered".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        driver.test_fail_all_user_message_event_writes = true;
+        let (queue, tx, _rx) = event_harness();
+        let target = driver.active_queue_target();
+        let (id, submission, receipt) = rich_client_submission(QUEUED);
+        let expected = submission.clone();
+
+        let run = driver.run_user_input(UserSubmission::text("start done path"), &queue, &tx);
+        let enqueue = async {
+            let _ = provider.next_request().await;
+            let (_, _, outcome) = queue
+                .push_idempotent(receipt, submission, target.clone())
+                .await;
+            assert_eq!(outcome, crate::engine::message::IdempotentPush::Inserted);
+        };
+        let (result, ()) = tokio::join!(run, enqueue);
+        result.unwrap();
+
+        let posts = provider_posts(&provider);
+        assert_eq!(
+            posts.len(),
+            1,
+            "Done must return instead of inferring failed input"
+        );
+        assert!(
+            !serde_json::to_string(&posts[0].body)
+                .unwrap()
+                .contains(QUEUED)
+        );
+        assert_eq!(
+            history_text(&driver.stack[0].history)
+                .matches(QUEUED)
+                .count(),
+            0
+        );
+        assert!(
+            driver
+                .session
+                .db
+                .client_submission_receipt(driver.session.id, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let retried = queue.recv().await.unwrap();
+        let mut expected = expected;
+        expected.queue_item_ids = vec![id];
+        expected.queue_target = Some(target);
+        assert_eq!(
+            serde_json::to_value(&retried).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        driver.test_fail_all_user_message_event_writes = false;
+        driver.run_user_input(retried, &queue, &tx).await.unwrap();
+        let posts = provider_posts(&provider);
+        assert_eq!(posts.len(), 2);
+        assert!(
+            serde_json::to_string(&posts[1].body)
+                .unwrap()
+                .contains(QUEUED)
+        );
+        assert!(
+            driver
+                .session
+                .db
+                .client_submission_receipt(driver.session.id, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
 }
 
 #[test]

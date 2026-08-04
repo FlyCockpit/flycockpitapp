@@ -1,13 +1,28 @@
 import { PROTOCOL_VERSION } from "@flycockpit/cockpit-protocol";
+import {
+  isAmbiguousUserMessageSendError,
+  RemoteSessionError,
+  shouldRetainUserMessageSubmission,
+} from "@flycockpit/cockpit-protocol/client";
 import { describe, expect, it, vi } from "vitest";
 import { emptyNativeDaemonState } from "./daemon-state";
 import {
+  acceptedClientSubmissionIdsFromEvent,
   appendOptimisticUserMessage,
+  clearAcceptedRetryDrafts,
+  clientSubmissionIdsFromHistory,
+  forgetUserMessageSubmission,
+  isCurrentUserMessageSubmission,
   type NativeSessionEventState,
   nativeAttachRuntimeState,
+  prepareUserMessageSubmission,
+  type RetainedUserMessageSubmissions,
+  reconcileAcceptedRetrySubmissions,
   reconcileRecordedUserMessage,
   reduceNativeSessionEvent,
   removeOptimisticUserMessage,
+  restoreRetainedUserMessagesAfterAttach,
+  retainUserMessageSubmission,
   warnNativeSessionEvent,
 } from "./session-events";
 
@@ -93,6 +108,63 @@ describe("native session event helpers", () => {
     ]);
   });
 
+  it("extracts durable submission receipts from history, replay, and queue folds", () => {
+    const acceptedId = "44444444-4444-4444-8444-444444444444";
+    expect(
+      clientSubmissionIdsFromHistory([
+        { role: "user", seq: 7, text: "accepted", client_submission_ids: [acceptedId] },
+      ]),
+    ).toEqual([acceptedId]);
+    expect(
+      acceptedClientSubmissionIdsFromEvent(
+        {
+          v: PROTOCOL_VERSION,
+          kind: "evt",
+          event: "history_replay",
+          data: {
+            session_id: sessionId,
+            max_seq: 7,
+            entries: [
+              { role: "user", seq: 7, text: "accepted", client_submission_ids: [acceptedId] },
+            ],
+          },
+        },
+        sessionId,
+      ),
+    ).toEqual([acceptedId]);
+    expect(
+      acceptedClientSubmissionIdsFromEvent(
+        {
+          v: PROTOCOL_VERSION,
+          kind: "evt",
+          event: "user_messages_terminated",
+          data: {
+            session_id: sessionId,
+            client_submission_ids: [acceptedId],
+            disposition: "cancelled",
+          },
+        },
+        sessionId,
+      ),
+    ).toEqual([acceptedId]);
+    expect(
+      acceptedClientSubmissionIdsFromEvent(
+        {
+          v: PROTOCOL_VERSION,
+          kind: "evt",
+          event: "queued_user_messages_folded",
+          data: {
+            session_id: sessionId,
+            text: "folded",
+            queue_item_ids: [acceptedId],
+            target: { id: "root", agent: "Build", depth: 0 },
+          },
+        },
+        sessionId,
+      ),
+    ).toEqual([acceptedId]);
+  });
+
   it("turns live inference failures into structured transcript surfaces", () => {
     const result = reduceNativeSessionEvent(initialState, {
       v: PROTOCOL_VERSION,
@@ -143,6 +215,18 @@ describe("native session event helpers", () => {
           generation: 4,
         },
         paused_work: [{ session_id: sessionId, reason: "daemon_shutdown" }],
+        repair_required: {
+          session_id: sessionId,
+          short_id: "s1",
+          provider: "openai",
+          model: "gpt-4o",
+          wire_api: "responses",
+          failure_kind: "orphan_tool_result",
+          failing_tool_call_ids: ["tool-1"],
+          safe_last_turn_seq: 7,
+          suggested_actions: ["open_read_only"],
+          detail: "Open read-only until repaired.",
+        },
       } as never,
       {
         ...emptyNativeDaemonState,
@@ -173,6 +257,191 @@ describe("native session event helpers", () => {
       path: "/work/app",
       holderAgent: "Build",
     });
+    expect(runtime.daemonState.repairRequired).toEqual(
+      expect.objectContaining({
+        failure_kind: "orphan_tool_result",
+        detail: "Open read-only until repaired.",
+      }),
+    );
+  });
+
+  it("accepts same-generation terminal corrections to default and divergence state", () => {
+    const initial = reduceNativeSessionEvent(initialState, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "active_model_state",
+      data: {
+        session_id: sessionId,
+        selection: { provider: "openai", model: "gpt-5" },
+        default_selection: { provider: "openai", model: "old-default" },
+        diverged: true,
+        generation: 7,
+      },
+    });
+    const corrected = reduceNativeSessionEvent(initial.state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "model_selection_result",
+      data: {
+        session_id: sessionId,
+        selection_id: "33333333-3333-4333-8333-333333333333",
+        provider: "openai",
+        model: "gpt-5",
+        reasoning_effort: "high",
+        thinking_mode: "high",
+        prompt_cache_retention: "extended",
+        outcome: {
+          status: "applied",
+          active_state: {
+            selection: {
+              provider: "openai",
+              model: "gpt-5",
+              reasoning_effort: { value: "high" },
+              thinking_mode: "high",
+              prompt_cache_retention: "extended",
+            },
+            default_selection: {
+              provider: "openai",
+              model: "gpt-5",
+              reasoning_effort: { value: "high" },
+              thinking_mode: "high",
+              prompt_cache_retention: "extended",
+            },
+            diverged: false,
+            generation: 7,
+          },
+          default_update: { status: "saved" },
+        },
+      },
+    });
+
+    expect(corrected.warning).toBeUndefined();
+    expect(corrected.state.activeModel).toMatchObject({
+      provider: "openai",
+      model: "gpt-5",
+      configProvider: "openai",
+      configModel: "gpt-5",
+      diverged: false,
+      generation: 7,
+    });
+    expect(corrected.state.activeModel?.selection).toEqual({
+      provider: "openai",
+      model: "gpt-5",
+      reasoning_effort: { value: "high" },
+      thinking_mode: "high",
+      prompt_cache_retention: "extended",
+    });
+  });
+
+  it("accepts same-generation full config corrections from active-model state", () => {
+    const initial = reduceNativeSessionEvent(initialState, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "active_model_state",
+      data: {
+        session_id: sessionId,
+        selection: { provider: "openai", model: "gpt-5" },
+        default_selection: { provider: "openai", model: "old-default" },
+        diverged: true,
+        generation: 7,
+      },
+    });
+    const corrected = reduceNativeSessionEvent(initial.state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "active_model_state",
+      data: {
+        session_id: sessionId,
+        selection: {
+          provider: "openai",
+          model: "gpt-5",
+          reasoning_effort: { value: "high" },
+          thinking_mode: "high",
+          prompt_cache_retention: "extended",
+        },
+        default_selection: {
+          provider: "openai",
+          model: "gpt-5",
+          reasoning_effort: { value: "high" },
+          thinking_mode: "high",
+          prompt_cache_retention: "extended",
+        },
+        diverged: false,
+        generation: 7,
+      },
+    });
+
+    expect(corrected.warning).toBeUndefined();
+    expect(corrected.state.activeModel).toMatchObject({
+      provider: "openai",
+      model: "gpt-5",
+      configProvider: "openai",
+      configModel: "gpt-5",
+      diverged: false,
+      generation: 7,
+    });
+    expect(corrected.state.activeModel?.defaultSelection).toEqual({
+      provider: "openai",
+      model: "gpt-5",
+      reasoning_effort: { value: "high" },
+      thinking_mode: "high",
+      prompt_cache_retention: "extended",
+    });
+  });
+
+  it("does not invent active state from a rejected model-selection result", () => {
+    const result = reduceNativeSessionEvent(initialState, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "model_selection_result",
+      data: {
+        session_id: sessionId,
+        selection_id: "33333333-3333-4333-8333-333333333333",
+        provider: "openai",
+        model: "gpt-5",
+        outcome: {
+          status: "rejected",
+          user_message: "Model selection was rejected.",
+          diagnostic_code: "model_switch_rejected",
+        },
+      },
+    });
+
+    expect(result.warning).toBeUndefined();
+    expect(result.state).toBe(initialState);
+    expect(result.state.activeModel).toBeUndefined();
+  });
+
+  it("rejects the removed flat active-model event without changing cached state", () => {
+    const cached = {
+      ...initialState,
+      activeModel: {
+        selection: { provider: "cached", model: "current" },
+        defaultSelection: { provider: "cached", model: "current" },
+        provider: "cached",
+        model: "current",
+        configProvider: "cached",
+        configModel: "current",
+        diverged: false,
+        generation: 9,
+      },
+    };
+    const result = reduceNativeSessionEvent(cached, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "active_model_state",
+      data: {
+        session_id: sessionId,
+        provider: "flat",
+        model: "removed-v5-shape",
+        diverged: true,
+        generation: 10,
+      },
+    });
+
+    expect(result.warning).toBe("[native-remote] unknown event: active_model_state");
+    expect(result.state).toBe(cached);
+    expect(result.state.activeModel).toBe(cached.activeModel);
   });
 
   it("streams assistant deltas into a pending row and replaces it with final text", () => {
@@ -252,9 +521,12 @@ describe("native session event helpers", () => {
       },
     ]);
 
-    expect(reconcileRecordedUserMessage(optimistic, { seq: 9 })).toEqual([
-      { id: "user:9", kind: "user_message", seq: 9, text: "run tests" },
-    ]);
+    expect(
+      reconcileRecordedUserMessage(optimistic, {
+        seq: 9,
+        client_submission_ids: ["1"],
+      }),
+    ).toEqual([{ id: "user:9", kind: "user_message", seq: 9, text: "run tests" }]);
     expect(
       reconcileRecordedUserMessage([], { seq: 10, preflight_cleaned: "cleaned text" }),
     ).toEqual([{ id: "user:10", kind: "user_message", seq: 10, text: "cleaned text" }]);
@@ -264,11 +536,16 @@ describe("native session event helpers", () => {
           { id: "assistant:4", kind: "assistant_text", seq: 4, text: "old" },
           ...appendOptimisticUserMessage([], "pending", "2"),
         ],
-        {},
+        { client_submission_ids: [] },
       ),
     ).toEqual([
       { id: "assistant:4", kind: "assistant_text", seq: 4, text: "old" },
-      { id: "user:5", kind: "user_message", seq: 5, text: "pending" },
+      {
+        id: "user:pending:2",
+        kind: "user_message",
+        seq: Number.MAX_SAFE_INTEGER - 2,
+        text: "pending",
+      },
     ]);
 
     expect(
@@ -280,6 +557,352 @@ describe("native session event helpers", () => {
         "1",
       ),
     ).toEqual([{ id: "assistant:11", kind: "assistant_text", seq: 11, text: "still here" }]);
+  });
+
+  it("folds multiple native optimistic rows into one canonical user row", () => {
+    const first = "44444444-4444-4444-8444-444444444444";
+    const second = "55555555-5555-4555-8555-555555555555";
+    const unrelated = "66666666-6666-4666-8666-666666666666";
+    const history = appendOptimisticUserMessage(
+      appendOptimisticUserMessage(
+        appendOptimisticUserMessage([], "first pending", first),
+        "second pending",
+        second,
+      ),
+      "unrelated pending",
+      unrelated,
+    );
+
+    const result = reduceNativeSessionEvent(
+      { ...initialState, history },
+      {
+        v: PROTOCOL_VERSION,
+        kind: "evt",
+        event: "queued_user_messages_folded",
+        data: {
+          session_id: sessionId,
+          text: "raw folded text",
+          display_text: "display folded text",
+          preflight_cleaned: "cleaned folded text",
+          tag_expansions: [{ tag: "src", replacement: "source context" }],
+          queue_item_ids: [first, second],
+          target: { id: "root", agent: "Build", depth: 0 },
+          seq: 7,
+        },
+      },
+    );
+
+    expect(result.warning).toBeUndefined();
+    expect(result.state.history.filter((entry) => entry.id === "user:7")).toEqual([
+      { id: "user:7", kind: "user_message", seq: 7, text: "display folded text" },
+    ]);
+    expect(result.state.history.map((entry) => entry.id)).not.toContain(`user:pending:${first}`);
+    expect(result.state.history.map((entry) => entry.id)).not.toContain(`user:pending:${second}`);
+    expect(result.state.history.map((entry) => entry.id)).toContain(`user:pending:${unrelated}`);
+  });
+
+  it("retains the complete user submission for an exact same-session retry", () => {
+    const retained = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "@review inspect this",
+        display_text: "inspect this",
+        tag_expansions: [{ tag: "review", replacement: "review the patch" }],
+        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
+        forced_skill: "review",
+      },
+    };
+
+    const retry = prepareUserMessageSubmission(sessionId, retained.params.text, retained);
+
+    expect(retry).toEqual({ submission: retained, isRetry: true });
+    expect(retry.submission.params).toBe(retained.params);
+  });
+
+  it("keeps an exact retry available after switching away and back", () => {
+    const retained: RetainedUserMessageSubmissions = new Map();
+    const original = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "same visible text",
+        display_text: "exact expanded display",
+        tag_expansions: [{ tag: "review", replacement: "exact expansion" }],
+        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" as const }],
+        forced_skill: "review",
+      },
+    };
+    const otherSessionId = "66666666-6666-4666-8666-666666666666";
+    retainUserMessageSubmission(retained, original);
+
+    const elsewhere = prepareUserMessageSubmission(otherSessionId, original.params.text, original);
+    const returned = prepareUserMessageSubmission(sessionId, original.params.text, original);
+
+    expect(elsewhere.isRetry).toBe(false);
+    expect(elsewhere.submission.sessionId).toBe(otherSessionId);
+    expect(returned).toEqual({ submission: original, isRetry: true });
+    expect(returned.submission.params).toBe(original.params);
+  });
+
+  it("restores every queue-ACKed optimistic row after an attach without a durable receipt", () => {
+    const retained: RetainedUserMessageSubmissions = new Map();
+    const first = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "expanded first",
+        display_text: "visible first",
+        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" as const }],
+      },
+    };
+    const second = {
+      sessionId,
+      params: {
+        client_submission_id: "66666666-6666-4666-8666-666666666666",
+        text: "expanded second",
+        display_text: "visible second",
+      },
+    };
+    retainUserMessageSubmission(retained, first);
+    retainUserMessageSubmission(retained, second);
+
+    const restored = restoreRetainedUserMessagesAfterAttach(
+      [{ id: "assistant:1", seq: 1, kind: "assistant_text", text: "existing" }],
+      sessionId,
+      retained,
+    );
+
+    expect(restored).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "user:pending:" + first.params.client_submission_id,
+          text: first.params.display_text,
+        }),
+        expect.objectContaining({
+          id: "user:pending:" + second.params.client_submission_id,
+          text: second.params.display_text,
+        }),
+      ]),
+    );
+  });
+
+  it("a delayed durable receipt clears only the matching retry-ready drafts", () => {
+    const first = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "first exact wire text",
+        display_text: "first visible draft",
+      },
+    };
+    const otherSessionId = "55555555-5555-4555-8555-555555555555";
+    const second = {
+      sessionId: otherSessionId,
+      params: {
+        client_submission_id: "66666666-6666-4666-8666-666666666666",
+        text: "second exact wire text",
+        display_text: "second visible draft",
+      },
+    };
+    const reconciled = reconcileAcceptedRetrySubmissions(
+      { [sessionId]: first, [otherSessionId]: second },
+      [first.params.client_submission_id, second.params.client_submission_id],
+    );
+    const messages = clearAcceptedRetryDrafts(
+      {
+        [sessionId]: " first exact wire text ",
+        [otherSessionId]: "newer user edit",
+      },
+      reconciled.accepted,
+    );
+
+    expect(reconciled.retries).toEqual({});
+    expect(messages).toEqual({
+      [sessionId]: "",
+      [otherSessionId]: "newer user edit",
+    });
+  });
+
+  it("tracks multiple complete retained submissions independently by client id", () => {
+    const retained: RetainedUserMessageSubmissions = new Map();
+    const first = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "same text",
+        display_text: "first exact payload",
+      },
+    };
+    const second = {
+      sessionId,
+      params: {
+        client_submission_id: "55555555-5555-4555-8555-555555555555",
+        text: "same text",
+        display_text: "second exact payload",
+      },
+    };
+
+    retainUserMessageSubmission(retained, first);
+    retainUserMessageSubmission(retained, second);
+    forgetUserMessageSubmission(retained, second.params.client_submission_id);
+
+    expect(retained.get(first.params.client_submission_id)).toBe(first);
+    expect(retained.has(second.params.client_submission_id)).toBe(false);
+    expect(prepareUserMessageSubmission(sessionId, first.params.text, first)).toEqual({
+      submission: first,
+      isRetry: true,
+    });
+    expect(
+      isCurrentUserMessageSubmission(sessionId, first.params.client_submission_id, first),
+    ).toBe(true);
+    expect(
+      isCurrentUserMessageSubmission(
+        "66666666-6666-4666-8666-666666666666",
+        first.params.client_submission_id,
+        first,
+      ),
+    ).toBe(false);
+  });
+
+  it("gives a deliberate same-text submission a fresh UUID without an explicit retry marker", () => {
+    const queued = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "repeat exactly",
+        display_text: "repeat exactly",
+      },
+    };
+    const retained: RetainedUserMessageSubmissions = new Map();
+    retainUserMessageSubmission(retained, queued);
+
+    const fresh = prepareUserMessageSubmission(sessionId, queued.params.text, undefined);
+    const retry = prepareUserMessageSubmission(sessionId, queued.params.text, queued);
+
+    expect(fresh.isRetry).toBe(false);
+    expect(fresh.submission.params.client_submission_id).not.toBe(
+      queued.params.client_submission_id,
+    );
+    expect(retry).toEqual({ submission: queued, isRetry: true });
+  });
+
+  it("keeps all optimistic rows when one exact durable persistence fails", () => {
+    const firstId = "44444444-4444-4444-8444-444444444444";
+    const secondId = "55555555-5555-4555-8555-555555555555";
+    const state = {
+      ...initialState,
+      history: appendOptimisticUserMessage(
+        appendOptimisticUserMessage([], "first", firstId),
+        "second",
+        secondId,
+      ),
+    };
+
+    const result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "session_persist_failed",
+      data: {
+        session_id: sessionId,
+        client_submission_id: firstId,
+        error: "disk full",
+      },
+    });
+
+    expect(result.warning).toBeUndefined();
+    expect(result.state).toBe(state);
+    expect(result.state.history.map((entry) => entry.id)).toEqual([
+      `user:pending:${firstId}`,
+      `user:pending:${secondId}`,
+    ]);
+  });
+
+  it("terminal events retire only their correlated optimistic submission", () => {
+    const firstId = "44444444-4444-4444-8444-444444444444";
+    const secondId = "55555555-5555-4555-8555-555555555555";
+    const state = {
+      ...initialState,
+      history: appendOptimisticUserMessage(
+        appendOptimisticUserMessage([], "first", firstId),
+        "second",
+        secondId,
+      ),
+    };
+
+    const result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "user_messages_terminated",
+      data: {
+        session_id: sessionId,
+        client_submission_ids: [firstId],
+        disposition: "preflight_rejected",
+      },
+    });
+
+    expect(result.warning).toBeUndefined();
+    expect(result.state.history.map((entry) => entry.id)).toEqual([`user:pending:${secondId}`]);
+  });
+
+  it.each([
+    "internal",
+    "shutdown",
+  ])("retains the exact native submission without another optimistic row after typed %s ambiguity", (code) => {
+    const retained = {
+      sessionId,
+      params: {
+        client_submission_id: "44444444-4444-4444-8444-444444444444",
+        text: "@review inspect this",
+        display_text: "inspect this",
+        tag_expansions: [{ tag: "review", replacement: "review the patch" }],
+        image_refs: [{ id: "55555555-5555-4555-8555-555555555555", detail: "high" }],
+        forced_skill: "review",
+      },
+    };
+    const history = appendOptimisticUserMessage(
+      [],
+      retained.params.display_text,
+      retained.params.client_submission_id,
+    );
+    const error = new RemoteSessionError("acceptance uncertain", code, { code });
+
+    expect(isAmbiguousUserMessageSendError(error)).toBe(true);
+    const retry = prepareUserMessageSubmission(sessionId, retained.params.text, retained);
+    const retryHistory = retry.isRetry
+      ? history
+      : appendOptimisticUserMessage(
+          history,
+          retry.submission.params.display_text ?? retry.submission.params.text,
+          retry.submission.params.client_submission_id,
+        );
+
+    expect(retry.submission.params).toBe(retained.params);
+    expect(retryHistory).toBe(history);
+    expect(retryHistory).toHaveLength(1);
+  });
+
+  it("classifies a definitive native rejection for optimistic-row cleanup", () => {
+    const rejection = new RemoteSessionError("payload rejected", "bad_request", {
+      code: "bad_request",
+    });
+
+    expect(isAmbiguousUserMessageSendError(rejection)).toBe(false);
+    expect(shouldRetainUserMessageSubmission(rejection)).toBe(false);
+    expect(
+      shouldRetainUserMessageSubmission(
+        new RemoteSessionError("not accepted", "user_message_not_accepted", {
+          code: "user_message_not_accepted",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRetainUserMessageSubmission(
+        new RemoteSessionError("terminal", "user_message_terminated", {
+          code: "user_message_terminated",
+        }),
+      ),
+    ).toBe(false);
   });
 
   it("adds and resolves interrupt events", () => {

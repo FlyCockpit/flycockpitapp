@@ -212,6 +212,16 @@ impl Session {
         self.model_selection.lock().unwrap().clone()
     }
 
+    /// Stage a recovery selection for worker construction without touching a
+    /// persisted session row. The registry commits it only after every
+    /// fallible worker-start validation has succeeded.
+    pub(crate) fn stage_active_model_ref_for_recovery(
+        &self,
+        selection: crate::config::providers::ActiveModelRef,
+    ) {
+        *self.model_selection.lock().unwrap() = Some(selection);
+    }
+
     pub fn session_llm_mode_raw(&self) -> Option<String> {
         self.session_llm_mode.lock().unwrap().clone()
     }
@@ -299,6 +309,7 @@ impl Session {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_active_model(&self, provider: &str, model: &str) -> Result<()> {
         self.set_active_model_ref(crate::config::providers::ActiveModelRef {
             provider: provider.to_string(),

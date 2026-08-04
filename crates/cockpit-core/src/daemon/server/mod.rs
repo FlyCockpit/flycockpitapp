@@ -34,7 +34,7 @@ use crate::daemon::proto::{
 };
 use crate::daemon::registry::SessionRegistry;
 use crate::daemon::scheduler::DaemonSchedulerHandle;
-use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
+use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle, UserMessageProbeResult};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::daemon::{
     EventEnvelope, EventReceiver, EventSender, SharedRedactionTable, current_redaction, send_event,
@@ -478,8 +478,9 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         }
         | proto::Event::ActiveModelState { .. }
         | proto::Event::ModelSelectionResult { .. }
-        | proto::Event::PreflightStarted { session_id: _ }
-        | proto::Event::UserMessageRetracted { session_id: _ }
+        | proto::Event::PreflightStarted { .. }
+        | proto::Event::UserMessagesTerminated { .. }
+        | proto::Event::UserMessageRetracted { .. }
         | proto::Event::Usage {
             session_id: _,
             agent: _,
@@ -610,6 +611,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::UserMessageRecorded {
             session_id: _,
             seq: _,
+            client_submission_ids: _,
             preflight_cleaned,
         } => scrub_option_string(preflight_cleaned, redact),
         proto::Event::QueuedUserMessagesFolded {
@@ -630,6 +632,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         proto::Event::SessionPersistFailed {
             session_id: _,
             error,
+            ..
         }
         | proto::Event::SessionDriverFailed {
             session_id: _,
@@ -947,6 +950,7 @@ fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &Redac
             text,
             display_text,
             tag_expansions,
+            client_submission_ids: _,
             ts_ms: _,
             seq: _,
             origin_principal: _,
@@ -2447,11 +2451,19 @@ fn format_upload_bytes(bytes: usize) -> String {
 #[derive(Debug, Default)]
 struct UploadAccounting {
     pending: HashMap<Uuid, usize>,
+    consumed_message_attachments: HashMap<Uuid, ConsumedMessageAttachment>,
 }
 
 impl UploadAccounting {
     fn pending_bytes(&self) -> usize {
         self.pending.values().sum()
+    }
+
+    fn consumed_bytes(&self) -> usize {
+        self.consumed_message_attachments
+            .values()
+            .map(|consumed| consumed.attachment.bytes.len())
+            .sum()
     }
 
     fn reserve(
@@ -2460,18 +2472,25 @@ impl UploadAccounting {
         byte_len: usize,
         limits: AttachmentUploadLimits,
     ) -> std::result::Result<(), ErrorPayload> {
-        if self.pending.len() >= limits.global_uploads {
+        let retained_count = self.consumed_message_attachments.len();
+        if self.pending.len() + retained_count >= limits.global_uploads {
             return Err(bad_request(format!(
-                "too many pending attachment uploads: daemon has {} pending, limit {}",
+                "too many retained or pending attachment uploads: daemon has {} retained and {} pending, limit {}",
+                retained_count,
                 self.pending.len(),
                 limits.global_uploads
             )));
         }
         let pending_bytes = self.pending_bytes();
-        if pending_bytes.saturating_add(byte_len) > limits.global_bytes {
+        let consumed_bytes = self.consumed_bytes();
+        if pending_bytes
+            .saturating_add(consumed_bytes)
+            .saturating_add(byte_len)
+            > limits.global_bytes
+        {
             return Err(bad_request(format!(
-                "pending attachment uploads exceed daemon byte limit: {} + {} bytes exceeds {}",
-                pending_bytes, byte_len, limits.global_bytes
+                "retained and pending attachment uploads exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
+                consumed_bytes, pending_bytes, byte_len, limits.global_bytes
             )));
         }
         self.pending.insert(upload_id, byte_len);
@@ -2503,12 +2522,21 @@ struct PendingAttachmentUpload {
     created_at: Instant,
 }
 
+#[derive(Debug)]
 struct ReadyAttachment {
     session_id: Uuid,
     mime: String,
     bytes: Vec<u8>,
     purpose: proto::AttachmentPurpose,
     created_at: Instant,
+}
+
+#[derive(Debug)]
+struct ConsumedMessageAttachment {
+    client_submission_id: Uuid,
+    origin_principal: Option<String>,
+    consumed_at: Instant,
+    attachment: ReadyAttachment,
 }
 
 struct AttachedSession {

@@ -616,12 +616,13 @@ async fn all_unwind_paths_drain_pending_input() {
         },
     ] {
         let (mut driver, _tmp) = test_driver(8);
-        let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
         let target = driver.active_queue_target();
+        let mut accepted_ids = Vec::new();
         for text in ["first", "second"] {
-            queue
+            let (id, _) = queue
                 .push(
                     UserSubmission {
                         kind: UserSubmissionKind::User,
@@ -634,30 +635,66 @@ async fn all_unwind_paths_drain_pending_input() {
                         job_id: None,
                         preflight_cleaned: None,
                         queue_item_ids: Vec::new(),
+                        client_submissions: Vec::new(),
                         queue_target: None,
+                        pending_terminal_disposition: None,
                     },
                     target.clone(),
                 )
                 .await;
+            accepted_ids.push(id);
         }
 
         assert_eq!(
-            driver
-                .unwind_stack_to_root_and_discard_pending_input(reason, &queue, &tx)
-                .await,
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                driver.unwind_stack_to_root_and_discard_pending_input(reason, &queue, &tx),
+            )
+            .await
+            .expect("cancel tombstones must become durable before releasing the queue"),
             2
+        );
+        let terminal_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("durable cancellation must emit a correlated terminal event")
+            .expect("terminal event channel remains open");
+        assert!(
+            matches!(
+                terminal_event,
+                TurnEvent::UserMessagesTerminated {
+                    ref client_submission_ids,
+                    disposition:
+                        crate::daemon::proto::UserMessageTerminalDisposition::Cancelled,
+                } if client_submission_ids == &accepted_ids
+            ),
+            "{terminal_event:?}"
         );
         let mut drained = Vec::new();
         queue
             .drain_into_for(&mut drained, MAX_FOLD, Some(&target.id))
             .await;
         assert!(drained.is_empty());
+        for id in accepted_ids {
+            let terminal = driver
+                .session
+                .db
+                .client_submission_terminal_receipt(driver.session.id, id)
+                .await
+                .unwrap()
+                .expect("discarded accepted submission has a durable tombstone");
+            assert_eq!(
+                terminal.disposition,
+                crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled
+            );
+            assert_eq!(terminal.fingerprint, id.to_string());
+            assert_eq!(terminal.wire_fingerprint, id.to_string());
+        }
     }
 }
 
 #[tokio::test]
 async fn queued_user_fold_records_and_emits_stable_ids() {
-    let (driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
     let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
@@ -677,11 +714,13 @@ async fn queued_user_fold_records_and_emits_stable_ids() {
     let first_seq = driver
         .record_queued_user_fold(&drained[0], &tx)
         .await
-        .expect("first queued message should persist");
+        .expect("first queued message should persist")
+        .expect("a queued message receives a durable sequence");
     let second_seq = driver
         .record_queued_user_fold(&drained[1], &tx)
         .await
-        .expect("second queued message should persist");
+        .expect("second queued message should persist")
+        .expect("a queued message receives a durable sequence");
 
     for (expected_text, expected_id, expected_seq) in [
         ("first queued", first_id, first_seq),

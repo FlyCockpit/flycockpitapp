@@ -223,7 +223,7 @@ fn with_worker_model_runtime(
     Arc::new(model)
 }
 
-fn resolve_or_seed_session_active_model(
+fn resolve_session_active_model(
     providers_cfg: &ProvidersConfig,
     session: &Session,
 ) -> Result<ActiveModelRef> {
@@ -234,9 +234,6 @@ fn resolve_or_seed_session_active_model(
         .active_model
         .clone()
         .context("session has no active model selection and no default is configured")?;
-    session
-        .set_active_model_ref(active.clone())
-        .context("backfilling the session model from the configured default")?;
     Ok(active)
 }
 
@@ -250,7 +247,7 @@ fn resolve_session_worker_model(
     shutdown: &ShutdownSignal,
 ) -> Result<Arc<Model>> {
     let inherited_model = {
-        let active = resolve_or_seed_session_active_model(providers_cfg, session)?;
+        let active = resolve_session_active_model(providers_cfg, session)?;
         let mut session_providers = providers_cfg.clone();
         session_providers.active_model = Some(active);
         let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
@@ -409,7 +406,7 @@ impl SessionRegistry {
         project_root: Option<PathBuf>,
         initial_model: Option<ActiveModelRef>,
         client_no_sandbox: bool,
-        model_override: Option<&str>,
+        model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
@@ -461,7 +458,14 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&project_root, &trust_policy)?;
+        if let (Some(initial), Some(pinned)) = (&initial_model, model_override) {
+            anyhow::ensure!(
+                initial == pinned,
+                "initial model and plan-level model pin must be the same complete selection"
+            );
+        }
         let active = initial_model
+            .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
         let mut llm_providers = providers_cfg.clone();
@@ -488,6 +492,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             model_override,
+            None,
             trust_policy,
             env_snapshot,
             generation,
@@ -543,6 +548,7 @@ impl SessionRegistry {
             &extended_cfg,
             client_no_sandbox,
             None,
+            None,
             trust_policy,
             env_snapshot,
             generation,
@@ -567,22 +573,13 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_with_trust(&session.project_root, &trust_policy)?;
-        // A recovery model may seed an old session that predates durable
-        // model selection. It never overwrites an existing session choice;
-        // the normal SetActiveModel request performs intentional switches.
-        if session.active_model_ref().is_none()
-            && let Some(initial_model) = initial_model
-        {
-            session
-                .set_active_model_ref(initial_model)
-                .context("seeding a model-less resumed session")?;
-        }
         self.start_worker(
             session,
             &providers_cfg,
             &extended_cfg,
             client_no_sandbox,
             None,
+            initial_model,
             trust_policy,
             env_snapshot,
             generation,
@@ -676,7 +673,8 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
-        model_override: Option<&str>,
+        model_override: Option<&ActiveModelRef>,
+        recovery_model: Option<ActiveModelRef>,
         trust_policy: WorkspaceTrustPolicy,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
@@ -686,6 +684,24 @@ impl SessionRegistry {
         }
         let session_id = session.id;
         let project_root = session.project_root.clone();
+
+        // Recovery of a pre-selection session is a two-phase operation. The
+        // full selection is visible in memory while the worker is validated,
+        // but the durable row remains untouched until every fallible worker
+        // construction step has succeeded. The commit immediately precedes
+        // `session_worker::spawn`, which is synchronous and infallible; any
+        // future fallible construction must remain above that commit. Existing
+        // selections are never overwritten by Attach; intentional changes go
+        // through SetActiveModel.
+        let staged_recovery = if session.active_model_ref().is_none() {
+            let active = recovery_model
+                .or_else(|| providers_cfg.active_model.clone())
+                .context("session has no active model selection and no default is configured")?;
+            session.stage_active_model_ref_for_recovery(active.clone());
+            Some(active)
+        } else {
+            None
+        };
 
         session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
 
@@ -708,7 +724,7 @@ impl SessionRegistry {
         // write to the most-specific layer that defines the active provider,
         // matching the runtime config write-target rule. `None` when nothing
         // is discoverable (the fallback still works, it just isn't persisted).
-        let session_active = resolve_or_seed_session_active_model(providers_cfg, &session)?;
+        let session_active = resolve_session_active_model(providers_cfg, &session)?;
         let config_path = {
             crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
                 self.inner
@@ -733,35 +749,20 @@ impl SessionRegistry {
         // onto the root spawn's `ModelParams` so every outbound request on the
         // session model carries the vendor reasoning controls.
         let mut session_providers = providers_cfg.clone();
-        session_providers.active_model = Some(session_active);
+        session_providers.active_model = Some(session_active.clone());
         let thinking_params = model.resolve_reasoning_params(&session_providers);
 
-        // Plan-level model override (`cockpit run --model`): a well-formed
-        // `provider/model` selector built through the same provider pipeline as
-        // the session model, with the same shutdown gate. A malformed selector
-        // or unconfigured provider degrades to no override rather than failing
-        // the attach — the executor already validated `--model` up front.
-        let model_override = model_override
-            .and_then(crate::config::provider::split_provider_model)
-            .and_then(|(provider, model_id)| {
-                let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-                Model::for_provider_with_env(
-                    providers_cfg,
-                    &provider,
-                    &model_id,
-                    redact.clone(),
-                    env_lookup,
-                )
-                .ok()
-            })
-            .map(|m| {
-                let m = m.with_shutdown_gate(self.inner.shutdown.clone());
-                let m = match config_path.clone() {
-                    Some(path) => m.with_config_path(path),
-                    None => m,
-                };
-                Arc::new(m)
-            });
+        // A plan-level pin is a second behavioral use of the authoritative
+        // session model, not a parallel selection. Reuse the already-validated
+        // model so provider failures cannot silently degrade to the configured
+        // default and every preference remains aligned with durable state.
+        if let Some(pinned) = model_override {
+            anyhow::ensure!(
+                pinned == &session_active,
+                "plan-level model pin must match the session's complete active selection"
+            );
+        }
+        let model_override = model_override.map(|_| model.clone());
 
         let session = Arc::new(session);
         let cleanup_inner = Arc::downgrade(&self.inner);
@@ -769,6 +770,11 @@ impl SessionRegistry {
             Box::new(move || cleanup_worker_on_exit(cleanup_inner, session_id, generation));
         let daemon_no_sandbox =
             session_worker::daemon_no_sandbox().context("reading COCKPIT_DAEMON_NO_SANDBOX")?;
+        if let Some(staged_recovery) = staged_recovery {
+            session
+                .set_active_model_ref(staged_recovery)
+                .context("committing recovered session model after worker validation")?;
+        }
         let (handle, join) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
@@ -1670,6 +1676,92 @@ mod tests {
             .expect("recovered session remains durable");
         assert_eq!(durable.active_model_ref(), Some(selection.clone()));
 
+        let invalid =
+            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let invalid_id = invalid.id;
+        drop(invalid);
+        let mut unconfigured = selection.clone();
+        unconfigured.provider = "missing-provider".to_string();
+        let failed_recovery = reg
+            .attach(
+                Some(invalid_id),
+                None,
+                Some(unconfigured),
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await;
+        assert!(failed_recovery.is_err());
+        let unchanged = reg
+            .inner
+            .db
+            .get_session(invalid_id)
+            .await
+            .unwrap()
+            .expect("failed recovery keeps the session row");
+        assert_eq!(unchanged.provider, None);
+        assert_eq!(unchanged.model, None);
+        assert_eq!(unchanged.model_selection_json, None);
+
+        // `cockpit run --model` sends the same complete selection as a
+        // plan-level pin. Even without a configured default, that pin is the
+        // authoritative durable session model rather than a parallel
+        // inference-only override.
+        let pinned = reg
+            .attach(
+                None,
+                Some(tmp.path().to_path_buf()),
+                None,
+                false,
+                Some(&selection),
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
+                    Default::default(),
+                ),
+            )
+            .await
+            .expect("structured model pin creates an aligned session");
+        assert_eq!(pinned.active_model_selection(), Some(selection.clone()));
+        pinned.persist_if_needed().unwrap();
+        let pinned_id = pinned.session_id;
+        reg.forget(pinned_id);
+        assert_eq!(
+            Session::resume(reg.inner.db.clone(), pinned_id)
+                .unwrap()
+                .expect("pinned session persists")
+                .active_model_ref(),
+            Some(selection.clone())
+        );
+
+        let mut conflicting = selection.clone();
+        conflicting.model = "other-model".to_string();
+        let mismatch = reg
+            .attach(
+                None,
+                Some(tmp.path().to_path_buf()),
+                Some(selection.clone()),
+                false,
+                Some(&conflicting),
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
+                    Default::default(),
+                ),
+            )
+            .await;
+        let mismatch = match mismatch {
+            Ok(_) => panic!("parallel active and pinned selections must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            mismatch
+                .to_string()
+                .contains("must be the same complete selection")
+        );
+
         let missing = reg
             .attach(
                 None,
@@ -1917,6 +2009,7 @@ mod tests {
             &providers,
             &extended,
             false,
+            None,
             None,
             policy,
             env,

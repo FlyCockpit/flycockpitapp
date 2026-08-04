@@ -137,31 +137,7 @@ impl App {
     /// first-message path and the eager display attach.
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         if let Ok(r) = &runner {
-            // A runner attach can replace the foreground session. Never let a
-            // result from the old session release the one message held behind
-            // its model transaction into this newly attached conversation.
-            if self
-                .pending_model_selection
-                .as_ref()
-                .is_some_and(|pending| pending.session_id != Some(r.session_id()))
-            {
-                if let Some(pending) = self.pending_model_selection.take() {
-                    tracing::warn!(
-                        old_session_id = ?pending.session_id,
-                        new_session_id = %r.session_id(),
-                        selection_id = %pending.selection_id,
-                        provider = %pending.requested.provider,
-                        model = %pending.requested.model,
-                        trigger = ?pending.trigger,
-                        generation = pending.minimum_generation,
-                        "model selection cancelled by session replacement"
-                    );
-                }
-                self.push_plain(
-                    "Model selection was cancelled by session replacement; your draft was kept."
-                        .to_string(),
-                );
-            }
+            self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();
             // In daemonless mode this runner spawned our own ephemeral
@@ -182,14 +158,6 @@ impl App {
             merge_counts(&mut self.usage_tags, &r.usage.tags);
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
-            if let Some(state) = &r.active_model_state {
-                self.apply_active_model_state(
-                    state.selection.clone(),
-                    state.default_selection.clone(),
-                    state.diverged,
-                    state.generation,
-                );
-            }
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.
@@ -226,6 +194,96 @@ impl App {
         self.agent_runner = Some(runner);
         if refresh_skills {
             self.refresh_skill_commands();
+        }
+    }
+
+    /// Start a new worker-local state epoch and apply the attach model snapshot
+    /// as authoritative state. Fresh runner adoption, same-runner socket
+    /// reconnect, and in-process session switching all use this path so neither
+    /// model nor config generation zero can ever be compared to a prior worker
+    /// epoch.
+    pub(super) fn start_model_state_epoch(
+        &mut self,
+        new_session_id: Option<uuid::Uuid>,
+        state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
+    ) {
+        self.cancel_model_controls_for_epoch_change(new_session_id);
+        self.start_config_snapshot_epoch();
+        self.active_model_state_generation = 0;
+        self.active_model_selection = None;
+        self.launch.provider_line.clear();
+        self.launch.active_model = None;
+        self.launch.active_model_diverged = false;
+        self.config_drift = None;
+        self.refresh_config_drift_surfaces();
+        self.refresh_active_model_projection();
+        if let Some(state) = state {
+            self.apply_active_model_state(
+                state.selection.clone(),
+                state.default_selection.clone(),
+                state.diverged,
+                state.generation,
+            );
+        }
+    }
+
+    /// Invalidate every daemon-resolved config projection before accepting
+    /// events from a newly adopted worker. Config generations are worker-local
+    /// just like active-model generations: retaining generation (or values)
+    /// from the previous attachment can both reject the new worker's
+    /// generation-zero snapshot and briefly expose the old session's provider
+    /// catalog, capabilities, trust projection, or daemon behavior settings.
+    ///
+    /// Use an intentionally authority-empty, non-daemon seed while waiting for
+    /// the authoritative snapshot. Presentation-only settings stay stable so
+    /// a reconnect cannot transiently reinterpret input or approval debounce;
+    /// provider, trust, model, skill, and engine settings do not cross the
+    /// epoch. Re-reading local config here would create a competing resolver.
+    fn start_config_snapshot_epoch(&mut self) {
+        let waiting_extended = cockpit_config::extended::ExtendedConfig {
+            tui: self.config_snapshot.extended.tui.clone(),
+            dialog: self.config_snapshot.extended.dialog.clone(),
+            predict_next_message: self.config_snapshot.extended.predict_next_message,
+            ..cockpit_config::extended::ExtendedConfig::default()
+        };
+        self.config_snapshot = super::HeldConfig::from_view(
+            0,
+            false,
+            waiting_extended,
+            cockpit_core::daemon::proto::ProviderConfigView::default(),
+        );
+        self.apply_tui_config_from_snapshot();
+        self.refresh_active_model_projection();
+    }
+
+    /// Cancel control work that cannot survive an attach/session transition,
+    /// without resetting the confirmed model snapshot before a replacement
+    /// attach has actually succeeded.
+    pub(super) fn cancel_model_controls_for_epoch_change(
+        &mut self,
+        new_session_id: Option<uuid::Uuid>,
+    ) {
+        let previous_session_id = self.launch.session_id;
+        if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
+            let reason = match new_session_id {
+                Some(session_id) if previous_session_id == Some(session_id) => "runner reconnect",
+                Some(_) => "session replacement",
+                None => "session transition",
+            };
+            tracing::warn!(
+                old_session_id = ?pending.session_id,
+                new_session_id = ?new_session_id,
+                selection_id = %pending.selection_id,
+                provider = %pending.requested.provider,
+                model = %pending.requested.model,
+                trigger = ?pending.trigger,
+                generation = pending.minimum_generation,
+                reason,
+                "model selection cancelled by runner epoch change"
+            );
+            self.push_plain(format!(
+                "Model selection was cancelled by {reason}; your draft and exact queued message were retained for retry."
+            ));
         }
     }
 

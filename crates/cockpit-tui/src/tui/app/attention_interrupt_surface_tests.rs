@@ -4,6 +4,7 @@ use cockpit_core::daemon::proto::{
 };
 use cockpit_core::engine::TurnEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::Instant;
 use uuid::Uuid;
 
 fn app() -> App {
@@ -77,6 +78,10 @@ fn foreground_visible_interrupt_opens_dialog_without_persistent_toast() {
         app.toast.is_none(),
         "visible foreground dialog should not create an action-required toast"
     );
+    assert!(
+        !app.question_dialog.as_ref().expect("dialog").locked(),
+        "startup/render without composer input must not arm approval debounce"
+    );
 }
 
 #[test]
@@ -95,6 +100,28 @@ fn background_interrupt_uses_persistent_toast_without_dialog() {
     assert_eq!(toast.kind, ToastKind::Info);
     assert_eq!(toast.text, "Question waiting");
     assert_eq!(app.attention_waiting_count(), 2);
+}
+
+#[test]
+fn background_interrupt_preserves_recent_edit_lockout_for_next_foreground_dialog() {
+    let mut app = app();
+    let foreground_session = Uuid::new_v4();
+    let background_session = Uuid::new_v4();
+    app.launch.session_id = Some(foreground_session);
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(app.last_composer_edit_at.is_some());
+
+    app.apply_event(raise(background_session, Uuid::new_v4(), 0));
+
+    assert!(app.question_dialog.is_none());
+    assert!(
+        app.last_composer_edit_at.is_some(),
+        "a background notification must not consume foreground debounce"
+    );
+
+    app.apply_event(raise(foreground_session, Uuid::new_v4(), 0));
+    assert!(app.question_dialog.as_ref().expect("dialog").locked());
+    assert!(app.last_composer_edit_at.is_none());
 }
 
 #[test]
@@ -128,7 +155,9 @@ fn dialog_ux_lockout_only_first_of_chain() {
     let mut app = app();
     let session_id = Uuid::new_v4();
     app.launch.session_id = Some(session_id);
-    app.composer_active_since_dialog = true;
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(app.composer.text(), "x");
+    assert!(app.last_composer_edit_at.is_some());
 
     let first = Uuid::new_v4();
     app.apply_event(raise_with_reason(
@@ -158,6 +187,26 @@ fn dialog_ux_lockout_only_first_of_chain() {
         Some(crate::tui::dialog::question::QuestionResult::Cancel { interrupt_id })
             if interrupt_id == second
     ));
+}
+
+#[test]
+fn rehydrated_dialog_without_recent_typing_has_no_lockout() {
+    let mut app = app();
+    let session_id = Uuid::new_v4();
+    app.launch.session_id = Some(session_id);
+    assert!(app.last_composer_edit_at.is_none());
+
+    app.apply_event(raise_with_reason(
+        session_id,
+        Uuid::new_v4(),
+        0,
+        InterruptRaiseReason::Rehydration,
+    ));
+
+    assert!(
+        !app.question_dialog.as_ref().expect("dialog").locked(),
+        "reattachment alone is not evidence of a buffered composer key"
+    );
 }
 
 #[test]
@@ -194,4 +243,24 @@ fn repeated_raise_for_active_interrupt_updates_counter_without_takeover() {
             .map(|state| state.pending_count),
         Some(3)
     );
+}
+
+#[test]
+fn duplicate_visible_interrupt_does_not_consume_a_later_recent_edit_marker() {
+    let mut app = app();
+    let session_id = Uuid::new_v4();
+    let interrupt_id = Uuid::new_v4();
+    app.launch.session_id = Some(session_id);
+    app.apply_event(raise(session_id, interrupt_id, 0));
+    app.last_composer_edit_at = Some(Instant::now());
+
+    app.apply_event(raise(session_id, interrupt_id, 2));
+
+    assert!(
+        app.last_composer_edit_at.is_some(),
+        "a same-id metadata refresh must not consume debounce state"
+    );
+    app.question_dialog = None;
+    app.apply_event(raise(session_id, Uuid::new_v4(), 0));
+    assert!(app.question_dialog.as_ref().expect("next dialog").locked());
 }

@@ -2037,14 +2037,22 @@ impl ExtendedConfigDoc {
         raw_get_path(&self.raw, path).is_some()
     }
 
-    pub fn remove_raw_path(&mut self, path: &[&str]) -> bool {
-        remove_raw_path(&mut self.raw, path)
+    /// Remove one raw path while preserving every sibling mutation made by
+    /// another config writer since this document was loaded.
+    pub fn remove_raw_path_and_save(&mut self, path: &[&str]) -> Result<bool> {
+        let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        let removed = remove_raw_path(&mut current.raw, path);
+        if removed {
+            current.persist_raw_unlocked()?;
+        }
+        self.raw = current.raw;
+        Ok(removed)
     }
 
-    pub fn save_raw(&self) -> Result<()> {
+    fn persist_raw_unlocked(&self) -> Result<()> {
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
-        crate::config::files::ensure_parent_dir_private(&self.path)?;
-        crate::config::files::write_private_file(&self.path, format!("{pretty}\n").as_bytes())
+        crate::config::files::atomic_write(&self.path, format!("{pretty}\n").as_bytes())
             .with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
     }
@@ -2054,49 +2062,29 @@ impl ExtendedConfigDoc {
     /// fields stay absent so sparse project layers do not materialize
     /// inherited security policy by accident.
     pub fn write(&mut self, cfg: &ExtendedConfig) -> Result<()> {
+        let originally_loaded = serde_json::to_value(self.config())
+            .context("serializing originally loaded extended config")?;
+        let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        current.merge_config_raw(&originally_loaded, cfg)?;
+        current.persist_raw_unlocked()?;
+        self.raw = current.raw;
+        Ok(())
+    }
+
+    fn merge_config_raw(&mut self, originally_loaded: &Value, cfg: &ExtendedConfig) -> Result<()> {
         let obj = self
             .raw
             .as_object_mut()
             .expect("config.json root is an object");
         let serialized = serde_json::to_value(cfg).context("serializing config")?;
-        let defaults = serde_json::to_value(ExtendedConfig::default())
-            .context("serializing default config")?;
-        if let (Value::Object(map), Value::Object(default_map)) = (&serialized, &defaults) {
-            for (k, v) in map {
-                if obj.contains_key(k) || default_map.get(k) != Some(v) {
-                    obj.insert(k.clone(), v.clone());
-                }
-            }
+        if let (Value::Object(base), Value::Object(desired)) = (originally_loaded, &serialized) {
+            apply_object_delta(obj, base, desired);
         }
         obj.remove("sandboxEscalationEnabled");
         obj.remove(&["trusted", "Only"].concat());
         obj.remove(&["trusted", "_only"].concat());
-        // Optional fields are skipped on serialize, so clearing them must
-        // explicitly remove stale raw keys from the target layer.
-        for key in [
-            "utility_model",
-            "translation_model",
-            "cheap_code",
-            "smart_code",
-            "reasoning",
-            "auto_title",
-            "skill_injection",
-            "predict_next_message_model",
-            "harness_report_summarization",
-            "compact_model",
-            "embedding_model",
-            "commandResourceProfiles",
-            "intel",
-            "sandbox",
-            "tools",
-            "web",
-            "goalVerification",
-        ] {
-            if serialized.get(key).is_none() {
-                obj.remove(key);
-            }
-        }
-        self.save_raw()
+        Ok(())
     }
 }
 
@@ -2148,6 +2136,42 @@ fn remove_raw_path(value: &mut Value, path: &[&str]) -> bool {
     cur.as_object_mut()
         .and_then(|obj| obj.remove(*last))
         .is_some()
+}
+
+fn apply_object_delta(
+    current: &mut Map<String, Value>,
+    base: &Map<String, Value>,
+    desired: &Map<String, Value>,
+) {
+    let keys = base
+        .keys()
+        .chain(desired.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in keys {
+        match (base.get(key), desired.get(key)) {
+            (Some(before), Some(after)) if before == after => {}
+            (Some(Value::Object(before)), Some(Value::Object(after))) => {
+                let target = current
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(before.clone()));
+                if !target.is_object() {
+                    *target = Value::Object(before.clone());
+                }
+                apply_object_delta(
+                    target.as_object_mut().expect("object installed above"),
+                    before,
+                    after,
+                );
+            }
+            (_, Some(after)) => {
+                current.insert(key.clone(), after.clone());
+            }
+            (Some(_), None) => {
+                current.remove(key);
+            }
+            (None, None) => unreachable!("key came from the union"),
+        }
+    }
 }
 
 #[cfg(test)]

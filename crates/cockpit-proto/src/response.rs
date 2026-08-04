@@ -538,6 +538,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sealed_values_response_is_registered() {
@@ -545,6 +546,24 @@ mod tests {
             Response::SealedValues { values: Vec::new() }.wire_tag(),
             "sealed_values"
         );
+    }
+
+    #[test]
+    fn active_model_state_requires_generation_in_protocol_v6() {
+        let missing_generation = json!({
+            "selection": {
+                "provider": "openai",
+                "model": "gpt-5",
+                "reasoning_effort": null,
+                "thinking_mode": null,
+                "prompt_cache_retention": null
+            },
+            "default_selection": null,
+            "diverged": false
+        });
+
+        serde_json::from_value::<ActiveModelState>(missing_generation)
+            .expect_err("protocol v6 active-model state must include generation");
     }
 }
 
@@ -554,7 +573,9 @@ pub struct ActiveModelState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_selection: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub diverged: bool,
-    #[serde(default)]
+    /// Monotonic only within the current attachment/worker epoch. An attach
+    /// snapshot is authoritative generation zero; clients must reset their
+    /// comparison baseline before applying it.
     pub generation: u64,
 }
 

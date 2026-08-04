@@ -1,8 +1,11 @@
 use super::*;
+#[cfg(test)]
 use crate::tui::agent_runner::AttachedRequest;
+use crate::tui::agent_runner::AttachedRequestBinding;
 use base64::Engine;
 use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response};
-use tokio::sync::{mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 const EXPORT_ACTION_KEY: &str = "export";
 const EXPORT_TRANSCRIPT_ACTION: &str = "export.transcript";
@@ -53,11 +56,11 @@ impl App {
         exports_dir: &Path,
         kind: ExportSessionKind,
     ) {
-        let Some(attached_request_tx) = self
+        let Some(attached_request) = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
-            .map(|runner| runner.attached_request_tx.clone())
+            .map(|runner| runner.attached_request_binding())
         else {
             self.push_plain(format!(
                 "{command}: an attached daemon is required for export"
@@ -76,7 +79,7 @@ impl App {
             AsyncActionPolicy::Replace(AsyncActionKey::new(EXPORT_ACTION_KEY)),
             async move {
                 export_via_attached_daemon(
-                    attached_request_tx,
+                    attached_request,
                     session_id,
                     kind,
                     file_stem,
@@ -91,31 +94,21 @@ impl App {
 }
 
 async fn export_via_attached_daemon(
-    attached_request_tx: mpsc::Sender<AttachedRequest>,
+    attached_request: AttachedRequestBinding,
     session_id: uuid::Uuid,
     kind: ExportSessionKind,
     file_stem: String,
     exports_dir: std::path::PathBuf,
     command: &'static str,
 ) -> Result<String, String> {
-    let (response_tx, response_rx) = oneshot::channel();
-    attached_request_tx
-        .send(AttachedRequest {
-            request: Request::ExportSessionData {
-                session_id,
-                kind,
-                include_generated_artifacts: false,
-                include_sensitive: false,
-            },
-            response_tx,
+    let response = attached_request
+        .request(Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts: false,
+            include_sensitive: false,
         })
         .await
-        .map_err(|_| format!("{command}: daemon request failed: daemon client task has stopped"))?;
-    let response = response_rx
-        .await
-        .map_err(|_| {
-            format!("{command}: daemon request failed: daemon client dropped reply channel")
-        })?
         .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
         return Err(format!(
@@ -154,7 +147,6 @@ mod tests {
     use super::*;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use cockpit_core::daemon::proto::ExportSessionData;
-    use cockpit_core::engine::message::UserSubmission;
     use std::sync::{Arc, Mutex};
 
     fn last_plain(app: &App) -> &str {
@@ -168,7 +160,7 @@ mod tests {
         session_id: uuid::Uuid,
         attached_request_tx: mpsc::Sender<AttachedRequest>,
     ) -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel::<UserSubmission>(1);
+        let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
         let (record_tx, _record_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = mpsc::channel(1);
         AgentRunner {
@@ -184,6 +176,9 @@ mod tests {
             foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(session_id)),
+            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            submission_session_tx: tokio::sync::watch::channel(session_id).0,
+            awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
@@ -324,7 +319,7 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(1);
         let task = tokio::spawn(export_via_attached_daemon(
-            tx,
+            AttachedRequestBinding::new(tx, session_id, 0),
             session_id,
             ExportSessionKind::TranscriptJson,
             "x".to_string(),

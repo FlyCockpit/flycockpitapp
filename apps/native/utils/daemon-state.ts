@@ -1,4 +1,4 @@
-import type { EventEnvelope } from "@flycockpit/cockpit-protocol";
+import type { EventEnvelope, ResumeRepairState } from "@flycockpit/cockpit-protocol";
 
 export type SandboxNotice = {
   remedy: string;
@@ -25,6 +25,7 @@ export type NativeDaemonState = {
   draining: DrainingNotice | null;
   waitingForLock: WaitingForLockNotice | null;
   pausedWork: PausedWorkNotice | null;
+  repairRequired: ResumeRepairState | null;
 };
 
 export type PausedWorkClient = {
@@ -37,6 +38,7 @@ export const emptyNativeDaemonState: NativeDaemonState = {
   draining: null,
   waitingForLock: null,
   pausedWork: null,
+  repairRequired: null,
 };
 
 function eventData(event: EventEnvelope) {
@@ -125,8 +127,11 @@ export function composerSendDisabled(input: {
   message: string;
   busy: boolean;
   draining: DrainingNotice | null;
+  repairRequired: ResumeRepairState | null;
 }) {
-  return !input.message.trim() || input.busy || Boolean(input.draining);
+  return (
+    !input.message.trim() || input.busy || Boolean(input.draining) || Boolean(input.repairRequired)
+  );
 }
 
 export async function resumePausedWorkAction(

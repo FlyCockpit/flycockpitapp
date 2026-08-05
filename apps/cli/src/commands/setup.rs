@@ -1135,6 +1135,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn nous_research_provider_wizard_materializes_secret_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config/config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let secret = "nr-provider-secret-abcdefghijklmnopqrstuvwxyz";
+        // Explicit paste-key + skip-test so we never hit the network.
+        let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret, "skip-test"]);
+        let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .expect("wizard completes");
+
+        assert!(run.is_complete(), "output={}", io.output);
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
+                .expect("provider path");
+        let raw = std::fs::read_to_string(&provider_path).expect("provider file");
+        assert!(raw.contains("$secret:nous-research"), "{raw}");
+        assert!(
+            raw.contains("https://inference-api.nousresearch.com/v1"),
+            "{raw}"
+        );
+        assert!(!raw.contains(secret), "{raw}");
+        let store =
+            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
+                .expect("credential store");
+        assert_eq!(
+            store.named_secret("nous-research"),
+            Some(&format!("Bearer {secret}")[..])
+        );
+        assert!(!io.output.contains(secret), "secret leaked in output");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nous_research_provider_wizard_env_var_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config/config.json");
+        let state_home = tmp.path().join("state");
+        let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        let mut io = ScriptIo::new(&[
+            "nous-research",
+            "",
+            "",
+            "env-var",
+            "NOUS_API_KEY",
+            "skip-test",
+        ]);
+        let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+        let run = run_terminal_wizard(
+            crate::wizard::provider_descriptor(),
+            &mut io,
+            &true,
+            &mut actions,
+        )
+        .await
+        .expect("wizard completes");
+        assert!(run.is_complete(), "output={}", io.output);
+        let provider_path =
+            crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
+                .expect("provider path");
+        let raw = std::fs::read_to_string(provider_path).expect("provider file");
+        assert!(raw.contains("Bearer $NOUS_API_KEY"), "{raw}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn provider_add_terminal_end_to_end() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config/config.json");

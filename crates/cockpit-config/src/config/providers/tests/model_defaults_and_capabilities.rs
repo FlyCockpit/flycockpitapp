@@ -1205,6 +1205,21 @@ fn effective_template_prefers_stored_then_falls_back_to_known_key() {
         ..ProviderEntry::default()
     };
     assert_eq!(custom.effective_template("my-endpoint"), None);
+
+    // Nous Research is a known template identity.
+    assert_eq!(
+        legacy.effective_template("nous-research"),
+        Some("nous-research")
+    );
+    let renamed_nous = ProviderEntry {
+        template: Some("nous-research".into()),
+        url: "https://inference-api.nousresearch.com/v1".into(),
+        ..ProviderEntry::default()
+    };
+    assert_eq!(
+        renamed_nous.effective_template("work-nous"),
+        Some("nous-research")
+    );
 }
 
 /// A renamed first-party connection (custom key, stored `template`) still

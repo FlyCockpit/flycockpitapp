@@ -40,7 +40,8 @@ cockpit models
 - Codex OAuth: browser/device-code login for ChatGPT Plus/Pro quota; no API key.
 - Grok xAI API: API key from the xAI console; defaults to `$XAI_API_KEY`.
 - Grok SuperGrok: browser login for SuperGrok; no API key.
-- z.ai, MiniMax, OpenCode Zen, OpenRouter, DeepSeek, Anthropic, and Xiaomi MiMo: API-key templates with provider-specific default environment variable names and headers.
+- z.ai, MiniMax, OpenCode Zen, OpenRouter, DeepSeek, Anthropic, Xiaomi MiMo, and Nous Research: API-key templates with provider-specific default environment variable names and headers.
+- Nous Research (`nous-research`): Chat Completions at `https://inference-api.nousresearch.com/v1` with `NOUS_API_KEY` / `Authorization: Bearer $NOUS_API_KEY`. There is no published `/models` endpoint — add models with `cockpit provider add nous-research` or `/setup model`. Failed credential checks report a sanitized status and the portal docs link (`https://portal.nousresearch.com/api-docs`), never a raw provider response body or key material. Automatic x402 payment and non-chat Nous services are not supported.
 - GitHub Copilot: OAuth-backed provider setup.
 
 ## Credentials
@@ -51,7 +52,7 @@ Environment-variable references are kept as references. For example, `Bearer $OP
 
 ## Test Key
 
-The setup wizard can test credentials before saving. A failed test reports the provider response and leaves the wizard open so you can edit the key, header, endpoint, or model. Skipping the test stores the configuration without making a network call.
+The setup wizard can test credentials before saving. A failed test reports a sanitized status/classification and the template's documentation link (never a raw response body or key material) and leaves the wizard open so you can edit the key, header, endpoint, or model. Skipping the test stores the configuration without making a network call.
 
 ## Trust And Redaction
 

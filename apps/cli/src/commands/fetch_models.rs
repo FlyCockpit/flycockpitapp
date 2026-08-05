@@ -23,6 +23,34 @@ use crate::config::providers::{
     provider_model_fetch_display_state, redact_model_fetch_reason,
 };
 use crate::providers::models_fetch::{self, FetchOutcome, persist_provider};
+use crate::providers::{ProviderTemplate, template_by_id};
+
+/// Exact CLI line when a selected provider's effective template has no
+/// published `/models` endpoint (no HTTP, no config write).
+pub(crate) fn models_endpoint_unsupported_message(
+    provider_id: &str,
+    template: &ProviderTemplate,
+) -> String {
+    format!(
+        "Provider `{provider_id}` ({}) has no published /models endpoint. Configure models with `cockpit provider add {}` or `/setup model`.",
+        template.display, template.id
+    )
+}
+
+/// Preflight: if the entry's effective template refuses `/models`, return
+/// that template so the caller can skip request resolution entirely.
+pub(crate) fn template_without_models_endpoint(
+    provider_id: &str,
+    entry: &ProviderEntry,
+) -> Option<&'static ProviderTemplate> {
+    let template_id = entry.effective_template(provider_id)?;
+    let template = template_by_id(template_id)?;
+    if template.supports_models_endpoint {
+        None
+    } else {
+        Some(template)
+    }
+}
 
 pub async fn run(args: FetchModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
@@ -72,6 +100,14 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
     for id in &targets {
         let entry = cfg.providers.get(id).expect("filtered above").clone();
         println!("→ {id} ({})", entry.url);
+
+        // Preflight by effective template before any request resolution so
+        // providers without a published /models endpoint (e.g. Nous Research)
+        // never hit the network or mutate config.
+        if let Some(template) = template_without_models_endpoint(id, &entry) {
+            println!("{}", models_endpoint_unsupported_message(id, template));
+            continue;
+        }
 
         let resolved = match models_fetch::resolve_provider_request_async(id, &entry).await {
             Ok(r) => r,
@@ -986,5 +1022,82 @@ mod tests {
         assert!(out.contains("Failed:       1 (failed)"));
         assert!(out.contains("AuthFailed:   1 (auth)"));
         assert!(out.contains("Unsupported:  1 (unsupported)"));
+    }
+
+    #[test]
+    fn nous_research_model_fetch_is_explicitly_unsupported() {
+        let nous = crate::providers::template_by_id("nous-research").expect("template");
+        assert!(!nous.supports_models_endpoint);
+
+        // Stock id
+        let mut entry = ProviderEntry {
+            template: Some("nous-research".into()),
+            url: nous.url.into(),
+            models: vec![crate::config::providers::ModelEntry {
+                id: "Hermes-4.3-36B".into(),
+                manual: true,
+                ..Default::default()
+            }],
+            models_fetched_at: Some(chrono::Utc::now()),
+            last_model_fetch: Some(crate::config::providers::ModelFetchStatus {
+                status: crate::config::providers::ModelFetchStatusKind::Live,
+                at: chrono::Utc::now(),
+                source: crate::config::providers::ModelFetchSource::Live,
+                reason: None,
+            }),
+            ..ProviderEntry::default()
+        };
+        let before = serde_json::to_vec(&entry).unwrap();
+        let template = template_without_models_endpoint("nous-research", &entry).expect("skip");
+        let msg = models_endpoint_unsupported_message("nous-research", template);
+        assert_eq!(
+            msg,
+            "Provider `nous-research` (Nous Research) has no published /models endpoint. Configure models with `cockpit provider add nous-research` or `/setup model`."
+        );
+        assert_eq!(serde_json::to_vec(&entry).unwrap(), before);
+
+        // Renamed map key still uses effective template
+        entry.template = Some("nous-research".into());
+        let template = template_without_models_endpoint("work-nous", &entry).expect("skip renamed");
+        let msg = models_endpoint_unsupported_message("work-nous", template);
+        assert!(msg.starts_with("Provider `work-nous` (Nous Research)"));
+        assert!(msg.contains("cockpit provider add nous-research"));
+
+        // Non-template id does not skip
+        let plain = ProviderEntry {
+            url: "https://api.openai.com/v1".into(),
+            ..ProviderEntry::default()
+        };
+        assert!(template_without_models_endpoint("openai", &plain).is_none());
+
+        // Mixed-provider order: Nous skip does not clear other targets from list
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert("a-openai".into(), plain);
+        cfg.providers.insert(
+            "b-nous".into(),
+            ProviderEntry {
+                template: Some("nous-research".into()),
+                url: nous.url.into(),
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "Hermes-4.3-36B".into(),
+                    manual: true,
+                    ..Default::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let keys: Vec<_> = cfg.providers.keys().cloned().collect();
+        assert_eq!(keys, vec!["a-openai".to_string(), "b-nous".to_string()]);
+        let nous_entry = cfg.providers.get("b-nous").unwrap();
+        let before_mixed = serde_json::to_vec(nous_entry).unwrap();
+        assert!(template_without_models_endpoint("b-nous", nous_entry).is_some());
+        assert!(
+            template_without_models_endpoint("a-openai", cfg.providers.get("a-openai").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_vec(cfg.providers.get("b-nous").unwrap()).unwrap(),
+            before_mixed
+        );
     }
 }

@@ -224,6 +224,34 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         },
     },
     ProviderTemplate {
+        id: "nous-research",
+        display: "Nous Research",
+        url: "https://inference-api.nousresearch.com/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("NOUS_API_KEY"),
+        env_var_candidates: &["NOUS_API_KEY"],
+        default_headers: &[("Authorization", "Bearer $NOUS_API_KEY")],
+        supports_models_endpoint: false,
+        hint: Some(
+            "Generate a key at https://portal.nousresearch.com/api-docs. Chat Completions only; no published /models endpoint.",
+        ),
+        use_id_as_default: true,
+        default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "Nous Research API key",
+            console_url: "https://portal.nousresearch.com/api-docs",
+        }),
+        // Official OpenAPI (2026-08-05) exposes POST /chat/completions only:
+        // https://portal.nousresearch.com/api/openapi
+        auth_check: AuthCheckKind::ChatCompletions {
+            path: "/chat/completions",
+            model: "Hermes-4.3-36B",
+            docs_url: "https://portal.nousresearch.com/api-docs",
+        },
+    },
+    ProviderTemplate {
         id: "minimax",
         display: "MiniMax",
         url: "https://api.minimax.io/v1",
@@ -527,6 +555,61 @@ mod tests {
     }
 
     #[test]
+    fn nous_research_does_not_alter_trust_or_non_chat_routes() {
+        let t = template_by_id("nous-research").expect("template");
+        // Template is a config prefiller only — no request-time branch, no
+        // x402 headers, no embeddings/audio/image routes, untrusted by default.
+        assert!(t.default_headers.iter().all(|(n, _)| {
+            !n.eq_ignore_ascii_case("x402") && !n.to_ascii_lowercase().contains("payment")
+        }));
+        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert!(!t.supports_models_endpoint);
+        // No built-in thinking params for nous-research (reasoning is model config).
+        assert!(builtin_thinking_params("nous-research", ThinkingMode::High).is_none());
+    }
+
+    #[test]
+    fn provider_template_catalog_contains_nous_research() {
+        let t = template_by_id("nous-research").expect("nous-research template");
+        assert_eq!(t.id, "nous-research");
+        assert_eq!(t.display, "Nous Research");
+        assert_eq!(t.url, "https://inference-api.nousresearch.com/v1");
+        assert_eq!(t.auth, AuthKind::ApiKey);
+        assert_eq!(t.default_env_var, Some("NOUS_API_KEY"));
+        assert_eq!(t.env_var_candidates, &["NOUS_API_KEY"]);
+        assert_eq!(
+            t.default_headers,
+            &[("Authorization", "Bearer $NOUS_API_KEY")]
+        );
+        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert!(!t.supports_models_endpoint);
+        assert!(t.use_id_as_default);
+        let api_key = t.api_key.expect("api key metadata");
+        assert_eq!(api_key.header_name, "Authorization");
+        assert_eq!(api_key.value_template, "Bearer {key}");
+        assert_eq!(
+            api_key.console_url,
+            "https://portal.nousresearch.com/api-docs"
+        );
+        assert!(
+            t.hint
+                .is_some_and(|h| h.contains("portal.nousresearch.com"))
+        );
+        match t.auth_check {
+            AuthCheckKind::ChatCompletions {
+                path,
+                model,
+                docs_url,
+            } => {
+                assert_eq!(path, "/chat/completions");
+                assert_eq!(model, "Hermes-4.3-36B");
+                assert_eq!(docs_url, "https://portal.nousresearch.com/api-docs");
+            }
+            other => panic!("expected ChatCompletions auth_check, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn every_template_has_a_display_label() {
         for t in TEMPLATES {
             assert!(!t.display.is_empty(), "template {} missing display", t.id);
@@ -580,6 +663,7 @@ mod tests {
         assert!(template_by_id("grok").is_some());
         assert!(template_by_id("grok-oauth").is_some());
         assert!(template_by_id("z-ai").is_some());
+        assert!(template_by_id("nous-research").is_some());
         assert!(template_by_id("minimax").is_some());
         assert!(template_by_id("openrouter").is_some());
         assert!(template_by_id("deepseek").is_some());

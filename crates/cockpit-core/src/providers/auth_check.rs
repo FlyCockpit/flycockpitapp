@@ -52,9 +52,20 @@ pub async fn check_provider_auth(
                 FetchOutcome::Unsupported => Ok(AuthCheckSuccess::Checked),
             }
         }
-        AuthCheckKind::ChatCompletions { path, model, .. } => {
-            post_chat_completion_probe(&resolved.base_url, &resolved.headers, path, model, timeout)
-                .await
+        AuthCheckKind::ChatCompletions {
+            path,
+            model,
+            docs_url,
+        } => {
+            post_chat_completion_probe(
+                &resolved.base_url,
+                &resolved.headers,
+                path,
+                model,
+                docs_url,
+                timeout,
+            )
+            .await
         }
     }
 }
@@ -64,6 +75,7 @@ async fn post_chat_completion_probe(
     headers: &[ResolvedHeader],
     path: &str,
     model: &str,
+    docs_url: &str,
     timeout: Duration,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
     let url = format!(
@@ -105,18 +117,19 @@ async fn post_chat_completion_probe(
         .send()
         .await
         .with_context(|| format!("POST {url}"))
-        .map_err(classify_error)?;
+        .map_err(|error| classify_chat_error(error, docs_url))?;
     let status = response.status();
+    // Drain body without surfacing it — ChatCompletions failures are status +
+    // docs_url only (never raw body or key material).
+    let _ = response.text().await;
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(AuthCheckError::CredentialsRejected(format!(
-            "{url} returned {status} — credentials rejected. Verify the API key, OAuth login, and headers."
+            "credentials rejected ({status}). See {docs_url}"
         )));
     }
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthCheckError::Other(format!(
-            "{url} returned {status}: {}",
-            response_body_snippet(&body)
+            "chat completions check returned {status}. See {docs_url}"
         )));
     }
     Ok(AuthCheckSuccess::Checked)
@@ -137,13 +150,18 @@ fn classify_error(error: anyhow::Error) -> AuthCheckError {
     AuthCheckError::Other(message)
 }
 
-fn response_body_snippet(body: &str) -> String {
-    const MAX: usize = 256;
-    let mut snippet = body.chars().take(MAX).collect::<String>();
-    if body.chars().count() > MAX {
-        snippet.push_str("...");
+fn classify_chat_error(error: anyhow::Error, docs_url: &str) -> AuthCheckError {
+    match classify_error(error) {
+        AuthCheckError::CredentialsRejected(message) => {
+            AuthCheckError::CredentialsRejected(format!("{message}. See {docs_url}"))
+        }
+        AuthCheckError::Network(message) => {
+            AuthCheckError::Network(format!("{message}. See {docs_url}"))
+        }
+        AuthCheckError::Other(message) => {
+            AuthCheckError::Other(format!("{message}. See {docs_url}"))
+        }
     }
-    format!("body_bytes={} body_prefix={snippet:?}", body.len())
 }
 
 #[cfg(test)]
@@ -274,5 +292,133 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(error, AuthCheckError::Network(_)), "{error:?}");
+    }
+
+    fn chat_templates() -> Vec<&'static ProviderTemplate> {
+        crate::providers::TEMPLATES
+            .iter()
+            .filter(|t| matches!(t.auth_check, AuthCheckKind::ChatCompletions { .. }))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_auth_check_failures_are_redacted_and_template_documented() {
+        const LEAK: &str = "sk-leaked-body-secret";
+        const LEAK_BODY: &str = r#"{"error":"sk-leaked-body-secret"}"#;
+        for template in chat_templates() {
+            let AuthCheckKind::ChatCompletions {
+                path,
+                model,
+                docs_url,
+            } = template.auth_check
+            else {
+                unreachable!();
+            };
+            assert!(docs_url.starts_with("https://"), "{} docs", template.id);
+
+            // Credentials rejected
+            let base = one_shot_server(StatusCode::UNAUTHORIZED, LEAK_BODY).await;
+            let entry = test_entry(base);
+            let err = check_provider_auth(template.id, &entry, template, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, AuthCheckError::CredentialsRejected(_)),
+                "{}: {err:?}",
+                template.id
+            );
+            assert!(
+                msg.contains(docs_url),
+                "{} missing docs: {msg}",
+                template.id
+            );
+            assert!(!msg.contains(LEAK), "{} leaked body: {msg}", template.id);
+            assert!(
+                !msg.contains("Bearer sk-test"),
+                "{} leaked key: {msg}",
+                template.id
+            );
+
+            // Non-success HTTP
+            let base = one_shot_server(StatusCode::INTERNAL_SERVER_ERROR, LEAK_BODY).await;
+            let entry = test_entry(base);
+            let err = check_provider_auth(template.id, &entry, template, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(docs_url),
+                "{} missing docs: {msg}",
+                template.id
+            );
+            assert!(!msg.contains(LEAK), "{} leaked body: {msg}", template.id);
+
+            // Transport
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let entry = test_entry(format!("http://{addr}/v1"));
+            let err =
+                check_provider_auth(template.id, &entry, template, Duration::from_millis(150))
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, AuthCheckError::Network(_)),
+                "{} transport: {err:?}",
+                template.id
+            );
+            let tmsg = err.to_string();
+            assert!(
+                tmsg.contains(docs_url),
+                "{} transport missing docs: {tmsg}",
+                template.id
+            );
+
+            if template.id == "nous-research" {
+                assert_eq!(path, "/chat/completions");
+                assert_eq!(model, "Hermes-4.3-36B");
+                assert_eq!(docs_url, "https://portal.nousresearch.com/api-docs");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nous_chat_probe_posts_bounded_completions_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = tx.send(req);
+            let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let template = crate::providers::template_by_id("nous-research").expect("template");
+        let entry = test_entry(format!("http://{addr}/v1"));
+        let result =
+            check_provider_auth("nous-research", &entry, template, Duration::from_secs(2)).await;
+        assert!(matches!(result, Ok(AuthCheckSuccess::Checked)));
+        let req = rx.await.expect("request captured");
+        assert!(req.starts_with("POST "), "{req}");
+        assert!(req.contains("/v1/chat/completions") || req.contains(" /chat/completions"));
+        assert!(req.to_ascii_lowercase().contains("authorization: bearer"));
+        assert!(req.contains("Hermes-4.3-36B"));
+        assert!(req.contains("\"max_tokens\":1") || req.contains("\"max_tokens\": 1"));
+        assert!(req.contains("\"stream\":false") || req.contains("\"stream\": false"));
     }
 }

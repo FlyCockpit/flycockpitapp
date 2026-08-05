@@ -1176,6 +1176,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn baseten_provider_wizard_materializes_secret_reference() {
+        let secret = "bt-provider-secret-abcdefghijklmnopqrstuvwxyz";
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let config_path = tmp.path().join("config/config.json");
+            let state_home = tmp.path().join("state");
+            let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+            let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret, "skip-test"]);
+            let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
+            let run = run_terminal_wizard(
+                crate::wizard::provider_descriptor(),
+                &mut io,
+                &true,
+                &mut actions,
+            )
+            .await
+            .expect("wizard completes");
+            assert!(run.is_complete(), "output={}", io.output);
+            let provider_path =
+                crate::config::providers::provider_file_path_for_config(&config_path, "baseten")
+                    .expect("provider path");
+            let raw = std::fs::read_to_string(provider_path).expect("provider file");
+            assert!(raw.contains("$secret:baseten"), "{raw}");
+            assert!(raw.contains("https://inference.baseten.co/v1"), "{raw}");
+            assert!(!raw.contains(secret), "{raw}");
+            let store = crate::credentials::CredentialStore::open(
+                state_home.join("cockpit/credentials.json"),
+            )
+            .expect("credential store");
+            assert_eq!(
+                store.named_secret("baseten"),
+                Some(&format!("Bearer {secret}")[..])
+            );
+            assert!(!io.output.contains(secret));
+        }
+
+        {
+            let tmp2 = tempfile::tempdir().expect("tempdir");
+            let config_path2 = tmp2.path().join("config/config.json");
+            let state_home2 = tmp2.path().join("state");
+            let _env2 =
+                CockpitConfigEnvGuard::set_with_state_async(&config_path2, &state_home2).await;
+            let mut io2 =
+                ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY", "skip-test"]);
+            let mut actions2 = ProviderSetupActions::new(tmp2.path().to_path_buf());
+            run_terminal_wizard(
+                crate::wizard::provider_descriptor(),
+                &mut io2,
+                &true,
+                &mut actions2,
+            )
+            .await
+            .expect("env wizard");
+            let raw2 = std::fs::read_to_string(
+                crate::config::providers::provider_file_path_for_config(&config_path2, "baseten")
+                    .expect("path"),
+            )
+            .expect("file");
+            assert!(raw2.contains("Bearer $BASETEN_API_KEY"), "{raw2}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn nous_research_provider_wizard_env_var_reference() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config/config.json");

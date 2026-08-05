@@ -122,6 +122,7 @@ const KNOWN_PROVIDER_TEMPLATE_IDS: &[&str] = &[
     "grok-oauth",
     "z-ai",
     "nous-research",
+    "baseten",
     "minimax",
     "opencode-zen",
     "copilot",

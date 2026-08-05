@@ -2897,4 +2897,447 @@ mod tests {
         assert_eq!(t.default_headers[0].0, "Authorization");
         assert_eq!(t.default_headers[0].1, "Bearer $COPILOT_GITHUB_TOKEN");
     }
+
+    #[tokio::test]
+    async fn baseten_models_fetches_v1_models() {
+        let (base_url, request_handle) =
+            serve_models_once(r#"{"data":[{"id":"moonshotai/Kimi-K2.5","object":"model"}]}"#).await;
+        let mut entry = ProviderEntry {
+            url: base_url.clone(),
+            template: Some("baseten".into()),
+            allow_insecure_http: true,
+            headers: vec![crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer bt-test".into(),
+            }],
+            models: vec![
+                crate::config::providers::ModelEntry {
+                    id: "manual-keep".into(),
+                    manual: true,
+                    favorite: true,
+                    name: Some("kept-name".into()),
+                    ..Default::default()
+                },
+                crate::config::providers::ModelEntry {
+                    id: "moonshotai/Kimi-K2.5".into(),
+                    favorite: true,
+                    quality_rank: Some(3),
+                    ..Default::default()
+                },
+            ],
+            ..ProviderEntry::default()
+        };
+        let resolved = ResolvedRequest {
+            base_url: base_url.clone(),
+            headers: vec![ResolvedHeader {
+                name: "Authorization".into(),
+                value: "Bearer bt-test".into(),
+            }],
+        };
+
+        let outcome =
+            fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
+                .await
+                .unwrap();
+        let request = request_handle.await.unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            request_line, "GET /v1/models HTTP/1.1",
+            "exact models route required, got {request_line}"
+        );
+        assert!(!request.contains("model-"), "{request}");
+        assert_eq!(
+            request_header_value(&request, "authorization"),
+            Some("Bearer bt-test")
+        );
+        match outcome {
+            FetchOutcome::Models { models, catalog } => {
+                assert_eq!(catalog, ProviderModelCatalog::Live);
+                assert!(models.iter().any(|m| m.id == "moonshotai/Kimi-K2.5"));
+                let before = entry.models.clone();
+                entry.models = crate::config::providers::merge_fetched_models_with_policy(
+                    entry.effective_template("baseten"),
+                    &before,
+                    models,
+                    crate::config::providers::ModelMergePolicy::KeepUnlisted,
+                );
+                entry.models_fetched_at = Some(chrono::Utc::now());
+                entry.model_catalog = catalog;
+                entry.mark_model_fetch_success(catalog);
+                assert!(
+                    entry
+                        .models
+                        .iter()
+                        .any(|m| m.id == "manual-keep" && m.manual && m.favorite),
+                    "manual model must survive keep-policy merge: {:?}",
+                    entry.models
+                );
+                let refreshed = entry
+                    .models
+                    .iter()
+                    .find(|m| m.id == "moonshotai/Kimi-K2.5")
+                    .expect("fetched model");
+                assert!(refreshed.favorite, "user favorite override must survive");
+                assert_eq!(refreshed.quality_rank, Some(3));
+                assert!(entry.models_fetched_at.is_some());
+                assert_eq!(entry.model_catalog, ProviderModelCatalog::Live);
+                let status = entry.last_model_fetch.expect("fetch status");
+                assert_eq!(
+                    status.status,
+                    crate::config::providers::ModelFetchStatusKind::Live
+                );
+            }
+            other => panic!("expected models, got {other:?}"),
+        }
+
+        // Bounded success body: oversized payloads error before parse/merge.
+        {
+            let mut body = String::from(r#"{"data":[{"id":"too-big"}]}"#);
+            body.push_str(&" ".repeat(MAX_MODELS_RESPONSE_BYTES));
+            let (base_url, _) = serve_models_once(body).await;
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "manual-keep".into(),
+                    manual: true,
+                    ..Default::default()
+                }],
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: Vec::new(),
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("response body exceeded"), "{msg}");
+            entry.mark_model_fetch_failed_kept_existing(msg);
+            assert_eq!(entry.models[0].id, "manual-keep");
+            assert_eq!(entry.models.len(), 1);
+        }
+    }
+
+    #[test]
+    fn baseten_models_preserve_unknown_catalog_metadata() {
+        // Table-driven unrecognised field shapes: absent key, object, array,
+        // number, boolean, null, and malformed (non-object) top-level data entry.
+        let cases: &[(&str, &str, serde_json::Value)] = &[
+            (
+                "object",
+                r#"{"data":[{"id":"m-obj","pricing":{"prompt":0.1,"completion":0.2}}]}"#,
+                serde_json::json!({"prompt": 0.1, "completion": 0.2}),
+            ),
+            (
+                "array",
+                r#"{"data":[{"id":"m-arr","tags":["chat","tools"]}]}"#,
+                serde_json::json!(["chat", "tools"]),
+            ),
+            (
+                "number",
+                r#"{"data":[{"id":"m-num","rank":7}]}"#,
+                serde_json::json!(7),
+            ),
+            (
+                "boolean",
+                r#"{"data":[{"id":"m-bool","supports_vision":true}]}"#,
+                serde_json::json!(true),
+            ),
+            (
+                "null",
+                r#"{"data":[{"id":"m-null","weird":null}]}"#,
+                serde_json::Value::Null,
+            ),
+        ];
+        for (label, body, expected) in cases {
+            let entries = parse_models_body(body).expect(label);
+            assert_eq!(entries.len(), 1, "{label}");
+            let m = &entries[0];
+            assert!(m.cost_rank.is_none(), "{label}");
+            assert!(m.quality_rank.is_none(), "{label}");
+            let key = match *label {
+                "object" => "pricing",
+                "array" => "tags",
+                "number" => "rank",
+                "boolean" => "supports_vision",
+                "null" => "weird",
+                _ => unreachable!(),
+            };
+            for bag in [&m.extra, &m.provider_metadata] {
+                assert_eq!(bag.get(key), Some(expected), "{label}");
+            }
+            let cfg = crate::config::providers::ProvidersConfig {
+                providers: std::collections::BTreeMap::from([(
+                    "baseten".into(),
+                    ProviderEntry {
+                        models: vec![m.clone()],
+                        ..ProviderEntry::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            let caps = cfg.resolve_effective_model_capabilities("baseten", &m.id, 0);
+            assert!(
+                caps.image_input.status.is_unknown()
+                    && caps.audio_input.status.is_unknown()
+                    && caps.video_input.status.is_unknown(),
+                "{label}"
+            );
+        }
+
+        // Absent: bare id has no opaque capability/price keys and stays Unknown.
+        let bare = parse_models_body(r#"{"data":[{"id":"m-absent"}]}"#).unwrap();
+        assert!(bare[0].extra.is_empty() || bare[0].extra.get("id").is_none());
+        assert!(bare[0].cost_rank.is_none());
+        let cfg = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([(
+                "baseten".into(),
+                ProviderEntry {
+                    models: bare.clone(),
+                    ..ProviderEntry::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let caps = cfg.resolve_effective_model_capabilities("baseten", "m-absent", 0);
+        assert!(caps.image_input.status.is_unknown());
+
+        // Malformed: non-object entries are skipped; parser still succeeds.
+        let mixed =
+            parse_models_body(r#"{"data":[null,"skip",{"id":"kept","nested":{"a":[1,2]}}]}"#)
+                .expect("malformed siblings");
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].id, "kept");
+        assert_eq!(
+            mixed[0]
+                .provider_metadata
+                .get("nested")
+                .and_then(|v| v.get("a")),
+            Some(&serde_json::json!([1, 2]))
+        );
+
+        // Malformed field values remain opaque without widening capabilities.
+        let malformed_field = parse_models_body(
+            r#"{"data":[{"id":"m-mal","pricing":"not-an-object","capabilities":"nope"}]}"#,
+        )
+        .expect("malformed field values");
+        assert_eq!(malformed_field.len(), 1);
+        assert!(malformed_field[0].cost_rank.is_none());
+        assert_eq!(
+            malformed_field[0].extra.get("pricing"),
+            Some(&serde_json::json!("not-an-object"))
+        );
+        assert_eq!(
+            malformed_field[0].provider_metadata.get("capabilities"),
+            Some(&serde_json::json!("nope"))
+        );
+        let cfg = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([(
+                "baseten".into(),
+                ProviderEntry {
+                    models: malformed_field.clone(),
+                    ..ProviderEntry::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let caps = cfg.resolve_effective_model_capabilities("baseten", "m-mal", 0);
+        assert!(caps.image_input.status.is_unknown());
+        assert!(caps.audio_input.status.is_unknown());
+    }
+
+    #[tokio::test]
+    async fn baseten_models_fetch_failures_keep_existing_catalog() {
+        let existing = vec![crate::config::providers::ModelEntry {
+            id: "manual".into(),
+            manual: true,
+            favorite: true,
+            ..Default::default()
+        }];
+
+        let assert_kept = |entry: &ProviderEntry, msg: &str, auth_failed: bool| {
+            assert_eq!(entry.models.len(), 1);
+            assert_eq!(entry.models[0].id, "manual");
+            assert!(entry.models[0].manual);
+            assert!(entry.models[0].favorite);
+            assert!(!msg.contains("SECRETKEY"), "auth secret leaked: {msg}");
+            let status = entry.last_model_fetch.as_ref().expect("status recorded");
+            if auth_failed {
+                assert_eq!(
+                    status.status,
+                    crate::config::providers::ModelFetchStatusKind::AuthFailed
+                );
+            } else {
+                assert_eq!(
+                    status.status,
+                    crate::config::providers::ModelFetchStatusKind::FailedKeptExisting
+                );
+            }
+            let reason = status.reason.as_deref().unwrap_or_default();
+            assert!(!reason.contains("SECRETKEY"), "redacted reason: {reason}");
+            // Failure must not invent capabilities on retained models.
+            assert!(entry.models[0].capabilities.image_input.is_unknown());
+            assert!(entry.models[0].capabilities.audio_input.is_unknown());
+            assert!(entry.models[0].capabilities.video_input.is_unknown());
+        };
+
+        for status in [401, 403] {
+            let (base_url, request_handle) =
+                serve_model_responses(vec![TestModelResponse::status(
+                    status,
+                    r#"{"error":"denied"}"#,
+                )])
+                .await;
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: existing.clone(),
+                model_catalog: ProviderModelCatalog::Live,
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: vec![ResolvedHeader {
+                    name: "Authorization".into(),
+                    value: "Bearer SECRETKEY".into(),
+                }],
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+            let _ = request_handle.await;
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("returned {status}")), "{msg}");
+            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            assert_kept(&entry, &msg, true);
+        }
+
+        // 429 is retryable (MAX_RETRIES=2 → three attempts); exhaust retries with
+        // Retry-After:0 so the final error keeps the existing catalog intact.
+        {
+            let responses = (0..=crate::providers::http_retry::MAX_RETRIES)
+                .map(|_| {
+                    TestModelResponse::status(429, r#"{"error":"slow"}"#)
+                        .with_header("Retry-After", "0")
+                })
+                .collect();
+            let (base_url, request_handle) = serve_model_responses(responses).await;
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: existing.clone(),
+                model_catalog: ProviderModelCatalog::Live,
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: vec![ResolvedHeader {
+                    name: "Authorization".into(),
+                    value: "Bearer SECRETKEY".into(),
+                }],
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+            let requests = request_handle.await.unwrap();
+            assert_eq!(
+                requests.len(),
+                crate::providers::http_retry::MAX_RETRIES + 1
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("429"), "{msg}");
+            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            assert_kept(&entry, &msg, false);
+        }
+
+        // Malformed JSON does not erase entry.models
+        {
+            let (base_url, _) = serve_models_once("not-json").await;
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: existing.clone(),
+                model_catalog: ProviderModelCatalog::Live,
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: Vec::new(),
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(5))
+                    .await
+                    .unwrap_err();
+            let msg = err.to_string();
+            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            assert_kept(&entry, &msg, false);
+        }
+
+        // Timeout: short client deadline against a hanging peer (no response body).
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _hold = tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            tokio::task::yield_now().await;
+            let base_url = format!("http://{addr}/v1");
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: existing.clone(),
+                model_catalog: ProviderModelCatalog::Live,
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: Vec::new(),
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_millis(50))
+                    .await
+                    .unwrap_err();
+            let msg = err.to_string();
+            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            assert_kept(&entry, &msg, false);
+        }
+
+        // Transport failure: bind then drop an ephemeral listener so the port is closed.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let base_url = format!("http://{addr}/v1");
+            let mut entry = ProviderEntry {
+                url: base_url.clone(),
+                template: Some("baseten".into()),
+                allow_insecure_http: true,
+                models: existing.clone(),
+                model_catalog: ProviderModelCatalog::Live,
+                ..ProviderEntry::default()
+            };
+            let resolved = ResolvedRequest {
+                base_url,
+                headers: Vec::new(),
+            };
+            let err =
+                fetch_models_for_provider("baseten", &entry, &resolved, Duration::from_secs(2))
+                    .await
+                    .unwrap_err();
+            let msg = err.to_string();
+            entry.mark_model_fetch_failed_kept_existing(msg.clone());
+            assert_kept(&entry, &msg, false);
+        }
+    }
 }

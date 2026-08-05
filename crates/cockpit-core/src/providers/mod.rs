@@ -252,6 +252,28 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         },
     },
     ProviderTemplate {
+        id: "baseten",
+        display: "Baseten Model APIs",
+        url: "https://inference.baseten.co/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("BASETEN_API_KEY"),
+        env_var_candidates: &["BASETEN_API_KEY"],
+        default_headers: &[("Authorization", "Bearer $BASETEN_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some(
+            "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview",
+        ),
+        use_id_as_default: true,
+        default_wire_api: WireApi::Auto,
+        api_key: Some(ApiKeyTemplate {
+            header_name: "Authorization",
+            value_template: "Bearer {key}",
+            format_hint: "Baseten API key",
+            console_url: "https://app.baseten.co/settings/api_keys",
+        }),
+        auth_check: AuthCheckKind::ModelsEndpoint,
+    },
+    ProviderTemplate {
         id: "minimax",
         display: "MiniMax",
         url: "https://api.minimax.io/v1",
@@ -569,6 +591,97 @@ mod tests {
     }
 
     #[test]
+    fn baseten_chat_wire_has_no_implicit_advanced_params() {
+        let t = template_by_id("baseten").expect("baseten");
+        // Template contract: no automatic chat_template_kwargs / reasoning /
+        // non-chat routes. Full Chat Completions body coverage lives in the
+        // OpenAI-compatible driver wire module under the same test name.
+        assert_eq!(t.default_headers.len(), 1);
+        assert_eq!(t.default_headers[0].0, "Authorization");
+        assert_eq!(t.default_headers[0].1, "Bearer $BASETEN_API_KEY");
+        for mode in [
+            ThinkingMode::Off,
+            ThinkingMode::Low,
+            ThinkingMode::Medium,
+            ThinkingMode::High,
+        ] {
+            assert!(
+                builtin_thinking_params("baseten", mode).is_none(),
+                "no builtin thinking params for {mode:?}"
+            );
+        }
+        assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
+        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert!(!t.url.contains("embeddings"));
+        assert!(!t.url.contains("audio"));
+        assert!(!t.url.contains("images"));
+        assert!(!t.url.contains("model-"));
+
+        // Default baseten entry materializes without advanced body fragments.
+        let headers = headers_for_env_var(t, "BASETEN_API_KEY");
+        let entry = crate::config::providers::ProviderEntry {
+            url: t.url.into(),
+            template: Some(t.id.into()),
+            headers,
+            wire_api: t.default_wire_api,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(!json.contains("chat_template_kwargs"), "{json}");
+        assert!(!json.contains("reasoning_effort"), "{json}");
+        let cfg = crate::config::providers::ProvidersConfig {
+            providers: std::collections::BTreeMap::from([("baseten".into(), entry)]),
+            ..Default::default()
+        };
+        for mode in [
+            ThinkingMode::Off,
+            ThinkingMode::Low,
+            ThinkingMode::Medium,
+            ThinkingMode::High,
+        ] {
+            assert_eq!(
+                cfg.resolve_thinking_params("baseten", "moonshotai/Kimi-K2.5", mode),
+                None,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_template_catalog_contains_baseten() {
+        let t = template_by_id("baseten").expect("baseten template");
+        assert_eq!(t.id, "baseten");
+        assert_eq!(t.display, "Baseten Model APIs");
+        assert_eq!(t.url, "https://inference.baseten.co/v1");
+        assert!(!t.url.contains("model-"));
+        assert_eq!(t.auth, AuthKind::ApiKey);
+        assert_eq!(t.default_env_var, Some("BASETEN_API_KEY"));
+        assert_eq!(t.env_var_candidates, &["BASETEN_API_KEY"]);
+        assert_eq!(
+            t.default_headers,
+            &[("Authorization", "Bearer $BASETEN_API_KEY")]
+        );
+        assert_eq!(t.default_wire_api, WireApi::Auto);
+        assert!(t.supports_models_endpoint);
+        assert!(t.use_id_as_default);
+        assert_eq!(
+            t.hint,
+            Some(
+                "Generate an API key at https://app.baseten.co/settings/api_keys. Model APIs: https://docs.baseten.co/inference/model-apis/overview"
+            )
+        );
+        let api_key = t.api_key.expect("api key metadata");
+        assert_eq!(api_key.header_name, "Authorization");
+        assert_eq!(api_key.value_template, "Bearer {key}");
+        assert_eq!(
+            api_key.console_url,
+            "https://app.baseten.co/settings/api_keys"
+        );
+        assert!(matches!(t.auth_check, AuthCheckKind::ModelsEndpoint));
+        assert!(builtin_thinking_params("baseten", ThinkingMode::High).is_none());
+    }
+
+    #[test]
     fn provider_template_catalog_contains_nous_research() {
         let t = template_by_id("nous-research").expect("nous-research template");
         assert_eq!(t.id, "nous-research");
@@ -664,6 +777,7 @@ mod tests {
         assert!(template_by_id("grok-oauth").is_some());
         assert!(template_by_id("z-ai").is_some());
         assert!(template_by_id("nous-research").is_some());
+        assert!(template_by_id("baseten").is_some());
         assert!(template_by_id("minimax").is_some());
         assert!(template_by_id("openrouter").is_some());
         assert!(template_by_id("deepseek").is_some());

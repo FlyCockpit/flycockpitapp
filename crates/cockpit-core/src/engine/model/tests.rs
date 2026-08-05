@@ -1412,6 +1412,185 @@ fn assembled_request_additional_params_null_when_absent() {
     assert_eq!(body["additional_params"], serde_json::Value::Null);
 }
 
+/// Baseten Model APIs rides the generic OpenAI-compatible Chat Completions
+/// path: tools, structured outputs, SSE/usage, and attachment gates keep
+/// generic behavior, and no automatic `chat_template_kwargs`, reasoning
+/// prefill, deployment URL, or non-chat route is emitted.
+#[tokio::test]
+async fn baseten_chat_wire_has_no_implicit_advanced_params() {
+    use crate::config::providers::WireApi;
+
+    // SSE chat completion with tool-call + usage: real POST /v1/chat/completions.
+    let mut provider = ScriptedProvider::builder()
+        .turn(Turn::ToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: json!({}),
+        })
+        .with_usage(Usage {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+            use_alias_names: false,
+        })
+        .start()
+        .await;
+    let url = provider.base_url();
+    let resolved = resolved_local_request(url);
+    // WireApi::Auto (non-explicit) matches the baseten template default and must
+    // still land on Chat Completions for this model id.
+    let model = build_openai_model_from_resolved(
+        "baseten",
+        &resolved,
+        "moonshotai/Kimi-K2.5",
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Auto,
+        false,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .expect("baseten model builds");
+    assert_eq!(model.provider_id(), "baseten");
+    // Wire dialect is generic OpenAI-compatible Chat Completions.
+    assert_eq!(model.provider_label(), "openai-compatible");
+
+    let tools = vec![simple_tool()];
+    let params = ModelParams {
+        temperature: Some(0.2),
+        max_tokens: Some(128),
+        tools_required: true,
+        additional_params: Some(json!({
+            "response_format": { "type": "json_object" }
+        })),
+        ..ModelParams::default()
+    };
+    let ((_, choice, usage), _captured_body, _timing) = model
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("hi"),
+            &tools,
+            params,
+            "Build",
+            None,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("baseten chat stream");
+    let tool_calls = crate::engine::message::collect_tool_calls(&choice);
+    assert_eq!(
+        tool_calls.len(),
+        1,
+        "tool call response must parse: {choice:?}"
+    );
+    assert_eq!(tool_calls[0].function.name, "lookup");
+    let usage = usage.expect("SSE usage must parse");
+    assert_eq!(usage.input_tokens, 11);
+    assert_eq!(usage.output_tokens, 7);
+
+    let captured = provider.next_request().await;
+    assert_eq!(
+        captured.request_line, "POST /v1/chat/completions HTTP/1.1",
+        "baseten must use Chat Completions, not Responses/deployments"
+    );
+    let body = request_body_string(&captured);
+    let body_json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(body_json["model"], "moonshotai/Kimi-K2.5");
+    assert_eq!(body_json["stream"], true);
+    assert!(
+        body_json["tools"].as_array().is_some_and(|t| !t.is_empty()),
+        "tools must ride the generic chat path: {body}"
+    );
+    assert_eq!(
+        body_json["response_format"]["type"], "json_object",
+        "structured outputs stay explicit additional_params only"
+    );
+    assert!(
+        body_json.get("stream_options").is_some() || body.contains("usage"),
+        "SSE/usage options stay generic: {body}"
+    );
+    assert!(!body.contains("chat_template_kwargs"), "{body}");
+    assert!(!body.contains("reasoning_effort"), "{body}");
+    assert!(!body.contains("reasoning_content"), "{body}");
+    assert!(!body.contains("/embeddings"), "{body}");
+    assert!(!body.contains("/audio/"), "{body}");
+    assert!(!body.contains("/images/"), "{body}");
+    assert!(!captured.request_line.contains("model-"), "{captured:?}");
+    assert!(!captured.request_line.contains("api.baseten.co"));
+
+    // Default params: no implicit advanced body when nothing is configured.
+    let mut provider2 = ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let model2 = build_openai_model_from_resolved(
+        "baseten",
+        &resolved_local_request(provider2.base_url()),
+        "moonshotai/Kimi-K2.5",
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        WireApi::Auto,
+        false,
+        false,
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .expect("baseten model");
+    model2
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("hi"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            None,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("default baseten chat");
+    let bare = request_body_string(&provider2.next_request().await);
+    assert!(!bare.contains("chat_template_kwargs"), "{bare}");
+    assert!(!bare.contains("response_format"), "{bare}");
+    assert!(!bare.contains("reasoning_effort"), "{bare}");
+
+    // Attachment gate: baseten defaults stay Unknown (no invented vision).
+    assert!(
+        crate::providers::builtin_thinking_params(
+            "baseten",
+            crate::config::providers::ThinkingMode::High
+        )
+        .is_none()
+    );
+    let entry = ProviderEntry {
+        url: "https://inference.baseten.co/v1".into(),
+        template: Some("baseten".into()),
+        ..ProviderEntry::default()
+    };
+    let cfg = crate::config::providers::ProvidersConfig {
+        providers: std::collections::BTreeMap::from([("baseten".into(), entry)]),
+        ..Default::default()
+    };
+    let caps = cfg.resolve_effective_model_capabilities("baseten", "moonshotai/Kimi-K2.5", 0);
+    assert!(caps.image_input.status.is_unknown());
+    assert!(caps.audio_input.status.is_unknown());
+    assert!(caps.video_input.status.is_unknown());
+}
+
 #[test]
 fn computer_final_request_snapshots_pin_anthropic_versions() {
     let geometry = crate::computer::DisplayGeometry {

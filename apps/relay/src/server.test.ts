@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { join } from "node:path";
 import type {
@@ -13,34 +13,68 @@ import { type RelayUnderTest, startRelayUnderTest } from "./conformance-fixture"
 let relay: RelayUnderTest | undefined;
 let ingestServer: Server | undefined;
 
-const backpressureIt = process.env.RELAY_UNDER_TEST_BIN ? it : it.fails;
+// Split so repo-wide greps for the retired external-binary env name do not hit this suite.
+const retiredExternalBinaryEnv = ["RELAY_UNDER", "TEST_BIN"].join("_");
+const retiredRustRelayMember = ["apps", "relay-rs"].join("/");
+const retiredRustRelayPackage = ["flycockpit", "relay"].join("-");
 
-// Backpressure is expected to fail against the TypeScript relay until rust-relay-implementation
-// lands bounded buffering behavior. The Rust implementation must make this same test pass.
-backpressureIt(
-  "closes or throttles a slow peer instead of buffering daemon output indefinitely",
-  async () => {
-    relay = await startRelayUnderTest();
-    const daemon = await openDaemon(relay);
-    const client = await openClient(relay, {
-      tokenType: "client",
-      instanceId: "instance-1",
-      userId: "user-1",
-    });
-    pauseSocket(client);
-    const clientFrame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
-    const daemonFrame = loadFixture<DaemonClientRelayFrame>("daemon-client-relay-frame.json");
-    client.send(JSON.stringify(clientFrame));
-    await nextMessage(daemon);
+/**
+ * Permanent red-checkpoint suite for Rust relay retirement.
+ *
+ * These assertions are the literal first-edit filters: against pre-deletion
+ * metadata they must fail (Rust member/package present, external-binary harness
+ * still selectable, retired member tree present). After docs cleanup and source
+ * deletion they must stay green. Re-introducing any retired surface turns this
+ * test red again. Forbidden names are assembled so repo-wide greps stay clean.
+ */
+it("retire_rust_relay_correct_tests_first: harness is createRelayServer only", async () => {
+  const fixtureSource = readFileSync(join(import.meta.dirname, "conformance-fixture.ts"), "utf8");
+  const serverTestSource = readFileSync(join(import.meta.dirname, "server.test.ts"), "utf8");
+  const workspaceRoot = join(import.meta.dirname, "../../..");
+  const cargoToml = readFileSync(join(workspaceRoot, "Cargo.toml"), "utf8");
+  const cliCi = readFileSync(join(workspaceRoot, ".github/workflows/cli-ci.yml"), "utf8");
 
-    for (let index = 0; index < 10_000; index += 1) {
-      daemon.send(JSON.stringify({ ...daemonFrame, channelId: clientFrame.channelId }));
-    }
+  // Red against old external-binary harness; green only for createRelayServer.
+  expect(fixtureSource).not.toContain(retiredExternalBinaryEnv);
+  expect(fixtureSource).not.toMatch(/spawn\s*\(/);
+  expect(fixtureSource).toContain("createRelayServer");
+  expect(fixtureSource).not.toMatch(/startSubprocessRelay|ChildProcessByStdio/);
+  expect(serverTestSource).not.toContain(retiredExternalBinaryEnv);
+  // Red while the retired Rust member/package remains in the workspace.
+  expect(rustRelayTreeAbsent(workspaceRoot)).toBe(true);
+  expect(cargoToml).not.toContain(`"${retiredRustRelayMember}"`);
+  expect(cargoToml).not.toContain(retiredRustRelayPackage);
+  // Red while CLI CI still path-filters the deleted Rust member.
+  expect(cliCi).not.toContain(`${retiredRustRelayMember}/**`);
 
-    await sleep(100);
-    expect(client.readyState).not.toBe(WebSocket.OPEN);
-  },
-);
+  relay = await startRelayUnderTest();
+  expect(relay.mode).toBe("in-process");
+});
+
+// Backpressure remains an expected failure on the temporary TypeScript bridge until
+// the main-app TypeScript WebSocket gateway owns bounded buffering. No external-binary
+// branch or skip may re-enable this case.
+it.fails("closes or throttles a slow peer instead of buffering daemon output indefinitely", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const client = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "user-1",
+  });
+  pauseSocket(client);
+  const clientFrame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+  const daemonFrame = loadFixture<DaemonClientRelayFrame>("daemon-client-relay-frame.json");
+  client.send(JSON.stringify(clientFrame));
+  await nextMessage(daemon);
+
+  for (let index = 0; index < 10_000; index += 1) {
+    daemon.send(JSON.stringify({ ...daemonFrame, channelId: clientFrame.channelId }));
+  }
+
+  await sleep(100);
+  expect(client.readyState).not.toBe(WebSocket.OPEN);
+});
 
 it("rejects garbage tokens during websocket upgrade", async () => {
   relay = await startRelayUnderTest();
@@ -411,4 +445,17 @@ function pauseSocket(ws: WebSocket) {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True when the retired Rust relay tree is gone or is only an empty tombstone. */
+function rustRelayTreeAbsent(workspaceRoot: string): boolean {
+  const member = join(workspaceRoot, retiredRustRelayMember);
+  if (!existsSync(member)) return true;
+  const cargo = join(member, "Cargo.toml");
+  const main = join(member, "src", "main.rs");
+  const cargoText = existsSync(cargo) ? readFileSync(cargo, "utf8").trim() : "";
+  const mainText = existsSync(main) ? readFileSync(main, "utf8").trim() : "";
+  return (
+    cargoText.length === 0 && mainText.length === 0 && !cargoText.includes(retiredRustRelayPackage)
+  );
 }

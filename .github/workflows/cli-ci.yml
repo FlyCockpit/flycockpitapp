@@ -8,7 +8,6 @@ name: CLI CI
       - master
     paths:
       - "apps/cli/**"
-      - "apps/relay-rs/**"
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,7 +15,6 @@ name: CLI CI
   pull_request:
     paths:
       - "apps/cli/**"
-      - "apps/relay-rs/**"
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"

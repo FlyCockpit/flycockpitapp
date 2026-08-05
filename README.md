@@ -15,7 +15,7 @@ FlyCockpit is an instance operations console for remote AI workspaces. This mono
 | Server | `apps/server` | Hono API server for auth, oRPC, assets, videos, MCP admin tools, SEO files, and static delivery. |
 | Worker | `apps/worker` | BullMQ worker for asset analysis, cleanup, seed jobs, video transcoding, and enterprise log exports. |
 | Native | `apps/native` | Expo Router app wired to the same auth and API contracts. |
-| Relay | `apps/relay` | Remote-session relay service. |
+| Relay | `apps/relay` | Temporary TypeScript remote-session relay bridge (`Dockerfile.relay`); destination WebSocket owner is `apps/server`. |
 | CLI | `apps/cli` | `cockpit`, the Rust AI coding harness with an interactive full-screen terminal UI, session daemon, and multi-agent execution. |
 | Docs | `apps/docs` | Starlight documentation app retained for now. |
 

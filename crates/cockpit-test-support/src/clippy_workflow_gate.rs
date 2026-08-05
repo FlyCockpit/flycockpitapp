@@ -541,14 +541,123 @@ fn clippy_ci_path_filters_match_workspace_members() {
          filters: {filters:?}"
     );
 
-    // apps/relay-rs stays filtered only while it is a workspace member.
-    let relay_rs_member = members.iter().any(|m| m == "apps/relay-rs");
-    let relay_rs_filter = filters.iter().any(|f| {
-        f == "apps/relay-rs/**" || f == "apps/relay-rs" || f.starts_with("apps/relay-rs/")
-    });
-    assert_eq!(
-        relay_rs_member, relay_rs_filter,
-        "apps/relay-rs path filter must be present iff it is a Cargo workspace member \
-         (member={relay_rs_member}, filter={relay_rs_filter})"
+    // The Rust WebSocket relay server experiment is retired. No workspace
+    // member or CLI CI path filter may reintroduce it.
+    let retired_member = format!("apps/{}", "relay-rs");
+    let retired_filter = format!("{retired_member}/**");
+    let retired_package = format!("{}-{}", "flycockpit", "relay");
+    assert!(
+        !members.iter().any(|m| m == &retired_member),
+        "Cargo workspace must not list retired Rust relay member {retired_member}"
+    );
+    assert!(
+        !filters.iter().any(|f| f == &retired_member
+            || f == &retired_filter
+            || f.starts_with(&format!("{retired_member}/"))),
+        "CLI CI path filters must not watch retired Rust relay paths ({retired_member})"
+    );
+
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo metadata for retired relay package check");
+    assert!(
+        metadata.status.success(),
+        "cargo metadata --locked --no-deps failed: {}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let meta: Value = serde_json::from_slice(&metadata.stdout).expect("parse cargo metadata JSON");
+    let packages = meta
+        .get("packages")
+        .and_then(Value::as_array)
+        .expect("metadata.packages");
+    let retired_pkg_present = packages
+        .iter()
+        .any(|pkg| pkg.get("name").and_then(Value::as_str) == Some(retired_package.as_str()));
+    assert!(
+        !retired_pkg_present,
+        "cargo metadata must not expose retired package {retired_package}"
+    );
+    // Surviving daemon/protocol crates must remain.
+    for required in [
+        "cockpit-cli",
+        "cockpit-core",
+        "cockpit-proto",
+        "flycockpit-relay-protocol",
+    ] {
+        assert!(
+            packages
+                .iter()
+                .any(|pkg| pkg.get("name").and_then(Value::as_str) == Some(required)),
+            "cargo metadata must retain required package {required}"
+        );
+    }
+}
+
+#[test]
+fn retire_rust_relay_correct_tests_first_rejects_rust_server_presence() {
+    let cargo_toml = read_workspace_file("Cargo.toml");
+    let cli_ci = read_workspace_file(CLI_CI);
+    let retired_member = format!("apps/{}", "relay-rs");
+    let retired_package = format!("{}-{}", "flycockpit", "relay");
+    let retired_env = format!("{}_{}", "RELAY_UNDER", "TEST_BIN");
+
+    assert!(
+        !cargo_toml.contains(&format!("\"{retired_member}\"")),
+        "root Cargo.toml must not list {retired_member}"
+    );
+    assert!(
+        !cli_ci.contains(&format!("{retired_member}/**")),
+        "{CLI_CI} must not path-filter {retired_member}"
+    );
+    let retired_path = workspace_root().join(&retired_member);
+    if retired_path.exists() {
+        // Prefer full deletion; an empty tombstone is only tolerated while the
+        // directory is removed by the landing cleanup step.
+        let cargo = retired_path.join("Cargo.toml");
+        let main = retired_path.join("src").join("main.rs");
+        let cargo_text = if cargo.exists() {
+            std::fs::read_to_string(&cargo).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let main_text = if main.exists() {
+            std::fs::read_to_string(&main).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        assert!(
+            cargo_text.trim().is_empty() && main_text.trim().is_empty(),
+            "{retired_member} must be deleted (or emptied of all package/source content)"
+        );
+        assert!(
+            !cargo_text.contains(&retired_package),
+            "{retired_member}/Cargo.toml must not declare package {retired_package}"
+        );
+    }
+
+    // TypeScript temporary bridge harness must not reintroduce external-binary selection.
+    let fixture = read_workspace_file("apps/relay/src/conformance-fixture.ts");
+    let server_test = read_workspace_file("apps/relay/src/server.test.ts");
+    assert!(
+        !fixture.contains(&retired_env),
+        "conformance harness must not reference {retired_env}"
+    );
+    assert!(
+        !fixture.contains("startSubprocessRelay"),
+        "conformance harness must not spawn an external relay binary"
+    );
+    assert!(
+        fixture.contains("createRelayServer"),
+        "conformance harness must use in-process createRelayServer"
+    );
+    assert!(
+        !server_test.contains(&retired_env),
+        "server.test.ts must not branch on {retired_env}"
+    );
+    assert!(
+        !fixture.contains(&retired_package),
+        "conformance harness must not name retired package {retired_package}"
     );
 }

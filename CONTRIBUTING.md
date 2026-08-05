@@ -48,8 +48,8 @@ pnpm check-types
 pnpm test
 ```
 
-For Rust changes in `apps/cli`, `apps/relay-rs`, or `crates/*`, run the Rust
-gate from the repository root:
+For Rust changes in `apps/cli` or `crates/*`, run the Rust gate from the
+repository root:
 
 ```sh
 cargo fmt --check

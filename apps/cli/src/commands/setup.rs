@@ -955,7 +955,7 @@ mod tests {
         provider.models.push(crate::config::providers::ModelEntry {
             id: "m".to_string(),
             capabilities: crate::config::providers::ModelCapabilities {
-                images: Some(false),
+                image_input: crate::config::providers::CapabilityStatus::Unsupported,
                 ..Default::default()
             },
             ..Default::default()
@@ -1000,7 +1000,10 @@ mod tests {
             model.trust,
             Some(crate::config::providers::ModelTrust::Trusted)
         );
-        assert_eq!(model.capability_overrides.images, Some(true));
+        assert_eq!(
+            model.capability_overrides.image_input,
+            Some(crate::config::providers::CapabilityStatus::Supported)
+        );
         assert_eq!(model.subagent_invokable, Some(false));
         assert_eq!(model.can_delegate, Some(false));
         assert_eq!(cfg.active_model.as_ref().unwrap().provider, "p");

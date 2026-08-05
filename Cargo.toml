@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "apps/cli",
-    "apps/relay-rs",
     "crates/cockpit-config",
     "crates/cockpit-core",
     "crates/cockpit-db",

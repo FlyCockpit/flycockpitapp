@@ -224,20 +224,53 @@
     "response": "history_page",
     "v": 6
   },
-  "models": {
+  "inventory_bundle": {
     "data": {
+      "agents": [
+        {
+          "builtin": true,
+          "description": "desc",
+          "mode": "normal",
+          "name": "Build",
+          "source": "builtin"
+        }
+      ],
+      "config_generation": 2,
+      "inventory_generation": 3,
       "models": [
         {
+          "available": true,
           "display_name": "Fixture Model",
           "favorite": true,
           "id": "model",
-          "provider": "fixture"
+          "native_provider_valid": true,
+          "provider": "fixture",
+          "reasoning_effort": {
+            "default": "high",
+            "values": [
+              {
+                "value": "high"
+              }
+            ]
+          },
+          "thinking_modes": ["off", "high"],
+          "trust": "untrusted"
+        }
+      ],
+      "selected_agent": "Build",
+      "session_generation": 1,
+      "skills": [
+        {
+          "description": "desc",
+          "name": "skill",
+          "source": "builtin",
+          "user_invocable": true
         }
       ]
     },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
-    "response": "models",
+    "response": "inventory_bundle",
     "v": 6
   },
   "restart_decision": {

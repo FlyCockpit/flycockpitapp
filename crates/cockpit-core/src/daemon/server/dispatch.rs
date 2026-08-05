@@ -1007,34 +1007,11 @@ pub(super) async fn handle_serialized_request(
 
         Request::DeleteSession { session_id } => delete_session(ctx, session_id).await,
 
-        Request::ListSkills { project_root } => {
-            // Resolve the configured scan dirs from the client's cwd so
-            // per-project skills config applies, then run the shared
-            // discovery used by the `skill` tool and auto-select path.
-            let att = require_attached(state)?;
-            let cwd = Path::new(&project_root);
-            let trust_policy = attached_trust_policy(ctx, att).await?;
-            let (_, extended) = ctx
-                .config_source()
-                .load_with_trust(cwd, &trust_policy)
-                .map_err(internal)?;
-            let active_tools = att.handle.active_tool_names();
-            let activation = crate::skills::ActivationContext::from_tool_names(
-                active_tools.iter().map(String::as_str),
-            );
-            let skills = crate::skills::discover_for_session(cwd, &extended.skills, &activation)
-                .map_err(internal)?;
-            let skills = skills
-                .into_iter()
-                .map(|s| proto::SkillSummary {
-                    name: s.frontmatter.name,
-                    description: s.frontmatter.description,
-                    source: s.source.display().to_string(),
-                    user_invocable: s.frontmatter.user_invocable,
-                })
-                .collect();
-            Ok(Response::Skills { skills })
-        }
+        Request::GetInventoryBundle {
+            project_root,
+            session_id,
+            selected_agent,
+        } => get_inventory_bundle(ctx, state, project_root, session_id, selected_agent).await,
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(ctx),
         }),
@@ -1078,9 +1055,6 @@ pub(super) async fn handle_serialized_request(
             scheduler.run_now(&id).await.map_err(internal)?;
             Ok(Response::ScheduledJobRunQueued { id })
         }
-
-        Request::ListAgents => list_agents(ctx, state).await,
-        Request::ListModels { provider } => list_models(ctx, state, provider.as_deref()).await,
 
         Request::SetModelFavorite {
             provider,
@@ -1912,8 +1886,13 @@ pub(super) async fn handle_concurrent_request(
                 .collect();
             Ok(Response::SessionLiveStatus { statuses })
         }
-        Request::ListSkills { project_root } => {
-            list_skills_shared(&ctx, &shared, project_root).await
+        Request::GetInventoryBundle {
+            project_root,
+            session_id,
+            selected_agent,
+        } => {
+            get_inventory_bundle_shared(&ctx, &shared, project_root, session_id, selected_agent)
+                .await
         }
         Request::ResourceSnapshot => Ok(Response::ResourceSnapshot {
             snapshot: resource_scheduler_snapshot(&ctx),
@@ -1925,10 +1904,6 @@ pub(super) async fn handle_concurrent_request(
                 .await
                 .map_err(internal)?;
             Ok(Response::ScheduledJobs { jobs })
-        }
-        Request::ListAgents => list_agents_shared(&ctx, &shared).await,
-        Request::ListModels { provider } => {
-            list_models_shared(&ctx, &shared, provider.as_deref()).await
         }
         Request::DaemonStatus => Ok(Response::DaemonStatus {
             pid: std::process::id(),
@@ -2011,78 +1986,85 @@ pub(super) async fn attached_trust_policy(
         .map_err(internal)
 }
 
-pub(super) async fn list_agents(
+pub(super) async fn get_inventory_bundle(
     ctx: &DaemonContext,
     state: &MutableClientState,
+    project_root: String,
+    session_id: Uuid,
+    selected_agent: String,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_attached(state)?;
-    let trust_policy = attached_trust_policy(ctx, att).await?;
-    let _ = ctx
-        .config_source()
-        .load_with_trust(&att.handle.project_root, &trust_policy)
-        .map_err(internal)?;
-    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        crate::agents::chat_ownable_primaries(&att.handle.project_root)
-    });
-    let mut agents = Vec::with_capacity(ownable.len());
-    for name in &ownable {
-        validate_set_agent_name(name, &ownable)?;
-        let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            crate::agents::resolve(&att.handle.project_root, name)
-        })
-        .map_err(internal)?
-        .ok_or_else(|| ErrorPayload {
-            code: ErrorCode::Internal,
-            message: format!("chat-ownable agent `{name}` did not resolve"),
-        })?;
-        agents.push(proto::AgentSummary {
-            builtin: crate::agents::is_builtin_agent(name),
-            name: name.clone(),
-            description: def.description,
-            mode: agent_mode_summary(def.mode).to_string(),
-            source: def.source.display().to_string(),
+    if att.handle.session_id != session_id {
+        return Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("session `{session_id}` is not the attached session"),
         });
     }
-    Ok(Response::Agents { agents })
+    // Inventory is always projected for the attached session project; the
+    // client-supplied project_root must match (canonical) or be rejected.
+    let attached_root = att.handle.project_root.clone();
+    if Path::new(&project_root) != attached_root.as_path()
+        && canonicalize_opt(Path::new(&project_root)) != canonicalize_opt(&attached_root)
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!(
+                "project_root `{project_root}` does not match attached session project `{}`",
+                attached_root.display()
+            ),
+        });
+    }
+
+    let trust_policy = attached_trust_policy(ctx, att).await?;
+    let cwd = attached_root.as_path();
+    // One immutable snapshot: the session worker's last-good config is
+    // authoritative. Disk is consulted only when the held snapshot has never
+    // been populated (generation 0 and empty providers).
+    let held = att.handle.config_snapshot();
+    let (providers, skills_config, config_generation) =
+        if held.generation > 0 || !held.providers.providers.is_empty() {
+            (
+                held.providers.clone(),
+                held.extended.skills.clone(),
+                held.generation,
+            )
+        } else {
+            match ctx.config_source().load_with_trust(cwd, &trust_policy) {
+                Ok((providers, extended)) => (providers, extended.skills, 0),
+                Err(err) => {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::InvalidConfig,
+                        message: format!("invalid config while building inventory: {err:#}"),
+                    });
+                }
+            }
+        };
+
+    // Session generation is the attached worker config epoch (attach identity).
+    let session_generation = held.generation.max(config_generation);
+    let inventory_generation = super::inventory::current_inventory_generation();
+    let ownable_agents =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            crate::agents::chat_ownable_primaries(cwd)
+        });
+
+    let snapshot = super::inventory::InventorySourceSnapshot {
+        project_root: cwd.to_path_buf(),
+        session_id,
+        selected_agent,
+        session_generation,
+        config_generation,
+        inventory_generation,
+        trust_policy,
+        providers,
+        skills_config,
+        ownable_agents,
+    };
+    super::inventory::project_inventory_bundle(&snapshot)
 }
 
-pub(super) async fn list_models(
-    ctx: &DaemonContext,
-    state: &MutableClientState,
-    requested_provider: Option<&str>,
-) -> std::result::Result<Response, ErrorPayload> {
-    let att = require_attached(state)?;
-    let trust_policy = attached_trust_policy(ctx, att).await?;
-    let (providers, _) = ctx
-        .config_source()
-        .load_with_trust(&att.handle.project_root, &trust_policy)
-        .map_err(internal)?;
-    let active_provider = providers
-        .active_model
-        .as_ref()
-        .map(|model| model.provider.as_str());
-    let provider_filter = requested_provider.or(active_provider);
-    let mut models = Vec::new();
-    for (provider_id, provider) in &providers.providers {
-        if provider_filter.is_some_and(|wanted| wanted != provider_id) {
-            continue;
-        }
-        for model in &provider.models {
-            models.push(proto::ModelSummary {
-                provider: provider_id.clone(),
-                id: model.id.clone(),
-                display_name: model.name.clone(),
-                favorite: model.favorite,
-            });
-        }
-    }
-    models.sort_by(|a, b| {
-        a.provider
-            .cmp(&b.provider)
-            .then_with(|| b.favorite.cmp(&a.favorite))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(Response::Models { models })
+fn canonicalize_opt(path: &Path) -> Option<std::path::PathBuf> {
+    path.canonicalize().ok()
 }
 
 pub(super) fn require_shared_attached(
@@ -2103,107 +2085,64 @@ pub(super) async fn attached_trust_policy_shared(
         .map_err(internal)
 }
 
-pub(super) async fn list_skills_shared(
+pub(super) async fn get_inventory_bundle_shared(
     ctx: &DaemonContext,
     shared: &SharedClientState,
     project_root: String,
+    session_id: Uuid,
+    selected_agent: String,
 ) -> std::result::Result<Response, ErrorPayload> {
     let att = require_shared_attached(shared)?;
-    let cwd = Path::new(&project_root);
-    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
-    let (_, extended) = ctx
-        .config_source()
-        .load_with_trust(cwd, &trust_policy)
-        .map_err(internal)?;
-    let activation = crate::skills::ActivationContext::from_tool_names(
-        att.active_tool_names.iter().map(String::as_str),
-    );
-    let skills = crate::skills::discover_for_session(cwd, &extended.skills, &activation)
-        .map_err(internal)?;
-    let skills = skills
-        .into_iter()
-        .map(|s| proto::SkillSummary {
-            name: s.frontmatter.name,
-            description: s.frontmatter.description,
-            source: s.source.display().to_string(),
-            user_invocable: s.frontmatter.user_invocable,
-        })
-        .collect();
-    Ok(Response::Skills { skills })
-}
-
-pub(super) async fn list_agents_shared(
-    ctx: &DaemonContext,
-    shared: &SharedClientState,
-) -> std::result::Result<Response, ErrorPayload> {
-    let att = require_shared_attached(shared)?;
-    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
-    let _ = ctx
-        .config_source()
-        .load_with_trust(&att.project_root, &trust_policy)
-        .map_err(internal)?;
-    let ownable = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        crate::agents::chat_ownable_primaries(&att.project_root)
-    });
-    let mut agents = Vec::with_capacity(ownable.len());
-    for name in &ownable {
-        validate_set_agent_name(name, &ownable)?;
-        let def = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-            crate::agents::resolve(&att.project_root, name)
-        })
-        .map_err(internal)?
-        .ok_or_else(|| ErrorPayload {
-            code: ErrorCode::Internal,
-            message: format!("chat-ownable agent `{name}` did not resolve"),
-        })?;
-        agents.push(proto::AgentSummary {
-            builtin: crate::agents::is_builtin_agent(name),
-            name: name.clone(),
-            description: def.description,
-            mode: agent_mode_summary(def.mode).to_string(),
-            source: def.source.display().to_string(),
+    if att.session_id != session_id {
+        return Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("session `{session_id}` is not the attached session"),
         });
     }
-    Ok(Response::Agents { agents })
-}
-
-pub(super) async fn list_models_shared(
-    ctx: &DaemonContext,
-    shared: &SharedClientState,
-    requested_provider: Option<&str>,
-) -> std::result::Result<Response, ErrorPayload> {
-    let att = require_shared_attached(shared)?;
-    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
-    let (providers, _) = ctx
-        .config_source()
-        .load_with_trust(&att.project_root, &trust_policy)
-        .map_err(internal)?;
-    let active_provider = providers
-        .active_model
-        .as_ref()
-        .map(|model| model.provider.as_str());
-    let provider_filter = requested_provider.or(active_provider);
-    let mut models = Vec::new();
-    for (provider_id, provider) in &providers.providers {
-        if provider_filter.is_some_and(|wanted| wanted != provider_id) {
-            continue;
-        }
-        for model in &provider.models {
-            models.push(proto::ModelSummary {
-                provider: provider_id.clone(),
-                id: model.id.clone(),
-                display_name: model.name.clone(),
-                favorite: model.favorite,
-            });
-        }
+    if Path::new(&project_root) != att.project_root.as_path()
+        && canonicalize_opt(Path::new(&project_root)) != canonicalize_opt(&att.project_root)
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!(
+                "project_root `{project_root}` does not match attached session project `{}`",
+                att.project_root.display()
+            ),
+        });
     }
-    models.sort_by(|a, b| {
-        a.provider
-            .cmp(&b.provider)
-            .then_with(|| b.favorite.cmp(&a.favorite))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(Response::Models { models })
+
+    let trust_policy = attached_trust_policy_shared(ctx, att).await?;
+    let cwd = att.project_root.as_path();
+    let (providers, extended) = ctx
+        .config_source()
+        .load_with_trust(cwd, &trust_policy)
+        .map_err(|err| ErrorPayload {
+            code: ErrorCode::InvalidConfig,
+            message: format!("invalid config while building inventory: {err:#}"),
+        })?;
+
+    // Shared concurrent path has no live config handle; use inventory gen only.
+    let config_generation = super::inventory::current_inventory_generation();
+    let session_generation = config_generation;
+    let inventory_generation = config_generation;
+    let ownable_agents =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            crate::agents::chat_ownable_primaries(cwd)
+        });
+
+    let snapshot = super::inventory::InventorySourceSnapshot {
+        project_root: cwd.to_path_buf(),
+        session_id,
+        selected_agent,
+        session_generation,
+        config_generation,
+        inventory_generation,
+        trust_policy,
+        providers,
+        skills_config: extended.skills,
+        ownable_agents,
+    };
+    super::inventory::project_inventory_bundle(&snapshot)
 }
 
 pub(super) async fn guidance_estimate(
@@ -2251,6 +2190,7 @@ pub(super) async fn guidance_estimate(
     }
 }
 
+#[allow(dead_code)] // retained for non-inventory agent summary projections
 pub(super) fn agent_mode_summary(mode: crate::agents::AgentMode) -> &'static str {
     match mode {
         crate::agents::AgentMode::All => "all",

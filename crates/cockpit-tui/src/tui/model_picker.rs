@@ -146,39 +146,43 @@ pub struct ModelChoice {
     pub mode: cockpit_config::extended::LlmMode,
 }
 
-pub fn ordered_model_choices(
-    cwd: &Path,
+/// Build ordered model choices from a daemon inventory-bundle model list.
+/// Does not read credentials or the local provider config tree.
+pub fn ordered_model_choices_from_inventory(
+    models: &[cockpit_core::daemon::proto::ModelSummary],
     global_mode: cockpit_config::extended::LlmMode,
     counts: &HashMap<String, u64>,
-) -> Result<Vec<ModelChoice>, String> {
-    ensure_config_reachable(cwd)?;
-    // NOTE: this provider read is owned by `tui-inventory-from-daemon`; the
-    // global LLM mode is now threaded in from the held daemon snapshot
-    // (`tui-config-single-source`) instead of a disk read.
-    let cfg = cockpit_core::secret_ref::load_effective(cwd);
-    let mut entries: Vec<Entry> = Vec::new();
-    for (pid, entry) in &cfg.providers {
-        for model in &entry.models {
-            entries.push(picker_entry(pid, entry, model));
-        }
-    }
+) -> Vec<ModelChoice> {
+    let mut entries: Vec<Entry> = models
+        .iter()
+        .map(|m| Entry {
+            provider_id: m.provider.clone(),
+            model_id: m.id.clone(),
+            display_name: m.display_name.clone(),
+            is_favorite: m.favorite,
+            reasoning_effort: m.reasoning_effort.clone(),
+            thinking_modes: m.thinking_modes.clone(),
+            failure_annotation: None,
+            trust: m.trust,
+        })
+        .collect();
     sort_entries(&mut entries, counts);
-    Ok(entries
+    entries
         .into_iter()
         .map(|e| {
             let label = e.label();
-            let trust = cfg.resolve_trust(&e.provider_id, &e.model_id);
-            let mode = cfg.resolve_mode(&e.provider_id, &e.model_id, global_mode);
             ModelChoice {
                 label,
                 provider_id: e.provider_id,
                 model_id: e.model_id,
                 is_favorite: e.is_favorite,
-                trust,
-                mode,
+                trust: e.trust,
+                // Mode resolution remains config-snapshot owned; inventory
+                // does not carry llm_mode. Default to the threaded global.
+                mode: global_mode,
             }
         })
-        .collect())
+        .collect()
 }
 
 fn sort_entries(entries: &mut [Entry], counts: &HashMap<String, u64>) {
@@ -221,21 +225,6 @@ enum RowHit {
 }
 
 impl ModelPickerDialog {
-    /// Try to open the picker for the given cwd. Returns `Err` if no
-    /// config is reachable; callers should show the message inline.
-    #[cfg(test)]
-    pub fn open(cwd: &Path, counts: &HashMap<String, u64>) -> Result<Self, String> {
-        ensure_config_reachable(cwd)?;
-        let providers = cockpit_core::secret_ref::load_effective(cwd);
-        Self::open_with_failures(
-            providers,
-            None,
-            counts,
-            &HashMap::new(),
-            chrono::Utc::now().timestamp(),
-        )
-    }
-
     /// Build the model picker from the held daemon provider snapshot
     /// (`tui-config-single-source`). The redacted projection carries all model
     /// metadata (ids, favorites, trust, capabilities) the picker renders.
@@ -1237,6 +1226,7 @@ pub fn cycle_active_favorite(
     Ok(Some(selection))
 }
 
+#[allow(dead_code)]
 fn ensure_config_reachable(cwd: &Path) -> Result<(), String> {
     if std::env::var_os(COCKPIT_CONFIG_ENV).is_some() {
         return Ok(());

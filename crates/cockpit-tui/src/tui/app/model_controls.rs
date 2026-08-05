@@ -69,14 +69,14 @@ impl App {
     /// [`Self::swap_primary_agent`], so it carries the same confirmation
     /// line and start-a-session-first guard `/plan`/`/build` have.
     pub(super) fn cycle_primary_agent(&mut self) {
-        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
+        let order = self.inventory_agent_names();
         let next = cockpit_core::agents::next_primary_in_cycle(&self.launch.agent_name, &order);
         self.swap_primary_agent(&next);
     }
 
     pub(super) fn open_footer_agent_picker(&mut self) {
         self.footer_mode_picker = None;
-        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
+        let order = self.inventory_agent_names();
         let current = self
             .agent_path
             .first()
@@ -562,18 +562,15 @@ impl App {
     }
 
     pub(super) fn open_quick_dialog(&mut self) {
-        let models = match crate::tui::model_picker::ordered_model_choices(
-            &self.launch.cwd,
+        let models = crate::tui::model_picker::ordered_model_choices_from_inventory(
+            &self.inventory_models(),
             self.config_snapshot.extended.llm_mode,
             &self.usage_models,
-        ) {
-            Ok(choices) => choices
-                .into_iter()
-                .filter(|choice| choice.is_favorite)
-                .map(crate::tui::quick_dialog::QuickModelChoice::from)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        )
+        .into_iter()
+        .filter(|choice| choice.is_favorite)
+        .map(crate::tui::quick_dialog::QuickModelChoice::from)
+        .collect();
         let current = crate::tui::quick_dialog::QuickCurrent {
             llm_mode: self.llm_mode,
             recursion_enabled: self.delegation_recursion_enabled,

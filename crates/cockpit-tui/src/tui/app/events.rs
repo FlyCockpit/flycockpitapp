@@ -2039,6 +2039,8 @@ impl App {
         self.config_snapshot = super::HeldConfig::from_view(generation, true, extended, providers);
         self.apply_tui_config_from_snapshot();
         self.refresh_active_model_projection();
+        // Config snapshot advances inventory floors / schedules replacement.
+        self.on_inventory_invalidation(Some(generation), None);
         // Config pushes are global to the attached session. A snapshot caused
         // by an unrelated writer while the add-model settings dialog remains
         // open must update the held config, but must not consume the causal

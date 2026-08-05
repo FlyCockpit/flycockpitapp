@@ -154,6 +154,17 @@
     "request": "fs_write",
     "v": 6
   },
+  "get_inventory_bundle": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "project_root": "project_root-fixture",
+      "selected_agent": "Build",
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "get_inventory_bundle",
+    "v": 6
+  },
   "git_diff_file": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",

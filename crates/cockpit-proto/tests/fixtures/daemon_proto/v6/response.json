@@ -2,19 +2,36 @@
   "ack": {
     "response": "ack"
   },
-  "agents": {
+  "approval_mode_state": {
     "data": {
-      "agents": [
-        {
-          "builtin": true,
-          "description": "desc",
-          "mode": "normal",
-          "name": "Build",
-          "source": "builtin"
-        }
-      ]
+      "mode": "auto"
     },
-    "response": "agents"
+    "response": "approval_mode_state"
+  },
+  "assistant_session_created": {
+    "data": {
+      "session": {
+        "active_agent": "helper-bot",
+        "assistant_name": "helper-bot",
+        "project_id": "project_id-fixture",
+        "project_root": "/tmp/project",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "short_id": "abc123"
+      }
+    },
+    "response": "assistant_session_created"
+  },
+  "assistant_upserted": {
+    "data": {
+      "assistant": {
+        "config_json": "{\"name\":\"helper-bot\"}",
+        "content_hash": "hash-fixture",
+        "created_at": 1700000000,
+        "home_dir": "/tmp/assistants/helper-bot",
+        "name": "helper-bot"
+      }
+    },
+    "response": "assistant_upserted"
   },
   "assistants": {
     "data": {
@@ -30,35 +47,10 @@
     },
     "response": "assistants"
   },
-  "assistant_session_created": {
-    "data": {
-      "session": {
-        "active_agent": "helper-bot",
-        "assistant_name": "helper-bot",
-        "project_id": "project_id-fixture",
-        "project_root": "/tmp/project",
-        "session_id": "11111111-1111-4111-8111-111111111111",
-        "short_id": "abc123"
-      }
-    },
-    "response": "assistant_session_created"
-  },
-  "approval_mode_state": {
-    "data": {
-      "mode": "auto"
-    },
-    "response": "approval_mode_state"
-  },
   "attached": {
     "data": {
       "active_agent": "active_agent-fixture",
       "active_agent_path": ["active_agent_path-fixture"],
-      "active_subagent": {
-        "child": "builder",
-        "label": "Implement",
-        "parent": "Build",
-        "task_call_id": "task-1"
-      },
       "active_model_state": {
         "default_selection": {
           "model": "model-fixture",
@@ -70,6 +62,12 @@
           "model": "model-fixture",
           "provider": "provider-fixture"
         }
+      },
+      "active_subagent": {
+        "child": "builder",
+        "label": "Implement",
+        "parent": "Build",
+        "task_call_id": "task-1"
       },
       "compatible": true,
       "daemon_version": "daemon_version-fixture",
@@ -267,15 +265,6 @@
     },
     "response": "delegation_steer"
   },
-  "forked": {
-    "data": {
-      "fork_point_turn_id": "fork_point_turn_id-fixture",
-      "parent_session_id": "11111111-1111-4111-8111-111111111111",
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "short_id": "short_id-fixture"
-    },
-    "response": "forked"
-  },
   "export_session_data": {
     "data": {
       "data": {
@@ -291,12 +280,14 @@
     },
     "response": "export_session_data"
   },
-  "import_session_archive": {
+  "forked": {
     "data": {
-      "imported": ["11111111-1111-4111-8111-111111111111"],
-      "redacted": true
+      "fork_point_turn_id": "fork_point_turn_id-fixture",
+      "parent_session_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "short_id": "short_id-fixture"
     },
-    "response": "import_session_archive"
+    "response": "forked"
   },
   "fs_list": {
     "data": {
@@ -416,6 +407,75 @@
     },
     "response": "guidance_estimate"
   },
+  "history_page": {
+    "data": {
+      "entries": [
+        {
+          "role": "user",
+          "seq": 5,
+          "text": "message",
+          "ts_ms": 1700000000000
+        }
+      ],
+      "has_more": true,
+      "oldest_seq": 5,
+      "session_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "response": "history_page"
+  },
+  "import_session_archive": {
+    "data": {
+      "imported": ["11111111-1111-4111-8111-111111111111"],
+      "redacted": true
+    },
+    "response": "import_session_archive"
+  },
+  "inventory_bundle": {
+    "data": {
+      "agents": [
+        {
+          "builtin": true,
+          "description": "desc",
+          "mode": "normal",
+          "name": "Build",
+          "source": "builtin"
+        }
+      ],
+      "config_generation": 2,
+      "inventory_generation": 3,
+      "models": [
+        {
+          "available": true,
+          "display_name": "Fixture Model",
+          "favorite": true,
+          "id": "model",
+          "native_provider_valid": true,
+          "provider": "fixture",
+          "reasoning_effort": {
+            "default": "high",
+            "values": [
+              {
+                "value": "high"
+              }
+            ]
+          },
+          "thinking_modes": ["off", "high"],
+          "trust": "untrusted"
+        }
+      ],
+      "selected_agent": "Build",
+      "session_generation": 1,
+      "skills": [
+        {
+          "description": "desc",
+          "name": "skill",
+          "source": "builtin",
+          "user_invocable": true
+        }
+      ]
+    },
+    "response": "inventory_bundle"
+  },
   "longcache_state": {
     "data": {
       "enabled": true
@@ -427,26 +487,6 @@
       "message": "message-fixture"
     },
     "response": "lsp_control_result"
-  },
-  "models": {
-    "data": {
-      "models": [
-        {
-          "display_name": "Fixture Model",
-          "favorite": true,
-          "id": "model",
-          "provider": "fixture"
-        }
-      ]
-    },
-    "response": "models"
-  },
-  "restart_decision": {
-    "data": {
-      "reason": "a session is busy",
-      "will_restart": false
-    },
-    "response": "restart_decision"
   },
   "note_recorded": {
     "data": {
@@ -471,11 +511,86 @@
     },
     "response": "paused_work"
   },
+  "pin_changed": {
+    "data": {
+      "changed": true
+    },
+    "response": "pin_changed"
+  },
+  "pin_count": {
+    "data": {
+      "count": 7
+    },
+    "response": "pin_count"
+  },
+  "pin_seqs": {
+    "data": {
+      "seqs": [7]
+    },
+    "response": "pin_seqs"
+  },
+  "pin_state": {
+    "data": {
+      "state": {
+        "count": 1,
+        "seqs": [7]
+      }
+    },
+    "response": "pin_state"
+  },
+  "pin_toggled": {
+    "data": {
+      "pinned": true
+    },
+    "response": "pin_toggled"
+  },
+  "pins_with_text": {
+    "data": {
+      "pins": [
+        {
+          "is_assistant": false,
+          "seq": 7,
+          "text": "pinned text"
+        }
+      ]
+    },
+    "response": "pins_with_text"
+  },
   "preflight_state": {
     "data": {
       "enabled": true
     },
     "response": "preflight_state"
+  },
+  "project_note_created": {
+    "data": {
+      "note": {
+        "content": "content-fixture",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "name": "note-fixture",
+        "project_root": "/tmp/project"
+      }
+    },
+    "response": "project_note_created"
+  },
+  "project_note_renamed": {
+    "data": {
+      "name": "note-fixture"
+    },
+    "response": "project_note_renamed"
+  },
+  "project_notes": {
+    "data": {
+      "notes": [
+        {
+          "content": "content-fixture",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "note-fixture",
+          "project_root": "/tmp/project"
+        }
+      ]
+    },
+    "response": "project_notes"
   },
   "promote_resource_result": {
     "data": {
@@ -777,6 +892,33 @@
     },
     "response": "resource_snapshot"
   },
+  "restart_decision": {
+    "data": {
+      "reason": "a session is busy",
+      "will_restart": false
+    },
+    "response": "restart_decision"
+  },
+  "sandbox_escalation_state": {
+    "data": {
+      "enabled": true
+    },
+    "response": "sandbox_escalation_state"
+  },
+  "sandbox_state": {
+    "data": {
+      "container_availability": {
+        "available": true,
+        "harness_in_container": false,
+        "reason": null,
+        "runtime": "docker"
+      },
+      "container_network_enabled": true,
+      "enabled": true,
+      "mode": "container"
+    },
+    "response": "sandbox_state"
+  },
   "scheduled_job": {
     "data": {
       "job": {
@@ -848,25 +990,19 @@
     },
     "response": "scheduled_jobs"
   },
-  "sandbox_escalation_state": {
+  "sealed_values": {
     "data": {
-      "enabled": true
+      "values": [
+        {
+          "created_at": 1700000000,
+          "origin": "user",
+          "origin_session_id": "11111111-1111-4111-8111-111111111111",
+          "reason": "deploy",
+          "value_id": "prod_token"
+        }
+      ]
     },
-    "response": "sandbox_escalation_state"
-  },
-  "sandbox_state": {
-    "data": {
-      "container_availability": {
-        "available": true,
-        "harness_in_container": false,
-        "reason": null,
-        "runtime": "docker"
-      },
-      "container_network_enabled": true,
-      "enabled": true,
-      "mode": "container"
-    },
-    "response": "sandbox_state"
+    "response": "sealed_values"
   },
   "session_live_status": {
     "data": {
@@ -894,40 +1030,6 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "response": "session_messages"
-  },
-  "history_page": {
-    "data": {
-      "entries": [
-        {
-          "role": "user",
-          "seq": 5,
-          "text": "message",
-          "ts_ms": 1700000000000
-        }
-      ],
-      "has_more": true,
-      "oldest_seq": 5,
-      "session_id": "11111111-1111-4111-8111-111111111111"
-    },
-    "response": "history_page"
-  },
-  "subagent_history_page": {
-    "data": {
-      "entries": [
-        {
-          "role": "user",
-          "seq": 5,
-          "text": "message",
-          "ts_ms": 1700000000000
-        }
-      ],
-      "has_more": true,
-      "label": "label-fixture",
-      "oldest_seq": 5,
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "task_call_id": "task_call_id-fixture"
-    },
-    "response": "subagent_history_page"
   },
   "sessions": {
     "data": {
@@ -958,19 +1060,6 @@
     },
     "response": "sessions"
   },
-  "skills": {
-    "data": {
-      "skills": [
-        {
-          "description": "desc",
-          "name": "skill",
-          "source": "builtin",
-          "user_invocable": true
-        }
-      ]
-    },
-    "response": "skills"
-  },
   "stats_rollup": {
     "data": {
       "rollup": {
@@ -993,17 +1082,6 @@
         "project_id": "project_id-fixture",
         "range": "all",
         "recovery": {
-          "by_model": [
-            {
-              "calls": 2,
-              "hard_fail": 0,
-              "hard_fail_pct": 0.0,
-              "malformed_pct": 50.0,
-              "model": "model-fixture",
-              "recovered": 1,
-              "recovered_pct": 50.0
-            }
-          ],
           "by_llm_mode": [
             {
               "calls": 2,
@@ -1011,6 +1089,17 @@
               "hard_fail_pct": 0.0,
               "llm_mode": "normal",
               "malformed_pct": 50.0,
+              "recovered": 1,
+              "recovered_pct": 50.0
+            }
+          ],
+          "by_model": [
+            {
+              "calls": 2,
+              "hard_fail": 0,
+              "hard_fail_pct": 0.0,
+              "malformed_pct": 50.0,
+              "model": "model-fixture",
               "recovered": 1,
               "recovered_pct": 50.0
             }
@@ -1073,6 +1162,24 @@
       }
     },
     "response": "stats_rollup"
+  },
+  "subagent_history_page": {
+    "data": {
+      "entries": [
+        {
+          "role": "user",
+          "seq": 5,
+          "text": "message",
+          "ts_ms": 1700000000000
+        }
+      ],
+      "has_more": true,
+      "label": "label-fixture",
+      "oldest_seq": 5,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "task_call_id": "task_call_id-fixture"
+    },
+    "response": "subagent_history_page"
   },
   "subagent_transcript": {
     "data": {
@@ -1159,106 +1266,5 @@
       ]
     },
     "response": "user_message_queued"
-  },
-  "assistant_upserted": {
-    "response": "assistant_upserted",
-    "data": {
-      "assistant": {
-        "name": "helper-bot",
-        "created_at": 1700000000,
-        "home_dir": "/tmp/assistants/helper-bot",
-        "config_json": "{\"name\":\"helper-bot\"}",
-        "content_hash": "hash-fixture"
-      }
-    }
-  },
-  "pin_changed": {
-    "response": "pin_changed",
-    "data": {
-      "changed": true
-    }
-  },
-  "pin_count": {
-    "response": "pin_count",
-    "data": {
-      "count": 7
-    }
-  },
-  "pin_seqs": {
-    "response": "pin_seqs",
-    "data": {
-      "seqs": [7]
-    }
-  },
-  "pin_state": {
-    "response": "pin_state",
-    "data": {
-      "state": {
-        "count": 1,
-        "seqs": [7]
-      }
-    }
-  },
-  "pin_toggled": {
-    "response": "pin_toggled",
-    "data": {
-      "pinned": true
-    }
-  },
-  "pins_with_text": {
-    "response": "pins_with_text",
-    "data": {
-      "pins": [
-        {
-          "seq": 7,
-          "is_assistant": false,
-          "text": "pinned text"
-        }
-      ]
-    }
-  },
-  "project_note_created": {
-    "response": "project_note_created",
-    "data": {
-      "note": {
-        "id": "11111111-1111-4111-8111-111111111111",
-        "project_root": "/tmp/project",
-        "name": "note-fixture",
-        "content": "content-fixture"
-      }
-    }
-  },
-  "project_note_renamed": {
-    "response": "project_note_renamed",
-    "data": {
-      "name": "note-fixture"
-    }
-  },
-  "project_notes": {
-    "response": "project_notes",
-    "data": {
-      "notes": [
-        {
-          "id": "11111111-1111-4111-8111-111111111111",
-          "project_root": "/tmp/project",
-          "name": "note-fixture",
-          "content": "content-fixture"
-        }
-      ]
-    }
-  },
-  "sealed_values": {
-    "response": "sealed_values",
-    "data": {
-      "values": [
-        {
-          "value_id": "prod_token",
-          "reason": "deploy",
-          "origin": "user",
-          "created_at": 1700000000,
-          "origin_session_id": "11111111-1111-4111-8111-111111111111"
-        }
-      ]
-    }
   }
 }

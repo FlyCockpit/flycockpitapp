@@ -191,7 +191,22 @@ impl App {
             }
         }
         let refresh_skills = runner.is_ok();
+        let attach_ids = runner.as_ref().ok().map(|r| {
+            let session_id = *cockpit_core::sync::lock_or_recover(&r.session_id_state);
+            let connection_epoch = r
+                .attachment_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (session_id, connection_epoch)
+        });
         self.agent_runner = Some(runner);
+        if let Some((session_id, connection_epoch)) = attach_ids {
+            self.bootstrap_inventory_after_attach(
+                uuid::Uuid::nil(), // single TUI instance
+                connection_epoch,
+                session_id,
+                self.config_snapshot.generation,
+            );
+        }
         if refresh_skills {
             self.refresh_skill_commands();
         }

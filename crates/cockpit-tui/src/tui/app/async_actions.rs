@@ -90,12 +90,26 @@ impl App {
                 }
             }
             AsyncActionKind::DaemonRpc("skills.list") => {
-                if let Overlay::Skills(pane) = &mut self.overlay
-                    && let Ok(AsyncActionPayload::Skills(result)) = result.payload
-                {
-                    pane.apply_fetch_result(result);
+                if let Ok(AsyncActionPayload::Skills(result)) = result.payload {
+                    if let Some(bundle) = result.bundle.clone() {
+                        self.apply_inventory_bundle_response(bundle);
+                    }
+                    if let Overlay::Skills(pane) = &mut self.overlay {
+                        pane.apply_fetch_result(result);
+                    }
                 }
             }
+            AsyncActionKind::DaemonRpc("inventory.bundle") => match result.payload {
+                Ok(AsyncActionPayload::InventoryBundle(response)) => {
+                    self.apply_inventory_bundle_response(response);
+                }
+                Err(error) => {
+                    if let Some(ticket) = self.inventory.in_flight.clone() {
+                        self.inventory.apply_failure(&ticket, error);
+                    }
+                }
+                _ => {}
+            },
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);

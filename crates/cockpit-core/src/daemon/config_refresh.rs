@@ -59,6 +59,7 @@ pub(crate) async fn refresh_session_config(
         })
         .await?;
     let generation = response_rx.await?;
+    crate::daemon::server::inventory::bump_inventory_generation();
     if let Some(deduper) = failure_deduper {
         deduper.record_success();
     }

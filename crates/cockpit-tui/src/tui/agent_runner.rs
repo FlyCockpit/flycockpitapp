@@ -66,6 +66,10 @@ impl AttachedRequestBinding {
         }
     }
 
+    pub(crate) fn session_id(&self) -> Uuid {
+        self.intended_session_id
+    }
+
     pub(crate) async fn request(&self, request: Request) -> Result<Response, String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
@@ -1325,19 +1329,27 @@ fn current_last_applied_seq(last_applied_seq: &Arc<Mutex<Option<i64>>>) -> Optio
 async fn run_skill_inventory_refresh(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
+    session_id_state: Arc<Mutex<Uuid>>,
+    active_agent: Arc<Mutex<String>>,
     skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     refresh_rx: watch::Receiver<u64>,
 ) {
     run_skill_inventory_refresh_with_request(
         attach_context,
+        session_id_state,
+        active_agent,
         skill_inventory_names,
         refresh_rx,
-        move |project_root| {
+        move |project_root, session_id, selected_agent| {
             let current_client = current_client.clone();
             async move {
                 let client = current_client.read().await.clone();
                 client
-                    .request_ok(Request::ListSkills { project_root })
+                    .request_ok(Request::GetInventoryBundle {
+                        project_root,
+                        session_id,
+                        selected_agent,
+                    })
                     .await
             }
         },
@@ -1347,17 +1359,26 @@ async fn run_skill_inventory_refresh(
 
 async fn run_skill_inventory_refresh_with_request<F, Fut>(
     attach_context: Arc<RwLock<AttachRequestContext>>,
+    session_id_state: Arc<Mutex<Uuid>>,
+    active_agent: Arc<Mutex<String>>,
     skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     mut refresh_rx: watch::Receiver<u64>,
     mut request_skills: F,
 ) where
-    F: FnMut(String) -> Fut,
+    F: FnMut(String, Uuid, String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Response>>,
 {
     while refresh_rx.changed().await.is_ok() {
         let project_root = attach_context.read().await.project_root.clone();
-        match request_skills(project_root).await {
-            Ok(Response::Skills { skills }) => {
+        let session_id = *session_id_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selected_agent = active_agent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match request_skills(project_root, session_id, selected_agent).await {
+            Ok(Response::InventoryBundle { skills, .. }) => {
                 let names = skills
                     .into_iter()
                     .map(|skill| skill.name)
@@ -1367,7 +1388,7 @@ async fn run_skill_inventory_refresh_with_request<F, Fut>(
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(names);
             }
             Ok(other) => {
-                tracing::debug!(?other, "list_skills returned unexpected response");
+                tracing::debug!(?other, "get_inventory_bundle returned unexpected response");
             }
             Err(error) => {
                 tracing::debug!(error = ?error, "skill inventory refresh failed");
@@ -1380,12 +1401,16 @@ fn spawn_skill_inventory_refresh_task(
     client_tasks: &mut ClientTasks,
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
+    session_id_state: Arc<Mutex<Uuid>>,
+    active_agent: Arc<Mutex<String>>,
     skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
 ) -> (watch::Sender<u64>, AbortHandle) {
     let (refresh_tx, refresh_rx) = watch::channel(0);
     let handle = tokio::spawn(run_skill_inventory_refresh(
         current_client,
         attach_context,
+        session_id_state,
+        active_agent,
         skill_inventory_names,
         refresh_rx,
     ));
@@ -1902,12 +1927,14 @@ fn try_spawn_inner(
             };
             let skill_inventory_names = match daemon
                 .client
-                .request_ok(Request::ListSkills {
+                .request_ok(Request::GetInventoryBundle {
                     project_root: cwd.to_string_lossy().into_owned(),
+                    session_id,
+                    selected_agent: active_agent_name.clone(),
                 })
                 .await
             {
-                Ok(Response::Skills { skills }) => Some(
+                Ok(Response::InventoryBundle { skills, .. }) => Some(
                     skills
                         .into_iter()
                         .map(|skill| skill.name)
@@ -2142,6 +2169,8 @@ fn try_spawn_inner(
         &mut client_tasks,
         current_client.clone(),
         attach_context.clone(),
+        session_id_state.clone(),
+        active_agent.clone(),
         skill_inventory_names.clone(),
     );
 
@@ -5084,17 +5113,24 @@ mod tests {
     async fn skill_inventory_refresh_does_not_block_event_drain() {
         let attach_context = test_attach_context("/tmp/project");
         let skill_inventory_names = Arc::new(Mutex::new(None));
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
         let (refresh_tx, refresh_rx) = watch::channel(0);
         let (list_seen_tx, list_seen_rx) = oneshot::channel();
         let list_seen_tx = Arc::new(Mutex::new(Some(list_seen_tx)));
         let refresh_task = tokio::spawn(run_skill_inventory_refresh_with_request(
             attach_context.clone(),
+            session_id_state,
+            active_agent,
             skill_inventory_names,
             refresh_rx,
-            move |project_root| {
+            move |project_root, got_session_id, selected_agent| {
                 let list_seen_tx = list_seen_tx.clone();
                 async move {
                     assert_eq!(project_root, "/tmp/project");
+                    assert_eq!(got_session_id, session_id);
+                    assert_eq!(selected_agent, "Build");
                     if let Some(tx) = list_seen_tx.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
@@ -5102,7 +5138,6 @@ mod tests {
                 }
             },
         ));
-        let session_id = Uuid::new_v4();
         let last_applied_seq = Arc::new(Mutex::new(None));
         let (mut state, events) =
             test_event_state(session_id, attach_context, last_applied_seq, refresh_tx);
@@ -5110,8 +5145,8 @@ mod tests {
         state.handle_regular_event(foreground_target_event(session_id));
         tokio::time::timeout(Duration::from_secs(1), list_seen_rx)
             .await
-            .expect("list_skills should be requested")
-            .expect("list_skills observer should stay alive");
+            .expect("get_inventory_bundle should be requested")
+            .expect("get_inventory_bundle observer should stay alive");
 
         state.handle_regular_event(proto::Event::AssistantText {
             session_id,
@@ -5134,6 +5169,9 @@ mod tests {
     async fn skill_inventory_refresh_coalesces_bursts() {
         let attach_context = test_attach_context("/tmp/project");
         let skill_inventory_names = Arc::new(Mutex::new(None));
+        let session_id = Uuid::new_v4();
+        let session_id_state = Arc::new(Mutex::new(session_id));
+        let active_agent = Arc::new(Mutex::new("Build".to_string()));
         let (refresh_tx, refresh_rx) = watch::channel(0);
         let (first_seen_tx, first_seen_rx) = oneshot::channel();
         let (release_first_tx, release_first_rx) = oneshot::channel();
@@ -5143,13 +5181,15 @@ mod tests {
         let release_first_rx = Arc::new(tokio::sync::Mutex::new(Some(release_first_rx)));
         let refresh_task = tokio::spawn(run_skill_inventory_refresh_with_request(
             attach_context.clone(),
+            session_id_state,
+            active_agent,
             skill_inventory_names.clone(),
             refresh_rx,
             {
                 let request_count = request_count.clone();
                 let first_seen_tx = first_seen_tx.clone();
                 let release_first_rx = release_first_rx.clone();
-                move |project_root| {
+                move |project_root, _session_id, _selected_agent| {
                     let request_count = request_count.clone();
                     let first_seen_tx = first_seen_tx.clone();
                     let release_first_rx = release_first_rx.clone();
@@ -5169,14 +5209,19 @@ mod tests {
                                 let _ = rx.await;
                             }
                         }
-                        Ok(Response::Skills {
+                        Ok(Response::InventoryBundle {
+                            selected_agent: "Build".into(),
+                            agents: Vec::new(),
+                            models: Vec::new(),
                             skills: vec![test_skill("refreshed")],
+                            session_generation: 0,
+                            config_generation: 0,
+                            inventory_generation: 0,
                         })
                     }
                 }
             },
         ));
-        let session_id = Uuid::new_v4();
         let last_applied_seq = Arc::new(Mutex::new(None));
         let (mut state, _events) =
             test_event_state(session_id, attach_context, last_applied_seq, refresh_tx);
@@ -5186,8 +5231,8 @@ mod tests {
         }
         tokio::time::timeout(Duration::from_secs(1), first_seen_rx)
             .await
-            .expect("first list_skills should be requested")
-            .expect("first list_skills observer should stay alive");
+            .expect("first get_inventory_bundle should be requested")
+            .expect("first get_inventory_bundle observer should stay alive");
         let _ = release_first_tx.send(());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

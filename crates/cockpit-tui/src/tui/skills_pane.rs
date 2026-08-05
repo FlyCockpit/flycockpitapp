@@ -5,8 +5,8 @@
 //! pane is purely informational: there's no selecting, invoking, or
 //! editing — Esc (or `q`) dismisses it.
 //!
-//! The list comes from the attached session's `ListSkills` RPC when an
-//! agent runner is present, with local discovery as the detached fallback.
+//! The list comes from the attached session's `GetInventoryBundle` RPC.
+//! Pre-attach inventory is explicitly unavailable (no local discovery).
 //! Mirrors [`crate::tui::stats_pane`]'s shape (`handle_key` / `render`);
 //! `App` opens it over the chat body and routes input/render the same way.
 
@@ -19,7 +19,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_config::extended::SkillsConfig;
 use cockpit_core::daemon::proto::SkillSummary;
 
 pub struct SkillsPane {
@@ -54,6 +53,8 @@ pub struct SkillsPaneFetchResult {
     pub generation: u64,
     pub source: SkillsPaneSource,
     pub skills: Result<Vec<SkillSummary>, String>,
+    /// Full bundle when the fetch came from GetInventoryBundle (for inventory state).
+    pub bundle: Option<cockpit_core::daemon::proto::Response>,
 }
 
 impl SkillsPane {
@@ -220,26 +221,6 @@ impl Pane for SkillsPane {
     }
 }
 
-pub(crate) fn local_skill_summaries(
-    cwd: &std::path::Path,
-    skills_config: &SkillsConfig,
-    agent_name: &str,
-) -> Result<Vec<SkillSummary>, String> {
-    cockpit_core::skills::discover_for_agent(cwd, skills_config, agent_name)
-        .map(|skills| {
-            skills
-                .into_iter()
-                .map(|s| SkillSummary {
-                    name: s.frontmatter.name,
-                    description: s.frontmatter.description,
-                    source: s.source.display().to_string(),
-                    user_invocable: s.frontmatter.user_invocable,
-                })
-                .collect()
-        })
-        .map_err(|error| error.to_string())
-}
-
 fn ready_lines(skills: &[SkillSummary], source: SkillsPaneSource) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if source == SkillsPaneSource::Local {
@@ -403,6 +384,7 @@ mod tests {
             generation: 1,
             source: SkillsPaneSource::Session,
             skills: Ok(vec![summary("stale", "d", "/s")]),
+            bundle: None,
         });
 
         assert!(!applied);

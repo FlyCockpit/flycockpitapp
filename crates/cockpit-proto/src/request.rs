@@ -570,10 +570,12 @@ pub enum Request {
         session_id: Uuid,
     },
 
-    /// List discovered skills, resolving the configured scan dirs from
-    /// `project_root` (the client's cwd) so per-project config applies.
-    ListSkills {
+    /// Return one atomic agents/models/skills inventory bundle for the
+    /// selected session and agent from a single daemon snapshot.
+    GetInventoryBundle {
         project_root: String,
+        session_id: Uuid,
+        selected_agent: String,
     },
 
     /// Snapshot the daemon-wide resource scheduler for `/resources`.
@@ -616,16 +618,6 @@ pub enum Request {
     /// Fire a durable scheduler job immediately without changing its schedule.
     RunScheduledJob {
         id: String,
-    },
-
-    /// List discovered agents (bundled + on-disk + agent_dirs).
-    ListAgents,
-
-    /// List models known for the active provider, or for a specific
-    /// provider when set.
-    ListModels {
-        #[serde(default)]
-        provider: Option<String>,
     },
 
     /// Set or clear one configured model’s favorite flag. The daemon validates
@@ -1071,7 +1063,7 @@ macro_rules! request_variants {
             (Request::ShareSession { .. }, "share_session");
             (Request::RecordSessionNote { .. }, "record_session_note");
             (Request::DeleteSession { .. }, "delete_session");
-            (Request::ListSkills { .. }, "list_skills");
+            (Request::GetInventoryBundle { .. }, "get_inventory_bundle");
             (Request::ResourceSnapshot, "resource_snapshot");
             (Request::PromoteResource { .. }, "promote_resource");
             (Request::CreateScheduledJob { .. }, "create_scheduled_job");
@@ -1079,8 +1071,6 @@ macro_rules! request_variants {
             (Request::DeleteScheduledJob { .. }, "delete_scheduled_job");
             (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled");
             (Request::RunScheduledJob { .. }, "run_scheduled_job");
-            (Request::ListAgents, "list_agents");
-            (Request::ListModels { .. }, "list_models");
             (Request::SetModelFavorite { .. }, "set_model_favorite");
             (Request::SetActiveModel { .. }, "set_active_model");
             (Request::SetAgent { .. }, "set_agent");
@@ -1207,7 +1197,7 @@ macro_rules! command {
             (Request::ShareSession { session_id, .. }, "share_session", owner_only, field(session_id), true, serialized, none);
             (Request::RecordSessionNote { session_id, .. }, "record_session_note", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::DeleteSession { session_id, .. }, "delete_session", session_row_writer(session_id), field(session_id), true, serialized, none);
-            (Request::ListSkills { project_root }, "list_skills", project_read(project_root), none, false, concurrent, none);
+            (Request::GetInventoryBundle { session_id, project_root, .. }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, concurrent, path(project_root));
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, concurrent, none);
             (Request::PromoteResource { session_id, .. }, "promote_resource", owner_only, option_field(session_id), true, serialized, none);
             (Request::CreateScheduledJob { .. }, "create_scheduled_job", owner_only, none, true, serialized, none);
@@ -1215,8 +1205,6 @@ macro_rules! command {
             (Request::DeleteScheduledJob { .. }, "delete_scheduled_job", owner_only, none, true, serialized, none);
             (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled", owner_only, none, true, serialized, none);
             (Request::RunScheduledJob { .. }, "run_scheduled_job", owner_only, none, true, serialized, none);
-            (Request::ListAgents, "list_agents", owner_only, none, false, concurrent, none);
-            (Request::ListModels { .. }, "list_models", owner_only, none, false, concurrent, none);
             (Request::SetModelFavorite { .. }, "set_model_favorite", owner_only, attached, true, serialized, none);
             (Request::SetActiveModel { .. }, "set_active_model", custom(authorize_set_active_model), attached, true, serialized, none);
             (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, serialized, none);

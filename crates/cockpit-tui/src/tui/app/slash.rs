@@ -878,6 +878,7 @@ fn run_multireview(app: &mut App, _: &str) -> bool {
     match crate::tui::multireview_dialog::MultireviewDialog::open(
         &app.launch.cwd,
         &app.config_snapshot.extended,
+        &app.inventory_models(),
         &app.usage_models,
     ) {
         Ok(dialog) => app.overlay = Overlay::Multireview(dialog),
@@ -1596,11 +1597,10 @@ impl App {
     /// available skills as a clear error — never a silent no-op. Trailing text
     /// after the name is forwarded as the accompanying task input.
     pub(super) fn handle_skill_command(&mut self, args: &str) {
-        // Re-discover per call so the dispatcher sees colliding +
-        // freshly-added skills regardless of the startup `skill_commands`
-        // cache (which holds only the non-colliding bare entries).
-        let skills = self.visible_skills();
-        let names: Vec<&str> = skills.iter().map(|s| s.frontmatter.name.as_str()).collect();
+        // Use the last complete daemon inventory snapshot (authorized for the
+        // selected agent). No local filesystem discovery.
+        let skills = self.visible_skill_summaries();
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         match resolve_skill_dispatch(args, &names) {
             SkillDispatch::Invoke { name, task } => {
                 let display = if task.is_empty() {
@@ -1773,7 +1773,7 @@ impl App {
     /// Bare `/agent` lists the primaries, marking the active one — it does
     /// not switch and does not open a picker.
     pub(super) fn handle_agent_command(&mut self, arg: &str) {
-        let order = cockpit_core::agents::chat_ownable_primaries(&self.launch.cwd);
+        let order = self.inventory_agent_names();
         match agent_command_outcome(arg, &self.launch.agent_name, &order) {
             // A valid named target: route through the shared swap entry point
             // (its confirmation line + start-a-session-first guard apply).
@@ -2562,7 +2562,7 @@ pub(super) enum AgentCommandOutcome {
 
 /// Pure resolution of `/agent [arg]` against the chat-ownable cycle `order`
 /// (builtins first, then user primaries alphabetically — see
-/// [`cockpit_core::agents::chat_ownable_primaries`]) and the `active` agent name.
+/// the daemon inventory agent list) and the `active` agent name.
 /// A blank `arg` yields the listing (active one marked `(active)`); a name in
 /// `order` yields a [`AgentCommandOutcome::Switch`]; anything else yields an
 /// error naming the bad value in backticks plus the valid choices. Subagents
@@ -2660,42 +2660,21 @@ pub(super) fn builtin_slash_name_taken(name: &str) -> bool {
     SLASH_COMMANDS.iter().any(|c| c.name == name)
 }
 
-/// Discover the skills reachable from `cwd` and project them into bare-sugar
-/// slash-menu entries (implementation note): one
-/// `SkillCommand` per skill whose name does NOT collide with a builtin. A
-/// colliding skill is dropped from the bare entries (logged once) but stays
-/// invokable via the `/skill <name>` dispatcher. Discovery is frontmatter-only
-/// (cheap) and tolerant — a discovery failure yields no skill entries.
-pub(super) fn discover_bare_skill_commands(
-    cwd: &Path,
-    extended: &cockpit_config::extended::ExtendedConfig,
-    agent_name: &str,
-) -> Vec<SkillCommand> {
-    let skills = cockpit_core::skills::discover_for_agent(cwd, &extended.skills, agent_name)
-        .unwrap_or_default();
-    bare_skill_commands_from(skills)
-}
-
-/// Project discovered skills into bare-sugar slash-menu entries, dropping any
-/// whose name collides with a builtin (the builtin keeps the bare name; the
-/// skill stays reachable via `/skill <name>`). Split from
-/// [`discover_bare_skill_commands`] so the collision filter is unit-testable
-/// without touching the host's layered-config discovery.
+/// Project daemon-authorized skill summaries into bare-sugar slash-menu
+/// entries, dropping any whose name collides with a builtin (the builtin keeps
+/// the bare name; the skill stays reachable via `/skill <name>`).
 pub(super) fn bare_skill_commands_from(
-    skills: Vec<cockpit_core::skills::Skill>,
+    skills: Vec<cockpit_core::daemon::proto::SkillSummary>,
 ) -> Vec<SkillCommand> {
     let mut out = Vec::with_capacity(skills.len());
     for s in skills {
         // Model-only skills (`user-invocable: false`) are hidden from the
-        // user's `/` menu but still eligible for auto-injection (their
-        // description stays in the auto-select catalog).
-        if !s.frontmatter.user_invocable {
+        // user's `/` menu but still eligible for auto-injection.
+        if !s.user_invocable {
             continue;
         }
-        let name = s.frontmatter.name;
+        let name = s.name;
         if builtin_slash_name_taken(&name) {
-            // Builtin shadows the bare name; surface the shadowed skill
-            // non-intrusively (still reachable via `/skill <name>`).
             tracing::info!(
                 skill = %name,
                 "skill name collides with a builtin slash command; bare /{name} runs the builtin — invoke the skill via `/skill {name}`",
@@ -2704,7 +2683,7 @@ pub(super) fn bare_skill_commands_from(
         }
         out.push(SkillCommand {
             name,
-            description: s.frontmatter.description,
+            description: s.description,
         });
     }
     out

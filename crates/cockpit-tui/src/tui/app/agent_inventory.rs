@@ -1,4 +1,6 @@
 use super::*;
+use cockpit_core::daemon::proto::{AgentSummary, ModelSummary, SkillSummary};
+use uuid::Uuid;
 
 impl App {
     pub(super) fn sync_active_agent(&mut self) {
@@ -20,42 +22,152 @@ impl App {
             self.agent_path = path;
         }
         if changed {
+            self.request_inventory_refresh(true);
             self.refresh_skill_commands();
         }
     }
 
-    /// Return the skill inventory visible to the current agent. Once attached,
-    /// the daemon publishes names filtered against the exact live toolbox;
-    /// before that point discovery uses the agent definition as a best-effort
-    /// startup approximation.
-    pub(super) fn visible_skills(&self) -> Vec<cockpit_core::skills::Skill> {
-        let extended = &self.config_snapshot.extended;
-        let exact_names = self
-            .agent_runner
+    /// Skills from the last complete daemon inventory snapshot. Empty when
+    /// inventory is unavailable (pre-attach) — never a local filesystem walk.
+    pub(super) fn visible_skill_summaries(&self) -> Vec<SkillSummary> {
+        self.inventory
+            .snapshot
             .as_ref()
-            .and_then(|runner| runner.as_ref().ok())
-            .and_then(|runner| runner.skill_inventory_names.lock().unwrap().clone());
-        if let Some(exact_names) = exact_names {
-            cockpit_core::skills::discover(&self.launch.cwd, &extended.skills)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|skill| exact_names.contains(&skill.frontmatter.name))
-                .collect()
-        } else {
-            cockpit_core::skills::discover_for_agent(
-                &self.launch.cwd,
-                &extended.skills,
-                &self.launch.agent_name,
-            )
+            .map(|snap| snap.skills.clone())
             .unwrap_or_default()
-        }
     }
 
-    /// Rebuild conditional skill slash entries after the root agent changes.
-    /// The active agent's declared tool grant is the pre-spawn inventory seam;
-    /// actual skill loading rechecks against the live toolbox.
+    pub(super) fn inventory_agents(&self) -> Vec<AgentSummary> {
+        self.inventory
+            .snapshot
+            .as_ref()
+            .map(|snap| snap.agents.clone())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn inventory_agent_names(&self) -> Vec<String> {
+        self.inventory_agents()
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect()
+    }
+
+    pub(super) fn inventory_models(&self) -> Vec<ModelSummary> {
+        self.inventory
+            .snapshot
+            .as_ref()
+            .map(|snap| snap.models.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rebuild slash skill entries from the last complete inventory snapshot.
     pub(super) fn refresh_skill_commands(&mut self) {
-        self.skill_commands = bare_skill_commands_from(self.visible_skills());
+        self.skill_commands = bare_skill_commands_from(self.visible_skill_summaries());
+    }
+
+    /// Schedule an async GetInventoryBundle refresh (coalesced via InventoryState).
+    pub(super) fn request_inventory_refresh(&mut self, allow_equal_generations: bool) {
+        let selected = self.launch.agent_name.clone();
+        let Some(_ticket) = self
+            .inventory
+            .start_refresh(selected.clone(), allow_equal_generations)
+        else {
+            return;
+        };
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let attached = runner.attached_request_binding();
+        let cwd = self.launch.cwd.clone();
+        let agent_name = selected;
+        const INVENTORY_REFRESH_ACTION: &str = "inventory.bundle";
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc(INVENTORY_REFRESH_ACTION),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new(INVENTORY_REFRESH_ACTION),
+            ),
+            async move {
+                let response = attached
+                    .request(cockpit_core::daemon::proto::Request::GetInventoryBundle {
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        session_id: attached.session_id(),
+                        selected_agent: agent_name,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(crate::tui::async_action::AsyncActionPayload::InventoryBundle(response))
+            },
+        );
+    }
+
+    /// Seed inventory identity after attach succeeds.
+    pub(super) fn bootstrap_inventory_after_attach(
+        &mut self,
+        client_instance_id: Uuid,
+        connection_epoch: u64,
+        session_id: Uuid,
+        session_generation: u64,
+    ) {
+        self.inventory.begin_attach(
+            client_instance_id,
+            connection_epoch,
+            session_id,
+            self.launch.agent_name.clone(),
+            session_generation,
+        );
+        self.request_inventory_refresh(true);
+    }
+
+    /// Apply a completed GetInventoryBundle response into inventory state.
+    /// Late results without a matching in-flight ticket are inert.
+    pub(super) fn apply_inventory_bundle_response(
+        &mut self,
+        response: cockpit_core::daemon::proto::Response,
+    ) -> bool {
+        let cockpit_core::daemon::proto::Response::InventoryBundle {
+            selected_agent,
+            agents,
+            models,
+            skills,
+            session_generation,
+            config_generation,
+            inventory_generation,
+        } = response
+        else {
+            return false;
+        };
+        let Some(ticket) = self.inventory.in_flight.clone() else {
+            return false;
+        };
+        let snap = inventory::InventorySnapshot {
+            selected_agent,
+            agents,
+            models,
+            skills,
+            session_generation,
+            config_generation,
+            inventory_generation,
+        };
+        let applied = self.inventory.apply_success(&ticket, snap);
+        if applied {
+            self.refresh_skill_commands();
+        } else if self.inventory.take_dirty_replacement() {
+            self.request_inventory_refresh(false);
+        }
+        applied
+    }
+
+    /// Apply inventory/config invalidation from a daemon event.
+    pub(super) fn on_inventory_invalidation(
+        &mut self,
+        config_generation: Option<u64>,
+        inventory_generation: Option<u64>,
+    ) {
+        self.inventory
+            .on_invalidation(config_generation, inventory_generation);
+        if self.inventory.take_dirty_replacement() {
+            self.request_inventory_refresh(false);
+        }
     }
 
     pub(super) fn push_agent_path_child(&mut self, parent: &str, child: &str) {

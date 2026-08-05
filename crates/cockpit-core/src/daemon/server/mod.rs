@@ -334,9 +334,23 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             info: _,
             created: _,
         } => {}
-        proto::Response::Skills { skills } => {
+        proto::Response::InventoryBundle {
+            selected_agent: _,
+            agents,
+            models,
+            skills,
+            session_generation: _,
+            config_generation: _,
+            inventory_generation: _,
+        } => {
             for skill in skills {
                 scrub_skill_summary(skill, redact);
+            }
+            for agent in agents {
+                scrub_agent_summary(agent, redact);
+            }
+            for model in models {
+                scrub_model_summary(model, redact);
             }
         }
         proto::Response::ResourceSnapshot { snapshot } => {
@@ -358,16 +372,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         proto::Response::ScheduledJobDeleted { id: _, deleted: _ } => {}
         proto::Response::ScheduledJobRunQueued { id: _ } => {}
-        proto::Response::Agents { agents } => {
-            for agent in agents {
-                scrub_agent_summary(agent, redact);
-            }
-        }
-        proto::Response::Models { models } => {
-            for model in models {
-                scrub_model_summary(model, redact);
-            }
-        }
         proto::Response::FsList {
             entries,
             truncated: _,
@@ -1327,6 +1331,11 @@ fn scrub_model_summary(model: &mut proto::ModelSummary, redact: &RedactionTable)
         id: _,
         display_name,
         favorite: _,
+        trust: _,
+        reasoning_effort: _,
+        thinking_modes: _,
+        available: _,
+        native_provider_valid: _,
     } = model;
     scrub_option_string(display_name, redact);
 }
@@ -2328,6 +2337,7 @@ pub(super) struct SharedAttachedSession {
     session_id: Uuid,
     project_root: PathBuf,
     redaction_table: Arc<RedactionTable>,
+    #[allow(dead_code)] // retained for attach-time toolbox identity snapshots
     active_tool_names: Vec<String>,
 }
 
@@ -3605,6 +3615,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+pub(crate) mod inventory;
 mod sessions;
 #[cfg(test)]
 mod tests;

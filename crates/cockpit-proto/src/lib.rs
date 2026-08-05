@@ -961,6 +961,15 @@ pub enum ErrorCode {
     /// (removed, cancelled, or rejected by preflight) and must never be
     /// executed by a later worker epoch.
     UserMessageTerminated,
+    /// Requested agent is not a chat-ownable primary in the acquired snapshot.
+    UnknownAgent,
+    /// An inventory collection exceeded a hard response bound.
+    InventoryTooLarge,
+    /// Config is invalid; the daemon retained the last valid snapshot and
+    /// cannot build a fresh inventory from the broken config.
+    InvalidConfig,
+    /// A dependency required to serve inventory is temporarily unavailable.
+    Unavailable,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -999,6 +1008,10 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "workspace_trust" => Self::WorkspaceTrust,
             "user_message_not_accepted" => Self::UserMessageNotAccepted,
             "user_message_terminated" => Self::UserMessageTerminated,
+            "unknown_agent" => Self::UnknownAgent,
+            "inventory_too_large" => Self::InventoryTooLarge,
+            "invalid_config" => Self::InvalidConfig,
+            "unavailable" => Self::Unavailable,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -1024,6 +1037,10 @@ impl std::fmt::Display for ErrorCode {
             Self::WorkspaceTrust => "workspace_trust",
             Self::UserMessageNotAccepted => "user_message_not_accepted",
             Self::UserMessageTerminated => "user_message_terminated",
+            Self::UnknownAgent => "unknown_agent",
+            Self::InventoryTooLarge => "inventory_too_large",
+            Self::InvalidConfig => "invalid_config",
+            Self::Unavailable => "unavailable",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -1534,6 +1551,22 @@ pub struct ModelSummary {
     pub id: String,
     pub display_name: Option<String>,
     pub favorite: bool,
+    /// Daemon-resolved trust for the picker; never credentials.
+    pub trust: cockpit_config::config::providers::ModelTrust,
+    /// Reasoning-effort capability projection for the picker, already
+    /// restricted for native-provider validity (e.g. Anthropic native).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<cockpit_config::config::providers::ReasoningEffortCapability>,
+    /// Thinking modes the picker may offer for this model. Empty for
+    /// native Anthropic (no free-form thinking modes on that wire).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_modes: Vec<cockpit_config::config::providers::ThinkingMode>,
+    /// Whether availability policy permits selecting this model in the
+    /// current inventory context.
+    pub available: bool,
+    /// False when the provider/model pair fails native-provider validation
+    /// (for example Anthropic native with an invalid model configuration).
+    pub native_provider_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2174,6 +2207,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "fs_write",
         "git_diff_file",
         "git_status",
+        "get_inventory_bundle",
         "list_sessions",
         "read_history_page",
         "read_session_messages",
@@ -2203,7 +2237,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "git_diff_file",
         "git_status",
         "history_page",
-        "models",
+        "inventory_bundle",
         "restart_decision",
         "session_messages",
         "sessions",

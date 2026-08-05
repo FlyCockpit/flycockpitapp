@@ -246,8 +246,16 @@ pub enum Response {
         created: bool,
     },
 
-    Skills {
+    /// Answer to [`Request::GetInventoryBundle`]: one atomic projection of
+    /// agents, models, and selected-agent skills with a single generation triple.
+    InventoryBundle {
+        selected_agent: String,
+        agents: Vec<AgentSummary>,
+        models: Vec<ModelSummary>,
         skills: Vec<SkillSummary>,
+        session_generation: u64,
+        config_generation: u64,
+        inventory_generation: u64,
     },
 
     /// Answer to [`Request::ResourceSnapshot`].
@@ -277,14 +285,6 @@ pub enum Response {
 
     ScheduledJobRunQueued {
         id: String,
-    },
-
-    Agents {
-        agents: Vec<AgentSummary>,
-    },
-
-    Models {
-        models: Vec<ModelSummary>,
     },
 
     FsList {
@@ -487,15 +487,13 @@ macro_rules! response_variants {
             (Response::SessionLiveStatus { .. }, "session_live_status");
             (Response::Forked { .. }, "forked");
             (Response::BtwFork { .. }, "btw_fork");
-            (Response::Skills { .. }, "skills");
+            (Response::InventoryBundle { .. }, "inventory_bundle");
             (Response::ResourceSnapshot { .. }, "resource_snapshot");
             (Response::PromoteResourceResult { .. }, "promote_resource_result");
             (Response::ScheduledJob { .. }, "scheduled_job");
             (Response::ScheduledJobs { .. }, "scheduled_jobs");
             (Response::ScheduledJobDeleted { .. }, "scheduled_job_deleted");
             (Response::ScheduledJobRunQueued { .. }, "scheduled_job_run_queued");
-            (Response::Agents { .. }, "agents");
-            (Response::Models { .. }, "models");
             (Response::FsList { .. }, "fs_list");
             (Response::FsStat { .. }, "fs_stat");
             (Response::FsRead { .. }, "fs_read");

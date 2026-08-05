@@ -47,6 +47,7 @@ const FIXTURE_DIALOG_LOCKOUT_MS: u64 = 2500;
 /// `load_for_cwd(cwd).tui.use_emojis`
 const FIXTURE_USE_EMOJIS: bool = false;
 /// `ordered_model_choices(cwd, &counts)` → `(provider_id, model_id, is_favorite, mode)`
+#[allow(dead_code)]
 fn fixture_model_ordering() -> Vec<(String, String, bool, LlmMode)> {
     vec![
         ("p".to_string(), "a".to_string(), true, LlmMode::Normal),
@@ -190,21 +191,17 @@ fn config_snapshot_values_match_previous_resolution() {
         app.config_snapshot.extended.tui.use_emojis,
         FIXTURE_USE_EMOJIS
     );
-    // Model-picker ordering: the global LLM mode is now threaded from the held
-    // snapshot (the provider list read is owned by `tui-inventory-from-daemon`).
-    let choices = with_trusted_tree(cwd, || {
-        crate::tui::model_picker::ordered_model_choices(
-            cwd,
-            app.config_snapshot.extended.llm_mode,
-            &std::collections::HashMap::new(),
-        )
-        .unwrap()
-    });
-    let ordering: Vec<(String, String, bool, LlmMode)> = choices
-        .into_iter()
-        .map(|c| (c.provider_id, c.model_id, c.is_favorite, c.mode))
-        .collect();
-    assert_eq!(ordering, fixture_model_ordering());
+    // Model-picker ordering comes from the daemon inventory projection; with
+    // no inventory snapshot yet the ordered list is empty (pre-attach).
+    let choices = crate::tui::model_picker::ordered_model_choices_from_inventory(
+        &app.inventory_models(),
+        app.config_snapshot.extended.llm_mode,
+        &std::collections::HashMap::new(),
+    );
+    assert!(
+        choices.is_empty(),
+        "pre-attach inventory models must be empty without a daemon bundle"
+    );
 }
 
 // ---- Criterion 1: no client-side config resolution remains -----------------
@@ -241,21 +238,11 @@ fn tui_has_no_config_disk_reads_outside_bootstrap() {
     let mut hits = Vec::new();
     visit(&tui_dir, &mut hits);
 
-    // The only surviving client-side provider read is `model_picker.rs`: the
-    // provider list inside `ordered_model_choices` is owned by
-    // `tui-inventory-from-daemon`, and its `#[cfg(test)] open` helper reuses it.
-    // Every other consumer renders from the held daemon snapshot.
-    for (file, line, text) in &hits {
-        assert_eq!(
-            file, "model_picker.rs",
-            "unexpected client-side config resolution at {file}:{line}: {text}"
-        );
-    }
-    assert_eq!(
-        hits.len(),
-        2,
-        "model_picker.rs should retain exactly the sibling-owned provider read \
-         and its test helper; found: {hits:?}"
+    // Inventory consumption removed secret_ref::load_effective from model_picker
+    // production paths. No non-test TUI consumer may re-resolve providers from disk.
+    assert!(
+        hits.is_empty(),
+        "unexpected client-side config resolution outside bootstrap: {hits:?}"
     );
 }
 
@@ -617,7 +604,7 @@ fn detached_tui_renders_from_bootstrap_without_disk_reads() {
 
     reset_config_counters();
     // Reading rendered config off the held snapshot must not touch disk.
-    let _ = app.visible_skills();
+    let _ = app.visible_skill_summaries();
     let _ = app.config_snapshot.extended.tui.use_emojis;
     assert_eq!(load_for_cwd_count(), 0);
     assert_eq!(load_effective_count(), 0);

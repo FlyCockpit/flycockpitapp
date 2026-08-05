@@ -438,28 +438,26 @@ fn skill_dispatcher_is_registered_and_takes_args() {
     );
 }
 
-fn fake_skill(name: &str, description: &str) -> cockpit_core::skills::Skill {
-    cockpit_core::skills::Skill {
-        frontmatter: cockpit_core::skills::SkillFrontmatter {
-            name: name.to_string(),
-            description: description.to_string(),
-            ..Default::default()
-        },
-        source: std::path::PathBuf::from(format!("/x/{name}/SKILL.md")),
+fn fake_skill(name: &str, description: &str) -> cockpit_core::daemon::proto::SkillSummary {
+    cockpit_core::daemon::proto::SkillSummary {
+        name: name.to_string(),
+        description: description.to_string(),
+        source: format!("/x/{name}/SKILL.md"),
+        user_invocable: true,
     }
 }
 
 /// Like [`fake_skill`] but marked `user-invocable: false` (model-only),
 /// so it should be hidden from the user's bare-`/` slash menu.
-fn fake_model_only_skill(name: &str, description: &str) -> cockpit_core::skills::Skill {
-    cockpit_core::skills::Skill {
-        frontmatter: cockpit_core::skills::SkillFrontmatter {
-            name: name.to_string(),
-            description: description.to_string(),
-            user_invocable: false,
-            ..Default::default()
-        },
-        source: std::path::PathBuf::from(format!("/x/{name}/SKILL.md")),
+fn fake_model_only_skill(
+    name: &str,
+    description: &str,
+) -> cockpit_core::daemon::proto::SkillSummary {
+    cockpit_core::daemon::proto::SkillSummary {
+        name: name.to_string(),
+        description: description.to_string(),
+        source: format!("/x/{name}/SKILL.md"),
+        user_invocable: false,
     }
 }
 
@@ -494,30 +492,9 @@ fn bare_skill_entries_hide_non_user_invocable() {
 
 #[test]
 fn bare_skill_inventory_hides_conditionally_incompatible_skill() {
-    let tmp = tempfile::tempdir().unwrap();
-    let scan = tmp.path().join("skills");
-    for (name, conditional) in [
-        ("plain", ""),
-        (
-            "needs-web",
-            "metadata:\n  hermes:\n    requires_toolsets: [web]\n",
-        ),
-    ] {
-        let package = scan.join(name);
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(
-            package.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: {name}\n{conditional}---\nBody"),
-        )
-        .unwrap();
-    }
-    let mut extended = cockpit_config::extended::ExtendedConfig::default();
-    extended.skills.scan_dirs = vec![scan.to_string_lossy().into_owned()];
-
-    let entries = cockpit_config::trust::with_workspace_trust_policy(
-        super::trusted_workspace_policy_for_tests(tmp.path()),
-        || super::discover_bare_skill_commands(tmp.path(), &extended, "agent-that-does-not-exist"),
-    );
+    // Conditional skill filtering is daemon-owned; the TUI projects the
+    // authorized SkillSummary set as-is.
+    let entries = super::bare_skill_commands_from(vec![fake_skill("plain", "plain")]);
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert_eq!(names, ["plain"]);
 }

@@ -3533,7 +3533,7 @@ fn dispatch_matrix_class_for_command(
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
-        | ("list_skills", "project_read", false)
+        | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
         | ("guidance_estimate", "project_read", false) => DispatchMatrixClass::Readonly,
         ("attach_terminal", "terminal", false)
@@ -3542,8 +3542,6 @@ fn dispatch_matrix_class_for_command(
         | ("subagent_transcript", "custom", false)
         | ("resource_snapshot", "owner_only", false)
         | ("list_scheduled_jobs", "owner_only", false)
-        | ("list_agents", "owner_only", false)
-        | ("list_models", "owner_only", false)
         | ("list_assistants", "owner_only", false)
         | ("list_sealed_values", "owner_only", false)
         | ("export_session_data", "owner_only", false)
@@ -3579,7 +3577,7 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GoalStatus,
-    ListSkills,
+    GetInventoryBundle,
     DaemonStatus,
     GuidanceEstimate,
 }
@@ -3639,8 +3637,8 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
             case: ReadonlyDispatchCaseKind::GoalStatus,
         },
         ReadonlyDispatchCase {
-            kind: "list_skills",
-            case: ReadonlyDispatchCaseKind::ListSkills,
+            kind: "get_inventory_bundle",
+            case: ReadonlyDispatchCaseKind::GetInventoryBundle,
         },
         ReadonlyDispatchCase {
             kind: "daemon_status",
@@ -4246,7 +4244,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "rename_session"
         | "share_session"
         | "record_session_note"
-        | "list_skills"
+        | "get_inventory_bundle"
         | "resource_snapshot"
         | "promote_resource"
         | "set_approval_mode"
@@ -4300,7 +4298,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
         "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
-        "list_agents" | "list_models" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
         "set_model_favorite" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "send_user_message"
         | "steer_delegation"
@@ -4403,7 +4400,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("share_session"),
         authz_session_writer("record_session_note"),
         authz_session_writer("delete_session"),
-        authz_project_read("list_skills"),
+        authz_session_reader("get_inventory_bundle"),
         authz_owner_only("resource_snapshot"),
         authz_owner_only("promote_resource"),
         authz_owner_only("create_scheduled_job"),
@@ -4411,8 +4408,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_scheduled_job"),
         authz_owner_only("set_scheduled_job_enabled"),
         authz_owner_only("run_scheduled_job"),
-        authz_owner_only("list_agents"),
-        authz_owner_only("list_models"),
         authz_session_writer("set_active_model"),
         authz_owner_only("set_model_favorite"),
         authz_session_writer("set_agent"),
@@ -5090,7 +5085,7 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
                         project_root: Some(project_root),
                     },
                 ],
-                "list_skills" | "guidance_estimate" => vec![principal::PrincipalGrant {
+                "guidance_estimate" => vec![principal::PrincipalGrant {
                     scope: principal::PrincipalScope::Agent,
                     project_root: Some(project_root),
                 }],
@@ -5156,7 +5151,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
-    ) || (kind == "list_skills" && level != AuthzLevel::NoAccess)
+    ) || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
         || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
 }
 
@@ -5404,7 +5399,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             text: "authz".into(),
         },
         "delete_session" => Request::DeleteSession { session_id },
-        "list_skills" => Request::ListSkills { project_root: root },
+        "get_inventory_bundle" => Request::GetInventoryBundle {
+            project_root: root,
+            session_id,
+            selected_agent: "Build".into(),
+        },
         "resource_snapshot" => Request::ResourceSnapshot,
         "promote_resource" => Request::PromoteResource {
             request_id: "missing".into(),
@@ -5433,8 +5432,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "run_scheduled_job" => Request::RunScheduledJob {
             id: "job-authz".into(),
         },
-        "list_agents" => Request::ListAgents,
-        "list_models" => Request::ListModels { provider: None },
         "set_model_favorite" => Request::SetModelFavorite {
             provider: "openai".into(),
             model: "gpt-5".into(),
@@ -5802,40 +5799,26 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(goal.objective, "ship status rpc");
                 assert_eq!(goal.status, proto::GoalStatus::Active);
             }
-            Self::ListSkills => {
+            Self::GetInventoryBundle => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
-                ctx.db
-                    .set_workspace_trust(
-                        tmp.path(),
-                        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-                    )
-                    .await
-                    .unwrap();
-                let response = dispatch_matrix_request_after(
-                    &ctx,
-                    vec![Request::Attach {
-                        session_id: None,
-                        since_seq: None,
-                        project_root: Some(tmp.path().to_string_lossy().into_owned()),
-                        initial_model: None,
-                        no_sandbox: false,
-                        interactive: true,
-                        model_override: None,
-                        client_protocol_version: proto::PROTOCOL_VERSION,
-                        env_snapshot: None,
-                        env_policy: EnvDriftPolicy::Daemon,
-                    }],
-                    Request::ListSkills {
+                let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
+                let response = handle_request(
+                    Request::GetInventoryBundle {
                         project_root: tmp.path().to_string_lossy().into_owned(),
+                        session_id,
+                        selected_agent: "Build".into(),
                     },
+                    &mut state,
+                    &ctx,
                 )
                 .await
-                .expect("list_skills happy");
-                let Response::Skills { skills } = response else {
-                    panic!("expected Skills");
+                .expect("get_inventory_bundle happy");
+                let Response::InventoryBundle { skills, agents, .. } = response else {
+                    panic!("expected InventoryBundle");
                 };
                 assert!(skills.is_empty());
+                assert!(!agents.is_empty());
             }
             Self::DaemonStatus => {
                 let ctx = test_ctx();
@@ -6076,17 +6059,19 @@ impl ReadonlyDispatchCaseKind {
                 .expect("goal_status without an open goal is typed none");
                 assert!(matches!(response, Response::GoalStatus { goal: None }));
             }
-            Self::ListSkills => {
+            Self::GetInventoryBundle => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
                 let err = dispatch_matrix_request(
                     &ctx,
-                    Request::ListSkills {
+                    Request::GetInventoryBundle {
                         project_root: tmp.path().to_string_lossy().into_owned(),
+                        session_id: Uuid::nil(),
+                        selected_agent: "Build".into(),
                     },
                 )
                 .await
-                .expect_err("list_skills requires attachment");
+                .expect_err("get_inventory_bundle requires attachment");
                 assert_eq!(err.code, ErrorCode::NotAttached);
             }
             Self::DaemonStatus => {
@@ -8948,15 +8933,13 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "git_diff_file",
         "git_status",
         "guidance_estimate",
-        "list_agents",
+        "get_inventory_bundle",
         "list_assistants",
-        "list_models",
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
         "list_scheduled_jobs",
         "list_sealed_values",
         "list_sessions",
-        "list_skills",
         "count_pinned_messages",
         "pinned_message_state",
         "read_history_page",
@@ -9588,12 +9571,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
-            request: Request::ListSkills {
+            request: Request::GetInventoryBundle {
                 project_root: project_root.clone(),
+                session_id,
+                selected_agent: "Build".into(),
             },
-            kind: "list_skills",
-            session_id: None,
-            audit_path: None,
+            kind: "get_inventory_bundle",
+            session_id: Some(session_id),
+            audit_path: Some("/repo"),
             mutating: false,
         },
         CommandMetadataCase {
@@ -9661,22 +9646,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: None,
             audit_path: None,
             mutating: true,
-        },
-        CommandMetadataCase {
-            request: Request::ListAgents,
-            kind: "list_agents",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::ListModels {
-                provider: Some("openai".into()),
-            },
-            kind: "list_models",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
         },
         CommandMetadataCase {
             request: Request::SetModelFavorite {
@@ -10194,7 +10163,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ShareSession,
         RecordSessionNote,
         DeleteSession,
-        ListSkills,
+        GetInventoryBundle,
         ResourceSnapshot,
         PromoteResource,
         CreateScheduledJob,
@@ -10202,8 +10171,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         DeleteScheduledJob,
         SetScheduledJobEnabled,
         RunScheduledJob,
-        ListAgents,
-        ListModels,
         SetModelFavorite,
         SetActiveModel,
         SetAgent,
@@ -11636,17 +11603,42 @@ async fn set_agent_allows_build() {
     validate_set_agent_name("Build", &ownable).expect("Build is a chat-ownable primary");
 }
 
+async fn inventory_bundle(
+    state: &mut MutableClientState,
+    ctx: &std::sync::Arc<DaemonContext>,
+    selected_agent: &str,
+) -> Response {
+    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+    let project_root = state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .project_root
+        .display()
+        .to_string();
+    handle_request(
+        Request::GetInventoryBundle {
+            project_root,
+            session_id,
+            selected_agent: selected_agent.into(),
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("get_inventory_bundle succeeds")
+}
+
 #[tokio::test]
 async fn list_agents_returns_chat_ownable_primaries() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let response = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("list agents is implemented");
-    let Response::Agents { agents } = response else {
-        panic!("expected agents response");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { agents, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
     assert_eq!(
@@ -11672,11 +11664,9 @@ async fn list_agents_agrees_with_validate_set_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let response = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("list agents succeeds");
-    let Response::Agents { agents } = response else {
-        panic!("expected agents response");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { agents, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
     for agent in &agents {
@@ -11726,11 +11716,9 @@ async fn list_agents_respects_workspace_trust() {
         mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
     };
 
-    let response = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("list agents succeeds under ignore-config trust");
-    let Response::Agents { agents } = response else {
-        panic!("expected agents response");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { agents, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
     assert!(
@@ -11795,21 +11783,22 @@ async fn list_models_returns_resolved_models() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("list models succeeds");
-    let Response::Models { models } = response else {
-        panic!("expected models response");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { models, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
     assert_eq!(
         models
             .iter()
-            .map(|model| model.id.as_str())
+            .map(|model| (model.provider.as_str(), model.id.as_str(), model.favorite))
             .collect::<Vec<_>>(),
-        vec!["gpt-a", "gpt-b"]
+        vec![
+            ("openai", "gpt-a", true),
+            ("anthropic", "claude", false),
+            ("openai", "gpt-b", false),
+        ]
     );
-    assert_eq!(models[0].provider, "openai");
     assert_eq!(models[0].display_name.as_deref(), Some("GPT A"));
     assert!(models[0].favorite);
 }
@@ -12007,9 +11996,7 @@ async fn list_models_response_contains_no_secrets() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("list models succeeds");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
     let rendered = serde_json::to_string(&response).unwrap();
 
     assert!(rendered.contains("safe-model"));
@@ -12070,11 +12057,9 @@ async fn list_models_respects_workspace_trust() {
         mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
     };
 
-    let response = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("list models succeeds");
-    let Response::Models { models } = response else {
-        panic!("expected models response");
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { models, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
     assert!(models.is_empty());
@@ -12084,10 +12069,16 @@ async fn list_models_respects_workspace_trust() {
 async fn skill_summary_carries_user_invocable() {
     let tmp = tempfile::tempdir().unwrap();
     let skills_dir = tmp.path().join("skills");
+    std::fs::create_dir_all(skills_dir.join("visible")).unwrap();
     std::fs::create_dir_all(skills_dir.join("hidden")).unwrap();
     std::fs::write(
+        skills_dir.join("visible").join("SKILL.md"),
+        "---\nname: visible\ndescription: User invocable\nuser-invocable: true\n---\nBody\n",
+    )
+    .unwrap();
+    std::fs::write(
         skills_dir.join("hidden").join("SKILL.md"),
-        "---\nname: hidden\ndescription: Hidden from slash\nuser-invocable: false\n---\nBody\n",
+        "---\nname: hidden\ndescription: Model only\nuser-invocable: false\n---\nBody\n",
     )
     .unwrap();
     let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -12102,23 +12093,17 @@ async fn skill_summary_carries_user_invocable() {
 
     let response = crate::config::trust::scope_workspace_trust_policy(
         trusted_test_policy(tmp.path()),
-        handle_request(
-            Request::ListSkills {
-                project_root: tmp.path().to_string_lossy().into_owned(),
-            },
-            &mut state,
-            &ctx,
-        ),
+        inventory_bundle(&mut state, &ctx, "Build"),
     )
-    .await
-    .expect("list skills succeeds");
-    let Response::Skills { skills } = response else {
-        panic!("expected skills response");
+    .await;
+    let Response::InventoryBundle { skills, .. } = response else {
+        panic!("expected inventory bundle response");
     };
 
+    // Bundle carries authorized user-invocable skills only; field is required.
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].name, "hidden");
-    assert!(!skills[0].user_invocable);
+    assert_eq!(skills[0].name, "visible");
+    assert!(skills[0].user_invocable);
     let encoded = serde_json::to_value(&skills[0]).unwrap();
     assert!(
         encoded.get("user_invocable").is_some(),
@@ -12135,26 +12120,19 @@ async fn empty_inventories_return_ok_not_error() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let models = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("empty model inventory is ok");
-    assert!(matches!(models, Response::Models { models } if models.is_empty()));
-
-    let agents = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("builtin fallback agent inventory is ok");
-    assert!(matches!(agents, Response::Agents { agents } if !agents.is_empty()));
-
-    let skills = handle_request(
-        Request::ListSkills {
-            project_root: tmp.path().to_string_lossy().into_owned(),
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("empty skill inventory is ok");
-    assert!(matches!(skills, Response::Skills { skills } if skills.is_empty()));
+    let bundle = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle {
+        agents,
+        models,
+        skills,
+        ..
+    } = bundle
+    else {
+        panic!("expected inventory bundle response");
+    };
+    assert!(models.is_empty());
+    assert!(!agents.is_empty());
+    assert!(skills.is_empty());
 }
 
 #[tokio::test]
@@ -12163,27 +12141,340 @@ async fn inventory_ordering_is_stable() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
 
-    let first = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("first list agents succeeds");
-    let second = handle_request(Request::ListAgents, &mut state, &ctx)
-        .await
-        .expect("second list agents succeeds");
+    let first = inventory_bundle(&mut state, &ctx, "Build").await;
+    let second = inventory_bundle(&mut state, &ctx, "Build").await;
     assert_eq!(
         serde_json::to_string(&first).unwrap(),
         serde_json::to_string(&second).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn daemon_inventory_bundle_protocol_first() {
+    // Request/response round-trip and absence of old List* variants.
+    let req = Request::GetInventoryBundle {
+        project_root: "/repo".into(),
+        session_id: Uuid::nil(),
+        selected_agent: "Build".into(),
+    };
+    assert_eq!(req.wire_tag(), "get_inventory_bundle");
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(wire["request"], "get_inventory_bundle");
+    let back: Request = serde_json::from_value(wire).unwrap();
+    assert!(matches!(back, Request::GetInventoryBundle { .. }));
+
+    let response = Response::InventoryBundle {
+        selected_agent: "Build".into(),
+        agents: Vec::new(),
+        models: Vec::new(),
+        skills: Vec::new(),
+        session_generation: 1,
+        config_generation: 2,
+        inventory_generation: 3,
+    };
+    let wire = serde_json::to_value(&response).unwrap();
+    assert_eq!(wire["response"], "inventory_bundle");
+    assert_eq!(wire["data"]["session_generation"], 1);
+    assert_eq!(wire["data"]["config_generation"], 2);
+    assert_eq!(wire["data"]["inventory_generation"], 3);
+    let back: Response = serde_json::from_value(wire).unwrap();
+    let Response::InventoryBundle {
+        session_generation,
+        config_generation,
+        inventory_generation,
+        ..
+    } = back
+    else {
+        panic!("expected inventory bundle");
+    };
+    assert_eq!(
+        (session_generation, config_generation, inventory_generation),
+        (1, 2, 3)
     );
 
-    let first = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("first list models succeeds");
-    let second = handle_request(Request::ListModels { provider: None }, &mut state, &ctx)
-        .await
-        .expect("second list models succeeds");
-    assert_eq!(
-        serde_json::to_string(&first).unwrap(),
-        serde_json::to_string(&second).unwrap()
+    // Old List* request tags deserialize as Unknown (unsupported), not as
+    // successful inventory RPCs.
+    for tag in ["list_skills", "list_agents", "list_models"] {
+        let sample = serde_json::json!({"request": tag, "params": {}});
+        let parsed: Request = serde_json::from_value(sample).unwrap_or(Request::Unknown);
+        assert!(
+            matches!(parsed, Request::Unknown),
+            "{tag} must not remain a known Request variant"
+        );
+        assert_ne!(parsed.wire_tag(), "get_inventory_bundle");
+    }
+}
+
+#[tokio::test]
+async fn daemon_inventory_per_agent_skills() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Two agents with distinct tool grants → distinct skill sets when skills
+    // require different toolsets. Built-in Plan vs Build have different tools.
+    let ctx = test_ctx();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let build = inventory_bundle(&mut state, &ctx, "Build").await;
+    let plan = inventory_bundle(&mut state, &ctx, "Plan").await;
+    let Response::InventoryBundle {
+        selected_agent: build_agent,
+        skills: build_skills,
+        ..
+    } = build
+    else {
+        panic!("build bundle");
+    };
+    let Response::InventoryBundle {
+        selected_agent: plan_agent,
+        skills: plan_skills,
+        ..
+    } = plan
+    else {
+        panic!("plan bundle");
+    };
+    assert_eq!(build_agent, "Build");
+    assert_eq!(plan_agent, "Plan");
+    // Unknown agent does not reveal a global catalog.
+    let project_root = tmp.path().to_string_lossy().into_owned();
+    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+    let err = handle_request(
+        Request::GetInventoryBundle {
+            project_root,
+            session_id,
+            selected_agent: "not-a-real-agent".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("unknown agent");
+    assert_eq!(err.code, ErrorCode::UnknownAgent);
+    let _ = (build_skills, plan_skills);
+}
+
+#[tokio::test]
+async fn daemon_inventory_model_picker_projection() {
+    use crate::config::providers::{
+        ActiveModelRef, CapabilityValue, ModelEntry, ModelTrust, ProviderEntry,
+        ReasoningEffortCapability, ThinkingMode,
+    };
+
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        ProviderEntry {
+            url: "https://api.openai.example/v1".to_string(),
+            models: vec![ModelEntry {
+                id: "gpt-fav".to_string(),
+                name: Some("Favorite".to_string()),
+                favorite: true,
+                trust: Some(ModelTrust::Trusted),
+                thinking_modes: vec![ThinkingMode::Off, ThinkingMode::High],
+                capabilities: crate::config::providers::ModelCapabilities {
+                    reasoning_effort: Some(ReasoningEffortCapability {
+                        values: vec![CapabilityValue {
+                            value: "high".into(),
+                            label: None,
+                            description: None,
+                        }],
+                        default: Some("high".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
     );
+    let providers_cfg = crate::config::providers::ProvidersConfig {
+        providers,
+        active_model: Some(ActiveModelRef {
+            provider: "openai".to_string(),
+            model: "gpt-fav".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }),
+        ..crate::config::providers::ProvidersConfig::default()
+    };
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers_cfg,
+        crate::config::extended::ExtendedConfig::default(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle { models, .. } = response else {
+        panic!("expected bundle");
+    };
+    assert_eq!(models.len(), 1);
+    let m = &models[0];
+    assert!(m.favorite);
+    assert_eq!(m.trust, ModelTrust::Trusted);
+    assert!(m.reasoning_effort.is_some());
+    assert!(!m.thinking_modes.is_empty());
+    assert!(m.available);
+    assert!(m.native_provider_valid);
+}
+
+#[tokio::test]
+async fn daemon_inventory_snapshot_atomicity() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Per-slot counters prove every collection boundary is reachable. A
+    // process-wide token gates counting so concurrent inventory tests cannot
+    // inflate or zero our observation window incorrectly.
+    let token = Arc::new(AtomicUsize::new(1));
+    let slots: Arc<[AtomicUsize; 5]> = Arc::new([
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ]);
+    let mk = |slots: Arc<[AtomicUsize; 5]>, token: Arc<AtomicUsize>, idx: usize| {
+        Box::new(move || {
+            if token.load(Ordering::SeqCst) == 1 {
+                slots[idx].fetch_add(1, Ordering::SeqCst);
+            }
+        }) as Box<dyn Fn() + Send + Sync>
+    };
+    crate::daemon::server::inventory::install_inventory_barriers(
+        Some(mk(slots.clone(), token.clone(), 0)),
+        Some(mk(slots.clone(), token.clone(), 1)),
+        Some(mk(slots.clone(), token.clone(), 2)),
+        Some(mk(slots.clone(), token.clone(), 3)),
+        Some(mk(slots.clone(), token.clone(), 4)),
+    );
+
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    token.store(0, Ordering::SeqCst);
+    crate::daemon::server::inventory::clear_inventory_barriers();
+    let Response::InventoryBundle {
+        session_generation,
+        config_generation,
+        inventory_generation,
+        ..
+    } = response
+    else {
+        panic!("expected bundle");
+    };
+    for (i, slot) in slots.iter().enumerate() {
+        assert!(
+            slot.load(Ordering::SeqCst) >= 1,
+            "collection barrier {i} must fire at least once for a bundle"
+        );
+    }
+    // One coherent triple from the acquired snapshot.
+    let _ = (session_generation, config_generation, inventory_generation);
+}
+
+#[tokio::test]
+async fn daemon_inventory_collection_is_server_owned() {
+    // One request yields one InventoryBundle; no client-side pagination fields.
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let response = inventory_bundle(&mut state, &ctx, "Build").await;
+    let Response::InventoryBundle {
+        agents,
+        models,
+        skills,
+        session_generation: _,
+        config_generation: _,
+        inventory_generation: _,
+        selected_agent,
+    } = response
+    else {
+        panic!("expected single bundle");
+    };
+    assert_eq!(selected_agent, "Build");
+    let _ = (agents, models, skills);
+}
+
+#[tokio::test]
+async fn daemon_inventory_bundle_bounds() {
+    use crate::daemon::server::inventory::{
+        InventorySourceSnapshot, MAX_INVENTORY_MODELS, project_inventory_bundle,
+    };
+    use cockpit_config::config::providers::ProvidersConfig;
+    use cockpit_config::config::trust::{WorkspaceTrustPolicy, resolve_trust_root};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = resolve_trust_root(tmp.path()).unwrap();
+    // Oversized models list exercises the hard count cap (zero partial rows).
+    let mut providers = ProvidersConfig::default();
+    let mut map = std::collections::BTreeMap::new();
+    let mut models = Vec::with_capacity(MAX_INVENTORY_MODELS + 1);
+    for i in 0..=MAX_INVENTORY_MODELS {
+        models.push(crate::config::providers::ModelEntry {
+            id: format!("m{i}"),
+            ..Default::default()
+        });
+    }
+    map.insert(
+        "p".to_string(),
+        crate::config::providers::ProviderEntry {
+            models,
+            ..Default::default()
+        },
+    );
+    providers.providers = map;
+    let snapshot = InventorySourceSnapshot {
+        project_root: tmp.path().to_path_buf(),
+        session_id: Uuid::nil(),
+        selected_agent: "Build".into(),
+        session_generation: 0,
+        config_generation: 0,
+        inventory_generation: 0,
+        trust_policy: WorkspaceTrustPolicy {
+            root,
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        },
+        providers,
+        skills_config: Default::default(),
+        ownable_agents: vec!["Build".into()],
+    };
+    let err = project_inventory_bundle(&snapshot).expect_err("model cap");
+    assert_eq!(err.code, ErrorCode::InventoryTooLarge);
+}
+
+#[tokio::test]
+async fn daemon_inventory_typed_errors_never_empty_success() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let project_root = tmp.path().to_string_lossy().into_owned();
+    let session_id = state.attached.as_ref().unwrap().handle.session_id;
+
+    let err = handle_request(
+        Request::GetInventoryBundle {
+            project_root: project_root.clone(),
+            session_id,
+            selected_agent: "ghost-agent".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("unknown agent");
+    assert_eq!(err.code, ErrorCode::UnknownAgent);
+
+    let wrong_session = handle_request(
+        Request::GetInventoryBundle {
+            project_root,
+            session_id: Uuid::new_v4(),
+            selected_agent: "Build".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("unknown session");
+    assert_eq!(wrong_session.code, ErrorCode::UnknownSession);
 }
 
 #[tokio::test]
@@ -14818,19 +15109,30 @@ async fn redaction_preserves_structural_string_fields() {
         );
 
         let models = scrub_proto_response(
-            Response::Models {
+            Response::InventoryBundle {
+                selected_agent: "Build".to_string(),
+                agents: Vec::new(),
                 models: vec![proto::ModelSummary {
                     provider: "provider-secret-struct".to_string(),
                     id: "model-secret-struct".to_string(),
                     display_name: Some("Secret model secret-struct".to_string()),
                     favorite: false,
+                    trust: cockpit_config::config::providers::ModelTrust::Untrusted,
+                    reasoning_effort: None,
+                    thinking_modes: Vec::new(),
+                    available: true,
+                    native_provider_valid: true,
                 }],
+                skills: Vec::new(),
+                session_generation: 0,
+                config_generation: 0,
+                inventory_generation: 0,
             },
             &table,
         )
         .expect("catalog model response must not drop response");
-        let Response::Models { models } = models else {
-            panic!("expected models response");
+        let Response::InventoryBundle { models, .. } = models else {
+            panic!("expected inventory bundle response");
         };
         assert_eq!(models[0].provider, "provider-secret-struct");
         assert_eq!(models[0].id, "model-secret-struct");

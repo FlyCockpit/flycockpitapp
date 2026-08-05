@@ -24,6 +24,9 @@ pub(in crate::tui) mod help_overlay;
 mod history_log;
 mod history_window;
 mod input;
+mod inventory;
+#[cfg(test)]
+mod inventory_tests;
 mod local_commands;
 mod model_controls;
 mod models_refresh;
@@ -70,8 +73,7 @@ use slash::{
 };
 use slash::{
     SkillCommand, SlashCommand, SlashEntry, SlashMenuCache, bare_skill_commands_from,
-    discover_bare_skill_commands, hidden_slash_alias, sandbox_mode_label, slash_args,
-    slash_matches_in,
+    hidden_slash_alias, sandbox_mode_label, slash_args, slash_matches_in,
 };
 
 use std::cell::Cell;
@@ -1996,13 +1998,12 @@ pub struct App {
     pub(super) usage_models: HashMap<String, u64>,
     pub(super) usage_slash: HashMap<String, u64>,
     pub(super) usage_tags: HashMap<String, u64>,
-    /// Discovered skills surfaced as bare-`/<name>` slash-menu entries
-    /// (implementation note). Built once at startup from
-    /// the layered skills config; names colliding with a builtin are omitted
-    /// (the builtin wins) but stay reachable via the `/skill <name>`
-    /// dispatcher. The dispatcher re-discovers per call (so it sees colliding
-    /// + freshly-added skills regardless of this cache).
+    /// Skills surfaced as bare-`/<name>` slash-menu entries, projected from
+    /// the last complete daemon inventory snapshot. Empty pre-attach.
     pub(super) skill_commands: Vec<SkillCommand>,
+    /// Generation-aware inventory consumer (agents/models/skills from one
+    /// GetInventoryBundle).
+    pub(super) inventory: inventory::InventoryState,
     /// The attached session's project id — the scope for `tag` records.
     /// `None` until the first attach.
     pub(super) project_id: Option<String>,
@@ -2997,11 +2998,9 @@ impl App {
         timer.phase("welcome_load");
         let tui_cfg = extended.tui.clone();
         timer.phase("config_load");
-        // Discovered skills surfaced as bare-`/<name>` slash-menu entries
-        // (implementation note); builtin-colliding names are
-        // dropped here (still reachable via `/skill <name>`).
-        let skill_commands =
-            discover_bare_skill_commands(&launch.cwd, &extended, &launch.agent_name);
+        // Skills populate after the first GetInventoryBundle; pre-attach is
+        // an explicit empty/unavailable inventory, not a local walk.
+        let skill_commands = Vec::new();
         timer.phase("skill_discovery");
         let llm_mode =
             resolve_tui_llm_mode(launch.active_model.as_ref(), extended.llm_mode, &providers);
@@ -3189,6 +3188,7 @@ impl App {
             usage_slash: HashMap::new(),
             usage_tags: HashMap::new(),
             skill_commands,
+            inventory: inventory::InventoryState::default(),
             project_id: None,
             current_session_persisted: false,
             guidance_estimate: None,

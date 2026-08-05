@@ -4,7 +4,7 @@ use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionR
 use crate::tui::skills_pane::{SkillsPaneFetchResult, SkillsPaneSource};
 use cockpit_core::daemon::proto::{Request, Response, SkillSummary};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -34,16 +34,6 @@ fn app_for_skills(tmp: &tempfile::TempDir) -> App {
             )
         },
     )
-}
-
-fn write_skill(scan: &Path, dir: &str, name: &str, description: &str) {
-    let skill_dir = scan.join(dir);
-    fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(
-        skill_dir.join("SKILL.md"),
-        format!("---\nname: {name}\ndescription: {description}\n---\nBody\n"),
-    )
-    .unwrap();
 }
 
 fn open_skills_pane_trusted(app: &mut App, tmp: &tempfile::TempDir) {
@@ -144,15 +134,26 @@ async fn skills_pane_uses_attached_client_when_runner_present() {
     );
     let attached = attached_request_rx.recv().await.unwrap();
     match attached.request {
-        Request::ListSkills { project_root } => {
+        Request::GetInventoryBundle {
+            project_root,
+            selected_agent,
+            ..
+        } => {
             assert_eq!(project_root, tmp.path().to_string_lossy().into_owned());
+            assert_eq!(selected_agent, "Build");
         }
         other => panic!("unexpected request: {other:?}"),
     }
     attached
         .response_tx
-        .send(Ok(Response::Skills {
+        .send(Ok(Response::InventoryBundle {
+            selected_agent: "Build".into(),
+            agents: Vec::new(),
+            models: Vec::new(),
             skills: vec![summary("session-only", "from attached session", "/session")],
+            session_generation: 0,
+            config_generation: 0,
+            inventory_generation: 0,
         }))
         .unwrap();
 
@@ -167,24 +168,20 @@ async fn skills_pane_uses_attached_client_when_runner_present() {
 #[test]
 fn skills_pane_local_fallback_when_detached() {
     let tmp = tempfile::tempdir().unwrap();
-    let scan = tmp.path().join("skills");
-    write_skill(&scan, "local", "local-skill", "from local discovery");
     let mut app = app_for_skills(&tmp);
 
     open_skills_pane_trusted(&mut app, &tmp);
 
     assert_eq!(app.async_actions.pending_count(), 0);
     let text = skills_text(&app);
-    assert!(text.contains("local view - session-specific activation unavailable"));
-    assert!(text.contains("local-skill"));
-    assert!(!text.contains("not_attached"));
+    // Pre-attach inventory is explicitly unavailable — no local walk.
+    assert!(text.contains("inventory unavailable until attached") || text.contains("unavailable"));
+    assert!(!text.contains("local view"));
 }
 
 #[tokio::test]
 async fn skills_pane_attached_failure_degrades_to_local() {
     let tmp = tempfile::tempdir().unwrap();
-    let scan = tmp.path().join("skills");
-    write_skill(&scan, "fallback", "fallback-skill", "from local fallback");
     let mut app = app_for_skills(&tmp);
     let (attached_request_tx, mut attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
@@ -199,10 +196,9 @@ async fn skills_pane_attached_failure_degrades_to_local() {
     drain_until_idle(&mut app).await;
 
     let text = skills_text(&app);
-    assert!(text.contains("local view - session-specific activation unavailable"));
-    assert!(text.contains("fallback-skill"));
-    assert!(!text.contains("not_attached"));
-    assert!(!text.contains("skills unavailable"));
+    // Failure surfaces the daemon error; no local discovery fallback.
+    assert!(text.contains("not_attached"));
+    assert!(!text.contains("local view"));
 }
 
 #[tokio::test]
@@ -224,8 +220,6 @@ async fn skills_pane_fetch_is_async_action() {
 #[tokio::test]
 async fn skills_pane_stale_result_dropped() {
     let tmp = tempfile::tempdir().unwrap();
-    let scan = tmp.path().join("skills");
-    write_skill(&scan, "fresh", "fresh-local", "new local pane");
     let mut app = app_for_skills(&tmp);
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     app.agent_runner = Some(Ok(runner_with_attached_request_tx(attached_request_tx)));
@@ -243,10 +237,12 @@ async fn skills_pane_stale_result_dropped() {
             generation: stale_generation,
             source: SkillsPaneSource::Session,
             skills: Ok(vec![summary("stale-session", "old result", "/session")]),
+            bundle: None,
         })),
     });
 
     let text = skills_text(&app);
-    assert!(text.contains("fresh-local"));
+    // Detached reopen shows unavailable; stale attached generation is dropped.
+    assert!(text.contains("inventory unavailable until attached") || text.contains("unavailable"));
     assert!(!text.contains("stale-session"));
 }

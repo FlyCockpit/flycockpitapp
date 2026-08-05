@@ -43,6 +43,7 @@ mod startup_layout;
 mod subagent_view;
 mod terminal_controls;
 mod terminal_display;
+mod terminal_suspend;
 mod toggles;
 mod transcript_toggles;
 
@@ -108,7 +109,7 @@ use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
     ToolCallState, classify_subagent_status, route_text_delta,
 };
-use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput, with_input_suspended};
+use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
 use cockpit_core::engine::message::{QueueTarget, QueuedUserMessage};
@@ -3369,8 +3370,15 @@ impl App {
         // scroll-wheel via alternate-scroll translation. Native
         // selection still works under capture if the user holds the
         // terminal's bypass modifier (Shift / Option / Fn).
-        if self.mouse_capture && enable_mouse_capture_with_motion().is_ok() {
-            terminal_mode_guard.mark_mouse_capture_enabled();
+        // `self.mouse_capture` tracks the live TTY capture state (not merely the
+        // config preference). Only mark it active when enable succeeds so
+        // external-editor restore cannot invent capture that was never armed.
+        if self.mouse_capture {
+            if enable_mouse_capture_with_motion().is_ok() {
+                terminal_mode_guard.mark_mouse_capture_enabled();
+            } else {
+                self.mouse_capture = false;
+            }
         }
 
         let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
@@ -3459,7 +3467,10 @@ impl App {
         let mut needs_redraw = true;
 
         loop {
-            if self.service_event_loop_wake(terminal, &mut terminal_input)? {
+            if self
+                .service_event_loop_wake(terminal, &mut terminal_input)
+                .await?
+            {
                 needs_redraw = true;
             }
             if self.tick_attention_interrupt() {
@@ -3533,7 +3544,7 @@ impl App {
         Ok(())
     }
 
-    fn service_event_loop_wake(
+    async fn service_event_loop_wake(
         &mut self,
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
@@ -3563,9 +3574,15 @@ impl App {
         // scrollback (alt screen doesn't have scrollback). The
         // wheel-scroll path handles in-app scrollback instead.
         changed |= self.maybe_service_new_session(terminal)?;
-        self.maybe_service_external_edit(terminal, terminal_input)?;
-        self.maybe_service_agent_file_edit(terminal, terminal_input)?;
-        self.maybe_service_category_setting_edit(terminal, terminal_input)?;
+        changed |= self
+            .maybe_service_external_edit(terminal, terminal_input)
+            .await?;
+        changed |= self
+            .maybe_service_agent_file_edit(terminal, terminal_input)
+            .await?;
+        changed |= self
+            .maybe_service_category_setting_edit(terminal, terminal_input)
+            .await?;
         Ok(changed)
     }
 

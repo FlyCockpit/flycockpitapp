@@ -1,43 +1,51 @@
+use super::terminal_suspend::{
+    EditorCancel, ExternalEditorSessionOutcome, LiveTerminalSuspendHost, ProcessExternalEditorHost,
+    TerminalSuspendHost, format_external_editor_notice, run_external_editor_with_guard,
+};
 use super::*;
 
 impl App {
-    fn run_external_editor_command(
+    /// Suspend terminal modes (including mouse capture), run `$EDITOR`, and
+    /// restore the exact pre-editor snapshot through one finish guard.
+    async fn run_external_editor_command(
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
+        mouse_capture: bool,
         editor: &std::ffi::OsStr,
         path: &std::path::Path,
-    ) -> Result<std::io::Result<std::process::ExitStatus>> {
-        with_input_suspended(terminal_input, |_| {
-            // Suspend ratatui's input handling for the editor invocation.
-            // We disable the keyboard-enhancement flags / cursor styles
-            // crossterm pushed for us, leave raw mode, and let the editor
-            // own the TTY. Re-enable everything after it exits.
-            use crossterm::terminal::{
-                EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-            };
-            let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
-            let _ = disable_raw_mode();
-
-            let status = std::process::Command::new(editor).arg(path).status();
-
-            let _ = enable_raw_mode();
-            let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
-            terminal.clear()?;
-
-            Ok(status)
-        })
+    ) -> (ExternalEditorSessionOutcome, bool) {
+        // Host is seeded with the App's live TTY capture flag (updated only on
+        // successful enable/disable). Snapshot that observed host state rather
+        // than a separate preference so restore cannot invent capture.
+        let mut host = LiveTerminalSuspendHost::new(terminal, terminal_input, mouse_capture);
+        let snapshot = host.state();
+        let mut editor_host = ProcessExternalEditorHost;
+        let cancel = EditorCancel::new();
+        let outcome = run_external_editor_with_guard(
+            &mut host,
+            &mut editor_host,
+            snapshot,
+            editor,
+            path,
+            &cancel,
+        )
+        .await;
+        let live_mouse = host.state().mouse_capture;
+        (outcome, live_mouse)
     }
 
     /// Ctrl+G was pressed: pop the composer text out into `$EDITOR`,
     /// then reload whatever the user wrote back into the buffer. Quits
     /// raw mode for the duration so the editor owns the terminal.
-    pub(super) fn maybe_service_external_edit(
+    ///
+    /// Returns `true` when a redraw is required after the handoff.
+    pub(super) async fn maybe_service_external_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.pending_external_edit {
-            return Ok(());
+            return Ok(false);
         }
         self.pending_external_edit = false;
 
@@ -45,7 +53,7 @@ impl App {
             // Defensive — we re-check here because env state can shift
             // between the keypress and now. The handler already
             // surfaced a toast when EDITOR was unset, so just bail.
-            return Ok(());
+            return Ok(false);
         };
 
         // Stash the buffer in a random Markdown tempfile so editor syntax
@@ -56,7 +64,7 @@ impl App {
                 self.history.push(HistoryEntry::CommandError {
                     line: format!("editor: failed to create temp file: {e}"),
                 });
-                return Ok(());
+                return Ok(true);
             }
         };
         let editor_text = self.paste_registry.expand_editor(self.composer.text());
@@ -65,19 +73,30 @@ impl App {
             self.history.push(HistoryEntry::CommandError {
                 line: format!("editor: failed to write temp file: {e}"),
             });
-            return Ok(());
+            return Ok(true);
         }
         if let Err(e) = temp.flush() {
             self.history.push(HistoryEntry::CommandError {
                 line: format!("editor: failed to flush temp file: {e}"),
             });
-            return Ok(());
+            return Ok(true);
         }
         let path = temp.path().to_path_buf();
 
-        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
+        let (outcome, live_mouse) = Self::run_external_editor_command(
+            terminal,
+            terminal_input,
+            self.mouse_capture,
+            &editor,
+            &path,
+        )
+        .await;
+        // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
+        // restore failed to re-enable capture).
+        self.mouse_capture = live_mouse;
+        let redraw = outcome.redraw;
 
-        match status {
+        match &outcome.status {
             Ok(s) if s.success() => match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     // Drop a single trailing newline — most editors
@@ -90,25 +109,27 @@ impl App {
                     );
                     self.composer.set(rebuilt.buffer);
                     self.paste_registry = rebuilt.registry;
+                    if let Err(restore) = &outcome.restore {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: format!("editor: terminal restore: {restore}"),
+                        });
+                    }
                 }
                 Err(e) => {
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("editor: failed to read temp file back: {e}"),
-                    });
+                    let mut line = format!("editor: failed to read temp file back: {e}");
+                    if let Err(restore) = &outcome.restore {
+                        line = format!("{line}; terminal restore: {restore}");
+                    }
+                    self.history.push(HistoryEntry::CommandError { line });
                 }
             },
-            Ok(s) => {
-                self.history.push(HistoryEntry::CommandError {
-                    line: format!("editor: exited with {s}"),
-                });
-            }
-            Err(e) => {
-                self.history.push(HistoryEntry::CommandError {
-                    line: format!("editor: invoking `{}`: {e}", editor.to_string_lossy()),
-                });
+            _ => {
+                if let Some(line) = format_external_editor_notice(&editor, &outcome) {
+                    self.history.push(HistoryEntry::CommandError { line });
+                }
             }
         }
-        Ok(())
+        Ok(redraw)
     }
 
     /// The `/settings → Agents` page asked to edit an agent file in
@@ -118,15 +139,14 @@ impl App {
     /// hand the outcome back so the page re-reads + re-parses the file
     /// (surfacing a parse error inline, never silently accepting a broken
     /// agent). External-process failure leaves the file untouched and is
-    /// reported inline. Reuses the same raw-mode/alt-screen toggle dance as
-    /// the composer's Ctrl+G handoff.
-    pub(super) fn maybe_service_agent_file_edit(
+    /// reported inline. Reuses the same suspension guard as Ctrl+G.
+    pub(super) async fn maybe_service_agent_file_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(path) = self.dialog.take_pending_agent_edit() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let Some(editor) = std::env::var_os("EDITOR") else {
@@ -134,52 +154,95 @@ impl App {
             // page only defers when EDITOR was set, so this is defensive.
             self.dialog
                 .finish_agent_edit(Some("$EDITOR is no longer set".to_string()));
-            return Ok(());
+            return Ok(true);
         };
 
-        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
+        let (outcome, live_mouse) = Self::run_external_editor_command(
+            terminal,
+            terminal_input,
+            self.mouse_capture,
+            &editor,
+            &path,
+        )
+        .await;
+        // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
+        // restore failed to re-enable capture).
+        self.mouse_capture = live_mouse;
+        let redraw = outcome.redraw;
 
-        let editor_error = match status {
-            Ok(s) if s.success() => None,
-            Ok(s) => Some(format!("editor exited with {s} — file left unchanged")),
-            Err(e) => Some(format!(
+        let editor_error = match (&outcome.status, &outcome.restore) {
+            (Ok(s), Ok(())) if s.success() => None,
+            (Ok(s), Ok(())) => Some(format!("editor exited with {s} — file left unchanged")),
+            (Ok(s), Err(restore)) if s.success() => {
+                Some(format!("terminal restore: {restore} — file left unchanged"))
+            }
+            (Ok(s), Err(restore)) => Some(format!(
+                "editor exited with {s}; terminal restore: {restore} — file left unchanged"
+            )),
+            (Err(e), Ok(())) => Some(format!(
                 "invoking `{}`: {e} — file left unchanged",
+                editor.to_string_lossy()
+            )),
+            (Err(e), Err(restore)) => Some(format!(
+                "invoking `{}`: {e}; terminal restore: {restore} — file left unchanged",
                 editor.to_string_lossy()
             )),
         };
         self.dialog.finish_agent_edit(editor_error);
-        Ok(())
+        Ok(redraw)
     }
 
     /// A category setting requested a `$EDITOR` round trip against a private
     /// tempfile. The dialog owns the temp path and validation; the app only
     /// suspends the terminal and reports process success/failure.
-    pub(super) fn maybe_service_category_setting_edit(
+    pub(super) async fn maybe_service_category_setting_edit(
         &mut self,
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(path) = self.dialog.take_pending_category_setting_edit() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let Some(editor) = std::env::var_os("EDITOR") else {
             self.dialog
                 .finish_category_setting_edit(Some("$EDITOR is no longer set".to_string()));
-            return Ok(());
+            return Ok(true);
         };
 
-        let status = Self::run_external_editor_command(terminal, terminal_input, &editor, &path)?;
-        let editor_error = match status {
-            Ok(s) if s.success() => None,
-            Ok(s) => Some(format!("editor exited with {s} - value left unchanged")),
-            Err(e) => Some(format!(
+        let (outcome, live_mouse) = Self::run_external_editor_command(
+            terminal,
+            terminal_input,
+            self.mouse_capture,
+            &editor,
+            &path,
+        )
+        .await;
+        // Keep App.mouse_capture aligned with post-restore TTY state (e.g. when
+        // restore failed to re-enable capture).
+        self.mouse_capture = live_mouse;
+        let redraw = outcome.redraw;
+
+        let editor_error = match (&outcome.status, &outcome.restore) {
+            (Ok(s), Ok(())) if s.success() => None,
+            (Ok(s), Ok(())) => Some(format!("editor exited with {s} - value left unchanged")),
+            (Ok(s), Err(restore)) if s.success() => Some(format!(
+                "terminal restore: {restore} - value left unchanged"
+            )),
+            (Ok(s), Err(restore)) => Some(format!(
+                "editor exited with {s}; terminal restore: {restore} - value left unchanged"
+            )),
+            (Err(e), Ok(())) => Some(format!(
                 "invoking `{}`: {e} - value left unchanged",
+                editor.to_string_lossy()
+            )),
+            (Err(e), Err(restore)) => Some(format!(
+                "invoking `{}`: {e}; terminal restore: {restore} - value left unchanged",
                 editor.to_string_lossy()
             )),
         };
         self.dialog.finish_category_setting_edit(editor_error);
-        Ok(())
+        Ok(redraw)
     }
 
     /// Open `$EDITOR` in an embedded pane (GOALS §1i). No-op if a pane

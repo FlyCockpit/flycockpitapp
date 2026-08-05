@@ -442,7 +442,11 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
     assert_eq!(
         app.config_snapshot
             .providers
-            .resolve_capabilities("old-provider", "a")
+            .resolve_effective_model_capabilities(
+                "old-provider",
+                "a",
+                app.config_snapshot.providers.resolution_generation,
+            )
             .context_tokens,
         Some(900_009)
     );
@@ -509,7 +513,11 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
     assert_eq!(
         app.config_snapshot
             .providers
-            .resolve_capabilities("attached-provider", "a")
+            .resolve_effective_model_capabilities(
+                "attached-provider",
+                "a",
+                app.config_snapshot.providers.resolution_generation,
+            )
             .context_tokens,
         Some(100_000)
     );
@@ -539,7 +547,11 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
     assert_eq!(
         app.config_snapshot
             .providers
-            .resolve_capabilities("updated-provider", "a")
+            .resolve_effective_model_capabilities(
+                "updated-provider",
+                "a",
+                app.config_snapshot.providers.resolution_generation,
+            )
             .context_tokens,
         Some(100_001)
     );

@@ -306,9 +306,14 @@ fn fill_chat_core(model: &mut ModelEntry, context_tokens: u32, max_output_tokens
 }
 
 fn fill_images(model: &mut ModelEntry, images: bool) {
-    if model.capabilities.images.is_none() {
-        model.capabilities.images = Some(images);
-    }
+    fill_status(
+        &mut model.capabilities.image_input,
+        if images {
+            CapabilityStatus::Supported
+        } else {
+            CapabilityStatus::Unsupported
+        },
+    );
 }
 
 fn fill_reasoning(model: &mut ModelEntry, status: CapabilityStatus) {

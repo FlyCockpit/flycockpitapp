@@ -533,7 +533,11 @@ fn parse_required_capabilities(
         };
         let capability = match name {
             "tool_calling" => RequiredModelCapability::ToolCalling,
-            "images" => RequiredModelCapability::Images,
+            // Breaking multimodal names only — no legacy `images`/`audio`/`video`
+            // aliases (pre-release: convert configs to image_input/audio_input/video_input).
+            "image_input" => RequiredModelCapability::ImageInput,
+            "audio_input" => RequiredModelCapability::AudioInput,
+            "video_input" => RequiredModelCapability::VideoInput,
             "reasoning" => RequiredModelCapability::Reasoning,
             "structured_outputs" => RequiredModelCapability::StructuredOutputs,
             other => {
@@ -614,7 +618,9 @@ fn selector_json(
                         Value::String(
                             match capability {
                                 RequiredModelCapability::ToolCalling => "tool_calling",
-                                RequiredModelCapability::Images => "images",
+                                RequiredModelCapability::ImageInput => "image_input",
+                                RequiredModelCapability::AudioInput => "audio_input",
+                                RequiredModelCapability::VideoInput => "video_input",
                                 RequiredModelCapability::Reasoning => "reasoning",
                                 RequiredModelCapability::StructuredOutputs => "structured_outputs",
                                 RequiredModelCapability::Embeddings => "embeddings",
@@ -636,7 +642,11 @@ fn selector_json(
 }
 
 fn policy_summary(providers: &ProvidersConfig, resolved: &ResolvedModelPolicy) -> String {
-    let caps = providers.resolve_capabilities(&resolved.provider, &resolved.model);
+    let caps = providers.resolve_effective_model_capabilities(
+        &resolved.provider,
+        &resolved.model,
+        providers.resolution_generation,
+    );
     format!(
         "trust={} location={} quality_rank={} cost_rank={} capabilities={} context_tokens={}",
         match resolved.trust {
@@ -661,8 +671,8 @@ fn capability_summary(caps: &EffectiveModelCapabilities) -> String {
     if caps.tool_calling == CapabilityStatus::Supported {
         out.push("tool_calling");
     }
-    if caps.images == Some(true) {
-        out.push("images");
+    if caps.supports_image_input() {
+        out.push("image_input");
     }
     if caps.reasoning == CapabilityStatus::Supported {
         out.push("reasoning");
@@ -691,12 +701,32 @@ fn policy_error_message(error: ModelPolicyError) -> String {
         ModelPolicyError::NotSubagentInvokable { provider, model } => {
             format!("model `{provider}:{model}` is not available for subagent invocation")
         }
-        ModelPolicyError::MissingCapability {
+        ModelPolicyError::CapabilityUnsupported {
             provider,
             model,
             capability,
         } => {
-            format!("model `{provider}:{model}` is missing required capability `{capability:?}`")
+            format!(
+                "model `{provider}:{model}` does not support required capability `{capability:?}`"
+            )
+        }
+        ModelPolicyError::CapabilityUnknown {
+            provider,
+            model,
+            capability,
+        } => {
+            format!(
+                "model `{provider}:{model}` has unknown support for required capability `{capability:?}`"
+            )
+        }
+        ModelPolicyError::CapabilityRequiresEntitlement {
+            provider,
+            model,
+            capability,
+        } => {
+            format!(
+                "model `{provider}:{model}` requires entitlement for required capability `{capability:?}`"
+            )
         }
         ModelPolicyError::ContextTooSmall {
             provider,
@@ -1061,7 +1091,11 @@ mod tests {
         let providers = providers();
         assert_eq!(
             providers
-                .resolve_capabilities("minimax", "MiniMax-M2")
+                .resolve_effective_model_capabilities(
+                    "minimax",
+                    "MiniMax-M2",
+                    providers.resolution_generation,
+                )
                 .context_tokens,
             None,
             "regression requires an unknown context window"

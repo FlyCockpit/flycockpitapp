@@ -595,7 +595,11 @@ impl App {
                 .map(|(provider, model)| {
                     self.config_snapshot
                         .providers
-                        .resolve_capabilities(provider, model)
+                        .resolve_effective_model_capabilities(
+                            provider,
+                            model,
+                            self.config_snapshot.generation,
+                        )
                         .prompt_cache_retention
                 })
                 .unwrap_or_default(),

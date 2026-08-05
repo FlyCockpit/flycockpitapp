@@ -262,7 +262,7 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
         "p".into(),
         ProviderEntry {
             capabilities: ProviderCapabilities {
-                images: Some(false),
+                image_input: CapabilityStatus::Unsupported,
                 context_tokens: Some(100_000),
                 max_output_tokens: Some(8_000),
                 tool_calling: CapabilityStatus::Unsupported,
@@ -272,7 +272,7 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
             models: vec![ModelEntry {
                 id: "m".into(),
                 capabilities: ModelCapabilities {
-                    images: Some(false),
+                    image_input: CapabilityStatus::Unsupported,
                     context_tokens: Some(200_000),
                     max_output_tokens: Some(16_000),
                     tool_calling: CapabilityStatus::Unsupported,
@@ -280,7 +280,7 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
                     ..ModelCapabilities::default()
                 },
                 capability_overrides: ModelCapabilityOverrides {
-                    images: Some(true),
+                    image_input: Some(CapabilityStatus::Supported),
                     context_tokens: Some(300_000),
                     max_output_tokens: Some(32_000),
                     tool_calling: Some(CapabilityStatus::Supported),
@@ -293,8 +293,8 @@ fn resolve_capabilities_applies_model_overrides_after_detection() {
         },
     );
 
-    let caps = cfg.resolve_capabilities("p", "m");
-    assert_eq!(caps.images, Some(true));
+    let caps = cfg.resolve_effective_model_capabilities("p", "m", cfg.resolution_generation);
+    assert!(caps.supports_image_input());
     assert_eq!(caps.context_tokens, Some(300_000));
     assert_eq!(caps.max_output_tokens, Some(32_000));
     assert_eq!(caps.tool_calling, CapabilityStatus::Supported);
@@ -329,12 +329,13 @@ fn resolve_capabilities_selects_computer_contract_from_metadata() {
         },
     );
 
-    let caps = cfg.resolve_capabilities("p", "m");
+    let caps = cfg.resolve_effective_model_capabilities("p", "m", cfg.resolution_generation);
     assert_eq!(
         caps.computer_use.as_ref().and_then(|cap| cap.contract),
         Some(ComputerUseContract::Anthropic20251124)
     );
-    let caps = cfg.resolve_capabilities("p", "unknown-model");
+    let caps =
+        cfg.resolve_effective_model_capabilities("p", "unknown-model", cfg.resolution_generation);
     assert_eq!(
         caps.computer_use.as_ref().and_then(|cap| cap.contract),
         Some(ComputerUseContract::Anthropic20250124)
@@ -403,20 +404,23 @@ fn probed_capability_precedence_order() {
     );
 
     assert_eq!(
-        cfg.resolve_capabilities("entry", "entry-only")
+        cfg.resolve_effective_model_capabilities("entry", "entry-only", cfg.resolution_generation)
             .context_tokens,
         Some(32_000)
     );
     assert_eq!(
-        cfg.resolve_capabilities("p", "detected").context_tokens,
+        cfg.resolve_effective_model_capabilities("p", "detected", cfg.resolution_generation)
+            .context_tokens,
         Some(96_000)
     );
     assert_eq!(
-        cfg.resolve_capabilities("p", "probed").context_tokens,
+        cfg.resolve_effective_model_capabilities("p", "probed", cfg.resolution_generation)
+            .context_tokens,
         Some(128_000)
     );
     assert_eq!(
-        cfg.resolve_capabilities("p", "manual").context_tokens,
+        cfg.resolve_effective_model_capabilities("p", "manual", cfg.resolution_generation)
+            .context_tokens,
         Some(256_000)
     );
 }
@@ -444,7 +448,7 @@ fn manual_override_beats_probed_value() {
         },
     );
 
-    let caps = cfg.resolve_capabilities("p", "m");
+    let caps = cfg.resolve_effective_model_capabilities("p", "m", cfg.resolution_generation);
     assert_eq!(caps.context_tokens, Some(256_000));
 }
 
@@ -485,11 +489,11 @@ fn probed_entry_is_not_manual() {
 #[test]
 fn merge_refresh_preserves_overrides_but_not_stale_detected_capabilities() {
     let mut existing = model("mimo-v2.5", false);
-    existing.capabilities.images = Some(false);
-    existing.capability_overrides.images = Some(true);
+    existing.capabilities.image_input = CapabilityStatus::Unsupported;
+    existing.capability_overrides.image_input = Some(CapabilityStatus::Supported);
 
     let mut fetched = model("mimo-v2.5", false);
-    fetched.capabilities.images = Some(false);
+    fetched.capabilities.image_input = CapabilityStatus::Unsupported;
     fetched.capabilities.context_tokens = Some(1_000_000);
 
     let merged = merge_fetched_models_with_policy(
@@ -499,9 +503,15 @@ fn merge_refresh_preserves_overrides_but_not_stale_detected_capabilities() {
         ModelMergePolicy::KeepUnlisted,
     );
 
-    assert_eq!(merged[0].capabilities.images, Some(false));
+    assert_eq!(
+        merged[0].capabilities.image_input,
+        CapabilityStatus::Unsupported
+    );
     assert_eq!(merged[0].capabilities.context_tokens, Some(1_000_000));
-    assert_eq!(merged[0].capability_overrides.images, Some(true));
+    assert_eq!(
+        merged[0].capability_overrides.image_input,
+        Some(CapabilityStatus::Supported)
+    );
 }
 
 #[test]
@@ -513,7 +523,10 @@ fn first_class_defaults_apply_only_to_matching_templates() {
 
     let mut minimax_m3 = model("minimax-m3", false);
     apply_template_model_defaults(Some("minimax"), &mut minimax_m3);
-    assert_eq!(minimax_m3.capabilities.images, Some(true));
+    assert_eq!(
+        minimax_m3.capabilities.image_input,
+        CapabilityStatus::Supported
+    );
     assert_eq!(minimax_m3.capabilities.context_tokens, Some(1_000_000));
 
     let mut minimax_m2 = model("MiniMax-M2", false);
@@ -540,13 +553,13 @@ fn first_class_defaults_apply_only_to_matching_templates() {
 
     let mut mimo = model("mimo-v2.5", false);
     apply_template_model_defaults(Some("xiaomi-mimo"), &mut mimo);
-    assert_eq!(mimo.capabilities.images, Some(true));
+    assert_eq!(mimo.capabilities.image_input, CapabilityStatus::Supported);
     assert_eq!(mimo.capabilities.context_tokens, Some(1_000_000));
     assert_eq!(mimo.capabilities.reasoning, CapabilityStatus::Supported);
 
     let mut pro = model("mimo-v2.5-pro", false);
     apply_template_model_defaults(Some("xiaomi-mimo"), &mut pro);
-    assert_eq!(pro.capabilities.images, None);
+    assert!(pro.capabilities.image_input.is_unknown());
     assert_eq!(pro.capabilities.context_tokens, Some(1_000_000));
 
     let mut zen = model("kimi-k2.7-code", false);
@@ -556,7 +569,7 @@ fn first_class_defaults_apply_only_to_matching_templates() {
 
     let mut openai = model("gpt-4o", false);
     apply_template_model_defaults(Some("openai"), &mut openai);
-    assert_eq!(openai.capabilities.images, Some(true));
+    assert_eq!(openai.capabilities.image_input, CapabilityStatus::Supported);
     assert_eq!(
         openai.capabilities.structured_outputs,
         CapabilityStatus::Supported

@@ -40,6 +40,7 @@ mod grab;
 mod harnesses_page;
 mod lsp_page;
 mod mcp_page;
+mod multimodal_capability_editor;
 mod providers;
 mod reset;
 pub(crate) mod secret_display;

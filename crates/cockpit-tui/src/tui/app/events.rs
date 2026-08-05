@@ -1996,12 +1996,16 @@ impl App {
                     .map(|entry| entry.favorite)
                     .unwrap_or(false);
                 let trusted = providers.resolve_trust(provider, model).is_trusted();
-                let capabilities = providers.resolve_capabilities(provider, model);
+                let capabilities = providers.resolve_effective_model_capabilities(
+                    provider,
+                    model,
+                    self.config_snapshot.generation,
+                );
                 (
                     favorite,
                     trusted,
                     capabilities.context_tokens,
-                    capabilities.images == Some(true),
+                    capabilities.supports_image_input(),
                 )
             } else {
                 (false, false, None, false)

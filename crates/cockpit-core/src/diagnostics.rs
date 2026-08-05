@@ -464,9 +464,10 @@ fn provider_lines(
                     computer_yolo += 1;
                 }
             }
-            let caps = cfg.resolve_capabilities(id, &model.id);
+            let caps =
+                cfg.resolve_effective_model_capabilities(id, &model.id, cfg.resolution_generation);
             if tier != crate::config::extended::ComputerUseMode::Disabled
-                && caps.images == Some(true)
+                && caps.supports_image_input()
                 && caps
                     .computer_use
                     .as_ref()
@@ -478,7 +479,11 @@ fn provider_lines(
         let embedding_count = provider
             .models
             .iter()
-            .filter(|model| cfg.resolve_capabilities(id, &model.id).embeddings == Some(true))
+            .filter(|model| {
+                cfg.resolve_effective_model_capabilities(id, &model.id, cfg.resolution_generation)
+                    .embeddings
+                    == Some(true)
+            })
             .count();
         let hidden_count = model_count.saturating_sub(subagent_count);
         let ranked_count = provider
@@ -1231,13 +1236,13 @@ mod tests {
                 "models": [
                     {
                         "id": "provider-yolo",
-                        "capabilities": { "images": false }
+                        "capabilities": { "image_input": "unsupported" }
                     },
                     {
                         "id": "model-ask",
                         "computer_use": "ask",
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     },
@@ -1245,7 +1250,7 @@ mod tests {
                         "id": "model-disabled",
                         "computer_use": "disabled",
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }

@@ -1968,7 +1968,7 @@ fn model_wizard_tui_advances_through_multitoggle_steps() {
     provider.models.push(ModelEntry {
         id: "m".to_string(),
         capabilities: cockpit_config::providers::ModelCapabilities {
-            images: Some(true),
+            image_input: cockpit_config::providers::CapabilityStatus::Supported,
             reasoning: cockpit_config::providers::CapabilityStatus::Supported,
             ..Default::default()
         },

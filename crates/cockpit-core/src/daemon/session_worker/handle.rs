@@ -429,8 +429,15 @@ impl SessionConfigHandle {
     }
 
     /// The effective provider config this handle reads.
+    ///
+    /// Stamps [`ProvidersConfig::resolution_generation`] from the snapshot
+    /// generation so capability resolution is generation-keyed.
     pub fn providers(&self) -> crate::config::providers::ProvidersConfig {
-        self.snapshot().providers.clone()
+        let snapshot = self.snapshot();
+        snapshot
+            .providers
+            .clone()
+            .with_resolution_generation(snapshot.generation)
     }
 
     /// Both resolved configs as one pair — mirrors the shape turn-scoped call
@@ -442,7 +449,13 @@ impl SessionConfigHandle {
         crate::config::providers::ProvidersConfig,
     ) {
         let snapshot = self.snapshot();
-        (snapshot.extended.clone(), snapshot.providers.clone())
+        (
+            snapshot.extended.clone(),
+            snapshot
+                .providers
+                .clone()
+                .with_resolution_generation(snapshot.generation),
+        )
     }
 }
 

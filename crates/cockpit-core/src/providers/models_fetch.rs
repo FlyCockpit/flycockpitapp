@@ -855,13 +855,34 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
 fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCapabilities> {
     let context_tokens = context_tokens_from_metadata(obj);
     let max_output_tokens = max_output_tokens_from_metadata(obj);
+    let input_modalities = input_modalities_from_metadata(obj);
     Ok(ModelCapabilities {
         tool_calling: capability_status_from_metadata(
             obj,
             "tool_calling",
             &["tools", "tool_choice", "functions", "function_calling"],
         ),
-        images: images_from_metadata(obj),
+        image_input: input_capability_from_metadata(
+            obj,
+            "image_input",
+            "images",
+            "image",
+            input_modalities,
+        ),
+        audio_input: input_capability_from_metadata(
+            obj,
+            "audio_input",
+            "audio",
+            "audio",
+            input_modalities,
+        ),
+        video_input: input_capability_from_metadata(
+            obj,
+            "video_input",
+            "video",
+            "video",
+            input_modalities,
+        ),
         embeddings: embeddings_from_metadata(obj),
         embedding_dimensions: embedding_dimensions_from_metadata(obj),
         context_tokens,
@@ -954,22 +975,65 @@ fn embedding_dimensions_from_metadata(obj: &Map<String, Value>) -> Option<u32> {
         })
 }
 
-fn images_from_metadata(obj: &Map<String, Value>) -> Option<bool> {
-    if let Some(images) = obj
+/// Project one input modality into typed model metadata.
+///
+/// Reads explicit capability fields first, then legacy `inputs.<key>` boolean
+/// membership, then architecture input-modality lists. Output-only modalities
+/// never enable input. Legacy projection here feeds detection only — runtime
+/// consumers must call `resolve_effective_model_capabilities`.
+fn input_capability_from_metadata(
+    obj: &Map<String, Value>,
+    capability_key: &str,
+    legacy_inputs_key: &str,
+    modality_name: &str,
+    input_modalities: Option<&Value>,
+) -> CapabilityStatus {
+    let camel = snake_to_camel(capability_key);
+    let raw = obj
+        .get(capability_key)
+        .or_else(|| obj.get(&camel))
+        .or_else(|| {
+            obj.get("capabilities")
+                .and_then(Value::as_object)
+                .and_then(|capabilities| {
+                    capabilities
+                        .get(capability_key)
+                        .or_else(|| capabilities.get(&camel))
+                        .or_else(|| capabilities.get(legacy_inputs_key))
+                })
+        });
+    if let Some(raw) = raw {
+        let parsed = capability_status_from_value(raw);
+        if !parsed.is_unknown() {
+            return parsed;
+        }
+    }
+    if let Some(listed) = obj
         .get("inputs")
         .and_then(Value::as_object)
-        .and_then(|inputs| inputs.get("images"))
+        .and_then(|inputs| inputs.get(legacy_inputs_key))
         .and_then(Value::as_bool)
     {
-        return Some(images);
+        // Detection projection: true → Supported. Explicit false/absence both
+        // stay Unknown under the legacy membership contract (not Unsupported).
+        return if listed {
+            CapabilityStatus::Supported
+        } else {
+            CapabilityStatus::Unknown
+        };
     }
-    let input_modalities = obj
-        .get("architecture")
+    if modality_list_contains(input_modalities, modality_name) {
+        return CapabilityStatus::Supported;
+    }
+    CapabilityStatus::Unknown
+}
+
+fn input_modalities_from_metadata(obj: &Map<String, Value>) -> Option<&Value> {
+    obj.get("architecture")
         .and_then(Value::as_object)
         .and_then(|architecture| architecture.get("input_modalities"))
         .or_else(|| obj.get("input_modalities"))
-        .or_else(|| obj.get("inputModalities"));
-    modality_list_contains(input_modalities, "image").then_some(true)
+        .or_else(|| obj.get("inputModalities"))
 }
 
 fn modality_list_contains(value: Option<&Value>, needle: &str) -> bool {
@@ -1595,7 +1659,7 @@ mod tests {
         let model = &entries[0];
         assert_eq!(model.context_length, Some(1_048_576));
         assert_eq!(model.capabilities.context_tokens, Some(1_048_576));
-        assert_eq!(model.capabilities.images, Some(true));
+        assert_eq!(model.capabilities.image_input, CapabilityStatus::Supported);
         assert_eq!(model.capabilities.tool_calling, CapabilityStatus::Supported);
         assert_eq!(model.capabilities.reasoning, CapabilityStatus::Supported);
         assert_eq!(
@@ -1614,7 +1678,7 @@ mod tests {
 
         let entries = parse_models_body(body).unwrap();
         let model = &entries[0];
-        assert_eq!(model.capabilities.images, None);
+        assert!(model.capabilities.image_input.is_unknown());
         assert_eq!(model.capabilities.context_tokens, Some(32_768));
     }
 

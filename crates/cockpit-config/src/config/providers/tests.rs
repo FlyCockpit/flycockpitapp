@@ -2249,7 +2249,7 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
     reasoning.quality_rank = Some(10);
     reasoning.cost_rank = Some(5);
     reasoning.thinking_modes = vec![ThinkingMode::High];
-    reasoning.capabilities.images = Some(true);
+    reasoning.capabilities.image_input = CapabilityStatus::Supported;
     reasoning.context_length = Some(128_000);
 
     cfg.providers.insert(
@@ -2309,7 +2309,7 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
             trust: None,
             required_capabilities: vec![
                 RequiredModelCapability::Reasoning,
-                RequiredModelCapability::Images,
+                RequiredModelCapability::ImageInput,
             ],
             min_context_tokens: Some(64_000),
             require_subagent_invokable: true,
@@ -2632,3 +2632,4 @@ fn resolve_text_embedded_recovery_three_tier_precedence() {
 /// built-in provider defaults, surfaced through
 /// `resolve_thinking_params` with no model/provider override configured.
 mod model_defaults_and_capabilities;
+mod multimodal_capability;

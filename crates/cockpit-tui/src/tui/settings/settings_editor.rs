@@ -61,11 +61,16 @@ use crate::tui::textfield::TextField;
 use cockpit_config::extended::LlmMode;
 use cockpit_config::providers::{
     BackupConfig, CacheConfig, CacheMode, CapabilitySource, CapabilityStatus,
-    ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES, ModelEntry,
-    ModelLocation, ModelTrust, PromptCacheRetention, ProviderEntry, ShrinkConfig, ShrinkStrategy,
-    ThinkingMode, TimeoutConfig, WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
-    is_anthropic_native_base_url, is_xai_grok_provider, model_system_prompt_too_large,
-    normalize_model_system_prompt,
+    ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES,
+    ModelCapabilityOverrides, ModelEntry, ModelLocation, ModelTrust, PromptCacheRetention,
+    ProviderEntry, ProvidersConfig, ShrinkConfig, ShrinkStrategy, ThinkingMode, TimeoutConfig,
+    WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url, is_xai_grok_provider,
+    model_system_prompt_too_large, normalize_model_system_prompt,
+};
+
+use super::multimodal_capability_editor::{
+    DraftOverride, EditorAction, EditorPhase, MediaModality, MultimodalCapabilityEditor,
+    OperationId, SelectionIdentity, snapshot_from_resolved,
 };
 
 /// Which scope the editor is bound to.
@@ -81,7 +86,9 @@ pub(super) enum SettingsScope {
 #[derive(Clone, Default)]
 struct DetectedCapabilityPreview {
     tool_calling: CapabilityStatus,
-    images: Option<bool>,
+    image_input: CapabilityStatus,
+    audio_input: CapabilityStatus,
+    video_input: CapabilityStatus,
     context_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
     reasoning: CapabilityStatus,
@@ -100,6 +107,8 @@ pub(super) enum ProviderSettingId {
     SubagentInvokable,
     SystemPrompt,
     CapabilityImages,
+    CapabilityAudio,
+    CapabilityVideo,
     CapabilityTools,
     CapabilityReasoning,
     CapabilityStructuredOutputs,
@@ -153,6 +162,8 @@ const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::SubagentInvokable,
     ProviderSettingId::SystemPrompt,
     ProviderSettingId::CapabilityImages,
+    ProviderSettingId::CapabilityAudio,
+    ProviderSettingId::CapabilityVideo,
     ProviderSettingId::CapabilityTools,
     ProviderSettingId::CapabilityReasoning,
     ProviderSettingId::CapabilityStructuredOutputs,
@@ -212,6 +223,8 @@ impl ProviderSettingId {
             Self::SubagentInvokable => "Subagent available",
             Self::SystemPrompt => "Model instructions",
             Self::CapabilityImages => "Image input",
+            Self::CapabilityAudio => "Audio input",
+            Self::CapabilityVideo => "Video input",
             Self::CapabilityTools => "Tool calling",
             Self::CapabilityReasoning => "Reasoning",
             Self::CapabilityStructuredOutputs => "Structured outputs",
@@ -279,7 +292,13 @@ impl ProviderSettingId {
                 "Master switch for automatic context pruning (lossless dedup of stale tool results). off never auto-prunes, protecting the provider's prompt cache; manual /prune still works. inherit falls through to the provider, then on.",
             ),
             Self::CapabilityImages => Some(
-                "auto uses fetched/default model capability metadata; supported sends pasted images as image parts, unsupported sends text notes.",
+                "auto uses fetched/default model capability metadata; supported sends pasted images as image parts, unsupported sends text notes. Independent of audio/video input.",
+            ),
+            Self::CapabilityAudio => Some(
+                "auto uses fetched/default model capability metadata for audio input. Independent of image/video input and of transcription tooling.",
+            ),
+            Self::CapabilityVideo => Some(
+                "auto uses fetched/default model capability metadata for video input. Independent of image/audio input and of extraction tooling.",
             ),
             Self::CapabilityTools => Some(
                 "auto uses fetched/default model capability metadata; override only when the provider metadata is wrong.",
@@ -419,7 +438,9 @@ pub(super) struct SettingsEditor {
     subagent_invokable: Option<bool>,
     system_prompt: Option<String>,
     capability_tool_calling: Option<CapabilityStatus>,
-    capability_images: Option<bool>,
+    capability_images: Option<CapabilityStatus>,
+    capability_audio: Option<CapabilityStatus>,
+    capability_video: Option<CapabilityStatus>,
     capability_context_tokens: Option<u32>,
     capability_max_output_tokens: Option<u32>,
     capability_reasoning: Option<CapabilityStatus>,
@@ -451,6 +472,9 @@ pub(super) struct SettingsEditor {
     pub(super) buf: TextField,
     /// Transient validation status shown under the rows.
     pub(super) status: Option<String>,
+    /// Live multimodal image/audio/video override state machine (model scope only).
+    /// Production model-settings path drives save/retry/stale/conflict/a11y here.
+    pub(super) multimodal: Option<MultimodalCapabilityEditor>,
 }
 
 impl SettingsEditor {
@@ -492,6 +516,8 @@ impl SettingsEditor {
             system_prompt: None,
             capability_tool_calling: None,
             capability_images: None,
+            capability_audio: None,
+            capability_video: None,
             capability_context_tokens: None,
             capability_max_output_tokens: None,
             capability_reasoning: None,
@@ -517,6 +543,7 @@ impl SettingsEditor {
             editing: None,
             buf: TextField::default(),
             status: None,
+            multimodal: None,
         }
     }
 
@@ -529,6 +556,17 @@ impl SettingsEditor {
     /// seeded from the override if present, else the provider value, so an
     /// inherited field shows its effective (inherited) value.
     pub(super) fn for_model(provider_id: &str, entry: &ProviderEntry, model_id: &str) -> Self {
+        Self::for_model_with_generation(provider_id, entry, model_id, 1)
+    }
+
+    /// Build the model-scope editor using the live config generation so save
+    /// and refresh completions cannot match an obsolete epoch.
+    pub(super) fn for_model_with_generation(
+        provider_id: &str,
+        entry: &ProviderEntry,
+        model_id: &str,
+        config_generation: u64,
+    ) -> Self {
         let model = entry.models.iter().find(|m| m.id == model_id);
         let context = model
             .and_then(|m| m.context.clone())
@@ -597,7 +635,9 @@ impl SettingsEditor {
             subagent_invokable: model.and_then(|m| m.subagent_invokable),
             system_prompt: model.and_then(|m| m.system_prompt.clone()),
             capability_tool_calling: model.and_then(|m| m.capability_overrides.tool_calling),
-            capability_images: model.and_then(|m| m.capability_overrides.images),
+            capability_images: model.and_then(|m| m.capability_overrides.image_input),
+            capability_audio: model.and_then(|m| m.capability_overrides.audio_input),
+            capability_video: model.and_then(|m| m.capability_overrides.video_input),
             capability_context_tokens: model.and_then(|m| m.capability_overrides.context_tokens),
             capability_max_output_tokens: model
                 .and_then(|m| m.capability_overrides.max_output_tokens),
@@ -625,6 +665,12 @@ impl SettingsEditor {
             editing: None,
             buf: TextField::default(),
             status: None,
+            multimodal: Some(build_multimodal_editor(
+                provider_id,
+                entry,
+                model_id,
+                config_generation.max(1),
+            )),
         }
     }
 
@@ -694,6 +740,8 @@ impl SettingsEditor {
             fields.extend([
                 SystemPrompt,
                 CapabilityImages,
+                CapabilityAudio,
+                CapabilityVideo,
                 CapabilityTools,
                 CapabilityReasoning,
                 CapabilityStructuredOutputs,
@@ -775,6 +823,8 @@ impl SettingsEditor {
             ProviderSettingId::SubagentInvokable => self.subagent_invokable.is_some(),
             ProviderSettingId::SystemPrompt => self.system_prompt.is_some(),
             ProviderSettingId::CapabilityImages => self.capability_images.is_some(),
+            ProviderSettingId::CapabilityAudio => self.capability_audio.is_some(),
+            ProviderSettingId::CapabilityVideo => self.capability_video.is_some(),
             ProviderSettingId::CapabilityTools => self.capability_tool_calling.is_some(),
             ProviderSettingId::CapabilityReasoning => self.capability_reasoning.is_some(),
             ProviderSettingId::CapabilityStructuredOutputs => {
@@ -860,8 +910,10 @@ impl SettingsEditor {
                 .map(|prompt| format!("{} characters", prompt.chars().count()))
                 .unwrap_or_else(|| "not set".to_string()),
             ProviderSettingId::CapabilityImages => {
-                capability_bool_label(self.capability_images, self.detected_capabilities.images)
+                self.media_capability_label(MediaModality::Image)
             }
+            ProviderSettingId::CapabilityAudio => self.media_capability_label(MediaModality::Audio),
+            ProviderSettingId::CapabilityVideo => self.media_capability_label(MediaModality::Video),
             ProviderSettingId::CapabilityTools => capability_status_label(
                 self.capability_tool_calling,
                 self.detected_capabilities.tool_calling,
@@ -1038,6 +1090,8 @@ impl SettingsEditor {
             | ProviderSettingId::SubagentInvokable
             | ProviderSettingId::SystemPrompt
             | ProviderSettingId::CapabilityImages
+            | ProviderSettingId::CapabilityAudio
+            | ProviderSettingId::CapabilityVideo
             | ProviderSettingId::CapabilityTools
             | ProviderSettingId::CapabilityReasoning
             | ProviderSettingId::CapabilityStructuredOutputs
@@ -1067,7 +1121,18 @@ impl SettingsEditor {
             ProviderSettingId::CostRank => self.cost_rank = None,
             ProviderSettingId::SubagentInvokable => self.subagent_invokable = None,
             ProviderSettingId::SystemPrompt => self.system_prompt = None,
-            ProviderSettingId::CapabilityImages => self.capability_images = None,
+            ProviderSettingId::CapabilityImages => {
+                self.capability_images = None;
+                self.set_media_draft(MediaModality::Image, DraftOverride::Auto);
+            }
+            ProviderSettingId::CapabilityAudio => {
+                self.capability_audio = None;
+                self.set_media_draft(MediaModality::Audio, DraftOverride::Auto);
+            }
+            ProviderSettingId::CapabilityVideo => {
+                self.capability_video = None;
+                self.set_media_draft(MediaModality::Video, DraftOverride::Auto);
+            }
             ProviderSettingId::CapabilityTools => self.capability_tool_calling = None,
             ProviderSettingId::CapabilityReasoning => self.capability_reasoning = None,
             ProviderSettingId::CapabilityStructuredOutputs => {
@@ -1214,11 +1279,13 @@ impl SettingsEditor {
                 self.mark_present(field);
             }
             ProviderSettingId::CapabilityImages => {
-                self.capability_images = match self.capability_images {
-                    None => Some(true),
-                    Some(true) => Some(false),
-                    Some(false) => None,
-                };
+                self.cycle_media_modality(MediaModality::Image);
+            }
+            ProviderSettingId::CapabilityAudio => {
+                self.cycle_media_modality(MediaModality::Audio);
+            }
+            ProviderSettingId::CapabilityVideo => {
+                self.cycle_media_modality(MediaModality::Video);
             }
             ProviderSettingId::CapabilityTools => {
                 self.capability_tool_calling =
@@ -1640,9 +1707,33 @@ impl SettingsEditor {
             // otherwise consume it — fields here don't take text in browse
             // mode, so `s` is always free as the accelerator).
             KeyCode::Char('s') => SettingsResult::Save,
+            // Media capability refresh (generation-keyed; ignored while saving).
+            KeyCode::Char('r') if self.multimodal.is_some() && !self.on_save_row() => {
+                let _ = self.begin_multimodal_refresh();
+                // Completing refresh requires the parent entry; mark pending and
+                // let the providers page finish with the live ProviderEntry.
+                self.provider_trust_confirm_pending = false;
+                SettingsResult::Stay
+            }
             KeyCode::Char('x') if !self.on_save_row() => {
+                // Prefer multimodal recovery Discard when the action list
+                // exposes it (save_failed / conflict / unavailable_dirty).
+                if self
+                    .multimodal
+                    .as_ref()
+                    .is_some_and(|e| e.available_actions().contains(&"Discard"))
+                {
+                    // Parent supplies the authoritative entry via multimodal_action.
+                    self.status = Some("press D to discard media draft".into());
+                    return SettingsResult::Stay;
+                }
                 self.clear_override(self.field_at(self.cursor));
                 self.provider_trust_confirm_pending = false;
+                SettingsResult::Stay
+            }
+            // Multimodal recovery actions when the reducer exposes them.
+            KeyCode::Char('R') if self.multimodal.is_some() => {
+                self.status = Some("retry media action pending parent entry".into());
                 SettingsResult::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -1664,6 +1755,505 @@ impl SettingsEditor {
                 SettingsResult::Stay
             }
             _ => SettingsResult::Stay,
+        }
+    }
+
+    /// Live multimodal editor for model-scope media capability rows.
+    pub(super) fn multimodal(&self) -> Option<&MultimodalCapabilityEditor> {
+        self.multimodal.as_ref()
+    }
+
+    pub(super) fn multimodal_mut(&mut self) -> Option<&mut MultimodalCapabilityEditor> {
+        self.multimodal.as_mut()
+    }
+
+    /// True when media capability drafts need explicit save or discard.
+    pub(super) fn multimodal_leave_blocked(&self) -> bool {
+        let Some(editor) = self.multimodal.as_ref() else {
+            return false;
+        };
+        matches!(
+            editor.phase,
+            EditorPhase::Dirty
+                | EditorPhase::Saving { .. }
+                | EditorPhase::SaveFailed { .. }
+                | EditorPhase::Conflict { .. }
+                | EditorPhase::UnavailableDirty { .. }
+        )
+    }
+
+    /// Discard media drafts back to the last authoritative snapshot (no disk write).
+    pub(super) fn discard_multimodal_draft(&mut self, entry: &ProviderEntry) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let identity = editor.identity.clone();
+        let snap = multimodal_snapshot_for(
+            &identity.provider_id,
+            entry,
+            &identity.model_id,
+            identity.config_generation,
+        );
+        editor.apply_editor(EditorAction::Discard {
+            authoritative: snap,
+        });
+        self.sync_media_drafts_from_multimodal();
+        self.status = Some("media capability draft discarded".into());
+    }
+
+    /// Start a generation-keyed refresh of detected media capabilities.
+    pub(super) fn begin_multimodal_refresh(&mut self) -> Option<OperationId> {
+        let editor = self.multimodal.as_mut()?;
+        if !editor.is_refresh_allowed() {
+            self.status = Some("cannot refresh while save is in progress".into());
+            return None;
+        }
+        editor.apply_refresh(super::multimodal_capability_editor::RefreshAction::Refresh);
+        match &editor.refresh {
+            super::multimodal_capability_editor::RefreshPhase::Refreshing {
+                refresh_id, ..
+            } => {
+                if let Some(line) = editor.accessibility_projection().first() {
+                    self.status = Some(line.clone());
+                }
+                Some(*refresh_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Complete a successful multimodal refresh (detected previews only).
+    pub(super) fn complete_multimodal_refresh_success(
+        &mut self,
+        refresh_id: OperationId,
+        entry: &ProviderEntry,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let identity = editor.identity.clone();
+        let before_refresh = format!("{:?}", editor.refresh);
+        let snap = multimodal_snapshot_for(
+            &identity.provider_id,
+            entry,
+            &identity.model_id,
+            identity.config_generation,
+        );
+        editor.apply_refresh(
+            super::multimodal_capability_editor::RefreshAction::RefreshSuccess {
+                refresh_id,
+                selection_generation: identity.selection_generation,
+                config_generation: identity.config_generation,
+                detected: snap,
+            },
+        );
+        if format!("{:?}", editor.refresh) == before_refresh {
+            return; // superseded: no status mutation
+        }
+        // Always clear the Refreshing… busy status on accepted success.
+        if let Some(line) = self
+            .multimodal
+            .as_ref()
+            .and_then(|m| m.accessibility_projection().first())
+            .cloned()
+        {
+            self.status = Some(line);
+        } else {
+            self.status = Some("media capabilities refreshed".into());
+        }
+    }
+
+    /// Complete a failed multimodal refresh without mutating drafts.
+    pub(super) fn complete_multimodal_refresh_failure(
+        &mut self,
+        refresh_id: OperationId,
+        reason: impl Into<String>,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let identity = editor.identity.clone();
+        let before_refresh = format!("{:?}", editor.refresh);
+        editor.apply_refresh(
+            super::multimodal_capability_editor::RefreshAction::RefreshFailure {
+                refresh_id,
+                selection_generation: identity.selection_generation,
+                config_generation: identity.config_generation,
+                safe_reason: reason.into(),
+            },
+        );
+        if format!("{:?}", editor.refresh) == before_refresh {
+            return;
+        }
+        if let Some(line) = editor.accessibility_projection().first() {
+            self.status = Some(line.clone());
+        }
+    }
+
+    /// Apply a multimodal recovery action exposed in the live UI.
+    pub(super) fn multimodal_action(&mut self, action: &str, entry: &ProviderEntry) -> bool {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return false;
+        };
+        let identity = editor.identity.clone();
+        let snap = multimodal_snapshot_for(
+            &identity.provider_id,
+            entry,
+            &identity.model_id,
+            identity.config_generation,
+        );
+        match action {
+            "Retry" => {
+                // Prefer refresh-overlay retry when refresh is failed, even if
+                // the editor phase is also Conflict/SaveFailed — otherwise R
+                // cannot complete the required refresh_failed + Retry path.
+                if matches!(
+                    editor.refresh,
+                    super::multimodal_capability_editor::RefreshPhase::RefreshFailed { .. }
+                ) {
+                    editor.apply_refresh(super::multimodal_capability_editor::RefreshAction::Retry);
+                } else if matches!(editor.phase, EditorPhase::SaveFailed { .. }) {
+                    editor.apply_editor(EditorAction::Retry);
+                } else if matches!(editor.phase, EditorPhase::Conflict { .. }) {
+                    // Conflict has no save Retry; leave phase for Reload/Reapply.
+                    self.status = Some("conflict: use L Reload, A Reapply, or D Discard".into());
+                    return true;
+                } else {
+                    editor.apply_refresh(super::multimodal_capability_editor::RefreshAction::Retry);
+                }
+            }
+            "Reload" => editor.apply_editor(EditorAction::Reload {
+                authoritative: snap,
+            }),
+            "Discard" => editor.apply_editor(EditorAction::Discard {
+                authoritative: snap,
+            }),
+            "Reapply" => editor.apply_editor(EditorAction::Reapply {
+                authoritative: snap,
+            }),
+            "Dismiss" => {
+                editor.apply_refresh(super::multimodal_capability_editor::RefreshAction::Dismiss);
+            }
+            "Rebind" => editor.apply_editor(EditorAction::Rebind {
+                identity: identity.clone(),
+                authoritative: snap,
+            }),
+            _ => return false,
+        }
+        self.sync_media_drafts_from_multimodal();
+        if let Some(line) = self
+            .multimodal
+            .as_ref()
+            .and_then(|m| m.accessibility_projection().first())
+            .cloned()
+        {
+            self.status = Some(line);
+        }
+        true
+    }
+
+    /// Provenance-aware label for image/audio/video rows (model scope uses the
+    /// live multimodal editor view model; provider scope falls back).
+    fn media_capability_label(&self, modality: MediaModality) -> String {
+        if let Some(editor) = self.multimodal.as_ref() {
+            let view = editor.row_view(modality);
+            let mut label = match view.busy {
+                Some(busy) => format!("{} · {}", view.effective_label, busy),
+                None => view.effective_label,
+            };
+            // Surface recovery controls on the focused media rows so keyboard
+            // help is discoverable (R=Retry, L=Reload, A=Reapply, D=Discard, B=Rebind).
+            let actions = editor.available_actions();
+            if !actions.is_empty() {
+                label = format!("{label} · actions: {}", actions.join("/"));
+            }
+            return label;
+        }
+        let (override_value, detected) = match modality {
+            MediaModality::Image => (
+                self.capability_images,
+                self.detected_capabilities.image_input,
+            ),
+            MediaModality::Audio => (
+                self.capability_audio,
+                self.detected_capabilities.audio_input,
+            ),
+            MediaModality::Video => (
+                self.capability_video,
+                self.detected_capabilities.video_input,
+            ),
+        };
+        capability_status_label(override_value, detected)
+    }
+
+    fn cycle_media_modality(&mut self, modality: MediaModality) {
+        if self.multimodal.is_none() {
+            match modality {
+                MediaModality::Image => {
+                    self.capability_images = cycle_capability_status(self.capability_images);
+                }
+                MediaModality::Audio => {
+                    self.capability_audio = cycle_capability_status(self.capability_audio);
+                }
+                MediaModality::Video => {
+                    self.capability_video = cycle_capability_status(self.capability_video);
+                }
+            }
+            return;
+        }
+        if let Some(editor) = self.multimodal.as_mut() {
+            editor.apply_editor(EditorAction::Cycle { modality });
+        }
+        self.sync_media_drafts_from_multimodal();
+        // Prefer accessibility projection; also keep a narrow vertical detail
+        // projection in status so draft/effective/provenance survive narrow
+        // terminals without a separate layout path.
+        if let Some(editor) = self.multimodal.as_ref() {
+            let mut lines = editor.accessibility_projection().to_vec();
+            if lines.is_empty() {
+                lines = editor.narrow_layout_lines(36);
+            } else {
+                // Append compact narrow detail for the focused modality.
+                let narrow = editor.narrow_layout_lines(36);
+                for line in narrow.into_iter().take(6) {
+                    if !lines.iter().any(|l| l == &line) {
+                        lines.push(line);
+                    }
+                }
+            }
+            if let Some(first) = lines.first() {
+                self.status = Some(if lines.len() == 1 {
+                    first.clone()
+                } else {
+                    lines.join(" · ")
+                });
+            }
+        }
+    }
+
+    fn set_media_draft(&mut self, modality: MediaModality, draft: DraftOverride) {
+        if let Some(editor) = self.multimodal.as_mut() {
+            editor.apply_editor(EditorAction::Edit { modality, draft });
+        }
+        self.sync_media_drafts_from_multimodal();
+    }
+
+    fn sync_media_drafts_from_multimodal(&mut self) {
+        let Some(editor) = self.multimodal.as_ref() else {
+            return;
+        };
+        self.capability_images = editor.working.image.draft.as_capability_status();
+        self.capability_audio = editor.working.audio.draft.as_capability_status();
+        self.capability_video = editor.working.video.draft.as_capability_status();
+    }
+
+    /// Dispatch ModelRemoved / ModelReappeared / SelectionChanged from live
+    /// models list and config generation so unavailable/rebind and stale
+    /// completion supersession are production-reachable.
+    pub(super) fn sync_multimodal_lifecycle(
+        &mut self,
+        provider_id: &str,
+        entry: &ProviderEntry,
+        models: &super::providers::ModelEditor,
+        live_config_generation: u64,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let model_id = match &self.scope {
+            SettingsScope::Model { model_id } => model_id.clone(),
+            SettingsScope::Provider => return,
+        };
+        let present = models.rows.iter().any(|m| m.id == model_id);
+        let was_unavailable = matches!(
+            editor.phase,
+            EditorPhase::UnavailableClean | EditorPhase::UnavailableDirty { .. }
+        );
+        if !present {
+            if !was_unavailable {
+                editor.apply_editor(EditorAction::ModelRemoved);
+            }
+            return;
+        }
+        if was_unavailable {
+            let identity = SelectionIdentity {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.clone(),
+                selection_generation: editor.identity.selection_generation.saturating_add(1),
+                config_generation: live_config_generation,
+            };
+            let snap =
+                multimodal_snapshot_for(provider_id, entry, &model_id, live_config_generation);
+            editor.apply_editor(EditorAction::ModelReappeared {
+                identity,
+                authoritative: snap,
+            });
+            self.sync_media_drafts_from_multimodal();
+            return;
+        }
+        // Config generation advance while still on the same model selection.
+        if live_config_generation != editor.identity.config_generation {
+            let identity = SelectionIdentity {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.clone(),
+                selection_generation: editor.identity.selection_generation.saturating_add(1),
+                config_generation: live_config_generation,
+            };
+            let snap =
+                multimodal_snapshot_for(provider_id, entry, &model_id, live_config_generation);
+            editor.apply_editor(EditorAction::SelectionChanged {
+                identity,
+                authoritative: snap,
+            });
+            self.sync_media_drafts_from_multimodal();
+        }
+    }
+
+    /// Begin a generation-keyed multimodal save before disk write.
+    /// Returns the operation identity when a save was started.
+    pub(super) fn begin_multimodal_save(
+        &mut self,
+    ) -> Option<(OperationId, String, String, u64, u64)> {
+        let editor = self.multimodal.as_mut()?;
+        if !editor.is_save_allowed() {
+            // Still sync drafts even when save is not multimodal-dirty.
+            return None;
+        }
+        editor.apply_editor(EditorAction::Save);
+        self.pending_multimodal_save()
+    }
+
+    /// Pending save operation identity when the reducer is in `Saving`.
+    pub(super) fn pending_multimodal_save(
+        &self,
+    ) -> Option<(OperationId, String, String, u64, u64)> {
+        let editor = self.multimodal.as_ref()?;
+        match &editor.phase {
+            EditorPhase::Saving {
+                save_id,
+                selection_generation,
+                base_config_generation,
+            } => Some((
+                *save_id,
+                editor.identity.provider_id.clone(),
+                editor.identity.model_id.clone(),
+                *selection_generation,
+                *base_config_generation,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Complete a successful multimodal save after disk commit.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn complete_multimodal_save_success(
+        &mut self,
+        save_id: OperationId,
+        provider_id: &str,
+        model_id: &str,
+        selection_generation: u64,
+        base_config_generation: u64,
+        saved_generation: u64,
+        entry: &ProviderEntry,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let before_phase = format!("{:?}", editor.phase);
+        let before_ann = format!("{:?}", editor.last_announcement());
+        let snap = multimodal_snapshot_for(provider_id, entry, model_id, saved_generation);
+        editor.apply_editor(EditorAction::SaveSuccess {
+            save_id,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            selection_generation,
+            base_config_generation,
+            saved_generation,
+            authoritative: snap,
+        });
+        // Superseded completions leave phase+announcement unchanged.
+        if format!("{:?}", editor.phase) == before_phase
+            && format!("{:?}", editor.last_announcement()) == before_ann
+        {
+            return;
+        }
+        self.sync_media_drafts_from_multimodal();
+        if let Some(line) = self
+            .multimodal
+            .as_ref()
+            .and_then(|m| m.accessibility_projection().first())
+        {
+            self.status = Some(line.clone());
+        }
+    }
+
+    /// Complete a failed multimodal save without mutating drafts.
+    pub(super) fn complete_multimodal_save_failure(
+        &mut self,
+        save_id: OperationId,
+        provider_id: &str,
+        model_id: &str,
+        selection_generation: u64,
+        base_config_generation: u64,
+        reason: impl Into<String>,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let before_phase = format!("{:?}", editor.phase);
+        editor.apply_editor(EditorAction::SaveSafeFailure {
+            save_id,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            selection_generation,
+            base_config_generation,
+            reason: reason.into(),
+        });
+        if format!("{:?}", editor.phase) == before_phase {
+            return;
+        }
+        if let Some(line) = editor.accessibility_projection().first() {
+            self.status = Some(line.clone());
+        }
+    }
+
+    /// Complete a version-conflicted multimodal save; preserves draft.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn complete_multimodal_save_conflict(
+        &mut self,
+        save_id: OperationId,
+        provider_id: &str,
+        model_id: &str,
+        selection_generation: u64,
+        base_config_generation: u64,
+        current_safe_generation: u64,
+        entry: &ProviderEntry,
+    ) {
+        let Some(editor) = self.multimodal.as_mut() else {
+            return;
+        };
+        let before_phase = format!("{:?}", editor.phase);
+        let snap =
+            multimodal_snapshot_for(provider_id, entry, model_id, current_safe_generation.max(1));
+        editor.apply_editor(EditorAction::SaveVersionConflict {
+            save_id,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            selection_generation,
+            base_config_generation,
+            current_safe_generation,
+            authoritative: snap,
+        });
+        if format!("{:?}", editor.phase) == before_phase {
+            return;
+        }
+        if let Some(line) = self
+            .multimodal
+            .as_ref()
+            .and_then(|m| m.accessibility_projection().first())
+            .cloned()
+        {
+            self.status = Some(line);
         }
     }
 
@@ -1750,7 +2340,9 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     m.subagent_invokable = e.subagent_invokable;
     m.system_prompt = e.system_prompt.clone();
     m.capability_overrides.tool_calling = e.capability_tool_calling;
-    m.capability_overrides.images = e.capability_images;
+    m.capability_overrides.image_input = e.capability_images;
+    m.capability_overrides.audio_input = e.capability_audio;
+    m.capability_overrides.video_input = e.capability_video;
     m.capability_overrides.context_tokens = e.capability_context_tokens;
     m.capability_overrides.max_output_tokens = e.capability_max_output_tokens;
     m.capability_overrides.reasoning = e.capability_reasoning;
@@ -1774,47 +2366,93 @@ fn detected_model_capabilities(
     entry: &ProviderEntry,
     model: &ModelEntry,
 ) -> DetectedCapabilityPreview {
-    let provider_caps = &entry.capabilities;
-    let model_caps = &model.capabilities;
-    let status = |model_status: CapabilityStatus, provider_status: CapabilityStatus| {
-        if model_status.is_unknown() {
-            provider_status
-        } else {
-            model_status
-        }
-    };
-    let reasoning = status(model_caps.reasoning, provider_caps.reasoning);
-    let reasoning = if reasoning.is_unknown()
-        && (!model.thinking_modes.is_empty()
-            || model
-                .capabilities
-                .reasoning_effort
-                .as_ref()
-                .is_some_and(|cap| !cap.values.is_empty()))
-    {
-        CapabilityStatus::Supported
-    } else {
-        reasoning
-    };
-    DetectedCapabilityPreview {
-        tool_calling: status(model_caps.tool_calling, provider_caps.tool_calling),
-        images: model_caps
-            .images
-            .or(provider_caps.images)
-            .or_else(|| model.inputs.as_ref()?.images),
-        context_tokens: model_caps
-            .context_tokens
-            .or(provider_caps.context_tokens)
-            .or(model.context_length),
-        max_output_tokens: model_caps
-            .max_output_tokens
-            .or(provider_caps.max_output_tokens),
-        reasoning,
-        structured_outputs: status(
-            model_caps.structured_outputs,
-            provider_caps.structured_outputs,
-        ),
+    // Detected preview is the Auto-path result: same authoritative resolver
+    // with a temporary entry that clears only the capability overrides so
+    // draft Auto rows show source-aware detection without raw field reads.
+    let mut preview_entry = entry.clone();
+    if let Some(m) = preview_entry.models.iter_mut().find(|m| m.id == model.id) {
+        m.capability_overrides = ModelCapabilityOverrides::default();
     }
+    let mut cfg = ProvidersConfig::default();
+    cfg.set_resolution_generation(1);
+    cfg.providers.insert("_preview".into(), preview_entry);
+    let caps = cfg.resolve_effective_model_capabilities("_preview", &model.id, 1);
+    DetectedCapabilityPreview {
+        tool_calling: caps.tool_calling,
+        image_input: caps.image_input.status,
+        audio_input: caps.audio_input.status,
+        video_input: caps.video_input.status,
+        context_tokens: caps.context_tokens,
+        max_output_tokens: caps.max_output_tokens,
+        reasoning: caps.reasoning,
+        structured_outputs: caps.structured_outputs,
+    }
+}
+
+fn build_multimodal_editor(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    model_id: &str,
+    config_generation: u64,
+) -> MultimodalCapabilityEditor {
+    let identity = SelectionIdentity {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        selection_generation: 1,
+        config_generation,
+    };
+    MultimodalCapabilityEditor::new(
+        identity,
+        multimodal_snapshot_for(provider_id, entry, model_id, config_generation),
+    )
+}
+
+fn multimodal_snapshot_for(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    model_id: &str,
+    config_generation: u64,
+) -> super::multimodal_capability_editor::MultimodalSnapshot {
+    let mut cfg = ProvidersConfig::default();
+    cfg.set_resolution_generation(config_generation);
+    cfg.providers.insert(provider_id.to_string(), entry.clone());
+    let caps = cfg.resolve_effective_model_capabilities(provider_id, model_id, config_generation);
+    // Detected path: clear overrides for Auto previews.
+    let mut detected_entry = entry.clone();
+    if let Some(m) = detected_entry.models.iter_mut().find(|m| m.id == model_id) {
+        m.capability_overrides.image_input = None;
+        m.capability_overrides.audio_input = None;
+        m.capability_overrides.video_input = None;
+    }
+    let mut detected_cfg = ProvidersConfig::default();
+    detected_cfg.set_resolution_generation(config_generation);
+    detected_cfg
+        .providers
+        .insert(provider_id.to_string(), detected_entry);
+    let detected =
+        detected_cfg.resolve_effective_model_capabilities(provider_id, model_id, config_generation);
+    let model = entry.models.iter().find(|m| m.id == model_id);
+    let image_draft = DraftOverride::from_capability_status(
+        model.and_then(|m| m.capability_overrides.image_input),
+    );
+    let audio_draft = DraftOverride::from_capability_status(
+        model.and_then(|m| m.capability_overrides.audio_input),
+    );
+    let video_draft = DraftOverride::from_capability_status(
+        model.and_then(|m| m.capability_overrides.video_input),
+    );
+    let mut snap = snapshot_from_resolved(
+        caps.image_input,
+        caps.audio_input,
+        caps.video_input,
+        image_draft,
+        audio_draft,
+        video_draft,
+    );
+    snap.image.detected = detected.image_input;
+    snap.audio.detected = detected.audio_input;
+    snap.video.detected = detected.video_input;
+    snap
 }
 
 fn capability_status_label(
@@ -1837,18 +2475,6 @@ fn capability_status_word(status: CapabilityStatus) -> &'static str {
         CapabilityStatus::Unsupported => "unsupported",
         CapabilityStatus::RequiresEntitlement => "requires entitlement",
         CapabilityStatus::Unknown => "unknown",
-    }
-}
-
-fn capability_bool_label(override_value: Option<bool>, detected: Option<bool>) -> String {
-    match override_value {
-        Some(true) => "supported".to_string(),
-        Some(false) => "unsupported".to_string(),
-        None => match detected {
-            Some(true) => "auto: supported".to_string(),
-            Some(false) => "auto: unsupported".to_string(),
-            None => "auto: unknown".to_string(),
-        },
     }
 }
 
@@ -2327,7 +2953,7 @@ mod tests {
 
         // Model scope: the row is present as the last field.
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
-        assert_eq!(e.field_count(), 30);
+        assert_eq!(e.field_count(), 32);
         assert_eq!(
             *e.fields().last().unwrap(),
             ProviderSettingId::HintToolCallCorrections
@@ -2714,15 +3340,17 @@ mod tests {
     #[test]
     fn model_capability_overrides_show_auto_and_reset_to_detection() {
         let mut entry = provider_with_model();
-        entry.models[0].capabilities.images = Some(true);
+        entry.models[0].capabilities.image_input = CapabilityStatus::Supported;
         entry.models[0].capabilities.context_tokens = Some(100_000);
         entry.models[0].capabilities.tool_calling = CapabilityStatus::Unsupported;
 
         let mut e = SettingsEditor::for_model("p", &entry, "m1");
+        // Live multimodal editor exposes draft + effective + provenance.
         assert_eq!(
             e.value_str(ProviderSettingId::CapabilityImages),
-            "auto: supported"
+            "Auto — Supported (model)"
         );
+        assert!(e.multimodal().is_some());
         assert_eq!(
             e.value_str(ProviderSettingId::CapabilityContextTokens),
             "auto: 100000"
@@ -2737,14 +3365,14 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(
             e.value_str(ProviderSettingId::CapabilityImages),
-            "supported"
+            "Supported — Supported (override)"
         );
         assert!(e.is_overridden(ProviderSettingId::CapabilityImages));
 
         e.handle_key(press(KeyCode::Char('x')));
         assert_eq!(
             e.value_str(ProviderSettingId::CapabilityImages),
-            "auto: supported"
+            "Auto — Supported (model)"
         );
         assert!(!e.is_overridden(ProviderSettingId::CapabilityImages));
 
@@ -2756,7 +3384,78 @@ mod tests {
             written.models[0].capability_overrides.context_tokens,
             Some(250_000)
         );
-        assert_eq!(written.models[0].capability_overrides.images, None);
+        assert_eq!(written.models[0].capability_overrides.image_input, None);
+    }
+
+    #[test]
+    fn multimodal_capability_settings_editor_round_trip_and_provenance() {
+        let mut entry = provider_with_model();
+        entry.models[0].capabilities.image_input = CapabilityStatus::Supported;
+        entry.models[0].capabilities.audio_input = CapabilityStatus::Unknown;
+        entry.models[0].capabilities.video_input = CapabilityStatus::Unsupported;
+
+        let mut e = SettingsEditor::for_model("p", &entry, "m1");
+        assert!(e.multimodal().is_some());
+        assert!(
+            e.value_str(ProviderSettingId::CapabilityImages)
+                .contains("Supported (model)")
+        );
+        assert!(
+            e.value_str(ProviderSettingId::CapabilityAudio)
+                .contains("Unknown (no source)")
+                || e.value_str(ProviderSettingId::CapabilityAudio)
+                    .contains("Unknown (none)")
+        );
+        assert!(
+            e.value_str(ProviderSettingId::CapabilityVideo)
+                .contains("Unsupported")
+        );
+
+        // Cycle image Auto→Supported→Unsupported and leave audio alone.
+        e.cursor = e
+            .fields()
+            .iter()
+            .position(|f| *f == ProviderSettingId::CapabilityImages)
+            .unwrap();
+        e.handle_key(press(KeyCode::Enter)); // Supported override
+        e.handle_key(press(KeyCode::Enter)); // Unsupported override
+        assert!(
+            e.value_str(ProviderSettingId::CapabilityImages)
+                .contains("Unsupported")
+        );
+        assert!(e.is_overridden(ProviderSettingId::CapabilityImages));
+        assert!(!e.is_overridden(ProviderSettingId::CapabilityAudio));
+
+        let mut written = entry.clone();
+        e.write_into(&mut written);
+        assert_eq!(
+            written.models[0].capability_overrides.image_input,
+            Some(CapabilityStatus::Unsupported)
+        );
+        assert_eq!(written.models[0].capability_overrides.audio_input, None);
+
+        // Generation-keyed save lifecycle through the production editor.
+        let save = e.begin_multimodal_save();
+        assert!(save.is_some(), "dirty multimodal draft should allow save");
+        let (save_id, provider_id, model_id, sel_gen, base_gen) = save.unwrap();
+        e.complete_multimodal_save_success(
+            save_id,
+            &provider_id,
+            &model_id,
+            sel_gen,
+            base_gen,
+            base_gen + 1,
+            &written,
+        );
+        let mm = e.multimodal().expect("multimodal editor");
+        assert!(matches!(mm.phase, EditorPhase::Clean { .. }));
+        assert!(
+            mm.accessibility_projection()
+                .iter()
+                .any(|line| line.contains("saved") || line.contains("Saved")),
+            "accessibility projection should announce save: {:?}",
+            mm.accessibility_projection()
+        );
     }
 
     #[test]
@@ -3020,6 +3719,8 @@ mod tests {
             (SubagentInvokable, false, false, false, false),
             (SystemPrompt, false, true, false, false),
             (CapabilityImages, false, true, false, false),
+            (CapabilityAudio, false, true, false, false),
+            (CapabilityVideo, false, true, false, false),
             (CapabilityTools, false, true, false, false),
             (CapabilityReasoning, false, true, false, false),
             (CapabilityStructuredOutputs, false, true, false, false),

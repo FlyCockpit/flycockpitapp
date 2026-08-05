@@ -1,7 +1,8 @@
 //! Model policy selection and capability resolution.
 
 use crate::config::providers::{
-    CapabilityStatus, ComputerUseCapability, ModelEntry, ModelLocation, ModelTrust, ProvidersConfig,
+    CapabilityStatus, ComputerUseCapability, Inputs, ModelCapabilityOverrides, ModelEntry,
+    ModelLocation, ModelTrust, ProvidersConfig,
 };
 
 #[allow(dead_code)]
@@ -17,10 +18,80 @@ pub enum ModelOptimization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequiredModelCapability {
     ToolCalling,
-    Images,
+    /// Image input for chat/multimodal understanding.
+    ImageInput,
+    /// Audio input. Independent of image/video.
+    AudioInput,
+    /// Video input. Independent of image/audio.
+    VideoInput,
     Reasoning,
     StructuredOutputs,
     Embeddings,
+}
+
+impl RequiredModelCapability {
+    /// Stable machine error code for a failed requirement check.
+    pub fn error_code(self, outcome: RequiredModelCapabilityOutcome) -> Option<&'static str> {
+        match outcome {
+            RequiredModelCapabilityOutcome::Allow => None,
+            RequiredModelCapabilityOutcome::Unsupported => Some("model_capability_unsupported"),
+            RequiredModelCapabilityOutcome::RequiresEntitlement => {
+                Some("model_capability_requires_entitlement")
+            }
+            RequiredModelCapabilityOutcome::Unknown => Some("model_capability_unknown"),
+        }
+    }
+}
+
+/// Result of checking a [`RequiredModelCapability`] against effective caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredModelCapabilityOutcome {
+    Allow,
+    Unsupported,
+    RequiresEntitlement,
+    Unknown,
+}
+
+/// Winning provenance for one resolved input capability dimension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveCapabilitySource {
+    /// Explicit per-model override (Auto is absent and never a source).
+    Override,
+    /// Fetched or checked-in model metadata on `ModelCapabilities`.
+    Model,
+    /// Provider-level model default on `ProviderCapabilities`.
+    Provider,
+    /// Legacy `inputs` membership (listed=Supported only).
+    Legacy,
+    #[default]
+    None,
+}
+
+/// One independent input capability with status, provenance, and generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedInputCapability {
+    pub status: CapabilityStatus,
+    pub source: EffectiveCapabilitySource,
+    /// Config/source generation supplied by the caller at resolve time. Stale
+    /// cached results for a different generation must not fill a new identity.
+    pub source_generation: u64,
+}
+
+impl Default for ResolvedInputCapability {
+    fn default() -> Self {
+        Self {
+            status: CapabilityStatus::Unknown,
+            source: EffectiveCapabilitySource::None,
+            source_generation: 0,
+        }
+    }
+}
+
+impl ResolvedInputCapability {
+    pub fn is_supported(self) -> bool {
+        matches!(self.status, CapabilityStatus::Supported)
+    }
 }
 
 #[allow(dead_code)]
@@ -121,7 +192,20 @@ pub enum ModelPolicyError {
         provider: String,
         model: String,
     },
-    MissingCapability {
+    /// Required capability is known-unsupported for this model.
+    CapabilityUnsupported {
+        provider: String,
+        model: String,
+        capability: RequiredModelCapability,
+    },
+    /// Required capability status is unknown (no authoritative source).
+    CapabilityUnknown {
+        provider: String,
+        model: String,
+        capability: RequiredModelCapability,
+    },
+    /// Required capability needs an entitlement the model advertises.
+    CapabilityRequiresEntitlement {
         provider: String,
         model: String,
         capability: RequiredModelCapability,
@@ -139,6 +223,55 @@ pub enum ModelPolicyError {
     NoEligibleModel(String),
 }
 
+impl ModelPolicyError {
+    /// Map a failed required-capability outcome onto the distinct policy error.
+    pub fn from_required_capability(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        capability: RequiredModelCapability,
+        outcome: RequiredModelCapabilityOutcome,
+    ) -> Option<Self> {
+        let provider = provider.into();
+        let model = model.into();
+        match outcome {
+            RequiredModelCapabilityOutcome::Allow => None,
+            RequiredModelCapabilityOutcome::Unsupported => Some(Self::CapabilityUnsupported {
+                provider,
+                model,
+                capability,
+            }),
+            RequiredModelCapabilityOutcome::Unknown => Some(Self::CapabilityUnknown {
+                provider,
+                model,
+                capability,
+            }),
+            RequiredModelCapabilityOutcome::RequiresEntitlement => {
+                Some(Self::CapabilityRequiresEntitlement {
+                    provider,
+                    model,
+                    capability,
+                })
+            }
+        }
+    }
+
+    /// Machine-stable error code for capability failures (for remediation).
+    pub fn capability_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::CapabilityUnsupported { capability, .. } => {
+                capability.error_code(RequiredModelCapabilityOutcome::Unsupported)
+            }
+            Self::CapabilityUnknown { capability, .. } => {
+                capability.error_code(RequiredModelCapabilityOutcome::Unknown)
+            }
+            Self::CapabilityRequiresEntitlement { capability, .. } => {
+                capability.error_code(RequiredModelCapabilityOutcome::RequiresEntitlement)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ModelPolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -150,14 +283,34 @@ impl std::fmt::Display for ModelPolicyError {
             Self::NotSubagentInvokable { provider, model } => {
                 write!(f, "model `{provider}:{model}` is not subagent-invokable")
             }
-            Self::MissingCapability {
+            Self::CapabilityUnsupported {
                 provider,
                 model,
                 capability,
             } => {
                 write!(
                     f,
-                    "model `{provider}:{model}` is missing required capability {capability:?}"
+                    "model `{provider}:{model}` does not support required capability {capability:?}"
+                )
+            }
+            Self::CapabilityUnknown {
+                provider,
+                model,
+                capability,
+            } => {
+                write!(
+                    f,
+                    "model `{provider}:{model}` has unknown support for required capability {capability:?}"
+                )
+            }
+            Self::CapabilityRequiresEntitlement {
+                provider,
+                model,
+                capability,
+            } => {
+                write!(
+                    f,
+                    "model `{provider}:{model}` requires entitlement for required capability {capability:?}"
                 )
             }
             Self::ContextTooSmall {
@@ -186,7 +339,9 @@ impl std::error::Error for ModelPolicyError {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveModelCapabilities {
     pub tool_calling: CapabilityStatus,
-    pub images: Option<bool>,
+    pub image_input: ResolvedInputCapability,
+    pub audio_input: ResolvedInputCapability,
+    pub video_input: ResolvedInputCapability,
     pub context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: CapabilityStatus,
@@ -195,6 +350,24 @@ pub struct EffectiveModelCapabilities {
     pub embeddings: Option<bool>,
     pub embedding_dimensions: Option<u32>,
     pub computer_use: Option<ComputerUseCapability>,
+    /// Generation stamped on every resolved dimension for this call.
+    pub config_generation: u64,
+}
+
+impl EffectiveModelCapabilities {
+    /// True when image input is effectively supported. Does not imply audio,
+    /// video, or computer-use eligibility.
+    pub fn supports_image_input(&self) -> bool {
+        self.image_input.is_supported()
+    }
+
+    pub fn supports_audio_input(&self) -> bool {
+        self.audio_input.is_supported()
+    }
+
+    pub fn supports_video_input(&self) -> bool {
+        self.video_input.is_supported()
+    }
 }
 
 #[allow(dead_code)]
@@ -212,22 +385,109 @@ fn parse_policy_selector(selector: &str) -> Result<(String, String), ModelPolicy
     Err(ModelPolicyError::MalformedSelector(selector.to_string()))
 }
 
+/// Map an effective capability status onto the consumer-facing requirement
+/// outcome table (allow / unsupported / requires-entitlement / unknown).
+pub fn required_model_capability_outcome(
+    caps: &EffectiveModelCapabilities,
+    required: RequiredModelCapability,
+) -> RequiredModelCapabilityOutcome {
+    let status = match required {
+        RequiredModelCapability::ToolCalling => caps.tool_calling,
+        RequiredModelCapability::ImageInput => caps.image_input.status,
+        RequiredModelCapability::AudioInput => caps.audio_input.status,
+        RequiredModelCapability::VideoInput => caps.video_input.status,
+        RequiredModelCapability::Reasoning => caps.reasoning,
+        RequiredModelCapability::StructuredOutputs => caps.structured_outputs,
+        RequiredModelCapability::Embeddings => match caps.embeddings {
+            Some(true) => CapabilityStatus::Supported,
+            Some(false) => CapabilityStatus::Unsupported,
+            None => CapabilityStatus::Unknown,
+        },
+    };
+    status_to_required_outcome(status)
+}
+
+pub fn status_to_required_outcome(status: CapabilityStatus) -> RequiredModelCapabilityOutcome {
+    match status {
+        CapabilityStatus::Supported => RequiredModelCapabilityOutcome::Allow,
+        CapabilityStatus::Unsupported => RequiredModelCapabilityOutcome::Unsupported,
+        CapabilityStatus::RequiresEntitlement => {
+            RequiredModelCapabilityOutcome::RequiresEntitlement
+        }
+        CapabilityStatus::Unknown => RequiredModelCapabilityOutcome::Unknown,
+    }
+}
+
 #[allow(dead_code)]
 fn capability_satisfied(
     caps: &EffectiveModelCapabilities,
     required: RequiredModelCapability,
 ) -> bool {
-    match required {
-        RequiredModelCapability::ToolCalling => {
-            matches!(caps.tool_calling, CapabilityStatus::Supported)
-        }
-        RequiredModelCapability::Images => caps.images == Some(true),
-        RequiredModelCapability::Reasoning => matches!(caps.reasoning, CapabilityStatus::Supported),
-        RequiredModelCapability::StructuredOutputs => {
-            matches!(caps.structured_outputs, CapabilityStatus::Supported)
-        }
-        RequiredModelCapability::Embeddings => caps.embeddings == Some(true),
+    matches!(
+        required_model_capability_outcome(caps, required),
+        RequiredModelCapabilityOutcome::Allow
+    )
+}
+
+/// Resolve one independent input dimension through the authoritative
+/// precedence table:
+///
+/// 1. explicit model override Supported/Unsupported
+/// 2. fetched/checked-in model metadata (any non-Unknown status)
+/// 3. provider model default
+/// 4. legacy `inputs` membership (listed=Supported; absence never Unsupported)
+/// 5. Unknown / none
+fn resolve_input_capability(
+    override_status: Option<CapabilityStatus>,
+    model_status: CapabilityStatus,
+    provider_status: CapabilityStatus,
+    legacy_listed: bool,
+    config_generation: u64,
+) -> ResolvedInputCapability {
+    // Manual overrides are only Auto/Supported/Unsupported. Treat other
+    // override values as Auto so RequiresEntitlement cannot be user-asserted.
+    let manual = match override_status {
+        Some(CapabilityStatus::Supported) => Some(CapabilityStatus::Supported),
+        Some(CapabilityStatus::Unsupported) => Some(CapabilityStatus::Unsupported),
+        Some(CapabilityStatus::RequiresEntitlement | CapabilityStatus::Unknown) | None => None,
+    };
+    if let Some(status) = manual {
+        return ResolvedInputCapability {
+            status,
+            source: EffectiveCapabilitySource::Override,
+            source_generation: config_generation,
+        };
     }
+    if !model_status.is_unknown() {
+        return ResolvedInputCapability {
+            status: model_status,
+            source: EffectiveCapabilitySource::Model,
+            source_generation: config_generation,
+        };
+    }
+    if !provider_status.is_unknown() {
+        return ResolvedInputCapability {
+            status: provider_status,
+            source: EffectiveCapabilitySource::Provider,
+            source_generation: config_generation,
+        };
+    }
+    if legacy_listed {
+        return ResolvedInputCapability {
+            status: CapabilityStatus::Supported,
+            source: EffectiveCapabilitySource::Legacy,
+            source_generation: config_generation,
+        };
+    }
+    ResolvedInputCapability {
+        status: CapabilityStatus::Unknown,
+        source: EffectiveCapabilitySource::None,
+        source_generation: config_generation,
+    }
+}
+
+fn legacy_input_listed(inputs: Option<&Inputs>, modality: fn(&Inputs) -> Option<bool>) -> bool {
+    inputs.and_then(modality) == Some(true)
 }
 
 #[allow(dead_code)]
@@ -259,15 +519,41 @@ fn policy_selector_label(request: &ModelPolicyRequest<'_>) -> String {
 }
 
 impl ProvidersConfig {
-    #[allow(dead_code)]
-    pub fn resolve_capabilities(&self, provider: &str, model: &str) -> EffectiveModelCapabilities {
+    /// Authoritative source-aware capability resolution for every consumer.
+    ///
+    /// `config_generation` is stamped onto each resolved dimension so late
+    /// metadata for a previous selection cannot fill a new provider/model
+    /// identity. Pass the caller's current config-snapshot generation.
+    pub fn resolve_effective_model_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        config_generation: u64,
+    ) -> EffectiveModelCapabilities {
         let Some(entry) = self.providers.get(provider) else {
-            return EffectiveModelCapabilities::default();
+            // Provider removal/missing: every dimension is Unknown/none at the
+            // caller's generation so late results cannot look like gen-0 stale
+            // data for a different identity.
+            let unknown = ResolvedInputCapability {
+                status: CapabilityStatus::Unknown,
+                source: EffectiveCapabilitySource::None,
+                source_generation: config_generation,
+            };
+            return EffectiveModelCapabilities {
+                image_input: unknown,
+                audio_input: unknown,
+                video_input: unknown,
+                config_generation,
+                ..EffectiveModelCapabilities::default()
+            };
         };
         let model_entry = entry.models.iter().find(|m| m.id == model);
         let model_caps = model_entry.map(|m| &m.capabilities);
         let overrides = model_entry.map(|m| &m.capability_overrides);
+        let empty_overrides = ModelCapabilityOverrides::default();
+        let overrides = overrides.unwrap_or(&empty_overrides);
         let provider_caps = &entry.capabilities;
+        let legacy_inputs = model_entry.and_then(|m| m.inputs.as_ref());
 
         let detected_reasoning = model_caps
             .map(|c| c.reasoning)
@@ -293,53 +579,69 @@ impl ProvidersConfig {
         };
 
         EffectiveModelCapabilities {
-            tool_calling: overrides.and_then(|o| o.tool_calling).unwrap_or_else(|| {
+            tool_calling: overrides.tool_calling.unwrap_or_else(|| {
                 status(
                     model_caps.map(|c| c.tool_calling),
                     provider_caps.tool_calling,
                 )
             }),
-            images: overrides
-                .and_then(|o| o.images)
-                .or_else(|| model_caps.and_then(|c| c.images))
-                .or(provider_caps.images)
-                .or_else(|| model_entry.and_then(|m| m.inputs.as_ref()?.images)),
+            image_input: resolve_input_capability(
+                overrides.image_input,
+                model_caps
+                    .map(|c| c.image_input)
+                    .unwrap_or(CapabilityStatus::Unknown),
+                provider_caps.image_input,
+                legacy_input_listed(legacy_inputs, |i| i.images),
+                config_generation,
+            ),
+            audio_input: resolve_input_capability(
+                overrides.audio_input,
+                model_caps
+                    .map(|c| c.audio_input)
+                    .unwrap_or(CapabilityStatus::Unknown),
+                provider_caps.audio_input,
+                legacy_input_listed(legacy_inputs, |i| i.audio),
+                config_generation,
+            ),
+            video_input: resolve_input_capability(
+                overrides.video_input,
+                model_caps
+                    .map(|c| c.video_input)
+                    .unwrap_or(CapabilityStatus::Unknown),
+                provider_caps.video_input,
+                legacy_input_listed(legacy_inputs, |i| i.video),
+                config_generation,
+            ),
             context_tokens: overrides
-                .and_then(|o| o.context_tokens)
+                .context_tokens
                 .or_else(|| model_caps.and_then(|c| c.context_tokens))
                 .or(provider_caps.context_tokens)
                 .or_else(|| model_entry.and_then(|m| m.context_length)),
             max_output_tokens: overrides
-                .and_then(|o| o.max_output_tokens)
+                .max_output_tokens
                 .or_else(|| model_caps.and_then(|c| c.max_output_tokens))
                 .or(provider_caps.max_output_tokens),
-            reasoning: overrides
-                .and_then(|o| o.reasoning)
-                .unwrap_or(detected_reasoning),
-            structured_outputs: overrides
-                .and_then(|o| o.structured_outputs)
-                .unwrap_or_else(|| {
-                    status(
-                        model_caps.map(|c| c.structured_outputs),
-                        provider_caps.structured_outputs,
-                    )
-                }),
-            prompt_cache_retention: overrides
-                .and_then(|o| o.prompt_cache_retention)
-                .unwrap_or_else(|| {
-                    status(
-                        model_caps.map(|c| c.prompt_cache_retention),
-                        provider_caps.prompt_cache_retention,
-                    )
-                }),
+            reasoning: overrides.reasoning.unwrap_or(detected_reasoning),
+            structured_outputs: overrides.structured_outputs.unwrap_or_else(|| {
+                status(
+                    model_caps.map(|c| c.structured_outputs),
+                    provider_caps.structured_outputs,
+                )
+            }),
+            prompt_cache_retention: overrides.prompt_cache_retention.unwrap_or_else(|| {
+                status(
+                    model_caps.map(|c| c.prompt_cache_retention),
+                    provider_caps.prompt_cache_retention,
+                )
+            }),
             embeddings: overrides
-                .and_then(|o| o.embeddings)
+                .embeddings
                 .or_else(|| model_caps.and_then(|c| c.embeddings))
                 .or_else(|| model_entry.and_then(|m| m.embeddings))
                 .or(provider_caps.embeddings)
                 .or(entry.embeddings),
             embedding_dimensions: overrides
-                .and_then(|o| o.embedding_dimensions)
+                .embedding_dimensions
                 .or_else(|| model_caps.and_then(|c| c.embedding_dimensions))
                 .or_else(|| model_entry.and_then(|m| m.embedding_dimensions))
                 .or(provider_caps.embedding_dimensions),
@@ -349,6 +651,7 @@ impl ProvidersConfig {
                     (!provider_caps.computer_use.is_empty())
                         .then(|| provider_caps.computer_use.clone())
                 }),
+            config_generation,
         }
     }
 
@@ -487,14 +790,20 @@ impl ProvidersConfig {
                 request,
             )));
         }
-        let caps = self.resolve_capabilities(provider, &model.id);
+        let caps = self.resolve_effective_model_capabilities(
+            provider,
+            &model.id,
+            self.resolution_generation,
+        );
         for capability in &request.required_capabilities {
-            if !capability_satisfied(&caps, *capability) {
-                return Err(ModelPolicyError::MissingCapability {
-                    provider: provider.to_string(),
-                    model: model.id.clone(),
-                    capability: *capability,
-                });
+            let outcome = required_model_capability_outcome(&caps, *capability);
+            if let Some(err) = ModelPolicyError::from_required_capability(
+                provider,
+                model.id.clone(),
+                *capability,
+                outcome,
+            ) {
+                return Err(err);
             }
         }
         if let Some(min) = request.min_context_tokens {
@@ -542,7 +851,11 @@ impl ProvidersConfig {
             let resolved = self
                 .resolve_model_policy(&request)
                 .map_err(EmbeddingModelResolutionError::Policy)?;
-            let caps = self.resolve_capabilities(&resolved.provider, &resolved.model);
+            let caps = self.resolve_effective_model_capabilities(
+                &resolved.provider,
+                &resolved.model,
+                self.resolution_generation,
+            );
             return Ok(ResolvedEmbeddingModel {
                 provider: resolved.provider,
                 model: resolved.model,
@@ -553,7 +866,11 @@ impl ProvidersConfig {
         let mut candidates = Vec::new();
         for (provider, entry) in &self.providers {
             for model in &entry.models {
-                let caps = self.resolve_capabilities(provider, &model.id);
+                let caps = self.resolve_effective_model_capabilities(
+                    provider,
+                    &model.id,
+                    self.resolution_generation,
+                );
                 if caps.embeddings == Some(true) {
                     candidates.push(ResolvedModelPolicy {
                         provider: provider.clone(),
@@ -570,7 +887,11 @@ impl ProvidersConfig {
         let Some(resolved) = candidates.into_iter().next() else {
             return Err(EmbeddingModelResolutionError::NoConfiguredOrEligibleModel);
         };
-        let caps = self.resolve_capabilities(&resolved.provider, &resolved.model);
+        let caps = self.resolve_effective_model_capabilities(
+            &resolved.provider,
+            &resolved.model,
+            self.resolution_generation,
+        );
         Ok(ResolvedEmbeddingModel {
             provider: resolved.provider,
             model: resolved.model,

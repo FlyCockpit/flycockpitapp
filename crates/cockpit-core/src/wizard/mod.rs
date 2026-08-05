@@ -695,9 +695,13 @@ fn model_wizard_context(
             if default_model_ref.is_none() {
                 default_model_ref = Some(model_ref.clone());
             }
-            let caps = cfg.resolve_capabilities(provider_id, &model.id);
+            let caps = cfg.resolve_effective_model_capabilities(
+                provider_id,
+                &model.id,
+                cfg.resolution_generation,
+            );
             let capabilities = [
-                (caps.images == Some(true), "images"),
+                (caps.supports_image_input(), "images"),
                 (
                     matches!(caps.tool_calling, CapabilityStatus::Supported),
                     "tools",

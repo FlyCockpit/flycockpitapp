@@ -1554,17 +1554,37 @@ impl SettingsCx {
     /// auto-commit-on-exit — routes through, so no Providers edit is ever
     /// dropped (no silent data loss).
     fn commit_edit_entry(&mut self, s: &EditState) -> Option<String> {
+        // Transactional: keep the prior entry so a failed disk write leaves
+        // effective in-memory config unchanged (failed multimodal saves must
+        // not publish drafts as authoritative).
+        let previous = self.config.providers.get(&s.provider_id).cloned();
         self.config
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
         match self.save_config() {
-            Ok(()) => Some(
-                self.last_secret_notice
-                    .take()
-                    .map(|notice| format!("saved. {notice}"))
-                    .unwrap_or_else(|| "saved".to_string()),
-            ),
-            Err(error) => Some(format!("save failed: {error}")),
+            Ok(()) => {
+                // Bump the live resolution generation so subsequent editors
+                // observe a new config epoch after a successful write.
+                self.config.resolution_generation =
+                    self.config.resolution_generation.saturating_add(1);
+                Some(
+                    self.last_secret_notice
+                        .take()
+                        .map(|notice| format!("saved. {notice}"))
+                        .unwrap_or_else(|| "saved".to_string()),
+                )
+            }
+            Err(error) => {
+                match previous {
+                    Some(entry) => {
+                        self.config.providers.insert(s.provider_id.clone(), entry);
+                    }
+                    None => {
+                        self.config.providers.remove(&s.provider_id);
+                    }
+                }
+                Some(format!("save failed: {error}"))
+            }
         }
     }
 
@@ -1995,9 +2015,13 @@ impl SettingsCx {
                 // sub-page so they're recalled intact on back.
                 let mut seed_entry = parent.entry.clone();
                 seed_entry.models = editor.rows.clone();
-                let settings =
-                    SettingsEditor::for_model(&parent.provider_id, &seed_entry, &model_id)
-                        .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
+                let settings = SettingsEditor::for_model_with_generation(
+                    &parent.provider_id,
+                    &seed_entry,
+                    &model_id,
+                    self.config.resolution_generation.max(1),
+                )
+                .with_trust_confirm_lockout_ms(self.extended.dialog.lockout_ms);
                 let models = Box::new(std::mem::replace(
                     editor,
                     ModelEditor::new(None, Vec::new()),
@@ -2027,7 +2051,34 @@ impl SettingsCx {
         models: &mut ModelEditor,
         parent: &mut Box<EditState>,
     ) -> Nav {
+        // Keep multimodal lifecycle in sync with live model rows + config gen.
+        // Snapshot resolver inputs from models.rows so unsaved reappearance uses
+        // the live row, not a stale parent.entry models vector.
+        let mut live_entry = parent.entry.clone();
+        live_entry.models = models.rows.clone();
+        editor.sync_multimodal_lifecycle(
+            &parent.provider_id,
+            &live_entry,
+            models,
+            self.config.resolution_generation.max(1),
+        );
         if editor.active_text_field().is_none() && matches!(key.code, KeyCode::Char('q')) {
+            // Same no-auto-save rule as Back for dirty media capability drafts.
+            if editor.multimodal_leave_blocked() {
+                if editor
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("discard draft and leave"))
+                {
+                    editor.discard_multimodal_draft(&parent.entry);
+                } else {
+                    editor.status = Some(
+                        "media capability draft dirty: press s to save, D to discard, or q/Esc again to discard draft and leave"
+                            .into(),
+                    );
+                    return Nav::Stay;
+                }
+            }
             let mut tmp = parent.entry.clone();
             tmp.models = models.rows.clone();
             editor.write_into(&mut tmp);
@@ -2036,20 +2087,206 @@ impl SettingsCx {
             let _ = self.commit_edit_entry(parent);
             return Nav::Close;
         }
+        // Multimodal recovery / refresh keys that need the live entry.
+        if editor.active_text_field().is_none() {
+            match key.code {
+                KeyCode::Char('r') if editor.multimodal().is_some() => {
+                    if let Some(refresh_id) = editor.begin_multimodal_refresh() {
+                        // Synchronous refresh against the live entry (no network
+                        // fetch in this dialog — re-resolve detected metadata).
+                        editor.complete_multimodal_refresh_success(refresh_id, &parent.entry);
+                    }
+                    return Nav::Stay;
+                }
+                KeyCode::Char('D') => {
+                    if editor.multimodal_action("Discard", &parent.entry) {
+                        return Nav::Stay;
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if editor.multimodal_action("Retry", &parent.entry) {
+                        // Refresh Retry re-enters Refreshing; complete local re-resolve.
+                        if let Some(mm) = editor.multimodal()
+                            && let crate::tui::settings::multimodal_capability_editor::RefreshPhase::Refreshing {
+                                refresh_id: rid,
+                                ..
+                            } = mm.refresh
+                        {
+                            let mut live = parent.entry.clone();
+                            live.models = models.rows.clone();
+                            editor.complete_multimodal_refresh_success(rid, &live);
+                            return Nav::Stay;
+                        }
+                        // Save Retry re-enters Saving; complete the disk write now.
+                        if let Some((
+                            save_id,
+                            provider_id,
+                            model_id,
+                            selection_generation,
+                            base_config_generation,
+                        )) = editor.pending_multimodal_save()
+                        {
+                            let live_gen = self.config.resolution_generation.max(1);
+                            if live_gen != base_config_generation {
+                                editor.complete_multimodal_save_conflict(
+                                    save_id,
+                                    &provider_id,
+                                    &model_id,
+                                    selection_generation,
+                                    base_config_generation,
+                                    live_gen,
+                                    &parent.entry,
+                                );
+                                return Nav::Stay;
+                            }
+                            let prior_parent_entry = parent.entry.clone();
+                            let mut tmp = parent.entry.clone();
+                            tmp.models = models.rows.clone();
+                            editor.write_into(&mut tmp);
+                            parent.entry.models = tmp.models.clone();
+                            self.apply_active_prompt_cache_retention_from_editor(editor);
+                            parent.status = self.commit_edit_entry(parent);
+                            match &parent.status {
+                                Some(msg) if msg.to_ascii_lowercase().contains("fail") => {
+                                    parent.entry = prior_parent_entry;
+                                    models.rows = parent.entry.models.clone();
+                                    editor.complete_multimodal_save_failure(
+                                        save_id,
+                                        &provider_id,
+                                        &model_id,
+                                        selection_generation,
+                                        base_config_generation,
+                                        msg.clone(),
+                                    );
+                                }
+                                _ => {
+                                    let saved_generation = self.config.resolution_generation.max(1);
+                                    editor.complete_multimodal_save_success(
+                                        save_id,
+                                        &provider_id,
+                                        &model_id,
+                                        selection_generation,
+                                        base_config_generation,
+                                        saved_generation,
+                                        &parent.entry,
+                                    );
+                                }
+                            }
+                        }
+                        return Nav::Stay;
+                    }
+                }
+                KeyCode::Char('L') if editor.multimodal_action("Reload", &parent.entry) => {
+                    return Nav::Stay;
+                }
+                KeyCode::Char('A') if editor.multimodal_action("Reapply", &parent.entry) => {
+                    return Nav::Stay;
+                }
+                KeyCode::Char('B') if editor.multimodal_action("Rebind", &parent.entry) => {
+                    return Nav::Stay;
+                }
+                KeyCode::Char('U') if editor.multimodal_action("Dismiss", &parent.entry) => {
+                    return Nav::Stay;
+                }
+                _ => {}
+            }
+        }
         match editor.handle_key(key) {
             SettingsResult::Stay => Nav::Stay,
             SettingsResult::Save => {
                 // `[save changes]` / `s`: write the overrides into the live
                 // model rows, commit to disk, and STAY on the sub-dialog.
+                // Multimodal media rows use the generation-keyed save machine.
+                let pending_mm = editor.begin_multimodal_save();
+                // Detect concurrent config change before mutating memory.
+                if let Some((
+                    save_id,
+                    provider_id,
+                    model_id,
+                    selection_generation,
+                    base_config_generation,
+                )) = pending_mm.as_ref()
+                {
+                    let live_gen = self.config.resolution_generation.max(1);
+                    if live_gen != *base_config_generation {
+                        editor.complete_multimodal_save_conflict(
+                            *save_id,
+                            provider_id,
+                            model_id,
+                            *selection_generation,
+                            *base_config_generation,
+                            live_gen,
+                            &parent.entry,
+                        );
+                        return Nav::Stay;
+                    }
+                }
+                // Snapshot authoritative entry before staging drafts so a failed
+                // save can restore parent.entry for Reload/Discard recovery.
+                let prior_parent_entry = parent.entry.clone();
                 let mut tmp = parent.entry.clone();
                 tmp.models = models.rows.clone();
                 editor.write_into(&mut tmp);
-                parent.entry.models = tmp.models;
+                parent.entry.models = tmp.models.clone();
                 self.apply_active_prompt_cache_retention_from_editor(editor);
                 parent.status = self.commit_edit_entry(parent);
+                if let Some((
+                    save_id,
+                    provider_id,
+                    model_id,
+                    selection_generation,
+                    base_config_generation,
+                )) = pending_mm
+                {
+                    match &parent.status {
+                        Some(msg) if msg.to_ascii_lowercase().contains("fail") => {
+                            // Leave draft in the multimodal editor; restore
+                            // parent entry so recovery snapshots are authoritative.
+                            parent.entry = prior_parent_entry;
+                            models.rows = parent.entry.models.clone();
+                            editor.complete_multimodal_save_failure(
+                                save_id,
+                                &provider_id,
+                                &model_id,
+                                selection_generation,
+                                base_config_generation,
+                                msg.clone(),
+                            );
+                        }
+                        _ => {
+                            let saved_generation = self.config.resolution_generation.max(1);
+                            editor.complete_multimodal_save_success(
+                                save_id,
+                                &provider_id,
+                                &model_id,
+                                selection_generation,
+                                base_config_generation,
+                                saved_generation,
+                                &parent.entry,
+                            );
+                        }
+                    }
+                }
                 Nav::Stay
             }
             SettingsResult::Back => {
+                // Media capability drafts never auto-save on leave: require
+                // explicit `s` save, or `D` discard, or confirm discard leave.
+                if editor.multimodal_leave_blocked() {
+                    if editor
+                        .status
+                        .as_deref()
+                        .is_some_and(|s| s.contains("discard draft and leave"))
+                    {
+                        editor.discard_multimodal_draft(&parent.entry);
+                    } else {
+                        editor.status = Some(
+                            "media capability draft dirty: press s to save, D to discard, or Esc again to discard draft and leave"
+                                .into(),
+                        );
+                        return Nav::Stay;
+                    }
+                }
                 // Write the overrides into a provider entry carrying the live
                 // model rows, then lift the updated rows back into the model
                 // editor so the Models page sees them.
@@ -2060,10 +2297,8 @@ impl SettingsCx {
                     parent.as_mut(),
                     EditState::new(String::new(), ProviderEntry::default()),
                 );
-                // Persist immediately: "editing a field and leaving the
-                // dialog persists it" (implementation note).
-                // The model-row edit is a self-contained override write, so
-                // we save rather than wait for the Edit page's `s`.
+                // Persist non-media settings immediately; multimodal drafts
+                // above are either clean or explicitly discarded.
                 owned.entry.models = tmp.models.clone();
                 self.apply_active_prompt_cache_retention_from_editor(editor);
                 owned.status = self.commit_edit_entry(&owned);
@@ -3775,13 +4010,22 @@ pub(super) fn active_model_settings_page(
         ));
     }
     let retention_status = config
-        .resolve_capabilities(&active.provider, &active.model)
+        .resolve_effective_model_capabilities(
+            &active.provider,
+            &active.model,
+            config.resolution_generation,
+        )
         .prompt_cache_retention;
-    let settings = SettingsEditor::for_model(&active.provider, entry, &active.model)
-        .with_active_prompt_cache_retention(
-            active.prompt_cache_retention.unwrap_or_default(),
-            retention_status,
-        );
+    let settings = SettingsEditor::for_model_with_generation(
+        &active.provider,
+        entry,
+        &active.model,
+        config.resolution_generation.max(1),
+    )
+    .with_active_prompt_cache_retention(
+        active.prompt_cache_retention.unwrap_or_default(),
+        retention_status,
+    );
     let models = Box::new(ModelEditor::new(
         entry
             .effective_template(&active.provider)

@@ -250,9 +250,10 @@ pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effec
 /// about the split on-disk layout.
 #[allow(unused_imports)]
 pub use crate::config::model_policy::{
-    EffectiveModelCapabilities, EmbeddingModelResolutionError, ModelOptimization, ModelPolicyError,
-    ModelPolicyRequest, ModelPolicySelector, RequiredModelCapability, ResolvedEmbeddingModel,
-    ResolvedModelPolicy,
+    EffectiveCapabilitySource, EffectiveModelCapabilities, EmbeddingModelResolutionError,
+    ModelOptimization, ModelPolicyError, ModelPolicyRequest, ModelPolicySelector,
+    RequiredModelCapability, RequiredModelCapabilityOutcome, ResolvedEmbeddingModel,
+    ResolvedInputCapability, ResolvedModelPolicy, required_model_capability_outcome,
 };
 
 #[allow(unused_imports)]
@@ -278,6 +279,24 @@ pub struct ProvidersConfig {
     /// yet (e.g. a freshly-scaffolded config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<ActiveModelRef>,
+    /// Runtime-only config snapshot generation stamped by session/TUI loaders.
+    /// Not persisted. Used by [`Self::resolve_capabilities`] so late results
+    /// are generation-keyed without every call site inventing a generation.
+    #[serde(skip)]
+    pub resolution_generation: u64,
+}
+
+impl ProvidersConfig {
+    /// Stamp the authoritative config generation used by capability resolution.
+    pub fn with_resolution_generation(mut self, generation: u64) -> Self {
+        self.resolution_generation = generation;
+        self
+    }
+
+    /// Stamp the authoritative config generation used by capability resolution.
+    pub fn set_resolution_generation(&mut self, generation: u64) {
+        self.resolution_generation = generation;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1235,8 +1254,16 @@ impl ComputerUseCapability {
 pub struct ModelCapabilities {
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub tool_calling: CapabilityStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub images: Option<bool>,
+    /// Image *input* for chat/multimodal understanding. Independent of audio,
+    /// video, generation output, and computer-use eligibility.
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub image_input: CapabilityStatus,
+    /// Audio *input*. Independent of image/video and of transcription tooling.
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub audio_input: CapabilityStatus,
+    /// Video *input*. Independent of image/audio and of extraction tooling.
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub video_input: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1266,7 +1293,9 @@ pub struct ModelCapabilities {
 impl ModelCapabilities {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_unknown()
-            && self.images.is_none()
+            && self.image_input.is_unknown()
+            && self.audio_input.is_unknown()
+            && self.video_input.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1285,12 +1314,38 @@ impl ModelCapabilities {
     }
 }
 
+/// Manual per-model capability assertions. Only Auto (absent), Supported, or
+/// Unsupported — `RequiresEntitlement` is detected metadata, never a manual
+/// override. Missing fields mean Auto and serialize nothing.
+///
+/// Status override fields reject `requires_entitlement` (and other non-manual
+/// statuses) at deserialize time so bad configs cannot assert entitlement.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilityOverrides {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
     pub tool_calling: Option<CapabilityStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub images: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
+    pub image_input: Option<CapabilityStatus>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
+    pub audio_input: Option<CapabilityStatus>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
+    pub video_input: Option<CapabilityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1299,18 +1354,55 @@ pub struct ModelCapabilityOverrides {
     pub context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
     pub reasoning: Option<CapabilityStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
     pub structured_outputs: Option<CapabilityStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_manual_capability_override"
+    )]
     pub prompt_cache_retention: Option<CapabilityStatus>,
+}
+
+/// Manual overrides accept only Supported / Unsupported (or absent = Auto).
+/// `RequiresEntitlement` and `Unknown` are rejected so detected metadata cannot
+/// be smuggled in as a user override via config.
+fn deserialize_manual_capability_override<'de, D>(
+    deserializer: D,
+) -> Result<Option<CapabilityStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<CapabilityStatus>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(CapabilityStatus::Supported) => Ok(Some(CapabilityStatus::Supported)),
+        Some(CapabilityStatus::Unsupported) => Ok(Some(CapabilityStatus::Unsupported)),
+        Some(CapabilityStatus::RequiresEntitlement) => Err(serde::de::Error::custom(
+            "manual capability overrides cannot be requires_entitlement; use auto (omit) or supported/unsupported",
+        )),
+        Some(CapabilityStatus::Unknown) => Err(serde::de::Error::custom(
+            "manual capability overrides cannot be unknown; omit the field for Auto",
+        )),
+    }
 }
 
 impl ModelCapabilityOverrides {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_none()
-            && self.images.is_none()
+            && self.image_input.is_none()
+            && self.audio_input.is_none()
+            && self.video_input.is_none()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -1325,8 +1417,12 @@ impl ModelCapabilityOverrides {
 pub struct ProviderCapabilities {
     #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
     pub tool_calling: CapabilityStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub images: Option<bool>,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub image_input: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub audio_input: CapabilityStatus,
+    #[serde(default, skip_serializing_if = "CapabilityStatus::is_unknown")]
+    pub video_input: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1350,7 +1446,9 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_unknown()
-            && self.images.is_none()
+            && self.image_input.is_unknown()
+            && self.audio_input.is_unknown()
+            && self.video_input.is_unknown()
             && self.embeddings.is_none()
             && self.embedding_dimensions.is_none()
             && self.context_tokens.is_none()
@@ -2527,7 +2625,8 @@ impl ProvidersConfig {
         if !matches!(selected, Some(PromptCacheRetention::Extended)) {
             return None;
         }
-        let caps = self.resolve_capabilities(provider, model);
+        let caps =
+            self.resolve_effective_model_capabilities(provider, model, self.resolution_generation);
         matches!(caps.prompt_cache_retention, CapabilityStatus::Supported)
             .then_some(PromptCacheRetention::EXTENDED_WIRE_VALUE)
     }

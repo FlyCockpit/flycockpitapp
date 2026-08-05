@@ -1547,7 +1547,8 @@ impl HeldConfig {
         extended: cockpit_config::extended::ExtendedConfig,
         provider_view: cockpit_core::daemon::proto::ProviderConfigView,
     ) -> Self {
-        let providers = providers_from_view(&provider_view);
+        let mut providers = providers_from_view(&provider_view);
+        providers.set_resolution_generation(generation);
         Self {
             generation,
             from_daemon,
@@ -1573,6 +1574,10 @@ fn providers_from_view(
         category_defaults: view.category_defaults.clone(),
         on_unlisted_models_fetch: view.on_unlisted_models_fetch,
         active_model: view.active_model.clone(),
+        // TUI rebuilds a redacted projection for local display; stamp a
+        // non-zero generation only when the daemon snapshot is applied via
+        // with_resolution_generation on the live path.
+        resolution_generation: 0,
     }
 }
 

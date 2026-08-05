@@ -80,9 +80,13 @@ impl ConfigDoc {
     /// `COCKPIT_CONFIG` supplies the only config.json path when set; provider
     /// files live beside that file under `providers/`.
     pub fn load_effective(cwd: &Path) -> ProvidersConfig {
-        LOAD_EFFECTIVE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let generation = LOAD_EFFECTIVE_CALLS.with(|calls| {
+            let next = calls.get().saturating_add(1);
+            calls.set(next);
+            next as u64
+        });
         let paths = crate::config::dirs::config_file_paths_for_load(cwd);
-        Self::providers_from_paths(&paths)
+        Self::providers_from_paths(&paths).with_resolution_generation(generation)
     }
 
     pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {

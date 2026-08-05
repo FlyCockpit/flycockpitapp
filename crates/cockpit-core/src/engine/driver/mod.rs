@@ -5533,7 +5533,11 @@ impl Driver {
     fn active_model_context_length(&self) -> Option<u32> {
         let (providers, provider, model) = self.active_providers_config()?;
         providers
-            .resolve_capabilities(&provider, &model)
+            .resolve_effective_model_capabilities(
+                &provider,
+                &model,
+                providers.resolution_generation,
+            )
             .context_tokens
     }
 

@@ -265,9 +265,13 @@ fn resolved_computer_use_for_model(
         configured,
         None,
     );
-    let caps = providers.resolve_capabilities(model.provider_id(), model.model_id_ref());
+    let caps = providers.resolve_effective_model_capabilities(
+        model.provider_id(),
+        model.model_id_ref(),
+        providers.resolution_generation,
+    );
     let native_computer = (tier != crate::config::extended::ComputerUseMode::Disabled
-        && caps.images == Some(true))
+        && caps.supports_image_input())
     .then(|| {
         caps.computer_use
             .and_then(|capability| capability.contract)
@@ -308,8 +312,12 @@ fn computer_subagent_candidate(
             if !providers.resolve_subagent_invokable(provider_id, &model.id) {
                 continue;
             }
-            let caps = providers.resolve_capabilities(provider_id, &model.id);
-            if caps.images != Some(true) {
+            let caps = providers.resolve_effective_model_capabilities(
+                provider_id,
+                &model.id,
+                providers.resolution_generation,
+            );
+            if !caps.supports_image_input() {
                 continue;
             }
             let Some(contract) = caps.computer_use.and_then(|capability| capability.contract)
@@ -2099,8 +2107,12 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
         &model_id,
         args.effective_model().session_redact_table(),
     )?);
-    let caps = providers.resolve_capabilities(model.provider_id(), model.model_id_ref());
-    if caps.images != Some(true) {
+    let caps = providers.resolve_effective_model_capabilities(
+        model.provider_id(),
+        model.model_id_ref(),
+        providers.resolution_generation,
+    );
+    if !caps.supports_image_input() {
         bail!(
             "computer-use subagent requires a vision-capable model; `{}`:`{}` is not vision-capable",
             model.provider_id(),
@@ -3916,7 +3928,7 @@ mod tests {
                         "id": "text",
                         "subagent_invokable": true,
                         "capabilities": {
-                            "images": false,
+                            "image_input": "unsupported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }
@@ -3943,13 +3955,13 @@ mod tests {
                     {
                         "id": "text",
                         "subagent_invokable": true,
-                        "capabilities": { "images": false }
+                        "capabilities": { "image_input": "unsupported" }
                     },
                     {
                         "id": "vision",
                         "subagent_invokable": true,
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }
@@ -3978,13 +3990,13 @@ mod tests {
                     {
                         "id": "text",
                         "subagent_invokable": true,
-                        "capabilities": { "images": false }
+                        "capabilities": { "image_input": "unsupported" }
                     },
                     {
                         "id": "vision",
                         "subagent_invokable": true,
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }
@@ -4014,13 +4026,13 @@ mod tests {
                     {
                         "id": "text",
                         "subagent_invokable": true,
-                        "capabilities": { "images": false }
+                        "capabilities": { "image_input": "unsupported" }
                     },
                     {
                         "id": "vision",
                         "subagent_invokable": true,
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }
@@ -4058,7 +4070,7 @@ mod tests {
                         "id": "vision",
                         "subagent_invokable": true,
                         "capabilities": {
-                            "images": true,
+                            "image_input": "supported",
                             "computer_use": { "contract": "open_ai_responses" }
                         }
                     }

@@ -62,7 +62,7 @@ pub struct LaunchInfo {
     /// config carries it. Drives the `(max Nk)` part of the chrome's
     /// context indicator.
     pub active_model_max_context: Option<u32>,
-    /// True when the active model declares `inputs.images: true` in
+    /// True when the active model effectively supports image input via
     /// config (vision-capable). Drives the composer image-paste send-time
     /// decision: bytes vs. text note. Recomputed on every
     /// `reload_launch_info` so a `/model` switch round-trips images
@@ -236,7 +236,7 @@ fn lookup_model_context(
     provider_id: &str,
     model_id: &str,
 ) -> Option<u32> {
-    cfg.resolve_capabilities(provider_id, model_id)
+    cfg.resolve_effective_model_capabilities(provider_id, model_id, cfg.resolution_generation)
         .context_tokens
 }
 
@@ -245,7 +245,8 @@ fn model_supports_images(
     provider_id: &str,
     model_id: &str,
 ) -> bool {
-    cfg.resolve_capabilities(provider_id, model_id).images == Some(true)
+    cfg.resolve_effective_model_capabilities(provider_id, model_id, cfg.resolution_generation)
+        .supports_image_input()
 }
 
 pub fn print(project: Option<&Path>) {
@@ -362,7 +363,7 @@ mod tests {
                 models: vec![ModelEntry {
                     id: "m".into(),
                     capabilities: ModelCapabilities {
-                        images: Some(true),
+                        image_input: CapabilityStatus::Supported,
                         tool_calling: CapabilityStatus::Unsupported,
                         ..ModelCapabilities::default()
                     },

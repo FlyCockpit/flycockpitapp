@@ -124,7 +124,7 @@ impl TaskTool {
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": ["tool_calling", "images", "reasoning", "structured_outputs"]
+                        "enum": ["tool_calling", "image_input", "audio_input", "video_input", "reasoning", "structured_outputs"]
                     }
                 },
                 "min_context_tokens": {
@@ -609,8 +609,9 @@ mod tests {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
         let len = serde_json::to_string(&tool.parameters()).unwrap().len();
         // Observed after seed schema removal plus scoped write support: ~3020
-        // bytes. Keep this low enough that the seed blob cannot return.
-        assert!(len < 3200, "task schema serialized to {len} bytes");
+        // bytes; multimodal requires enums add ~200. Keep this low enough that
+        // the seed blob cannot return.
+        assert!(len < 3300, "task schema serialized to {len} bytes");
     }
 
     #[test]

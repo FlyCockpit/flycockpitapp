@@ -127,8 +127,16 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf
     }) {
         model.capability_overrides = Default::default();
     }
-    let base_capabilities = base.resolve_capabilities(&provider_id, &model_id);
-    let current_capabilities = effective.resolve_capabilities(&provider_id, &model_id);
+    let base_capabilities = base.resolve_effective_model_capabilities(
+        &provider_id,
+        &model_id,
+        base.resolution_generation,
+    );
+    let current_capabilities = effective.resolve_effective_model_capabilities(
+        &provider_id,
+        &model_id,
+        effective.resolution_generation,
+    );
     let global_mode = crate::config::extended::load_for_cwd(cwd).llm_mode;
     let provider_read = effective
         .providers
@@ -201,14 +209,14 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf
     }
 
     let selected_capabilities = model_capability_answers(run);
-    let next_images = capability_bool_override(
+    let next_images = capability_status_override(
         selected_capabilities.contains("images"),
-        current_capabilities.images == Some(true),
-        base_capabilities.images == Some(true),
-        model.capability_overrides.images,
+        current_capabilities.image_input.status,
+        base_capabilities.image_input.status,
+        model.capability_overrides.image_input,
     );
-    if model.capability_overrides.images != next_images {
-        model.capability_overrides.images = next_images;
+    if model.capability_overrides.image_input != next_images {
+        model.capability_overrides.image_input = next_images;
         model_changed = true;
     }
     let next_tools = capability_status_override(
@@ -350,21 +358,6 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf
     Ok(saved)
 }
 
-fn capability_bool_override(
-    selected: bool,
-    current_supported: bool,
-    base_supported: bool,
-    existing: Option<bool>,
-) -> Option<bool> {
-    if selected == current_supported {
-        existing
-    } else if selected == base_supported {
-        None
-    } else {
-        Some(selected)
-    }
-}
-
 fn capability_status_override(
     selected: bool,
     current: crate::config::providers::CapabilityStatus,
@@ -453,7 +446,7 @@ mod tests {
         provider.models.push(crate::config::providers::ModelEntry {
             id: "m".to_string(),
             capabilities: crate::config::providers::ModelCapabilities {
-                images: Some(false),
+                image_input: crate::config::providers::CapabilityStatus::Unsupported,
                 ..Default::default()
             },
             ..Default::default()
@@ -480,7 +473,7 @@ mod tests {
         provider.models.push(crate::config::providers::ModelEntry {
             id: "m".to_string(),
             capabilities: crate::config::providers::ModelCapabilities {
-                images: Some(false),
+                image_input: crate::config::providers::CapabilityStatus::Unsupported,
                 ..Default::default()
             },
             ..Default::default()
@@ -798,7 +791,7 @@ mod tests {
         let model = serde_json::to_value(model_entry).unwrap();
         assert_eq!(model["mode"], "frontier");
         assert_eq!(model["trust"], "trusted");
-        assert_eq!(model["capability_overrides"]["images"], true);
+        assert_eq!(model["capability_overrides"]["image_input"], "supported");
         assert_eq!(model["subagent_invokable"], false);
         assert_eq!(model["can_delegate"], false);
         assert!(model.get("default_thinking_mode").is_none());
@@ -831,7 +824,7 @@ mod tests {
             .iter()
             .find(|model| model.id == "m")
             .unwrap();
-        assert_eq!(model.capability_overrides.images, None);
+        assert_eq!(model.capability_overrides.image_input, None);
         assert_eq!(model.capability_overrides.tool_calling, None);
         assert_eq!(model.capability_overrides.reasoning, None);
         assert_eq!(model.capability_overrides.structured_outputs, None);
@@ -851,7 +844,7 @@ mod tests {
             .iter_mut()
             .find(|model| model.id == "m")
             .unwrap();
-        model.capabilities.images = Some(true);
+        model.capabilities.image_input = crate::config::providers::CapabilityStatus::Supported;
         model.capabilities.tool_calling = crate::config::providers::CapabilityStatus::Supported;
         model.capabilities.reasoning = crate::config::providers::CapabilityStatus::Supported;
         model.capabilities.structured_outputs =
@@ -873,7 +866,7 @@ mod tests {
             .find(|model| model.id == "m")
             .unwrap();
         assert_eq!(model.trust, None);
-        assert_eq!(model.capability_overrides.images, None);
+        assert_eq!(model.capability_overrides.image_input, None);
         assert_eq!(model.capability_overrides.tool_calling, None);
         assert_eq!(model.capability_overrides.reasoning, None);
         assert_eq!(model.capability_overrides.structured_outputs, None);
@@ -898,8 +891,9 @@ mod tests {
             .iter_mut()
             .find(|model| model.id == "m")
             .unwrap();
-        model.capabilities.images = Some(true);
-        model.capability_overrides.images = Some(false);
+        model.capabilities.image_input = crate::config::providers::CapabilityStatus::Supported;
+        model.capability_overrides.image_input =
+            Some(crate::config::providers::CapabilityStatus::Unsupported);
         model.can_delegate = Some(false);
         doc.write(&cfg).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -983,7 +977,10 @@ mod tests {
             model.trust,
             Some(crate::config::providers::ModelTrust::Trusted)
         );
-        assert_eq!(model.capability_overrides.images, Some(true));
+        assert_eq!(
+            model.capability_overrides.image_input,
+            Some(crate::config::providers::CapabilityStatus::Supported)
+        );
         assert!(
             !crate::config::providers::provider_file_path_for_config(&project_config, "p")
                 .unwrap()
@@ -1039,7 +1036,7 @@ mod tests {
         let overlay = models.iter().find(|model| model["id"] == "m").unwrap();
         assert_eq!(overlay["mode"], "frontier");
         assert_eq!(overlay["trust"], "trusted");
-        assert_eq!(overlay["capability_overrides"]["images"], true);
+        assert_eq!(overlay["capability_overrides"]["image_input"], "supported");
         assert!(raw.get("url").is_none());
         crate::config::trust::clear_runtime_policy_for_tests();
     }

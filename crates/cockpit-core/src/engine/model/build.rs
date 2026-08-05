@@ -45,7 +45,11 @@ impl Model {
         let subagent_invokable = cfg.resolve_subagent_invokable(&active.provider, &active.model);
         let can_delegate = cfg.resolve_can_delegate(&active.provider, &active.model);
         let computer_use = cfg
-            .resolve_capabilities(&active.provider, &active.model)
+            .resolve_effective_model_capabilities(
+                &active.provider,
+                &active.model,
+                cfg.resolution_generation,
+            )
             .computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, &active.provider, &active.model, redact.clone());
@@ -132,7 +136,9 @@ impl Model {
         let cost_rank = cfg.resolve_cost_rank(provider_id, model_id);
         let subagent_invokable = cfg.resolve_subagent_invokable(provider_id, model_id);
         let can_delegate = cfg.resolve_can_delegate(provider_id, model_id);
-        let computer_use = cfg.resolve_capabilities(provider_id, model_id).computer_use;
+        let computer_use = cfg
+            .resolve_effective_model_capabilities(provider_id, model_id, cfg.resolution_generation)
+            .computer_use;
         let effective_redact =
             Self::effective_redact_table_for(cfg, provider_id, model_id, redact.clone());
         build_model_with_can_delegate(

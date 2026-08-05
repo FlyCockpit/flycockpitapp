@@ -47,6 +47,10 @@ jaq-core = "3.1.0"
 jaq-json = "2.0.1"
 jaq-std = "3.0.1"
 keepawake = "0.6"
+# Direct pins for daemon-owned native secure keys (`native-secure-key-store`).
+# Application model: keyring-core + one target native store (never the
+# all-in-one `keyring` facade). Platform crates are target-gated on members.
+keyring-core = { version = "=1.0.0", default-features = false }
 libc = "0.2"
 lsp-types = "0.97"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }
@@ -103,6 +107,8 @@ walkdir = "2"
 which = "8"
 zbus = "5"
 zerobox = "0.3"
+# Direct pin: zeroize 1.9.0, no derive; alloc for Zeroizing/Vec paths.
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # Shared lint posture for every workspace member (each opts in with

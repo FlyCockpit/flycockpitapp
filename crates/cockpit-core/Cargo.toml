@@ -88,8 +88,21 @@ rayon = { workspace = true }
 firecrawl = "2"
 jsonc-parser = { workspace = true }
 
+# Native secure key store: keyring-core on every target; exactly one native
+# store per supported OS; Unsupported adapter elsewhere. Never the all-in-one
+# `keyring` crate. Features pinned exactly per `native-secure-key-store`.
+keyring-core = { workspace = true }
+zeroize = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
+zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "=1.0.1", default-features = false, features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -1498,3 +1498,84 @@ CREATE TABLE session_plan_docs (
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
+
+-- ---- installation_identity -------------------------------------------------
+-- Singleton installation identity for native secure-key account scoping.
+-- Exactly one row (id = 1). 16 random bytes; callers see 32 lowercase hex.
+-- Never derived from hostname, machine-id, user, config, env, or caller input.
+
+CREATE TABLE installation_identity (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    identity_bytes  BLOB    NOT NULL CHECK (length(identity_bytes) = 16),
+    created_at      INTEGER NOT NULL
+);
+
+-- ---- secure_key_namespaces -------------------------------------------------
+-- Nonsecret coordination for versioned native secure keys.
+
+CREATE TABLE secure_key_namespaces (
+    namespace       TEXT    PRIMARY KEY,
+    active_version  INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+-- ---- secure_key_versions ---------------------------------------------------
+
+CREATE TABLE secure_key_versions (
+    namespace    TEXT    NOT NULL,
+    version     INTEGER NOT NULL,
+    state       TEXT    NOT NULL CHECK (state IN (
+                    'Pending', 'Active', 'Retained', 'Retiring', 'Retired'
+                )),
+    key_digest  TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (namespace, version),
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+);
+
+CREATE INDEX idx_secure_key_versions_state
+    ON secure_key_versions (namespace, state);
+
+-- ---- secure_key_sagas ------------------------------------------------------
+-- Cross-store provision/retire phase ledger. Safe digests/metadata only.
+
+CREATE TABLE secure_key_sagas (
+    op_id       TEXT    PRIMARY KEY,
+    namespace   TEXT    NOT NULL,
+    kind        TEXT    NOT NULL CHECK (kind IN ('Provision', 'Retire')),
+    version     INTEGER NOT NULL,
+    phase       TEXT    NOT NULL,
+    key_digest  TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+);
+
+CREATE INDEX idx_secure_key_sagas_ns ON secure_key_sagas (namespace, kind);
+
+-- ---- secure_key_consumer_refs ----------------------------------------------
+-- Durable consumer references; no key or ciphertext.
+
+CREATE TABLE secure_key_consumer_refs (
+    reference_id    TEXT    PRIMARY KEY,
+    namespace       TEXT    NOT NULL,
+    version         INTEGER NOT NULL,
+    consumer_kind   TEXT    NOT NULL,
+    consumer_id     TEXT    NOT NULL,
+    state           TEXT    NOT NULL CHECK (state IN (
+                        'Reserved', 'Active', 'Releasing', 'Released'
+                    )),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE (namespace, version, consumer_kind, consumer_id),
+    FOREIGN KEY (namespace, version)
+        REFERENCES secure_key_versions(namespace, version)
+);
+
+CREATE INDEX idx_secure_key_refs_version_state
+    ON secure_key_consumer_refs (namespace, version, state);
+CREATE INDEX idx_secure_key_refs_recon
+    ON secure_key_consumer_refs (state)
+    WHERE state IN ('Reserved', 'Releasing');

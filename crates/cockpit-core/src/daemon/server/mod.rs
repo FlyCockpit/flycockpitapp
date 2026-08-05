@@ -1681,6 +1681,12 @@ pub struct DaemonContext {
     /// provider/extended config. Shared with the registry so attach-create,
     /// resume, and worker startup all consult the same source.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// Daemon-owned native secure key actor (`native-secure-key-store`).
+    /// Started under the single-instance lock after installation identity
+    /// is loaded; process-global keyring registration is drained on drop.
+    pub secure_key: Option<crate::secure_key::SecureKeyHandle>,
+    /// Owns the actor thread; kept so Drop drains before unset_default_store.
+    _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
 }
 
 impl DaemonContext {
@@ -1780,7 +1786,19 @@ impl DaemonContext {
             scheduler,
             credential_store_path: None,
             config_source,
+            secure_key: None,
+            _secure_key_actor: None,
         }
+    }
+
+    /// Install the secure-key actor after identity creation. Production calls
+    /// [`crate::secure_key::SecureKeyActor::start_production`] which registers
+    /// the platform store before intake. Failures are non-fatal for daemon
+    /// boot (typed Unavailable on later use); headless CI may lack Secret Service.
+    #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
+    pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
+        self.secure_key = Some(actor.handle());
+        self._secure_key_actor = Some(actor);
     }
 
     /// The daemon's config-resolution seam
@@ -1948,13 +1966,64 @@ pub(crate) async fn boot_with_db(
     timer.phase("lock_manager");
     run_boot_housekeeping(&db).await;
     timer.phase("prune_and_sweep");
-    let ctx = DaemonContext::new(
-        db,
+    #[cfg_attr(test, allow(unused_mut))]
+    let mut ctx = DaemonContext::new(
+        db.clone(),
         locks,
         paths,
         terminal_factory,
         crate::daemon::config_source::ConfigSource::production(),
     );
+    // Installation identity + secure-key actor: under single-instance lock
+    // (caller already holds pid/socket). Registration + keyring I/O stay on the
+    // dedicated actor OS thread. Boot handshake runs on a short-lived std thread
+    // (not Tokio blocking/core pool) so `blocking_recv` never pins a runtime worker.
+    //
+    // Unit tests skip production native registration (no real OS keyring; avoids
+    // D-Bus hangs that stall ephemeral idle-reap tests after the socket is bound).
+    #[cfg(not(test))]
+    {
+        let db_for_keys = db.clone();
+        let (boot_tx, boot_rx) = tokio::sync::oneshot::channel();
+        match std::thread::Builder::new()
+            .name("cockpit-secure-key-boot".into())
+            .spawn(move || {
+                let result = crate::secure_key::SecureKeyActor::start_production(db_for_keys);
+                let _ = boot_tx.send(result);
+            }) {
+            Ok(_handle) => match boot_rx.await {
+                Ok(Ok(actor)) => {
+                    ctx.attach_secure_key_actor(actor);
+                    timer.phase("secure_key_actor");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        error = %error,
+                        "secure key actor not started; native secure keys unavailable"
+                    );
+                    timer.phase("secure_key_actor_skipped");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "secure key actor boot channel dropped; native secure keys unavailable"
+                    );
+                    timer.phase("secure_key_actor_skipped");
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "secure key actor boot thread spawn failed; native secure keys unavailable"
+                );
+                timer.phase("secure_key_actor_skipped");
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = db;
+        timer.phase("secure_key_actor_skipped");
+    }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
     {

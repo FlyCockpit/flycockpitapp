@@ -51,6 +51,7 @@ pub mod providers;
 pub mod redact;
 pub mod secret_paths;
 pub mod secret_ref;
+pub mod secure_key;
 pub mod session;
 pub mod skills;
 pub mod startup;

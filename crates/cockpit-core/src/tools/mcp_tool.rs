@@ -123,11 +123,11 @@ impl Tool for McpTool {
         let host = crate::mcp::builtin::HostContext::from_tool_ctx(ctx);
         match crate::mcp::sandbox::run_with_host(script, &cfg, &host).await {
             Ok(out) => Ok(rendered_result_output(out)),
-            // A sandbox error (compile error, denied OS access, mcp.invoke
-            // failure surfaced as a Python exception, etc.) is an execution
-            // outcome the model should see and react to, not an invocation
-            // shape error — return it as content.
-            Err(e) => Ok(ToolOutput::text(format!("[mcp sandbox error] {e}"))),
+            // Unhandled Monty compile/runtime/OS denial/import/host
+            // exceptions are failed parent tool calls (`hard_fail`). Authored
+            // try/except that returns a value remains Ok above. Do not infer
+            // failure by inspecting successful result text.
+            Err(e) => Err(e),
         }
     }
 
@@ -417,5 +417,222 @@ mod tests {
             })
             .count();
         assert_eq!(configured_cockpit_hits, 0, "{output}");
+    }
+
+    async fn call_script(script: &str) -> Result<ToolOutput> {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        McpTool
+            .call(serde_json::json!({ "script": script }), &ctx)
+            .await
+    }
+
+    async fn expect_parent_err(script: &str, label: &str) -> String {
+        match call_script(script).await {
+            Ok(out) => panic!(
+                "{label}: expected Err parent, got Ok content={}",
+                out.content
+            ),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// AC1: unhandled sandbox failures surface as parent Err through
+    /// `McpTool::call` (not Ok text with a sandbox-error prefix).
+    #[tokio::test]
+    async fn sandbox_denies_filesystem() {
+        let msg = expect_parent_err("open('/etc/passwd').read()", "filesystem")
+            .await
+            .to_lowercase();
+        assert!(
+            msg.contains("denied") || msg.contains("permission"),
+            "filesystem must be denied via Err, got: {msg}"
+        );
+        assert!(
+            !msg.contains("[mcp sandbox error]"),
+            "must not wrap as Ok text: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_arg_must_be_string() {
+        let msg = expect_parent_err("mcp.search(123)", "search arg").await;
+        assert!(
+            !msg.contains("[mcp sandbox error]"),
+            "must not wrap as Ok text: {msg}"
+        );
+    }
+
+    /// AC4: unhandled compile/runtime/denied/name/import/uncaught host
+    /// errors fail the parent tool call. hard_fail / export state /
+    /// ToolError lifecycle follow from parent Err classification.
+    #[tokio::test]
+    async fn mcp_unhandled_parent_failure() {
+        let compile = expect_parent_err("def (", "compile").await;
+        assert!(
+            compile.to_lowercase().contains("compile")
+                || compile.to_lowercase().contains("syntax")
+                || compile.contains("Python"),
+            "{compile}"
+        );
+
+        let runtime = expect_parent_err("1 / 0", "runtime").await;
+        assert!(
+            runtime.to_lowercase().contains("zero")
+                || runtime.to_lowercase().contains("division")
+                || runtime.to_lowercase().contains("sandbox"),
+            "{runtime}"
+        );
+
+        let denied = expect_parent_err("open('/etc/passwd')", "denied").await;
+        assert!(
+            denied.to_lowercase().contains("denied")
+                || denied.to_lowercase().contains("permission"),
+            "{denied}"
+        );
+
+        let name = expect_parent_err("undefined_name", "name").await;
+        assert!(
+            name.contains("not defined") || name.to_lowercase().contains("name"),
+            "{name}"
+        );
+
+        let import = expect_parent_err("import mcp", "import").await;
+        assert!(
+            import.contains("ModuleNotFoundError") || import.to_lowercase().contains("module"),
+            "{import}"
+        );
+        assert!(
+            import.contains(crate::mcp::sandbox::MCP_IMPORT_GUIDANCE)
+                || import.contains("prebound"),
+            "{import}"
+        );
+
+        let host = expect_parent_err("mcp.describe('nope', 'tool')", "uncaught host").await;
+        assert!(
+            host.to_lowercase().contains("describe")
+                || host.to_lowercase().contains("sandbox")
+                || host.to_lowercase().contains("unknown")
+                || host.to_lowercase().contains("nope"),
+            "{host}"
+        );
+
+        // Mirror tool_dispatch's Err branch: hard_fail=true, no exit_code,
+        // export/TUI state "bad_call", ToolError event.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut ctx = crate::tools::common::test_ctx(tmp.path());
+        ctx.events = Some(tx);
+        let session = ctx.session.clone();
+        let call_id = "parent-mcp-fail".to_string();
+        let err = McpTool
+            .call(serde_json::json!({ "script": "1 / 0" }), &ctx)
+            .await
+            .expect_err("parent must Err");
+        let raw_output = format!("Error: {err}");
+        let hard_fail = true;
+        // tool_dispatch maps every Err to hard_fail + ToolFailKind::Execution
+        // (unless InvalidToolInput). In-process Monty has no process exit code.
+        assert_eq!(
+            crate::engine::tool::classify_failure(&err),
+            crate::engine::tool::ToolFailKind::Execution
+        );
+        assert!(hard_fail);
+        session
+            .record_tool_call(crate::session::ToolCallRow {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                agent: "test".into(),
+                call_id: call_id.clone(),
+                parent_call_id: None,
+                parent_child_index: None,
+                identity: crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
+                    &call_id, None,
+                ),
+                tool: "mcp".into(),
+                mcp_server: None,
+                path: None,
+                original_input_json: serde_json::json!({ "script": "1 / 0" }),
+                wire_input_json: serde_json::json!({ "script": "1 / 0" }),
+                recovery: crate::db::tool_calls::Recovery::Clean,
+                hard_fail,
+                exit_code: None,
+                sandbox_enabled: false,
+                sandboxed: false,
+                sandbox_unavailable_reason: None,
+                output: raw_output.clone(),
+                truncated: false,
+                duration_ms: 0,
+                llm_mode: LlmMode::Normal,
+                shape_fingerprint: None,
+                hint: None,
+            })
+            .await
+            .unwrap();
+        let _ = ctx
+            .events
+            .as_ref()
+            .unwrap()
+            .send(TurnEvent::ToolError {
+                agent: "test".into(),
+                call_id: call_id.clone(),
+                tool: "mcp".into(),
+                error: raw_output,
+                kind: crate::engine::tool::ToolFailKind::Execution,
+                seq: None,
+            })
+            .await;
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        let parent = rows.iter().find(|r| r.call_id == call_id).unwrap();
+        assert!(parent.hard_fail, "lifecycle hard_fail");
+        assert!(
+            parent.exit_code.is_none(),
+            "in-process Monty has no exit code"
+        );
+        // Export/TUI failed state (session/export/mod.rs tool_state_str).
+        let export_state = if parent.hard_fail {
+            "bad_call"
+        } else {
+            "success"
+        };
+        assert_eq!(export_state, "bad_call");
+        let event = rx.try_recv().expect("ToolError lifecycle event");
+        assert!(
+            matches!(event, TurnEvent::ToolError { ref tool, .. } if tool == "mcp"),
+            "{event:?}"
+        );
+    }
+
+    /// AC7: successful results and MCP protocol error *payloads* stay Ok —
+    /// no output-string heuristics that reclassify success as failure.
+    #[tokio::test]
+    async fn mcp_success_and_protocol_result_unchanged() {
+        let ok = call_script("{'ok': True, 'error': 'looks scary but is data'}")
+            .await
+            .expect("success must stay Ok");
+        assert!(ok.content.contains("\"ok\":true"), "{}", ok.content);
+        assert!(
+            ok.content.contains("looks scary"),
+            "must not strip error-looking data: {}",
+            ok.content
+        );
+
+        let caught = call_script(
+            "\
+try:
+    mcp.describe('nope', 'tool')
+    r = 'no-error'
+except Exception:
+    r = 'caught'
+r",
+        )
+        .await
+        .expect("caught host error is parent success");
+        assert!(caught.content.contains("caught"), "{}", caught.content);
     }
 }

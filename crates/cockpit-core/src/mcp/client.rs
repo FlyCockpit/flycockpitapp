@@ -140,9 +140,11 @@ pub async fn connect_with_context(
             {
                 Ok(result) => result?,
                 Err(_) => {
-                    anyhow::bail!(
-                        "MCP stdio server `{name}` spawn timed out and the connection was reset"
-                    );
+                    return Err(crate::mcp::child_failure::ChildFailure::timeout(
+                        name,
+                        "spawn_deadline_exceeded_connection_reset",
+                    )
+                    .into());
                 }
             };
             let remaining = connect_deadline
@@ -154,9 +156,11 @@ pub async fn connect_with_context(
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     client.poison("initialize timeout").await;
-                    anyhow::bail!(
-                        "MCP stdio server `{name}` initialize timed out and the connection was reset"
-                    );
+                    return Err(crate::mcp::child_failure::ChildFailure::timeout(
+                        name,
+                        "initialize_deadline_exceeded_connection_reset",
+                    )
+                    .into());
                 }
             }
         }

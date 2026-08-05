@@ -13,6 +13,7 @@ pub mod auth;
 pub mod builtin;
 pub mod cache;
 pub mod catalog;
+pub mod child_failure;
 pub mod client;
 pub mod config;
 pub mod invoke_prep;

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -18,6 +18,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::mcp::child_failure::{ChildFailure, ExitEvidence, exit_evidence_from_status};
 use crate::mcp::protocol::{
     JsonRpcRequest, JsonRpcResponse, McpClient, ToolDescriptor, initialize_params, parse_tools_list,
 };
@@ -75,9 +76,17 @@ impl StdioClient {
             .envs(stdio_child_env(std::env::vars(), env));
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning MCP stdio server `{command}`"))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // Never embed args, env, or cwd — only a short spawn cause.
+                return Err(ChildFailure::spawn(
+                    server_name,
+                    format!("command_spawn_failed: {error}"),
+                )
+                .into());
+            }
+        };
         let stdin = child.stdin.take().context("child stdin missing")?;
         let stdout = child.stdout.take().context("child stdout missing")?;
         Ok(Self::new(
@@ -163,17 +172,19 @@ where
             RequestOutcome::Complete(result) => result,
             RequestOutcome::Cancelled => {
                 self.state.poison_and_kill("cancellation").await;
-                bail!(
-                    "MCP stdio request to `{}` was cancelled and the connection was reset",
-                    self.state.server_name
+                Err(ChildFailure::cancel(
+                    &self.state.server_name,
+                    "request_cancelled_connection_reset",
                 )
+                .into())
             }
             RequestOutcome::TimedOut => {
                 self.state.poison_and_kill("timeout").await;
-                bail!(
-                    "MCP stdio request to `{}` timed out and the connection was reset",
-                    self.state.server_name
+                Err(ChildFailure::timeout(
+                    &self.state.server_name,
+                    "request_deadline_exceeded_connection_reset",
                 )
+                .into())
             }
         }
     }
@@ -192,17 +203,38 @@ where
         let req = JsonRpcRequest::new(id, method, params);
         let mut line = serde_json::to_string(&req)?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        if let Err(error) = self.stdin.write_all(line.as_bytes()).await {
+            return Err(ChildFailure::transport(
+                &self.state.server_name,
+                format!("write_failed: {error}"),
+            )
+            .into());
+        }
+        if let Err(error) = self.stdin.flush().await {
+            return Err(ChildFailure::transport(
+                &self.state.server_name,
+                format!("flush_failed: {error}"),
+            )
+            .into());
+        }
 
         // Read lines until we get one that parses as a response carrying
         // our id (servers may emit notifications without an `id`).
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = self.stdout.read_line(&mut buf).await?;
+            let n = match self.stdout.read_line(&mut buf).await {
+                Ok(n) => n,
+                Err(error) => {
+                    return Err(ChildFailure::transport(
+                        &self.state.server_name,
+                        format!("read_failed: {error}"),
+                    )
+                    .into());
+                }
+            };
             if n == 0 {
-                bail!("MCP stdio server closed the connection");
+                return Err(self.state.connection_closed_failure().await.into());
             }
             let trimmed = buf.trim();
             if trimmed.is_empty() {
@@ -282,12 +314,61 @@ impl StdioState {
                 .ok()
                 .and_then(|reason| reason.clone())
                 .unwrap_or_else(|| "an abandoned request".to_string());
-            bail!(
-                "MCP stdio server `{}` connection was reset after {reason}; retry to reconnect",
-                self.server_name
-            );
+            let stage = match reason.as_str() {
+                "timeout" | "initialize timeout" => {
+                    return Err(ChildFailure::timeout(
+                        &self.server_name,
+                        format!("connection_reset_after_{reason}"),
+                    )
+                    .into());
+                }
+                "cancellation" => {
+                    return Err(ChildFailure::cancel(
+                        &self.server_name,
+                        "connection_reset_after_cancellation",
+                    )
+                    .into());
+                }
+                _ => crate::mcp::child_failure::Stage::Transport,
+            };
+            return Err(ChildFailure::new(
+                stage,
+                &self.server_name,
+                format!("connection_reset_after_{reason}"),
+                None,
+            )
+            .into());
         }
         Ok(())
+    }
+
+    /// When stdout EOF arrives, harvest optional exit evidence without
+    /// capturing stderr, args, env, or cwd.
+    async fn connection_closed_failure(&self) -> ChildFailure {
+        let mut exit = None;
+        if let Ok(mut guard) = self.child.try_lock()
+            && let Some(child) = guard.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            exit = Some(exit_evidence_from_status(status));
+        }
+        match exit {
+            Some(evidence)
+                if evidence.code.is_some_and(|code| code != 0) || evidence.signal.is_some() =>
+            {
+                let cause = if evidence.signal.is_some() {
+                    "signal_exit"
+                } else {
+                    "nonzero_status"
+                };
+                ChildFailure::exit(&self.server_name, cause, evidence)
+            }
+            Some(ExitEvidence {
+                code: Some(0),
+                signal: None,
+            }) => ChildFailure::transport(&self.server_name, "connection_closed_exit_0"),
+            _ => ChildFailure::transport(&self.server_name, "connection_closed"),
+        }
     }
 
     fn poison_sync(&self, reason: &str, reason_mode: PoisonReasonMode) {
@@ -562,8 +643,9 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         let err = task.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("timed out"), "{err}");
-        assert!(err.to_string().contains("connection was reset"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("stage=timeout"), "{msg}");
+        assert!(msg.contains("request_deadline_exceeded"), "{msg}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -584,7 +666,7 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         let err = task.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.to_string().contains("stage=timeout"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -615,7 +697,7 @@ mod tests {
         assert!(!task.is_finished(), "initialize used request timeout");
         tokio::time::advance(Duration::from_secs(4)).await;
         let err = task.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.to_string().contains("stage=timeout"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -631,12 +713,10 @@ mod tests {
         let _ = task.await.unwrap().unwrap_err();
 
         let err = client.lock().await.list_tools().await.unwrap_err();
-        assert!(err.to_string().contains("test-server"), "{err}");
-        assert!(
-            err.to_string()
-                .contains("connection was reset after timeout"),
-            "{err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("server=`test-server`"), "{msg}");
+        assert!(msg.contains("stage=timeout"), "{msg}");
+        assert!(msg.contains("connection_reset_after_timeout"), "{msg}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -662,7 +742,7 @@ mod tests {
             .unwrap();
 
         let err = client.lock().await.list_tools().await.unwrap_err();
-        assert!(err.to_string().contains("connection was reset"), "{err}");
+        assert!(err.to_string().contains("connection_reset"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -679,13 +759,11 @@ mod tests {
         cancel.cancel();
 
         let err = task.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(err.to_string().contains("stage=cancel"), "{err}");
         let err = client.lock().await.list_tools().await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("connection was reset after cancellation"),
-            "{err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("stage=cancel"), "{msg}");
+        assert!(msg.contains("connection_reset_after_cancellation"), "{msg}");
     }
 
     #[tokio::test(start_paused = true)]

@@ -65,9 +65,14 @@ pub async fn run(script: &str, cfg: &McpConfig) -> Result<String> {
     run_with_host(script, cfg, &host).await
 }
 
+/// Guidance when models try `import mcp` / `from mcp import …`. `mcp` is a
+/// prebound namespace — imports stay disabled.
+pub(crate) const MCP_IMPORT_GUIDANCE: &str = "mcp is prebound in this sandbox; call mcp.search, \
+mcp.grep_tool_names, mcp.grep_tool_definitions, mcp.describe, or mcp.invoke directly — do not import mcp";
+
 pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) -> Result<String> {
     let runner = MontyRun::new(script.to_owned(), "mcp.py", vec!["mcp".to_owned()])
-        .map_err(|e| anyhow::anyhow!("Python compile error: {}", exc_msg(&e)))?;
+        .map_err(|e| sandbox_err("Python compile error", &e))?;
 
     // The `mcp` namespace: an empty frozen dataclass. Any `mcp.<attr>(…)`
     // misses its (empty) attrs and dispatches to the host as a method-call
@@ -88,7 +93,7 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
             tracker,
             PrintWriter::CollectString(&mut stdout),
         )
-        .map_err(|e| anyhow::anyhow!("sandbox error: {}", exc_msg(&e)))?;
+        .map_err(|e| sandbox_err("sandbox error", &e))?;
 
     loop {
         match progress {
@@ -114,7 +119,7 @@ pub async fn run_with_host(script: &str, cfg: &McpConfig, host: &HostContext) ->
                         if let Some(recorder) = &host.child_events {
                             recorder.finish_suppressed().await;
                         }
-                        return Err(anyhow::anyhow!("sandbox error: {}", exc_msg(&e)));
+                        return Err(sandbox_err("sandbox error", &e));
                     }
                 };
             }
@@ -187,6 +192,28 @@ fn normalize_python_literal_stdout(stdout: &str) -> Option<String> {
 /// Render a `MontyException` to a short message.
 fn exc_msg(e: &MontyException) -> String {
     e.to_string()
+}
+
+/// Map a Monty exception into a parent-tool Err, appending import guidance
+/// only when the failure is an attempt to import the prebound `mcp` module.
+fn sandbox_err(prefix: &str, e: &MontyException) -> anyhow::Error {
+    let mut msg = format!("{prefix}: {}", exc_msg(e));
+    if is_mcp_import_failure(&msg) {
+        msg.push_str(". ");
+        msg.push_str(MCP_IMPORT_GUIDANCE);
+    }
+    anyhow::anyhow!(msg)
+}
+
+fn is_mcp_import_failure(msg: &str) -> bool {
+    // Pinned Monty shapes:
+    //   ModuleNotFoundError: No module named 'mcp'
+    //   ImportError: cannot import name '…' from 'mcp' (unknown location)
+    let lower = msg.to_lowercase();
+    (lower.contains("modulenotfounderror") && lower.contains("no module named 'mcp'"))
+        || (lower.contains("importerror")
+            && lower.contains("from 'mcp'")
+            && lower.contains("cannot import name"))
 }
 
 /// Dispatch a sandbox external call to the host. `method_call` means the
@@ -1788,5 +1815,233 @@ for line in sys.stdin:
             .unwrap();
         assert!(out.contains("\"count\":3"), "{out}");
         assert!(out.contains("\"count_type\":\"int\""), "{out}");
+    }
+
+    /// AC3: import/from-import/alias/inner-function import of `mcp` get
+    /// direct-call guidance; unrelated modules do not.
+    #[tokio::test]
+    async fn mcp_import_guidance_actual_monty() {
+        let cfg = McpConfig::default();
+
+        let cases: &[(&str, bool)] = &[
+            ("import mcp", true),
+            ("from mcp import invoke", true),
+            ("import mcp as m", true),
+            (
+                "\
+def f():
+    import mcp
+    return mcp
+f()",
+                true,
+            ),
+            ("import totally_unavailable_module_xyz", false),
+        ];
+
+        for (script, expect_guidance) in cases {
+            let err = run(script, &cfg)
+                .await
+                .expect_err(&format!("import must fail: {script}"));
+            let msg = err.to_string();
+            // Pinned Monty shapes: ModuleNotFoundError / ImportError.
+            assert!(
+                msg.contains("ModuleNotFoundError")
+                    || msg.contains("ImportError")
+                    || msg.to_lowercase().contains("module"),
+                "unexpected Monty shape for `{script}`: {msg}"
+            );
+            if *expect_guidance {
+                assert!(
+                    msg.contains(MCP_IMPORT_GUIDANCE) || msg.contains("prebound"),
+                    "mcp import must include guidance: {msg}"
+                );
+                assert!(
+                    !msg.to_lowercase().contains("no module named 'totally"),
+                    "{msg}"
+                );
+            } else {
+                assert!(
+                    !msg.contains(MCP_IMPORT_GUIDANCE) && !msg.contains("prebound"),
+                    "unrelated import must not get MCP guidance: {msg}"
+                );
+            }
+        }
+    }
+
+    /// AC5: stdio spawn/timeout/transport/exit/cancel produce typed
+    /// stage/cause diagnostics with optional sanitized exit evidence.
+    #[tokio::test]
+    async fn mcp_stdio_child_failure_matrix() {
+        use crate::mcp::child_failure::{ChildFailure, ExitEvidence, Stage};
+
+        let spawn = ChildFailure::spawn("fake", "command_spawn_failed: No such file");
+        assert_eq!(spawn.stage, Stage::Spawn);
+        let rendered = spawn.render();
+        assert!(rendered.contains("stage=spawn"), "{rendered}");
+        assert!(rendered.contains("server=`fake`"), "{rendered}");
+        assert!(
+            rendered.contains("cause=command_spawn_failed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/secret/cwd"), "{rendered}");
+
+        let timeout = ChildFailure::timeout("fake", "request_deadline_exceeded_connection_reset");
+        assert!(timeout.render().contains("stage=timeout"), "{timeout}");
+
+        let transport = ChildFailure::transport("fake", "connection_closed");
+        assert!(
+            transport.render().contains("stage=transport"),
+            "{transport}"
+        );
+
+        let nonzero = ChildFailure::exit(
+            "fake",
+            "nonzero_status",
+            ExitEvidence {
+                code: Some(2),
+                signal: None,
+            },
+        );
+        let r = nonzero.render();
+        assert!(r.contains("stage=exit"), "{r}");
+        assert!(r.contains("exit_code=2"), "{r}");
+
+        let signal = ChildFailure::exit(
+            "fake",
+            "signal_exit",
+            ExitEvidence {
+                code: None,
+                signal: Some("SIGTERM".into()),
+            },
+        );
+        let r = signal.render();
+        assert!(r.contains("stage=exit"), "{r}");
+        assert!(r.contains("signal=SIGTERM"), "{r}");
+
+        let cancel = ChildFailure::cancel("fake", "request_cancelled_connection_reset");
+        assert!(cancel.render().contains("stage=cancel"), "{cancel}");
+
+        // Live spawn failure through catalog/invoke surfaces as typed child
+        // failure when a script invokes a broken stdio server.
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            "broken".into(),
+            ServerConfig {
+                transport: Transport::Stdio,
+                endpoint: None,
+                command: Some("/nonexistent/mcp-server-binary-xyz".into()),
+                args: vec!["--should-not-appear-in-diagnostics".into()],
+                env: {
+                    let mut env = BTreeMap::new();
+                    env.insert("SECRET_TOKEN".into(), "s3cret".into());
+                    env
+                },
+                env_credential_refs: BTreeMap::new(),
+                auth: Default::default(),
+                mode: DisclosureMode::Monty,
+                enabled: true,
+                cache_ttl_secs: 3600,
+                connect_timeout_secs: Some(1),
+                timeout_secs: Some(1),
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, db, _hub) = approvable_ctx(root.path());
+        crate::approval::store::GrantStore::new(
+            db,
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        )
+        .record_mcp_tool("broken", "t", crate::approval::store::Scope::Session)
+        .await
+        .unwrap();
+        let mut ctx = ctx;
+        ctx.current_tool_call_id = Some("outer-stdio-matrix".into());
+        let host = HostContext::from_tool_ctx(&ctx);
+        let err = run_with_host("mcp.invoke('broken', 't', {})", &cfg, &host)
+            .await
+            .expect_err("broken stdio spawn must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stage=spawn")
+                || msg.contains("stage=timeout")
+                || msg.contains("mcp child failure"),
+            "typed child failure expected: {msg}"
+        );
+        assert!(
+            !msg.contains("should-not-appear") && !msg.contains("s3cret"),
+            "diagnostics must exclude args/env: {msg}"
+        );
+
+        let rows = child_rows(&ctx.session, "outer-stdio-matrix").await;
+        assert_eq!(rows.len(), 1, "failed child must be recorded");
+        assert!(rows[0].hard_fail);
+        assert!(
+            rows[0].output.contains("stage=")
+                || rows[0].output.contains("mcp child failure")
+                || rows[0].output.contains("spawn")
+                || rows[0].output.contains("failed"),
+            "child row carries failure evidence: {}",
+            rows[0].output
+        );
+    }
+
+    /// AC6: catching a stdio child failure leaves the child row failed while
+    /// the parent script result succeeds.
+    #[tokio::test]
+    async fn mcp_caught_stdio_failure_parent_succeeds() {
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            "broken".into(),
+            ServerConfig {
+                transport: Transport::Stdio,
+                endpoint: None,
+                command: Some("/nonexistent/mcp-server-binary-xyz".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                env_credential_refs: BTreeMap::new(),
+                auth: Default::default(),
+                mode: DisclosureMode::Monty,
+                enabled: true,
+                cache_ttl_secs: 3600,
+                connect_timeout_secs: Some(1),
+                timeout_secs: Some(1),
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let (mut ctx, db, _hub) = approvable_ctx(root.path());
+        crate::approval::store::GrantStore::new(
+            db,
+            ctx.session.id,
+            root.path().to_path_buf(),
+            ctx.config.clone(),
+        )
+        .record_mcp_tool("broken", "t", crate::approval::store::Scope::Session)
+        .await
+        .unwrap();
+        ctx.current_tool_call_id = Some("outer-caught-stdio".into());
+        let host = HostContext::from_tool_ctx(&ctx);
+        let out = run_with_host(
+            "\
+try:
+    mcp.invoke('broken', 't', {})
+    r = 'no-error'
+except Exception as e:
+    r = {'caught': True, 'err': str(e)}
+r",
+            &cfg,
+            &host,
+        )
+        .await
+        .expect("authored catch must yield parent success");
+        assert!(out.contains("\"caught\":true"), "{out}");
+
+        let rows = child_rows(&ctx.session, "outer-caught-stdio").await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].hard_fail,
+            "child remains failed when parent catches"
+        );
     }
 }

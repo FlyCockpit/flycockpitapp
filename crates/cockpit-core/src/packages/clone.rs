@@ -99,6 +99,11 @@ fn hex_upper(nibble: u8) -> char {
 /// for large dependencies (prompt decision 4). A non-zero exit surfaces
 /// the captured stderr as the error (clean failure, no panic).
 pub(super) fn git_clone(url: &str, dest: &Path, branch: Option<&str>, shallow: bool) -> Result<()> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        dest.parent().unwrap_or(dest),
+    )
+    .map_err(|err| anyhow::anyhow!("git clone blocked by external-runtime health: {err}"))?;
     let mut cmd = build_git_clone_command(url, dest, branch, shallow);
     let output = cmd
         .output()

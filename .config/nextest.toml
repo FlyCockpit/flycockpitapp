@@ -15,6 +15,11 @@ max-threads = 1
 filter = "package(cockpit-cli) & binary(e2e) & test(/daemon_lifecycle_replay/)"
 test-group = "daemon-lifecycle-replay"
 
+# Broadcast lag marker drains a full in-process queue; cargo test ~2min.
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::in_process_full_event_queue_emits_lag_marker)"
+slow-timeout = { period = "90s", terminate-after = 3 }
+
 # Inner-loop profile for iterative agent runs. Skips only apps/cli's
 # integration-test binary (`kind(test)`), which spawns the real `cockpit`
 # binary and live daemons — the most expensive link + runtime in the

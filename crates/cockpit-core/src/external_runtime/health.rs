@@ -268,6 +268,36 @@ impl HealthSnapshotStore {
         inner.current.clone()
     }
 
+    /// Atomically assign a new generation, merge `entry` into the published
+    /// snapshot, and return `(published_snapshot, generation)`.
+    ///
+    /// Used by live launch gates so concurrent multi-id handoffs each publish
+    /// a strictly newer generation without racing `begin_refresh` reservations
+    /// (full Settings/doctor refreshes still use begin_refresh + publish).
+    pub fn publish_live_entry(
+        &self,
+        entry: HealthEntry,
+        platform: HostPlatform,
+    ) -> (Arc<ExternalRuntimeSnapshot>, u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.next_generation = inner.next_generation.saturating_add(1);
+        let generation = inner.next_generation;
+        let mut snapshot = if let Some(current) = &inner.current {
+            let mut snap = (**current).clone();
+            snap.generation = generation;
+            snap.platform = platform;
+            snap
+        } else {
+            ExternalRuntimeSnapshot::empty(generation, platform)
+        };
+        snapshot
+            .entries
+            .insert(entry.id.as_str().to_string(), entry);
+        let arc = Arc::new(snapshot);
+        inner.current = Some(arc.clone());
+        (arc, generation)
+    }
+
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.current = None;

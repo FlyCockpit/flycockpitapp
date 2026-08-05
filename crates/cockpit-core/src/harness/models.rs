@@ -31,6 +31,17 @@ pub async fn probe_models(
     if cfg.model_list_args.is_empty() {
         return None;
     }
+    // Model-list probe is a real command handoff: require same-generation
+    // Available for the exact configured executable. Never inherit a trusted
+    // catalog recipe by executable-name resemblance.
+    let input = crate::external_runtime::ConfiguredCommandInput::new("models", &cfg.command);
+    crate::external_runtime::require_configured_command_available_for_launch(
+        crate::external_runtime::custom_harness_id("models"),
+        "harness.models",
+        &input,
+        cwd,
+    )
+    .ok()?;
     let mut cmd = tokio::process::Command::new(&cfg.command);
     cmd.args(&cfg.model_list_args)
         .current_dir(cwd)

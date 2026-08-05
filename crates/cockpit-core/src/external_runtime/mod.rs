@@ -7,6 +7,7 @@
 //! Health is in-memory only and is never persisted. Remedies never execute
 //! package managers, elevation, downloads, browsers, auth, or runtime mutation.
 
+mod adapters;
 mod health;
 mod platform;
 mod probe;
@@ -17,6 +18,24 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
+pub use adapters::{
+    ConfiguredCommandInput, GhAuthState, ID_ACCEL_FD, ID_ACCEL_GSED, ID_ACCEL_RG, ID_GH, ID_GIT,
+    ID_HARNESS_CLAUDE, ID_HARNESS_CODEX, ID_HARNESS_GEMINI, ID_HARNESS_OPENCODE, ID_JQ_EXTERNAL,
+    ID_KCL, ID_LAZYGIT, IntegrationHealthComposeInput, LaunchGateError, accelerator_adapter_id,
+    assert_catalog_discovery_is_safe, catalog_adapter_descriptors,
+    cockpit_owned_jq_requires_host_jq, compose_settings_doctor_health,
+    compose_settings_doctor_health_with_executor, custom_harness_id, discovery_performs_gh_auth,
+    discovery_probe_argv_is_safe, discovery_side_effects_forbidden,
+    ensure_integration_adapters_registered, external_jq_adapter_id, gh_binary_health_implies_auth,
+    global_health_store, harness_compose_inputs, known_catalog_adapter_ids,
+    known_harness_preset_names, lsp_command_input, lsp_server_id, mcp_stdio_input,
+    register_integration_adapters, require_available_for_launch,
+    require_available_for_launch_uncancelled, require_configured_command_available_for_launch,
+    require_configured_command_available_for_launch_with_cancel, require_live_available_for_launch,
+    require_live_available_for_launch_with_cancel, stdio_mcp_id, upsert_custom_harness,
+    upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers, upsert_stdio_mcp,
+    upsert_stdio_mcp_servers,
+};
 pub use health::{
     ExternalRuntimeSnapshot, GroupHealth, HealthCause, HealthEntry, HealthSnapshotStore,
     HealthState, SpawnFailureKind, evaluate_requirement_group,
@@ -29,6 +48,7 @@ pub use probe::{
     CancelToken, EvaluationContext, ProbeCommandResult, ProbeDeadlines, ProbeExecutor,
     RecordingProbeExecutor, RunRecord, SystemProbeExecutor, evaluate_descriptor, refresh_snapshot,
 };
+// CancelToken is re-exported above for launch-gate callers.
 pub use registry::{ExternalRuntimeRegistry, RegistryError, global_registry};
 pub use sanitize::sanitize_version_evidence;
 pub use schema::{

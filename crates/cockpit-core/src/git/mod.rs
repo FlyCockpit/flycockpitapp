@@ -144,6 +144,15 @@ fn unpushed_commits(worktree: &Path) -> Result<u32> {
 }
 
 fn run_optional_command(command: &str, cwd: &Path, args: &[&str]) -> Option<Output> {
+    if command == "git"
+        && crate::external_runtime::require_live_available_for_launch(
+            crate::external_runtime::ID_GIT,
+            cwd,
+        )
+        .is_err()
+    {
+        return None;
+    }
     match Command::new(command).args(args).current_dir(cwd).output() {
         Ok(output) => Some(output),
         Err(error) => {
@@ -183,6 +192,11 @@ pub struct GitOutcome {
 /// *launch* git (binary missing) is an `Err`; a non-zero git exit is a
 /// `GitOutcome { success: false, .. }` the caller inspects.
 pub fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutcome> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        dir,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -348,6 +362,9 @@ pub fn review_source_unpushed(dir: &Path) -> Result<ReviewSourceCommand> {
 }
 
 pub fn gh_pr_diff(dir: &Path, pr: &str) -> Result<String> {
+    // Binary health only — authentication is a separate feature-owned check.
+    crate::external_runtime::require_live_available_for_launch(crate::external_runtime::ID_GH, dir)
+        .map_err(|err| anyhow::anyhow!("gh blocked by external-runtime health: {err}"))?;
     let output = Command::new("gh")
         .args(["pr", "diff", "--", pr])
         .current_dir(dir)

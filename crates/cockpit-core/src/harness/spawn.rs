@@ -53,6 +53,7 @@ pub enum RunOutcome {
 /// bounded tail, and wait up to `timeout`. On Unix the child runs in its
 /// own process group so a timeout kill reaches grandchildren.
 pub async fn run_to_completion(
+    harness_name: &str,
     command: &str,
     args: &[String],
     env: &[(String, String)],
@@ -60,6 +61,29 @@ pub async fn run_to_completion(
     delivery: PromptDelivery,
     timeout: std::time::Duration,
 ) -> Result<RunOutcome> {
+    // Match preflight: stock bare presets use trusted-catalog health; overrides
+    // and custom harnesses use ConfiguredCommand under harness.custom.<name>.
+    let gate = if crate::external_runtime::known_harness_preset_names().contains(&harness_name)
+        && command == harness_name
+    {
+        crate::external_runtime::require_live_available_for_launch(
+            &format!("harness.{harness_name}"),
+            cwd,
+        )
+        .map(|_| ())
+    } else {
+        let input = crate::external_runtime::ConfiguredCommandInput::new(harness_name, command);
+        crate::external_runtime::require_configured_command_available_for_launch(
+            crate::external_runtime::custom_harness_id(harness_name),
+            &format!("harness.custom.{harness_name}"),
+            &input,
+            cwd,
+        )
+        .map(|_| ())
+    };
+    gate.map_err(|err| {
+        anyhow::anyhow!("harness launch blocked by external-runtime health: {err}")
+    })?;
     let mut cmd = Command::new(command);
     cmd.args(args)
         .current_dir(cwd)
@@ -161,6 +185,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_and_exit_zero() {
         let out = run_to_completion(
+            "test-harness",
             "sh",
             &["-c".to_string(), "printf 'hello'".to_string()],
             &[],
@@ -183,6 +208,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_failure() {
         let out = run_to_completion(
+            "test-harness",
             "sh",
             &["-c".to_string(), "exit 3".to_string()],
             &[],
@@ -204,6 +230,7 @@ mod tests {
     #[tokio::test]
     async fn stdin_delivery_reaches_child() {
         let out = run_to_completion(
+            "test-harness",
             "cat",
             &[],
             &[],
@@ -222,6 +249,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_and_reports() {
         let out = run_to_completion(
+            "test-harness",
             "sh",
             &["-c".to_string(), "sleep 30".to_string()],
             &[],
@@ -238,6 +266,7 @@ mod tests {
     async fn large_output_is_bounded() {
         // Emit ~1 MB; the captured tail must be bounded and not deadlock.
         let out = run_to_completion(
+            "test-harness",
             "sh",
             &[
                 "-c".to_string(),
@@ -286,6 +315,7 @@ mod tests {
         };
         let env = crate::harness::env::harness_child_env(&cfg, None);
         let out = run_to_completion(
+            "test-harness",
             "sh",
             &[
                 "-c".to_string(),

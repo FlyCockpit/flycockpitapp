@@ -285,12 +285,39 @@ pub fn evaluate_tool_requirements(
     );
     let mut evaluation = ToolCapabilityEvaluation::default();
     for requirement in requirements {
-        let status = results
-            .get(&requirement.name)
-            .cloned()
-            .unwrap_or(BinaryProbeStatus::Unknown(
-                "probe result missing".to_string(),
-            ));
+        // Optional accelerators with external-runtime adapters (rg/fd/gsed)
+        // resolve through shared adapter health on Host so Settings/doctor and
+        // tool gates observe the same missing/available state.
+        // Optional accelerators (rg/fd/gsed): resolve under the tool-effective
+        // PATH via the same SystemProbeExecutor used by external-runtime health
+        // so restricted tool environments stay consistent with adapter resolve
+        // semantics without re-running trusted-catalog version probes on every
+        // capability check (those probes belong to doctor composition).
+        let status = if target == ExecutionTarget::Host
+            && crate::external_runtime::accelerator_adapter_id(&requirement.name).is_some()
+        {
+            let path_env = env.get("PATH").map(String::as_str);
+            let executor = crate::external_runtime::SystemProbeExecutor;
+            match crate::external_runtime::ProbeExecutor::resolve(
+                &executor,
+                &requirement.name,
+                None,
+                path_env,
+                cwd,
+            )
+            .filter(|p| crate::external_runtime::ProbeExecutor::is_spawnable(&executor, p))
+            {
+                Some(path) => BinaryProbeStatus::Present(path),
+                None => BinaryProbeStatus::Missing,
+            }
+        } else {
+            results
+                .get(&requirement.name)
+                .cloned()
+                .unwrap_or(BinaryProbeStatus::Unknown(
+                    "probe result missing".to_string(),
+                ))
+        };
         if status.is_available() {
             continue;
         }

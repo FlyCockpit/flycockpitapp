@@ -164,7 +164,19 @@ fn package_name_from_pyproject(package_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+fn require_git_available(cwd: &Path) -> Result<()> {
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        cwd,
+    )
+    .map_err(|err| anyhow::anyhow!("git blocked by external-runtime health: {err}"))?;
+    Ok(())
+}
+
 fn is_git_checkout(path: &Path) -> bool {
+    if require_git_available(path).is_err() {
+        return false;
+    }
     Command::new("git")
         .arg("-C")
         .arg(path)
@@ -177,6 +189,7 @@ fn is_git_checkout(path: &Path) -> bool {
 }
 
 fn git_origin_url(path: &Path) -> Result<Option<String>> {
+    require_git_available(path)?;
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -198,6 +211,7 @@ fn git_origin_url(path: &Path) -> Result<Option<String>> {
 }
 
 fn git_current_branch(path: &Path) -> Option<String> {
+    require_git_available(path).ok()?;
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -283,21 +297,23 @@ pub(super) async fn add_git_with_prepare_scope(
 }
 
 /// Import packages from kcl's registry that cockpit doesn't already have.
-/// Prefers kcl's portable `kcl packages export` v1 manifest, which has no
-/// clone path, so Git entries are cloned or source-url-deduped into
-/// cockpit's own `packages_directory`. If the export command is unavailable,
-/// falls back to kcl's legacy `~/.local/share/kcl/kcl.db` (honoring
-/// `$XDG_DATA_HOME`) and references those old on-disk paths as-is. One-way:
-/// never writes to kcl's DB. Returns the number of packages added.
+/// Uses kcl's portable `kcl packages export` v1 manifest only (current KCL).
+/// The legacy on-disk kcl.db fallback is intentionally removed.
 ///
 /// Dedupe matches the registry's own: by `identifier`, and additionally
 /// by `source_url` for Git packages (so a repo cockpit already tracks
 /// under a different identifier isn't re-imported).
 pub async fn import_from_kcl(db: &Db, cwd: &Path) -> Result<KclImport> {
-    if let Some(manifest) = export_kcl_packages()? {
-        return import_kcl_manifest(db, cwd, &manifest).await;
-    }
-    import_from_legacy_kcl_db(db).await
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_KCL,
+        cwd,
+    )
+    .map_err(|err| anyhow::anyhow!("kcl blocked by external-runtime health: {err}"))?;
+    let Some(manifest) = export_kcl_packages()? else {
+        // Current KCL only: no legacy DB fallback when export is unavailable.
+        return Ok(KclImport::NoKclDb(cwd.join("kcl-export-unavailable")));
+    };
+    import_kcl_manifest(db, cwd, &manifest).await
 }
 
 fn export_kcl_packages() -> Result<Option<String>> {
@@ -359,6 +375,9 @@ pub(super) fn default_prepare_scope() -> String {
     "global".to_string()
 }
 
+/// Historical test helper for the removed on-disk kcl.db path. Production
+/// [`import_from_kcl`] never calls this (current KCL export only).
+#[cfg(test)]
 pub(super) async fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
     let kcl_db_path = kcl_db_path()?;
     if !kcl_db_path.exists() {
@@ -419,6 +438,7 @@ pub(super) async fn import_from_legacy_kcl_db(db: &Db) -> Result<KclImport> {
 
 /// Resolve kcl's DB path: `$XDG_DATA_HOME/kcl/kcl.db` if set, else
 /// `~/.local/share/kcl/kcl.db`.
+#[cfg(test)]
 pub(super) fn kcl_db_path() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_DATA_HOME")
         && !s.trim().is_empty()

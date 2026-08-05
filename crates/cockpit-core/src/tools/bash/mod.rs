@@ -99,6 +99,10 @@ impl BashTool {
     }
 
     fn declared_binary_requirements() -> Vec<crate::capabilities::BinaryRequirement> {
+        // Optional accelerators align with external-runtime adapter ids
+        // (`accel.rg`, `accel.fd`, `accel.gsed`). Host `jq` is intentionally
+        // omitted: Cockpit-owned jq behavior uses the built-in `cockpit jq`
+        // applet and must not require host jq for base/bash health.
         let mut requirements = vec![
             crate::capabilities::BinaryRequirement::optional(
                 "rg",
@@ -107,10 +111,6 @@ impl BashTool {
             crate::capabilities::BinaryRequirement::optional(
                 "fd",
                 crate::capabilities::common_remedy("fd"),
-            ),
-            crate::capabilities::BinaryRequirement::optional(
-                "jq",
-                crate::capabilities::common_remedy("jq"),
             ),
         ];
         if cfg!(target_os = "macos") {

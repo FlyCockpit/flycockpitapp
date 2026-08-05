@@ -140,7 +140,7 @@ impl LspManager {
                     LspServerStatus::Disabled
                 } else if let Some(s) = statuses.get(recipe.id) {
                     *s
-                } else if program_on_path(&recipe.command[0]) {
+                } else if lsp_recipe_available(&recipe, cwd) {
                     LspServerStatus::Installed
                 } else {
                     LspServerStatus::Missing
@@ -240,7 +240,7 @@ impl LspManager {
             crate::daemon::proto::LspControlAction::Check => {
                 let status = if recipe.disabled {
                     LspServerStatus::Disabled
-                } else if program_on_path(&recipe.command[0]) {
+                } else if lsp_recipe_available(&recipe, cwd) {
                     LspServerStatus::Installed
                 } else {
                     LspServerStatus::Missing
@@ -279,7 +279,7 @@ impl LspManager {
             .insert(recipe.id.to_string(), LspServerStatus::Installing);
         let outcome = run_command_capture(&install.argv).await;
         match outcome {
-            CommandOutcome::Success { .. } if program_on_path(&recipe.command[0]) => {
+            CommandOutcome::Success { .. } if lsp_recipe_available(recipe, cwd) => {
                 self.inner.installed.write().await.insert(
                     recipe.id.to_string(),
                     InstalledRecord {
@@ -431,7 +431,7 @@ impl LspManager {
             client.touch();
             return Some(client);
         }
-        if !program_on_path(&recipe.command[0]) {
+        if !lsp_recipe_available(&recipe, cwd) {
             self.handle_missing(&recipe, cwd, config).await;
             return None;
         }
@@ -499,7 +499,7 @@ impl LspManager {
                     .await
                     .insert(recipe.id.to_string(), LspServerStatus::Installing);
                 match run_command_capture(&install.argv).await {
-                    CommandOutcome::Success { .. } if program_on_path(&recipe.command[0]) => {
+                    CommandOutcome::Success { .. } if lsp_recipe_available(recipe, cwd) => {
                         self.inner.installed.write().await.insert(
                             recipe.id.to_string(),
                             InstalledRecord {
@@ -572,7 +572,7 @@ pub fn builtin_server_views(cwd: &Path, config: &ExtendedConfig) -> Vec<LspServe
             let recipe = recipe.with_config(config);
             let status = if recipe.disabled {
                 LspServerStatus::Disabled
-            } else if program_on_path(&recipe.command[0]) {
+            } else if lsp_recipe_available(&recipe, cwd) {
                 LspServerStatus::Installed
             } else {
                 LspServerStatus::Missing
@@ -607,6 +607,17 @@ struct LspClient {
 
 impl LspClient {
     async fn spawn(recipe: Recipe, root: PathBuf) -> Result<Self> {
+        // Configured LSP command health only — never executes during health;
+        // launch still requires same-generation Available.
+        let input = crate::external_runtime::lsp_command_input(recipe.id, &recipe.command)
+            .ok_or_else(|| anyhow::anyhow!("LSP recipe `{}` has empty command", recipe.id))?;
+        crate::external_runtime::require_configured_command_available_for_launch(
+            crate::external_runtime::lsp_server_id(recipe.id),
+            &format!("lsp.{}", recipe.id),
+            &input,
+            &root,
+        )
+        .map_err(|err| anyhow::anyhow!("LSP launch blocked by external-runtime health: {err}"))?;
         let mut cmd = Command::new(&recipe.command[0]);
         cmd.args(&recipe.command[1..])
             .current_dir(&root)
@@ -1362,7 +1373,25 @@ fn find_root(file: &Path, cwd: &Path, markers: &[String]) -> PathBuf {
     }
 }
 
+/// Shared external-runtime health for an LSP recipe (ConfiguredCommand).
+/// Preserves install-confirmation ownership: callers use Missing to drive
+/// feature-local `handle_missing` / install prompts.
+fn lsp_recipe_available(recipe: &Recipe, cwd: &Path) -> bool {
+    let Some(input) = crate::external_runtime::lsp_command_input(recipe.id, &recipe.command) else {
+        return false;
+    };
+    crate::external_runtime::require_configured_command_available_for_launch(
+        crate::external_runtime::lsp_server_id(recipe.id),
+        &format!("lsp.{}", recipe.id),
+        &input,
+        cwd,
+    )
+    .is_ok()
+}
+
 fn program_on_path(cmd: &str) -> bool {
+    // Legacy helper retained for non-recipe call sites; recipe health uses
+    // [`lsp_recipe_available`].
     crate::capabilities::resolve_binary(cmd).is_some()
 }
 

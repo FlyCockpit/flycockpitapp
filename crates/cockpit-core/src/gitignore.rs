@@ -171,7 +171,15 @@ fn ancestor_dirs_root_first(root: &Path, target: &Path) -> Vec<PathBuf> {
 fn global_ignore_path() -> Option<PathBuf> {
     // git config core.excludesfile, else $XDG_CONFIG_HOME/git/ignore, else
     // ~/.config/git/ignore — the same precedence git itself uses.
-    if let Ok(out) = std::process::Command::new("git")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        &cwd,
+    )
+    .is_err()
+    {
+        // Fall through to XDG/home defaults when git is not Available.
+    } else if let Ok(out) = std::process::Command::new("git")
         .args(["config", "--get", "core.excludesfile"])
         .output()
         && out.status.success()

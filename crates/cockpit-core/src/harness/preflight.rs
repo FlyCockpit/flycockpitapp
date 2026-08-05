@@ -55,11 +55,33 @@ pub async fn preflight_with_env(
     cwd: &Path,
     session_overlay: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<(), PreflightError> {
-    if which_on_path(&cfg.command).is_none() {
-        return Err(PreflightError::NotOnPath {
+    // Shared external-runtime health is the sole missing-state source (no
+    // separate which_on_path branch). Catalog presets only when the configured
+    // command is the bare preset name. Overrides use ConfiguredCommand only —
+    // never inherit a trusted-catalog recipe by name resemblance.
+    if is_unmodified_catalog_preset(harness_name, &cfg.command) {
+        let adapter_id = format!("harness.{harness_name}");
+        if let Err(err) =
+            crate::external_runtime::require_live_available_for_launch(&adapter_id, cwd)
+        {
+            return Err(PreflightError::NotOnPath {
+                harness: harness_name.to_string(),
+                command: format!("{} ({err})", cfg.command),
+            });
+        }
+    } else {
+        let input =
+            crate::external_runtime::ConfiguredCommandInput::new(harness_name, cfg.command.clone());
+        let _ = crate::external_runtime::require_configured_command_available_for_launch(
+            crate::external_runtime::custom_harness_id(harness_name),
+            &format!("harness.custom.{harness_name}"),
+            &input,
+            cwd,
+        )
+        .map_err(|err| PreflightError::NotOnPath {
             harness: harness_name.to_string(),
-            command: cfg.command.clone(),
-        });
+            command: format!("{} ({err})", cfg.command),
+        })?;
     }
 
     if is_authenticated(cfg, cwd, session_overlay).await {
@@ -70,6 +92,16 @@ pub async fn preflight_with_env(
             command: cfg.command.clone(),
         })
     }
+}
+
+/// Whether `harness_name` is a known preset whose configured command is still
+/// the stock bare preset executable (exact string match only).
+///
+/// Path wrappers such as `/opt/wrappers/claude` are **not** catalog presets —
+/// they use ConfiguredCommand resolution for the exact configured executable.
+fn is_unmodified_catalog_preset(harness_name: &str, command: &str) -> bool {
+    crate::external_runtime::known_harness_preset_names().contains(&harness_name)
+        && command == harness_name
 }
 
 /// Resolve `command` against `PATH`, honoring `PATHEXT` on Windows.
@@ -210,7 +242,20 @@ mod tests {
         assert!(matches!(err, PreflightError::NotOnPath { .. }));
         let msg = format!("{err}");
         assert!(msg.contains("`ghost`"), "{msg}");
-        assert!(msg.contains("`definitely-not-a-real-binary-xyz`"), "{msg}");
+        assert!(msg.contains("definitely-not-a-real-binary-xyz"), "{msg}");
+    }
+
+    #[test]
+    fn path_wrapper_named_like_preset_is_not_catalog() {
+        // `/opt/wrappers/claude` must not inherit the trusted claude catalog
+        // recipe solely because its basename matches a preset.
+        assert!(!is_unmodified_catalog_preset(
+            "claude",
+            "/opt/wrappers/claude"
+        ));
+        assert!(!is_unmodified_catalog_preset("claude", "my-claude-wrapper"));
+        assert!(is_unmodified_catalog_preset("claude", "claude"));
+        assert!(!is_unmodified_catalog_preset("shell", "sh"));
     }
 
     #[cfg(unix)]

@@ -133,6 +133,11 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
 
     let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
     let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
+
+    // Settings/doctor composition: register catalog + configured harness/LSP/MCP
+    // into shared external-runtime health (resolution-only for configured cmds).
+    compose_doctor_integration_health(&input.cwd, &harnesses);
+
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
         active_agent: input.active_agent.clone(),
@@ -785,7 +790,59 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Production Settings/doctor composition entry: upserts every configured
+/// custom harness, builtin/configured LSP command, and stdio MCP server into
+/// the shared health store and refreshes a generation-tagged snapshot.
+fn compose_doctor_integration_health(
+    cwd: &Path,
+    harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
+) {
+    let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
+        harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
+        lsp_servers: Vec::new(),
+        stdio_mcp: Vec::new(),
+    };
+    // Builtin + configured LSP recipes (command argv only; install stays feature-local).
+    let extended = crate::config::extended::load_for_cwd(cwd);
+    for view in crate::daemon::lsp::builtin_server_views(cwd, &extended) {
+        if let Some(input) = crate::external_runtime::lsp_command_input(&view.id, &view.command) {
+            compose.lsp_servers.push(input);
+        }
+    }
+    // Stdio MCP servers from layered mcp.json.
+    let mcp = crate::mcp::config::McpConfig::discover(cwd);
+    for (name, server) in &mcp.servers {
+        if !server.enabled {
+            continue;
+        }
+        if server.transport != crate::mcp::config::Transport::Stdio {
+            continue;
+        }
+        let Some(command) = server.command.as_deref() else {
+            continue;
+        };
+        compose
+            .stdio_mcp
+            .push(crate::external_runtime::mcp_stdio_input(
+                name,
+                command,
+                &server.args,
+            ));
+    }
+    let _ = crate::external_runtime::compose_settings_doctor_health(cwd, &compose);
+}
+
 fn git_lines(cwd: &Path) -> Vec<String> {
+    if crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GIT,
+        cwd,
+    )
+    .is_err()
+    {
+        return vec![
+            "git: not Available (informational; shared external-runtime health)".to_string(),
+        ];
+    }
     let Some(version) = command_output(Command::new("git").arg("--version")) else {
         return vec!["git: not found (informational)".to_string()];
     };

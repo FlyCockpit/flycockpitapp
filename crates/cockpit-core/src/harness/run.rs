@@ -252,8 +252,16 @@ pub async fn run_harness(ctx: RunContext<'_>) -> Result<HarnessRunResult, String
 
     // 5. Spawn + drain + timeout.
     let timeout = Duration::from_secs(ctx.cfg.timeout_secs.max(1));
-    let outcome =
-        run_to_completion(&ctx.cfg.command, &args, &env, &run_dir, delivery, timeout).await;
+    let outcome = run_to_completion(
+        ctx.harness_name,
+        &ctx.cfg.command,
+        &args,
+        &env,
+        &run_dir,
+        delivery,
+        timeout,
+    )
+    .await;
 
     let outcome = match outcome {
         Ok(o) => o,

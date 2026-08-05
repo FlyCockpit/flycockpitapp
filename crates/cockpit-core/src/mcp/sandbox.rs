@@ -1963,11 +1963,16 @@ f()",
             .await
             .expect_err("broken stdio spawn must fail");
         let msg = err.to_string();
+        // Fail-closed external-runtime health may block before OS spawn when
+        // the configured command is Missing; otherwise typed child failures
+        // report spawn/timeout stages.
         assert!(
             msg.contains("stage=spawn")
                 || msg.contains("stage=timeout")
-                || msg.contains("mcp child failure"),
-            "typed child failure expected: {msg}"
+                || msg.contains("mcp child failure")
+                || msg.contains("external-runtime health")
+                || msg.contains("not Available"),
+            "typed child failure or health gate expected: {msg}"
         );
         assert!(
             !msg.contains("should-not-appear") && !msg.contains("s3cret"),
@@ -1975,16 +1980,25 @@ f()",
         );
 
         let rows = child_rows(&ctx.session, "outer-stdio-matrix").await;
-        assert_eq!(rows.len(), 1, "failed child must be recorded");
-        assert!(rows[0].hard_fail);
-        assert!(
-            rows[0].output.contains("stage=")
-                || rows[0].output.contains("mcp child failure")
-                || rows[0].output.contains("spawn")
-                || rows[0].output.contains("failed"),
-            "child row carries failure evidence: {}",
-            rows[0].output
-        );
+        // Health-blocked launches never create a child process; spawn-stage
+        // failures still record a hard-fail child row.
+        if msg.contains("external-runtime health") || msg.contains("not Available") {
+            assert!(
+                rows.is_empty() || rows.iter().all(|r| r.hard_fail),
+                "health-blocked launch has no successful child: {rows:?}"
+            );
+        } else {
+            assert_eq!(rows.len(), 1, "failed child must be recorded");
+            assert!(rows[0].hard_fail);
+            assert!(
+                rows[0].output.contains("stage=")
+                    || rows[0].output.contains("mcp child failure")
+                    || rows[0].output.contains("spawn")
+                    || rows[0].output.contains("failed"),
+                "child row carries failure evidence: {}",
+                rows[0].output
+            );
+        }
     }
 
     /// AC6: catching a stdio child failure leaves the child row failed while

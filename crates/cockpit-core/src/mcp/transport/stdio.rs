@@ -5,6 +5,7 @@
 //! injected into the child. The process is killed on drop.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -66,6 +67,36 @@ impl StdioClient {
         timeouts: McpTimeouts,
         runtime: StdioRuntimeContext,
     ) -> Result<Self> {
+        let input = crate::external_runtime::mcp_stdio_input(server_name, command, args);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Bridge feature cancellation into the launch gate so a cancel that
+        // lands during health evaluation cannot authorize OS handoff.
+        let launch_cancel = crate::external_runtime::CancelToken::new();
+        if runtime
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            launch_cancel.cancel();
+        }
+        crate::external_runtime::require_configured_command_available_for_launch_with_cancel(
+            crate::external_runtime::stdio_mcp_id(server_name),
+            &format!("mcp.stdio.{server_name}"),
+            &input,
+            &cwd,
+            Some(&launch_cancel),
+        )
+        .map_err(|err| {
+            anyhow::anyhow!("stdio MCP launch blocked by external-runtime health: {err}")
+        })?;
+        // Recheck immediately before spawn — late cancel after health.
+        if runtime
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(ChildFailure::cancel(server_name, "request_cancelled_before_spawn").into());
+        }
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -87,6 +118,28 @@ impl StdioClient {
                 .into());
             }
         };
+        // Cancellation after the pre-spawn recheck but before/at handoff: reap
+        // immediately so a late cancel cannot leave a running MCP child.
+        if runtime
+            .cancel
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            let _ = child.start_kill();
+            // Blocking reap so a cancelled handoff never leaves an orphan.
+            // Bounded so a stuck process cannot wedge spawn forever.
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < wait_deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => break,
+                }
+            }
+            return Err(ChildFailure::cancel(server_name, "request_cancelled_at_spawn").into());
+        }
         let stdin = child.stdin.take().context("child stdin missing")?;
         let stdout = child.stdout.take().context("child stdout missing")?;
         Ok(Self::new(

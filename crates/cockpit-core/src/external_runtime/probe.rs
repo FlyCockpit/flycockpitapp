@@ -97,13 +97,30 @@ impl ProbeExecutor for SystemProbeExecutor {
         cwd: &Path,
     ) -> Option<PathBuf> {
         if let Some(path) = exact_path {
-            return self.is_spawnable(path).then(|| path.to_path_buf());
+            // Relative exact paths are resolved against the launch cwd so
+            // project-local LSP/MCP binaries match spawn current_dir semantics.
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            return self.is_spawnable(&resolved).then_some(resolved);
         }
         let p = Path::new(name);
         if p.components().count() > 1 || p.is_absolute() {
-            return self.is_spawnable(p).then(|| p.to_path_buf());
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+            return self.is_spawnable(&resolved).then_some(resolved);
         }
-        which::which_in(name, path_env, cwd)
+        // `which::which_in` requires an explicit PATH list in which 8.x; `None`
+        // does not fall back to the process environment and errors as empty.
+        let owned_path = path_env
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"));
+        which::which_in(name, owned_path.as_ref(), cwd)
             .ok()
             .filter(|path| self.is_spawnable(path))
     }

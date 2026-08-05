@@ -93,6 +93,22 @@ impl ExternalRuntimeRegistry {
     pub fn clear(&self) {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
+
+    /// Remove dynamic configured-command descriptors whose ids are not in
+    /// `keep`. Catalog (non-configured) entries are never removed.
+    ///
+    /// Ids are matched exactly (e.g. `harness.custom.foo`, `lsp.rust`,
+    /// `mcp.stdio.fs`). Used by Settings/doctor composition so deleted config
+    /// does not leave stale health entries.
+    pub fn retain_configured_ids(&self, keep: &std::collections::BTreeSet<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.retain(|id, desc| {
+            if !desc.probe_policy.is_configured_command() {
+                return true;
+            }
+            keep.contains(id)
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -107,10 +123,19 @@ pub enum RegistryError {
     Schema(#[from] SchemaError),
 }
 
-/// Process-global registry used by later adapter prompts.
+/// Process-global registry used by adapter composition and launch gates.
+///
+/// Initializes with the closed integration-adapter catalog so production
+/// callers always observe the known roster without a separate setup step.
 pub fn global_registry() -> Arc<ExternalRuntimeRegistry> {
     static REGISTRY: std::sync::OnceLock<Arc<ExternalRuntimeRegistry>> = std::sync::OnceLock::new();
     REGISTRY
-        .get_or_init(|| Arc::new(ExternalRuntimeRegistry::new()))
+        .get_or_init(|| {
+            let registry = Arc::new(ExternalRuntimeRegistry::new());
+            // Catalog registration is best-effort at process init; launch
+            // paths re-call ensure_integration_adapters_registered.
+            let _ = super::adapters::ensure_integration_adapters_registered(&registry);
+            registry
+        })
         .clone()
 }

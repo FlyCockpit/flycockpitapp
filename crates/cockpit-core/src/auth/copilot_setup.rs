@@ -130,6 +130,19 @@ pub fn append_to_rc(path: &Path, shell: Shell) -> Result<bool> {
 /// Run `gh auth token` and return the trimmed token. Emits a
 /// user-readable error if `gh` is missing or the user isn't logged in.
 pub fn fetch_gh_token() -> Result<String> {
+    // Binary health is separate from authentication; fail closed when the
+    // host `gh` binary is not same-generation Available.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::external_runtime::require_live_available_for_launch(
+        crate::external_runtime::ID_GH,
+        &cwd,
+    )
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "`gh` CLI not available ({err}). Install from https://cli.github.com, \
+             then run `gh auth login` and try again."
+        )
+    })?;
     let out = Command::new("gh")
         .args(["auth", "token"])
         .output()

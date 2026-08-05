@@ -107,7 +107,20 @@ impl Embedder for OpenAiCompatEmbedder {
             input: &redacted_refs,
         };
         let mut req = self.client.post(self.embeddings_url()).json(&body);
+        // Canonical UA unless the provider configuration supplies one.
+        // Emit exactly once, then skip every case-insensitive User-Agent when
+        // applying the remaining resolved headers (matches catalog/auth/usage).
+        let effective_ua = self
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+            .map(|header| header.value.as_str())
+            .unwrap_or_else(|| crate::user_agent::user_agent());
+        req = req.header(reqwest::header::USER_AGENT, effective_ua);
         for header in &self.headers {
+            if header.name.eq_ignore_ascii_case("user-agent") {
+                continue;
+            }
             req = req.header(&header.name, &header.value);
         }
 
@@ -195,9 +208,18 @@ mod tests {
     const SECRET: &str = "sk-embed-secret-token-abc123";
     const PLACEHOLDER: &str = "[embed-redacted]";
 
+    #[derive(Debug, Clone)]
+    struct CapturedEmbeddingRequest {
+        head: String,
+        body: String,
+    }
+
     async fn capture_embedding_server_with_response(
         response_body: &'static str,
-    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -228,7 +250,10 @@ mod tests {
                         let body =
                             String::from_utf8(buf[body_start..body_start + content_len].to_vec())
                                 .unwrap();
-                        let _ = tx.send(body);
+                        let _ = tx.send(CapturedEmbeddingRequest {
+                            head: headers.into_owned(),
+                            body,
+                        });
                         break;
                     }
                 }
@@ -243,11 +268,27 @@ mod tests {
         (format!("http://{addr}/v1"), rx)
     }
 
-    async fn capture_embedding_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+    async fn capture_embedding_server() -> (
+        String,
+        tokio::sync::oneshot::Receiver<CapturedEmbeddingRequest>,
+    ) {
         capture_embedding_server_with_response(
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]},{"index":1,"embedding":[4.0,5.0,6.0]}]}"#,
         )
         .await
+    }
+
+    fn user_agent_values(head: &str) -> Vec<String> {
+        head.lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("user-agent") {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -302,15 +343,95 @@ mod tests {
 
     #[tokio::test]
     async fn embedder_openai_compat_wire() {
-        let (base_url, body_rx) = capture_embedding_server().await;
+        let (base_url, capture_rx) = capture_embedding_server().await;
         let embedder = embedder(base_url, guard(false));
 
         let vectors = embedder.embed(&["alpha", "beta"]).await.unwrap();
 
         assert_eq!(vectors, vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]);
-        let body: serde_json::Value = serde_json::from_str(&body_rx.await.unwrap()).unwrap();
+        let captured = capture_rx.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
         assert_eq!(body["model"], "text-embedding-3-small");
         assert_eq!(body["input"], serde_json::json!(["alpha", "beta"]));
+        let uas = user_agent_values(&captured.head);
+        assert_eq!(
+            uas,
+            vec![crate::user_agent::user_agent().to_string()],
+            "exactly one canonical User-Agent expected; head=\n{}",
+            captured.head
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_user_agent_configured_override_wins() {
+        let (base_url, capture_rx) = capture_embedding_server_with_response(
+            r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
+        )
+        .await;
+        let embedder = OpenAiCompatEmbedder::from_resolved_request(
+            models_fetch::ResolvedRequest {
+                base_url: base_url.clone(),
+                headers: vec![
+                    models_fetch::ResolvedHeader {
+                        name: "Authorization".into(),
+                        value: "Bearer test-token".into(),
+                    },
+                    models_fetch::ResolvedHeader {
+                        name: "User-Agent".into(),
+                        value: "first-ua/1".into(),
+                    },
+                    models_fetch::ResolvedHeader {
+                        name: "user-agent".into(),
+                        value: "second-ua/2".into(),
+                    },
+                ],
+            },
+            "text-embedding-3-small".into(),
+            Some(3),
+            guard(false),
+        );
+
+        let _ = embedder.embed(&["alpha"]).await.unwrap();
+        let captured = capture_rx.await.unwrap();
+        let uas = user_agent_values(&captured.head);
+        assert_eq!(
+            uas,
+            vec!["first-ua/1".to_string()],
+            "User-Agent before user-agent: first resolved wins; head=\n{}",
+            captured.head
+        );
+        assert_ne!(uas[0], crate::user_agent::user_agent());
+    }
+
+    #[tokio::test]
+    async fn embedding_user_agent_single_configured_header() {
+        let (base_url, capture_rx) = capture_embedding_server_with_response(
+            r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
+        )
+        .await;
+        let embedder = OpenAiCompatEmbedder::from_resolved_request(
+            models_fetch::ResolvedRequest {
+                base_url,
+                headers: vec![
+                    models_fetch::ResolvedHeader {
+                        name: "Authorization".into(),
+                        value: "Bearer test-token".into(),
+                    },
+                    models_fetch::ResolvedHeader {
+                        name: "user-agent".into(),
+                        value: "configured-ua/1".into(),
+                    },
+                ],
+            },
+            "text-embedding-3-small".into(),
+            Some(3),
+            guard(false),
+        );
+
+        let _ = embedder.embed(&["alpha"]).await.unwrap();
+        let captured = capture_rx.await.unwrap();
+        let uas = user_agent_values(&captured.head);
+        assert_eq!(uas, vec!["configured-ua/1".to_string()]);
     }
 
     #[test]
@@ -331,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn embed_redacts_before_send() {
-        let (base_url, body_rx) = capture_embedding_server_with_response(
+        let (base_url, capture_rx) = capture_embedding_server_with_response(
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
         .await;
@@ -340,27 +461,28 @@ mod tests {
 
         let _ = embedder.embed(&[input.as_str()]).await.unwrap();
 
-        let raw = body_rx.await.unwrap();
+        let raw = capture_rx.await.unwrap().body;
         assert!(raw.contains(PLACEHOLDER), "redacted body: {raw}");
         assert!(!raw.contains(SECRET), "secret leaked in body: {raw}");
     }
 
     #[tokio::test]
     async fn embed_redacts_every_batch_element() {
-        let (base_url, body_rx) = capture_embedding_server().await;
+        let (base_url, capture_rx) = capture_embedding_server().await;
         let embedder = embedder(base_url, guard(false));
         let later = format!("beta {SECRET}");
 
         let _ = embedder.embed(&["alpha", later.as_str()]).await.unwrap();
 
-        let body: serde_json::Value = serde_json::from_str(&body_rx.await.unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&capture_rx.await.unwrap().body).unwrap();
         assert_eq!(body["input"][0], "alpha");
         assert_eq!(body["input"][1], format!("beta {PLACEHOLDER}"));
     }
 
     #[tokio::test]
     async fn embed_trusted_provider_skips_redaction() {
-        let (base_url, body_rx) = capture_embedding_server_with_response(
+        let (base_url, capture_rx) = capture_embedding_server_with_response(
             r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
         )
         .await;
@@ -369,7 +491,7 @@ mod tests {
 
         let _ = embedder.embed(&[input.as_str()]).await.unwrap();
 
-        let raw = body_rx.await.unwrap();
+        let raw = capture_rx.await.unwrap().body;
         assert!(
             raw.contains(SECRET),
             "trusted provider should see original text: {raw}"
@@ -382,13 +504,14 @@ mod tests {
 
     #[tokio::test]
     async fn embed_empty_batch_is_safe() {
-        let (base_url, body_rx) = capture_embedding_server_with_response(r#"{"data":[]}"#).await;
+        let (base_url, capture_rx) = capture_embedding_server_with_response(r#"{"data":[]}"#).await;
         let embedder = embedder(base_url, guard(false));
 
         let vectors = embedder.embed(&[]).await.unwrap();
 
         assert!(vectors.is_empty());
-        let body: serde_json::Value = serde_json::from_str(&body_rx.await.unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&capture_rx.await.unwrap().body).unwrap();
         assert_eq!(body["input"], serde_json::json!([]));
     }
 

@@ -6,12 +6,9 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: apps/cli
-
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
   RUSTFLAGS: "-D warnings"
 
 jobs:
@@ -25,13 +22,15 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          workspaces: apps/cli -> target
+          workspaces: . -> target
       # Scoped to the whole workspace, not just the `cockpit-cli` package: the
       # released binary links `cockpit-tui` and the `crates/*` layers, so a
       # package-scoped preflight would silently skip most of the shipped code.
-      # Matches the workspace-scoped gate in cli-ci.yml.
+      # Matches the workspace-scoped gate in cli-ci.yml. Every Cargo step runs
+      # from the monorepo root and reuses flycockpitapp/target via CARGO_TARGET_DIR.
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --tests --locked -- -D warnings
+      - run: cargo clippy --locked --workspace --examples -- -D warnings
       - uses: taiki-e/install-action@314b6e93a9b2f40a64f401a23fed55603083dc69 # nextest
         with:
           tool: nextest

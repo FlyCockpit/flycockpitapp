@@ -32,6 +32,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
 
 jobs:
   gates:
@@ -100,6 +101,14 @@ jobs:
       - name: Clippy Windows target
         if: matrix.os == 'windows-latest'
         run: cargo clippy --locked --workspace --tests --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Clippy examples
+        if: matrix.os != 'windows-latest'
+        run: cargo clippy --locked --workspace --examples -- -D warnings
+
+      - name: Clippy examples Windows target
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --locked --workspace --examples --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Format
         run: cargo fmt --all -- --check

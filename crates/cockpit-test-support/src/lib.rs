@@ -7,6 +7,9 @@ use tokio::sync::{Mutex, MutexGuard};
 
 pub mod provider;
 
+#[cfg(test)]
+mod clippy_workflow_gate;
+
 const COCKPIT_CONFIG_ENV: &str = "COCKPIT_CONFIG";
 const COCKPIT_TRUST_ROOT_ENV: &str = "COCKPIT_TRUST_ROOT";
 const COCKPIT_TRUST_MODE_ENV: &str = "COCKPIT_TRUST_MODE";

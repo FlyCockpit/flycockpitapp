@@ -302,6 +302,172 @@ async fn fork_child_records_fork_ceiling() {
     assert_eq!(fork_session.fork_point_turn_id, Some(seq.to_string()));
 }
 
+/// Subagent inheritance characterization: a real fork-context subagent
+/// session created through the production delegation seam resolves a
+/// parent sealed value written before the fork point, without exposing
+/// the literal on metadata or event surfaces.
+#[tokio::test]
+async fn sealed_subagent_inherits_parent_value_before_fork_point() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    // Distinct high-entropy literal kept out of assert_eq! failure output.
+    let literal = "parent-pre-fork-sealed-value-9f3a";
+    driver
+        .session
+        .set_sealed_value(
+            &crate::redact::RedactionTable::empty(),
+            "parent_pre",
+            literal,
+            "delegation inheritance",
+            "user",
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "delegate after seal"}),
+        )
+        .await
+        .unwrap();
+
+    let (child, history) = driver.prepare_fork_task_context().await.unwrap();
+    assert_eq!(child.parent_session_id, Some(driver.session.id));
+    let history_dump = format!("{history:?}");
+    assert!(
+        !history_dump.contains(literal),
+        "fork history (model-facing seed) must not carry the sealed literal"
+    );
+
+    let resolved = child
+        .resolve_sealed_value_for_injection("parent_pre")
+        .await
+        .unwrap();
+    assert!(
+        resolved.is_some(),
+        "subagent must inject parent value sealed before fork point"
+    );
+    // Availability only — do not read the literal-bearing wrapper via as_str.
+    // Prove the sealed literal is redacted and never appears on metadata/events.
+    let parent_table = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("parent redaction table");
+    assert!(
+        !parent_table.scrub(literal).contains(literal),
+        "parent redaction table must scrub the sealed literal"
+    );
+
+    let child_meta = child.list_sealed_value_metadata().await.unwrap();
+    assert!(
+        child_meta.iter().any(|row| row.value_id == "parent_pre"),
+        "child metadata must list the inherited id"
+    );
+    for row in &child_meta {
+        assert!(!row.value_id.contains(literal));
+        assert!(!row.reason.contains(literal));
+        assert!(!row.origin.contains(literal));
+    }
+    let child_events = child.db.list_session_events(child.id).await.unwrap();
+    for event in &child_events {
+        assert!(
+            !event.data.to_string().contains(literal),
+            "subagent event payload must not carry the sealed literal"
+        );
+    }
+    let parent_meta = driver.session.list_sealed_value_metadata().await.unwrap();
+    for row in &parent_meta {
+        assert!(!row.value_id.contains(literal));
+        assert!(!row.reason.contains(literal));
+        assert!(!row.origin.contains(literal));
+    }
+    let parent_events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap();
+    for event in &parent_events {
+        assert!(
+            !event.data.to_string().contains(literal),
+            "parent event payload must not carry the sealed literal"
+        );
+    }
+}
+
+/// Late parent writes after the subagent fork must stay parent-only under
+/// the existing fork-point snapshot contract.
+#[tokio::test]
+async fn sealed_subagent_does_not_inherit_late_parent_value() {
+    let (driver, _tmp) = test_driver_without_network(8);
+    let early = "parent-early-sealed-value-7c2b";
+    let late = "parent-late-sealed-value-4e1d";
+    driver
+        .session
+        .set_sealed_value(
+            &crate::redact::RedactionTable::empty(),
+            "early_token",
+            early,
+            "before fork",
+            "user",
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "fork now"}),
+        )
+        .await
+        .unwrap();
+
+    let (child, _history) = driver.prepare_fork_task_context().await.unwrap();
+    assert!(
+        child
+            .resolve_sealed_value_for_injection("early_token")
+            .await
+            .unwrap()
+            .is_some(),
+        "value sealed before fork remains injectable on the child"
+    );
+
+    let parent_table = driver.session.persisted_redaction_table().unwrap().unwrap();
+    driver
+        .session
+        .set_sealed_value(&parent_table, "late_token", late, "after fork", "user")
+        .await
+        .unwrap();
+
+    assert!(
+        driver
+            .session
+            .resolve_sealed_value_for_injection("late_token")
+            .await
+            .unwrap()
+            .is_some(),
+        "parent must resolve its own late value"
+    );
+    assert!(
+        child
+            .resolve_sealed_value_for_injection("late_token")
+            .await
+            .unwrap()
+            .is_none(),
+        "subagent must not resolve parent values written after the fork point"
+    );
+    let child_meta = child.list_sealed_value_metadata().await.unwrap();
+    assert!(
+        child_meta.iter().all(|row| row.value_id != "late_token"),
+        "late parent id must not appear on the child metadata list"
+    );
+}
+
 #[tokio::test]
 async fn task_delegate_unknown_agent_refuses_with_reachable_list() {
     let (driver, _tmp) = test_driver(8);

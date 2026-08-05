@@ -1853,6 +1853,225 @@ async fn oversized_compact_handoff_leaves_history_unchanged() {
     );
 }
 
+/// Compaction is an in-place history reset: sealed injection availability and
+/// the union-only redaction table must survive a completed boundary.
+#[tokio::test]
+async fn sealed_value_survives_completed_compaction() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    let literal = "compact-survives-sealed-value-3a8c";
+    // Mirror the worker path: seal against the live driver table, then install
+    // the unioned table into both persisted session state and the live driver.
+    driver
+        .session
+        .set_sealed_value(
+            driver.redact.as_ref(),
+            "compact_keep",
+            literal,
+            "compaction survival",
+            "user",
+        )
+        .await
+        .unwrap();
+    let persisted = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("persisted redaction after seal");
+    // Production installation path: driver + agent models + scheduler tables.
+    driver.set_redaction_table(std::sync::Arc::new(persisted));
+    assert!(
+        !driver.redact.scrub(literal).contains(literal),
+        "live driver redaction table must scrub the sealed literal before compaction"
+    );
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    let mut saw_ready = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, TurnEvent::CompactReady { .. }) {
+            saw_ready = true;
+        }
+    }
+    assert!(saw_ready, "completed compaction must emit CompactReady");
+
+    let resolved = driver
+        .session
+        .resolve_sealed_value_for_injection("compact_keep")
+        .await
+        .unwrap();
+    assert!(
+        resolved.is_some(),
+        "sealed value must remain injectable after completed compaction"
+    );
+    let table = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("redaction table must persist across compaction");
+    assert!(
+        !table.scrub(literal).contains(literal),
+        "persisted redaction table must still scrub the sealed literal"
+    );
+    assert!(
+        !driver.redact.scrub(literal).contains(literal),
+        "live driver redaction table must still scrub the sealed literal after compaction"
+    );
+}
+
+/// Resume after a completed compaction reloads the same injection and
+/// redaction guarantees from durable session state.
+#[tokio::test]
+async fn sealed_value_survives_compaction_and_resume() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    let literal = "compact-resume-sealed-value-6b1e";
+    let session_id = driver.session.id;
+    let db = driver.session.db.clone();
+    driver
+        .session
+        .set_sealed_value(
+            driver.redact.as_ref(),
+            "resume_keep",
+            literal,
+            "compaction resume",
+            "user",
+        )
+        .await
+        .unwrap();
+    driver.set_redaction_table(std::sync::Arc::new(
+        driver
+            .session
+            .persisted_redaction_table()
+            .unwrap()
+            .expect("persisted after seal"),
+    ));
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    let resumed = Session::resume(db, session_id)
+        .unwrap()
+        .expect("session must resume after compaction");
+    let resolved = resumed
+        .resolve_sealed_value_for_injection("resume_keep")
+        .await
+        .unwrap();
+    assert!(
+        resolved.is_some(),
+        "resumed session must inject the pre-compaction sealed value"
+    );
+    let scrubbed = resumed
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("resumed redaction table")
+        .scrub(literal);
+    assert!(
+        !scrubbed.contains(literal),
+        "resumed redaction table must still scrub the sealed literal"
+    );
+}
+
+/// A deterministic prepare failure must leave sealed injection and redaction
+/// state exactly as they were before the attempt.
+#[tokio::test]
+async fn failed_compaction_does_not_change_sealed_state() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let literal = "failed-compact-sealed-value-2d9f";
+    driver
+        .session
+        .set_sealed_value(
+            &crate::redact::RedactionTable::empty(),
+            "fail_keep",
+            literal,
+            "failed compaction",
+            "user",
+        )
+        .await
+        .unwrap();
+    let before_meta = driver.session.list_sealed_value_metadata().await.unwrap();
+    let before_table_json = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("pre-attempt redaction table")
+        .to_persisted_json()
+        .unwrap();
+    let before_scrub = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .unwrap()
+        .scrub(literal);
+    driver.stack[0].history = vec![
+        Message::user("retain this exact user turn"),
+        Message::assistant("retain this exact assistant turn"),
+    ];
+    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 40);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact(&tx).await;
+    drop(tx);
+    let mut saw_unchanged_notice = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, TurnEvent::Notice { text } if text.contains("history was left unchanged"))
+        {
+            saw_unchanged_notice = true;
+        }
+    }
+    assert!(
+        saw_unchanged_notice,
+        "failed compaction must surface the unchanged-history notice"
+    );
+
+    let after = driver
+        .session
+        .resolve_sealed_value_for_injection("fail_keep")
+        .await
+        .unwrap();
+    assert!(
+        after.is_some(),
+        "failed compaction must keep the pre-attempt sealed value injectable"
+    );
+    let after_meta = driver.session.list_sealed_value_metadata().await.unwrap();
+    assert_eq!(
+        after_meta.len(),
+        before_meta.len(),
+        "failed compaction must not alter sealed metadata cardinality"
+    );
+    assert_eq!(
+        after_meta
+            .iter()
+            .map(|row| row.value_id.as_str())
+            .collect::<Vec<_>>(),
+        before_meta
+            .iter()
+            .map(|row| row.value_id.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let after_table = driver
+        .session
+        .persisted_redaction_table()
+        .unwrap()
+        .expect("redaction table after failed compaction");
+    // Compare without assert_eq so a mismatch cannot dump the literal-bearing JSON.
+    assert!(
+        after_table.to_persisted_json().unwrap() == before_table_json,
+        "failed compaction must not mutate the persisted redaction table"
+    );
+    let after_scrub = after_table.scrub(literal);
+    assert!(
+        after_scrub == before_scrub,
+        "failed compaction must leave scrub coverage unchanged"
+    );
+    assert!(
+        !after_scrub.contains(literal),
+        "failed compaction must leave the sealed literal in the redaction table"
+    );
+}
+
 #[tokio::test]
 async fn zero_window_compact_fails_explicitly_without_mutation() {
     use crate::config::providers::{CacheMode, ContextConfig};

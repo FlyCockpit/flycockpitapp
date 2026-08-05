@@ -254,4 +254,67 @@ mod tests {
                 .is_none()
         );
     }
+
+    /// Source inspection for the repair acceptance gate: no public literal-read
+    /// API, no printable wrapper, no schema/migration expansion in this module.
+    #[test]
+    fn sealed_value_surface_has_no_public_literal_read_or_migration() {
+        // Inspect production source only so this test's own string literals cannot
+        // self-match the forbidden Debug/Display patterns.
+        let source = include_str!("sealed_values.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production module precedes test module");
+        let debug_impl = format!("impl fmt::{} for SealedValueForInjection", "Debug");
+        let display_impl = format!("impl fmt::{} for SealedValueForInjection", "Display");
+        assert!(
+            !production.contains(&debug_impl),
+            "SealedValueForInjection must not gain Debug"
+        );
+        assert!(
+            !production.contains(&display_impl),
+            "SealedValueForInjection must not gain Display"
+        );
+        // Injection wrapper declaration must not derive printable traits.
+        let after_struct = production
+            .split("struct SealedValueForInjection")
+            .nth(1)
+            .unwrap_or_default();
+        let struct_header = after_struct.split('{').next().unwrap_or_default();
+        assert!(
+            !struct_header.contains("Debug") && !struct_header.contains("Display"),
+            "SealedValueForInjection must not derive Debug/Display"
+        );
+        assert!(
+            production.contains("pub(crate) fn as_str"),
+            "literal access stays crate-private on the injection wrapper"
+        );
+        assert!(
+            !production.contains("pub async fn get_sealed_value")
+                && !production.contains("pub fn get_sealed_value")
+                && !production.contains("pub fn into_inner")
+                && !production.contains("pub fn reveal")
+                && !production.contains("pub fn plaintext"),
+            "no new public literal-read API"
+        );
+
+        let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cockpit-db/src/db/migrations");
+        let entries = std::fs::read_dir(&migrations)
+            .unwrap_or_else(|error| panic!("read migrations dir: {error}"))
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sql_migrations: Vec<_> = entries
+            .iter()
+            .filter(|name| name.ends_with(".sql"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            sql_migrations,
+            vec!["0001_initial.sql".to_string()],
+            "sealed-value repair must not add any migration beyond the squashed initial schema"
+        );
+    }
 }

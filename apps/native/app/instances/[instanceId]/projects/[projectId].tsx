@@ -9,7 +9,13 @@ import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams } from "expo-router";
 import { Button, Card, Chip, Input, Spinner, Surface, TextField } from "heroui-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Text, View } from "react-native";
+import {
+  FlatList,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  Text,
+  View,
+} from "react-native";
 import { Container } from "@/components/container";
 import { useNativeRemoteClient } from "@/hooks/use-native-remote-client";
 import {
@@ -18,6 +24,15 @@ import {
   emptyNativeDaemonState,
   resumePausedWorkAction,
 } from "@/utils/daemon-state";
+import {
+  emptyNativeHistoryPagingState,
+  loadNativeHistoryPage,
+  markNativeHistoryPageLoading,
+  NativeHistoryPagingCoordinator,
+  type NativeHistoryPagingState,
+  nativeTranscriptScreenScrollOwners,
+  pagingFromNativeHistory,
+} from "@/utils/history-paging";
 import { activeModelView } from "@/utils/inference-failure-view";
 import {
   type InterruptSelection,
@@ -26,6 +41,11 @@ import {
   type RiskTone,
   resolveFromSelection,
 } from "@/utils/interrupt-view";
+import {
+  contentOffsetAfterLayoutChange,
+  shouldApplyPrependAnchor,
+  shouldLoadOlderHistory,
+} from "@/utils/scroll-anchor";
 import { NativeAttachCoordinator } from "@/utils/session-attach";
 import {
   acceptedClientSubmissionIdsFromEvent,
@@ -33,6 +53,7 @@ import {
   clearAcceptedRetryDrafts,
   clientSubmissionIdsFromHistory,
   forgetUserMessageSubmission,
+  interruptDecisionView,
   isCurrentUserMessageSubmission,
   type NativeHistoryEntry,
   nativeAttachRuntimeState,
@@ -47,6 +68,10 @@ import {
   toNativeHistoryEntry,
   warnNativeSessionEvent,
 } from "@/utils/session-events";
+
+/** Satisfies native_history_virtualized_list: one FlatList owns transcript scrolling. */
+const transcriptScrollOwners = nativeTranscriptScreenScrollOwners();
+const TranscriptList = FlatList;
 
 type InterruptDraft = {
   text: string;
@@ -71,6 +96,13 @@ function historyText(entry: NativeHistoryEntry) {
   if (entry.kind === "boundary") return entry.label;
   if (entry.kind === "subagent_report") return entry.title + "\n" + entry.body;
   if (entry.kind === "interrupt") return entry.interrupt.title;
+  if (entry.kind === "interrupt_decision") {
+    const view = interruptDecisionView(entry);
+    if (!view) return "";
+    const status = view.cancelled ? "Interrupt cancelled" : "Interrupt resolved";
+    const lines = view.lines.map((line) => `${line.prompt}: ${line.answer}`).join("\n");
+    return lines ? `${status}\n${lines}` : status;
+  }
   return "";
 }
 
@@ -96,6 +128,9 @@ export default function ProjectSessions() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialSession ?? null);
   const [history, setHistory] = useState<NativeHistoryEntry[]>([]);
+  const [historyPaging, setHistoryPaging] = useState<NativeHistoryPagingState>(() =>
+    emptyNativeHistoryPagingState(),
+  );
   const [messagesBySession, setMessagesBySession] = useState<Record<string, string>>({});
   const [sendingMessage, setSendingMessage] = useState(false);
   const [retrySubmissionsBySession, setRetrySubmissionsBySession] = useState<
@@ -112,6 +147,7 @@ export default function ProjectSessions() {
   const [llmMode, setLlmMode] = useState<string | null>(null);
   const selectedSessionRef = useRef<string | null>(initialSession ?? null);
   const historyRef = useRef<NativeHistoryEntry[]>([]);
+  const historyPagingRef = useRef<NativeHistoryPagingState>(emptyNativeHistoryPagingState());
   const daemonStateRef = useRef(emptyNativeDaemonState);
   const activeModelStateRef = useRef<Parameters<typeof activeModelView>[0]>(null);
   const llmModeRef = useRef<string | null>(null);
@@ -119,11 +155,16 @@ export default function ProjectSessions() {
   const latestSubmitIdRef = useRef<string | null>(null);
   const sessionListRequestRef = useRef(0);
   const attachCoordinatorRef = useRef(new NativeAttachCoordinator());
+  const historyPagingCoordinatorRef = useRef(new NativeHistoryPagingCoordinator());
   const attachLifecycleRef = useRef<{
     client: object | null;
     connectionEpoch: number;
   }>({ client: null, connectionEpoch: 0 });
   const lastAutoAttachRef = useRef<{ client: object; connectionEpoch: number } | null>(null);
+  const transcriptListRef = useRef<FlatList<NativeHistoryEntry>>(null);
+  const scrollOffsetYRef = useRef(0);
+  const contentHeightRef = useRef(0);
+  const prependPendingRef = useRef(false);
 
   const message = selectedSessionId ? (messagesBySession[selectedSessionId] ?? "") : "";
   const retrySubmission = selectedSessionId
@@ -223,12 +264,103 @@ export default function ProjectSessions() {
     repairRequired: daemonState.repairRequired,
   });
 
+  const applyHistoryPaging = (next: NativeHistoryPagingState) => {
+    historyPagingRef.current = next;
+    setHistoryPaging(next);
+  };
+
+  const loadOlderHistory = useCallback(async () => {
+    const pageClient = clientRef.current;
+    const sessionId = selectedSessionRef.current;
+    const epoch = connectionEpochRef.current;
+    if (!pageClient || !sessionId || statusRef.current !== "connected") return;
+    if (!attachmentReadyFor(sessionId)) return;
+    const paging = historyPagingRef.current;
+    if (!paging.hasMore || paging.isLoading || historyPagingCoordinatorRef.current.hasInFlight()) {
+      return;
+    }
+
+    const requestGeneration = historyPagingCoordinatorRef.current.currentRequestGeneration();
+    applyHistoryPaging(markNativeHistoryPageLoading(paging));
+
+    const result = await loadNativeHistoryPage({
+      coordinator: historyPagingCoordinatorRef.current,
+      client: pageClient,
+      connectionEpoch: epoch,
+      sessionId,
+      requestGeneration,
+      paging: { ...paging, isLoading: true, error: null },
+      history: historyRef.current,
+      // Capture history only after the attempt is confirmed current so live
+      // appends during the request are retained.
+      resolveHistory: () => historyRef.current,
+    });
+
+    if (result.kind === "success") {
+      // Arm prepend anchor only when the successful merge actually grew the
+      // list from older rows (not for live/resize layout changes mid-flight).
+      if (result.prepended) {
+        prependPendingRef.current = true;
+      }
+      historyRef.current = result.history;
+      setHistory(result.history);
+      applyHistoryPaging(result.paging);
+      return;
+    }
+
+    if (result.kind === "error") {
+      prependPendingRef.current = false;
+      applyHistoryPaging(result.paging);
+      return;
+    }
+    // skipped or stale: do not mutate history, cursor, error, or loading.
+    // A stale result must not clear a newer request's isLoading flag.
+  }, []);
+
+  const loadOlderHistoryRef = useRef(loadOlderHistory);
+  loadOlderHistoryRef.current = loadOlderHistory;
+
+  const onTranscriptScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const offsetY = event.nativeEvent.contentOffset.y;
+    scrollOffsetYRef.current = offsetY;
+    if (shouldLoadOlderHistory({ offsetY })) {
+      void loadOlderHistoryRef.current();
+    }
+  }, []);
+
+  const onTranscriptContentSizeChange = useCallback((_width: number, height: number) => {
+    const previousHeight = contentHeightRef.current;
+    const grew = height > previousHeight;
+    if (
+      shouldApplyPrependAnchor({
+        prependPending: prependPendingRef.current,
+        contentGrewFromPrepend: grew,
+      })
+    ) {
+      const nextOffset = contentOffsetAfterLayoutChange({
+        previousOffsetY: scrollOffsetYRef.current,
+        prependPending: true,
+        previousContentHeight: previousHeight,
+        nextContentHeight: height,
+      });
+      transcriptListRef.current?.scrollToOffset({ offset: nextOffset, animated: false });
+      scrollOffsetYRef.current = nextOffset;
+      prependPendingRef.current = false;
+    } else if (prependPendingRef.current && !grew) {
+      // Prepend completed with no measurable growth (empty/overlap-only page).
+      prependPendingRef.current = false;
+    }
+    contentHeightRef.current = height;
+  }, []);
+
   const attach = async (sessionId: string) => {
     const attachClient = clientRef.current;
     const attachEpoch = connectionEpochRef.current;
     if (!attachClient || statusRef.current !== "connected") return;
     const coordinator = attachCoordinatorRef.current;
     if (!coordinator.needsAttach(attachClient, attachEpoch, sessionId)) return;
+    // Switching sessions invalidates any in-flight older-page request.
+    historyPagingCoordinatorRef.current.bumpRequestGeneration();
     const attempt = coordinator.begin(attachClient, attachEpoch, sessionId);
     const attemptIsCurrent = () =>
       statusRef.current === "connected" &&
@@ -254,16 +386,22 @@ export default function ProjectSessions() {
         forgetUserMessageSubmission(pendingUserSubmissionsRef.current, id);
       }
       reconcileAcceptedRetryDrafts(acceptedIds);
+      // Attach starts a fresh paging window for this session/generation.
+      historyPagingCoordinatorRef.current.bumpRequestGeneration();
+      const nextPaging = pagingFromNativeHistory(nextHistory);
       setSelectedSessionId(sessionId);
       selectedSessionRef.current = sessionId;
       historyRef.current = nextHistory;
+      historyPagingRef.current = nextPaging;
       daemonStateRef.current = runtime.daemonState;
       activeModelStateRef.current = runtime.activeModel;
       llmModeRef.current = runtime.llmMode;
       setHistory(nextHistory);
+      setHistoryPaging(nextPaging);
       setDaemonState(runtime.daemonState);
       setActiveModel(activeModelView(runtime.activeModel, runtime.llmMode));
       setLlmMode(runtime.llmMode);
+      prependPendingRef.current = false;
       const pending = [...pendingUserSubmissionsRef.current.values()].filter(
         (submission) => submission.sessionId === sessionId,
       );
@@ -531,6 +669,10 @@ export default function ProjectSessions() {
       sessionListRequestRef.current += 1;
       setLoadingSessions(false);
       attachCoordinatorRef.current.invalidate();
+      historyPagingCoordinatorRef.current.invalidate();
+      historyPagingRef.current = emptyNativeHistoryPagingState();
+      setHistoryPaging(emptyNativeHistoryPagingState());
+      prependPendingRef.current = false;
       setAttachingSessionId(null);
     }
     attachLifecycleRef.current = { client, connectionEpoch };
@@ -549,8 +691,8 @@ export default function ProjectSessions() {
     if (sessionId) void attach(sessionId);
   }, [client, status, connectionEpoch]);
 
-  return (
-    <Container className="p-6">
+  const listHeader = (
+    <View className="p-6 pb-0">
       <View className="py-4 mb-4">
         <Text className="text-4xl font-bold text-foreground mb-2">{projectName ?? "Sessions"}</Text>
         <Text className="text-muted text-base">{projectRoot}</Text>
@@ -610,8 +752,27 @@ export default function ProjectSessions() {
       </View>
 
       {selectedSessionId ? (
-        <View className="gap-3">
+        <View className="gap-3 mb-3">
           <Text className="text-foreground text-xl font-semibold">Transcript</Text>
+          {historyPaging.hasMore ? (
+            <View className="gap-2 items-center">
+              <Button
+                onPress={() => void loadOlderHistory()}
+                isDisabled={historyPaging.isLoading || !selectedAttachmentReady}
+              >
+                <Button.Label>
+                  {historyPaging.isLoading
+                    ? "Loading older…"
+                    : historyPaging.error
+                      ? "Retry load older"
+                      : "Load older"}
+                </Button.Label>
+              </Button>
+              {historyPaging.error ? (
+                <Text className="text-danger text-xs">{historyPaging.error}</Text>
+              ) : null}
+            </View>
+          ) : null}
           {unresolvedInterrupts.map((entry) =>
             entry.kind === "interrupt" ? (
               <InterruptCard
@@ -627,90 +788,116 @@ export default function ProjectSessions() {
               />
             ) : null,
           )}
-
-          {history.map((entry) => (
-            <TranscriptEntry key={entry.id} entry={entry} />
-          ))}
-
-          {daemonState.sandboxNotice ? (
-            <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
-              <Text className="text-foreground font-semibold">Sandbox unavailable</Text>
-              <Text className="text-muted text-sm mt-1">{daemonState.sandboxNotice.remedy}</Text>
-              {daemonState.sandboxNotice.fixCommand ? (
-                <View className="mt-3 gap-2">
-                  <Text className="text-foreground text-sm">
-                    {daemonState.sandboxNotice.fixCommand}
-                  </Text>
-                  <Button onPress={copyFixCommand}>
-                    <Button.Label>Copy fix command</Button.Label>
-                  </Button>
-                </View>
-              ) : null}
-            </Surface>
-          ) : null}
-
-          {daemonState.pausedWork ? (
-            <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
-              <Text className="text-foreground font-semibold">Paused work available</Text>
-              <Text className="text-muted text-sm mt-1">
-                {daemonState.pausedWork.items.length} paused item
-                {daemonState.pausedWork.items.length === 1 ? "" : "s"} need a decision.
-              </Text>
-              <View className="flex-row gap-2 mt-3">
-                <Button
-                  onPress={resumePausedWork}
-                  isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
-                >
-                  <Button.Label>Resume</Button.Label>
-                </Button>
-                <Button
-                  onPress={cancelPausedWork}
-                  isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
-                >
-                  <Button.Label>Cancel</Button.Label>
-                </Button>
-              </View>
-            </Surface>
-          ) : null}
-
-          {daemonState.repairRequired ? (
-            <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
-              <Text className="text-foreground font-semibold">Read-only recovery</Text>
-              <Text className="text-muted text-sm mt-1">{daemonState.repairRequired.detail}</Text>
-            </Surface>
-          ) : null}
-
-          <Surface variant="secondary" className="p-4 rounded-lg">
-            <TextField>
-              <Input
-                value={message}
-                onChangeText={(value) => {
-                  if (selectedSessionId) {
-                    setSessionMessage(selectedSessionId, value);
-                    if (retrySubmission && retrySubmission.params.text !== value.trim()) {
-                      setSessionRetry(selectedSessionId, null);
-                    }
-                  }
-                }}
-                placeholder="Message Flycockpit"
-                multiline
-                isDisabled={sendingMessage || Boolean(daemonState.repairRequired)}
-              />
-            </TextField>
-            <View className="flex-row flex-wrap gap-2 mt-3">
-              <Button onPress={pasteClipboard}>
-                <Button.Label>Paste</Button.Label>
-              </Button>
-              <Button onPress={addImage}>
-                <Button.Label>Image</Button.Label>
-              </Button>
-              <Button onPress={sendMessage} isDisabled={sendDisabled}>
-                <Button.Label>Send</Button.Label>
-              </Button>
-            </View>
-          </Surface>
         </View>
       ) : null}
+    </View>
+  );
+
+  const listFooter = selectedSessionId ? (
+    <View className="gap-3 p-6 pt-3">
+      {daemonState.sandboxNotice ? (
+        <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
+          <Text className="text-foreground font-semibold">Sandbox unavailable</Text>
+          <Text className="text-muted text-sm mt-1">{daemonState.sandboxNotice.remedy}</Text>
+          {daemonState.sandboxNotice.fixCommand ? (
+            <View className="mt-3 gap-2">
+              <Text className="text-foreground text-sm">
+                {daemonState.sandboxNotice.fixCommand}
+              </Text>
+              <Button onPress={copyFixCommand}>
+                <Button.Label>Copy fix command</Button.Label>
+              </Button>
+            </View>
+          ) : null}
+        </Surface>
+      ) : null}
+
+      {daemonState.pausedWork ? (
+        <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
+          <Text className="text-foreground font-semibold">Paused work available</Text>
+          <Text className="text-muted text-sm mt-1">
+            {daemonState.pausedWork.items.length} paused item
+            {daemonState.pausedWork.items.length === 1 ? "" : "s"} need a decision.
+          </Text>
+          <View className="flex-row gap-2 mt-3">
+            <Button
+              onPress={resumePausedWork}
+              isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
+            >
+              <Button.Label>Resume</Button.Label>
+            </Button>
+            <Button
+              onPress={cancelPausedWork}
+              isDisabled={uiBusy || !attachmentReadyFor(daemonState.pausedWork.sessionId)}
+            >
+              <Button.Label>Cancel</Button.Label>
+            </Button>
+          </View>
+        </Surface>
+      ) : null}
+
+      {daemonState.repairRequired ? (
+        <Surface variant="secondary" className="p-4 rounded-lg border border-warning">
+          <Text className="text-foreground font-semibold">Read-only recovery</Text>
+          <Text className="text-muted text-sm mt-1">{daemonState.repairRequired.detail}</Text>
+        </Surface>
+      ) : null}
+
+      <Surface variant="secondary" className="p-4 rounded-lg">
+        <TextField>
+          <Input
+            value={message}
+            onChangeText={(value) => {
+              if (selectedSessionId) {
+                setSessionMessage(selectedSessionId, value);
+                if (retrySubmission && retrySubmission.params.text !== value.trim()) {
+                  setSessionRetry(selectedSessionId, null);
+                }
+              }
+            }}
+            placeholder="Message Flycockpit"
+            multiline
+            isDisabled={sendingMessage || Boolean(daemonState.repairRequired)}
+          />
+        </TextField>
+        <View className="flex-row flex-wrap gap-2 mt-3">
+          <Button onPress={pasteClipboard}>
+            <Button.Label>Paste</Button.Label>
+          </Button>
+          <Button onPress={addImage}>
+            <Button.Label>Image</Button.Label>
+          </Button>
+          <Button onPress={sendMessage} isDisabled={sendDisabled}>
+            <Button.Label>Send</Button.Label>
+          </Button>
+        </View>
+      </Surface>
+    </View>
+  ) : (
+    <View className="h-6" />
+  );
+
+  return (
+    <Container isScrollable={transcriptScrollOwners.containerScrollable} className="flex-1">
+      <TranscriptList
+        ref={transcriptListRef}
+        style={{ flex: 1 }}
+        data={selectedSessionId ? history : []}
+        keyExtractor={(entry) => entry.id}
+        renderItem={({ item }) => (
+          <View className="px-6 pb-3">
+            <TranscriptEntry entry={item} />
+          </View>
+        )}
+        ListHeaderComponent={listHeader}
+        ListFooterComponent={listFooter}
+        onScroll={onTranscriptScroll}
+        onContentSizeChange={onTranscriptContentSizeChange}
+        scrollEventThrottle={16}
+        keyboardShouldPersistTaps="handled"
+        // Single virtualized scroll owner — never nested in Container ScrollView.
+        nestedScrollEnabled={transcriptScrollOwners.nestedSameAxisUnboundedScrollView}
+      />
     </Container>
   );
 }
@@ -1093,6 +1280,31 @@ function TranscriptEntry({ entry }: { entry: NativeHistoryEntry }) {
             <Text className="text-muted text-sm">{entry.view.recovery.guidance}</Text>
           </View>
         )}
+      </Surface>
+    );
+  }
+  if (entry.kind === "interrupt_decision") {
+    const view = interruptDecisionView(entry);
+    if (!view) return null;
+    return (
+      <Surface variant="secondary" className="p-3 rounded-lg">
+        <Text className="text-muted text-xs mb-1">interrupt decision</Text>
+        <Text className="text-foreground font-semibold">
+          {view.cancelled ? "Interrupt cancelled" : "Interrupt resolved"}
+        </Text>
+        <Text className="text-muted text-xs mt-1">
+          {view.permission ? "Permission" : "Question"}
+        </Text>
+        {view.lines.length ? (
+          <View className="mt-3 gap-2">
+            {view.lines.map((line, index) => (
+              <View key={`${line.prompt}:${index}`} className="gap-1">
+                <Text className="text-muted text-xs">{line.prompt}</Text>
+                <Text className="text-foreground text-sm">{line.answer}</Text>
+              </View>
+            ))}
+          </View>
+        ) : null}
       </Surface>
     );
   }

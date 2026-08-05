@@ -67,6 +67,16 @@ export type NativeHistoryEntry =
       seq: number;
       kind: "interrupt";
       interrupt: NativeInterrupt;
+    }
+  | {
+      id: string;
+      seq: number;
+      kind: "interrupt_decision";
+      decision: {
+        permission: boolean;
+        cancelled: boolean;
+        lines: { prompt: string; answer: string }[];
+      };
     };
 
 export type NativeSessionEventState = {
@@ -234,11 +244,30 @@ export function toNativeHistoryEntry(entry: HistoryEntry, fallbackSeq = 0): Nati
     };
   }
   if (entry.role === "interrupt_decision") {
+    const decision =
+      entry.decision && typeof entry.decision === "object"
+        ? (entry.decision as {
+            permission?: unknown;
+            cancelled?: unknown;
+            lines?: unknown;
+          })
+        : null;
+    const lines = Array.isArray(decision?.lines)
+      ? decision.lines.filter((line): line is { prompt: string; answer: string } => {
+          if (!line || typeof line !== "object") return false;
+          const record = line as Record<string, unknown>;
+          return typeof record.prompt === "string" && typeof record.answer === "string";
+        })
+      : [];
     return {
       id: entryId("interrupt-decision", seq),
       seq,
-      kind: "assistant_reasoning",
-      text: entry.decision.cancelled ? "Interrupt cancelled" : "Interrupt resolved",
+      kind: "interrupt_decision",
+      decision: {
+        permission: decision?.permission === true,
+        cancelled: decision?.cancelled === true,
+        lines,
+      },
     };
   }
   return {
@@ -246,6 +275,22 @@ export function toNativeHistoryEntry(entry: HistoryEntry, fallbackSeq = 0): Nati
     seq,
     kind: "assistant_reasoning",
     text: "Unknown transcript entry",
+  };
+}
+
+/** Resolved interrupt decision view — non-interactive, structured lines only. */
+export function interruptDecisionView(entry: NativeHistoryEntry): {
+  interactive: false;
+  permission: boolean;
+  cancelled: boolean;
+  lines: { prompt: string; answer: string }[];
+} | null {
+  if (entry.kind !== "interrupt_decision") return null;
+  return {
+    interactive: false,
+    permission: entry.decision.permission,
+    cancelled: entry.decision.cancelled,
+    lines: entry.decision.lines,
   };
 }
 
@@ -268,6 +313,69 @@ export function nativeAttachRuntimeState(
 
 export function sortNativeHistory(history: NativeHistoryEntry[]) {
   return [...history].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+}
+
+/**
+ * Settled rows merge by seq; pending/optimistic rows merge by id and are never
+ * collapsed into settled rows here (acknowledgement reducers own that).
+ */
+export function nativeHistoryMergeKey(entry: NativeHistoryEntry) {
+  if (
+    entry.seq >= pendingUserSeq ||
+    entry.id === pendingAssistantId ||
+    entry.id.startsWith(pendingUserPrefix) ||
+    (entry.kind === "tool_call" && entry.status === "running") ||
+    (entry.kind === "interrupt" && !entry.interrupt.resolved)
+  ) {
+    return `id:${entry.id}`;
+  }
+  return `seq:${entry.seq}`;
+}
+
+export function mergeNativeHistoryEntries(
+  history: readonly NativeHistoryEntry[],
+  entries: readonly NativeHistoryEntry[],
+) {
+  const byKey = new Map<string, NativeHistoryEntry>();
+  // Incoming first; existing history wins on key collision so settled window
+  // rows are preferred over overlapping page duplicates.
+  for (const entry of entries) byKey.set(nativeHistoryMergeKey(entry), entry);
+  for (const entry of history) byKey.set(nativeHistoryMergeKey(entry), entry);
+  return sortNativeHistory([...byKey.values()]);
+}
+
+export function oldestSeqFromNativeHistory(history: readonly NativeHistoryEntry[]) {
+  return history.reduce<number | null>((min, entry) => {
+    if (entry.seq >= pendingUserSeq) return min;
+    return min === null ? entry.seq : Math.min(min, entry.seq);
+  }, null);
+}
+
+function nextSeqFromHistory(history: readonly NativeHistoryEntry[]) {
+  return history.reduce(
+    (max, entry) => (entry.seq < pendingUserSeq ? Math.max(max, entry.seq + 1) : max),
+    1,
+  );
+}
+
+/**
+ * Preserve older paged rows and pending/live tail when a truncated snapshot
+ * (attach/history_replay) refreshes the mid-window.
+ */
+export function mergeNativeHistorySnapshot(
+  current: readonly NativeHistoryEntry[],
+  snapshot: readonly NativeHistoryEntry[],
+) {
+  if (!snapshot.length) return sortNativeHistory([...current]);
+  const nextSeq = nextSeqFromHistory(snapshot);
+  const oldestSnapshotSeq = oldestSeqFromNativeHistory(snapshot);
+  const snapshotIds = new Set(snapshot.map((entry) => entry.id));
+  const preserved = current.filter(
+    (entry) =>
+      !snapshotIds.has(entry.id) &&
+      ((oldestSnapshotSeq !== null && entry.seq < oldestSnapshotSeq) || entry.seq >= nextSeq),
+  );
+  return mergeNativeHistoryEntries(snapshot, preserved);
 }
 
 function upsertHistory(history: NativeHistoryEntry[], entry: NativeHistoryEntry) {
@@ -631,12 +739,11 @@ export function reduceNativeSessionEvent(
 
   if (event.event === "history_replay") {
     const data = event.data as { entries: HistoryEntry[] };
+    const snapshot = data.entries.map((entry, index) => toNativeHistoryEntry(entry, index));
     return {
       state: {
         ...state,
-        history: sortNativeHistory(
-          data.entries.map((entry, index) => toNativeHistoryEntry(entry, index)),
-        ),
+        history: mergeNativeHistorySnapshot(state.history, snapshot),
       },
     };
   }

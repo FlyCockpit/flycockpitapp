@@ -2,10 +2,13 @@
 //!
 //! File-backed databases use one dedicated writer thread plus a small
 //! read-only WAL connection pool. Async call sites use [`Db::read`] and
-//! [`Db::write`]. The only non-deprecated synchronous escape hatch is
+//! [`Db::write`]. The permanent synchronous escape hatch is
 //! [`Db::blocking_for_sync_cli`], which runs a read/write-capable closure on
 //! the writer connection and panics if called from any Tokio runtime; async
 //! code must use [`Db::read`], [`Db::write`], or [`Db::transaction`] instead.
+//! Four temporary sync UI/event/maintenance wrappers remain until
+//! `db-sync-wrapper-migration`; the cockpit-db-local AST/call-graph gate in
+//! `tests/db_blocking_boundary_gate.rs` freezes that exact allowlist.
 //!
 //! Async migration rules:
 //!
@@ -517,8 +520,10 @@ impl Db {
     /// Guarded blocking access for synchronous CLI one-shots.
     ///
     /// This closure runs on the writer connection, so it may read and write.
-    /// It is the only non-deprecated blocking DB accessor; async code must use
-    /// [`Self::read`], [`Self::write`], or [`Self::transaction`].
+    /// It is the permanent allowlisted blocking DB entrypoint for synchronous
+    /// CLI one-shots; async code must use [`Self::read`], [`Self::write`], or
+    /// [`Self::transaction`]. Temporary sync UI/event/maintenance wrappers
+    /// below are owned for removal by `db-sync-wrapper-migration`.
     pub fn blocking_for_sync_cli<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -534,10 +539,11 @@ impl Db {
 
     /// Blocking read access for synchronous TUI render/input edges.
     ///
-    /// This uses the read pool for file-backed databases and never touches
-    /// the writer connection. Async application code should still use
-    /// [`Self::read`]; this exists for synchronous UI paths that cannot
-    /// await while rendering or handling input.
+    /// Temporary allowlisted boundary; owned for removal by
+    /// `db-sync-wrapper-migration`. This uses the read pool for file-backed
+    /// databases and never touches the writer connection. Async application
+    /// code should still use [`Self::read`]; this exists for synchronous UI
+    /// paths that cannot await while rendering or handling input.
     pub fn blocking_read_for_sync_ui<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
@@ -547,9 +553,10 @@ impl Db {
 
     /// Blocking write access for synchronous TUI input edges.
     ///
-    /// TUI input handlers are synchronous but may need to persist settings
-    /// after local file writes. Async application code should still use
-    /// [`Self::write`].
+    /// Temporary allowlisted boundary; owned for removal by
+    /// `db-sync-wrapper-migration`. TUI input handlers are synchronous but may
+    /// need to persist settings after local file writes. Async application
+    /// code should still use [`Self::write`].
     pub fn blocking_write_for_sync_ui<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -560,9 +567,11 @@ impl Db {
 
     /// Blocking write access for synchronous event fanout callbacks.
     ///
-    /// This is intentionally narrower than [`Self::blocking_for_sync_cli`]:
-    /// it exists for call stacks that must synchronously broadcast an event
-    /// and persist its audit row from a non-async callback.
+    /// Temporary allowlisted boundary; owned for removal by
+    /// `db-sync-wrapper-migration`. This is intentionally narrower than
+    /// [`Self::blocking_for_sync_cli`]: it exists for call stacks that must
+    /// synchronously broadcast an event and persist its audit row from a
+    /// non-async callback.
     pub fn blocking_write_for_sync_event<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -573,27 +582,17 @@ impl Db {
 
     /// Blocking write access for synchronous startup maintenance.
     ///
-    /// Startup housekeeping is called before the daemon context is fully
-    /// assembled, while some tests exercise it from an async harness. Keep
-    /// this out of regular async code; prefer [`Self::write`] there.
+    /// Temporary allowlisted boundary; owned for removal by
+    /// `db-sync-wrapper-migration`. Startup housekeeping is called before the
+    /// daemon context is fully assembled, while some tests exercise it from an
+    /// async harness. Keep this out of regular async code; prefer
+    /// [`Self::write`] there.
     pub fn blocking_write_for_sync_maintenance<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         self.write_blocking_unguarded(f)
-    }
-
-    /// Explicit blocking read access for legacy synchronous paths.
-    /// Async code should prefer [`Self::read`]. Removed by `db-blocking-api-removal`.
-    #[deprecated(
-        note = "temporary db-async-foundation bridge; migrate to Db::read/Db::write before db-blocking-api-removal"
-    )]
-    pub fn read_blocking<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T>,
-    {
-        self.read_blocking_unguarded(f)
     }
 
     fn read_blocking_unguarded<F, T>(&self, f: F) -> Result<T>
@@ -611,19 +610,6 @@ impl Db {
             .lock()
             .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
         f(&guard)
-    }
-
-    /// Explicit blocking write access for legacy synchronous paths.
-    /// Async code should prefer [`Self::write`]. Removed by `db-blocking-api-removal`.
-    #[deprecated(
-        note = "temporary db-async-foundation bridge; migrate to Db::read/Db::write before db-blocking-api-removal"
-    )]
-    pub fn write_blocking<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.write_blocking_unguarded(f)
     }
 
     fn write_blocking_unguarded<F, T>(&self, f: F) -> Result<T>
@@ -1286,6 +1272,9 @@ mod tests {
 
     #[test]
     fn db_async_ops_accessor_layer_has_no_blocking_calls() {
+        // Mechanical substring guard for accessor modules. The semantic
+        // AST/call-graph gate lives in `tests/db_blocking_boundary_gate.rs`
+        // (db-blocking-api-removal) and is authoritative for public reachability.
         let db_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("db");
         let mut stack = vec![db_dir];
         while let Some(path) = stack.pop() {

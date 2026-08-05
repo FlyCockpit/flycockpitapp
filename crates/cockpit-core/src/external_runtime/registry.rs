@@ -133,8 +133,9 @@ pub fn global_registry() -> Arc<ExternalRuntimeRegistry> {
         .get_or_init(|| {
             let registry = Arc::new(ExternalRuntimeRegistry::new());
             // Catalog registration is best-effort at process init; launch
-            // paths re-call ensure_integration_adapters_registered.
+            // paths re-call ensure_*_adapters_registered.
             let _ = super::adapters::ensure_integration_adapters_registered(&registry);
+            let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
             registry
         })
         .clone()

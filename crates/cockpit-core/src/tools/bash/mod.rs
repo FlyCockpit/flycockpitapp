@@ -2396,9 +2396,11 @@ async fn run_container_shell(
     let manager = crate::container::container_manager()
         .get_or_init(|| async { crate::container::ContainerManager::detect() })
         .await;
-    if let Err(reason) = manager.ensure_available() {
-        return RunOutcome::SpawnError(std::io::Error::other(reason));
-    }
+    // Atomic reselect + capture: owned runtime is immutable for this launch.
+    let runtime = match manager.select_for_launch() {
+        Ok(runtime) => runtime,
+        Err(reason) => return RunOutcome::SpawnError(std::io::Error::other(reason)),
+    };
     let map = crate::container::MountMap::for_current_platform(ctx.cwd.clone());
     let Some(container_cwd) = map.to_container(cwd) else {
         return RunOutcome::SpawnError(std::io::Error::other(format!(
@@ -2424,7 +2426,7 @@ async fn run_container_shell(
         }
     };
     let image = match manager
-        .ensure_image(&resolved.path, &dockerfile_bytes)
+        .ensure_image(&resolved.path, &dockerfile_bytes, &runtime)
         .await
     {
         Ok(image) => image,
@@ -2445,6 +2447,7 @@ async fn run_container_shell(
             &map,
             &profile_mounts,
             ctx.session.container_network_enabled(),
+            &runtime,
         )
         .await
     {
@@ -2452,7 +2455,7 @@ async fn run_container_shell(
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };
     let env = crate::container::container_env(session_env, scrub);
-    let cmd = match manager.exec_command(&name, &container_cwd, &env, command) {
+    let cmd = match manager.exec_command(&name, &container_cwd, &env, command, &runtime) {
         Ok(cmd) => cmd,
         Err(e) => return RunOutcome::SpawnError(std::io::Error::other(e.to_string())),
     };

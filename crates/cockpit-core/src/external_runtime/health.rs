@@ -53,13 +53,25 @@ impl HealthState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum HealthCause {
-    SpawnFailed { failure: SpawnFailureKind },
-    NonZeroExit { code: Option<i32> },
+    SpawnFailed {
+        failure: SpawnFailureKind,
+    },
+    NonZeroExit {
+        code: Option<i32>,
+    },
     OutputParseFailed,
     Cancellation,
-    Internal { message: String },
+    Internal {
+        message: String,
+    },
     ResolutionFailed,
     NotSpawnable,
+    /// Explicit container/engine permission failure (distinct from spawn EACCES).
+    PermissionDenied,
+    /// Engine CLI present but cannot reach the daemon socket.
+    SocketUnavailable,
+    /// Engine CLI present but the daemon/service is not usable.
+    DaemonUnavailable,
 }
 
 /// Coarse spawn failure class without platform path/text leakage.

@@ -92,46 +92,85 @@ pub fn detect_runtime_call_count() -> usize {
     DETECT_RUNTIME_CALLS.with(std::cell::Cell::get)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static DETECT_RUNTIME_OVERRIDE: std::cell::RefCell<
+        Option<(Option<ContainerRuntime>, ContainerAvailability)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Install a test-only override so unit tests never touch a real Docker/Podman daemon.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_detect_runtime_override(
+    value: Option<(Option<ContainerRuntime>, ContainerAvailability)>,
+) {
+    DETECT_RUNTIME_OVERRIDE.with(|slot| *slot.borrow_mut() = value);
+}
+
 pub fn detect_runtime() -> (Option<ContainerRuntime>, ContainerAvailability) {
     #[cfg(any(test, feature = "test-support"))]
     DETECT_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let harness = harness_in_container();
-    let docker = crate::capabilities::resolve_binary("docker");
-    let podman = crate::capabilities::resolve_binary("podman");
-    let runtime = docker
-        .map(|binary| ContainerRuntime {
-            kind: ContainerRuntimeKind::Docker,
-            binary,
-        })
-        .or_else(|| {
-            podman.map(|binary| ContainerRuntime {
-                kind: ContainerRuntimeKind::Podman,
-                binary,
-            })
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Some(overridden) = DETECT_RUNTIME_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return overridden;
+        }
+    }
+    // cockpit-core unit tests (`cfg(test)`) never contact a real engine unless
+    // a test installs an override. Library consumers (CLI/TUI) use read-only
+    // health probes; they may install an override under `test-support` to skip
+    // host engines in their own tests.
+    #[cfg(test)]
+    {
+        (
+            None,
+            ContainerAvailability {
+                runtime: None,
+                harness_in_container: harness_in_container(),
+                available: false,
+                reason: Some(if harness_in_container() {
+                    ContainerUnavailableReason::HarnessInContainer
+                } else {
+                    ContainerUnavailableReason::NoRuntime
+                }),
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let mode = crate::external_runtime::current_container_engine_mode();
+        let harness = harness_in_container();
+        let platform = crate::external_runtime::detect_host_platform();
+        // Prefer the latest published doctor/safety snapshot when it carries
+        // engine rows — so a later refresh affects later detect() calls while
+        // an already-built ContainerManager remains immutable for its launches.
+        if let Some(snap) = crate::external_runtime::global_health_store().current() {
+            let has_engine = snap.get(crate::external_runtime::ID_DOCKER).is_some()
+                || snap.get(crate::external_runtime::ID_PODMAN).is_some()
+                || matches!(mode, crate::external_runtime::ContainerEngineMode::Disabled);
+            if has_engine || matches!(mode, crate::external_runtime::ContainerEngineMode::Disabled)
+            {
+                let selection =
+                    crate::external_runtime::resolve_container_engine(mode, &snap, harness);
+                let runtime = selection.runtime.map(|r| ContainerRuntime {
+                    kind: r.kind,
+                    binary: r.binary,
+                });
+                return (runtime, selection.availability);
+            }
+        }
+        let selection = crate::external_runtime::detect_container_runtime_health(
+            mode,
+            &crate::external_runtime::SystemProbeExecutor,
+            harness,
+            platform,
+        );
+        let runtime = selection.runtime.map(|r| ContainerRuntime {
+            kind: r.kind,
+            binary: r.binary,
         });
-    let availability = if harness {
-        ContainerAvailability {
-            runtime: runtime.as_ref().map(|r| r.kind),
-            harness_in_container: true,
-            available: false,
-            reason: Some(ContainerUnavailableReason::HarnessInContainer),
-        }
-    } else if let Some(runtime) = &runtime {
-        ContainerAvailability {
-            runtime: Some(runtime.kind),
-            harness_in_container: false,
-            available: true,
-            reason: None,
-        }
-    } else {
-        ContainerAvailability {
-            runtime: None,
-            harness_in_container: false,
-            available: false,
-            reason: Some(ContainerUnavailableReason::NoRuntime),
-        }
-    };
-    (runtime, availability)
+        (runtime, selection.availability)
+    }
 }
 
 pub fn harness_in_container() -> bool {
@@ -156,9 +195,17 @@ pub fn harness_markers(body: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub struct ContainerManager {
+struct SelectedEngine {
     runtime: Option<ContainerRuntime>,
     availability: ContainerAvailability,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerManager {
+    /// Atomic engine selection for status. Launches capture an owned
+    /// [`ContainerRuntime`] from [`Self::select_for_launch`] and pass it through
+    /// image/create/exec so concurrent reselect cannot mix engines mid-launch.
+    selection: Arc<std::sync::Mutex<SelectedEngine>>,
     build_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     create_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -167,26 +214,56 @@ impl ContainerManager {
     pub fn detect() -> Self {
         let (runtime, availability) = detect_runtime();
         Self {
-            runtime,
-            availability,
+            selection: Arc::new(std::sync::Mutex::new(SelectedEngine {
+                runtime,
+                availability,
+            })),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             create_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn availability(&self) -> &ContainerAvailability {
-        &self.availability
+    /// Atomically reselect from health and return a launch-scoped runtime.
+    pub fn select_for_launch(&self) -> Result<ContainerRuntime, String> {
+        let (runtime, availability) = detect_runtime();
+        let mut sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
+        sel.runtime = runtime.clone();
+        sel.availability = availability.clone();
+        if !availability.available {
+            return Err(availability
+                .unavailable_reason_text()
+                .unwrap_or_else(|| "container sandbox is unavailable".to_string()));
+        }
+        runtime.ok_or_else(|| "container runtime missing".to_string())
     }
 
-    pub fn ensure_available(&self) -> Result<&ContainerRuntime, String> {
-        if !self.availability.available {
-            return Err(self
+    /// Reselect without returning (status path). Prefer [`Self::select_for_launch`].
+    pub fn reselect_for_launch(&self) {
+        let (runtime, availability) = detect_runtime();
+        let mut sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
+        sel.runtime = runtime;
+        sel.availability = availability;
+    }
+
+    pub fn availability(&self) -> ContainerAvailability {
+        self.selection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .availability
+            .clone()
+    }
+
+    /// Gate on the currently stored selection without reselection.
+    pub fn ensure_available(&self) -> Result<ContainerRuntime, String> {
+        let sel = self.selection.lock().unwrap_or_else(|p| p.into_inner());
+        if !sel.availability.available {
+            return Err(sel
                 .availability
                 .unavailable_reason_text()
                 .unwrap_or_else(|| "container sandbox is unavailable".to_string()));
         }
-        self.runtime
-            .as_ref()
+        sel.runtime
+            .clone()
             .ok_or_else(|| "container runtime missing".to_string())
     }
 
@@ -198,11 +275,15 @@ impl ContainerManager {
             .clone()
     }
 
-    pub async fn image_exists(&self, tag: &str) -> Result<bool> {
-        let runtime = self
+    fn selected_runtime(&self) -> Option<ContainerRuntime> {
+        self.selection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .runtime
-            .as_ref()
-            .context("container runtime unavailable")?;
+            .clone()
+    }
+
+    pub async fn image_exists(&self, tag: &str, runtime: &ContainerRuntime) -> Result<bool> {
         let status = tokio::process::Command::new(&runtime.binary)
             .arg("image")
             .arg("inspect")
@@ -215,17 +296,18 @@ impl ContainerManager {
         Ok(status.success())
     }
 
-    pub async fn ensure_image(&self, dockerfile: &Path, bytes: &[u8]) -> Result<String> {
+    pub async fn ensure_image(
+        &self,
+        dockerfile: &Path,
+        bytes: &[u8],
+        runtime: &ContainerRuntime,
+    ) -> Result<String> {
         let tag = image_tag(bytes, &[]);
         let lock = self.build_lock(&tag).await;
         let _guard = lock.lock().await;
-        if self.image_exists(&tag).await? {
+        if self.image_exists(&tag, runtime).await? {
             return Ok(tag);
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .context("container runtime unavailable")?;
         let context = dockerfile.parent().unwrap_or_else(|| Path::new("."));
         let output = tokio::process::Command::new(&runtime.binary)
             .arg("build")
@@ -254,11 +336,7 @@ impl ContainerManager {
             .clone()
     }
 
-    pub async fn container_exists(&self, name: &str) -> Result<bool> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .context("container runtime unavailable")?;
+    pub async fn container_exists(&self, name: &str, runtime: &ContainerRuntime) -> Result<bool> {
         let status = tokio::process::Command::new(&runtime.binary)
             .arg("container")
             .arg("inspect")
@@ -271,6 +349,7 @@ impl ContainerManager {
         Ok(status.success())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_container(
         &self,
         session_id: Uuid,
@@ -279,15 +358,12 @@ impl ContainerManager {
         map: &MountMap,
         profile_mounts: &[ContainerMount],
         network_enabled: bool,
+        runtime: &ContainerRuntime,
     ) -> Result<String> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .context("container runtime unavailable")?;
         let name = container_name(session_id);
         let lock = self.create_lock(&name).await;
         let _guard = lock.lock().await;
-        if self.container_exists(&name).await? {
+        if self.container_exists(&name, runtime).await? {
             return Ok(name);
         }
         let args = build_create_args(
@@ -315,17 +391,31 @@ impl ContainerManager {
     }
 
     pub async fn remove_container(&self, session_id: Uuid) -> Result<()> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(());
-        };
-        let _ = tokio::process::Command::new(&runtime.binary)
-            .arg("rm")
-            .arg("-f")
-            .arg(container_name(session_id))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        // Best-effort teardown across engines: a later launch may have
+        // reselected a different engine, so cleanup must not depend on the
+        // current selection alone.
+        let mut binaries = Vec::new();
+        if let Some(runtime) = self.selected_runtime() {
+            binaries.push(runtime.binary);
+        }
+        for name in ["docker", "podman"] {
+            if let Some(path) = crate::capabilities::resolve_binary(name)
+                && !binaries.iter().any(|b| b == &path)
+            {
+                binaries.push(path);
+            }
+        }
+        let name = container_name(session_id);
+        for binary in binaries {
+            let _ = tokio::process::Command::new(&binary)
+                .arg("rm")
+                .arg("-f")
+                .arg(&name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
         Ok(())
     }
 
@@ -335,8 +425,8 @@ impl ContainerManager {
         cwd: &Path,
         env: &BTreeMap<String, String>,
         command: &str,
+        runtime: &ContainerRuntime,
     ) -> Result<tokio::process::Command> {
-        let runtime = self.ensure_available().map_err(anyhow::Error::msg)?;
         let mut cmd = tokio::process::Command::new(&runtime.binary);
         cmd.args(build_exec_args(container, cwd, env, command));
         Ok(cmd)
@@ -360,8 +450,21 @@ pub fn initial_availability_unknown() -> ContainerAvailability {
 pub fn availability_snapshot() -> ContainerAvailability {
     container_manager()
         .get()
-        .map(|manager| manager.availability().clone())
-        .unwrap_or_else(|| detect_runtime().1)
+        .map(|manager| manager.availability())
+        .unwrap_or_else(|| {
+            // When no manager is installed (unit tests, pre-daemon UI), do not
+            // spawn docker/podman probes. Production daemon installs the manager
+            // via `ContainerManager::detect()` once at startup.
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                if DETECT_RUNTIME_OVERRIDE.with(|slot| slot.borrow().is_none())
+                    && container_manager().get().is_none()
+                {
+                    return initial_availability_unknown();
+                }
+            }
+            detect_runtime().1
+        })
 }
 
 pub fn default_config_dir() -> Result<PathBuf> {
@@ -759,30 +862,155 @@ mod tests {
 
     #[test]
     fn runtime_detection_prefers_docker_and_blocks_nested_container() {
-        let avail = detect_runtime_with(
+        // Binary PATH presence alone is not availability. Selection uses
+        // generation-tagged external-runtime health (version+info), nested
+        // policy, and ContainerEngineMode — not detect_runtime_with's which().
+        use crate::capabilities::ExecutionTarget;
+        use crate::external_runtime::{
+            ContainerEngineMode, DependencyImportance, ExternalRuntimeId, ExternalRuntimeSnapshot,
+            HealthCause, HealthEntry, HealthState, HostPlatform, ID_DOCKER, ID_PODMAN,
+            resolve_container_engine,
+        };
+
+        // Binary-only which() would have reported available — health must win.
+        let binary_only = detect_runtime_with(
             |name| Some(PathBuf::from(format!("/usr/bin/{name}"))),
             false,
         );
-        assert_eq!(avail.runtime, Some(ContainerRuntimeKind::Docker));
-        assert!(avail.available);
+        // The legacy which helper still resolves a preferred binary path, but
+        // production availability is decided by resolve_container_engine.
+        assert_eq!(binary_only.runtime, Some(ContainerRuntimeKind::Docker));
 
-        let avail = detect_runtime_with(
-            |name| (name == "podman").then(|| PathBuf::from("/usr/bin/podman")),
-            false,
+        let mut snap = ExternalRuntimeSnapshot::empty(1, HostPlatform::DebianUbuntu);
+        // Present on PATH but daemon unhealthy → not available.
+        snap.entries.insert(
+            ID_DOCKER.into(),
+            HealthEntry {
+                id: ExternalRuntimeId::new(ID_DOCKER),
+                state: HealthState::Failed {
+                    cause: HealthCause::DaemonUnavailable,
+                },
+                importance: DependencyImportance::RequiredWhenFeatureSelected,
+                target: ExecutionTarget::Host,
+                remedy: None,
+                platform: HostPlatform::DebianUbuntu,
+            },
         );
-        assert_eq!(avail.runtime, Some(ContainerRuntimeKind::Podman));
-        assert!(avail.available);
+        snap.entries.insert(
+            ID_PODMAN.into(),
+            HealthEntry {
+                id: ExternalRuntimeId::new(ID_PODMAN),
+                state: HealthState::Available {
+                    resolved_path: Some(PathBuf::from("/usr/bin/podman")),
+                    version_evidence: Some("4.0".into()),
+                },
+                importance: DependencyImportance::RequiredWhenFeatureSelected,
+                target: ExecutionTarget::Host,
+                remedy: None,
+                platform: HostPlatform::DebianUbuntu,
+            },
+        );
 
-        let avail = detect_runtime_with(|_| None, false);
-        assert_eq!(avail.reason, Some(ContainerUnavailableReason::NoRuntime));
-
-        let avail =
-            detect_runtime_with(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))), true);
+        let auto = resolve_container_engine(ContainerEngineMode::Auto, &snap, false);
+        assert!(auto.availability.available);
         assert_eq!(
-            avail.reason,
+            auto.availability.runtime,
+            Some(ContainerRuntimeKind::Podman),
+            "Auto must skip unhealthy Docker and select healthy Podman"
+        );
+
+        // Docker present as binary but explicit mode fails closed without Podman fallback.
+        let explicit = resolve_container_engine(ContainerEngineMode::Docker, &snap, false);
+        assert!(!explicit.availability.available);
+        assert_eq!(
+            explicit.availability.reason,
+            Some(ContainerUnavailableReason::DaemonUnavailable)
+        );
+
+        // Nested container blocks regardless of healthy engines.
+        snap.entries.insert(
+            ID_DOCKER.into(),
+            HealthEntry {
+                id: ExternalRuntimeId::new(ID_DOCKER),
+                state: HealthState::Available {
+                    resolved_path: Some(PathBuf::from("/usr/bin/docker")),
+                    version_evidence: Some("24".into()),
+                },
+                importance: DependencyImportance::RequiredWhenFeatureSelected,
+                target: ExecutionTarget::Host,
+                remedy: None,
+                platform: HostPlatform::DebianUbuntu,
+            },
+        );
+        let nested = resolve_container_engine(ContainerEngineMode::Auto, &snap, true);
+        assert!(!nested.availability.available);
+        assert_eq!(
+            nested.availability.reason,
             Some(ContainerUnavailableReason::HarnessInContainer)
         );
-        assert!(!avail.available);
+
+        // Healthy Docker preferred over healthy Podman in Auto.
+        snap.entries.insert(
+            ID_PODMAN.into(),
+            HealthEntry {
+                id: ExternalRuntimeId::new(ID_PODMAN),
+                state: HealthState::Available {
+                    resolved_path: Some(PathBuf::from("/usr/bin/podman")),
+                    version_evidence: Some("4.0".into()),
+                },
+                importance: DependencyImportance::RequiredWhenFeatureSelected,
+                target: ExecutionTarget::Host,
+                remedy: None,
+                platform: HostPlatform::DebianUbuntu,
+            },
+        );
+        let prefer_docker = resolve_container_engine(ContainerEngineMode::Auto, &snap, false);
+        assert_eq!(
+            prefer_docker.availability.runtime,
+            Some(ContainerRuntimeKind::Docker)
+        );
+        assert!(prefer_docker.availability.available);
+    }
+
+    #[test]
+    fn launch_reselect_is_explicit_and_selection_stays_until_next_reselect() {
+        let manager = ContainerManager::detect();
+        assert!(!manager.availability().available);
+        assert!(manager.select_for_launch().is_err());
+
+        set_detect_runtime_override(Some((
+            Some(ContainerRuntime {
+                kind: ContainerRuntimeKind::Docker,
+                binary: PathBuf::from("/usr/bin/docker"),
+            }),
+            ContainerAvailability {
+                runtime: Some(ContainerRuntimeKind::Docker),
+                harness_in_container: false,
+                available: true,
+                reason: None,
+            },
+        )));
+        let runtime = manager.select_for_launch().expect("healthy docker");
+        assert_eq!(runtime.kind, ContainerRuntimeKind::Docker);
+
+        // Owned runtime is independent of later manager reselection.
+        set_detect_runtime_override(Some((
+            Some(ContainerRuntime {
+                kind: ContainerRuntimeKind::Podman,
+                binary: PathBuf::from("/usr/bin/podman"),
+            }),
+            ContainerAvailability {
+                runtime: Some(ContainerRuntimeKind::Podman),
+                harness_in_container: false,
+                available: true,
+                reason: None,
+            },
+        )));
+        assert_eq!(runtime.kind, ContainerRuntimeKind::Docker);
+        let next = manager.select_for_launch().expect("podman launch");
+        assert_eq!(next.kind, ContainerRuntimeKind::Podman);
+        assert_eq!(runtime.kind, ContainerRuntimeKind::Docker);
+        set_detect_runtime_override(None);
     }
 
     #[test]

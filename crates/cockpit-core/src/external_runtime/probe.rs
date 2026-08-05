@@ -669,13 +669,21 @@ fn evaluate_trusted_catalog(
         };
     }
     if version_result.exit_code != Some(0) {
+        let id = descriptor.id.as_str();
+        let cause = if id == "container.docker" || id == "container.podman" {
+            let combined = version_result.combined_capped();
+            super::safety_adapters::classify_container_daemon_failure(
+                &combined,
+                version_result.exit_code,
+            )
+        } else {
+            HealthCause::NonZeroExit {
+                code: version_result.exit_code,
+            }
+        };
         return HealthEntry {
             id: descriptor.id.clone(),
-            state: HealthState::Failed {
-                cause: HealthCause::NonZeroExit {
-                    code: version_result.exit_code,
-                },
-            },
+            state: HealthState::Failed { cause },
             importance: descriptor.importance,
             target: descriptor.target,
             remedy: Some(descriptor.remedy.clone()),
@@ -687,6 +695,27 @@ fn evaluate_trusted_catalog(
     let evidence = sanitize_version_evidence(&combined, Some(&program));
     // Parse from sanitized evidence only — never put raw probe output into health.
     let parsed_version = parse_version(version_parser, &evidence);
+
+    // Docker/Podman require parseable engine-shaped version evidence; empty or
+    // arbitrary shim output is not healthy.
+    if (descriptor.id.as_str() == "container.docker"
+        || descriptor.id.as_str() == "container.podman")
+        && !super::safety_adapters::container_version_evidence_is_valid(
+            descriptor.id.as_str(),
+            &evidence,
+        )
+    {
+        return HealthEntry {
+            id: descriptor.id.clone(),
+            state: HealthState::Failed {
+                cause: HealthCause::OutputParseFailed,
+            },
+            importance: descriptor.importance,
+            target: descriptor.target,
+            remedy: Some(descriptor.remedy.clone()),
+            platform,
+        };
+    }
 
     if let Some(rule) = &descriptor.compatibility
         && let Some(detail) = compatibility_failure(rule, parsed_version.as_deref())
@@ -740,13 +769,20 @@ fn evaluate_trusted_catalog(
             };
         }
         if func.exit_code != Some(0) {
+            // Container engines: classify version+info style functional failures
+            // into permission/socket/daemon causes without leaking raw paths.
+            let id = descriptor.id.as_str();
+            let cause = if id == "container.docker" || id == "container.podman" {
+                let combined = func.combined_capped();
+                super::safety_adapters::classify_container_daemon_failure(&combined, func.exit_code)
+            } else {
+                HealthCause::NonZeroExit {
+                    code: func.exit_code,
+                }
+            };
             return HealthEntry {
                 id: descriptor.id.clone(),
-                state: HealthState::Failed {
-                    cause: HealthCause::NonZeroExit {
-                        code: func.exit_code,
-                    },
-                },
+                state: HealthState::Failed { cause },
                 importance: descriptor.importance,
                 target: descriptor.target,
                 remedy: Some(descriptor.remedy.clone()),

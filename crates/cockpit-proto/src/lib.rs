@@ -320,6 +320,12 @@ impl ContainerRuntimeKind {
 pub enum ContainerUnavailableReason {
     NoRuntime,
     HarnessInContainer,
+    /// Engine CLI present but permission denied talking to the daemon/socket.
+    PermissionDenied,
+    /// Engine CLI present but the daemon socket is missing/unreachable.
+    SocketUnavailable,
+    /// Engine CLI present but the daemon/service is not running or not usable.
+    DaemonUnavailable,
 }
 
 impl ContainerUnavailableReason {
@@ -327,6 +333,9 @@ impl ContainerUnavailableReason {
         match self {
             Self::NoRuntime => "no_runtime",
             Self::HarnessInContainer => "harness_in_container",
+            Self::PermissionDenied => "permission_denied",
+            Self::SocketUnavailable => "socket_unavailable",
+            Self::DaemonUnavailable => "daemon_unavailable",
         }
     }
 }
@@ -354,10 +363,19 @@ impl ContainerAvailability {
     pub fn unavailable_reason_text(&self) -> Option<String> {
         self.reason.map(|reason| match reason {
             ContainerUnavailableReason::NoRuntime => {
-                "no docker or podman executable found on PATH".to_string()
+                "no healthy docker or podman engine available".to_string()
             }
             ContainerUnavailableReason::HarnessInContainer => {
                 "cockpit is already running inside a container".to_string()
+            }
+            ContainerUnavailableReason::PermissionDenied => {
+                "permission denied talking to the container engine daemon".to_string()
+            }
+            ContainerUnavailableReason::SocketUnavailable => {
+                "container engine daemon socket is unavailable".to_string()
+            }
+            ContainerUnavailableReason::DaemonUnavailable => {
+                "container engine daemon is not running or not usable".to_string()
             }
         })
     }

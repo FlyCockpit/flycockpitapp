@@ -714,7 +714,18 @@ fn container_unavailable_label(
         Some(cockpit_core::container::ContainerUnavailableReason::HarnessInContainer) => {
             "Cockpit is running inside a container"
         }
-        _ => "No docker/podman runtime found",
+        Some(cockpit_core::container::ContainerUnavailableReason::PermissionDenied) => {
+            "Permission denied for the container engine daemon"
+        }
+        Some(cockpit_core::container::ContainerUnavailableReason::SocketUnavailable) => {
+            "Container engine daemon socket is unavailable"
+        }
+        Some(cockpit_core::container::ContainerUnavailableReason::DaemonUnavailable) => {
+            "Container engine daemon is not running"
+        }
+        Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime) | None => {
+            "No healthy docker/podman engine available"
+        }
     }
 }
 
@@ -1010,7 +1021,7 @@ mod tests {
         assert!(
             dialog
                 .snapshot()
-                .contains("unavailable: No docker/podman runtime found")
+                .contains("unavailable: No healthy docker/podman engine available")
         );
     }
 

@@ -521,6 +521,7 @@ pub fn compose_settings_doctor_health_with_executor(
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
     let registry = super::registry::global_registry();
     ensure_integration_adapters_registered(&registry)?;
+    let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
     let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
     let lsp_ids = upsert_lsp_servers(&registry, input.lsp_servers.clone())?;
     let mcp_ids = upsert_stdio_mcp_servers(&registry, input.stdio_mcp.clone())?;
@@ -541,11 +542,20 @@ pub fn compose_settings_doctor_health_with_executor(
         features.insert(desc.owner.feature.clone());
     }
     let platform = super::platform::detect_host_platform();
+    // Container engines: only mark the feature selected and probe when mode is
+    // not Disabled (Settings may call set_container_engine_mode).
+    let engine_mode = super::safety_adapters::current_container_engine_mode();
+    if !matches!(
+        engine_mode,
+        super::safety_adapters::ContainerEngineMode::Disabled
+    ) {
+        features.insert("container-sandbox".to_string());
+    }
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
     let generation = store.begin_refresh();
     let cancel = super::probe::CancelToken::new();
-    let snapshot = super::probe::refresh_snapshot(
+    let mut snapshot = super::probe::refresh_snapshot(
         generation,
         &descriptors,
         executor,
@@ -555,6 +565,32 @@ pub fn compose_settings_doctor_health_with_executor(
         super::probe::ProbeDeadlines::default(),
         &cancel,
     );
+    // Merge Docker/Podman health from a private mode-aware refresh (never
+    // registered into the global catalog).
+    {
+        use super::safety_adapters::{
+            ContainerEngineMode, ID_DOCKER, ID_PODMAN, refresh_safety_snapshot,
+        };
+        if !matches!(engine_mode, ContainerEngineMode::Disabled) {
+            let engine_reg = super::registry::ExternalRuntimeRegistry::new();
+            let engine_snap = refresh_safety_snapshot(
+                &engine_reg,
+                executor,
+                path_env,
+                cwd,
+                &ctx,
+                super::probe::ProbeDeadlines::default(),
+                &cancel,
+                generation,
+                engine_mode,
+            );
+            for id in [ID_DOCKER, ID_PODMAN] {
+                if let Some(entry) = engine_snap.get(id) {
+                    snapshot.entries.insert(id.to_string(), entry.clone());
+                }
+            }
+        }
+    }
     if !store.publish(snapshot.clone()) {
         // A newer full refresh or live handoff superseded this composition;
         // surface the current published snapshot when available.

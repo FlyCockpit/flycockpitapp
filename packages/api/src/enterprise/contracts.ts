@@ -8,6 +8,10 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+// Enterprise log seq is Prisma Int (not remote-protocol u64 wire). Full
+// CanonicalU64DecimalStringV1 for remote JSON/JWS u64 lives in
+// @flycockpit/cockpit-protocol; domain remote u64 migration is separate.
+
 const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string(),

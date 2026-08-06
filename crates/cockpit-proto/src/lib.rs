@@ -24,6 +24,8 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod remote_protocol_id;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;

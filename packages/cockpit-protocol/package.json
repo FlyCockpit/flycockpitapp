@@ -18,7 +18,8 @@
   },
   "dependencies": {
     "zod": "catalog:",
-    "@flycockpit/relay-protocol": "workspace:*"
+    "@flycockpit/relay-protocol": "workspace:*",
+    "jose": "catalog:"
   },
   "devDependencies": {
     "typescript": "catalog:",

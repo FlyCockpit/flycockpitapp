@@ -1,0 +1,27 @@
+// Remote protocol identifier aliases (opaque 16-byte protocol IDs).
+// Application CUID/CUID2 primary keys stay internal; remote wire uses protocolId only.
+
+enum RemoteProtocolIdentifierKind {
+  tenant
+  account
+  instance
+  project
+}
+
+model RemoteProtocolIdentifier {
+  // Stable random protocol alias (exactly 16 raw bytes). Never reassigned.
+  protocolId Bytes                        @db.ByteA
+  kind       RemoteProtocolIdentifierKind
+  // Kind-scoped internal application ID (CUID/CUID2). Never on the wire.
+  // Null after retirement: source binding removed; protocolId remains a tombstone.
+  sourceId   String?
+  createdAt  DateTime                     @default(now())
+  // Non-null means permanently retired; protocolId never reassigns.
+  retiredAt  DateTime?
+
+  @@id([kind, protocolId])
+  // Active rows only: Postgres UNIQUE allows multiple NULLs for tombstones.
+  @@unique([kind, sourceId])
+  @@index([kind, protocolId])
+  @@map("remote_protocol_identifiers")
+}

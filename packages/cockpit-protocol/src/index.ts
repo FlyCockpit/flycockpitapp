@@ -228,6 +228,13 @@ const requestParamSchemas = {
     .strict(),
   git_diff_file: z.object({ project_root: projectRootSchema, path: z.string() }).strict(),
   git_status: z.object({ project_root: projectRootSchema }).strict(),
+  get_inventory_bundle: z
+    .object({
+      session_id: uuidSchema,
+      project_root: projectRootSchema,
+      selected_agent: z.string().min(1),
+    })
+    .strict(),
   list_sessions: z
     .object({ project_id: z.string().nullable().optional(), parent_session_id: optionalUuidSchema })
     .strict(),
@@ -346,6 +353,7 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("fs_write", requestParamSchemas.fs_write),
   requestVariant("git_diff_file", requestParamSchemas.git_diff_file),
   requestVariant("git_status", requestParamSchemas.git_status),
+  requestVariant("get_inventory_bundle", requestParamSchemas.get_inventory_bundle),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
@@ -383,6 +391,7 @@ export const responseNameSchema = z.enum([
   "git_diff_file",
   "git_status",
   "history_page",
+  "inventory_bundle",
   "models",
   "restart_decision",
   "session_messages",
@@ -747,6 +756,57 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
             })
             .passthrough(),
         ),
+      })
+      .passthrough(),
+  ),
+  responseVariant(
+    "inventory_bundle",
+    z
+      .object({
+        agents: z
+          .array(
+            z
+              .object({
+                name: z.string().min(1),
+                description: z.string(),
+                mode: z.string().min(1),
+                source: z.string().min(1),
+                builtin: z.boolean(),
+              })
+              .passthrough(),
+          )
+          .min(0),
+        models: z
+          .array(
+            z
+              .object({
+                provider: z.string().min(1),
+                id: z.string().min(1),
+                display_name: z.string(),
+                favorite: z.boolean(),
+                available: z.boolean(),
+                native_provider_valid: z.boolean(),
+                trust: z.string().min(1),
+              })
+              .passthrough(),
+          )
+          .min(0),
+        skills: z
+          .array(
+            z
+              .object({
+                name: z.string().min(1),
+                description: z.string(),
+                source: z.string().min(1),
+                user_invocable: z.boolean(),
+              })
+              .passthrough(),
+          )
+          .min(0),
+        selected_agent: z.string().min(1),
+        config_generation: z.number().int().nonnegative(),
+        inventory_generation: z.number().int().nonnegative(),
+        session_generation: z.number().int().nonnegative(),
       })
       .passthrough(),
   ),
@@ -1226,3 +1286,5 @@ export function parseSessionLiveStatusResult(value: unknown) {
 export function createEnvelope(id: string, request: ClientRequest): ClientEnvelope {
   return clientEnvelopeSchema.parse({ v: PROTOCOL_VERSION, kind: "req", id, ...request });
 }
+
+export * from "./remote-protocol-id";

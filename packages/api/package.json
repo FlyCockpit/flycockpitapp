@@ -104,7 +104,8 @@
     "sharp": "catalog:",
     "web-push": "^3.6.7",
     "zod": "catalog:",
-    "@flycockpit/relay-protocol": "workspace:*"
+    "@flycockpit/relay-protocol": "workspace:*",
+    "@flycockpit/cockpit-protocol": "workspace:*"
   },
   "devDependencies": {
     "@types/web-push": "^3.6.4",

@@ -862,6 +862,9 @@ importers:
       '@flycockpit/auth':
         specifier: workspace:*
         version: link:../auth
+      '@flycockpit/cockpit-protocol':
+        specifier: workspace:*
+        version: link:../cockpit-protocol
       '@flycockpit/config':
         specifier: workspace:*
         version: link:../config
@@ -963,6 +966,9 @@ importers:
       '@flycockpit/relay-protocol':
         specifier: workspace:*
         version: link:../relay-protocol
+      jose:
+        specifier: 'catalog:'
+        version: 6.2.3
       zod:
         specifier: 'catalog:'
         version: 4.4.3

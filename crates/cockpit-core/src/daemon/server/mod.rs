@@ -569,6 +569,10 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             terminal_id: _,
             count: _,
         }
+        | proto::Event::Osc52ProtocolViolation {
+            terminal_id: _,
+            generation: _,
+        }
         | proto::Event::EventStreamLagged {
             session_id: _,
             dropped: _,

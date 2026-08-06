@@ -20,6 +20,7 @@ use std::io::{Write, stdout};
 
 use base64::Engine;
 use cockpit_core::sysinfo::is_ssh;
+use cockpit_proto::terminal::OSC52_MAX_SEQUENCE_BYTES;
 
 /// Why a copy attempt didn't reach the system clipboard.
 #[derive(Debug)]
@@ -42,7 +43,10 @@ impl std::fmt::Display for CopyError {
             Self::UnsupportedOverSsh => write!(f, "rich-text copy unavailable over SSH"),
             Self::Backend(s) => write!(f, "clipboard backend error: {s}"),
             Self::TooLarge { max } => {
-                write!(f, "selection too large for OSC52 (max {max} base64 bytes)")
+                write!(
+                    f,
+                    "selection too large for OSC52 (max {max} total sequence bytes)"
+                )
             }
         }
     }
@@ -123,16 +127,13 @@ pub fn copy_rich(plain: &str, html: &str) -> Result<(), CopyError> {
     arboard_set_html(html, plain)
 }
 
-/// xterm's documented OSC-string parse ceiling for the base64 payload;
-/// past it terminals drop the escape, so we hard-fail rather than emit a
-/// truncated clipboard.
-const OSC52_MAX_B64: usize = 74_994;
-
 /// Build the OSC52 clipboard-set escape(s) for `encoded_b64`. Inside
 /// tmux, returns the raw BEL-terminated escape immediately followed by
 /// the DCS-passthrough-wrapped form (double-emit, covering both
 /// `set-clipboard` and `allow-passthrough` tmux configs); outside tmux,
 /// the raw escape alone.
+///
+/// Sequence length is bounded by [`cockpit_proto::terminal::OSC52_MAX_SEQUENCE_BYTES`].
 fn osc52_sequence(encoded_b64: &str, in_tmux: bool) -> String {
     let raw = format!("\x1b]52;c;{encoded_b64}\x07");
     if !in_tmux {
@@ -148,9 +149,13 @@ fn osc52_sequence(encoded_b64: &str, in_tmux: bool) -> String {
 fn osc52_set_clipboard(text: &str) -> Result<(), CopyError> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     // Hard-fail before writing anything — a partial escape would corrupt
-    // the terminal stream and leave a half-set clipboard.
-    if encoded.len() > OSC52_MAX_B64 {
-        return Err(CopyError::TooLarge { max: OSC52_MAX_B64 });
+    // the terminal stream and leave a half-set clipboard. Cap is the total
+    // raw sequence length: ESC ] 52 ; c ; payload BEL.
+    let total = 2 /* ESC ] */ + 5 /* 52;c; */ + encoded.len() + 1 /* BEL */;
+    if total > OSC52_MAX_SEQUENCE_BYTES {
+        return Err(CopyError::TooLarge {
+            max: OSC52_MAX_SEQUENCE_BYTES,
+        });
     }
     // `c` selects the system clipboard buffer (vs `p` primary or numeric
     // cut-buffers). Inside tmux we double-emit the raw + passthrough form.
@@ -475,23 +480,26 @@ mod tests {
 
     #[test]
     fn osc52_size_guard_rejects_oversized_payload() {
-        // One raw byte yields ~1.34 base64 chars, so this comfortably
-        // exceeds the base64 ceiling.
-        let big = "x".repeat(OSC52_MAX_B64);
+        // A decoded payload whose base64 plus the 8-byte BEL envelope exceeds
+        // OSC52_MAX_SEQUENCE_BYTES must fail before any write.
+        let max_payload_b64 = OSC52_MAX_SEQUENCE_BYTES.saturating_sub(8);
+        // Over-size by ensuring base64 length alone is past the total cap.
+        let n = ((max_payload_b64 / 4) + 2) * 3;
+        let big = "x".repeat(n);
         match osc52_set_clipboard(&big) {
-            Err(CopyError::TooLarge { max }) => assert_eq!(max, OSC52_MAX_B64),
+            Err(CopyError::TooLarge { max }) => assert_eq!(max, OSC52_MAX_SEQUENCE_BYTES),
             other => panic!("expected TooLarge, got {other:?}"),
         }
     }
 
     #[test]
     fn osc52_size_guard_allows_just_under_ceiling() {
-        // Pick a raw length whose base64 length is at or just under the
-        // ceiling: base64 len = 4 * ceil(n / 3).
-        let n = (OSC52_MAX_B64 / 4) * 3;
+        // Largest decoded payload whose raw BEL sequence is still in-cap.
+        let max_payload_b64 = OSC52_MAX_SEQUENCE_BYTES.saturating_sub(8);
+        let n = (max_payload_b64 / 4) * 3;
         let payload = "y".repeat(n);
         let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-        assert!(encoded.len() <= OSC52_MAX_B64);
+        assert!(2 + 5 + encoded.len() < OSC52_MAX_SEQUENCE_BYTES);
         assert!(osc52_set_clipboard(&payload).is_ok());
     }
 
@@ -500,7 +508,11 @@ mod tests {
         let outcome = copy_plain_with(
             "hello",
             false,
-            |_| Err(CopyError::TooLarge { max: OSC52_MAX_B64 }),
+            |_| {
+                Err(CopyError::TooLarge {
+                    max: OSC52_MAX_SEQUENCE_BYTES,
+                })
+            },
             |_| Ok(()),
         )
         .unwrap();
@@ -518,7 +530,11 @@ mod tests {
         let err = copy_plain_with(
             "hello",
             true,
-            |_| Err(CopyError::TooLarge { max: OSC52_MAX_B64 }),
+            |_| {
+                Err(CopyError::TooLarge {
+                    max: OSC52_MAX_SEQUENCE_BYTES,
+                })
+            },
             |_| panic!("local clipboard must not run over SSH"),
         )
         .expect_err("no observable backend accepted");

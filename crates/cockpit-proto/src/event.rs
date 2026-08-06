@@ -1372,6 +1372,15 @@ pub enum Event {
         exit_code: Option<i32>,
     },
 
+    /// Content-free OSC 52 protocol violation for a hosted terminal generation.
+    /// Emitted exactly once when the terminal-generation close oracle runs
+    /// because a candidate exceeded `terminal::OSC52_MAX_SEQUENCE_BYTES`.
+    /// Carries no payload, encoded text, or secret-bearing diagnostics.
+    Osc52ProtocolViolation {
+        terminal_id: Uuid,
+        generation: u64,
+    },
+
     /// The daemon began (or escalated) a graceful shutdown
     /// (`daemon-graceful-drain-shutdown.md`). **Daemon-global**: carries no
     /// `session_id` and is broadcast to *every* connected client so each
@@ -1483,6 +1492,7 @@ macro_rules! event_variants {
             (Event::TerminalClipboard { .. }, "terminal_clipboard");
             (Event::TerminalViewers { .. }, "terminal_viewers");
             (Event::TerminalClosed { .. }, "terminal_closed");
+            (Event::Osc52ProtocolViolation { .. }, "osc52_protocol_violation");
             (Event::DaemonDraining { .. }, "daemon_draining");
             (Event::PausedWorkAvailable { .. }, "paused_work_available");
             (Event::WaitingForLock { .. }, "waiting_for_lock");

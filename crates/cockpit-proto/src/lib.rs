@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_protocol_id;
+pub mod terminal;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

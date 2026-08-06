@@ -973,6 +973,7 @@ export const knownEventKindSchema = z.enum([
   "model_selection_result",
   "nested_turn",
   "notice",
+  "osc52_protocol_violation",
   "paused_work_available",
   "preflight_started",
   "preflight_state",

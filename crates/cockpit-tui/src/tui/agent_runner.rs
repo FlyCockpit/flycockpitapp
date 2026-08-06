@@ -2967,6 +2967,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
         | TerminalClosed { .. }
+        | Osc52ProtocolViolation { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -3841,6 +3842,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
         | TerminalClosed { .. }
+        | Osc52ProtocolViolation { .. }
         | Unknown => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.

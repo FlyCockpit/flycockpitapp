@@ -2334,7 +2334,17 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
     .expect_err("unknown skill rejects");
 
     assert_eq!(err.code, ErrorCode::BadRequest);
-    assert_eq!(ctx.db.list_skill_usage().await.unwrap(), before);
+    let after = ctx.db.list_skill_usage().await.unwrap();
+    // Compare skill identity/state only — `updated_at` can tick by one wall
+    // second between the two list calls under concurrent suite load.
+    assert_eq!(after.len(), before.len());
+    for (a, b) in after.iter().zip(before.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.source_path, b.source_path);
+        assert_eq!(a.state, b.state);
+        assert_eq!(a.use_count, b.use_count);
+        assert_eq!(a.pinned, b.pinned);
+    }
     assert!(skill_root.join("curated").join("SKILL.md").is_file());
 }
 

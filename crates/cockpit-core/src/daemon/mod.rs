@@ -1239,7 +1239,10 @@ async fn run_foreground_inner_with_boot_db(
         let grace = drain_grace;
         // Prefer a real-time upper bound slightly above grace so a paused
         // Tokio clock cannot leave this future pending forever.
-        let wall_cap = grace.checked_add(Duration::from_secs(2)).unwrap_or(grace);
+        let wall_cap = grace
+            .checked_add(Duration::from_millis(500))
+            .unwrap_or(grace)
+            .min(Duration::from_secs(2));
         match tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

@@ -295,25 +295,18 @@ impl ProcessContainmentActor {
 
 impl Drop for ProcessContainmentActor {
     fn drop(&mut self) {
-        // Never block the Tokio runtime: disconnect the queue so the actor
-        // loop exits, then join the OS thread only when not inside a runtime.
-        drop(self.handle.tx.clone()); // keep handle clone alive? actually need disconnect
-        // Dropping all SyncSenders disconnects; we hold one in handle. Replace
-        // by sending Shutdown without waiting when in a runtime.
+        // Best-effort shutdown: never block the daemon exit path on a full
+        // queue or a wedged actor. try_send + detach join when inside Tokio.
         let (reply, rx) = oneshot::channel();
-        let _ = self.handle.tx.send(Op::Shutdown { reply });
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Poll with a short std-thread join of the oneshot would still block;
-            // detach the actor thread after enqueueing Shutdown.
-            if let Some(join) = self.join.take() {
+        let _ = self.handle.tx.try_send(Op::Shutdown { reply });
+        if let Some(join) = self.join.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
                 std::thread::spawn(move || {
                     let _ = rx.blocking_recv();
                     let _ = join.join();
                 });
-            }
-        } else {
-            let _ = rx.blocking_recv();
-            if let Some(join) = self.join.take() {
+            } else {
+                let _ = rx.blocking_recv();
                 let _ = join.join();
             }
         }

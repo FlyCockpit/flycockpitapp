@@ -1583,6 +1583,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
         | TerminalClosed { .. }
+        | Osc52ProtocolViolation { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..

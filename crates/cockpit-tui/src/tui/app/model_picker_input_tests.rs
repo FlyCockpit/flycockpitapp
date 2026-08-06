@@ -174,6 +174,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             queue_item_ids: vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)],
             client_submissions: Vec::new(),
             pending_terminal_disposition: None,
+            run_invocation_id: None,
             queue_target: Some(cockpit_core::engine::message::QueueTarget {
                 id: "target-1".to_string(),
                 agent: "Build".to_string(),

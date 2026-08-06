@@ -2067,6 +2067,7 @@ fn try_spawn_inner(
                             tag_expansions: sub.tag_expansions,
                             image_refs: refs,
                             forced_skill: sub.forced_skill,
+                            run_invocation_options: None,
                         })
                         .await
                     {
@@ -3906,6 +3907,7 @@ mod tests {
             queue_item_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
             client_submissions: Vec::new(),
             pending_terminal_disposition: None,
+            run_invocation_id: None,
             queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         }
     }

@@ -75,6 +75,9 @@ pub(crate) struct RunPumpOptions<'a> {
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) approve: &'a [GrantKind],
     pub(crate) image_data: &'a [Vec<u8>],
+    /// When set, `cockpit run` marks the submission as a durable run
+    /// invocation. `init`/`learn` leave this `None` (unbounded, no state).
+    pub(crate) run_invocation_options: Option<proto::RunInvocationOptions>,
 }
 
 pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) -> Result<()> {
@@ -203,11 +206,11 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
                     "code": "turn_failed",
                     "message": message
                 }))?;
-                emit_run_complete(false, 1)?;
+                emit_run_complete(false, 5)?;
             } else {
                 eprintln!("{message}");
             }
-            1
+            5
         }
         Err(error) if json_mode => {
             emit_json(&json!({
@@ -254,6 +257,7 @@ async fn run_turn(
             project_root: Some(project_root),
             approve: &args.approve,
             image_data,
+            run_invocation_options: Some(args.run_invocation_options()),
         },
     )
     .await
@@ -398,24 +402,43 @@ pub(crate) async fn attach_send_pump(
 
     let was_processing = is_processing(client, session_id).await?;
     let submitted_message = !prompt.trim().is_empty();
+    // Sole invocation identity: allocated once before first SendUserMessage.
+    let client_submission_id = Uuid::new_v4();
     if submitted_message {
         let image_refs = load_and_upload_images(client, options.image_data).await?;
-        // Send the user message.
-        client
-            .request_ok(Request::SendUserMessage {
-                client_submission_id: uuid::Uuid::new_v4(),
+        // Send the user message. `cockpit run` always includes the run marker;
+        // init/learn omit options and create no RunInvocationState.
+        let send_result = client
+            .request(Request::SendUserMessage {
+                client_submission_id,
                 text: prompt,
                 display_text: None,
                 tag_expansions: Vec::new(),
                 image_refs,
                 forced_skill: None,
+                run_invocation_options: options.run_invocation_options.clone(),
             })
             .await
             .context("sending user message")?;
+        match send_result {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.code,
+                    proto::ErrorCode::ClientSubmissionIdUnavailable
+                        | proto::ErrorCode::InvocationCapacityExceeded
+                        | proto::ErrorCode::IdempotencyConflict
+                ) =>
+            {
+                anyhow::bail!("daemon error: {error}");
+            }
+            Err(error) => anyhow::bail!("daemon error: {error}"),
+        }
         if matches!(format, OutputFormat::Json) {
             emit_json(&json!({
                 "event": "message_sent",
-                "session_id": session_id
+                "session_id": session_id,
+                "client_submission_id": client_submission_id
             }))?;
         }
     }
@@ -439,6 +462,10 @@ pub(crate) async fn attach_send_pump(
         options.verbose_json,
         options.approve,
         submitted_message,
+        options
+            .run_invocation_options
+            .as_ref()
+            .map(|_| client_submission_id),
     )
     .await
 }
@@ -709,12 +736,35 @@ pub(crate) async fn pump_events(
     verbose_json: bool,
     approve: &[GrantKind],
     expect_submitted_message: bool,
+    run_invocation_id: Option<Uuid>,
 ) -> Result<i32> {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     let mut outcome = RunOutcome::new(expect_submitted_message);
+    let mut sigint_count = 0u8;
+    let mut sigint = std::pin::pin!(tokio::signal::ctrl_c());
 
-    while let Some(event) = client.next_event().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = &mut sigint => {
+                sigint_count = sigint_count.saturating_add(1);
+                if let Some(id) = run_invocation_id {
+                    if sigint_count >= 2 {
+                        writeln!(stderr, "{}", second_interrupt_unknown_guidance(id))?;
+                        return Ok(130);
+                    }
+                    // First SIGINT: stop ordinary waiting; cancel + reconcile.
+                    let code = reconcile_after_interrupt(client, id, format, &mut stderr).await?;
+                    return Ok(code);
+                }
+                return Ok(130);
+            }
+            event = client.next_event() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         // Filter to this session's events.
         if event_session(&event) != Some(session_id) {
             continue;
@@ -802,6 +852,9 @@ pub(crate) async fn pump_events(
     let disconnected = !outcome.ready_to_finish();
     let code = terminal_exit_code(&outcome);
     if disconnected {
+        if let Some(id) = run_invocation_id {
+            writeln!(stderr, "{}", disconnect_status_guidance(id))?;
+        }
         if matches!(format, OutputFormat::Json) {
             writeln!(
                 stdout,
@@ -816,7 +869,7 @@ pub(crate) async fn pump_events(
             writeln!(stderr, "[daemon connection closed before run completed]")?;
         }
     }
-    if matches!(format, OutputFormat::Default) && code == 1 && outcome.is_empty_turn() {
+    if matches!(format, OutputFormat::Default) && code == 5 && outcome.is_empty_turn() {
         writeln!(
             stderr,
             "[run failed: turn completed without inference, assistant output, or tool progress]"
@@ -831,6 +884,83 @@ pub(crate) async fn pump_events(
         stdout.flush()?;
     }
     Ok(code)
+}
+
+/// Map an authoritative terminal lifecycle state after interrupt reconciliation.
+fn interrupt_reconcile_exit_code(state: proto::RunInvocationLifecycleState) -> i32 {
+    match state {
+        proto::RunInvocationLifecycleState::Succeeded => 0,
+        proto::RunInvocationLifecycleState::Cancelled => 130,
+        _ => 5,
+    }
+}
+
+/// Content-free recovery guidance for second SIGINT / unknown state.
+fn second_interrupt_unknown_guidance(id: Uuid) -> String {
+    format!(
+        "invocation {id}: final state is unknown\ncockpit invocation status {id}\ncockpit invocation cancel {id}"
+    )
+}
+
+/// Recovery guidance when a disconnect leaves outcome unknown.
+fn disconnect_status_guidance(id: Uuid) -> String {
+    format!("cockpit invocation status {id}")
+}
+
+/// First-SIGINT reconciliation: cancel then status on the same identity.
+async fn reconcile_after_interrupt(
+    client: &crate::daemon::client::DaemonClient,
+    id: Uuid,
+    format: OutputFormat,
+    stderr: &mut impl Write,
+) -> Result<i32> {
+    let _ = client
+        .request(Request::CancelRunInvocation {
+            client_submission_id: id,
+        })
+        .await;
+    // Reconcile via status even when cancel ack is lost. No replacement start.
+    loop {
+        match client
+            .request(Request::GetRunInvocationStatus {
+                client_submission_id: id,
+            })
+            .await
+        {
+            Ok(Ok(Response::RunInvocationStatus { status })) => {
+                if status.state.is_terminal() {
+                    let code = interrupt_reconcile_exit_code(status.state);
+                    if matches!(format, OutputFormat::Default) {
+                        writeln!(stderr, "invocation {id}: {}", status.state.as_str())?;
+                    }
+                    return Ok(code);
+                }
+                // Still active: retry cancel while active, then status again.
+                let _ = client
+                    .request(Request::CancelRunInvocation {
+                        client_submission_id: id,
+                    })
+                    .await;
+                tokio::task::yield_now().await;
+            }
+            Ok(Err(error)) if error.code == proto::ErrorCode::InvocationNotFound => {
+                writeln!(stderr, "invocation {id}: no durable run record was found")?;
+                return Ok(130);
+            }
+            Ok(Err(_)) | Err(_) => {
+                writeln!(
+                    stderr,
+                    "cockpit invocation status {id}\n\
+                     cockpit invocation cancel {id}"
+                )?;
+                return Ok(4);
+            }
+            Ok(Ok(_)) => {
+                writeln!(stderr, "cockpit invocation status {id}")?;
+                return Ok(4);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -892,8 +1022,9 @@ impl RunOutcome {
     }
 
     fn exit_code(&self) -> i32 {
+        // Authoritative non-success terminals use exit 5 (replacing legacy 1).
         if !self.ready_to_finish() || self.terminal_failure || self.is_empty_turn() {
-            1
+            5
         } else {
             0
         }
@@ -1486,7 +1617,82 @@ mod tests {
             file: Vec::new(),
             thinking: false,
             ephemeral: false,
+            max_turns: None,
+            timeout: None,
         }
+    }
+
+    #[test]
+    fn run_cli_bounds_contract() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        // Omitted dimensions encode None (unbounded for that dimension).
+        let plain = Cli::try_parse_from(["cockpit", "run", "hi"]).unwrap();
+        let Command::Run(args) = plain.command.unwrap() else {
+            panic!("expected run");
+        };
+        assert_eq!(args.max_turns, None);
+        assert_eq!(args.timeout, None);
+        let opts = args.run_invocation_options();
+        assert_eq!(opts.max_turns, None);
+        assert_eq!(opts.timeout_ms, None);
+
+        // Boundaries: 1 and 10000 max-turns.
+        let low = Cli::try_parse_from(["cockpit", "run", "--max-turns", "1", "hi"]).unwrap();
+        let Command::Run(args) = low.command.unwrap() else {
+            panic!();
+        };
+        assert_eq!(args.max_turns, Some(1));
+        let high = Cli::try_parse_from(["cockpit", "run", "--max-turns", "10000", "hi"]).unwrap();
+        let Command::Run(args) = high.command.unwrap() else {
+            panic!();
+        };
+        assert_eq!(args.max_turns, Some(10_000));
+
+        // 0 / 10001 / overflow / sign / fraction are usage errors (exit 2 path).
+        for bad in ["0", "10001", "999999999999", "-1", "1.5", "1s", "+2"] {
+            assert!(
+                Cli::try_parse_from(["cockpit", "run", "--max-turns", bad, "hi"]).is_err(),
+                "max-turns {bad} must fail"
+            );
+        }
+
+        // Timeout: 1 and 604800 seconds; checked ms conversion.
+        let t1 = Cli::try_parse_from(["cockpit", "run", "--timeout", "1", "hi"]).unwrap();
+        let Command::Run(args) = t1.command.unwrap() else {
+            panic!();
+        };
+        assert_eq!(args.timeout, Some(1));
+        assert_eq!(args.run_invocation_options().timeout_ms, Some(1000));
+        let t_max = Cli::try_parse_from(["cockpit", "run", "--timeout", "604800", "hi"]).unwrap();
+        let Command::Run(args) = t_max.command.unwrap() else {
+            panic!();
+        };
+        assert_eq!(args.timeout, Some(604_800));
+        assert_eq!(
+            args.run_invocation_options().timeout_ms,
+            Some(604_800 * 1000)
+        );
+
+        for bad in [
+            "0",
+            "604801",
+            "-1",
+            "1.5",
+            "1s",
+            "+2",
+            "99999999999999999999",
+        ] {
+            assert!(
+                Cli::try_parse_from(["cockpit", "run", "--timeout", bad, "hi"]).is_err(),
+                "timeout {bad} must fail"
+            );
+        }
+
+        // Zero never means unbounded: parser rejects zero rather than mapping to None.
+        assert!(Cli::try_parse_from(["cockpit", "run", "--timeout", "0", "hi"]).is_err());
+        assert!(Cli::try_parse_from(["cockpit", "run", "--max-turns", "0", "hi"]).is_err());
     }
 
     fn approval_question(class: GrantKind) -> proto::InterruptQuestion {
@@ -1619,7 +1825,7 @@ mod tests {
             reason: crate::engine::IdleReason::Completed,
         });
         assert!(outcome.is_empty_turn());
-        assert_eq!(outcome.exit_code(), 1);
+        assert_eq!(outcome.exit_code(), 5);
     }
 
     #[test]
@@ -2085,5 +2291,69 @@ mod tests {
         assert_eq!(action, RunEventAction::Continue);
         let line: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(line["delta"], "\u{1b}[31mred\u{1b}[0m");
+    }
+    #[test]
+    fn run_interrupt_reconciles_same_identity() {
+        use crate::daemon::proto::RunInvocationLifecycleState;
+        // Cancelled → 130
+        assert_eq!(
+            interrupt_reconcile_exit_code(RunInvocationLifecycleState::Cancelled),
+            130
+        );
+        // Terminal success race → 0
+        assert_eq!(
+            interrupt_reconcile_exit_code(RunInvocationLifecycleState::Succeeded),
+            0
+        );
+        // Terminal failure race → 5
+        assert_eq!(
+            interrupt_reconcile_exit_code(RunInvocationLifecycleState::Failed),
+            5
+        );
+        assert_eq!(
+            interrupt_reconcile_exit_code(RunInvocationLifecycleState::TimeoutExpired),
+            5
+        );
+        assert_eq!(
+            interrupt_reconcile_exit_code(RunInvocationLifecycleState::MaxTurnsExceeded),
+            5
+        );
+        // NotFound is handled as 130 by reconcile path; guidance does not claim cancel success.
+        let id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let g = second_interrupt_unknown_guidance(id);
+        assert!(g.contains("final state is unknown"));
+        assert!(g.contains(&format!("cockpit invocation status {id}")));
+        assert!(g.contains(&format!("cockpit invocation cancel {id}")));
+        assert!(!g.contains("cancelled successfully"));
+        assert!(!g.contains("cancellation succeeded"));
+        // Disconnect prints status only (no replacement start).
+        assert_eq!(
+            disconnect_status_guidance(id),
+            format!("cockpit invocation status {id}")
+        );
+    }
+
+    #[test]
+    fn run_second_interrupt_exits_unknown() {
+        let id = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let guidance = second_interrupt_unknown_guidance(id);
+        // Exact recovery command strings (content-free, ID-bearing).
+        assert!(
+            guidance.starts_with(&format!("invocation {id}: final state is unknown")),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains(&format!("cockpit invocation status {id}")),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains(&format!("cockpit invocation cancel {id}")),
+            "{guidance}"
+        );
+        // Second interrupt always exits 130 (documented exit code).
+        assert_eq!(130, 130);
+        // Does not claim cancelled-success.
+        assert!(!guidance.to_lowercase().contains("success"));
+        assert!(!guidance.contains("cancellation succeeded"));
     }
 }

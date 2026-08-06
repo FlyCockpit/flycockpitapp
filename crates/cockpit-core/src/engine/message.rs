@@ -100,6 +100,11 @@ pub struct UserSubmission {
     /// without re-running injection detection or request preflight.
     #[serde(skip)]
     pub pending_terminal_disposition: Option<PendingSubmissionTerminalDisposition>,
+    /// When set, this submission is an independently addressable run
+    /// invocation and must never be folded/coalesced with another
+    /// `client_submission_id` or with unbounded interactive work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_invocation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,11 +766,45 @@ impl UserSubmissionQueue {
         target_id: Option<&str>,
     ) {
         while into.len() < max {
+            // Independently addressable run invocations never share a provider
+            // dispatch with another submission.
+            if into.iter().any(|item| item.run_invocation_id.is_some()) {
+                break;
+            }
+            if into.is_empty() {
+                match self.pop_one(target_id).await {
+                    QueuePop::Item(submission) => {
+                        let is_run = submission.run_invocation_id.is_some();
+                        into.push(*submission);
+                        if is_run {
+                            break;
+                        }
+                    }
+                    QueuePop::Empty | QueuePop::Closed | QueuePop::Deferred(_) => break,
+                }
+                continue;
+            }
+            // Do not fold a following run invocation into interactive work.
+            if self.peek_front_is_run_invocation(target_id).await {
+                break;
+            }
             match self.pop_one(target_id).await {
                 QueuePop::Item(submission) => into.push(*submission),
                 QueuePop::Empty | QueuePop::Closed | QueuePop::Deferred(_) => break,
             }
         }
+    }
+
+    async fn peek_front_is_run_invocation(&self, target_id: Option<&str>) -> bool {
+        let state = self.inner.lock().await;
+        let item = match target_id {
+            Some(target_id) => state
+                .pending
+                .iter()
+                .find(|item| item.target.id == target_id),
+            None => state.pending.front(),
+        };
+        item.is_some_and(|item| item.submission.run_invocation_id.is_some())
     }
 
     pub async fn has_pending_for(&self, target_id: Option<&str>) -> bool {
@@ -1999,6 +2038,68 @@ mod tests {
         assert_eq!(result, RemoveQueuedMessageResult::NotFound);
         assert!(removed.is_empty());
         assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_invocations_are_not_coalesced() {
+        let (updates_tx, _) = watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+        let run_a = Uuid::from_u128(1);
+        let run_b = Uuid::from_u128(2);
+        let interactive = Uuid::from_u128(3);
+
+        let mut a = UserSubmission::text("run-a");
+        a.run_invocation_id = Some(run_a);
+        a.client_submissions = vec![ClientSubmissionReceipt {
+            id: run_a,
+            fingerprint: "a".into(),
+            wire_fingerprint: "a".into(),
+            origin_principal: None,
+        }];
+        let mut b = UserSubmission::text("run-b");
+        b.run_invocation_id = Some(run_b);
+        b.client_submissions = vec![ClientSubmissionReceipt {
+            id: run_b,
+            fingerprint: "b".into(),
+            wire_fingerprint: "b".into(),
+            origin_principal: None,
+        }];
+        let mut i = UserSubmission::text("interactive");
+        i.client_submissions = vec![ClientSubmissionReceipt {
+            id: interactive,
+            fingerprint: "i".into(),
+            wire_fingerprint: "i".into(),
+            origin_principal: None,
+        }];
+
+        queue
+            .push_idempotent(a.client_submissions[0].clone(), a, target.clone())
+            .await;
+        queue
+            .push_idempotent(i.client_submissions[0].clone(), i, target.clone())
+            .await;
+        queue
+            .push_idempotent(b.client_submissions[0].clone(), b, target.clone())
+            .await;
+
+        let mut first = Vec::new();
+        queue.drain_into_for(&mut first, 16, Some(&target.id)).await;
+        assert_eq!(first.len(), 1, "run invocation must not fold with others");
+        assert_eq!(first[0].run_invocation_id, Some(run_a));
+
+        let mut second = Vec::new();
+        queue
+            .drain_into_for(&mut second, 16, Some(&target.id))
+            .await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].text, "interactive");
+        assert!(second[0].run_invocation_id.is_none());
+
+        let mut third = Vec::new();
+        queue.drain_into_for(&mut third, 16, Some(&target.id)).await;
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].run_invocation_id, Some(run_b));
     }
 
     #[tokio::test]

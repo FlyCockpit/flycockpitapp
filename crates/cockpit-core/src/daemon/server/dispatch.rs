@@ -28,6 +28,7 @@ async fn handle_send_user_message(
     tag_expansions: Vec<proto::TagExpansionMeta>,
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
+    run_invocation_options: Option<proto::RunInvocationOptions>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if let Some(scheduler) = &ctx.scheduler {
         scheduler.record_user_activity().await;
@@ -41,13 +42,29 @@ async fn handle_send_user_message(
     let session_id = require_attached(state)?.handle.session_id;
     let handle = require_attached(state)?.handle.clone();
     let origin_principal = state.principal.tag();
-    let wire_fingerprint = user_message_wire_fingerprint(
+    let mut wire_fingerprint = user_message_wire_fingerprint(
         &text,
         display_text.as_deref(),
         &tag_expansions,
         &image_refs,
         forced_skill.as_deref(),
     );
+    // Run marker acceptance is a durable barrier before queueing. Include
+    // immutable options in the fingerprint so option drift conflicts.
+    if let Some(options) = &run_invocation_options {
+        let opts_digest = run_invocation::options_digest(options);
+        wire_fingerprint = format!("{wire_fingerprint}|run:{opts_digest}");
+        let _accepted = run_invocation::accept_run_if_marked(
+            ctx,
+            &state.principal,
+            session_id,
+            client_submission_id,
+            &wire_fingerprint,
+            options,
+            run_invocation::wall_ms_now(),
+        )
+        .await?;
+    }
     let mut requires_content_check = false;
     if !image_refs.is_empty() {
         let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
@@ -108,6 +125,9 @@ async fn handle_send_user_message(
         client_submissions: Vec::new(),
         queue_target: None,
         pending_terminal_disposition: None,
+        run_invocation_id: run_invocation_options
+            .as_ref()
+            .map(|_| client_submission_id),
     };
     let fingerprint = submission.client_fingerprint();
     submission
@@ -258,6 +278,7 @@ pub(super) async fn handle_serialized_request(
             tag_expansions,
             image_refs,
             forced_skill,
+            run_invocation_options,
         } => {
             Box::pin(handle_send_user_message(
                 state,
@@ -268,9 +289,20 @@ pub(super) async fn handle_serialized_request(
                 tag_expansions,
                 image_refs,
                 forced_skill,
+                run_invocation_options,
             ))
             .await
         }
+
+        Request::GetRunInvocationStatus {
+            client_submission_id,
+        } => {
+            run_invocation::handle_get_run_invocation_status(state, ctx, client_submission_id).await
+        }
+
+        Request::CancelRunInvocation {
+            client_submission_id,
+        } => run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await,
 
         Request::SteerDelegation {
             session_id,
@@ -1950,6 +1982,16 @@ pub(super) async fn handle_concurrent_request(
                 slash,
                 tags,
             })
+        }
+        Request::GetRunInvocationStatus {
+            client_submission_id,
+        } => {
+            run_invocation::handle_get_run_invocation_status_shared(
+                &shared,
+                &ctx,
+                client_submission_id,
+            )
+            .await
         }
         Request::StatsRollup {
             project_id,

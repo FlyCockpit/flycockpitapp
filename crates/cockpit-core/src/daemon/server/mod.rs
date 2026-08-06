@@ -459,6 +459,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_assistant_summary(assistant, redact)
         }
         proto::Response::ImportSessionArchive { .. } => {}
+        // Content-free run-invocation responses: safe fields only; nothing to scrub.
+        proto::Response::RunInvocationStatus { .. }
+        | proto::Response::RunInvocationCancelResult { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -3615,6 +3618,13 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+mod run_invocation;
+pub use run_invocation::{
+    RemainingRestart as RunInvocationRemaining,
+    principal_digest as run_invocation_principal_digest,
+    remaining_after_restart as run_invocation_remaining_after_restart,
+    wall_ms_now as run_invocation_wall_ms_now,
+};
 pub(crate) mod inventory;
 mod sessions;
 #[cfg(test)]

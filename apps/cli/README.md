@@ -173,6 +173,8 @@ cockpit packages prune --dry-run
 | `cockpit` | Launch the TUI in the current directory. |
 | `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
+| `cockpit invocation status <id>` | Show durable status for a run invocation by client_submission_id. |
+| `cockpit invocation cancel <id>` | Request cancellation of a run invocation (idempotent). |
 | `cockpit agent list` | List configured agent definitions. |
 | `cockpit assistant list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |

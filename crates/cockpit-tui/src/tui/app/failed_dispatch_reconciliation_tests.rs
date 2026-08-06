@@ -1061,6 +1061,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         queue_item_ids: vec![uuid::Uuid::new_v4()],
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
+        run_invocation_id: None,
         queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
@@ -1175,6 +1176,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
             "reviewer",
         )),
         pending_terminal_disposition: None,
+        run_invocation_id: None,
     }
 }
 
@@ -1965,6 +1967,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         queue_item_ids: vec![uuid::Uuid::new_v4()],
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
+        run_invocation_id: None,
         queue_target: Some(cockpit_core::engine::message::QueueTarget::child(
             "Build",
             1,

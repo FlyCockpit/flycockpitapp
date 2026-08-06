@@ -946,6 +946,7 @@ impl App {
                     client_submissions: Vec::new(),
                     queue_target: None,
                     pending_terminal_disposition: None,
+                    run_invocation_id: None,
                 };
                 self.dispatch_optimistic_user_submission(
                     kickoff,

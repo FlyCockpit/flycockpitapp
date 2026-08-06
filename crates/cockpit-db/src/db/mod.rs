@@ -56,6 +56,7 @@ pub mod project_notes;
 pub mod prune_ledger;
 pub mod remote_audit_upload;
 pub mod retention;
+pub mod run_invocations;
 pub mod scheduler;
 pub mod sealed_values;
 pub mod secure_key;
@@ -2135,6 +2136,12 @@ mod tests {
                 .iter()
                 .any(|column| column == "session_id");
             if !has_session_id || name == "sessions" {
+                continue;
+            }
+            // Run invocations retain durable receipts after session deletion
+            // (cancelled_session_deleted terminalization; no FK cascade).
+            // Tombstones are global UUID receipts with no session column FK.
+            if name == "run_invocations" || name == "run_invocation_tombstones" {
                 continue;
             }
             if !has_cascade_path_to_sessions(conn, &name, &mut std::collections::HashSet::new())? {

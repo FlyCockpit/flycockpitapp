@@ -184,6 +184,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         queue_item_ids: vec![uuid::Uuid::from_u128(index as u128 + 1)],
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
+        run_invocation_id: None,
         queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
     }
 }

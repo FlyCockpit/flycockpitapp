@@ -221,7 +221,7 @@ async fn inference_failure_is_loud() {
     let default_output = spawn_run(default_command);
     assert_eq!(
         default_output.status.code(),
-        Some(1),
+        Some(5),
         "{}",
         output_text(&default_output)
     );
@@ -241,7 +241,7 @@ async fn inference_failure_is_loud() {
     let json_output = spawn_run(json_command);
     assert_eq!(
         json_output.status.code(),
-        Some(1),
+        Some(5),
         "{}",
         output_text(&json_output)
     );
@@ -251,7 +251,7 @@ async fn inference_failure_is_loud() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("\"event\":\"run_complete\",\"exit_code\":1,\"ok\":false"),
+        stdout.contains("\"event\":\"run_complete\",\"exit_code\":5,\"ok\":false"),
         "{stdout}"
     );
 }

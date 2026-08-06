@@ -42,5 +42,50 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "err",
     "v": 6
+  },
+  "idempotency_conflict_paired": {
+    "error": {
+      "code": "idempotency_conflict",
+      "message": "client_submission_id was already used with different content"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
+  "client_submission_id_unavailable_paired": {
+    "error": {
+      "code": "client_submission_id_unavailable",
+      "message": "client_submission_id is unavailable"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
+  "invocation_not_found_paired": {
+    "error": {
+      "code": "invocation_not_found",
+      "message": "invocation not found"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
+  "invocation_capacity_exceeded_paired": {
+    "error": {
+      "code": "invocation_capacity_exceeded",
+      "message": "invocation capacity exceeded"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
+  "invocation_lookup_busy_paired": {
+    "error": {
+      "code": "invocation_lookup_busy",
+      "message": "invocation lookup busy"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
   }
 }

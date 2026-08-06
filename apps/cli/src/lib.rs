@@ -283,6 +283,7 @@ pub mod integration {
                         .collect(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    run_invocation_options: None,
                 })
                 .await?
             {
@@ -650,7 +651,7 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
 fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     !matches!(
         command,
-        Some(Command::Debug(crate::cli::DebugCommand::Paths))
+        Some(Command::Debug(crate::cli::DebugCommand::Paths)) | Some(Command::Invocation(_))
     )
 }
 
@@ -689,6 +690,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Run(args)) => {
             commands::run::run(args, cli.no_sandbox, cli.project.as_deref()).await
         }
+        Some(Command::Invocation(sub)) => commands::invocation::run(sub).await,
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
         Some(Command::Assistant(sub)) => {
             commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await

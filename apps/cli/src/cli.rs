@@ -64,9 +64,13 @@ pub enum Command {
 
     /// Run a one-shot prompt non-interactively.
     #[command(
-        after_long_help = "Exit codes:\n  0  turn succeeded\n  1  turn failed\n  2  usage or configuration error\n  3  workspace trust refused\n  4  daemon or connection error"
+        after_long_help = "Exit codes:\n  0  turn succeeded\n  2  usage or configuration error\n  3  workspace trust refused\n  4  daemon, connection, capacity, or unavailable id\n  5  authoritative non-success terminal outcome (timeout, max-turns, failure, not-found)\n  130 interrupted (SIGINT)"
     )]
     Run(RunArgs),
+
+    /// Query or cancel a durable run invocation by client_submission_id.
+    #[command(subcommand)]
+    Invocation(InvocationCommand),
 
     /// Manage agents.
     #[command(subcommand)]
@@ -542,6 +546,17 @@ pub struct RunArgs {
     /// the run completes. Useful for CI and clean-state scripts.
     #[arg(long)]
     pub ephemeral: bool,
+
+    /// Maximum provider-dispatch reservations for this run (1..=10000).
+    /// Omitted means unbounded. Zero is a usage error, never unbounded.
+    #[arg(long, value_name = "TURNS", value_parser = parse_max_turns)]
+    pub max_turns: Option<u32>,
+
+    /// Wall-clock timeout in whole seconds from durable acceptance
+    /// (1..=604800 = seven days). Converted to milliseconds for the daemon.
+    /// Omitted means unbounded. Zero is a usage error, never unbounded.
+    #[arg(long, value_name = "SECONDS", value_parser = parse_timeout_secs)]
+    pub timeout: Option<u64>,
 }
 
 impl RunArgs {
@@ -552,6 +567,92 @@ impl RunArgs {
             self.format
         }
     }
+
+    /// Immutable run bounds for `SendUserMessage`. Always `Some` for `cockpit run`.
+    pub fn run_invocation_options(&self) -> crate::daemon::proto::RunInvocationOptions {
+        crate::daemon::proto::RunInvocationOptions {
+            max_turns: self.max_turns,
+            timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
+        }
+    }
+}
+
+fn parse_max_turns(raw: &str) -> Result<u32, String> {
+    if raw.is_empty()
+        || raw.contains(['+', '-', '.', 'e', 'E'])
+        || !raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(
+            "--max-turns must be a decimal integer in 1..=10000 (no signs, fractions, or suffixes)"
+                .into(),
+        );
+    }
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| "--max-turns must be a decimal integer in 1..=10000".to_string())?;
+    if !(1..=10_000).contains(&value) {
+        return Err("--max-turns must be a decimal integer in 1..=10000".into());
+    }
+    Ok(value)
+}
+
+fn parse_timeout_secs(raw: &str) -> Result<u64, String> {
+    if raw.is_empty()
+        || raw.contains(['+', '-', '.', 'e', 'E'])
+        || !raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(
+            "--timeout must be a decimal integer number of seconds in 1..=604800 (no signs, fractions, or suffixes)"
+                .into(),
+        );
+    }
+    let value: u64 = raw.parse().map_err(|_| {
+        "--timeout must be a decimal integer number of seconds in 1..=604800".to_string()
+    })?;
+    if !(1..=604_800).contains(&value) {
+        return Err("--timeout must be a decimal integer number of seconds in 1..=604800".into());
+    }
+    // Checked millisecond conversion (must not overflow u64).
+    value
+        .checked_mul(1000)
+        .ok_or_else(|| "--timeout millisecond conversion overflow".to_string())?;
+    Ok(value)
+}
+
+// ---- invocation subcommands ----
+
+#[derive(Debug, Subcommand)]
+pub enum InvocationCommand {
+    /// Print durable status for a run invocation.
+    #[command(
+        after_long_help = "Exit codes:\n  0  found active or terminal status\n  2  usage error\n  4  transport/protocol/auth/busy\n  5  authoritative InvocationNotFound"
+    )]
+    Status(InvocationStatusArgs),
+    /// Request cancellation of a run invocation (idempotent).
+    #[command(
+        after_long_help = "Exit codes:\n  0  cancel result recorded\n  2  usage error\n  4  transport/protocol/auth/busy\n  5  authoritative InvocationNotFound"
+    )]
+    Cancel(InvocationCancelArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct InvocationStatusArgs {
+    /// Canonical lowercase hyphenated UUIDv4 client_submission_id.
+    pub client_submission_id: String,
+
+    /// Output format. There is no `--json` alias.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Default)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct InvocationCancelArgs {
+    /// Canonical lowercase hyphenated UUIDv4 client_submission_id.
+    pub client_submission_id: String,
+
+    /// Output format. There is no `--json` alias.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Default)]
+    pub format: OutputFormat,
 }
 
 // ---- agent subcommands ----

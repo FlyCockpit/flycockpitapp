@@ -791,6 +791,7 @@ async fn all_unwind_paths_drain_pending_input() {
                         client_submissions: Vec::new(),
                         queue_target: None,
                         pending_terminal_disposition: None,
+                        run_invocation_id: None,
                     },
                     target.clone(),
                 )

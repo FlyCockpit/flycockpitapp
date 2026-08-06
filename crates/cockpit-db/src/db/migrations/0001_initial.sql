@@ -1604,3 +1604,75 @@ CREATE TABLE sealed_state_sagas (
 
 CREATE INDEX idx_sealed_state_sagas_ns
     ON sealed_state_sagas (namespace);
+
+-- ---- run_invocations -------------------------------------------------------
+-- Daemon-global durable run identity keyed solely by client_submission_id
+-- (canonical lowercase hyphenated UUIDv4). No session CASCADE: rows outlive
+-- session deletion and receive cancelled_session_deleted terminalization.
+-- InvocationNotFound equalization relies on content-free columns only.
+
+CREATE TABLE run_invocations (
+    client_submission_id    TEXT PRIMARY KEY,
+    origin_principal_digest TEXT NOT NULL,
+    session_id              TEXT NOT NULL,
+    options_json            TEXT NOT NULL,
+    options_digest          TEXT NOT NULL,
+    content_digest          TEXT NOT NULL,
+    state                   TEXT NOT NULL CHECK (state IN (
+        'accepted', 'queued', 'dispatching', 'submission_unknown', 'running',
+        'cancellation_requested', 'succeeded', 'failed', 'cancelled',
+        'timeout_expired', 'max_turns_exceeded', 'clock_rollback_timed_out',
+        'outcome_unknown'
+    )),
+    state_version           INTEGER NOT NULL,
+    created_at_wall_ms      INTEGER NOT NULL,
+    updated_at_wall_ms      INTEGER NOT NULL,
+    last_observed_wall_ms   INTEGER NOT NULL,
+    remaining_ms            INTEGER,
+    reserved_turns          INTEGER NOT NULL DEFAULT 0,
+    max_turns               INTEGER,
+    timeout_ms              INTEGER,
+    cancel_requested        INTEGER NOT NULL DEFAULT 0,
+    cancel_result           TEXT CHECK (
+        cancel_result IS NULL OR cancel_result IN (
+            'cancellation_requested', 'already_cancelled', 'already_terminal'
+        )
+    ),
+    terminal_reason         TEXT CHECK (
+        terminal_reason IS NULL OR terminal_reason IN (
+            'succeeded', 'failed', 'cancelled', 'cancelled_session_deleted',
+            'timeout_expired', 'max_turns_exceeded', 'clock_rollback_timed_out',
+            'outcome_unknown'
+        )
+    ),
+    terminal_at_wall_ms     INTEGER,
+    expires_at_wall_ms      INTEGER,
+    accounted_bytes         INTEGER NOT NULL
+);
+
+CREATE INDEX idx_run_invocations_session
+    ON run_invocations (session_id);
+CREATE INDEX idx_run_invocations_principal
+    ON run_invocations (origin_principal_digest);
+CREATE INDEX idx_run_invocations_expires
+    ON run_invocations (expires_at_wall_ms)
+    WHERE expires_at_wall_ms IS NOT NULL;
+CREATE INDEX idx_run_invocations_active_session
+    ON run_invocations (session_id)
+    WHERE terminal_at_wall_ms IS NULL;
+
+-- Content-free rejected-before-acceptance tombstones. Same global UUID key as
+-- run_invocations. Never enumerated, listed, or distinguished from NotFound.
+
+CREATE TABLE run_invocation_tombstones (
+    client_submission_id     TEXT PRIMARY KEY,
+    claiming_principal_digest TEXT NOT NULL,
+    created_at_wall_ms       INTEGER NOT NULL,
+    expires_at_wall_ms       INTEGER NOT NULL,
+    accounted_bytes          INTEGER NOT NULL
+);
+
+CREATE INDEX idx_run_invocation_tombstones_principal
+    ON run_invocation_tombstones (claiming_principal_digest);
+CREATE INDEX idx_run_invocation_tombstones_expires
+    ON run_invocation_tombstones (expires_at_wall_ms);

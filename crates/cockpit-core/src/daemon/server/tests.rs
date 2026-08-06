@@ -1102,6 +1102,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
             &mut state,
             &first_ctx,
@@ -1177,6 +1178,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
             &mut state,
             &second_ctx,
@@ -3532,6 +3534,7 @@ fn dispatch_matrix_class_for_command(
         | ("read_history_page", "custom", false)
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
+        | ("get_run_invocation_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
@@ -3576,6 +3579,7 @@ enum ReadonlyDispatchCaseKind {
     ReadHistoryPage,
     ReadSubagentHistoryPage,
     SessionLiveStatus,
+    GetRunInvocationStatus,
     GoalStatus,
     GetInventoryBundle,
     DaemonStatus,
@@ -3633,6 +3637,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
             case: ReadonlyDispatchCaseKind::SessionLiveStatus,
         },
         ReadonlyDispatchCase {
+            kind: "get_run_invocation_status",
+            case: ReadonlyDispatchCaseKind::GetRunInvocationStatus,
+        },
+        ReadonlyDispatchCase {
             kind: "goal_status",
             case: ReadonlyDispatchCaseKind::GoalStatus,
         },
@@ -3685,6 +3693,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "send_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::UserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "cancel_run_invocation",
+            effect_class: Durable,
+            observation: "durable cancel result for accepted run invocation",
         },
         MutatingDispatchCase {
             kind: "steer_delegation",
@@ -5172,6 +5185,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
             session_id,
@@ -5399,6 +5413,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             text: "authz".into(),
         },
         "delete_session" => Request::DeleteSession { session_id },
+        "get_run_invocation_status" => Request::GetRunInvocationStatus {
+            client_submission_id: Uuid::new_v4(),
+        },
+        "cancel_run_invocation" => Request::CancelRunInvocation {
+            client_submission_id: Uuid::new_v4(),
+        },
         "get_inventory_bundle" => Request::GetInventoryBundle {
             project_root: root,
             session_id,
@@ -5836,6 +5856,44 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(pid, std::process::id());
                 assert_eq!(protocol_version, proto::PROTOCOL_VERSION);
             }
+            Self::GetRunInvocationStatus => {
+                let ctx = test_ctx();
+                let id = Uuid::new_v4();
+                let now = 1_700_000_000_000i64;
+                ctx.db
+                    .accept_run_invocation(
+                        id,
+                        crate::daemon::server::run_invocation_principal_digest(
+                            &ClientPrincipal::owner(),
+                        ),
+                        Uuid::new_v4(),
+                        serde_json::to_string(&serde_json::json!({
+                            "max_turns": null,
+                            "timeout_ms": null
+                        }))
+                        .unwrap(),
+                        "opts".into(),
+                        "content".into(),
+                        None,
+                        None,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::GetRunInvocationStatus {
+                        client_submission_id: id,
+                    },
+                )
+                .await
+                .expect("get_run_invocation_status happy");
+                let Response::RunInvocationStatus { status } = response else {
+                    panic!("expected RunInvocationStatus, got {response:?}");
+                };
+                assert_eq!(status.client_submission_id, id);
+                assert_eq!(status.schema_version, 1);
+            }
             Self::GuidanceEstimate => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
@@ -6092,6 +6150,18 @@ impl ReadonlyDispatchCaseKind {
                 .expect_err("daemon_status malformed protocol version");
                 assert_eq!(err.code, ErrorCode::ProtocolVersion);
             }
+            Self::GetRunInvocationStatus => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::GetRunInvocationStatus {
+                        client_submission_id: Uuid::nil(),
+                    },
+                )
+                .await
+                .expect_err("nil client_submission_id is rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
             Self::GuidanceEstimate => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
@@ -6304,6 +6374,47 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "prune"
         | "compact"
         | "pin" => assert_worker_delivery_happy(case.kind).await,
+        "cancel_run_invocation" => {
+            let ctx = test_ctx();
+            let id = Uuid::new_v4();
+            let now = 1_700_000_000_000i64;
+            let digest =
+                crate::daemon::server::run_invocation_principal_digest(&ClientPrincipal::owner());
+            ctx.db
+                .accept_run_invocation(
+                    id,
+                    digest,
+                    Uuid::new_v4(),
+                    serde_json::to_string(&serde_json::json!({
+                        "max_turns": null,
+                        "timeout_ms": null
+                    }))
+                    .unwrap(),
+                    "opts".into(),
+                    "content".into(),
+                    None,
+                    None,
+                    now,
+                )
+                .await
+                .unwrap();
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::CancelRunInvocation {
+                    client_submission_id: id,
+                },
+            )
+            .await
+            .expect("cancel_run_invocation happy");
+            let Response::RunInvocationCancelResult { result } = response else {
+                panic!("expected RunInvocationCancelResult, got {response:?}");
+            };
+            assert_eq!(result.client_submission_id, id);
+            assert_eq!(
+                result.outcome,
+                proto::RunInvocationCancelOutcome::CancellationRequested
+            );
+        }
         other => panic!("unhandled mutating happy case {other}"),
     }
 }
@@ -6549,6 +6660,18 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             ));
             assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Running);
         }
+        "cancel_run_invocation" => {
+            let ctx = test_ctx();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::CancelRunInvocation {
+                    client_submission_id: Uuid::nil(),
+                },
+            )
+            .await
+            .expect_err("nil client_submission_id is rejected");
+            assert_eq!(err.code, ErrorCode::BadRequest);
+        }
         other => panic!("unhandled mutating malformed case {other}"),
     }
 }
@@ -6690,6 +6813,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         },
         "steer_delegation" => Request::SteerDelegation {
             session_id,
@@ -7070,6 +7194,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: Some("review".to_string()),
+            run_invocation_options: None,
         },
         |work| {
             let SessionWork::UserMessage {
@@ -7163,6 +7288,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         },
         "remove_queued_user_message" => Request::RemoveQueuedUserMessage {
             queue_item_id: Uuid::new_v4(),
@@ -8911,7 +9037,7 @@ macro_rules! request_ordering_rows_from_command_table {
 }
 
 #[tokio::test]
-async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_reads() {
+async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     let rows = proto::command!(request_ordering_rows_from_command_table);
     assert!(
         rows.len() > 80,
@@ -8929,6 +9055,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_twenty_one_enumerated_re
         "fs_list",
         "fs_read",
         "fs_stat",
+        "get_run_invocation_status",
         "get_usage_counts",
         "git_diff_file",
         "git_status",
@@ -9094,9 +9221,28 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
             kind: "send_user_message",
             session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetRunInvocationStatus {
+                client_submission_id: Uuid::from_u128(42),
+            },
+            kind: "get_run_invocation_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::CancelRunInvocation {
+                client_submission_id: Uuid::from_u128(43),
+            },
+            kind: "cancel_run_invocation",
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -10096,6 +10242,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         Attach,
         SubagentTranscript,
         SendUserMessage,
+        GetRunInvocationStatus,
+        CancelRunInvocation,
         SteerDelegation,
         BeginAttachmentUpload,
         UploadAttachmentChunk,
@@ -10367,6 +10515,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         client_submissions: Vec::new(),
         queue_target: None,
         pending_terminal_disposition: None,
+        run_invocation_id: None,
     };
     let fingerprint = submission.client_fingerprint();
     let wire_fingerprint = user_message_wire_fingerprint(text, None, &[], &[], None);
@@ -10392,6 +10541,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         },
         &mut state,
         &ctx,
@@ -10413,6 +10563,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         },
         &mut state,
         &ctx,
@@ -10500,6 +10651,7 @@ async fn image_submission_exact_retry_case() {
         }],
         image_refs: vec![image_ref.clone()],
         forced_skill: Some("image-skill".to_string()),
+        run_invocation_options: None,
     };
 
     // Treat the first successful response as lost by intentionally discarding
@@ -10605,6 +10757,7 @@ async fn image_submission_exact_retry_case() {
             }],
             image_refs: vec![reuploaded_ref.clone()],
             forced_skill: Some("image-skill".to_string()),
+            run_invocation_options: None,
         },
         &mut state,
         &ctx,
@@ -10660,6 +10813,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         tag_expansions: Vec::new(),
         image_refs: vec![image_ref.clone()],
         forced_skill: None,
+        run_invocation_options: None,
     };
 
     let first_ctx = ctx.clone();
@@ -12628,6 +12782,7 @@ async fn serialized_requests_apply_in_receipt_order() {
                     tag_expansions: Vec::new(),
                     image_refs: Vec::new(),
                     forced_skill: None,
+                    run_invocation_options: None,
                 },
             ),
         ))))
@@ -13715,6 +13870,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
             &mut parent_state,
             &ctx_for_parent,
@@ -13766,6 +13922,7 @@ async fn btw_concurrent_with_parent_turn() {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
             &mut btw_state,
             &ctx_for_btw,
@@ -14157,6 +14314,7 @@ async fn send_user_message_refused_while_draining() {
             tag_expansions: Vec::new(),
             image_refs: vec![],
             forced_skill: None,
+            run_invocation_options: None,
         },
         &mut state,
         &ctx,

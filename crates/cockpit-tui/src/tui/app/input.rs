@@ -2211,6 +2211,7 @@ impl App {
             client_submissions: Vec::new(),
             queue_target: None,
             pending_terminal_disposition: None,
+            run_invocation_id: None,
         };
         if let Some(pending) = self.pending_model_selection.as_mut() {
             let status = format!(

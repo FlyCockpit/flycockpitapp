@@ -701,7 +701,8 @@ pub enum Body {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
+    UsageKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,7 +855,11 @@ impl DelegationSteerResult {
 }
 
 mod response;
-pub use response::{ActiveModelState, BtwForkInfo, Response};
+pub use response::{
+    ActiveModelState, BtwForkInfo, Response, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {
@@ -972,6 +977,21 @@ pub enum ErrorCode {
     InvalidConfig,
     /// A dependency required to serve inventory is temporarily unavailable.
     Unavailable,
+    /// Same-principal start/replay used a client_submission_id with different
+    /// message or immutable run options. Content-free; does not mutate state.
+    IdempotencyConflict,
+    /// A client_submission_id is reserved by another principal, a tombstone,
+    /// or is otherwise unavailable for a new start. Content-free.
+    ClientSubmissionIdUnavailable,
+    /// Authoritative unknown or unauthorized run-invocation lookup. Content-free;
+    /// shared by never-seen, wrong-principal, tombstoned, and expired UUIDs.
+    InvocationNotFound,
+    /// New start rejected because session/principal quota is full. Retryable,
+    /// content-free; no receipt or partial row is written.
+    InvocationCapacityExceeded,
+    /// Status/cancel for an unknown id could not install a tombstone because
+    /// quota is full. Non-authoritative Busy; content-free.
+    InvocationLookupBusy,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -1014,6 +1034,11 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "inventory_too_large" => Self::InventoryTooLarge,
             "invalid_config" => Self::InvalidConfig,
             "unavailable" => Self::Unavailable,
+            "idempotency_conflict" => Self::IdempotencyConflict,
+            "client_submission_id_unavailable" => Self::ClientSubmissionIdUnavailable,
+            "invocation_not_found" => Self::InvocationNotFound,
+            "invocation_capacity_exceeded" => Self::InvocationCapacityExceeded,
+            "invocation_lookup_busy" => Self::InvocationLookupBusy,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -1043,6 +1068,11 @@ impl std::fmt::Display for ErrorCode {
             Self::InventoryTooLarge => "inventory_too_large",
             Self::InvalidConfig => "invalid_config",
             Self::Unavailable => "unavailable",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::ClientSubmissionIdUnavailable => "client_submission_id_unavailable",
+            Self::InvocationNotFound => "invocation_not_found",
+            Self::InvocationCapacityExceeded => "invocation_capacity_exceeded",
+            Self::InvocationLookupBusy => "invocation_lookup_busy",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -2198,6 +2228,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "archive_session",
         "attach",
         "cancel_paused_work",
+        "cancel_run_invocation",
         "delete_session",
         "fork_session",
         "fs_create_dir",
@@ -2207,6 +2238,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "fs_rename",
         "fs_stat",
         "fs_write",
+        "get_run_invocation_status",
         "git_diff_file",
         "git_status",
         "get_inventory_bundle",
@@ -2241,6 +2273,8 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "history_page",
         "inventory_bundle",
         "restart_decision",
+        "run_invocation_cancel_result",
+        "run_invocation_status",
         "session_messages",
         "sessions",
         "stats_rollup",
@@ -2303,6 +2337,11 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             "bad_request",
             "user_message_not_accepted",
             "user_message_terminated",
+            "idempotency_conflict",
+            "client_submission_id_unavailable",
+            "invocation_not_found",
+            "invocation_capacity_exceeded",
+            "invocation_lookup_busy",
         ] {
             assert!(
                 errors.values().any(|value| value
@@ -2599,6 +2638,36 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 Some(sentinel_uuid()),
                 ErrorCode::UserMessageTerminated,
                 "user message reached a durable terminal disposition",
+            ),
+            (
+                "idempotency_conflict_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::IdempotencyConflict,
+                "client_submission_id was already used with different content",
+            ),
+            (
+                "client_submission_id_unavailable_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::ClientSubmissionIdUnavailable,
+                "client_submission_id is unavailable",
+            ),
+            (
+                "invocation_not_found_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvocationNotFound,
+                "invocation not found",
+            ),
+            (
+                "invocation_capacity_exceeded_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvocationCapacityExceeded,
+                "invocation capacity exceeded",
+            ),
+            (
+                "invocation_lookup_busy_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvocationLookupBusy,
+                "invocation lookup busy",
             ),
         ] {
             generated.insert(
@@ -3363,6 +3432,7 @@ mod tests {
                 tag_expansions: Vec::new(),
                 image_refs: Vec::new(),
                 forced_skill: None,
+                run_invocation_options: None,
             },
         );
         let s = serde_json::to_string(&env).unwrap();
@@ -3423,6 +3493,7 @@ mod tests {
                 tag_expansions: Vec::new(),
                 image_refs: vec![image_ref],
                 forced_skill: None,
+                run_invocation_options: None,
             },
         );
         let json = serde_json::to_value(&env).unwrap();

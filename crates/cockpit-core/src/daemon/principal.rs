@@ -294,6 +294,7 @@ mod tests {
             "fs_list",
             "fs_read",
             "fs_stat",
+            "get_run_invocation_status",
             "get_usage_counts",
             "git_diff_file",
             "git_status",

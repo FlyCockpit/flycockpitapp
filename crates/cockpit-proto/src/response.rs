@@ -440,8 +440,178 @@ pub enum Response {
         items: Vec<PausedWorkSummary>,
     },
 
+    /// Durable status for a run invocation ([`Request::GetRunInvocationStatus`]).
+    RunInvocationStatus {
+        status: RunInvocationStatusV1,
+    },
+
+    /// Idempotent cancel result ([`Request::CancelRunInvocation`]).
+    RunInvocationCancelResult {
+        result: RunInvocationCancelResultV1,
+    },
+
     #[serde(other)]
     Unknown,
+}
+
+/// Closed content-free lifecycle state for a durable run invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInvocationLifecycleState {
+    Accepted,
+    Queued,
+    Dispatching,
+    SubmissionUnknown,
+    Running,
+    CancellationRequested,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimeoutExpired,
+    MaxTurnsExceeded,
+    ClockRollbackTimedOut,
+    OutcomeUnknown,
+}
+
+impl RunInvocationLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Queued => "queued",
+            Self::Dispatching => "dispatching",
+            Self::SubmissionUnknown => "submission_unknown",
+            Self::Running => "running",
+            Self::CancellationRequested => "cancellation_requested",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimeoutExpired => "timeout_expired",
+            Self::MaxTurnsExceeded => "max_turns_exceeded",
+            Self::ClockRollbackTimedOut => "clock_rollback_timed_out",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed
+                | Self::Cancelled
+                | Self::TimeoutExpired
+                | Self::MaxTurnsExceeded
+                | Self::ClockRollbackTimedOut
+                | Self::OutcomeUnknown
+        )
+    }
+}
+
+impl std::fmt::Display for RunInvocationLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Closed content-free terminal reason for a durable run invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInvocationTerminalReason {
+    Succeeded,
+    Failed,
+    Cancelled,
+    CancelledSessionDeleted,
+    TimeoutExpired,
+    MaxTurnsExceeded,
+    ClockRollbackTimedOut,
+    OutcomeUnknown,
+}
+
+impl RunInvocationTerminalReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::CancelledSessionDeleted => "cancelled_session_deleted",
+            Self::TimeoutExpired => "timeout_expired",
+            Self::MaxTurnsExceeded => "max_turns_exceeded",
+            Self::ClockRollbackTimedOut => "clock_rollback_timed_out",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    pub fn to_lifecycle_state(self) -> RunInvocationLifecycleState {
+        match self {
+            Self::Succeeded => RunInvocationLifecycleState::Succeeded,
+            Self::Failed => RunInvocationLifecycleState::Failed,
+            Self::Cancelled | Self::CancelledSessionDeleted => {
+                RunInvocationLifecycleState::Cancelled
+            }
+            Self::TimeoutExpired => RunInvocationLifecycleState::TimeoutExpired,
+            Self::MaxTurnsExceeded => RunInvocationLifecycleState::MaxTurnsExceeded,
+            Self::ClockRollbackTimedOut => RunInvocationLifecycleState::ClockRollbackTimedOut,
+            Self::OutcomeUnknown => RunInvocationLifecycleState::OutcomeUnknown,
+        }
+    }
+}
+
+/// Versioned, content-free run-invocation status response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInvocationStatusV1 {
+    pub schema_version: u32,
+    pub client_submission_id: Uuid,
+    pub state: RunInvocationLifecycleState,
+    pub state_version: u64,
+    pub created_at_wall_ms: i64,
+    pub updated_at_wall_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms: Option<u64>,
+    pub reserved_turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_wall_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<RunInvocationTerminalReason>,
+}
+
+impl RunInvocationStatusV1 {
+    pub const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Closed cancel-result kind for [`RunInvocationCancelResultV1`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInvocationCancelOutcome {
+    CancellationRequested,
+    AlreadyCancelled,
+    AlreadyTerminal,
+}
+
+impl RunInvocationCancelOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CancellationRequested => "cancellation_requested",
+            Self::AlreadyCancelled => "already_cancelled",
+            Self::AlreadyTerminal => "already_terminal",
+        }
+    }
+}
+
+/// Versioned, content-free cancel response for a run invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInvocationCancelResultV1 {
+    pub schema_version: u32,
+    pub client_submission_id: Uuid,
+    pub outcome: RunInvocationCancelOutcome,
+    pub state: RunInvocationLifecycleState,
+    pub state_version: u64,
+}
+
+impl RunInvocationCancelResultV1 {
+    pub const SCHEMA_VERSION: u32 = 1;
 }
 #[macro_export]
 macro_rules! response_variants {
@@ -515,6 +685,8 @@ macro_rules! response_variants {
             (Response::DelegationRecursionState { .. }, "delegation_recursion_state");
             (Response::CaffeinateState { .. }, "caffeinate_state");
             (Response::PausedWork { .. }, "paused_work");
+            (Response::RunInvocationStatus { .. }, "run_invocation_status");
+            (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::Unknown, "__unknown");
         ] }
     };
@@ -544,6 +716,77 @@ mod tests {
             Response::SealedValues { values: Vec::new() }.wire_tag(),
             "sealed_values"
         );
+    }
+
+    #[test]
+    fn run_invocation_status_and_cancel_response_fixtures() {
+        let id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let status = RunInvocationStatusV1 {
+            schema_version: RunInvocationStatusV1::SCHEMA_VERSION,
+            client_submission_id: id,
+            state: RunInvocationLifecycleState::Queued,
+            state_version: 2,
+            created_at_wall_ms: 1_700_000_000_000,
+            updated_at_wall_ms: 1_700_000_001_000,
+            max_turns: None,
+            timeout_ms: Some(86_400_000),
+            remaining_ms: Some(86_399_000),
+            reserved_turns: 0,
+            terminal_at_wall_ms: None,
+            terminal_reason: None,
+        };
+        let status_json = serde_json::to_value(&Response::RunInvocationStatus {
+            status: status.clone(),
+        })
+        .unwrap();
+        assert_eq!(status_json["response"], "run_invocation_status");
+        let data = &status_json["data"]["status"];
+        assert_eq!(data["schema_version"], 1);
+        assert_eq!(data["client_submission_id"], id.to_string());
+        assert_eq!(data["state"], "queued");
+        assert_eq!(data["state_version"], 2);
+        assert!(data.get("max_turns").is_none());
+        assert_eq!(data["timeout_ms"], 86_400_000);
+        assert!(data.get("prompt").is_none());
+        assert!(data.get("session_id").is_none());
+        assert!(data.get("project_root").is_none());
+        assert!(data.get("output").is_none());
+        assert!(data.get("error").is_none());
+        assert!(data.get("provider").is_none());
+
+        let terminal = RunInvocationStatusV1 {
+            state: RunInvocationLifecycleState::TimeoutExpired,
+            terminal_at_wall_ms: Some(1_700_000_100_000),
+            terminal_reason: Some(RunInvocationTerminalReason::TimeoutExpired),
+            remaining_ms: Some(0),
+            reserved_turns: 1,
+            ..status
+        };
+        let terminal_json = serde_json::to_value(&terminal).unwrap();
+        assert_eq!(terminal_json["state"], "timeout_expired");
+        assert_eq!(terminal_json["terminal_reason"], "timeout_expired");
+
+        let cancel = RunInvocationCancelResultV1 {
+            schema_version: RunInvocationCancelResultV1::SCHEMA_VERSION,
+            client_submission_id: id,
+            outcome: RunInvocationCancelOutcome::CancellationRequested,
+            state: RunInvocationLifecycleState::CancellationRequested,
+            state_version: 3,
+        };
+        let cancel_resp = Response::RunInvocationCancelResult { result: cancel };
+        assert_eq!(cancel_resp.wire_tag(), "run_invocation_cancel_result");
+        let cancel_json = serde_json::to_value(&cancel_resp).unwrap();
+        assert_eq!(
+            cancel_json["data"]["result"]["outcome"],
+            "cancellation_requested"
+        );
+        assert!(cancel_json["data"]["result"].get("session_id").is_none());
+
+        // Closed enums reject unknown variants at the wire boundary.
+        assert!(
+            serde_json::from_value::<RunInvocationLifecycleState>(json!("still_cooking")).is_err()
+        );
+        assert!(serde_json::from_value::<RunInvocationTerminalReason>(json!("oops")).is_err());
     }
 
     #[test]

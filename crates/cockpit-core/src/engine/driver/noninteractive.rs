@@ -1015,6 +1015,7 @@ impl Driver {
                     client_submissions: Vec::new(),
                     queue_target: None,
                     pending_terminal_disposition: None,
+                    run_invocation_id: None,
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {
@@ -2804,6 +2805,7 @@ impl Driver {
                     client_submissions: Vec::new(),
                     queue_target: None,
                     pending_terminal_disposition: None,
+                    run_invocation_id: None,
                 }))
             }
             completion = self.recv_noninteractive_completion_for(&task_call_id) => {

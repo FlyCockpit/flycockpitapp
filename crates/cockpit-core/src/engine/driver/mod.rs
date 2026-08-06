@@ -4677,6 +4677,7 @@ impl Driver {
             client_submissions: submission.client_submissions,
             queue_target: submission.queue_target,
             pending_terminal_disposition: None,
+            run_invocation_id: submission.run_invocation_id,
         })
     }
 
@@ -4797,6 +4798,7 @@ impl Driver {
                 client_submissions: Vec::new(),
                 queue_target: None,
                 pending_terminal_disposition: None,
+                run_invocation_id: None,
             }));
         }
         let result = self
@@ -6365,6 +6367,9 @@ impl Driver {
                 slot: self.cancel_current.clone(),
             }
         };
+        // Run-invocation deadline: child cancel token so expiry aborts provider/
+        // tool/approval work without waiting for cooperation.
+        let mut _run_deadline_task: Option<tokio::task::JoinHandle<()>> = None;
         // Timeline event (session-log-export Part B): the unit of user /
         // injected input that drives this run. Tagged with the foreground
         // agent. Recorded before prelude/seed wrapping so the export shows
@@ -6375,6 +6380,62 @@ impl Driver {
         let client_submissions = submission.client_submissions.clone();
         let queue_target = submission.queue_target.clone();
         let pending_terminal_disposition = submission.pending_terminal_disposition;
+        let run_invocation_id = submission.run_invocation_id;
+        if let Some(run_id) = run_invocation_id {
+            let now = crate::daemon::server::run_invocation_wall_ms_now();
+            // Checkpoint remaining before any side effect (queue already done).
+            if let Ok(Some(row)) = self.session.db.get_run_invocation(run_id).await {
+                if let Some(remaining) = row.remaining_ms {
+                    if remaining == 0 {
+                        let _ = self
+                            .session
+                            .db
+                            .fire_run_invocation_timeout(run_id, now)
+                            .await;
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::TimeoutIdle,
+                        });
+                        return Ok(());
+                    }
+                    // Parent cancel is owned by the live deadline: expiry cancels
+                    // in-flight provider/tool/approval work and commits TimeoutExpired once.
+                    let deadline_cancel = cancel.clone();
+                    let db = self.session.db.clone();
+                    _run_deadline_task = Some(tokio::spawn(async move {
+                        tokio::select! {
+                            _ = deadline_cancel.cancelled() => {
+                                // External cancel already owns the outcome.
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(remaining)) => {
+                                // Cancel first so non-cooperative work begins reaping.
+                                deadline_cancel.cancel();
+                                let wall = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                let _ = db.fire_run_invocation_timeout(run_id, wall).await;
+                            }
+                        }
+                    }));
+                }
+                // Transition accepted → queued/running bookkeeping.
+                let _ = self
+                    .session
+                    .db
+                    .update_run_invocation_state(
+                        run_id,
+                        row.state_version,
+                        "queued",
+                        row.remaining_ms,
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
+            }
+        }
         let event_data = user_message_event_data(UserMessageEventData {
             text: &user_text,
             display_text: display_text.as_deref(),
@@ -6448,6 +6509,7 @@ impl Driver {
                             client_submissions,
                             queue_target,
                             pending_terminal_disposition,
+                            run_invocation_id,
                         },
                         self.active_queue_target(),
                         DURABLE_SUBMISSION_RETRY_BACKOFF,
@@ -6566,6 +6628,7 @@ impl Driver {
                 client_submissions: Vec::new(),
                 queue_target: None,
                 pending_terminal_disposition: None,
+                run_invocation_id: None,
             })
         } else {
             crate::engine::message::build_user_message(UserSubmission {
@@ -6586,6 +6649,7 @@ impl Driver {
                 client_submissions: Vec::new(),
                 queue_target: None,
                 pending_terminal_disposition: None,
+                run_invocation_id: None,
             })
         };
         let max_primary_rounds = self.max_primary_rounds;
@@ -6637,6 +6701,83 @@ impl Driver {
             self.emit_command_capability_notice_if_new(tx).await;
             let mut turn_metadata = BackupTurnMetadata::default();
             let fallback_models = self.resolve_failover_models(&agent.model);
+            // Run-invocation turn reservation: exact N max, terminal before N+1.
+            if let Some(run_id) = run_invocation_id {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                // Checkpoint remaining before provider dispatch.
+                if let Ok(Some(row)) = self.session.db.get_run_invocation(run_id).await {
+                    if row.terminal_at_wall_ms.is_some() {
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::TimeoutIdle,
+                        });
+                        return Ok(());
+                    }
+                    if row.timeout_ms.is_some() {
+                        let _ = self
+                            .session
+                            .db
+                            .checkpoint_run_invocation_remaining(
+                                run_id,
+                                match crate::daemon::server::run_invocation_remaining_after_restart(
+                                    row.remaining_ms,
+                                    row.last_observed_wall_ms,
+                                    now,
+                                ) {
+                                    crate::daemon::server::RunInvocationRemaining::Remaining(ms) => {
+                                        Some(ms)
+                                    }
+                                    crate::daemon::server::RunInvocationRemaining::Expired
+                                    | crate::daemon::server::RunInvocationRemaining::ClockRollback => {
+                                        let _ = self
+                                            .session
+                                            .db
+                                            .fire_run_invocation_timeout(run_id, now)
+                                            .await;
+                                        cancel.cancel();
+                                        self.pending_idle_reason =
+                                            Some(crate::engine::IdleReason::Error {
+                                                class: crate::engine::model::InferenceErrorClass::TimeoutIdle,
+                                            });
+                                        return Ok(());
+                                    }
+                                    crate::daemon::server::RunInvocationRemaining::Unbounded => None,
+                                },
+                                now,
+                            )
+                            .await;
+                    }
+                }
+                match self
+                    .session
+                    .db
+                    .reserve_run_invocation_turn(run_id, now)
+                    .await
+                {
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::Reserved(_)) => {}
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::MaxTurnsExceeded(_)) => {
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                            class: crate::engine::model::InferenceErrorClass::Other(
+                                "max_turns_exceeded".into(),
+                            ),
+                        });
+                        return Ok(());
+                    }
+                    Ok(
+                        crate::db::run_invocations::ReserveTurnOutcome::AlreadyTerminal(_)
+                        | crate::db::run_invocations::ReserveTurnOutcome::CancelRequested(_),
+                    ) => {
+                        cancel.cancel();
+                        return Ok(());
+                    }
+                    Ok(crate::db::run_invocations::ReserveTurnOutcome::NotFound) | Err(_) => {
+                        // Fail closed: do not dispatch without a reservation.
+                        return Ok(());
+                    }
+                }
+            }
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 // The foreground frame's deferred-log buffer (`plan.md §3d`):
@@ -6710,6 +6851,18 @@ impl Driver {
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
+                    if let Some(run_id) = run_invocation_id {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        // Deadline may have already timed out; mark cancel only if still active.
+                        let _ = self
+                            .session
+                            .db
+                            .mark_run_invocation_terminal(run_id, "cancelled", "cancelled", now)
+                            .await;
+                    }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::Cancelled,
                         input_rx,
@@ -6762,6 +6915,17 @@ impl Driver {
                         self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
                             class: f.class.clone(),
                         });
+                    }
+                    if let Some(run_id) = run_invocation_id {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let _ = self
+                            .session
+                            .db
+                            .mark_run_invocation_terminal(run_id, "failed", "failed", now)
+                            .await;
                     }
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
@@ -6884,6 +7048,7 @@ impl Driver {
                                         client_submissions: Vec::new(),
                                         queue_target: None,
                                         pending_terminal_disposition: None,
+                                        run_invocation_id: None,
                                     });
                             }
                         }
@@ -6964,7 +7129,10 @@ impl Driver {
                                         client_submissions: Vec::new(),
                                         queue_target: None,
                                         pending_terminal_disposition: None,
+                                        run_invocation_id: prepared.run_invocation_id,
                                     });
+                                // Continue under the next invocation's identity when present.
+                                // (Outer `run_invocation_id` still binds the original run.)
                                 continue;
                             }
                         }
@@ -6978,6 +7146,17 @@ impl Driver {
                         }
                     }
                     self.maybe_spawn_self_improvement_review(tx).await;
+                    if let Some(run_id) = run_invocation_id {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let _ = self
+                            .session
+                            .db
+                            .mark_run_invocation_terminal(run_id, "succeeded", "succeeded", now)
+                            .await;
+                    }
                     return Ok(());
                 }
                 TurnOutcome::SpawnSubagent {

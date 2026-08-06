@@ -24,6 +24,22 @@ where
     Ok(value)
 }
 
+/// Client-owned immutable bounds attached to a `cockpit run` submission.
+///
+/// Presence of this object (including both dimensions `None`) is the run
+/// marker that creates a durable `RunInvocationState`. Bounds are never
+/// defaulted by the daemon; omitted dimensions stay unbounded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInvocationOptions {
+    /// Maximum provider-dispatch reservations. `None` is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Wall/monotonic timeout budget in milliseconds from durable acceptance.
+    /// `None` is unbounded. Zero is never treated as unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
 /// Client → daemon RPCs. The daemon answers each with a matching
 /// [`Response`] keyed by envelope id, or an [`ErrorPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +127,9 @@ pub enum Request {
         /// daemon uses it as the queue item id and durable idempotency key, so
         /// a retry after an ambiguous response/socket loss cannot execute the
         /// message twice or reconcile the wrong optimistic transcript row.
+        ///
+        /// When `run_invocation_options` is present this UUID is also the
+        /// daemon-global run invocation id (no parallel identity exists).
         client_submission_id: Uuid,
         text: String,
         /// User-facing transcript form. When absent, clients display `text`.
@@ -128,6 +147,25 @@ pub enum Request {
         /// ordinary message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forced_skill: Option<String>,
+        /// Client-owned immutable bounds marker. Presence (even when both
+        /// dimensions are `None`/unbounded) creates a durable run invocation
+        /// keyed solely by `client_submission_id`. Non-run clients omit this
+        /// field; `cockpit run` always sends `Some(...)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_invocation_options: Option<RunInvocationOptions>,
+    },
+
+    /// Query durable run-invocation status by the canonical client submission
+    /// id. Does not require an attached session.
+    GetRunInvocationStatus {
+        client_submission_id: Uuid,
+    },
+
+    /// Request cancellation of a run invocation by the same client submission
+    /// id used at start. Idempotent compare-and-set; does not introduce a
+    /// second cancellation identity.
+    CancelRunInvocation {
+        client_submission_id: Uuid,
     },
 
     /// Side-channel steer for a running noninteractive child. This bypasses
@@ -980,7 +1018,28 @@ impl Request {
             }
             Self::SendUserMessage {
                 client_submission_id,
+                run_invocation_options,
                 ..
+            } => {
+                if client_submission_id.is_nil() {
+                    return Err("client_submission_id must not be nil".to_string());
+                }
+                if let Some(options) = run_invocation_options {
+                    if options.max_turns == Some(0) {
+                        return Err("run_invocation_options.max_turns must not be zero".to_string());
+                    }
+                    if options.timeout_ms == Some(0) {
+                        return Err(
+                            "run_invocation_options.timeout_ms must not be zero".to_string()
+                        );
+                    }
+                }
+            }
+            Self::GetRunInvocationStatus {
+                client_submission_id,
+            }
+            | Self::CancelRunInvocation {
+                client_submission_id,
             } if client_submission_id.is_nil() => {
                 return Err("client_submission_id must not be nil".to_string());
             }
@@ -996,6 +1055,8 @@ macro_rules! request_variants {
             (Request::Attach { .. }, "attach");
             (Request::SubagentTranscript { .. }, "subagent_transcript");
             (Request::SendUserMessage { .. }, "send_user_message");
+            (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
+            (Request::CancelRunInvocation { .. }, "cancel_run_invocation");
             (Request::SteerDelegation { .. }, "steer_delegation");
             (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload");
             (Request::UploadAttachmentChunk { .. }, "upload_attachment_chunk");
@@ -1130,6 +1191,8 @@ macro_rules! command {
             (Request::Attach { session_id, .. }, "attach", custom(authorize_attach), option_field(session_id), true, serialized, none);
             (Request::SubagentTranscript { session_id, .. }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, concurrent, none);
             (Request::SendUserMessage { .. }, "send_user_message", session_writer, attached, true, serialized, none);
+            (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status", public_read, none, false, concurrent, none);
+            (Request::CancelRunInvocation { .. }, "cancel_run_invocation", public_read, none, true, serialized, none);
             (Request::SteerDelegation { session_id, .. }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, serialized, none);
             (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, serialized, none);
             (Request::UploadAttachmentChunk { .. }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, serialized, none);
@@ -1401,6 +1464,7 @@ mod tests {
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
             forced_skill: None,
+            run_invocation_options: None,
         };
         assert_eq!(
             nil_submission.validate_semantics().unwrap_err(),
@@ -1515,6 +1579,147 @@ mod tests {
         let command_tags = crate::command!(command_tags);
         for tag in tags {
             assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn run_invocation_options_protocol() {
+        let id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let unbounded = RunInvocationOptions::default();
+        let bounded = RunInvocationOptions {
+            max_turns: Some(3),
+            timeout_ms: Some(60_000),
+        };
+
+        let send = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "run me".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(unbounded.clone()),
+        };
+        let json = serde_json::to_value(&send).unwrap();
+        assert_eq!(json["request"], "send_user_message");
+        assert_eq!(json["params"]["client_submission_id"], id.to_string());
+        // Empty options object is the run marker; absent dimensions omit/null.
+        assert_eq!(
+            json["params"]["run_invocation_options"],
+            serde_json::json!({})
+        );
+        assert!(json["params"].get("invocation_id").is_none());
+        assert!(json["params"].get("state_version").is_none());
+        assert!(json["params"].get("remaining_ms").is_none());
+
+        let bounded_send = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "run me".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(bounded.clone()),
+        };
+        let bounded_json = serde_json::to_value(&bounded_send).unwrap();
+        assert_eq!(
+            bounded_json["params"]["run_invocation_options"]["max_turns"],
+            3
+        );
+        assert_eq!(
+            bounded_json["params"]["run_invocation_options"]["timeout_ms"],
+            60_000
+        );
+
+        let non_run = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "interactive".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        };
+        let non_run_json = serde_json::to_value(&non_run).unwrap();
+        assert!(
+            non_run_json["params"]
+                .get("run_invocation_options")
+                .is_none()
+        );
+
+        let status = Request::GetRunInvocationStatus {
+            client_submission_id: id,
+        };
+        assert_eq!(status.wire_tag(), "get_run_invocation_status");
+        let status_json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            status_json["params"]["client_submission_id"],
+            id.to_string()
+        );
+        assert!(status_json["params"].get("session_id").is_none());
+        assert!(status_json["params"].get("invocation_id").is_none());
+
+        let cancel = Request::CancelRunInvocation {
+            client_submission_id: id,
+        };
+        assert_eq!(cancel.wire_tag(), "cancel_run_invocation");
+        let cancel_json = serde_json::to_value(&cancel).unwrap();
+        assert_eq!(
+            cancel_json["params"]["client_submission_id"],
+            id.to_string()
+        );
+        assert!(cancel_json["params"].get("session_id").is_none());
+
+        let command_tags = crate::command!(command_tags);
+        assert!(command_tags.contains(&"get_run_invocation_status"));
+        assert!(command_tags.contains(&"cancel_run_invocation"));
+
+        // Zero is never unbounded: semantic validation rejects it.
+        let zero_turns = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "x".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(RunInvocationOptions {
+                max_turns: Some(0),
+                timeout_ms: None,
+            }),
+        };
+        assert!(
+            zero_turns
+                .validate_semantics()
+                .unwrap_err()
+                .contains("max_turns")
+        );
+        let zero_timeout = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "x".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(RunInvocationOptions {
+                max_turns: None,
+                timeout_ms: Some(0),
+            }),
+        };
+        assert!(
+            zero_timeout
+                .validate_semantics()
+                .unwrap_err()
+                .contains("timeout_ms")
+        );
+
+        // Round-trip preserves options immutably.
+        let again: Request = serde_json::from_value(bounded_json).unwrap();
+        match again {
+            Request::SendUserMessage {
+                run_invocation_options: Some(opts),
+                ..
+            } => assert_eq!(opts, bounded),
+            other => panic!("expected SendUserMessage, got {other:?}"),
         }
     }
 }

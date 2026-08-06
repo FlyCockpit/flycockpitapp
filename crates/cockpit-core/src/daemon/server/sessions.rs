@@ -407,6 +407,13 @@ pub(super) async fn delete_session(
     // live workers in the affected subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
     stop_subtree(ctx, session_id, true).await?;
+    // Terminalize active run invocations at the deletion transaction's wall
+    // time without cascading their durable rows with the session.
+    let now_wall_ms = super::run_invocation::wall_ms_now();
+    ctx.db
+        .terminalize_session_run_invocations(session_id, now_wall_ms)
+        .await
+        .map_err(internal)?;
     ctx.db.delete_session(session_id).await.map_err(internal)?;
     Ok(Response::Ack)
 }

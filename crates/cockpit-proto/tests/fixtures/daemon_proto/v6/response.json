@@ -1236,6 +1236,34 @@
     },
     "response": "usage_counts"
   },
+  "run_invocation_status": {
+    "data": {
+      "status": {
+        "schema_version": 1,
+        "client_submission_id": "11111111-1111-4111-8111-111111111111",
+        "state": "queued",
+        "state_version": 2,
+        "created_at_wall_ms": 1700000000000,
+        "updated_at_wall_ms": 1700000001000,
+        "timeout_ms": 86400000,
+        "remaining_ms": 86399000,
+        "reserved_turns": 0
+      }
+    },
+    "response": "run_invocation_status"
+  },
+  "run_invocation_cancel_result": {
+    "data": {
+      "result": {
+        "schema_version": 1,
+        "client_submission_id": "11111111-1111-4111-8111-111111111111",
+        "outcome": "cancellation_requested",
+        "state": "cancellation_requested",
+        "state_version": 3
+      }
+    },
+    "response": "run_invocation_cancel_result"
+  },
   "user_message_queued": {
     "data": {
       "item": {

@@ -275,8 +275,17 @@ const requestParamSchemas = {
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       image_refs: z.array(z.object({ id: uuidSchema }).passthrough()).optional(),
       forced_skill: optionalStringSchema,
+      run_invocation_options: z
+        .object({
+          max_turns: z.number().int().positive().optional(),
+          timeout_ms: z.number().int().positive().optional(),
+        })
+        .strict()
+        .optional(),
     })
     .strict(),
+  get_run_invocation_status: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
+  cancel_run_invocation: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   session_live_status: z.object({ session_ids: z.array(uuidSchema) }).strict(),
   set_model_favorite: z
     .object({
@@ -363,6 +372,8 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
+  requestVariant("get_run_invocation_status", requestParamSchemas.get_run_invocation_status),
+  requestVariant("cancel_run_invocation", requestParamSchemas.cancel_run_invocation),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
   requestVariant("set_model_favorite", requestParamSchemas.set_model_favorite),
   requestVariant("set_active_model", requestParamSchemas.set_active_model),
@@ -380,6 +391,60 @@ export const clientEnvelopeSchema = z.intersection(
 );
 export type ClientEnvelope = z.infer<typeof clientEnvelopeSchema>;
 
+export const runInvocationLifecycleStateSchema = z.enum([
+  "accepted",
+  "queued",
+  "dispatching",
+  "submission_unknown",
+  "running",
+  "cancellation_requested",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timeout_expired",
+  "max_turns_exceeded",
+  "clock_rollback_timed_out",
+  "outcome_unknown",
+]);
+export type RunInvocationLifecycleState = z.infer<typeof runInvocationLifecycleStateSchema>;
+export const runInvocationTerminalReasonSchema = z.enum([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "cancelled_session_deleted",
+  "timeout_expired",
+  "max_turns_exceeded",
+  "clock_rollback_timed_out",
+  "outcome_unknown",
+]);
+export const runInvocationStatusV1Schema = z
+  .object({
+    schema_version: z.literal(1),
+    client_submission_id: uuidSchema,
+    state: runInvocationLifecycleStateSchema,
+    state_version: z.number().int().nonnegative(),
+    created_at_wall_ms: z.number().int(),
+    updated_at_wall_ms: z.number().int(),
+    max_turns: z.number().int().positive().nullable().optional(),
+    timeout_ms: z.number().int().positive().nullable().optional(),
+    remaining_ms: z.number().int().nonnegative().nullable().optional(),
+    reserved_turns: z.number().int().nonnegative(),
+    terminal_at_wall_ms: z.number().int().nullable().optional(),
+    terminal_reason: runInvocationTerminalReasonSchema.nullable().optional(),
+  })
+  .strict();
+export type RunInvocationStatusV1 = z.infer<typeof runInvocationStatusV1Schema>;
+export const runInvocationCancelResultV1Schema = z
+  .object({
+    schema_version: z.literal(1),
+    client_submission_id: uuidSchema,
+    outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal"]),
+    state: runInvocationLifecycleStateSchema,
+    state_version: z.number().int().nonnegative(),
+  })
+  .strict();
+export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResultV1Schema>;
+
 export const responseNameSchema = z.enum([
   "ack",
   "attached",
@@ -394,6 +459,8 @@ export const responseNameSchema = z.enum([
   "inventory_bundle",
   "models",
   "restart_decision",
+  "run_invocation_status",
+  "run_invocation_cancel_result",
   "session_messages",
   "session_live_status",
   "sessions",
@@ -845,6 +912,14 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ statuses: z.array(liveStatusWireSchema) }).passthrough(),
   ),
   responseVariant("user_message_queued", userMessageQueuedResultSchema),
+  responseVariant(
+    "run_invocation_status",
+    z.object({ status: runInvocationStatusV1Schema }).strict(),
+  ),
+  responseVariant(
+    "run_invocation_cancel_result",
+    z.object({ result: runInvocationCancelResultV1Schema }).strict(),
+  ),
 ]);
 export type ResponseEnvelope = z.infer<typeof responseEnvelopeSchema>;
 

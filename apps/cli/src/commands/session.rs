@@ -332,7 +332,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
         } else {
             OutputFormat::Default
         };
-        crate::commands::run::pump_events(&client, session_id, format, args.json, &[], false)
+        crate::commands::run::pump_events(&client, session_id, format, args.json, &[], false, None)
             .await?;
     }
     Ok(())

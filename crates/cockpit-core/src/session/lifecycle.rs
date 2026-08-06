@@ -315,6 +315,8 @@ impl Session {
             approval_mode: AtomicU8::new(approval_mode_to_u8(
                 crate::config::extended::ApprovalMode::Manual,
             )),
+            invocation_approval_override: AtomicU8::new(255),
+            active_run_invocation_id: Mutex::new(None),
             // Default ON until the spawn path applies the config default.
             shell_compression_enabled: AtomicBool::new(true),
             active_tool_names: Mutex::new(std::collections::HashSet::new()),

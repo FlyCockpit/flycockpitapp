@@ -1619,6 +1619,7 @@ mod tests {
             ephemeral: false,
             max_turns: None,
             timeout: None,
+            permission_mode: None,
         }
     }
 
@@ -1693,6 +1694,182 @@ mod tests {
         // Zero never means unbounded: parser rejects zero rather than mapping to None.
         assert!(Cli::try_parse_from(["cockpit", "run", "--timeout", "0", "hi"]).is_err());
         assert!(Cli::try_parse_from(["cockpit", "run", "--max-turns", "0", "hi"]).is_err());
+    }
+
+    #[test]
+    fn permission_mode_parses_exact_variants() {
+        use crate::cli::{Cli, Command, PermissionModeArg};
+        use crate::daemon::proto::ApprovalMode;
+        use clap::{CommandFactory, Parser};
+
+        for (raw, expected) in [
+            ("manual", PermissionModeArg::Manual),
+            ("auto", PermissionModeArg::Auto),
+            ("yolo", PermissionModeArg::Yolo),
+        ] {
+            let cli =
+                Cli::try_parse_from(["cockpit", "run", "--permission-mode", raw, "hi"]).unwrap();
+            let Command::Run(args) = cli.command.unwrap() else {
+                panic!("expected run");
+            };
+            assert_eq!(args.permission_mode, Some(expected));
+            assert_eq!(
+                args.run_invocation_options().approval_mode,
+                Some(ApprovalMode::from(expected))
+            );
+        }
+
+        // Omitted → no override (session/default).
+        let plain = Cli::try_parse_from(["cockpit", "run", "hi"]).unwrap();
+        let Command::Run(args) = plain.command.unwrap() else {
+            panic!("expected run");
+        };
+        assert_eq!(args.permission_mode, None);
+        assert_eq!(args.run_invocation_options().approval_mode, None);
+
+        // Invalid values are clap usage errors.
+        for bad in ["Manual", "AUTO", "yes", "1", "full", ""] {
+            assert!(
+                Cli::try_parse_from(["cockpit", "run", "--permission-mode", bad, "hi"]).is_err(),
+                "permission-mode {bad:?} must fail"
+            );
+        }
+
+        // Help lists the exact variants.
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--permission-mode"), "{help}");
+        for variant in ["manual", "auto", "yolo"] {
+            assert!(
+                help.to_lowercase().contains(variant),
+                "help must list {variant}: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_permission_mode_uses_submission_id_and_immutable_options() {
+        use crate::daemon::proto::{ApprovalMode, Request, RunInvocationOptions};
+        use uuid::Uuid;
+
+        // Run path constructs SendUserMessage with client_submission_id + options.
+        // Never SetApprovalMode; approval_mode is client-owned immutable input.
+        let id = Uuid::new_v4();
+        let options = RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(ApprovalMode::Yolo),
+        };
+        let send = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "go".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(options.clone()),
+        };
+        let json = serde_json::to_value(&send).unwrap();
+        assert_eq!(json["request"], "send_user_message");
+        assert_eq!(json["params"]["client_submission_id"], id.to_string());
+        assert_eq!(
+            json["params"]["run_invocation_options"]["approval_mode"],
+            "yolo"
+        );
+        // Sole identity: no parallel invocation_id; no daemon-owned state fields.
+        assert!(json["params"].get("invocation_id").is_none());
+        assert!(json["params"].get("state_version").is_none());
+        assert!(json["params"].get("remaining_ms").is_none());
+        assert!(json["params"].get("checkpoint").is_none());
+        // approval_mode is only under options — not a sibling state field.
+        assert!(json["params"].get("approval_mode").is_none());
+
+        // Run ordering rejects SetApprovalMode as the run permission mechanism.
+        let set = Request::SetApprovalMode {
+            mode: ApprovalMode::Yolo,
+        };
+        assert_eq!(set.wire_tag(), "set_approval_mode");
+        assert_ne!(set.wire_tag(), send.wire_tag());
+        // Shared envelope requires SendUserMessage with options marker.
+        match send {
+            Request::SendUserMessage {
+                client_submission_id,
+                run_invocation_options: Some(opts),
+                ..
+            } => {
+                assert_eq!(client_submission_id, id);
+                assert_eq!(opts.approval_mode, Some(ApprovalMode::Yolo));
+            }
+            other => panic!("run path must send SendUserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_override_default() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["cockpit", "run", "hi"]).unwrap();
+        let Command::Run(args) = cli.command.unwrap() else {
+            panic!();
+        };
+        let opts = args.run_invocation_options();
+        assert!(opts.approval_mode.is_none());
+        // Marker is still Some for cockpit run (bounds dimensions may be None).
+        assert!(matches!(
+            Some(opts),
+            Some(crate::daemon::proto::RunInvocationOptions {
+                approval_mode: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn init_learn_no_override() {
+        use crate::cli::Cli;
+        use clap::{CommandFactory, Parser};
+
+        // Init/learn have no --permission-mode / --max-turns / --timeout flags.
+        for sub in ["init", "assistant"] {
+            let mut root = Cli::command();
+            let help = if sub == "assistant" {
+                root.find_subcommand_mut("assistant")
+                    .unwrap()
+                    .find_subcommand_mut("learn")
+                    .unwrap()
+                    .render_long_help()
+                    .to_string()
+            } else {
+                root.find_subcommand_mut("init")
+                    .unwrap()
+                    .render_long_help()
+                    .to_string()
+            };
+            assert!(
+                !help.contains("--permission-mode"),
+                "{sub} must not expose --permission-mode: {help}"
+            );
+            assert!(
+                !help.contains("--max-turns"),
+                "{sub} must not expose --max-turns"
+            );
+            assert!(
+                !help.contains("--timeout"),
+                "{sub} must not expose --timeout"
+            );
+        }
+
+        // Pump options for init/learn leave run_invocation_options as None.
+        let pump = RunPumpOptions::default();
+        assert!(pump.run_invocation_options.is_none());
+
+        // Parse paths still work without the flag.
+        assert!(Cli::try_parse_from(["cockpit", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["cockpit", "assistant", "learn", "how we deploy"]).is_ok());
     }
 
     fn approval_question(class: GrantKind) -> proto::InterruptQuestion {

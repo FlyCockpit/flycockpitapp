@@ -279,6 +279,7 @@ const requestParamSchemas = {
         .object({
           max_turns: z.number().int().positive().optional(),
           timeout_ms: z.number().int().positive().optional(),
+          approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
         })
         .strict()
         .optional(),

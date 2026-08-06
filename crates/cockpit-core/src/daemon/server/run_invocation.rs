@@ -47,15 +47,20 @@ pub fn options_digest(options: &proto::RunInvocationOptions) -> String {
             hasher.update(n.to_le_bytes());
         }
     }
+    match options.approval_mode {
+        None => hasher.update(b"am:none"),
+        Some(mode) => {
+            hasher.update(b"am:some");
+            hasher.update(mode.as_str().as_bytes());
+        }
+    }
     crate::intel::hex_lower(&hasher.finalize())
 }
 
 pub fn options_json(options: &proto::RunInvocationOptions) -> Result<String, ErrorPayload> {
-    serde_json::to_string(&serde_json::json!({
-        "max_turns": options.max_turns,
-        "timeout_ms": options.timeout_ms,
-    }))
-    .map_err(internal)
+    // Canonicalize through the shared serde shape so approval_mode is
+    // immutable client input in options_json only (no daemon state field).
+    serde_json::to_string(options).map_err(internal)
 }
 
 pub fn content_digest(wire_fingerprint: &str, options_digest: &str) -> String {
@@ -623,10 +628,12 @@ mod tests {
         let a = proto::RunInvocationOptions {
             max_turns: None,
             timeout_ms: None,
+            approval_mode: None,
         };
         let b = proto::RunInvocationOptions {
             max_turns: Some(1),
             timeout_ms: None,
+            approval_mode: None,
         };
         assert_eq!(options_digest(&a), options_digest(&a));
         assert_ne!(options_digest(&a), options_digest(&b));
@@ -634,8 +641,184 @@ mod tests {
         let zero = proto::RunInvocationOptions {
             max_turns: Some(0),
             timeout_ms: None,
+            approval_mode: None,
         };
         assert_ne!(options_digest(&a), options_digest(&zero));
+        // approval_mode is part of the immutable client digest.
+        let yolo = proto::RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(proto::ApprovalMode::Yolo),
+        };
+        let manual = proto::RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(proto::ApprovalMode::Manual),
+        };
+        assert_ne!(options_digest(&a), options_digest(&yolo));
+        assert_ne!(options_digest(&yolo), options_digest(&manual));
+        assert!(options_json(&yolo).unwrap().contains("yolo"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_modes_are_isolated() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Uuid::new_v4();
+        let manual_id = Uuid::from_u128(0x11);
+        let yolo_id = Uuid::from_u128(0x22);
+        let now = 1_700_000_000_000i64;
+        let origin = principal_digest(&ClientPrincipal::Owner);
+
+        let manual_opts = proto::RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(proto::ApprovalMode::Manual),
+        };
+        let yolo_opts = proto::RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(proto::ApprovalMode::Yolo),
+        };
+        for (id, opts) in [(manual_id, &manual_opts), (yolo_id, &yolo_opts)] {
+            let oj = options_json(opts).unwrap();
+            let od = options_digest(opts);
+            let content = content_digest(&format!("text:{id}"), &od);
+            let outcome = db
+                .accept_run_invocation(
+                    id,
+                    origin.clone(),
+                    session,
+                    oj,
+                    od,
+                    content,
+                    None,
+                    None,
+                    now,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, AcceptRunInvocationOutcome::Created(_)));
+        }
+
+        // Parked side by side: each durable record retains its own mode.
+        let manual_row = db.get_run_invocation(manual_id).await.unwrap().unwrap();
+        let yolo_row = db.get_run_invocation(yolo_id).await.unwrap().unwrap();
+        let manual_parsed: proto::RunInvocationOptions =
+            serde_json::from_str(&manual_row.options_json).unwrap();
+        let yolo_parsed: proto::RunInvocationOptions =
+            serde_json::from_str(&yolo_row.options_json).unwrap();
+        assert_eq!(
+            manual_parsed.approval_mode,
+            Some(proto::ApprovalMode::Manual)
+        );
+        assert_eq!(yolo_parsed.approval_mode, Some(proto::ApprovalMode::Yolo));
+        assert_ne!(manual_row.options_digest, yolo_row.options_digest);
+        // Status exposes bounds columns only — no duplicate approval_mode state field.
+        assert!(manual_row.max_turns.is_none());
+        assert!(!manual_row.options_json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_mode_survives_restart() {
+        let db = Db::open_in_memory().unwrap();
+        let session = Uuid::new_v4();
+        let id = Uuid::from_u128(0x33);
+        let now = 1_700_000_000_000i64;
+        let opts = proto::RunInvocationOptions {
+            max_turns: Some(2),
+            timeout_ms: Some(60_000),
+            approval_mode: Some(proto::ApprovalMode::Auto),
+        };
+        let oj = options_json(&opts).unwrap();
+        let od = options_digest(&opts);
+        db.accept_run_invocation(
+            id,
+            principal_digest(&ClientPrincipal::Owner),
+            session,
+            oj.clone(),
+            od.clone(),
+            content_digest("wire", &od),
+            opts.max_turns,
+            opts.timeout_ms,
+            now,
+        )
+        .await
+        .unwrap();
+
+        // Simulate restart: re-read durable options; they must be unchanged.
+        let row = db.get_run_invocation(id).await.unwrap().unwrap();
+        assert_eq!(row.options_json, oj);
+        assert_eq!(row.options_digest, od);
+        let parsed: proto::RunInvocationOptions = serde_json::from_str(&row.options_json).unwrap();
+        assert_eq!(parsed.approval_mode, Some(proto::ApprovalMode::Auto));
+        assert_eq!(parsed.max_turns, Some(2));
+        // Restart remaining math does not touch options.
+        let rem = remaining_after_restart(row.remaining_ms, row.last_observed_wall_ms, now + 1_000);
+        assert_eq!(rem, RemainingRestart::Remaining(59_000));
+        let after = db.get_run_invocation(id).await.unwrap().unwrap();
+        let after_parsed: proto::RunInvocationOptions =
+            serde_json::from_str(&after.options_json).unwrap();
+        assert_eq!(after_parsed.approval_mode, Some(proto::ApprovalMode::Auto));
+    }
+
+    #[tokio::test]
+    async fn cancelled_mode_does_not_leak() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = Uuid::new_v4();
+        let id = Uuid::from_u128(0x44);
+        let now = 1_700_000_000_000i64;
+        let opts = proto::RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(proto::ApprovalMode::Yolo),
+        };
+        let od = options_digest(&opts);
+        db.accept_run_invocation(
+            id,
+            principal_digest(&ClientPrincipal::Owner),
+            session_id,
+            options_json(&opts).unwrap(),
+            od.clone(),
+            content_digest("cancel-me", &od),
+            None,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+
+        // Cancel terminalizes only this invocation; options stay with the record
+        // and do not migrate to a later unbounded message (no run marker).
+        db.mark_run_invocation_terminal(id, "cancelled", "cancelled", now + 10)
+            .await
+            .unwrap();
+        let row = db.get_run_invocation(id).await.unwrap().unwrap();
+        assert_eq!(row.state, "cancelled");
+        let parsed: proto::RunInvocationOptions = serde_json::from_str(&row.options_json).unwrap();
+        assert_eq!(parsed.approval_mode, Some(proto::ApprovalMode::Yolo));
+
+        // A fresh invocation without override is independent.
+        let next = Uuid::from_u128(0x45);
+        let none_opts = proto::RunInvocationOptions::default();
+        let nod = options_digest(&none_opts);
+        db.accept_run_invocation(
+            next,
+            principal_digest(&ClientPrincipal::Owner),
+            session_id,
+            options_json(&none_opts).unwrap(),
+            nod.clone(),
+            content_digest("next", &nod),
+            None,
+            None,
+            now + 20,
+        )
+        .await
+        .unwrap();
+        let next_row = db.get_run_invocation(next).await.unwrap().unwrap();
+        let next_parsed: proto::RunInvocationOptions =
+            serde_json::from_str(&next_row.options_json).unwrap();
+        assert_eq!(next_parsed.approval_mode, None);
+        assert_ne!(next_row.options_digest, row.options_digest);
     }
 
     #[tokio::test]

@@ -468,6 +468,28 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Invocation-scoped permission mode for `cockpit run` only.
+/// Does not mutate session approval state.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum PermissionModeArg {
+    /// Ask for every grant-or-ask surface (session default when omitted).
+    Manual,
+    /// Utility-model safety gate first; fail closed without a guard model.
+    Auto,
+    /// Fully unattended for grant-or-ask surfaces; hard gates still apply.
+    Yolo,
+}
+
+impl From<PermissionModeArg> for crate::daemon::proto::ApprovalMode {
+    fn from(value: PermissionModeArg) -> Self {
+        match value {
+            PermissionModeArg::Manual => crate::daemon::proto::ApprovalMode::Manual,
+            PermissionModeArg::Auto => crate::daemon::proto::ApprovalMode::Auto,
+            PermissionModeArg::Yolo => crate::daemon::proto::ApprovalMode::Yolo,
+        }
+    }
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
     /// Message to send. When present, stdin is ignored. If absent, read
@@ -557,6 +579,12 @@ pub struct RunArgs {
     /// Omitted means unbounded. Zero is a usage error, never unbounded.
     #[arg(long, value_name = "SECONDS", value_parser = parse_timeout_secs)]
     pub timeout: Option<u64>,
+
+    /// Invocation-scoped permission mode for this run only
+    /// (`manual` | `auto` | `yolo`). Omitted uses the session/default mode.
+    /// Never mutates session approval state; concurrent runs may differ.
+    #[arg(long = "permission-mode", value_enum, value_name = "MODE")]
+    pub permission_mode: Option<PermissionModeArg>,
 }
 
 impl RunArgs {
@@ -573,6 +601,7 @@ impl RunArgs {
         crate::daemon::proto::RunInvocationOptions {
             max_turns: self.max_turns,
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
+            approval_mode: self.permission_mode.map(|m| m.into()),
         }
     }
 }

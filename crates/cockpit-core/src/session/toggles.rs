@@ -149,10 +149,54 @@ impl Session {
         self.agent_compact_requested.load(Ordering::Relaxed)
     }
 
-    /// The session's current command-approval mode
-    /// (implementation note). Read per gated tool call.
+    /// Effective command-approval mode for gated tool calls.
+    /// Prefers an active run-invocation override (keyed by
+    /// `client_submission_id`) when installed; otherwise the session mode.
     pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        let override_raw = self.invocation_approval_override.load(Ordering::Relaxed);
+        if override_raw != 255 {
+            return approval_mode_from_u8(override_raw);
+        }
+        self.session_approval_mode()
+    }
+
+    /// Session-owned approval mode only — never the run-invocation override.
+    /// Used by SetApprovalMode and tests that assert session mode is unchanged.
+    pub fn session_approval_mode(&self) -> crate::config::extended::ApprovalMode {
         approval_mode_from_u8(self.approval_mode.load(Ordering::Relaxed))
+    }
+
+    /// Install an invocation-scoped approval override for `client_submission_id`.
+    /// Does not mutate [`Self::session_approval_mode`].
+    pub fn set_invocation_approval_override(
+        &self,
+        client_submission_id: Uuid,
+        mode: crate::config::extended::ApprovalMode,
+    ) {
+        self.invocation_approval_override
+            .store(approval_mode_to_u8(mode), Ordering::Relaxed);
+        *self
+            .active_run_invocation_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(client_submission_id);
+    }
+
+    /// Clear the invocation-scoped approval override when the owning run ends.
+    pub fn clear_invocation_approval_override(&self) {
+        self.invocation_approval_override
+            .store(255, Ordering::Relaxed);
+        *self
+            .active_run_invocation_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Active run invocation that owns the approval override, if any.
+    pub fn active_run_invocation_id(&self) -> Option<Uuid> {
+        *self
+            .active_run_invocation_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn is_btw_fork(&self) -> bool {
@@ -161,12 +205,12 @@ impl Session {
 
     /// Set the session's command-approval mode. Used by the spawn path to
     /// apply the config default and by `/settings` to flip it at runtime.
-    /// Returns the new mode.
+    /// Returns the new mode. Never touches the invocation override.
     pub fn set_approval_mode(
         &self,
         mode: crate::config::extended::ApprovalMode,
     ) -> crate::config::extended::ApprovalMode {
-        if self.approval_mode() != mode {
+        if self.session_approval_mode() != mode {
             self.clear_safety_gate_degrade_notice();
         }
         self.approval_mode

@@ -24,11 +24,14 @@ where
     Ok(value)
 }
 
-/// Client-owned immutable bounds attached to a `cockpit run` submission.
+/// Client-owned immutable options attached to a `cockpit run` submission.
 ///
-/// Presence of this object (including both dimensions `None`) is the run
-/// marker that creates a durable `RunInvocationState`. Bounds are never
-/// defaulted by the daemon; omitted dimensions stay unbounded.
+/// Presence of this object (including every field `None`) is the run marker
+/// that creates a durable `RunInvocationState`. Fields are never defaulted by
+/// the daemon; omitted bounds stay unbounded and omitted `approval_mode`
+/// falls through to the session/default mode. `approval_mode` is client-owned
+/// immutable input only — it never appears on daemon-owned state/version/
+/// checkpoint fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInvocationOptions {
     /// Maximum provider-dispatch reservations. `None` is unbounded.
@@ -38,6 +41,11 @@ pub struct RunInvocationOptions {
     /// `None` is unbounded. Zero is never treated as unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Invocation-scoped Manual/Auto/Yolo override. `None` uses the live
+    /// session mode. Concurrent runs may carry different values; none mutate
+    /// session approval state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
 }
 
 /// Client → daemon RPCs. The daemon answers each with a matching
@@ -1589,6 +1597,7 @@ mod tests {
         let bounded = RunInvocationOptions {
             max_turns: Some(3),
             timeout_ms: Some(60_000),
+            approval_mode: None,
         };
 
         let send = Request::SendUserMessage {
@@ -1630,6 +1639,29 @@ mod tests {
             bounded_json["params"]["run_invocation_options"]["timeout_ms"],
             60_000
         );
+
+        let with_mode = RunInvocationOptions {
+            max_turns: None,
+            timeout_ms: None,
+            approval_mode: Some(ApprovalMode::Yolo),
+        };
+        let mode_send = Request::SendUserMessage {
+            client_submission_id: id,
+            text: "run me".into(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: Some(with_mode),
+        };
+        let mode_json = serde_json::to_value(&mode_send).unwrap();
+        assert_eq!(
+            mode_json["params"]["run_invocation_options"]["approval_mode"],
+            "yolo"
+        );
+        // approval_mode is only under options — not daemon state/version fields.
+        assert!(mode_json["params"].get("approval_mode").is_none());
+        assert!(mode_json["params"].get("state_version").is_none());
 
         let non_run = Request::SendUserMessage {
             client_submission_id: id,
@@ -1685,6 +1717,7 @@ mod tests {
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: Some(0),
                 timeout_ms: None,
+                approval_mode: None,
             }),
         };
         assert!(
@@ -1703,6 +1736,7 @@ mod tests {
             run_invocation_options: Some(RunInvocationOptions {
                 max_turns: None,
                 timeout_ms: Some(0),
+                approval_mode: None,
             }),
         };
         assert!(

@@ -493,6 +493,19 @@ impl Drop for CancelSlotGuard {
     }
 }
 
+/// Clears the session's invocation-scoped approval override when a run ends
+/// (success, failure, cancel, timeout, early return). Session mode is never
+/// mutated by the override path.
+struct InvocationApprovalGuard {
+    session: Arc<crate::session::Session>,
+}
+
+impl Drop for InvocationApprovalGuard {
+    fn drop(&mut self) {
+        self.session.clear_invocation_approval_override();
+    }
+}
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -6381,10 +6394,24 @@ impl Driver {
         let queue_target = submission.queue_target.clone();
         let pending_terminal_disposition = submission.pending_terminal_disposition;
         let run_invocation_id = submission.run_invocation_id;
+        // RAII: clear invocation approval override on every exit of this run.
+        let mut _invocation_approval_guard: Option<InvocationApprovalGuard> = None;
         if let Some(run_id) = run_invocation_id {
             let now = crate::daemon::server::run_invocation_wall_ms_now();
             // Checkpoint remaining before any side effect (queue already done).
             if let Ok(Some(row)) = self.session.db.get_run_invocation(run_id).await {
+                // Prefer immutable client options by client_submission_id.
+                // Missing approval_mode falls through to session mode.
+                if let Ok(options) = serde_json::from_str::<
+                    crate::daemon::proto::RunInvocationOptions,
+                >(&row.options_json)
+                    && let Some(mode) = options.approval_mode
+                {
+                    self.session.set_invocation_approval_override(run_id, mode);
+                    _invocation_approval_guard = Some(InvocationApprovalGuard {
+                        session: self.session.clone(),
+                    });
+                }
                 if let Some(remaining) = row.remaining_ms {
                     if remaining == 0 {
                         let _ = self

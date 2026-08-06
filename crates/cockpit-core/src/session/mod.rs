@@ -158,6 +158,14 @@ pub struct Session {
     /// [`Self::approval_mode`]. Default `manual` until the spawn path
     /// applies the config default. Distinct from the `auto` *router agent*.
     approval_mode: AtomicU8,
+    /// Invocation-scoped Manual/Auto/Yolo override installed while a
+    /// durable run with `RunInvocationOptions.approval_mode` is active.
+    /// `255` means no override (use session mode). Never written by
+    /// [`Self::set_approval_mode`]; cleared when the owning run ends.
+    invocation_approval_override: AtomicU8,
+    /// Client submission id of the run that owns
+    /// [`Self::invocation_approval_override`], when set.
+    active_run_invocation_id: Mutex<Option<Uuid>>,
     /// Native shell-output compression for this session right now
     /// (implementation note). Resolved at spawn from
     /// [`crate::config::extended::ExtendedConfig::shell_compression`]
@@ -1611,6 +1619,111 @@ mod tests {
             assert_eq!(s.set_approval_mode(m), m);
             assert_eq!(s.approval_mode(), m);
         }
+    }
+
+    #[tokio::test]
+    async fn session_mode_unchanged() {
+        use crate::config::extended::ApprovalMode;
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        s.set_approval_mode(ApprovalMode::Manual);
+        let before = s.session_approval_mode();
+        assert_eq!(before, ApprovalMode::Manual);
+
+        let run_id = Uuid::new_v4();
+        // During success-path override.
+        s.set_invocation_approval_override(run_id, ApprovalMode::Yolo);
+        assert_eq!(s.approval_mode(), ApprovalMode::Yolo);
+        assert_eq!(s.session_approval_mode(), before);
+        assert_eq!(s.active_run_invocation_id(), Some(run_id));
+        s.clear_invocation_approval_override();
+        assert_eq!(s.session_approval_mode(), before);
+        assert_eq!(s.approval_mode(), before);
+
+        // During failure-style override (auto) then clear.
+        s.set_invocation_approval_override(run_id, ApprovalMode::Auto);
+        assert_eq!(s.session_approval_mode(), before);
+        s.clear_invocation_approval_override();
+        assert_eq!(s.session_approval_mode(), before);
+
+        // During cancellation-style: install yolo then clear (terminal cancel).
+        s.set_invocation_approval_override(run_id, ApprovalMode::Yolo);
+        assert_eq!(s.session_approval_mode(), before);
+        s.clear_invocation_approval_override();
+        assert_eq!(s.session_approval_mode(), before);
+        assert_eq!(s.active_run_invocation_id(), None);
+
+        // set_approval_mode still only mutates session mode, never the override slot
+        // when clear.
+        s.set_approval_mode(ApprovalMode::Auto);
+        assert_eq!(s.session_approval_mode(), ApprovalMode::Auto);
+        assert_eq!(s.approval_mode(), ApprovalMode::Auto);
+        s.set_approval_mode(ApprovalMode::Manual);
+    }
+
+    #[tokio::test]
+    async fn auto_fail_closed() {
+        use crate::config::extended::ApprovalMode;
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let s = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "builder").unwrap());
+        // Session stays Manual; run override is Auto without a guard model.
+        s.set_approval_mode(ApprovalMode::Manual);
+        let run_id = Uuid::new_v4();
+        s.set_invocation_approval_override(run_id, ApprovalMode::Auto);
+        assert_eq!(s.approval_mode(), ApprovalMode::Auto);
+        assert_eq!(s.session_approval_mode(), ApprovalMode::Manual);
+        // Approver fails closed when Auto has no guard model (auto_allows → false).
+        let store = crate::approval::store::GrantStore::new(
+            db.clone(),
+            s.id,
+            tmp.path().to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path()),
+        );
+        let approver = crate::approval::Approver::new_for_session(
+            store,
+            db,
+            s.clone(),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            "builder",
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+        );
+        assert_eq!(approver.approval_mode(), ApprovalMode::Auto);
+        assert!(!approver.yolo_mode());
+        assert!(
+            !approver.auto_allows("bash", "rm -rf /").await,
+            "Auto without guard model must fail closed"
+        );
+        s.clear_invocation_approval_override();
+    }
+
+    #[tokio::test]
+    async fn yolo_hard_gates() {
+        use crate::config::extended::ApprovalMode;
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        s.set_approval_mode(ApprovalMode::Manual);
+        // Sandbox remains the gate under Yolo invocation override.
+        assert!(s.sandbox_enabled());
+        let run_id = Uuid::new_v4();
+        s.set_invocation_approval_override(run_id, ApprovalMode::Yolo);
+        assert_eq!(s.approval_mode(), ApprovalMode::Yolo);
+        assert!(
+            s.sandbox_enabled(),
+            "yolo override must not disable sandbox hard gate"
+        );
+        assert_eq!(
+            s.session_approval_mode(),
+            ApprovalMode::Manual,
+            "session mode must remain Manual"
+        );
+        // Explicit set_approval_mode is the only path that mutates session mode.
+        s.clear_invocation_approval_override();
+        assert_eq!(s.approval_mode(), ApprovalMode::Manual);
+        assert!(s.sandbox_enabled());
     }
 
     #[tokio::test]

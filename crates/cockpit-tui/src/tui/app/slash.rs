@@ -2147,24 +2147,15 @@ impl App {
             CopyFormat::Rich => {
                 let html = crate::clipboard::markdown_to_html(&text);
                 match crate::clipboard::copy_rich(&text, &html) {
+                    Ok(result) if result.downgrade.is_some() => (
+                        "Copied last response as plain text                          (rich copy unavailable on this route)."
+                            .to_string(),
+                        ToastKind::Success,
+                    ),
                     Ok(_) => (
                         "Copied last response (rich).".to_string(),
                         ToastKind::Success,
                     ),
-                    Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
-                        // No multi-format clipboard pathway over SSH —
-                        // fall back to plain so `/copy rich` never
-                        // silently does nothing, and say why.
-                        match crate::clipboard::copy_plain(&text) {
-                            Ok(_) => (
-                                "SSH — copied last response as plain text \
-                                 (rich copy unavailable over SSH)."
-                                    .to_string(),
-                                ToastKind::Success,
-                            ),
-                            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
-                        }
-                    }
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }

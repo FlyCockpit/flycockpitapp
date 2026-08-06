@@ -1848,25 +1848,25 @@ fn apply_fetch_result_save_failure_surfaces() {
 #[test]
 fn copy_oauth_url_reports_success_error_and_missing_url() {
     let mut status = None;
-    let copied = crate::clipboard::CopyOutcome {
-        osc52_written: true,
-        local_clipboard_written: false,
+    let copied = crate::clipboard::DeliveryResult {
+        attempts: vec![],
+        requested_representation: crate::clipboard::Representation::Plain,
+        delivered_representation: crate::clipboard::Representation::Plain,
+        downgrade: None,
+        confidence: crate::clipboard::Confidence::Unverified,
     };
     copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
-        Ok(copied)
+        Ok(copied.clone())
     });
     assert_eq!(status, Some(Ok("copied OAuth URL".to_string())));
 
-    copy_oauth_url_with(None, &mut status, |_| Ok(copied));
+    copy_oauth_url_with(None, &mut status, |_| Ok(copied.clone()));
     assert_eq!(status, Some(Ok("no OAuth URL yet".to_string())));
 
     copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
-        Err(crate::clipboard::CopyError::Backend("denied".to_string()))
+        Err(crate::clipboard::CopyError::Backend)
     });
-    assert_eq!(
-        status,
-        Some(Err("clipboard backend error: denied".to_string()))
-    );
+    assert_eq!(status, Some(Err("clipboard backend error".to_string())));
 }
 
 static OAUTH_EFFECTS_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -1885,14 +1885,17 @@ fn oauth_effects_log() -> Vec<String> {
     OAUTH_EFFECTS_LOG.lock().unwrap().clone()
 }
 
-fn fake_copy(value: &str) -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError> {
+fn fake_copy(value: &str) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError> {
     OAUTH_EFFECTS_LOG
         .lock()
         .unwrap()
         .push(format!("copy:{value}"));
-    Ok(crate::clipboard::CopyOutcome {
-        osc52_written: true,
-        local_clipboard_written: false,
+    Ok(crate::clipboard::DeliveryResult {
+        attempts: vec![],
+        requested_representation: crate::clipboard::Representation::Plain,
+        delivered_representation: crate::clipboard::Representation::Plain,
+        downgrade: None,
+        confidence: crate::clipboard::Confidence::Unverified,
     })
 }
 

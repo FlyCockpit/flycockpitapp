@@ -181,7 +181,8 @@ pub(crate) struct GrokBrowserStart {
 
 #[derive(Clone, Copy)]
 pub(crate) struct OAuthEffects {
-    pub(super) copy: fn(&str) -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError>,
+    pub(super) copy:
+        fn(&str) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
     pub(super) is_ssh: fn() -> bool,
     pub(super) open: fn(&str) -> anyhow::Result<()>,
     pub(super) bind: fn(u16) -> anyhow::Result<tokio::net::TcpListener>,

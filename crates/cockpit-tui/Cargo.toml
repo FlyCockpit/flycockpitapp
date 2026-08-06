@@ -63,6 +63,16 @@ similar = { workspace = true }
 tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
 vt100 = "0.16"
 
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
+
 [dev-dependencies]
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core", features = ["test-support"] }

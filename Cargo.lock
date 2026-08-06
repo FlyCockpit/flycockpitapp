@@ -1196,6 +1196,7 @@ dependencies = [
  "futures",
  "ignore",
  "image",
+ "libc",
  "notify-rust",
  "portable-pty",
  "predicates",
@@ -1226,6 +1227,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

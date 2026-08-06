@@ -707,7 +707,7 @@ fn oauth_option_cursor_next(cursor: usize, len: usize) -> usize {
 fn copy_oauth_url_with(
     url: Option<&str>,
     status: &mut Option<Result<String, String>>,
-    copy: impl FnOnce(&str) -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError>,
+    copy: impl FnOnce(&str) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
 ) {
     let Some(url) = url else {
         *status = Some(Ok("no OAuth URL yet".to_string()));

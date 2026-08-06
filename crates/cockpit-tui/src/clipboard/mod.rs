@@ -1,243 +1,99 @@
-//! System-clipboard helpers (plan.md T8.e).
+//! Trusted ordered clipboard delivery (native → OSC52 → executable).
 //!
-//! Two entry points:
-//!
-//! - [`copy_plain`] — plain-text only. Prefers OSC52 (works through SSH)
-//!   and falls back to the local OS clipboard via `arboard` if the OSC52
-//!   write fails (e.g. terminal doesn't honor the escape).
-//! - [`copy_rich`] — multi-format (HTML + plain alt). Uses `arboard`
-//!   only, because OSC52 is single-format. Returns `Err(Unsupported)`
-//!   when the session is over SSH so the caller can show a toast and
-//!   fall back to `copy_plain`.
-//!
-//! SSH detection lives in [`cockpit_core::sysinfo::is_ssh`] — it is an
-//! environment probe rather than terminal-UI logic, and non-TUI callers
-//! such as `cockpit setup` need it too. It reads `$SSH_CONNECTION` /
-//! `$SSH_TTY`, which OpenSSH sets on the remote side; inside tmux on a
-//! local machine they're unset so we still pick the local-clipboard path.
+//! One service evaluates routes in order, stops at first Confirmed, continues
+//! after unacknowledged OSC52 (Unverified), and never writes plaintext to disk.
+//! OSC52 size uses the sole
+//! [`cockpit_proto::terminal::OSC52_MAX_SEQUENCE_BYTES`] contract.
 
-use std::io::{Write, stdout};
+mod display;
+mod executable;
+mod native;
+mod osc52;
+mod service;
+mod types;
 
-use base64::Engine;
-use cockpit_core::sysinfo::is_ssh;
-use cockpit_proto::terminal::OSC52_MAX_SEQUENCE_BYTES;
+#[cfg(test)]
+mod tests;
 
-/// Why a copy attempt didn't reach the system clipboard.
-#[derive(Debug)]
-pub enum CopyError {
-    /// Rich-text copy was attempted over SSH, where no protocol can
-    /// forward multi-format clipboard data. Caller should fall back to
-    /// plain text and surface a toast.
-    UnsupportedOverSsh,
-    /// Underlying clipboard backend failed (no clipboard service,
-    /// permission denied, etc.).
-    Backend(String),
-    /// Base64 payload exceeds the OSC52 size ceiling; nothing was
-    /// written (no partial escape). Carries the max allowed base64 len.
-    TooLarge { max: usize },
-}
+pub use service::{ClipboardService, attached_client_route_exists};
+pub use types::{
+    AttemptOutcome, AttemptRecord, Confidence, CopyError, CopyRequest, DeliveryResult, Downgrade,
+    Eligibility, OscTransport, PlatformKind, Representation, RichPolicy, Route, SafeErrorKind,
+    SessionContext, SkipReason,
+};
 
-impl std::fmt::Display for CopyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedOverSsh => write!(f, "rich-text copy unavailable over SSH"),
-            Self::Backend(s) => write!(f, "clipboard backend error: {s}"),
-            Self::TooLarge { max } => {
-                write!(
-                    f,
-                    "selection too large for OSC52 (max {max} total sequence bytes)"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CopyError {}
-
-/// Observable result of a plain-text copy attempt.
+/// Copy plain text through the shared delivery service.
 ///
-/// OSC52 is fire-and-forget: writing the escape means Cockpit accepted the
-/// attempt locally, but terminals do not acknowledge whether they placed the
-/// text on the user's clipboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CopyOutcome {
-    pub osc52_written: bool,
-    pub local_clipboard_written: bool,
-}
-
-impl CopyOutcome {
-    pub fn accepted(self) -> bool {
-        self.osc52_written || self.local_clipboard_written
-    }
-}
-
-/// Copy plain text to the system clipboard.
-///
-/// Tries OSC52 first (terminal escape, works through SSH and tmux with
-/// `set-clipboard on`). Falls back to the local OS clipboard via
-/// `arboard` if OSC52 isn't acknowledged by the terminal (we can't
-/// actually detect that — we just attempt OSC52 and additionally try
-/// arboard locally so at least one path lands).
-pub fn copy_plain(text: &str) -> Result<CopyOutcome, CopyError> {
-    copy_plain_with(text, is_ssh(), osc52_set_clipboard, arboard_set_text)
-}
-
-fn copy_plain_with(
-    text: &str,
-    ssh: bool,
-    mut osc52: impl FnMut(&str) -> Result<(), CopyError>,
-    mut local: impl FnMut(&str) -> Result<(), CopyError>,
-) -> Result<CopyOutcome, CopyError> {
-    let mut outcome = CopyOutcome {
-        osc52_written: false,
-        local_clipboard_written: false,
-    };
-    let mut first_err = None;
-
-    match osc52(text) {
-        Ok(()) => outcome.osc52_written = true,
-        Err(e) => first_err = Some(e),
-    }
-
-    if !ssh {
-        match local(text) {
-            Ok(()) => outcome.local_clipboard_written = true,
-            Err(e) if first_err.is_none() => first_err = Some(e),
-            Err(_) => {}
-        }
-    }
-
-    if outcome.accepted() {
-        Ok(outcome)
+/// Returns `Ok(result)` when confidence is Confirmed or Unverified, and
+/// `Err` only for Failed (including empty/over-limit pre-route failures).
+pub fn copy_plain(text: &str) -> Result<DeliveryResult, CopyError> {
+    let mut svc = ClipboardService::system();
+    let result = svc.deliver_plain(text);
+    if result.delivered() {
+        Ok(result)
+    } else if text.is_empty() {
+        Err(CopyError::Empty)
     } else {
-        Err(first_err.unwrap_or_else(|| CopyError::Backend("no clipboard backend".to_string())))
+        Err(result.failure_error())
     }
 }
 
-/// Copy rich text (HTML + plain alt) to the system clipboard.
+/// Copy rich text (HTML + plain) with [`RichPolicy::AllowPlainDowngrade`].
 ///
-/// Goes through `arboard` only — OSC52 cannot carry multi-format. Over
-/// SSH there's no clipboard pathway, so this returns
-/// [`CopyError::UnsupportedOverSsh`] and the caller falls back to
-/// [`copy_plain`].
-pub fn copy_rich(plain: &str, html: &str) -> Result<(), CopyError> {
-    if is_ssh() {
-        return Err(CopyError::UnsupportedOverSsh);
-    }
-    arboard_set_html(html, plain)
+/// Preferred entry for UI actions that should visibly fall back to plain.
+pub fn copy_rich(plain: &str, html: &str) -> Result<DeliveryResult, CopyError> {
+    copy_rich_with_policy(plain, html, RichPolicy::AllowPlainDowngrade)
 }
 
-/// Build the OSC52 clipboard-set escape(s) for `encoded_b64`. Inside
-/// tmux, returns the raw BEL-terminated escape immediately followed by
-/// the DCS-passthrough-wrapped form (double-emit, covering both
-/// `set-clipboard` and `allow-passthrough` tmux configs); outside tmux,
-/// the raw escape alone.
-///
-/// Sequence length is bounded by [`cockpit_proto::terminal::OSC52_MAX_SEQUENCE_BYTES`].
-fn osc52_sequence(encoded_b64: &str, in_tmux: bool) -> String {
-    let raw = format!("\x1b]52;c;{encoded_b64}\x07");
-    if !in_tmux {
-        return raw;
+/// Copy rich text with an explicit policy.
+pub fn copy_rich_with_policy(
+    plain: &str,
+    html: &str,
+    policy: RichPolicy,
+) -> Result<DeliveryResult, CopyError> {
+    let mut svc = ClipboardService::system();
+    let result = svc.deliver_rich(plain, html, policy);
+    if result.delivered() {
+        Ok(result)
+    } else {
+        Err(result.failure_error())
     }
-    // tmux DCS passthrough: prefix `ESC P tmux ;`, double every inner
-    // ESC (the BEL-terminated form has only the leading ESC), terminate
-    // with ST (`ESC \`). Inner BEL is never doubled.
-    let inner = raw.replace('\x1b', "\x1b\x1b");
-    format!("{raw}\x1bPtmux;{inner}\x1b\\")
-}
-
-fn osc52_set_clipboard(text: &str) -> Result<(), CopyError> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    // Hard-fail before writing anything — a partial escape would corrupt
-    // the terminal stream and leave a half-set clipboard. Cap is the total
-    // raw sequence length: ESC ] 52 ; c ; payload BEL.
-    let total = 2 /* ESC ] */ + 5 /* 52;c; */ + encoded.len() + 1 /* BEL */;
-    if total > OSC52_MAX_SEQUENCE_BYTES {
-        return Err(CopyError::TooLarge {
-            max: OSC52_MAX_SEQUENCE_BYTES,
-        });
-    }
-    // `c` selects the system clipboard buffer (vs `p` primary or numeric
-    // cut-buffers). Inside tmux we double-emit the raw + passthrough form.
-    let seq = osc52_sequence(&encoded, std::env::var_os("TMUX").is_some());
-    let mut out = stdout();
-    write!(out, "{seq}").map_err(|e| CopyError::Backend(e.to_string()))?;
-    out.flush().map_err(|e| CopyError::Backend(e.to_string()))?;
-    Ok(())
 }
 
 /// Read an image from the system clipboard and encode it to PNG bytes.
 ///
-/// Returns `Ok(Some(png))` when the clipboard holds a bitmap image,
-/// `Ok(None)` when it holds no image (the caller falls back to treating
-/// the paste as text), and `Err` only when the clipboard backend itself
-/// is unavailable. arboard hands us raw RGBA (`width`/`height`/`bytes`);
-/// we wrap it in an `image::RgbaImage` and re-encode as PNG so every
-/// provider gets a normalized, self-describing payload. Mirrors codex's
-/// `clipboard_paste::paste_image_as_png`, minus the file-list fallback
-/// (we only care about a real bitmap on the clipboard, not file paths).
-///
-/// Local clipboard only — SSH image paste is out of scope, and arboard
-/// has no remote pathway anyway.
+/// Paste path only — not part of the copy routing service. Local clipboard
+/// only; SSH image paste is out of scope.
 pub fn read_image_as_png() -> Result<Option<Vec<u8>>, CopyError> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
+    let mut cb = arboard::Clipboard::new().map_err(|_| CopyError::Backend)?;
     let img = match cb.get_image() {
         Ok(img) => img,
-        // No image on the clipboard is the common case (the user pasted
-        // text); surface it as `None`, not an error.
         Err(_) => return Ok(None),
     };
     let w = img.width as u32;
     let h = img.height as u32;
     let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
-        return Err(CopyError::Backend(
-            "clipboard image had an invalid RGBA buffer".to_string(),
-        ));
+        return Err(CopyError::Backend);
     };
     let dynimg = image::DynamicImage::ImageRgba8(rgba);
     let mut png = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut png);
     dynimg
         .write_to(&mut cursor, image::ImageFormat::Png)
-        .map_err(|e| CopyError::Backend(format!("PNG encode failed: {e}")))?;
+        .map_err(|_| CopyError::Backend)?;
     Ok(Some(png))
 }
 
-/// Read plain text from the system clipboard.
-///
-/// Returns `Ok(Some(text))` when the clipboard holds text, `Ok(None)`
-/// when it holds no text (e.g. an image or an empty clipboard), and
-/// `Err` only when the clipboard backend itself is unavailable. Used by
-/// the composer vim register mirror so an OS copy is pasteable with
-/// `p`/`P`. Local clipboard only (arboard) — OSC52 is write-only and
-/// SSH has no read pathway.
+/// Read plain text from the system clipboard (paste path).
 pub fn read_text() -> Result<Option<String>, CopyError> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
+    let mut cb = arboard::Clipboard::new().map_err(|_| CopyError::Backend)?;
     match cb.get_text() {
         Ok(text) => Ok(Some(text)),
-        // No text on the clipboard is the common case (image, empty);
-        // surface it as `None`, not an error.
         Err(_) => Ok(None),
     }
 }
 
-fn arboard_set_text(text: &str) -> Result<(), CopyError> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
-    cb.set_text(text.to_string())
-        .map_err(|e| CopyError::Backend(e.to_string()))?;
-    Ok(())
-}
-
-fn arboard_set_html(html: &str, plain: &str) -> Result<(), CopyError> {
-    let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
-    cb.set_html(html.to_string(), Some(plain.to_string()))
-        .map_err(|e| CopyError::Backend(e.to_string()))?;
-    Ok(())
-}
-
-/// Convert a markdown source string to a self-contained HTML fragment
-/// suitable for the system clipboard's HTML slot. Used by the
-/// rich-text copy keybind (plan.md T8.g).
+/// Convert markdown to a self-contained HTML fragment for the rich slot.
 pub fn markdown_to_html(markdown: &str) -> String {
     use pulldown_cmark::{Options, Parser, html};
     let mut opts = Options::empty();
@@ -252,11 +108,7 @@ pub fn markdown_to_html(markdown: &str) -> String {
     buf
 }
 
-/// Render a markdown source string to plain text — drops the
-/// formatting markers (`**`, `_`, backticks, ATX `#`, etc.) and
-/// keeps readable structure (paragraph breaks, list items as
-/// "- item", code block contents on their own lines). Used by the
-/// "Copy as plain text" context-menu action.
+/// Render markdown to plain text (drop markers, keep structure).
 pub fn markdown_to_plain(markdown: &str) -> String {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let mut opts = Options::empty();
@@ -265,7 +117,6 @@ pub fn markdown_to_plain(markdown: &str) -> String {
     opts.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(markdown, opts);
     let mut out = String::with_capacity(markdown.len());
-    // Track list nesting to render bullets/numbered prefixes.
     let mut list_stack: Vec<Option<u64>> = Vec::new();
     let mut at_block_start = true;
     let mut in_code_block = false;
@@ -281,9 +132,6 @@ pub fn markdown_to_plain(markdown: &str) -> String {
             }
             Event::Start(Tag::Heading { .. }) => {
                 ensure_paragraph_break(&mut out);
-                // No `#` prefix; the next text + a trailing blank
-                // line gives the heading enough visual weight on its
-                // own in a plain-text paste.
             }
             Event::End(TagEnd::Heading(_)) => {
                 out.push_str("\n\n");
@@ -353,7 +201,6 @@ pub fn markdown_to_plain(markdown: &str) -> String {
                 at_block_start = false;
             }
             Event::Code(s) => {
-                // Inline code stays as the bare text — no backticks.
                 out.push_str(&s);
                 at_block_start = false;
             }
@@ -381,8 +228,6 @@ pub fn markdown_to_plain(markdown: &str) -> String {
             _ => {}
         }
     }
-    // Collapse trailing whitespace + newlines so the pasted result
-    // doesn't end with a sea of blank lines.
     while out.ends_with(['\n', ' ']) {
         out.pop();
     }
@@ -436,9 +281,6 @@ pub fn extract_code_blocks(markdown: &str) -> Vec<CodeBlock> {
     blocks
 }
 
-/// Ensure the buffer ends with a paragraph break (`\n\n`) before
-/// appending a new block. No-op when the buffer is empty or already
-/// terminates that way.
 fn ensure_paragraph_break(out: &mut String) {
     if out.is_empty() {
         return;
@@ -452,161 +294,5 @@ fn ensure_paragraph_break(out: &mut String) {
         } else {
             out.push_str("\n\n");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn osc52_sequence_outside_tmux_is_raw_only() {
-        let seq = osc52_sequence("QUJD", false);
-        assert_eq!(seq, "\x1b]52;c;QUJD\x07");
-    }
-
-    #[test]
-    fn osc52_sequence_inside_tmux_double_emits_wrapped() {
-        let seq = osc52_sequence("QUJD", true);
-        // Raw form, then the DCS-passthrough-wrapped form: leading ESC
-        // doubled, inner BEL untouched, terminated with ST (`ESC \`).
-        assert_eq!(
-            seq,
-            "\x1b]52;c;QUJD\x07\x1bPtmux;\x1b\x1b]52;c;QUJD\x07\x1b\\"
-        );
-        // The inner BEL must not be doubled.
-        assert!(!seq.contains("\x07\x07"));
-    }
-
-    #[test]
-    fn osc52_size_guard_rejects_oversized_payload() {
-        // A decoded payload whose base64 plus the 8-byte BEL envelope exceeds
-        // OSC52_MAX_SEQUENCE_BYTES must fail before any write.
-        let max_payload_b64 = OSC52_MAX_SEQUENCE_BYTES.saturating_sub(8);
-        // Over-size by ensuring base64 length alone is past the total cap.
-        let n = ((max_payload_b64 / 4) + 2) * 3;
-        let big = "x".repeat(n);
-        match osc52_set_clipboard(&big) {
-            Err(CopyError::TooLarge { max }) => assert_eq!(max, OSC52_MAX_SEQUENCE_BYTES),
-            other => panic!("expected TooLarge, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn osc52_size_guard_allows_just_under_ceiling() {
-        // Largest decoded payload whose raw BEL sequence is still in-cap.
-        let max_payload_b64 = OSC52_MAX_SEQUENCE_BYTES.saturating_sub(8);
-        let n = (max_payload_b64 / 4) * 3;
-        let payload = "y".repeat(n);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
-        assert!(2 + 5 + encoded.len() < OSC52_MAX_SEQUENCE_BYTES);
-        assert!(osc52_set_clipboard(&payload).is_ok());
-    }
-
-    #[test]
-    fn copy_plain_osc52_too_large_local_success_is_accepted() {
-        let outcome = copy_plain_with(
-            "hello",
-            false,
-            |_| {
-                Err(CopyError::TooLarge {
-                    max: OSC52_MAX_SEQUENCE_BYTES,
-                })
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(
-            outcome,
-            CopyOutcome {
-                osc52_written: false,
-                local_clipboard_written: true
-            }
-        );
-    }
-
-    #[test]
-    fn copy_plain_osc52_too_large_over_ssh_errors() {
-        let err = copy_plain_with(
-            "hello",
-            true,
-            |_| {
-                Err(CopyError::TooLarge {
-                    max: OSC52_MAX_SEQUENCE_BYTES,
-                })
-            },
-            |_| panic!("local clipboard must not run over SSH"),
-        )
-        .expect_err("no observable backend accepted");
-        assert!(matches!(err, CopyError::TooLarge { .. }));
-    }
-
-    #[test]
-    fn copy_plain_local_failure_outside_ssh_keeps_osc52_acceptance() {
-        let outcome = copy_plain_with(
-            "hello",
-            false,
-            |_| Ok(()),
-            |_| Err(CopyError::Backend("local unavailable".to_string())),
-        )
-        .unwrap();
-        assert_eq!(
-            outcome,
-            CopyOutcome {
-                osc52_written: true,
-                local_clipboard_written: false
-            }
-        );
-    }
-
-    #[test]
-    fn copy_plain_all_observable_backends_fail_errors() {
-        let err = copy_plain_with(
-            "hello",
-            false,
-            |_| Err(CopyError::Backend("osc failed".to_string())),
-            |_| Err(CopyError::Backend("local failed".to_string())),
-        )
-        .expect_err("all backends failed");
-        assert!(matches!(err, CopyError::Backend(_)));
-    }
-
-    #[test]
-    fn extract_code_blocks_fenced_returns_body_and_lang() {
-        let blocks = extract_code_blocks("```rust\nlet x=1;\n```");
-        assert_eq!(
-            blocks,
-            vec![CodeBlock {
-                lang: Some("rust".to_string()),
-                body: "let x=1;\n".to_string()
-            }]
-        );
-    }
-
-    #[test]
-    fn extract_code_blocks_multiple_in_document_order() {
-        let blocks = extract_code_blocks("```sh\necho one\n```\ntext\n```\ntwo\n```");
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].lang.as_deref(), Some("sh"));
-        assert_eq!(blocks[0].body, "echo one\n");
-        assert_eq!(blocks[1].lang, None);
-        assert_eq!(blocks[1].body, "two\n");
-    }
-
-    #[test]
-    fn extract_code_blocks_indented_block() {
-        let blocks = extract_code_blocks("prose\n\n    indented\n    block\n");
-        assert_eq!(
-            blocks,
-            vec![CodeBlock {
-                lang: None,
-                body: "indented\nblock\n".to_string()
-            }]
-        );
-    }
-
-    #[test]
-    fn extract_code_blocks_none_for_prose() {
-        assert!(extract_code_blocks("plain prose only").is_empty());
     }
 }

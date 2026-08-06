@@ -66,22 +66,14 @@ impl App {
                 };
                 let html = crate::clipboard::markdown_to_html(&rich_source);
                 match crate::clipboard::copy_rich(&rich_source, &html) {
+                    Ok(result) if result.downgrade.is_some() => (
+                        format!(
+                            "Copied {title} as plain text \
+                             (rich-text unavailable on this route)."
+                        ),
+                        ToastKind::Success,
+                    ),
                     Ok(_) => (format!("Copied {title} as rich text."), ToastKind::Success),
-                    Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
-                        // Shouldn't normally happen because the menu
-                        // builder hides this option over SSH, but
-                        // guard anyway so a stale menu doesn't error.
-                        match crate::clipboard::copy_plain(&text) {
-                            Ok(_) => (
-                                format!(
-                                    "SSH — copied {title} as plain text \
-                                     (rich-text unavailable over SSH)."
-                                ),
-                                ToastKind::Success,
-                            ),
-                            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
-                        }
-                    }
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
@@ -120,10 +112,9 @@ impl App {
     }
 
     /// Build the plaintext of the active drag-selection from the
-    /// cached chat grid and push it to the system clipboard via
-    /// `clipboard::copy_plain` (OSC52 + arboard locally). No-op when
-    /// the selection is empty or stale (chat_area moved between
-    /// selection and copy).
+    /// cached chat grid and push it to the system clipboard via the
+    /// shared delivery service. No-op when the selection is empty or
+    /// stale (chat_area moved between selection and copy).
     /// On a successful copy, show the one-time-per-session tmux OSC52
     /// discoverability hint (first cockpit copy while `$TMUX` is set,
     /// independent of whether OSC52 was acknowledged); otherwise show
@@ -149,7 +140,7 @@ impl App {
         copy_plain: impl FnOnce(
             &str,
         )
-            -> Result<crate::clipboard::CopyOutcome, crate::clipboard::CopyError>,
+            -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
     ) {
         let Some(sel) = self.selection else {
             return;
@@ -203,7 +194,7 @@ impl App {
             }
             Err(crate::clipboard::CopyError::TooLarge { .. }) => {
                 self.show_toast(
-                    "Selection too large to copy over OSC52 (max ~73 KB) — copy a smaller range.",
+                    "Selection too large to copy (max sequence size) — copy a smaller range.",
                     ToastKind::Error,
                 );
             }
@@ -233,23 +224,15 @@ impl App {
         };
         let html = crate::clipboard::markdown_to_html(&text);
         match crate::clipboard::copy_rich(&text, &html) {
+            Ok(result) if result.downgrade.is_some() => self.show_copy_ok_or_tmux_hint(
+                "Copied as plain text (rich-text unavailable on this route).".to_string(),
+            ),
             Ok(_) => self
                 .show_copy_ok_or_tmux_hint("Copied last agent message as rich text.".to_string()),
-            Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
-                // SSH session — fall back to plain text via OSC52 so
-                // the user gets at least something on the local
-                // clipboard.
-                match crate::clipboard::copy_plain(&text) {
-                    Ok(_) => self.show_copy_ok_or_tmux_hint(
-                        "SSH — copied as plain text (rich-text unavailable over SSH).".to_string(),
-                    ),
-                    Err(crate::clipboard::CopyError::TooLarge { .. }) => self.show_toast(
-                        "Selection too large to copy over OSC52 (max ~73 KB) — copy a smaller range.",
-                        ToastKind::Error,
-                    ),
-                    Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
-                }
-            }
+            Err(crate::clipboard::CopyError::TooLarge { .. }) => self.show_toast(
+                "Selection too large to copy (max sequence size) — copy a smaller range.",
+                ToastKind::Error,
+            ),
             Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
         }
     }

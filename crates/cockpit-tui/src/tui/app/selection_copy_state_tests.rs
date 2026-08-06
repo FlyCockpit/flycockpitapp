@@ -1,5 +1,5 @@
 use super::*;
-use crate::clipboard::{CopyError, CopyOutcome};
+use crate::clipboard::{Confidence, CopyError, DeliveryResult, Representation};
 use crate::tui::app::render::{ChatCopyTarget, ChatRowKind, ChatRowMeta};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -30,10 +30,13 @@ fn message_meta(history_index: usize) -> ChatRowMeta {
     }
 }
 
-fn copy_outcome() -> CopyOutcome {
-    CopyOutcome {
-        osc52_written: true,
-        local_clipboard_written: false,
+fn copy_outcome() -> DeliveryResult {
+    DeliveryResult {
+        attempts: vec![],
+        requested_representation: Representation::Plain,
+        delivered_representation: Representation::Plain,
+        downgrade: None,
+        confidence: Confidence::Unverified,
     }
 }
 
@@ -249,7 +252,7 @@ fn left_mouse_release_finalizes_selection_without_copy_feedback() {
 fn copy_selection_keeps_selection_on_hard_failure() {
     let mut app = app_with_selection();
 
-    app.copy_selection_plaintext_with(|_| Err(CopyError::Backend("no clipboard".to_string())));
+    app.copy_selection_plaintext_with(|_| Err(CopyError::Backend));
 
     assert!(app.selection.is_some());
     assert!(matches!(
@@ -262,12 +265,7 @@ fn copy_selection_keeps_selection_on_hard_failure() {
 fn copy_selection_clears_selection_after_accepted_copy() {
     let mut app = app_with_selection();
 
-    app.copy_selection_plaintext_with(|_| {
-        Ok(CopyOutcome {
-            osc52_written: true,
-            local_clipboard_written: false,
-        })
-    });
+    app.copy_selection_plaintext_with(|_| Ok(copy_outcome()));
 
     assert!(app.selection.is_none());
     assert!(app.toast.is_some());

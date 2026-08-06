@@ -5,8 +5,18 @@
 //! actions and add approvals/redaction/audit. The default target is a Cockpit
 //! owned virtual display. Real-desktop control is refused unless a
 //! machine-local grant file matches this machine.
+//!
+//! Target identity and host-global physical keys live in [`host_identity`] and
+//! [`target`]; platform evidence adapters are under [`platform`].
 
 #![allow(dead_code)]
+
+pub mod host_identity;
+pub mod platform;
+pub mod target;
+
+#[cfg(test)]
+mod target_tests;
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;

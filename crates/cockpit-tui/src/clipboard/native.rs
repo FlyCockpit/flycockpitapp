@@ -108,5 +108,3 @@ impl NativeClipboard for RecordingNative {
         Ok(())
     }
 }
-
-

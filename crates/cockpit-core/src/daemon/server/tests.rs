@@ -13574,6 +13574,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
+        process_containment: None,
+        _process_containment_actor: None,
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 
@@ -13636,6 +13638,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
+        process_containment: None,
+        _process_containment_actor: None,
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 

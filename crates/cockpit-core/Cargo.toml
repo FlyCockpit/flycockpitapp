@@ -106,6 +106,15 @@ apple-native-keyring-store = { version = "=1.0.1", default-features = false, fea
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
+# Direct ownership for Job Object containment (`cross-platform-descendant-process-containment`).
+# Exactly these five leaves; do not rely on cockpit-config or third-party feature activation.
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -1228,6 +1228,63 @@ async fn run_foreground_inner_with_boot_db(
     let drain_grace = ctx.take_shutdown_grace_override().unwrap_or(drain_grace);
     spawn_force_timer(ctx.clone(), drain_grace);
     let drained_clean = ctx.registry.drain_all(drain_grace).await;
+    // Generation-bound containment barrier: clean shutdown only when every
+    // containment is ProvenEmpty. Deadline/failure leaves Uncertain/Stopping
+    // rows durable for restart reconciliation.
+    // Bound the containment barrier with a wall-clock cap so paused-time
+    // tests and wedged adapters cannot prevent daemon exit. Clean status
+    // still requires ProvenEmpty within that bound.
+    let containment_clean = if let Some(pc) = ctx.process_containment.as_ref() {
+        let pc = pc.clone();
+        let grace = drain_grace;
+        // Prefer a real-time upper bound slightly above grace so a paused
+        // Tokio clock cannot leave this future pending forever.
+        let wall_cap = grace.checked_add(Duration::from_secs(2)).unwrap_or(grace);
+        match tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("containment barrier runtime");
+            rt.block_on(async move {
+                let barrier = async move {
+                    if let Err(error) = pc.begin_shutdown().await {
+                        tracing::warn!(error = %error, "process containment begin_shutdown failed");
+                    }
+                    pc.await_all_empty(Some(grace)).await
+                };
+                match tokio::time::timeout(wall_cap, barrier).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            error = %error,
+                            "process containment not proven empty at shutdown"
+                        );
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "process containment barrier timed out at shutdown; leaving durable rows"
+                        );
+                        false
+                    }
+                }
+            })
+        })
+        .await
+        {
+            Ok(clean) => clean,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "process containment barrier task failed at shutdown"
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+    let drained_clean = drained_clean && containment_clean;
     if !drained_clean {
         // Make sure the forced state + notice are set even if the timer
         // hadn't fired yet (e.g. all workers wedged right at the deadline).

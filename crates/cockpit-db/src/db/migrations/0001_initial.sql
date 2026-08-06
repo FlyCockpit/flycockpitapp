@@ -122,6 +122,11 @@ CREATE TABLE sessions (
     created_by_principal TEXT,
     shared_with_collaborators INTEGER NOT NULL DEFAULT 0 CHECK (shared_with_collaborators IN (0, 1)),
 
+    -- Deletion barrier lifecycle (cross-platform-descendant-process-containment).
+    -- 'active' accepts work; 'deleting' rejects new work until every bound
+    -- execution containment is ProvenEmpty, then the session row may drop.
+    lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'deleting')),
+
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
     FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
@@ -1676,3 +1681,39 @@ CREATE INDEX idx_run_invocation_tombstones_principal
     ON run_invocation_tombstones (claiming_principal_digest);
 CREATE INDEX idx_run_invocation_tombstones_expires
     ON run_invocation_tombstones (expires_at_wall_ms);
+
+
+-- ---- execution_containments ------------------------------------------------
+-- Daemon-owned generation-bound descendant containment recovery rows.
+-- Safe platform locators/digests only — never command args, env, output, or
+-- secrets. States: Creating/Active/Stopping/Empty/Uncertain.
+
+CREATE TABLE execution_containments (
+    containment_id          TEXT PRIMARY KEY,
+    session_id              TEXT NOT NULL,
+    operation_id            TEXT NOT NULL,
+    generation              INTEGER NOT NULL,
+    platform_kind           TEXT NOT NULL CHECK (platform_kind IN (
+        'linux_cgroup', 'windows_job', 'macos_unsupported',
+        'docker', 'podman', 'fake', 'unsupported'
+    )),
+    state                   TEXT NOT NULL CHECK (state IN (
+        'creating', 'active', 'stopping', 'empty', 'uncertain'
+    )),
+    guarantee               TEXT NOT NULL CHECK (guarantee IN ('proven', 'unsupported')),
+    platform_locator_json   TEXT NOT NULL DEFAULT '{}',
+    runtime_context_digest  TEXT,
+    unsupported_reason      TEXT,
+    created_at_wall_ms      INTEGER NOT NULL,
+    updated_at_wall_ms      INTEGER NOT NULL,
+    emptied_at_wall_ms      INTEGER,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_execution_containments_session
+    ON execution_containments (session_id);
+CREATE INDEX idx_execution_containments_session_state
+    ON execution_containments (session_id, state);
+CREATE INDEX idx_execution_containments_nonempty
+    ON execution_containments (session_id)
+    WHERE state NOT IN ('empty');

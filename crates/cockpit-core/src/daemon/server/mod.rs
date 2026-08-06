@@ -1699,6 +1699,9 @@ pub struct DaemonContext {
     pub secure_key: Option<crate::secure_key::SecureKeyHandle>,
     /// Owns the actor thread; kept so Drop drains before unset_default_store.
     _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
+    /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
+    pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    _process_containment_actor: Option<crate::process_containment::ProcessContainmentActor>,
 }
 
 impl DaemonContext {
@@ -1800,6 +1803,8 @@ impl DaemonContext {
             config_source,
             secure_key: None,
             _secure_key_actor: None,
+            process_containment: None,
+            _process_containment_actor: None,
         }
     }
 
@@ -1811,6 +1816,14 @@ impl DaemonContext {
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         self.secure_key = Some(actor.handle());
         self._secure_key_actor = Some(actor);
+    }
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn attach_process_containment_actor(
+        &mut self,
+        actor: crate::process_containment::ProcessContainmentActor,
+    ) {
+        self.process_containment = Some(actor.handle());
+        self._process_containment_actor = Some(actor);
     }
 
     /// The daemon's config-resolution seam
@@ -2035,6 +2048,34 @@ pub(crate) async fn boot_with_db(
     {
         let _ = db;
         timer.phase("secure_key_actor_skipped");
+    }
+    // Process containment actor: durable generation-bound descendant groups.
+    // Under unit tests the actor is opt-in via `attach_process_containment_actor`
+    // so paused-time daemon lifecycle tests are not blocked by a cross-runtime
+    // barrier; production always installs and recovers.
+    #[cfg(not(test))]
+    {
+        let adapter = crate::process_containment::default_host_adapter();
+        let actor = crate::process_containment::ProcessContainmentActor::start(db.clone(), adapter);
+        let handle = actor.handle();
+        ctx.attach_process_containment_actor(actor);
+        match handle.recover().await {
+            Ok(outcomes) => {
+                tracing::info!(
+                    recovered = outcomes.len(),
+                    "process containment recovery finished"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "process containment recovery failed");
+            }
+        }
+        timer.phase("process_containment_actor");
+    }
+    #[cfg(test)]
+    {
+        let _ = db;
+        timer.phase("process_containment_actor_skipped");
     }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await

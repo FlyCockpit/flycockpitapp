@@ -47,6 +47,7 @@ pub mod packages;
 pub mod path_containment;
 pub mod private_fs;
 pub mod process;
+pub mod process_containment;
 pub mod providers;
 pub mod redact;
 pub mod secret_paths;

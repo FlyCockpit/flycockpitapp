@@ -40,6 +40,7 @@ pub mod app_flags;
 pub mod assistants;
 pub mod compressed_results;
 pub mod connector;
+pub mod execution_containments;
 mod files;
 pub mod guidance;
 pub mod inference_calls;

@@ -407,6 +407,21 @@ pub(super) async fn delete_session(
     // live workers in the affected subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
     stop_subtree(ctx, session_id, true).await?;
+    // Deletion barrier: commit Deleting, wait for ProvenEmpty containments.
+    if let Some(pc) = ctx.process_containment.as_ref() {
+        pc.begin_session_deletion(session_id)
+            .await
+            .map_err(|e| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("containment deletion barrier: {e}"),
+            })?;
+        if let Err(e) = pc.finish_session_deletion(session_id).await {
+            return Err(ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("session deletion blocked on nonempty containments: {e}"),
+            });
+        }
+    }
     // Terminalize active run invocations at the deletion transaction's wall
     // time without cascading their durable rows with the session.
     let now_wall_ms = super::run_invocation::wall_ms_now();

@@ -92,6 +92,9 @@ pub struct SessionRow {
     pub model_system_prompt_snapshot_json: String,
     pub created_by_principal: Option<String>,
     pub shared_with_collaborators: bool,
+    /// Session lifecycle barrier. `active` accepts work; `deleting` rejects new
+    /// work until every bound execution containment is ProvenEmpty.
+    pub lifecycle: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +163,9 @@ impl SessionRow {
                 .unwrap_or_else(|_| "{}".to_string()),
             created_by_principal: row.get("created_by_principal")?,
             shared_with_collaborators: row.get::<_, i64>("shared_with_collaborators")? != 0,
+            lifecycle: row
+                .get::<_, String>("lifecycle")
+                .unwrap_or_else(|_| "active".to_string()),
         })
     }
 }
@@ -483,6 +489,7 @@ fn build_session_row(
         model_system_prompt_snapshot_json: "{}".to_string(),
         created_by_principal: None,
         shared_with_collaborators: false,
+        lifecycle: "active".to_string(),
     }
 }
 
@@ -965,6 +972,7 @@ impl Db {
                 model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
                 created_by_principal: parent.created_by_principal,
                 shared_with_collaborators: false,
+                lifecycle: "active".to_string(),
             };
             let row = insert_fork_row_with_short_id_retry(&tx, row, &None)
                 .context("inserting btw fork session")?;
@@ -1067,6 +1075,7 @@ impl Db {
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
+            lifecycle: "active".to_string(),
         };
         let row = insert_fork_row_with_short_id_retry(&tx, row, &fork_point_turn_id)
             .context("inserting fork session")?;

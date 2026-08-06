@@ -726,6 +726,10 @@ fn map_ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecureKeyConsumerRef
 }
 
 /// Reserve a consumer reference. Idempotent only for the same full tuple.
+///
+/// Released rows are re-armable only for the sealed_state consumer kind (dual-slot
+/// key retention may re-pin after SQLite rollback). All other consumers treat
+/// Released as terminal for that reference_id.
 pub fn reserve_consumer_ref_conn(
     conn: &rusqlite::Connection,
     reference_id: &str,
@@ -738,6 +742,8 @@ pub fn reserve_consumer_ref_conn(
         return Ok(ReserveResult::NotFound);
     };
 
+    let sealed_rearm = consumer_kind == SEALED_STATE_CONSUMER_KIND;
+
     // Idempotent same-tuple first (even if version is now Retiring/Retired).
     if let Some(existing) = get_ref_by_id_conn(conn, reference_id)? {
         if existing.namespace == namespace
@@ -745,17 +751,44 @@ pub fn reserve_consumer_ref_conn(
             && existing.consumer_kind == consumer_kind
             && existing.consumer_id == consumer_id
         {
-            return Ok(ReserveResult::Idempotent(existing));
+            if existing.state == SecureKeyRefState::Released && sealed_rearm {
+                conn.execute(
+                    "DELETE FROM secure_key_consumer_refs WHERE reference_id = ?1 AND state = ?2",
+                    params![reference_id, SecureKeyRefState::Released.as_str()],
+                )
+                .context("clearing released sealed-state ref for re-reserve")?;
+            } else {
+                // Active/Reserved/Releasing: idempotent. Non-sealed Released: terminal.
+                return Ok(ReserveResult::Idempotent(existing));
+            }
+        } else {
+            return Ok(ReserveResult::Conflict);
         }
-        return Ok(ReserveResult::Conflict);
     }
     if let Some(existing) =
         get_ref_by_tuple_conn(conn, namespace, version, consumer_kind, consumer_id)?
     {
         if existing.reference_id == reference_id {
-            return Ok(ReserveResult::Idempotent(existing));
+            if existing.state == SecureKeyRefState::Released && sealed_rearm {
+                conn.execute(
+                    "DELETE FROM secure_key_consumer_refs WHERE reference_id = ?1 AND state = ?2",
+                    params![reference_id, SecureKeyRefState::Released.as_str()],
+                )
+                .context("clearing released sealed-state ref for re-reserve")?;
+            } else {
+                return Ok(ReserveResult::Idempotent(existing));
+            }
+        } else if existing.state != SecureKeyRefState::Released {
+            return Ok(ReserveResult::Conflict);
+        } else if sealed_rearm {
+            conn.execute(
+                "DELETE FROM secure_key_consumer_refs WHERE reference_id = ?1 AND state = ?2",
+                params![existing.reference_id, SecureKeyRefState::Released.as_str()],
+            )
+            .context("clearing released sealed-state tuple ref for re-reserve")?;
+        } else {
+            return Ok(ReserveResult::Conflict);
         }
-        return Ok(ReserveResult::Conflict);
     }
 
     // New reservations only while Active/Retained.
@@ -930,6 +963,218 @@ pub fn delete_pending_version_conn(
     )
     .context("deleting pending version")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sealed-state write sagas (dual-slot CAS coordination)
+// ---------------------------------------------------------------------------
+
+/// Consumer kind for sealed-state key retention references.
+pub const SEALED_STATE_CONSUMER_KIND: &str = "sealed_state";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedStateSagaPhase {
+    Prepared,
+    RefReserved,
+    NativeWritten,
+    NativeVerified,
+    RefActivated,
+}
+
+impl SealedStateSagaPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "Prepared",
+            Self::RefReserved => "RefReserved",
+            Self::NativeWritten => "NativeWritten",
+            Self::NativeVerified => "NativeVerified",
+            Self::RefActivated => "RefActivated",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "Prepared" => Ok(Self::Prepared),
+            "RefReserved" => Ok(Self::RefReserved),
+            "NativeWritten" => Ok(Self::NativeWritten),
+            "NativeVerified" => Ok(Self::NativeVerified),
+            "RefActivated" => Ok(Self::RefActivated),
+            other => bail!("unknown sealed state saga phase: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedStateSagaRow {
+    pub op_id: String,
+    pub namespace: String,
+    pub target_slot: String,
+    pub target_account: String,
+    /// Decimal text encoding of a full u64 generation.
+    pub expected_generation: u64,
+    /// Decimal text encoding of a full u64 generation.
+    pub new_generation: u64,
+    pub payload_digest_hex: String,
+    /// Hex digest of the payload expected at CAS start; empty string for create.
+    pub expected_payload_digest_hex: String,
+    /// Prior current slot suffix (`state-a`/`state-b`) or empty for create.
+    pub prior_slot: String,
+    pub key_version: i64,
+    pub phase: SealedStateSagaPhase,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_sealed_state_saga_conn(
+    conn: &rusqlite::Connection,
+    op_id: &str,
+    namespace: &str,
+    target_slot: &str,
+    target_account: &str,
+    expected_generation: u64,
+    new_generation: u64,
+    payload_digest_hex: &str,
+    expected_payload_digest_hex: &str,
+    prior_slot: &str,
+    key_version: i64,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO sealed_state_sagas
+            (op_id, namespace, target_slot, target_account, expected_generation,
+             new_generation, payload_digest_hex, expected_payload_digest_hex, prior_slot,
+             key_version, phase, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        params![
+            op_id,
+            namespace,
+            target_slot,
+            target_account,
+            expected_generation.to_string(),
+            new_generation.to_string(),
+            payload_digest_hex,
+            expected_payload_digest_hex,
+            prior_slot,
+            key_version,
+            SealedStateSagaPhase::Prepared.as_str(),
+            now
+        ],
+    )
+    .context("inserting sealed state saga")?;
+    Ok(())
+}
+
+pub fn set_sealed_state_saga_phase_conn(
+    conn: &rusqlite::Connection,
+    op_id: &str,
+    phase: SealedStateSagaPhase,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let n = conn
+        .execute(
+            "UPDATE sealed_state_sagas SET phase = ?1, updated_at = ?2 WHERE op_id = ?3",
+            params![phase.as_str(), now, op_id],
+        )
+        .context("updating sealed state saga phase")?;
+    if n == 0 {
+        bail!("sealed state saga not found: {op_id}");
+    }
+    Ok(())
+}
+
+const SEALED_SAGA_SELECT: &str = "SELECT op_id, namespace, target_slot, target_account,
+    expected_generation, new_generation, payload_digest_hex, expected_payload_digest_hex,
+    prior_slot, key_version, phase, created_at, updated_at
+ FROM sealed_state_sagas";
+
+pub fn get_sealed_state_saga_conn(
+    conn: &rusqlite::Connection,
+    op_id: &str,
+) -> Result<Option<SealedStateSagaRow>> {
+    conn.query_row(
+        &format!("{SEALED_SAGA_SELECT} WHERE op_id = ?1"),
+        [op_id],
+        map_sealed_state_saga_row,
+    )
+    .optional()
+    .context("loading sealed state saga")
+}
+
+pub fn list_open_sealed_state_sagas_conn(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SealedStateSagaRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "{SEALED_SAGA_SELECT} ORDER BY created_at ASC, op_id ASC"
+    ))?;
+    let rows = stmt.query_map([], map_sealed_state_saga_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing sealed state sagas")
+}
+
+pub fn get_sealed_state_saga_for_namespace_conn(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> Result<Option<SealedStateSagaRow>> {
+    conn.query_row(
+        &format!("{SEALED_SAGA_SELECT} WHERE namespace = ?1 ORDER BY created_at ASC LIMIT 1"),
+        [namespace],
+        map_sealed_state_saga_row,
+    )
+    .optional()
+    .context("loading sealed state saga by namespace")
+}
+
+pub fn delete_sealed_state_saga_conn(conn: &rusqlite::Connection, op_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM sealed_state_sagas WHERE op_id = ?1", [op_id])
+        .context("deleting sealed state saga")?;
+    Ok(())
+}
+
+fn map_sealed_state_saga_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SealedStateSagaRow> {
+    let phase: String = row.get(10)?;
+    let expected_s: String = row.get(4)?;
+    let new_s: String = row.get(5)?;
+    let expected_generation = expected_s.parse::<u64>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(e.to_string())),
+        )
+    })?;
+    let new_generation = new_s.parse::<u64>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(e.to_string())),
+        )
+    })?;
+    Ok(SealedStateSagaRow {
+        op_id: row.get(0)?,
+        namespace: row.get(1)?,
+        target_slot: row.get(2)?,
+        target_account: row.get(3)?,
+        expected_generation,
+        new_generation,
+        payload_digest_hex: row.get(6)?,
+        expected_payload_digest_hex: row.get(7)?,
+        prior_slot: row.get(8)?,
+        key_version: row.get(9)?,
+        phase: SealedStateSagaPhase::parse(&phase).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(e.to_string())),
+            )
+        })?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+/// Stable reference_id for a sealed-state key retention ref.
+pub fn sealed_state_ref_id(namespace: &str, key_version: i64) -> String {
+    format!("sealed-state:{namespace}:v{key_version}")
 }
 
 #[cfg(test)]

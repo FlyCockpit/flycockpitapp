@@ -1579,3 +1579,28 @@ CREATE INDEX idx_secure_key_refs_version_state
 CREATE INDEX idx_secure_key_refs_recon
     ON secure_key_consumer_refs (state)
     WHERE state IN ('Reserved', 'Releasing');
+
+-- ---- sealed_state_sagas ----------------------------------------------------
+-- In-flight dual-slot sealed-state writes. Safe digests/accounts only.
+
+CREATE TABLE sealed_state_sagas (
+    op_id               TEXT    PRIMARY KEY,
+    namespace           TEXT    NOT NULL,
+    target_slot         TEXT    NOT NULL CHECK (target_slot IN ('state-a', 'state-b')),
+    target_account      TEXT    NOT NULL,
+    -- Full u64 range as decimal text (SQLite INTEGER is signed i64 only).
+    expected_generation TEXT    NOT NULL,
+    new_generation      TEXT    NOT NULL,
+    -- New payload digest (hex). Empty expected digest means create (no prior).
+    payload_digest_hex  TEXT    NOT NULL,
+    expected_payload_digest_hex TEXT NOT NULL,
+    -- Prior/current slot at CAS start: 'state-a'/'state-b', or '' for create.
+    prior_slot          TEXT    NOT NULL,
+    key_version         INTEGER NOT NULL,
+    phase               TEXT    NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE INDEX idx_sealed_state_sagas_ns
+    ON sealed_state_sagas (namespace);

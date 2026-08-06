@@ -44,7 +44,7 @@ pub struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn tx<T>(
+    pub(crate) fn tx<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> Result<T, SecureKeyError> + Send + 'static,
     ) -> Result<T, SecureKeyError>
@@ -71,7 +71,7 @@ impl Worker<'_> {
         }
     }
 
-    fn read<T>(
+    pub(crate) fn read<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> Result<T, SecureKeyError> + Send + 'static,
     ) -> Result<T, SecureKeyError>
@@ -97,6 +97,15 @@ impl Worker<'_> {
         for ns_row in &namespaces {
             let ns = Namespace::parse(&ns_row.namespace)?;
             self.pre_resume_manifest_invariants(&ns)?;
+        }
+        // Resume interrupted sealed-state writes before consumers observe slots.
+        self.sealed_startup_resume_all()?;
+        // Conservatively re-pin sealed_state consumer refs from valid native slots.
+        for ns_row in &namespaces {
+            if let Ok(ns) = Namespace::parse(&ns_row.namespace) {
+                // Fail closed: cannot start with unreconciled sealed-state retention.
+                self.sealed_reconcile_key_refs(&ns)?;
+            }
         }
         // Drive every open saga to completion (or Corrupt).
         let sagas = self.read(|conn| {
@@ -179,8 +188,18 @@ impl Worker<'_> {
     }
 
     /// Drive open sagas for `namespace`, then fail closed on unexplained mismatch.
-    fn ensure_namespace_ready(&self, namespace: &Namespace) -> Result<(), SecureKeyError> {
+    pub(crate) fn ensure_namespace_ready(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<(), SecureKeyError> {
         self.pre_resume_manifest_invariants(namespace)?;
+        // 1) Resume sealed-state write sagas first so an interrupted invalid target
+        //    can be explained/removed before slot reconciliation sees it as Corrupt.
+        self.sealed_resume_open_sagas_for(namespace)?;
+        // 2) Re-pin sealed_state refs from valid native slots before any Retire resume.
+        //    A rolled-back consumer ref must never authorize deleting a key still named
+        //    by a sealed slot (AC4).
+        self.sealed_reconcile_key_refs(namespace)?;
         let ns = namespace.as_str().to_owned();
         let open = self.read({
             let ns = ns.clone();
@@ -231,7 +250,10 @@ impl Worker<'_> {
         self.load_version_after_consistent(namespace, version)
     }
 
-    fn load_version_after_consistent(
+    /// Load a key version without resuming open provision/retire sagas.
+    /// Used by sealed-state probe/reconcile so retirement cannot run before
+    /// native slots re-pin their consumer refs.
+    pub(crate) fn load_version_after_consistent(
         &self,
         namespace: &Namespace,
         version: i64,

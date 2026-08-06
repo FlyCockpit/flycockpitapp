@@ -16,8 +16,16 @@ mod manifest;
 mod namespace;
 mod native_store;
 mod platform;
+mod sealed_ops;
+mod sealed_state;
 mod worker;
 
+pub use sealed_state::{
+    MAX_PAYLOAD_LEN, SealedHealth, SealedPayload, SealedSlot, SealedStateMeta, SealedStateView,
+};
+
+#[cfg(test)]
+mod sealed_tests;
 #[cfg(test)]
 mod tests;
 

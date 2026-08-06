@@ -19,6 +19,7 @@ use super::platform::{
     mark_actor_intake_ready, mark_worker_drained, production_native_store,
     set_default_platform_store, unset_default_platform_store,
 };
+use super::sealed_state::{SealedPayload, SealedStateView};
 use super::worker::{NamespaceMetadata, Worker};
 
 /// Bounded queue capacity (acceptance: 32).
@@ -75,6 +76,22 @@ enum Op {
     CheckConsistency {
         namespace: Namespace,
         reply: Reply<Result<(), SecureKeyError>>,
+    },
+    SealedCreateOrLoad {
+        namespace: Namespace,
+        initial: SealedPayload,
+        reply: Reply<Result<SealedStateView, SecureKeyError>>,
+    },
+    SealedLoad {
+        namespace: Namespace,
+        reply: Reply<Result<SealedStateView, SecureKeyError>>,
+    },
+    SealedCompareAndSwap {
+        namespace: Namespace,
+        expected_generation: u64,
+        expected_payload_digest: [u8; 32],
+        new_payload: SealedPayload,
+        reply: Reply<Result<SealedStateView, SecureKeyError>>,
     },
     Shutdown {
         reply: Reply<()>,
@@ -228,6 +245,47 @@ impl SecureKeyHandle {
         Self::await_reply(rx).await?
     }
 
+    pub async fn sealed_create_or_load(
+        &self,
+        namespace: &str,
+        initial: SealedPayload,
+    ) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedCreateOrLoad {
+            namespace,
+            initial,
+            reply,
+        })?;
+        Self::await_reply(rx).await?
+    }
+
+    pub async fn sealed_load(&self, namespace: &str) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedLoad { namespace, reply })?;
+        Self::await_reply(rx).await?
+    }
+
+    pub async fn sealed_compare_and_swap(
+        &self,
+        namespace: &str,
+        expected_generation: u64,
+        expected_payload_digest: [u8; 32],
+        new_payload: SealedPayload,
+    ) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedCompareAndSwap {
+            namespace,
+            expected_generation,
+            expected_payload_digest,
+            new_payload,
+            reply,
+        })?;
+        Self::await_reply(rx).await?
+    }
+
     /// Sync call for tests that are not on an async runtime.
     pub fn create_or_load_blocking(
         &self,
@@ -308,6 +366,50 @@ impl SecureKeyHandle {
         let namespace = Namespace::parse(namespace)?;
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::ListMetadata { namespace, reply })?;
+        rx.blocking_recv()
+            .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
+    }
+
+    pub fn sealed_create_or_load_blocking(
+        &self,
+        namespace: &str,
+        initial: SealedPayload,
+    ) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedCreateOrLoad {
+            namespace,
+            initial,
+            reply,
+        })?;
+        rx.blocking_recv()
+            .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
+    }
+
+    pub fn sealed_load_blocking(&self, namespace: &str) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedLoad { namespace, reply })?;
+        rx.blocking_recv()
+            .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
+    }
+
+    pub fn sealed_compare_and_swap_blocking(
+        &self,
+        namespace: &str,
+        expected_generation: u64,
+        expected_payload_digest: [u8; 32],
+        new_payload: SealedPayload,
+    ) -> Result<SealedStateView, SecureKeyError> {
+        let namespace = Namespace::parse(namespace)?;
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::SealedCompareAndSwap {
+            namespace,
+            expected_generation,
+            expected_payload_digest,
+            new_payload,
+            reply,
+        })?;
         rx.blocking_recv()
             .map_err(|_| SecureKeyError::Internal("actor dropped reply".into()))?
     }
@@ -639,6 +741,30 @@ fn actor_loop(
             }
             Op::CheckConsistency { namespace, reply } => {
                 let _ = reply.send(worker.check_consistency(&namespace));
+            }
+            Op::SealedCreateOrLoad {
+                namespace,
+                initial,
+                reply,
+            } => {
+                let _ = reply.send(worker.sealed_create_or_load(&namespace, initial));
+            }
+            Op::SealedLoad { namespace, reply } => {
+                let _ = reply.send(worker.sealed_load(&namespace));
+            }
+            Op::SealedCompareAndSwap {
+                namespace,
+                expected_generation,
+                expected_payload_digest,
+                new_payload,
+                reply,
+            } => {
+                let _ = reply.send(worker.sealed_compare_and_swap(
+                    &namespace,
+                    expected_generation,
+                    expected_payload_digest,
+                    new_payload,
+                ));
             }
             Op::Shutdown { reply } => {
                 let _ = reply.send(());

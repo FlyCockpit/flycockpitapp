@@ -196,6 +196,17 @@ impl FakeNativeStore {
             .len()
     }
 
+    /// Diagnostic: list (service, account) keys currently held (tests only).
+    pub fn accounts(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .items
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn contains(&self, service: &str, account: &str) -> bool {
         self.inner
             .lock()
@@ -378,5 +389,14 @@ impl NativeKeyStore for FakeNativeStore {
         }
         self.check_fault_at(FaultPoint::AfterDelete, next)?;
         Ok(())
+    }
+
+    fn list_accounts(&self, service: &str) -> Result<Vec<String>, SecureKeyError> {
+        Ok(self
+            .accounts()
+            .into_iter()
+            .filter(|(svc, _)| svc == service)
+            .map(|(_, acct)| acct)
+            .collect())
     }
 }

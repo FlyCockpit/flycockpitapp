@@ -13,6 +13,13 @@ pub trait NativeKeyStore: Send + Sync {
 
     /// Delete; missing item is success (idempotent verify-absent).
     fn delete_secret(&self, service: &str, account: &str) -> Result<(), SecureKeyError>;
+
+    /// Diagnostic enumeration of accounts under `service` when the adapter supports it.
+    /// Used only to detect unexpected third sealed-state accounts; never to load state.
+    /// Default: empty (adapter cannot enumerate).
+    fn list_accounts(&self, _service: &str) -> Result<Vec<String>, SecureKeyError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Production adapter: uses keyring_core::Entry against the default store.

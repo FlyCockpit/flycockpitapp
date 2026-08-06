@@ -93,6 +93,9 @@ jsonc-parser = { workspace = true }
 # `keyring` crate. Features pinned exactly per `native-secure-key-store`.
 keyring-core = { workspace = true }
 zeroize = { workspace = true }
+# Sealed-state HMAC: direct pin on this member only (not workspace.dependencies).
+# native-secure-sealed-state-store requires exactly 0.13.0 + zeroize feature.
+hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }

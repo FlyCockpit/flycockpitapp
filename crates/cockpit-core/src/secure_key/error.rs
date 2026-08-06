@@ -27,6 +27,15 @@ pub enum SecureKeyError {
     Retiring { namespace: String, version: i64 },
     /// Active version cannot be retired.
     ActiveVersion { namespace: String, version: i64 },
+    /// Sealed-state CAS mismatch; safe current metadata only (no payload).
+    /// `degraded` is true when only one slot is present (SealedHealth::Degraded).
+    Conflict {
+        namespace: String,
+        generation: u64,
+        payload_digest: [u8; 32],
+        key_version: u32,
+        degraded: bool,
+    },
     /// Internal coordination failure (safe message only).
     Internal(String),
 }
@@ -44,6 +53,7 @@ impl SecureKeyError {
             Self::InUse(_) => "InUse",
             Self::Retiring { .. } => "Retiring",
             Self::ActiveVersion { .. } => "ActiveVersion",
+            Self::Conflict { .. } => "Conflict",
             Self::Internal(_) => "Internal",
         }
     }
@@ -76,6 +86,26 @@ impl fmt::Debug for SecureKeyError {
                 .field("namespace", namespace)
                 .field("version", version)
                 .finish(),
+            Self::Conflict {
+                namespace,
+                generation,
+                payload_digest,
+                key_version,
+                degraded,
+            } => f
+                .debug_struct("Conflict")
+                .field("namespace", namespace)
+                .field("generation", generation)
+                .field(
+                    "payload_digest",
+                    &payload_digest
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                )
+                .field("key_version", key_version)
+                .field("degraded", degraded)
+                .finish(),
             Self::Internal(m) => f.debug_tuple("Internal").field(m).finish(),
         }
     }
@@ -104,6 +134,15 @@ impl fmt::Display for SecureKeyError {
             Self::ActiveVersion { namespace, version } => write!(
                 f,
                 "secure key version {namespace}/{version} is active and cannot be retired"
+            ),
+            Self::Conflict {
+                namespace,
+                generation,
+                key_version,
+                ..
+            } => write!(
+                f,
+                "sealed state conflict for {namespace} (generation {generation}, key v{key_version})"
             ),
             Self::Internal(m) => write!(f, "secure key internal error: {m}"),
         }

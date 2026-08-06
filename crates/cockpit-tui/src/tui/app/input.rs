@@ -438,6 +438,7 @@ impl App {
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
                 self.drain_oauth_actions();
+                let open_default_model_picker = self.dialog.take_pending_default_model_picker();
                 // Closing the settings dialog can change the active
                 // provider/model — reload launch info so the status
                 // line and header refresh. TUI-side settings (vim
@@ -469,7 +470,16 @@ impl App {
                     // the user has since dismissed.
                     self.refresh_reopened_model_picker_after_settings = Some(provider);
                 }
+                if open_default_model_picker {
+                    self.open_default_model_picker_from_settings();
+                }
             } else if let Some(req) = self.dialog.take_daemon_request() {
+                // A staged default-model request carries its own correlation
+                // id; adopt it so the terminal result is matched to this
+                // operation and not silently dropped.
+                if let Some(id) = self.dialog.take_pending_default_model_update_id() {
+                    self.pending_default_model_update_id = Some(id);
+                }
                 self.send_daemon_request("/settings", req, ControlApplied::None);
             }
             self.drain_oauth_actions();

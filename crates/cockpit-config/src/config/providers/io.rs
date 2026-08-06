@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::HashMap;
+
 /// How an atomic active-model mutation should treat an existing effective
 /// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,49 +10,6 @@ pub enum ActiveModelWriteMode {
     Replace,
     /// Write only when the effective layered config has no default.
     InitializeIfMissing,
-}
-
-/// Result of an atomic active-model mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveModelWriteResult {
-    /// The effective default after the locked mutation completes.
-    pub authoritative_selection: Option<ActiveModelRef>,
-    /// Whether this caller wrote the concrete config layer.
-    pub wrote: bool,
-}
-
-/// A fully prepared active-model default mutation.
-///
-/// The cross-process config lock is already held, the effective layered
-/// default has been resolved, and any replacement bytes have been written and
-/// synced to a private temporary file. [`Self::commit`] performs only the
-/// final atomic replacement while retaining that lock. Dropping an uncommitted
-/// plan removes its temporary file and leaves config unchanged.
-pub struct PreparedActiveModelWrite {
-    _lock: ConfigMutationLock,
-    pending_write: Option<PreparedAtomicWrite>,
-    authoritative_selection_before_commit: Option<ActiveModelRef>,
-    result: ActiveModelWriteResult,
-}
-
-impl PreparedActiveModelWrite {
-    /// The effective default while the mutation lock was acquired, before a
-    /// pending replacement is committed.
-    pub fn authoritative_selection_before_commit(&self) -> Option<&ActiveModelRef> {
-        self.authoritative_selection_before_commit.as_ref()
-    }
-
-    /// The effective default after a successful commit.
-    pub fn authoritative_selection(&self) -> Option<&ActiveModelRef> {
-        self.result.authoritative_selection.as_ref()
-    }
-
-    pub fn commit(mut self) -> Result<ActiveModelWriteResult> {
-        if let Some(write) = self.pending_write.take() {
-            write.commit()?;
-        }
-        Ok(self.result)
-    }
 }
 
 /// Read+write a provider config layer while preserving fields cockpit
@@ -74,29 +33,168 @@ pub fn load_effective_call_count() -> usize {
     LOAD_EFFECTIVE_CALLS.with(std::cell::Cell::get)
 }
 
+/// Advance and return the per-thread effective-resolution generation.
+///
+/// Every effective resolution — including the ones journal recovery and the
+/// effective-default mutation perform under the lock — stamps a distinct
+/// generation so a caller can order snapshots deterministically.
+///
+/// The counter is thread-local and monotonic *per thread*, so it orders
+/// snapshots within one resolution context, not across threads. It is also the
+/// counter [`load_effective_call_count`] exposes, so any code path that
+/// resolves the effective config now advances it: a test asserting an exact
+/// call count must account for the resolutions the mutation and recovery paths
+/// perform under the lock, not only its own `load_effective` calls.
+pub(crate) fn next_load_effective_generation() -> u64 {
+    LOAD_EFFECTIVE_CALLS.with(|calls| {
+        let next = calls.get().saturating_add(1);
+        calls.set(next);
+        next as u64
+    })
+}
+
 impl ConfigDoc {
     /// Load the effective provider config for `cwd` by merging every
     /// applicable config layer from least-specific to most-specific.
     /// `COCKPIT_CONFIG` supplies the only config.json path when set; provider
     /// files live beside that file under `providers/`.
     pub fn load_effective(cwd: &Path) -> ProvidersConfig {
-        let generation = LOAD_EFFECTIVE_CALLS.with(|calls| {
-            let next = calls.get().saturating_add(1);
-            calls.set(next);
-            next as u64
-        });
+        // Layer discovery happens exactly once per load; recovery, masking,
+        // and the merge all reuse the same resolved list.
         let paths = crate::config::dirs::config_file_paths_for_load(cwd);
-        Self::providers_from_paths(&paths).with_resolution_generation(generation)
+        Self::load_effective_from_paths(&paths)
+    }
+
+    /// Resolve the effective config from an already-discovered layer list.
+    ///
+    /// Journal recovery is an effective-config resolution barrier: a fresh
+    /// client never observes a half-committed default. Config-only journals
+    /// are finished here; a session-bearing journal needs daemon session
+    /// authority, so its layer is *masked* with the recorded prior bytes
+    /// instead until startup/attach can converge it.
+    pub fn load_effective_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
+        match Self::try_load_effective_from_paths(paths) {
+            Ok(providers) => providers,
+            Err(error) => {
+                // Infallible callers still must not observe a half-committed
+                // default. Degrade to the safest resolution available: drop
+                // `active_model` from every unmaskable layer so the default
+                // falls back to a layer that is not mid-transaction.
+                tracing::error!(
+                    %error,
+                    "serving a degraded effective config: a pending default-model transaction could not be masked"
+                );
+                let generation = next_load_effective_generation();
+                let (mut masks, unmaskable) =
+                    crate::config::effective_default::masked_layers(paths);
+                for path in unmaskable {
+                    masks.insert(path, b"{}\n".to_vec());
+                }
+                Self::providers_from_paths_with_masks(paths, &masks)
+                    .with_resolution_generation(generation)
+            }
+        }
+    }
+
+    /// Fallible effective resolution.
+    ///
+    /// Fails closed when a layer has a pending effective-default journal that
+    /// can neither be recovered nor masked: its bytes may already hold the
+    /// target of an unfinished transaction, and merging them would expose a
+    /// half-committed default. Daemon-facing loads use this so attach reports
+    /// a typed error instead of serving an ambiguous snapshot.
+    pub fn try_load_effective_from_paths(paths: &[PathBuf]) -> Result<ProvidersConfig> {
+        use crate::config::effective_default;
+
+        effective_default::recover_layer_journals(
+            paths,
+            effective_default::JournalRecovery::read_only(),
+        )
+        .context("recovering a pending default-model transaction")?;
+        let generation = next_load_effective_generation();
+        let (mut masks, mut unmaskable) = effective_default::masked_layers(paths);
+        let mut merged = Self::providers_from_paths_with_masks(paths, &masks);
+        // The probe and the merge both ran outside the cross-process mutation
+        // lock. A journal that appeared in between would have been merged
+        // unmasked, so re-check once and redo the merge if the picture moved.
+        if masks.is_empty()
+            && unmaskable.is_empty()
+            && effective_default::any_journal_present(paths)
+        {
+            let reprobed = effective_default::masked_layers(paths);
+            masks = reprobed.0;
+            unmaskable = reprobed.1;
+            if !masks.is_empty() {
+                merged = Self::providers_from_paths_with_masks(paths, &masks);
+            }
+        }
+        if !unmaskable.is_empty() {
+            anyhow::bail!(
+                "{} configuration layer(s) have a pending default-model transaction that cannot be                  masked; run `cockpit doctor` to inspect the journal",
+                unmaskable.len()
+            );
+        }
+        Ok(merged.with_resolution_generation(generation))
     }
 
     pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
+        Self::providers_from_paths_with_masks(paths, &HashMap::new())
+    }
+
+    /// Masked merge that is **not** a counted effective resolution.
+    ///
+    /// Pre-attach bootstrap and export read config without resolving
+    /// credentials or stamping a resolution generation — that budget is
+    /// daemon-side and load-count-gated. They still must not observe a
+    /// half-committed default, so they mask pending layers here without
+    /// running recovery or consuming a load.
+    pub fn providers_from_paths_masked(paths: &[PathBuf]) -> ProvidersConfig {
+        use crate::config::effective_default;
+
+        // Same fail-closed rule as the counted path: a layer whose pending
+        // journal cannot be masked is degraded to an empty object, because its
+        // bytes may already hold the target of an unfinished transaction.
+        fn masks_for(paths: &[PathBuf]) -> (HashMap<PathBuf, Vec<u8>>, bool) {
+            let (mut masks, unmaskable) = effective_default::masked_layers(paths);
+            let degraded = !unmaskable.is_empty();
+            for path in unmaskable {
+                tracing::error!(
+                    "masking a pending default-model transaction failed; serving this layer as empty"
+                );
+                masks.insert(path, b"{}\n".to_vec());
+            }
+            (masks, degraded)
+        }
+
+        let (masks, _) = masks_for(paths);
+        let mut merged = Self::providers_from_paths_with_masks(paths, &masks);
+        // The probe and the merge both ran outside the cross-process mutation
+        // lock, so a journal that appeared in between would have been merged
+        // unmasked. Re-check once and redo the merge if the picture moved.
+        if masks.is_empty() && effective_default::any_journal_present(paths) {
+            let (masks, _) = masks_for(paths);
+            if !masks.is_empty() {
+                merged = Self::providers_from_paths_with_masks(paths, &masks);
+            }
+        }
+        merged
+    }
+
+    /// Merge layers, substituting `masks[path]` for a layer's `config.json`
+    /// bytes. Provider files beside a masked layer are unaffected — only the
+    /// layer-wide metadata (including `active_model`) is masked.
+    pub(crate) fn providers_from_paths_with_masks(
+        paths: &[PathBuf],
+        masks: &HashMap<PathBuf, Vec<u8>>,
+    ) -> ProvidersConfig {
         let mut merged = Value::Object(Map::new());
         for path in paths {
-            if !path.exists() {
+            let mask = masks.get(path).map(Vec::as_slice);
+            if mask.is_none() && !path.exists() {
                 merge_provider_files_for_layer(&mut merged, path);
                 continue;
             }
-            match Self::load(path) {
+            match Self::load_with_mask(path, mask) {
                 Ok(doc) => {
                     let mut layer = doc.raw.clone();
                     warn_inline_providers_ignored(path, &layer);
@@ -121,12 +219,16 @@ impl ConfigDoc {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with_mask(path, None)
+    }
+
+    fn load_with_mask(path: &Path, mask: Option<&[u8]>) -> Result<Self> {
         let path = config_path_for_layer_path(path);
-        let raw_str = if path.exists() {
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("reading config.json at {}", path.display()))?
-        } else {
-            "{}".to_string()
+        let raw_str = match mask {
+            Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            None if path.exists() => std::fs::read_to_string(&path)
+                .with_context(|| format!("reading config.json at {}", path.display()))?,
+            None => "{}".to_string(),
         };
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
@@ -214,7 +316,6 @@ impl ConfigDoc {
         current.set_layer_metadata_raw(
             cfg,
             originally_loaded.on_unlisted_models_fetch != cfg.on_unlisted_models_fetch,
-            originally_loaded.active_model != cfg.active_model,
             originally_loaded.category_defaults != cfg.category_defaults,
         )?;
         current.persist_raw_unlocked()?;
@@ -222,11 +323,15 @@ impl ConfigDoc {
         self.refresh_from_disk_unlocked()
     }
 
+    /// Persist layer-wide provider metadata.
+    ///
+    /// `active_model` is deliberately absent: it is layer-wide *default*
+    /// policy, not provider-owned metadata, and is only ever written by
+    /// [`crate::config::effective_default::mutate_effective_default`].
     fn set_layer_metadata_raw(
         &mut self,
         cfg: &ProvidersConfig,
         replace_unlisted_policy: bool,
-        replace_active_model: bool,
         replace_category_defaults: bool,
     ) -> Result<()> {
         let obj = self.raw.as_object_mut().expect("root is an object");
@@ -243,16 +348,6 @@ impl ConfigDoc {
                 }
             }
         }
-        if replace_active_model {
-            match serialize_active_model(cfg.active_model.as_ref())? {
-                Some(active) => {
-                    obj.insert("active_model".to_string(), active);
-                }
-                None => {
-                    obj.remove("active_model");
-                }
-            }
-        }
         if replace_category_defaults {
             if cfg.category_defaults.is_empty() {
                 obj.remove("category_defaults");
@@ -263,98 +358,6 @@ impl ConfigDoc {
             }
         }
         Ok(())
-    }
-
-    pub fn write_active_model(&mut self, active: Option<&ActiveModelRef>) -> Result<()> {
-        let _lock = ConfigMutationLock::acquire(&self.path)?;
-        let mut current = Self::load(&self.path)?;
-        current.set_active_model_raw(active)?;
-        current.persist_raw_unlocked()?;
-        self.refresh_from_disk_unlocked()
-    }
-
-    /// Atomically reload the effective layered config, decide whether to
-    /// initialize or replace its default, and persist the concrete write
-    /// target. The OS lock spans the complete reload/check/write sequence and
-    /// is shared by independent cockpit processes.
-    pub fn write_effective_active_model_atomically(
-        cwd: &Path,
-        write_target: &Path,
-        requested: &ActiveModelRef,
-        mode: ActiveModelWriteMode,
-    ) -> Result<ActiveModelWriteResult> {
-        Self::prepare_effective_active_model_write(cwd, write_target, requested, mode)?.commit()
-    }
-
-    /// Prepare the complete blocking portion of an effective-default write
-    /// while holding the shared cross-process mutation lock. Callers with a
-    /// deadline can run this in a blocking task before claiming terminal
-    /// ownership, then call [`PreparedActiveModelWrite::commit`] only after
-    /// the surrounding session transaction is ready to commit.
-    pub fn prepare_effective_active_model_write(
-        cwd: &Path,
-        write_target: &Path,
-        requested: &ActiveModelRef,
-        mode: ActiveModelWriteMode,
-    ) -> Result<PreparedActiveModelWrite> {
-        let write_target = config_path_for_layer_path(write_target);
-        let lock = ConfigMutationLock::acquire(&write_target)?;
-        Self::prepare_effective_active_model_write_locked(cwd, write_target, requested, mode, lock)
-    }
-
-    /// Like [`Self::prepare_effective_active_model_write`], but abandons a
-    /// contended cross-process lock when `cancelled` becomes true. The caller
-    /// must still join the blocking task after cancellation; this method
-    /// guarantees that join does not wait for the current lock owner.
-    pub fn prepare_effective_active_model_write_cancellable(
-        cwd: &Path,
-        write_target: &Path,
-        requested: &ActiveModelRef,
-        mode: ActiveModelWriteMode,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Result<PreparedActiveModelWrite> {
-        let write_target = config_path_for_layer_path(write_target);
-        let lock = ConfigMutationLock::acquire_cancellable(&write_target, cancelled)?;
-        Self::prepare_effective_active_model_write_locked(cwd, write_target, requested, mode, lock)
-    }
-
-    fn prepare_effective_active_model_write_locked(
-        cwd: &Path,
-        write_target: PathBuf,
-        requested: &ActiveModelRef,
-        mode: ActiveModelWriteMode,
-        lock: ConfigMutationLock,
-    ) -> Result<PreparedActiveModelWrite> {
-        let current = Self::load_effective(cwd).active_model;
-        let should_write = match mode {
-            ActiveModelWriteMode::Replace => current.as_ref() != Some(requested),
-            ActiveModelWriteMode::InitializeIfMissing => current.is_none(),
-        };
-        if !should_write {
-            return Ok(PreparedActiveModelWrite {
-                _lock: lock,
-                pending_write: None,
-                authoritative_selection_before_commit: current.clone(),
-                result: ActiveModelWriteResult {
-                    authoritative_selection: current,
-                    wrote: false,
-                },
-            });
-        }
-
-        let mut doc = Self::load(&write_target)?;
-        doc.set_active_model_raw(Some(requested))?;
-        let pretty = serde_json::to_string_pretty(&doc.raw).context("serializing config.json")?;
-        let pending_write = prepare_atomic_write(&write_target, format!("{pretty}\n").as_bytes())?;
-        Ok(PreparedActiveModelWrite {
-            _lock: lock,
-            pending_write: Some(pending_write),
-            authoritative_selection_before_commit: current,
-            result: ActiveModelWriteResult {
-                authoritative_selection: Some(requested.clone()),
-                wrote: true,
-            },
-        })
     }
 
     pub fn write_provider_models(
@@ -516,20 +519,6 @@ impl ConfigDoc {
         Ok(())
     }
 
-    fn set_active_model_raw(&mut self, active: Option<&ActiveModelRef>) -> Result<()> {
-        let obj = self.raw.as_object_mut().expect("root is an object");
-        match active {
-            Some(active) => {
-                let value = serde_json::to_value(active).context("serializing active_model")?;
-                obj.insert("active_model".to_string(), value);
-            }
-            None => {
-                obj.remove("active_model");
-            }
-        }
-        Ok(())
-    }
-
     fn provider_raw_object(&self, provider_id: &str) -> Result<Map<String, Value>> {
         let path = provider_file_path_for_config(&self.path, provider_id)?;
         if path.exists() {
@@ -626,12 +615,6 @@ impl ConfigDoc {
         self.originally_loaded_providers = refreshed.originally_loaded_providers;
         Ok(())
     }
-}
-
-fn serialize_active_model(active: Option<&ActiveModelRef>) -> Result<Option<Value>> {
-    active
-        .map(|active| serde_json::to_value(active).context("serializing active_model"))
-        .transpose()
 }
 
 fn serialize_json_object<T: Serialize>(value: &T, label: &str) -> Result<Map<String, Value>> {
@@ -958,15 +941,14 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::*;
-
     #[test]
     fn prepared_write_publishes_only_at_commit_and_replaces_existing_destination() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("config.json");
         std::fs::write(&destination, b"old contents").unwrap();
 
-        let prepared = prepare_atomic_write(&destination, b"new contents").unwrap();
+        let prepared =
+            crate::config::files::prepare_atomic_write(&destination, b"new contents").unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"old contents");
 
         prepared.commit().unwrap();

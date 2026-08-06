@@ -519,16 +519,24 @@ impl App {
                         cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested => {
                             self.push_plain(format!("Using {provider}/{model} for this session."));
                         }
-                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Saved => {
-                            self.push_plain(format!(
-                                "Using {provider}/{model} and saved it as the default."
-                            ));
+                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                            selection,
+                            scope_label,
+                            unchanged,
+                            ..
+                        } => {
+                            let label = format!("{}/{}", selection.provider, selection.model);
+                            if unchanged {
+                                self.push_plain(format!(
+                                    "Using {label}; default for new sessions already set ({scope_label})."
+                                ));
+                            } else {
+                                self.push_plain(format!(
+                                    "Using {label} and set it as the default for new sessions ({scope_label})."
+                                ));
+                            }
                             self.resync_config_after_local_write();
                         }
-                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Failed {
-                            user_message,
-                            ..
-                        } => self.push_plain(user_message),
                     }
                 }
                 if !applied {
@@ -571,6 +579,44 @@ impl App {
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
                 self.apply_config_snapshot(*snapshot);
+            }
+            TurnEvent::DefaultModelUpdateResult {
+                default_update_id,
+                outcome,
+            } => {
+                if self.pending_default_model_update_id != Some(default_update_id) {
+                    return;
+                }
+                self.pending_default_model_update_id = None;
+                match outcome {
+                    cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+                        selection,
+                        scope_label,
+                        unchanged,
+                        ..
+                    } => {
+                        let label = selection
+                            .as_ref()
+                            .map(|s| format!("{}/{}", s.provider, s.model))
+                            .unwrap_or_else(|| "(unset)".into());
+                        if unchanged {
+                            self.push_plain(format!(
+                                "Default model for new sessions unchanged: {label} ({scope_label})."
+                            ));
+                        } else {
+                            self.push_plain(format!(
+                                "Default model for new sessions set to {label} ({scope_label})."
+                            ));
+                        }
+                        self.resync_config_after_local_write();
+                    }
+                    cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                        user_message,
+                        ..
+                    } => {
+                        self.push_plain(format!("Default model was not changed — {user_message}"));
+                    }
+                }
             }
             TurnEvent::ThinkingStarted { agent, turn_id } => {
                 // Note: a `ThinkingStarted` does NOT clear the reconnect

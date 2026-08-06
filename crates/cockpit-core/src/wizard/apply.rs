@@ -105,14 +105,36 @@ pub fn apply_security_answers(cwd: &Path, run: &WizardRun) -> Result<Option<Path
     Ok(Some(target))
 }
 
+/// What `/setup model` actually changed.
+///
+/// Provider/model metadata and the layer-wide default are separate
+/// authorities, so they are reported separately: the metadata write names a
+/// concrete file, while the default names only a safe scope label — the
+/// effective-default operation owns its target layer and never exposes a
+/// path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelAnswersOutcome {
+    /// Provider/model metadata file that was written, if any.
+    pub model_file: Option<PathBuf>,
+    /// Safe scope label of the layer that now owns the verified effective
+    /// default, if the wizard's "make default" choice changed it.
+    pub default_scope: Option<String>,
+}
+
+impl ModelAnswersOutcome {
+    pub fn changed_nothing(&self) -> bool {
+        self.model_file.is_none() && self.default_scope.is_none()
+    }
+}
+
 /// Persist the model wizard's answers for the selected `provider:model`:
 /// LLM mode, trust, capability overrides, context/output token ceilings,
 /// default thinking mode, `subagent_invokable`/`can_delegate`, the system
 /// prompt, and optionally the active model. Model fields go to the most
-/// specific writable layer for that provider; `active_model` goes to the
-/// most specific writable config layer, which may be a different file.
-/// Returns `Ok(None)` when nothing changed, else the first file written.
-pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf>> {
+/// specific writable layer for that provider; the "make default" choice
+/// delegates to the one authoritative effective-default operation, which
+/// selects and verifies its own target layer.
+pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<ModelAnswersOutcome> {
     let (provider_id, model_id) = model_ref_answer(run).context("model answer")?;
     let model_target = config_write_target_for_provider(cwd, &provider_id).ok_or_else(|| {
         anyhow!("provider `{provider_id}` config is not writable; cannot save model settings")
@@ -335,27 +357,36 @@ pub fn apply_model_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf
     }
 
     if !model_changed && !active_changed {
-        return Ok(None);
+        return Ok(ModelAnswersOutcome::default());
     }
 
     if model_changed {
         model_doc.write_model_wizard_fields(&provider_id, model)?;
     }
 
-    let mut saved = model_changed.then_some(model_target);
+    let mut outcome = ModelAnswersOutcome {
+        model_file: model_changed.then_some(model_target),
+        default_scope: None,
+    };
     if let Some(next) = next_active
         && active_changed
     {
-        let active_target = most_specific_config_write_target(cwd)
-            .ok_or_else(|| anyhow!("config is not writable; cannot save active_model"))?;
-        let mut active_doc = ConfigDoc::load(&active_target)?;
-        active_doc.write_active_model(Some(&next))?;
-        if saved.is_none() {
-            saved = Some(active_target);
-        }
+        // The wizard's "make default" choice delegates to the same
+        // authoritative operation as Ctrl+Enter and `/settings`; there is no
+        // parallel default-persistence API.
+        let result = crate::config::providers::mutate_effective_default(
+            cwd,
+            Some(&next),
+            crate::config::providers::ActiveModelWriteMode::Replace,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| anyhow!("{}", error.user_message))?;
+        outcome.default_scope = Some(result.scope_label);
     }
 
-    Ok(saved)
+    Ok(outcome)
 }
 
 fn capability_status_override(
@@ -781,7 +812,7 @@ mod tests {
         submit_model_wizard_until_save(&mut run, vec!["images"], vec![]);
 
         let saved = apply_model_answers(tmp.path(), &run).unwrap();
-        assert_eq!(saved.as_deref(), Some(provider_path.as_path()));
+        assert_eq!(saved.model_file.as_deref(), Some(provider_path.as_path()));
         let cfg = ConfigDoc::load_effective(tmp.path());
         let model_entry = cfg.providers["p"]
             .models
@@ -858,7 +889,7 @@ mod tests {
 
         let saved = apply_model_answers(tmp.path(), &run).unwrap();
 
-        assert_eq!(saved, None);
+        assert!(saved.changed_nothing(), "{saved:?}");
         let cfg = ConfigDoc::load_effective(tmp.path());
         let model = cfg.providers["p"]
             .models
@@ -903,7 +934,7 @@ mod tests {
 
         let saved = apply_model_answers(tmp.path(), &run).unwrap();
 
-        assert_eq!(saved, None);
+        assert!(saved.changed_nothing(), "{saved:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
@@ -965,7 +996,7 @@ mod tests {
             apply_model_answers(&project, &run).unwrap()
         });
 
-        assert_eq!(saved.as_deref(), Some(home_provider.as_path()));
+        assert_eq!(saved.model_file.as_deref(), Some(home_provider.as_path()));
         let home_cfg = ConfigDoc::load(&home_config).unwrap().providers();
         let model = home_cfg.providers["p"]
             .models
@@ -1024,7 +1055,10 @@ mod tests {
             apply_model_answers(&project, &run).unwrap()
         });
 
-        assert_eq!(saved.as_deref(), Some(project_provider.as_path()));
+        assert_eq!(
+            saved.model_file.as_deref(),
+            Some(project_provider.as_path())
+        );
         assert_eq!(
             std::fs::read_to_string(&home_provider).unwrap(),
             before_home

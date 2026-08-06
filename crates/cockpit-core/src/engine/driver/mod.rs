@@ -189,18 +189,19 @@ pub enum DriverControl {
     /// model. Breaking the prompt cache is expected (new model = new cache
     /// key). On an unconfigured/bad target it **fails loudly** via
     /// [`TurnEvent::Notice`] and keeps the current model active (never a silent
-    /// no-op). The daemon-owned transaction always writes the session row and
-    /// writes config only when `persist_as_default` explicitly replaces the
-    /// future-session default or `initialize_default_if_missing` wins the
-    /// daemon-side first-default race. Model-build/session-persistence
-    /// failures keep the prior live model; a default-write failure leaves the
-    /// successful session selection in place and is reported independently.
+    /// no-op). Config is written **only** when `persist_as_default` explicitly
+    /// asks to replace the future-session default; there is no first-default
+    /// race, because a session-only selection never writes `active_model` in
+    /// any layer. A model-build or session-persistence failure keeps the prior
+    /// live model. An explicit default request is all-or-nothing: it is one
+    /// journaled transaction that commits the guarded session revision and the
+    /// config together, or converges both back to their recorded prior
+    /// values — a default-write failure never leaves a half-applied switch.
     SetActiveModel {
         selection_id: uuid::Uuid,
         provider: String,
         model: String,
         persist_as_default: bool,
-        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,
@@ -217,11 +218,19 @@ pub enum DriverControl {
         provider: String,
         model: String,
         persist_as_default: bool,
-        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
+    },
+    /// Emit the correlated terminal results for effective-default
+    /// transactions that a recovery pass converged on this session's behalf.
+    ///
+    /// Routed through the driver so the event carries *this driver's*
+    /// active-model-state generation. A recovery pass has no access to that
+    /// counter, and a client's terminal gate compares against it.
+    EmitRecoveredDefaultTerminals {
+        transactions: Vec<crate::config::providers::RecoveredTransaction>,
     },
     /// Set the session's model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note).
@@ -3429,7 +3438,6 @@ impl Driver {
                 provider,
                 model,
                 persist_as_default,
-                initialize_default_if_missing,
                 trigger,
                 reasoning_effort,
                 thinking_mode,
@@ -3447,14 +3455,15 @@ impl Driver {
                     .set_active_model_live(
                         selection_id,
                         target,
-                        swap::DefaultModelWriteIntent::from_flags(
-                            persist_as_default,
-                            initialize_default_if_missing,
-                        ),
+                        swap::DefaultModelWriteIntent::from_flags(persist_as_default),
                         None,
                         trigger,
                         tx,
                     )
+                    .await;
+            }
+            DriverControl::EmitRecoveredDefaultTerminals { transactions } => {
+                self.emit_recovered_default_terminals(transactions, tx)
                     .await;
             }
             DriverControl::SetActiveModelWithDeadline {
@@ -3465,7 +3474,6 @@ impl Driver {
                 provider,
                 model,
                 persist_as_default,
-                initialize_default_if_missing,
                 trigger,
                 reasoning_effort,
                 thinking_mode,
@@ -3483,10 +3491,7 @@ impl Driver {
                     .set_active_model_live(
                         selection_id,
                         target,
-                        swap::DefaultModelWriteIntent::from_flags(
-                            persist_as_default,
-                            initialize_default_if_missing,
-                        ),
+                        swap::DefaultModelWriteIntent::from_flags(persist_as_default),
                         Some(swap::ModelSelectionTerminal {
                             deadline,
                             claimed: &terminal_claimed,

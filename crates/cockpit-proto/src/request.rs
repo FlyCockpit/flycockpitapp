@@ -674,6 +674,43 @@ pub enum Request {
         favorite: bool,
     },
 
+    /// Replace the effective default model for new sessions in the attached
+    /// client's configuration context. Local-owner-only; does not switch the
+    /// live session. Callers cannot supply an arbitrary filesystem target.
+    SetDefaultModel {
+        default_update_id: Uuid,
+        /// Absent exactly when `clear` is set. A clear carries no reference,
+        /// so an empty-string placeholder would be rejected by the
+        /// non-empty-string contract every other model field uses.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonempty_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonempty_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        model: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_nonempty_string",
+            skip_serializing_if = "Option::is_none"
+        )]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_mode: Option<cockpit_config::config::providers::ThinkingMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_retention: Option<PromptCacheRetention>,
+        /// When true, clear the context default instead of writing `provider/model`.
+        /// The resulting reloaded effective configuration must still resolve to a
+        /// deterministic inherited default or explicit no-default state.
+        #[serde(default)]
+        clear: bool,
+    },
+
     /// Switch the attached session to a different model.
     SetActiveModel {
         selection_id: Uuid,
@@ -688,7 +725,6 @@ pub enum Request {
         /// has no configured default at commit time. This is distinct from an
         /// explicit default replacement and prevents stale clients from
         /// overwriting a concurrently-added default.
-        initialize_default_if_missing: bool,
         #[serde(default)]
         trigger: ActiveModelSwitchTrigger,
         #[serde(
@@ -997,6 +1033,35 @@ impl Request {
                     return Err("model must not be empty".to_string());
                 }
             }
+            Self::SetDefaultModel {
+                provider,
+                model,
+                reasoning_effort,
+                clear,
+                default_update_id,
+                ..
+            } => {
+                if default_update_id.is_nil() {
+                    return Err("default_update_id must not be nil".to_string());
+                }
+                // The reference and the clear flag are mutually exclusive, and
+                // exactly one of them must be present.
+                if *clear {
+                    if provider.is_some() || model.is_some() {
+                        return Err("clear must not be combined with provider/model".to_string());
+                    }
+                } else {
+                    if provider.is_none() {
+                        return Err("provider is required unless clear is set".to_string());
+                    }
+                    if model.is_none() {
+                        return Err("model is required unless clear is set".to_string());
+                    }
+                }
+                if reasoning_effort.as_ref().is_some_and(String::is_empty) {
+                    return Err("reasoning_effort must not be empty".to_string());
+                }
+            }
             Self::SetActiveModel {
                 provider,
                 model,
@@ -1011,17 +1076,6 @@ impl Request {
                 }
                 if reasoning_effort.as_ref().is_some_and(String::is_empty) {
                     return Err("reasoning_effort must not be empty".to_string());
-                }
-                if let Self::SetActiveModel {
-                    persist_as_default: true,
-                    initialize_default_if_missing: true,
-                    ..
-                } = self
-                {
-                    return Err(
-                        "persist_as_default and initialize_default_if_missing cannot both be true"
-                            .to_string(),
-                    );
                 }
             }
             Self::SendUserMessage {
@@ -1141,6 +1195,7 @@ macro_rules! request_variants {
             (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled");
             (Request::RunScheduledJob { .. }, "run_scheduled_job");
             (Request::SetModelFavorite { .. }, "set_model_favorite");
+            (Request::SetDefaultModel { .. }, "set_default_model");
             (Request::SetActiveModel { .. }, "set_active_model");
             (Request::SetAgent { .. }, "set_agent");
             (Request::SetLlmMode { .. }, "set_llm_mode");
@@ -1277,6 +1332,7 @@ macro_rules! command {
             (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled", owner_only, none, true, serialized, none);
             (Request::RunScheduledJob { .. }, "run_scheduled_job", owner_only, none, true, serialized, none);
             (Request::SetModelFavorite { .. }, "set_model_favorite", owner_only, attached, true, serialized, none);
+            (Request::SetDefaultModel { .. }, "set_default_model", owner_only, attached, true, serialized, none);
             (Request::SetActiveModel { .. }, "set_active_model", custom(authorize_set_active_model), attached, true, serialized, none);
             (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, serialized, none);
             (Request::SetLlmMode { .. }, "set_llm_mode", session_writer, attached, true, serialized, none);
@@ -1415,7 +1471,6 @@ mod tests {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
                 persist_as_default: false,
-                initialize_default_if_missing: false,
                 trigger: ActiveModelSwitchTrigger::Picker,
                 reasoning_effort: Some(String::new()),
                 thinking_mode: None,
@@ -1436,7 +1491,6 @@ mod tests {
             provider: "provider".to_string(),
             model: "model".to_string(),
             persist_as_default: false,
-            initialize_default_if_missing: false,
             trigger: ActiveModelSwitchTrigger::Picker,
             reasoning_effort: Some("high".to_string()),
             thinking_mode: None,
@@ -1449,22 +1503,6 @@ mod tests {
 
     #[test]
     fn semantic_validation_rejects_ambiguous_model_flags_and_nil_submission_id() {
-        let ambiguous = Request::SetActiveModel {
-            selection_id: Uuid::new_v4(),
-            provider: "provider".to_string(),
-            model: "model".to_string(),
-            persist_as_default: true,
-            initialize_default_if_missing: true,
-            trigger: ActiveModelSwitchTrigger::Picker,
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        };
-        assert_eq!(
-            ambiguous.validate_semantics().unwrap_err(),
-            "persist_as_default and initialize_default_if_missing cannot both be true"
-        );
-
         let nil_submission = Request::SendUserMessage {
             client_submission_id: Uuid::nil(),
             text: "hello".to_string(),

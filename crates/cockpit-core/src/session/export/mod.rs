@@ -1390,7 +1390,9 @@ fn config_active_model(
     env: &HashMap<String, String>,
 ) -> Option<crate::config::providers::ActiveModelRef> {
     let paths = config_file_paths_for_export(Path::new(project_root), env);
-    crate::config::providers::ConfigDoc::providers_from_paths(&paths).active_model
+    // Masked resolution: an export must not record a half-committed default
+    // from a layer whose transaction is still pending.
+    crate::config::providers::ConfigDoc::providers_from_paths_masked(&paths).active_model
 }
 
 fn config_file_paths_for_export(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {

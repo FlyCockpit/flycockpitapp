@@ -100,8 +100,11 @@ impl ConfigSource {
     pub fn production() -> Self {
         Self::new(
             |cwd| {
+                // Fail closed: a layer with an unmaskable pending default-model
+                // transaction must surface as a typed error, never as an
+                // ambiguous snapshot the daemon then serves to clients.
                 Ok((
-                    crate::secret_ref::load_effective(cwd),
+                    crate::secret_ref::try_load_effective(cwd)?,
                     crate::config::extended::load_for_cwd(cwd),
                 ))
             },
@@ -163,15 +166,6 @@ impl ConfigSource {
     pub fn watch_paths(&self, cwd: &Path) -> ConfigWatchPaths {
         (self.watch_paths)(cwd)
     }
-}
-
-/// Re-read the effective provider metadata inside a serialized config
-/// mutation's read/decide/write critical section. Ordinary session work must
-/// use `SessionConfigHandle`; this narrow mutation seam exists because a
-/// worker snapshot can become stale between an explicit/conditional default
-/// request and the write that resolves it.
-pub(crate) fn load_effective_providers_for_atomic_mutation(cwd: &Path) -> ProvidersConfig {
-    crate::config::providers::ConfigDoc::load_effective(cwd)
 }
 
 #[cfg(test)]

@@ -7,10 +7,11 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 11 nodes; see `root_nodes()`):
+//! The Settings page tree (root has 13 nodes; see `root_nodes()`):
 //!
 //! ```text
 //! Root
+//!  ├── Default model for new sessions
 //!  ├── Providers
 //!  │    ├── List ──── Add Provider wizard ─── (template -> URL -> Auth -> save)
 //!  │    │           └── Edit Provider page
@@ -423,10 +424,140 @@ pub struct SettingsCx {
     pub(super) last_secret_notice: Option<String>,
     pending_daemon_request: Option<Request>,
     pending_oauth_action: Option<OAuthFlowRequest>,
+    /// Close settings and open the model picker for default-only mutation.
+    pub(super) pending_default_model_picker: bool,
+    /// Correlation id of a staged `SetDefaultModel`, so the app can match the
+    /// terminal `DefaultModelUpdateResult` to this exact operation.
+    pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
 }
 
 fn root_page(cursor: usize) -> PageBox {
     Box::new(RootPage { cursor })
+}
+
+fn default_model_page(page: DefaultModelPage) -> PageBox {
+    Box::new(page)
+}
+
+/// `/settings` -> **Default model for new sessions**.
+///
+/// Shows the currently effective default (or an explicit unset state) and its
+/// safe scope label, opens the same provider-scoped model picker `/model`
+/// uses, and can clear the context default. Every mutation goes through the
+/// daemon's one authoritative effective-default operation; this page never
+/// writes `active_model` and never changes a running session.
+pub(super) struct DefaultModelPage {
+    pub(super) status: Option<String>,
+    /// Resolved once when the page opens, alongside the *effective* default
+    /// below — both are layered resolutions and must not run per frame.
+    pub(super) scope_label: String,
+    /// The default a new session would actually resolve, i.e. the merge of
+    /// every applicable layer. `cx.config` is only the single layer this
+    /// dialog edits, so showing it here would misreport the default whenever
+    /// a higher-precedence layer overrides it (AC9).
+    pub(super) effective_default: Option<cockpit_config::providers::ActiveModelRef>,
+}
+
+impl SettingsPage for DefaultModelPage {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        match key.code {
+            KeyCode::Esc
+            | KeyCode::Char('q')
+            | KeyCode::Left
+            | KeyCode::Char('h')
+            | KeyCode::Backspace => Nav::Back,
+            KeyCode::Enter | KeyCode::Char('c') => {
+                cx.pending_default_model_picker = true;
+                Nav::Close
+            }
+            // Clearing is a daemon-verified operation: it succeeds only when
+            // the reloaded effective configuration still resolves to a
+            // deterministic inherited default or an explicit no-default state.
+            KeyCode::Char('x') => {
+                if self.effective_default.is_none() {
+                    self.status =
+                        Some("No default is set in this configuration context.".to_string());
+                    return Nav::Stay;
+                }
+                let default_update_id = uuid::Uuid::new_v4();
+                // Correlate the terminal event with this exact operation so
+                // the confirmation names the resulting effective state.
+                cx.pending_default_model_update_id = Some(default_update_id);
+                cx.pending_daemon_request = Some(Request::SetDefaultModel {
+                    default_update_id,
+                    provider: None,
+                    model: None,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                    clear: true,
+                });
+                self.status = Some(
+                    "Clearing the default for new sessions… the result names the resulting effective state."
+                        .to_string(),
+                );
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        // Both values are resolved when the page opens: each is a layered
+        // resolution and must not run per frame.
+        let default = self.effective_default.as_ref();
+        let scope = &self.scope_label;
+        let mut lines = vec![Line::from("Default model for new sessions"), Line::from("")];
+        match default {
+            Some(active) => {
+                lines.push(Line::from(format!(
+                    "Effective default: {}/{}",
+                    active.provider, active.model
+                )));
+                if let Some(effort) = active.reasoning_effort.as_ref() {
+                    lines.push(Line::from(format!("  reasoning: {}", effort.value)));
+                }
+            }
+            None => lines.push(Line::from(
+                "Effective default: (unset — a new session resolves its model at creation)",
+            )),
+        }
+        lines.push(Line::from(format!("Scope: {scope}")));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Enter: choose the default model for new sessions",
+        ));
+        lines.push(Line::from("x: clear the default for this scope"));
+        lines.push(Line::from("Applies to newly created sessions only."));
+        lines.push(Line::from(
+            "Reopening an existing session keeps its own saved model.",
+        ));
+        if let Some(status) = &self.status {
+            lines.push(Line::from(""));
+            lines.push(Line::from(status.clone()));
+        }
+        let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(para, area);
+    }
+
+    fn title(&self, _cx: &SettingsCx) -> String {
+        "Default model for new sessions".into()
+    }
+
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        "enter: change default  x: clear  esc/h: back"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "DefaultModel"
+    }
 }
 
 fn agents_page(page: AgentsPage) -> PageBox {
@@ -1203,6 +1334,26 @@ impl Dialog {
         }
     }
 
+    /// Correlation id of the default-model request most recently staged by
+    /// this dialog, taken alongside the request itself.
+    pub fn take_pending_default_model_update_id(&mut self) -> Option<uuid::Uuid> {
+        match self {
+            Dialog::Settings(s) => s.pending_default_model_update_id.take(),
+            _ => None,
+        }
+    }
+
+    pub fn take_pending_default_model_picker(&mut self) -> bool {
+        match self {
+            Dialog::Settings(s) => {
+                let pending = s.pending_default_model_picker;
+                s.pending_default_model_picker = false;
+                pending
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn take_oauth_action(&mut self) -> Option<OAuthFlowRequest> {
         match self {
             Dialog::Settings(s) => s.pending_oauth_action.take(),
@@ -1440,6 +1591,8 @@ impl SettingsDialog {
                 last_secret_notice: None,
                 pending_daemon_request: None,
                 pending_oauth_action: None,
+                pending_default_model_picker: false,
+                pending_default_model_update_id: None,
             },
         }
     }
@@ -1502,6 +1655,10 @@ impl SettingsDialog {
             self.credential_store_path.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // The layer-wide default is never part of this file write; it goes to
+        // the daemon's authoritative effective-default operation, and the
+        // dialog only shows the new value once that verified result arrives.
+        self.stage_default_model_change();
         doc.write(&merged).map_err(|e| e.to_string())?;
         self.config = merged.clone();
         self.original_config = merged;
@@ -1855,6 +2012,11 @@ impl SettingsPage for RootPage {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let chosen = children.get(self.cursor).map(|n| n.title).unwrap_or("");
                 let next = match chosen {
+                    DEFAULT_MODEL_TITLE => Some(default_model_page(DefaultModelPage {
+                        status: None,
+                        scope_label: cx.effective_default_scope_label(),
+                        effective_default: cx.effective_default_model(),
+                    })),
                     PROVIDERS_TITLE => Some(providers_page(ProvidersPage::List {
                         cursor: providers::initial_list_cursor(&cx.config),
                         status: None,
@@ -1972,12 +2134,18 @@ impl SettingsPage for RootPage {
 
 /// The Providers & Provider Models menu node title (also the dispatch key).
 const PROVIDERS_TITLE: &str = "Providers & Provider Models";
+const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 
 /// The reorganized top-level menu (implementation note).
-/// The first ten nodes are the locked scheme, in order; MCP/LSP are kept as
-/// extra nodes so integration settings stay reachable from the menu.
-fn root_nodes() -> [NavNode; 12] {
+/// `Default model for new sessions` leads, then the locked scheme in order;
+/// MCP/LSP are kept as extra nodes so integration settings stay reachable
+/// from the menu.
+fn root_nodes() -> [NavNode; 13] {
     [
+        NavNode {
+            title: DEFAULT_MODEL_TITLE,
+            description: "Default model for newly created sessions in the current configuration context. Does not change the model of an already-running session.",
+        },
         NavNode {
             title: PROVIDERS_TITLE,
             description: "Provider setup and request controls: endpoints, headers, model lists, default model, context/cache, fallback, wire API, and per-provider/per-model inline-<think> extraction overrides.",
@@ -2087,6 +2255,74 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &Set
 }
 
 impl SettingsCx {
+    /// Safe, non-secret label for the layer that governs the effective
+    /// default in this dialog's configuration context. Never a filesystem
+    /// path.
+    /// The default a newly created session would resolve in this dialog's
+    /// configuration context — the layered merge, not the single edited layer.
+    pub(super) fn effective_default_model(
+        &self,
+    ) -> Option<cockpit_config::providers::ActiveModelRef> {
+        let cwd = self
+            .active_project_root
+            .clone()
+            .or_else(|| self.picker_cwd.clone());
+        match cwd {
+            Some(cwd) => cockpit_config::providers::ConfigDoc::load_effective(&cwd).active_model,
+            None => self.config.active_model.clone(),
+        }
+    }
+
+    pub(super) fn effective_default_scope_label(&self) -> String {
+        let cwd = self
+            .active_project_root
+            .clone()
+            .or_else(|| self.picker_cwd.clone());
+        match cwd
+            .as_deref()
+            .map(cockpit_config::providers::resolve_effective_default_write_target)
+        {
+            Some(Ok(target)) => target.scope_label(),
+            _ => "current configuration context".to_string(),
+        }
+    }
+
+    /// Stage the one authoritative default-model request when a Settings edit
+    /// changed the layer-wide `active_model`.
+    ///
+    /// `/settings` never writes `active_model` to a `config.json`: the daemon
+    /// owns target-layer selection, locking, the journal, and reload
+    /// verification, and it changes no running session.
+    fn stage_default_model_change(&mut self) -> bool {
+        if self.config.active_model == self.original_config.active_model {
+            return false;
+        }
+        let default_update_id = uuid::Uuid::new_v4();
+        let request = match self.config.active_model.clone() {
+            Some(active) => Request::SetDefaultModel {
+                default_update_id,
+                provider: Some(active.provider),
+                model: Some(active.model),
+                reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
+                thinking_mode: active.thinking_mode,
+                prompt_cache_retention: active.prompt_cache_retention,
+                clear: false,
+            },
+            None => Request::SetDefaultModel {
+                default_update_id,
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+                clear: true,
+            },
+        };
+        self.pending_default_model_update_id = Some(default_update_id);
+        self.pending_daemon_request = Some(request);
+        true
+    }
+
     fn reload_extended(&mut self) {
         if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
             let (extended, warnings) = doc.config_with_warnings();
@@ -2110,6 +2346,10 @@ impl SettingsCx {
             self.credential_store_path.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // The layer-wide default is never part of this file write; it goes to
+        // the daemon's authoritative effective-default operation, and the
+        // dialog only shows the new value once that verified result arrives.
+        self.stage_default_model_change();
         doc.write(&merged).map_err(|e| e.to_string())?;
         self.config = merged.clone();
         self.original_config = merged;
@@ -2189,9 +2429,9 @@ fn merge_dialog_provider_config(
     original: &ProvidersConfig,
     current: &ProvidersConfig,
 ) {
-    if current.active_model != original.active_model {
-        disk.active_model = current.active_model.clone();
-    }
+    // `active_model` is deliberately not merged here. It is layer-wide default
+    // policy owned by the daemon's one effective-default mutation, so Settings
+    // stages a `SetDefaultModel` request instead of writing the file directly.
     if current.category_defaults != original.category_defaults {
         disk.category_defaults = current.category_defaults.clone();
     }
@@ -2316,10 +2556,23 @@ fn handle_setup_wizard_key(wizard: &mut SetupWizardDialog, key: KeyEvent) -> boo
                 }
             } else if step.id == "model-save" {
                 match cockpit_core::wizard::apply_model_answers(cwd, run) {
-                    Ok(Some(path)) => {
-                        *status = Some(format!("Saved model settings to {}.", path.display()))
+                    Ok(outcome) if outcome.changed_nothing() => {
+                        *status = Some("No model-setting changes were needed.".to_string())
                     }
-                    Ok(None) => *status = Some("No model-setting changes were needed.".to_string()),
+                    Ok(outcome) => {
+                        let mut parts = Vec::new();
+                        if let Some(path) = outcome.model_file.as_ref() {
+                            parts.push(format!("Saved model settings to {}.", path.display()));
+                        }
+                        // Layer-wide default policy names a safe scope label,
+                        // never a filesystem path.
+                        if let Some(scope) = outcome.default_scope.as_ref() {
+                            parts.push(format!(
+                                "Set the default model for new sessions ({scope}); running sessions are unchanged."
+                            ));
+                        }
+                        *status = Some(parts.join(" "));
+                    }
                     Err(error) => {
                         *status = Some(format!("Could not save model settings: {error}"));
                         return false;

@@ -617,7 +617,6 @@
   },
   "set_active_model": {
     "params": {
-      "initialize_default_if_missing": false,
       "model": "model-fixture",
       "persist_as_default": true,
       "prompt_cache_retention": "extended",
@@ -646,6 +645,18 @@
       "mode": "until_idle"
     },
     "request": "set_caffeinate"
+  },
+  "set_default_model": {
+    "params": {
+      "clear": false,
+      "default_update_id": "22222222-2222-4222-8222-222222222222",
+      "model": "model-fixture",
+      "prompt_cache_retention": "extended",
+      "provider": "provider-fixture",
+      "reasoning_effort": "high",
+      "thinking_mode": "high"
+    },
+    "request": "set_default_model"
   },
   "set_delegation_recursion": {
     "params": {

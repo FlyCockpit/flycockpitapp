@@ -11,8 +11,8 @@ use anyhow::{Result, anyhow};
 mod apply;
 
 pub use apply::{
-    apply_model_answers, apply_security_answers, descriptor_for_cwd, model_descriptor_for_cwd,
-    security_config_path,
+    ModelAnswersOutcome, apply_model_answers, apply_security_answers, descriptor_for_cwd,
+    model_descriptor_for_cwd, security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";

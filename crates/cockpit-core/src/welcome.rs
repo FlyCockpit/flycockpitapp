@@ -121,7 +121,11 @@ pub fn load_bundle(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
 pub fn load_bundle_bootstrap(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
     let cwd = resolve_launch_dir(project);
     let paths = crate::config::dirs::config_file_paths_for_load(&cwd);
-    let providers = crate::config::providers::ConfigDoc::providers_from_paths(&paths);
+    // Pre-attach bootstrap is still a config *resolution*, so it must observe
+    // the same effective-default barrier: a layer with a pending session or
+    // correlated transaction is masked to its recorded prior bytes rather than
+    // showing whichever half is already on disk.
+    let providers = crate::config::providers::ConfigDoc::providers_from_paths_masked(&paths);
     let extended = crate::config::extended::load_for_cwd(&cwd);
     let launch = build_launch_info(cwd, fetch_git, &providers, &extended);
     LaunchBundle {

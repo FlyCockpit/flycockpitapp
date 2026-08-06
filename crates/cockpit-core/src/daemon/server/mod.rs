@@ -485,6 +485,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
         }
         | proto::Event::ActiveModelState { .. }
         | proto::Event::ModelSelectionResult { .. }
+        | proto::Event::DefaultModelUpdateResult { .. }
         | proto::Event::PreflightStarted { .. }
         | proto::Event::UserMessagesTerminated { .. }
         | proto::Event::UserMessageRetracted { .. }
@@ -2199,6 +2200,34 @@ fn sweep_ephemeral_sessions_blocking(db: &Db) -> Result<usize> {
 /// [`crate::daemon::run_foreground_inner`], which drains the workers.
 #[cfg(unix)]
 pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
+    // Startup recovery: converge any effective-default journal left behind by
+    // an unclean shutdown before the first client can read a config snapshot.
+    // Per-attach recovery re-runs this with the attached project root and
+    // trust policy; startup covers the non-project layers.
+    {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match crate::daemon::effective_default_recovery::recover_effective_default_journals(
+            &ctx.db, &cwd, None,
+        )
+        .await
+        {
+            // No worker exists yet at startup, so this only logs undelivered
+            // correlations; a client waiting across a daemon restart has lost
+            // its connection anyway, and attach re-runs recovery per project.
+            Ok(recovered) => {
+                crate::daemon::effective_default_recovery::deliver_recovered_terminals(
+                    &ctx, recovered,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "startup effective-default journal recovery failed; attach will retry and fail closed"
+                );
+            }
+        }
+    }
     let mut shutdown = ctx.shutdown.subscribe();
     let retention_cfg = retention_config();
     let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(

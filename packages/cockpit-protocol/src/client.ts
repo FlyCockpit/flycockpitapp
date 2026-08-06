@@ -263,6 +263,15 @@ export class RemoteSessionClient {
     return parseAckResult(await this.send({ request: "set_model_favorite", params }));
   }
 
+  /// Replace (or clear) the effective default model for **new** sessions in
+  /// the attached client's configuration context. Local-owner-only, and it
+  /// never changes the model of a running session. The ack only means the
+  /// request was accepted; the verified outcome arrives as a correlated
+  /// `default_model_update_result` event carrying `default_update_id`.
+  async setDefaultModel(params: ParamsOf<"set_default_model">) {
+    return parseAckResult(await this.send({ request: "set_default_model", params }));
+  }
+
   async setAgent(name: string) {
     return parseAckResult(await this.send({ request: "set_agent", params: { name } }));
   }

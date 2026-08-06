@@ -1478,6 +1478,23 @@ pub(super) async fn run_worker(
                     );
                     let _ = respond_to.send(Ok((item, queue)));
                 }
+                SessionWork::EmitRecoveredDefaultTerminals { transactions } => {
+                    // Best effort: if the driver is gone there is no terminal
+                    // gate left to satisfy, and the converged durable state is
+                    // already what the next attach will serve.
+                    let _ = send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::EmitRecoveredDefaultTerminals {
+                            transactions,
+                        },
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await;
+                }
                 SessionWork::SteerDelegation {
                     task_call_id,
                     label,
@@ -1969,7 +1986,6 @@ pub(super) async fn run_worker(
                     provider,
                     model,
                     persist_as_default,
-                    initialize_default_if_missing,
                     trigger,
                     reasoning_effort,
                     thinking_mode,
@@ -2028,7 +2044,6 @@ pub(super) async fn run_worker(
                             provider,
                             model,
                             persist_as_default,
-                            initialize_default_if_missing,
                             trigger,
                             reasoning_effort,
                             thinking_mode,

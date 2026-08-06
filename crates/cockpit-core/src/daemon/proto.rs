@@ -681,6 +681,14 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             prompt_cache_retention,
             outcome,
         }],
+        TurnEvent::DefaultModelUpdateResult {
+            default_update_id,
+            outcome,
+        } => vec![Event::DefaultModelUpdateResult {
+            session_id,
+            default_update_id,
+            outcome,
+        }],
         TurnEvent::ConnectorStatus { .. } => vec![],
     }
 }

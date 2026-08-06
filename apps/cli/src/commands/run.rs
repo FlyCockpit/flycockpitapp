@@ -1569,6 +1569,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TandemState { session_id, .. }
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
+        | DefaultModelUpdateResult { session_id, .. }
         | WaitingForLock { session_id, .. } => *session_id,
         EventStreamLagged {
             session_id: Some(session_id),

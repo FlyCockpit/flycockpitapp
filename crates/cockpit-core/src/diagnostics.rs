@@ -40,6 +40,11 @@ pub struct DiagnosticsSnapshot {
     pub network: Vec<String>,
     pub harnesses: Vec<String>,
     pub delegation: Vec<String>,
+    /// Pending effective-default journals, if any. This is the actionable
+    /// half of every "run `cockpit doctor`" repair diagnostic the daemon
+    /// emits: it names the file to inspect, its phase, and whether a running
+    /// daemon is required to finish it. Never any configuration content.
+    pub default_model_journals: Vec<String>,
     pub has_failures: bool,
 }
 
@@ -115,6 +120,13 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     push_section(&mut out, "git", &snapshot.git);
     push_section(&mut out, "harnesses", &snapshot.harnesses);
     push_section(&mut out, "delegation", &snapshot.delegation);
+    if !snapshot.default_model_journals.is_empty() {
+        push_section(
+            &mut out,
+            "default model journal",
+            &snapshot.default_model_journals,
+        );
+    }
     out
 }
 
@@ -194,8 +206,44 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             !harnesses.is_empty(),
             &extended,
         ),
+        default_model_journals: default_model_journal_lines(&input.cwd),
         has_failures: provider_failures,
     })
+}
+
+/// One safe line per pending effective-default journal.
+///
+/// A journal only exists while a default-model transaction is unfinished, so
+/// an empty list is the normal state. Each line names the journal file, its
+/// phase, and whether a daemon is required to finish it — enough to act on,
+/// with no configuration content, credentials, or model bodies.
+fn default_model_journal_lines(cwd: &Path) -> Vec<String> {
+    crate::config::providers::journal_diagnostics(cwd)
+        .into_iter()
+        .map(|journal| {
+            // Only a pass that can supply the missing capability finishes a
+            // journal, so the guidance has to match its kind exactly.
+            let needs = match (journal.needs_session_authority, journal.correlated) {
+                (true, _) => "needs a running daemon: it has a session participant",
+                (false, true) => {
+                    "needs a running daemon: a client is waiting for its terminal result"
+                }
+                (false, false) => "config-only; the next config read finishes it",
+            };
+            let context = if journal.out_of_context {
+                "; out of context — recovery refuses it, remove it by hand after checking the layer"
+            } else {
+                ""
+            };
+            format!(
+                "{} [{} scope, phase {}, txn {}] {needs}{context}",
+                journal.journal_path.display(),
+                journal.scope_label,
+                journal.phase,
+                journal.transaction_id
+            )
+        })
+        .collect()
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
@@ -1614,5 +1662,42 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("embedding-capable 1/2"), "{rendered}");
+    }
+
+    /// The daemon's repair diagnostic tells the user to run `cockpit doctor`,
+    /// so doctor must actually describe the pending journal — and describe it
+    /// without leaking configuration content.
+    #[test]
+    fn doctor_reports_a_pending_default_model_journal_and_omits_it_when_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cockpit = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit).unwrap();
+        let config_path = cockpit.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"api_key":"sk-not-in-doctor-output","providers":{}}"#,
+        )
+        .unwrap();
+
+        let clean = render(&trusted_snapshot(base_input(tmp.path())));
+        assert!(
+            !clean.contains("default model journal"),
+            "no journal, no section: {clean}"
+        );
+
+        let journal_path = crate::config::providers::journal_path_for_layer(&config_path);
+        std::fs::write(&journal_path, b"{ not a journal record").unwrap();
+
+        let rendered = render(&trusted_snapshot(base_input(tmp.path())));
+        assert!(rendered.contains("default model journal"), "{rendered}");
+        assert!(
+            rendered.contains(&journal_path.display().to_string()),
+            "the report must name the file to inspect: {rendered}"
+        );
+        assert!(rendered.contains("unreadable"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-not-in-doctor-output"),
+            "doctor must never render configuration content: {rendered}"
+        );
     }
 }

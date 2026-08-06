@@ -137,6 +137,22 @@ cockpit fetch-models
 cockpit models
 ```
 
+`cockpit models` starts with the effective **default model for new sessions**
+and the safe scope label of the configuration layer that governs it (`user`,
+`machine/local`, `project`, or `explicit override`) — no filesystem paths and
+no secrets. That default governs only the model a **newly created** session
+resolves. Reopening the TUI can reattach to an existing durable session, and
+that session keeps its own persisted model; a new default never overwrites it.
+
+In the TUI, `/model` + Enter switches only the current session. `/model` +
+`Ctrl+Enter` is one all-or-nothing transaction: it switches this session **and**
+sets the default for new sessions in the current configuration context. The
+completion line appears only after the daemon has verified that a reloaded
+effective configuration resolves to exactly that model reference. `/settings`
+has a first-class **Default model for new sessions** row that uses the same
+picker and the same daemon operation, and changes no running session.
+`/setup model`'s "make default" choice delegates to that one operation too.
+
 Message arguments take precedence over stdin; with no message or
 `--prompt-file`, `run` reads stdin to EOF. Target another workspace with
 `-C/--cwd` (or global `--project`), continue its latest session with `-c`, and
@@ -180,7 +196,7 @@ cockpit packages prune --dry-run
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
-| `cockpit models [provider]` | List locally configured models. |
+| `cockpit models [provider]` | Show the effective default model for new sessions plus its scope, then list locally configured models. |
 | `cockpit provider-catalog-status [provider]` | Show the last local provider catalog refresh status. |
 | `cockpit fetch-models [provider]` | Refresh model catalogs from configured providers. |
 | `cockpit jq [args...]` | Run Cockpit's bundled jq-compatible JSON query applet. |

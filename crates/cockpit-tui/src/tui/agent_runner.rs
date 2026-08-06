@@ -2896,6 +2896,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | ForegroundInputTarget { session_id, .. }
         | ActiveModelState { session_id, .. }
         | ModelSelectionResult { session_id, .. }
+        | DefaultModelUpdateResult { session_id, .. }
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
@@ -3342,6 +3343,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             reasoning_effort,
             thinking_mode,
             prompt_cache_retention,
+            outcome,
+        },
+        DefaultModelUpdateResult {
+            default_update_id,
+            outcome,
+            ..
+        } => TurnEvent::DefaultModelUpdateResult {
+            default_update_id,
             outcome,
         },
         SessionPersistFailed {

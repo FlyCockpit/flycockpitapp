@@ -15,75 +15,112 @@ impl DefaultModelUpdateResult {
         }
     }
 
-    fn write_failed(
-        target: &crate::config::providers::ActiveModelRef,
-        error: &anyhow::Error,
-        authoritative_selection: Option<crate::config::providers::ActiveModelRef>,
+    fn verified(
+        selection: crate::config::providers::ActiveModelRef,
+        generation: u64,
+        scope_label: String,
+        unchanged: bool,
     ) -> Self {
         Self {
-            outcome: crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
-                user_message: format!(
-                    "Using `{}/{}` for this session, but could not save it as the default — {error:#}.",
-                    target.provider, target.model
-                ),
-                diagnostic_code: "default_model_write_failed".to_string(),
+            outcome: crate::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                selection: selection.clone(),
+                generation,
+                scope_label,
+                unchanged,
             },
-            authoritative_selection,
+            authoritative_selection: Some(selection),
         }
     }
 
-    fn from_prepared_commit(
-        target: &crate::config::providers::ActiveModelRef,
-        intent: DefaultModelWriteIntent,
-        authoritative_before_commit: Option<crate::config::providers::ActiveModelRef>,
-        committed: Result<crate::config::providers::ActiveModelWriteResult>,
-    ) -> Self {
-        match committed {
-            Ok(result) => Self {
-                outcome: match intent {
-                    DefaultModelWriteIntent::InitializeIfMissing if !result.wrote => {
-                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-                    }
-                    DefaultModelWriteIntent::Replace
-                    | DefaultModelWriteIntent::InitializeIfMissing => {
-                        crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-                    }
-                    DefaultModelWriteIntent::None => unreachable!("handled during prepare"),
-                },
-                authoritative_selection: result.authoritative_selection,
-            },
-            Err(error) => Self::write_failed(target, &error, authoritative_before_commit),
+    fn from_mutation(result: crate::config::providers::EffectiveDefaultMutationResult) -> Self {
+        match result.selection {
+            Some(selection) => Self::verified(
+                selection,
+                result.generation,
+                result.scope_label,
+                result.unchanged,
+            ),
+            // Unreachable from `/model`: a picker selection always requests a
+            // concrete reference. Clearing is a Settings-only, config-only
+            // operation with its own terminal result.
+            None => Self::not_requested(None),
         }
+    }
+}
+
+/// Durable session-model authority for the journaled session+default
+/// transaction. Every mutation is a guarded CAS on `active_model_revision`.
+///
+/// Bound to exactly one session row. A stale journal naming a different
+/// session is refused rather than silently CAS'd into this one — the driver
+/// has no way to reach another session's row and must never appear to.
+struct DriverSessionAuthority {
+    session: std::sync::Arc<crate::session::Session>,
+}
+
+impl DriverSessionAuthority {
+    fn require_own_session(&self, session_id: uuid::Uuid) -> Result<()> {
+        if session_id != self.session.id {
+            anyhow::bail!(
+                "refusing to touch session {session_id} from the driver bound to session {}",
+                self.session.id
+            );
+        }
+        Ok(())
+    }
+}
+
+impl crate::config::providers::SessionRevisionAuthority for DriverSessionAuthority {
+    fn bound_session_id(&self) -> Option<uuid::Uuid> {
+        Some(self.session.id)
+    }
+
+    fn current_revision(&mut self, session_id: uuid::Uuid) -> Result<Option<i64>> {
+        self.require_own_session(session_id)?;
+        self.session.active_model_revision().map(Some)
+    }
+
+    fn cas_set_active_model(
+        &mut self,
+        session_id: uuid::Uuid,
+        expected_revision: i64,
+        selection: &crate::config::providers::ActiveModelRef,
+    ) -> Result<bool> {
+        self.require_own_session(session_id)?;
+        self.session
+            .cas_set_active_model_ref(expected_revision, selection.clone())
     }
 }
 
 enum PreparedDefaultModelUpdate {
     Immediate(DefaultModelUpdateResult),
-    Production {
-        write: Box<crate::config::providers::PreparedActiveModelWrite>,
-        intent: DefaultModelWriteIntent,
-        authoritative_before_commit: Option<crate::config::providers::ActiveModelRef>,
-    },
+    /// Session+default must run as one journaled transaction at commit time.
+    PendingReplace,
     #[cfg(test)]
     Test(DefaultModelWriteIntent),
 }
 
+/// What a `/model` selection asks of the effective default.
+///
+/// There is no "initialize if missing": plain Enter is session-only by
+/// contract, so a session request can only ask for nothing or an explicit
+/// replacement.
 #[derive(Clone, Copy)]
 pub(super) enum DefaultModelWriteIntent {
     None,
     Replace,
-    InitializeIfMissing,
 }
 
 impl DefaultModelWriteIntent {
-    pub(super) fn from_flags(
-        persist_as_default: bool,
-        initialize_default_if_missing: bool,
-    ) -> Self {
+    /// Only an explicit `Ctrl+Enter` asks for a default write.
+    ///
+    /// Plain Enter is session-only by contract: it never invokes the
+    /// effective-default mutation API and cannot alter `active_model` in any
+    /// layer, so there is no "initialize if missing" branch here. A first
+    /// default is established by `/settings`, `/setup model`, or `Ctrl+Enter`.
+    pub(super) fn from_flags(persist_as_default: bool) -> Self {
         if persist_as_default {
             Self::Replace
-        } else if initialize_default_if_missing {
-            Self::InitializeIfMissing
         } else {
             Self::None
         }
@@ -112,6 +149,11 @@ struct ModelSelectionTerminalEmission<'a> {
 struct ModelSelectionRejection {
     user_message: String,
     diagnostic_code: &'static str,
+    /// The transaction crossed the durable commit boundary and this process
+    /// could prove neither outcome. It is **not** terminal: no result may be
+    /// emitted and the terminal slot must be released, so the recovery pass
+    /// that finishes the journal emits the one correlated terminal event.
+    pending_recovery: bool,
 }
 
 impl ModelSelectionRejection {
@@ -121,6 +163,7 @@ impl ModelSelectionRejection {
                 "Model selection timed out before it could be committed; retry from /model."
                     .to_string(),
             diagnostic_code: "model_selection_deadline_exceeded",
+            pending_recovery: false,
         }
     }
 
@@ -135,6 +178,33 @@ impl ModelSelectionRejection {
                 target.provider, target.model
             ),
             diagnostic_code,
+            pending_recovery: false,
+        }
+    }
+
+    /// Map a typed effective-default failure onto the terminal rejection.
+    ///
+    /// Post-boundary outcomes keep the engine's own wording: a verified
+    /// restoration says the default was not changed, while an unresolved
+    /// transaction says recovery still owns it and never claims either value.
+    fn from_effective_default(
+        target: &crate::config::providers::ActiveModelRef,
+        error: &crate::config::providers::EffectiveDefaultError,
+    ) -> Self {
+        if error.restored_after_boundary || error.recovery_pending {
+            return Self {
+                user_message: error.user_message.clone(),
+                diagnostic_code: error.diagnostic_code,
+                pending_recovery: error.recovery_pending,
+            };
+        }
+        Self {
+            user_message: format!(
+                "Could not make `{}/{}` the default for new sessions — {}. The default was not changed and this session kept its model.",
+                target.provider, target.model, error.user_message
+            ),
+            diagnostic_code: error.diagnostic_code,
+            pending_recovery: false,
         }
     }
 }
@@ -232,6 +302,7 @@ impl Driver {
                         "Could not switch to `{provider}/{model}` because no root agent frame is available; retry after reattaching."
                     ),
                     diagnostic_code: "model_selection_no_active_frame",
+                    pending_recovery: false,
                 }),
                 ModelSelectionTerminalEmission {
                     claimed: terminal_claimed,
@@ -255,10 +326,7 @@ impl Driver {
             && current.model_id_ref() == model
             && old_session_selection.as_ref() == Some(&target)
         {
-            let prepared_default = match self
-                .prepare_default_model(&target, default_write, deadline)
-                .await
-            {
+            let prepared_default = match self.prepare_default_model(default_write) {
                 Ok(prepared) => prepared,
                 Err(rejection) => {
                     self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
@@ -301,10 +369,46 @@ impl Driver {
                     return false;
                 }
             };
-            let default_update = self.commit_prepared_default_model(&target, prepared_default);
+            let default_update = match self
+                .commit_prepared_default_model(
+                    selection_id,
+                    &target,
+                    prepared_default,
+                    true, // session already matches target
+                    deadline,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(rejection) => {
+                    self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                    if rejection.pending_recovery {
+                        self.leave_terminal_to_recovery(
+                            selection_id,
+                            &target,
+                            &rejection,
+                            terminal_claimed,
+                        );
+                        return false;
+                    }
+                    self.emit_model_selection_result(
+                        selection_id,
+                        &target,
+                        DefaultModelUpdateResult::not_requested(None),
+                        Some(rejection),
+                        ModelSelectionTerminalEmission {
+                            claimed: terminal_claimed,
+                            owned: terminal_owned,
+                        },
+                        tx,
+                    )
+                    .await;
+                    return false;
+                }
+            };
             if matches!(
-                default_update.outcome,
-                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
+                &default_update.outcome,
+                crate::daemon::proto::DefaultModelUpdateOutcome::Verified { .. }
             ) && default_update.authoritative_selection.as_ref() == Some(&target)
             {
                 for idx in 0..self.stack.len() {
@@ -325,12 +429,7 @@ impl Driver {
                 error: None,
             })
             .await;
-            let saved_default = matches!(
-                &default_update.outcome,
-                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-            )
-            .then(|| target.clone())
-            .or_else(|| default_update.authoritative_selection.clone());
+            let saved_default = default_update.authoritative_selection.clone();
             self.emit_active_model_state_with_default(tx, saved_default)
                 .await;
             if self.prompt_cache_retention_override.is_some() {
@@ -445,10 +544,7 @@ impl Driver {
                     return false;
                 }
             };
-        let prepared_default = match self
-            .prepare_default_model(&target, default_write, deadline)
-            .await
-        {
+        let prepared_default = match self.prepare_default_model(default_write) {
             Ok(prepared) => prepared,
             Err(rejection) => {
                 self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
@@ -491,7 +587,17 @@ impl Driver {
                 return false;
             }
         };
-        if let Err(e) = self.persist_active_model_session(&target) {
+        // Session+default (Ctrl+Enter) journals session CAS with config; plain
+        // Enter / initialize persist the session first, then config if needed.
+        let is_session_and_default =
+            matches!(prepared_default, PreparedDefaultModelUpdate::PendingReplace);
+        #[cfg(test)]
+        let is_session_and_default = is_session_and_default
+            || matches!(
+                prepared_default,
+                PreparedDefaultModelUpdate::Test(DefaultModelWriteIntent::Replace)
+            );
+        if !is_session_and_default && let Err(e) = self.persist_active_model_session(&target) {
             let error = format!("{e:#}");
             self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
             let restored_provider = self.session.active_provider();
@@ -533,7 +639,61 @@ impl Driver {
             .await;
             return false;
         }
-        let default_update = self.commit_prepared_default_model(&target, prepared_default);
+        let default_update = match self
+            .commit_prepared_default_model(selection_id, &target, prepared_default, false, deadline)
+            .await
+        {
+            Ok(result) => result,
+            Err(rejection) => {
+                self.prompt_cache_retention_preference = old_prompt_cache_retention_preference;
+                if rejection.pending_recovery {
+                    self.leave_terminal_to_recovery(
+                        selection_id,
+                        &target,
+                        &rejection,
+                        terminal_claimed,
+                    );
+                    return false;
+                }
+                self.record_model_switch_audit(crate::session::ModelSwitchAudit {
+                    from_provider: old_session_provider.as_deref(),
+                    from_model: old_session_model.as_deref(),
+                    to_provider: provider,
+                    to_model: model,
+                    trigger,
+                    outcome: crate::session::ModelSwitchOutcome::SendFailed,
+                    error: Some(rejection.user_message.as_str()),
+                })
+                .await;
+                // The rejection message owns every claim about the default:
+                // a pre-boundary failure says it did not change, a verified
+                // restoration says both values were restored, and an
+                // unresolved transaction says recovery still owns it.
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "Model switch to `{provider}/{model}` failed — {}. \
+                             Keeping the current model active.",
+                            rejection.user_message
+                        ),
+                    })
+                    .await;
+                self.emit_active_model_state(tx).await;
+                self.emit_model_selection_result(
+                    selection_id,
+                    &target,
+                    DefaultModelUpdateResult::not_requested(None),
+                    Some(rejection),
+                    ModelSelectionTerminalEmission {
+                        claimed: terminal_claimed,
+                        owned: terminal_owned,
+                    },
+                    tx,
+                )
+                .await;
+                return false;
+            }
+        };
         self.record_model_switch_audit(crate::session::ModelSwitchAudit {
             from_provider: old_session_provider.as_deref(),
             from_model: old_session_model.as_deref(),
@@ -557,12 +717,7 @@ impl Driver {
         // The model changed, so the prefix cache key changes — refresh the
         // prunable projection the chrome shows (cache-cold reflects the bust).
         self.emit_context_projection(tx).await;
-        let saved_default = matches!(
-            &default_update.outcome,
-            crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-        )
-        .then(|| target.clone())
-        .or_else(|| default_update.authoritative_selection.clone());
+        let saved_default = default_update.authoritative_selection.clone();
         self.emit_active_model_state_with_default(tx, saved_default)
             .await;
         if self.prompt_cache_retention_override.is_some() {
@@ -581,6 +736,252 @@ impl Driver {
         )
         .await;
         true
+    }
+
+    /// Emit the correlated terminal result for each transaction a recovery
+    /// pass converged on this session's behalf.
+    ///
+    /// The originating call deliberately emitted nothing (it could prove
+    /// neither outcome), so this is the one terminal result for that
+    /// operation. The generation is this driver's own active-model-state
+    /// counter, which is exactly what a client's terminal gate compares
+    /// against — a recovery pass cannot know it.
+    pub(in crate::engine::driver) async fn emit_recovered_default_terminals(
+        &mut self,
+        transactions: Vec<crate::config::providers::RecoveredTransaction>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        use crate::config::providers::{RecoveredOutcome, TransactionCorrelation};
+
+        for transaction in transactions {
+            if transaction.correlation.session_id() != self.session.id {
+                continue;
+            }
+            // A recovered `Applied` for a *session+default* transaction says
+            // the durable authorities hold the target while this driver
+            // returned before its root swap, so the live agent is still the
+            // old model: rebuild it here, on the control loop (single
+            // writer), before any event claims success.
+            //
+            // A `DefaultUpdate` correlation is `SetDefaultModel` — config-only
+            // by contract. It must never switch the running session (AC6/AC9),
+            // so it is deliberately excluded.
+            let swapped = match (&transaction.correlation, &transaction.outcome) {
+                (
+                    TransactionCorrelation::ModelSelection { .. },
+                    RecoveredOutcome::Applied { .. },
+                ) => match transaction.requested.as_ref() {
+                    Some(requested) => self.adopt_recovered_session_model(requested),
+                    None => Ok(()),
+                },
+                _ => Ok(()),
+            };
+            self.active_model_state_generation =
+                self.active_model_state_generation.saturating_add(1);
+            let generation = self.active_model_state_generation;
+            if let Err(error) = swapped {
+                // Never claim a model the running agent is not using.
+                let message = format!(
+                    "The default was updated, but this session could not switch to the recovered \
+                     model — {error:#}. Re-select it from /model."
+                );
+                match transaction.correlation {
+                    TransactionCorrelation::DefaultUpdate {
+                        default_update_id, ..
+                    } => {
+                        let _ = tx
+                            .send(TurnEvent::DefaultModelUpdateResult {
+                                default_update_id,
+                                outcome:
+                                    crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                                        user_message: message,
+                                        diagnostic_code: "model_selection_recovered_rebuild_failed"
+                                            .to_string(),
+                                    },
+                            })
+                            .await;
+                    }
+                    TransactionCorrelation::ModelSelection { selection_id, .. } => {
+                        let Some(requested) = transaction.requested.clone() else {
+                            continue;
+                        };
+                        let _ = tx
+                            .send(TurnEvent::ModelSelectionResult {
+                                selection_id,
+                                provider: requested.provider.clone(),
+                                model: requested.model.clone(),
+                                reasoning_effort: requested
+                                    .reasoning_effort
+                                    .as_ref()
+                                    .map(|effort| effort.value.clone()),
+                                thinking_mode: requested.thinking_mode,
+                                prompt_cache_retention: requested.prompt_cache_retention,
+                                outcome: crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                                    user_message: message,
+                                    diagnostic_code: "model_selection_recovered_rebuild_failed"
+                                        .to_string(),
+                                },
+                            })
+                            .await;
+                    }
+                }
+                continue;
+            }
+            match transaction.correlation {
+                TransactionCorrelation::DefaultUpdate {
+                    default_update_id, ..
+                } => {
+                    let outcome = match &transaction.outcome {
+                        RecoveredOutcome::Applied { selection, .. } => {
+                            crate::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+                                selection: selection.clone(),
+                                generation,
+                                scope_label: transaction.scope_label.clone(),
+                                unchanged: false,
+                            }
+                        }
+                        RecoveredOutcome::Restored { session, .. } => {
+                            crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                                user_message: format!(
+                                    "The default model was not changed — the update could not be \
+                                     completed. The previous default was restored and {}.",
+                                    session.describe()
+                                ),
+                                diagnostic_code: "effective_default_restored_after_boundary"
+                                    .to_string(),
+                            }
+                        }
+                    };
+                    let _ = tx
+                        .send(TurnEvent::DefaultModelUpdateResult {
+                            default_update_id,
+                            outcome,
+                        })
+                        .await;
+                }
+                TransactionCorrelation::ModelSelection { selection_id, .. } => {
+                    let Some(requested) = transaction.requested.clone() else {
+                        continue;
+                    };
+                    let outcome = match &transaction.outcome {
+                        RecoveredOutcome::Applied { selection, .. } => {
+                            crate::daemon::proto::ModelSelectionOutcome::Applied {
+                                active_state: Box::new(
+                                    crate::daemon::proto::ModelSelectionActiveState {
+                                        selection: requested.clone(),
+                                        default_selection: selection.clone(),
+                                        diverged: selection.as_ref() != Some(&requested),
+                                        generation,
+                                    },
+                                ),
+                                default_update:
+                                    crate::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                                        selection: requested.clone(),
+                                        generation,
+                                        scope_label: transaction.scope_label.clone(),
+                                        unchanged: false,
+                                    },
+                            }
+                        }
+                        RecoveredOutcome::Restored { session, .. } => {
+                            crate::daemon::proto::ModelSelectionOutcome::Rejected {
+                                user_message: format!(
+                                    "The model switch did not complete. The previous default was \
+                                     restored and {}.",
+                                    session.describe()
+                                ),
+                                diagnostic_code: "effective_default_restored_after_boundary"
+                                    .to_string(),
+                            }
+                        }
+                    };
+                    let _ = tx
+                        .send(TurnEvent::ModelSelectionResult {
+                            selection_id,
+                            provider: requested.provider.clone(),
+                            model: requested.model.clone(),
+                            reasoning_effort: requested
+                                .reasoning_effort
+                                .as_ref()
+                                .map(|effort| effort.value.clone()),
+                            thinking_mode: requested.thinking_mode,
+                            prompt_cache_retention: requested.prompt_cache_retention,
+                            outcome,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Bring the live root agent onto a model that recovery already committed
+    /// to both durable authorities.
+    ///
+    /// This is the swap `set_active_model_live` would have performed had the
+    /// transaction completed in-process. It runs on the driver's control loop,
+    /// so it keeps the single-writer discipline the rest of the swap path
+    /// relies on. A no-op when the root already runs that model.
+    fn adopt_recovered_session_model(
+        &mut self,
+        requested: &crate::config::providers::ActiveModelRef,
+    ) -> Result<()> {
+        if self.stack.is_empty() {
+            anyhow::bail!("no root agent frame is available");
+        }
+        let root_idx = 0;
+        let running = &self.stack[root_idx].agent.model;
+        if running.provider_id() == requested.provider && running.model_id_ref() == requested.model
+        {
+            return Ok(());
+        }
+        let new_model = Arc::new(self.build_live_model(requested)?);
+        let llm_mode = self.effective_llm_mode_for(&requested.provider, &requested.model);
+        let rebuilt = match self.try_rebuild_frame_with_model(
+            root_idx,
+            new_model.clone(),
+            llm_mode,
+            requested,
+        ) {
+            Ok(agent) => Arc::new(agent),
+            Err(_) => {
+                Arc::new(self.rebuild_frame_with_model(root_idx, new_model, llm_mode, requested))
+            }
+        };
+        self.stack[root_idx].agent = rebuilt;
+        if self.active_frame_index() == Some(root_idx) {
+            self.schedule.set_agent(self.stack[root_idx].agent.clone());
+        }
+        self.prompt_cache_retention_preference = requested.prompt_cache_retention;
+        Ok(())
+    }
+
+    /// A post-boundary transaction whose outcome this process could not prove
+    /// is **not** terminal. Emit nothing, release the terminal slot, and let
+    /// the recovery pass that converges the journal emit the one correlated
+    /// terminal result. The client keeps showing non-terminal pending wording.
+    fn leave_terminal_to_recovery(
+        &self,
+        selection_id: uuid::Uuid,
+        target: &crate::config::providers::ActiveModelRef,
+        rejection: &ModelSelectionRejection,
+        claimed: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        // The claim is deliberately *kept*. Releasing it would let the
+        // worker's deadline path win the race and emit a `Rejected` for a
+        // transaction that already crossed the durable commit boundary — and
+        // recovery would then emit a second terminal for the same
+        // `selection_id`. Recovery emits directly through the driver, which
+        // does not consult this flag, so holding it makes exactly one terminal
+        // result possible.
+        let _ = claimed;
+        tracing::warn!(
+            session_id = %self.session.id,
+            %selection_id,
+            provider = %target.provider,
+            model = %target.model,
+            diagnostic_code = rejection.diagnostic_code,
+            "default-model transaction is pending recovery; no terminal result emitted"
+        );
     }
 
     async fn emit_model_selection_result(
@@ -612,14 +1013,9 @@ impl Driver {
         // Config-watch refresh is asynchronous. A successful write is already
         // authoritative for this terminal result even if the worker's live
         // snapshot still contains the prior default for a few milliseconds.
-        let terminal_default_selection = default_update.authoritative_selection.or_else(|| {
-            matches!(
-                &default_update.outcome,
-                crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-            )
-            .then(|| target.clone())
-            .or_else(|| self.live_config_active_model())
-        });
+        let terminal_default_selection = default_update
+            .authoritative_selection
+            .or_else(|| self.live_config_active_model());
         let terminal_diverged = terminal_default_selection.as_ref() != Some(target);
         let _ = tx
             .send(TurnEvent::ModelSelectionResult {
@@ -639,12 +1035,12 @@ impl Driver {
                     }
                 } else {
                     crate::daemon::proto::ModelSelectionOutcome::Applied {
-                        active_state: crate::daemon::proto::ModelSelectionActiveState {
+                        active_state: Box::new(crate::daemon::proto::ModelSelectionActiveState {
                             selection: target.clone(),
                             default_selection: terminal_default_selection,
                             diverged: terminal_diverged,
                             generation: self.active_model_state_generation,
-                        },
+                        }),
                         default_update: default_update.outcome,
                     }
                 },
@@ -724,6 +1120,7 @@ impl Driver {
         self.live_providers_config().ok()?.active_model
     }
 
+    #[cfg(test)]
     fn authoritative_config_active_model(
         &self,
     ) -> Option<crate::config::providers::ActiveModelRef> {
@@ -731,22 +1128,26 @@ impl Driver {
         if let Some((providers, _, _)) = &self.test_providers_override {
             return providers.active_model.clone();
         }
-        crate::daemon::config_source::load_effective_providers_for_atomic_mutation(&self.cwd)
-            .active_model
+        // Session-scoped code reads config through the driver's live snapshot,
+        // never straight from disk.
+        self.live_config_active_model()
     }
 
-    async fn prepare_default_model(
-        &mut self,
-        target: &crate::config::providers::ActiveModelRef,
+    /// Resolve what the terminal default-update outcome will be, without
+    /// touching any authority.
+    ///
+    /// Only two intents exist: `None` (plain Enter — session-only, so the
+    /// default is reported as `NotRequested`) and `Replace` (Ctrl+Enter — one
+    /// journaled transaction performed at commit time). There is deliberately
+    /// no "initialize if missing" path: a session-only selection can never
+    /// write `active_model` in any layer.
+    fn prepare_default_model(
+        &self,
         intent: DefaultModelWriteIntent,
-        deadline: Option<std::time::Instant>,
     ) -> std::result::Result<PreparedDefaultModelUpdate, ModelSelectionRejection> {
         if matches!(intent, DefaultModelWriteIntent::None) {
             return Ok(PreparedDefaultModelUpdate::Immediate(
-                DefaultModelUpdateResult {
-                    outcome: crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
-                    authoritative_selection: self.live_config_active_model(),
-                },
+                DefaultModelUpdateResult::not_requested(self.live_config_active_model()),
             ));
         }
 
@@ -755,111 +1156,83 @@ impl Driver {
             return Ok(PreparedDefaultModelUpdate::Test(intent));
         }
 
-        // Acquire the cross-process lock, resolve the effective layered
-        // default, serialize, and fsync a private temp file before terminal
-        // ownership is claimed. Lock acquisition polls a cancellation flag:
-        // after a deadline we cancel and join the blocking task before
-        // returning, so timed-out attempts cannot remain queued and later
-        // monopolize the global config lock.
-        let cwd = self.cwd.clone();
-        let target_for_write = target.clone();
-        let trust_policy = crate::config::trust::current_workspace_trust_policy();
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let prepare_cancelled = std::sync::Arc::clone(&cancelled);
-        let mut prepare = tokio::task::spawn_blocking(move || {
-            let write = || {
-                let path = crate::config::dirs::most_specific_config_write_target(&cwd)
-                    .context("no cockpit config found — run `/settings` to create one")?;
-                let mode = match intent {
-                    DefaultModelWriteIntent::Replace => {
-                        crate::config::providers::ActiveModelWriteMode::Replace
-                    }
-                    DefaultModelWriteIntent::InitializeIfMissing => {
-                        crate::config::providers::ActiveModelWriteMode::InitializeIfMissing
-                    }
-                    DefaultModelWriteIntent::None => unreachable!("handled above"),
-                };
-                crate::config::providers::ConfigDoc::prepare_effective_active_model_write_cancellable(
-                    &cwd,
-                    &path,
-                    &target_for_write,
-                    mode,
-                    &prepare_cancelled,
-                )
-            };
-            match trust_policy {
-                Some(policy) => crate::config::trust::with_workspace_trust_policy(policy, write),
-                None => write(),
-            }
-        });
-        let prepared = if let Some(deadline) = deadline {
-            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut prepare)
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    cancelled.store(true, std::sync::atomic::Ordering::Release);
-                    // `spawn_blocking` tasks are not cancelled when their
-                    // join handle is dropped. Await the cooperatively
-                    // cancelled waiter so no orphan can acquire this lock
-                    // after the deadline. Any prepared plan that won the
-                    // boundary race is dropped here without committing.
-                    if let Err(error) = prepare.await {
-                        tracing::warn!(
-                            %error,
-                            "joining cancelled active-model config mutation preparation"
-                        );
-                    }
-                    return Err(ModelSelectionRejection::deadline());
-                }
-            }
-        } else {
-            prepare.await
-        };
-        let prepared = match prepared {
-            Ok(result) => result,
-            Err(error) => Err(anyhow::anyhow!(
-                "joining active-model config mutation preparation: {error}"
-            )),
-        };
+        // The explicit replace is a single journaled transaction at commit
+        // time (guarded session CAS + config). Preparation only resolves that
+        // the call is pending; no authority changes here.
+        Ok(PreparedDefaultModelUpdate::PendingReplace)
+    }
 
-        Ok(match prepared {
-            Ok(write) => {
-                let authoritative_before_commit =
-                    write.authoritative_selection_before_commit().cloned();
-                PreparedDefaultModelUpdate::Production {
-                    write: Box::new(write),
-                    intent,
-                    authoritative_before_commit,
+    /// Run one journaled effective-default mutation off the async runtime.
+    ///
+    /// The deadline is enforced by requesting cancellation and then honoring
+    /// whatever the transaction actually decided: cancellation is only
+    /// observed *before* the durable commit boundary, so a transaction that
+    /// already crossed it still reports its verified terminal outcome instead
+    /// of a spurious timeout rejection.
+    async fn await_effective_default_mutation(
+        task: tokio::task::JoinHandle<
+            std::result::Result<
+                crate::config::providers::EffectiveDefaultMutationResult,
+                crate::config::providers::EffectiveDefaultError,
+            >,
+        >,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        deadline: Option<std::time::Instant>,
+        target: &crate::config::providers::ActiveModelRef,
+    ) -> std::result::Result<
+        crate::config::providers::EffectiveDefaultMutationResult,
+        ModelSelectionRejection,
+    > {
+        let mut task = task;
+        let joined = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
+                    .await
+                {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        task.await
+                    }
                 }
             }
-            Err(error) => {
-                PreparedDefaultModelUpdate::Immediate(DefaultModelUpdateResult::write_failed(
-                    target,
-                    &error,
-                    self.authoritative_config_active_model(),
-                ))
+            None => task.await,
+        };
+        let joined = joined.map_err(|error| {
+            ModelSelectionRejection::failure(
+                target,
+                &format!("joining the default-model transaction: {error}"),
+                "default_model_write_failed",
+            )
+        })?;
+        joined.map_err(|error| {
+            if error.diagnostic_code == "effective_default_cancelled" {
+                ModelSelectionRejection::deadline()
+            } else {
+                ModelSelectionRejection::from_effective_default(target, &error)
             }
         })
     }
 
-    fn commit_prepared_default_model(
+    async fn commit_prepared_default_model(
         &mut self,
+        selection_id: uuid::Uuid,
         target: &crate::config::providers::ActiveModelRef,
         prepared: PreparedDefaultModelUpdate,
-    ) -> DefaultModelUpdateResult {
+        session_already_persisted: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<DefaultModelUpdateResult, ModelSelectionRejection> {
         match prepared {
-            PreparedDefaultModelUpdate::Immediate(result) => result,
-            PreparedDefaultModelUpdate::Production {
-                write,
-                intent,
-                authoritative_before_commit,
-            } => DefaultModelUpdateResult::from_prepared_commit(
-                target,
-                intent,
-                authoritative_before_commit,
-                (*write).commit(),
-            ),
+            PreparedDefaultModelUpdate::Immediate(result) => Ok(result),
+            PreparedDefaultModelUpdate::PendingReplace => {
+                self.run_session_and_default_transaction(
+                    selection_id,
+                    target,
+                    session_already_persisted,
+                    deadline,
+                )
+                .await
+            }
             #[cfg(test)]
             PreparedDefaultModelUpdate::Test(intent) => {
                 self.update_default_model_for_test(target, intent)
@@ -867,39 +1240,146 @@ impl Driver {
         }
     }
 
+    /// The Ctrl+Enter all-or-nothing transaction: one journaled operation
+    /// commits the guarded session revision and the effective default, or
+    /// converges both back to their recorded prior values.
+    async fn run_session_and_default_transaction(
+        &mut self,
+        selection_id: uuid::Uuid,
+        target: &crate::config::providers::ActiveModelRef,
+        session_already_persisted: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<DefaultModelUpdateResult, ModelSelectionRejection> {
+        #[cfg(test)]
+        if self.test_fail_next_active_model_config_write {
+            self.test_fail_next_active_model_config_write = false;
+            return Err(ModelSelectionRejection::failure(
+                target,
+                "test injected active model config write failure",
+                "default_model_write_failed",
+            ));
+        }
+
+        let prior_session = self
+            .session
+            .active_model_ref()
+            .unwrap_or_else(|| target.clone());
+        // The guard revision is the whole point of the CAS. Reading it must
+        // not be papered over with a default: a wrong guard would either fail
+        // every commit or, worse, match a row it does not describe.
+        let expected_revision = match self.session.active_model_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Err(ModelSelectionRejection::failure(
+                    target,
+                    &format!("the session's active-model revision could not be read: {error:#}"),
+                    "model_selection_session_revision_unreadable",
+                ));
+            }
+        };
+        let session_id = self.session.id;
+        let session = self.session.clone();
+        let cwd = self.cwd.clone();
+        let target_for_write = target.clone();
+        let trust_policy = crate::config::trust::current_workspace_trust_policy();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_cancelled = std::sync::Arc::clone(&cancelled);
+
+        let task = tokio::task::spawn_blocking(move || {
+            let _guard = trust_policy.map(crate::config::trust::enter_workspace_trust_policy);
+            let mut authority = DriverSessionAuthority { session };
+            // A no-op switch already holds the target session model, so only
+            // the config half participates; the reload is still verified.
+            let participant = if session_already_persisted {
+                None
+            } else {
+                Some(crate::config::providers::SessionDefaultParticipant {
+                    session_id,
+                    prior: prior_session,
+                    expected_revision,
+                    authority: &mut authority,
+                })
+            };
+            crate::config::providers::mutate_effective_default(
+                &cwd,
+                Some(&target_for_write),
+                crate::config::providers::ActiveModelWriteMode::Replace,
+                participant,
+                Some(task_cancelled.as_ref()),
+                // Recorded in the journal so a transaction this process
+                // cannot finish still yields exactly one correlated terminal
+                // result, emitted by the recovery pass that does finish it.
+                Some(
+                    crate::config::providers::TransactionCorrelation::ModelSelection {
+                        selection_id,
+                        session_id,
+                    },
+                ),
+            )
+        });
+
+        Self::await_effective_default_mutation(task, cancelled, deadline, target)
+            .await
+            .map(DefaultModelUpdateResult::from_mutation)
+    }
+
     #[cfg(test)]
     fn update_default_model_for_test(
         &mut self,
         target: &crate::config::providers::ActiveModelRef,
         intent: DefaultModelWriteIntent,
-    ) -> DefaultModelUpdateResult {
+    ) -> std::result::Result<DefaultModelUpdateResult, ModelSelectionRejection> {
         let current = self.authoritative_config_active_model();
         let should_write = match intent {
             DefaultModelWriteIntent::Replace => current.as_ref() != Some(target),
-            DefaultModelWriteIntent::InitializeIfMissing => current.is_none(),
             DefaultModelWriteIntent::None => unreachable!("handled above"),
         };
         if !should_write {
-            return DefaultModelUpdateResult {
-                outcome: match intent {
-                    DefaultModelWriteIntent::Replace => {
-                        crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-                    }
-                    DefaultModelWriteIntent::InitializeIfMissing => {
-                        crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
-                    }
-                    DefaultModelWriteIntent::None => unreachable!("handled above"),
-                },
-                authoritative_selection: current,
-            };
+            return Ok(match intent {
+                DefaultModelWriteIntent::Replace => DefaultModelUpdateResult::verified(
+                    target.clone(),
+                    self.active_model_state_generation.max(1),
+                    "test".to_string(),
+                    true,
+                ),
+                DefaultModelWriteIntent::None => unreachable!("handled above"),
+            });
         }
 
+        // Session first for replace (mirrors journal order after prepared).
+        if matches!(intent, DefaultModelWriteIntent::Replace)
+            && self.test_fail_next_active_model_session_persist
+        {
+            self.test_fail_next_active_model_session_persist = false;
+            return Err(ModelSelectionRejection::failure(
+                target,
+                "test injected active model session persist failure",
+                "model_selection_session_persist_failed",
+            ));
+        }
         match self.write_active_model_config_for_test(target) {
-            Ok(()) => DefaultModelUpdateResult {
-                outcome: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
-                authoritative_selection: Some(target.clone()),
-            },
-            Err(error) => DefaultModelUpdateResult::write_failed(target, &error, current),
+            Ok(()) => {
+                if matches!(intent, DefaultModelWriteIntent::Replace)
+                    && let Err(error) = self.session.set_active_model_ref(target.clone())
+                {
+                    return Err(ModelSelectionRejection::failure(
+                        target,
+                        &format!("{error:#}"),
+                        "effective_default_session_cas_failed",
+                    ));
+                }
+                Ok(DefaultModelUpdateResult::verified(
+                    target.clone(),
+                    self.active_model_state_generation.saturating_add(1).max(1),
+                    "test".to_string(),
+                    false,
+                ))
+            }
+            Err(error) => Err(ModelSelectionRejection::failure(
+                target,
+                &format!("{error:#}"),
+                "default_model_write_failed",
+            )),
         }
     }
 
@@ -1264,26 +1744,24 @@ mod default_model_commit_tests {
     }
 
     #[test]
-    fn failed_prepared_commit_retains_old_authoritative_default_and_divergence() {
-        let old = selection("provider-a", "model-a");
+    fn verified_outcome_carries_scope_and_selection() {
         let target = selection("provider-b", "model-b");
-
-        let result = DefaultModelUpdateResult::from_prepared_commit(
-            &target,
-            DefaultModelWriteIntent::Replace,
-            Some(old.clone()),
-            Err(anyhow::anyhow!("injected atomic replacement failure")),
-        );
-
-        assert!(matches!(
-            result.outcome,
-            crate::daemon::proto::DefaultModelUpdateOutcome::Failed { .. }
-        ));
-        assert_eq!(result.authoritative_selection, Some(old));
-        assert_ne!(
-            result.authoritative_selection.as_ref(),
-            Some(&target),
-            "the terminal active state must remain diverged after commit failure"
-        );
+        let result =
+            DefaultModelUpdateResult::verified(target.clone(), 3, "user".to_string(), false);
+        match result.outcome {
+            crate::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                selection,
+                generation,
+                scope_label,
+                unchanged,
+            } => {
+                assert_eq!(selection, target);
+                assert_eq!(generation, 3);
+                assert_eq!(scope_label, "user");
+                assert!(!unchanged);
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+        assert_eq!(result.authoritative_selection.as_ref(), Some(&target));
     }
 }

@@ -26,14 +26,37 @@ pub struct ModelSelectionActiveState {
     pub generation: u64,
 }
 
-/// Result of the optional, independent request to save a selected session
-/// model as the default for future sessions.
+/// Result of an optional request to save a selected session model as the
+/// verified effective default for future sessions in the current configuration
+/// context.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DefaultModelUpdateOutcome {
     NotRequested,
-    Saved,
-    Failed {
+    /// Post-commit reload under the attach trust policy resolved exactly to
+    /// `selection`. `unchanged` is true when no bytes were written because the
+    /// effective default already matched.
+    Verified {
+        selection: cockpit_config::config::providers::ActiveModelRef,
+        generation: u64,
+        scope_label: String,
+        #[serde(default)]
+        unchanged: bool,
+    },
+}
+
+/// Terminal result for `Request::SetDefaultModel` (config-only).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DefaultModelStandaloneOutcome {
+    Applied {
+        selection: Option<cockpit_config::config::providers::ActiveModelRef>,
+        generation: u64,
+        scope_label: String,
+        #[serde(default)]
+        unchanged: bool,
+    },
+    Rejected {
         user_message: String,
         diagnostic_code: String,
     },
@@ -44,7 +67,11 @@ pub enum DefaultModelUpdateOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ModelSelectionOutcome {
     Applied {
-        active_state: ModelSelectionActiveState,
+        /// Boxed to keep the enum small: the applied payload carries two full
+        /// model references plus the verified default, which would otherwise
+        /// make every `Rejected` pay for the success case. `Box` is
+        /// serde-transparent, so the wire shape is unchanged.
+        active_state: Box<ModelSelectionActiveState>,
         default_update: DefaultModelUpdateOutcome,
     },
     Rejected {
@@ -616,6 +643,14 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_cache_retention: Option<PromptCacheRetention>,
         outcome: ModelSelectionOutcome,
+    },
+
+    /// Terminal outcome for a local-owner-only config-only default update
+    /// (`SetDefaultModel`). Never mutates the live session model.
+    DefaultModelUpdateResult {
+        session_id: Uuid,
+        default_update_id: Uuid,
+        outcome: DefaultModelStandaloneOutcome,
     },
 
     /// Model inference started. TUI shows `Thinking…` until the first
@@ -1427,6 +1462,7 @@ macro_rules! event_variants {
             (Event::ForegroundInputTarget { .. }, "foreground_input_target");
             (Event::ActiveModelState { .. }, "active_model_state");
             (Event::ModelSelectionResult { .. }, "model_selection_result");
+            (Event::DefaultModelUpdateResult { .. }, "default_model_update_result");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");
             (Event::InferenceWarning { .. }, "inference_warning");

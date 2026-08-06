@@ -21,6 +21,13 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Exposes the effective-default journal's phase-boundary crash seam so
+# daemon-level tests can replay the same failures. Only enabled by
+# `cockpit-core`'s dev-dependencies; never by a normal build.
+test-support = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", default-features = false, features = [

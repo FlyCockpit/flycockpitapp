@@ -60,6 +60,8 @@ CREATE TABLE sessions (
     provider        TEXT,
     model           TEXT,
     model_selection_json TEXT,
+    -- Durable CAS token for active-model mutations (picker, recovery, controls).
+    active_model_revision INTEGER NOT NULL DEFAULT 0,
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     tool_surface_override_json TEXT,
     goal_settings_override_json TEXT,

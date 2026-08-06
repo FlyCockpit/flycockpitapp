@@ -210,7 +210,6 @@ describe("RemoteSessionClient", () => {
       thinking_mode: "high",
       prompt_cache_retention: "extended",
       persist_as_default: true,
-      initialize_default_if_missing: false,
     });
     const selectionRelay = JSON.parse(socket.sent[0] ?? "{}");
     expect(selectionRelay.payload).toMatchObject({
@@ -224,7 +223,6 @@ describe("RemoteSessionClient", () => {
         thinking_mode: "high",
         prompt_cache_retention: "extended",
         persist_as_default: true,
-        initialize_default_if_missing: false,
       },
     });
     socket.message({

@@ -915,8 +915,9 @@ fn default_client_protocol_version() -> u32 {
 
 mod event;
 pub use event::{
-    AuthFailureKind, DefaultModelUpdateOutcome, Event, InferenceErrorClass,
-    ModelSelectionActiveState, ModelSelectionOutcome, UserMessageTerminalDisposition,
+    AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
+    InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome,
+    UserMessageTerminalDisposition,
 };
 
 // ---- Errors ----------------------------------------------------------------
@@ -2255,6 +2256,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_live_status",
         "set_active_model",
         "set_agent",
+        "set_default_model",
         "set_model_favorite",
         "share_session",
         "stats_rollup",
@@ -3282,7 +3284,6 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-5",
                 "persist_as_default": false,
-                "initialize_default_if_missing": false,
                 "thinking_mode": "turbo"
             }
         });
@@ -3301,7 +3302,6 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-5",
                 "persist_as_default": false,
-                "initialize_default_if_missing": false,
                 "reasoning_effort": ""
             }
         });
@@ -3320,8 +3320,7 @@ mod tests {
                     "selection_id": "11111111-1111-4111-8111-111111111111",
                     "provider": provider,
                     "model": model,
-                    "persist_as_default": false,
-                    "initialize_default_if_missing": false
+                    "persist_as_default": false
                 }
             });
 

@@ -9,6 +9,7 @@ import {
   activeModelStateSchema,
   clientEnvelopeSchema,
   commandDetailSchema,
+  defaultModelUpdateOutcomeSchema,
   errorEnvelopeSchema,
   eventEnvelopeSchema,
   grantKindSchema,
@@ -76,6 +77,71 @@ describe("cockpit-proto daemon wire schemas", () => {
       const parsed = eventEnvelopeSchema.parse(frame);
       expect("__unknown" in parsed, name).toBe(false);
     }
+  });
+
+  it("requires set_default_model to carry either a reference or clear", () => {
+    const base = {
+      v: PROTOCOL_VERSION,
+      kind: "req" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      request: "set_default_model" as const,
+    };
+    const id = "22222222-2222-4222-8222-222222222222";
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...base,
+        params: { default_update_id: id, provider: "openai", model: "gpt-5" },
+      }).success,
+    ).toBe(true);
+    expect(
+      clientEnvelopeSchema.safeParse({ ...base, params: { default_update_id: id, clear: true } })
+        .success,
+    ).toBe(true);
+    // A clear must not carry a reference, and a set must not omit one.
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...base,
+        params: { default_update_id: id, clear: true, provider: "openai", model: "gpt-5" },
+      }).success,
+    ).toBe(false);
+    expect(
+      clientEnvelopeSchema.safeParse({ ...base, params: { default_update_id: id } }).success,
+    ).toBe(false);
+    // Empty strings are not a stand-in for absence.
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...base,
+        params: { default_update_id: id, provider: "", model: "" },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts only verified default-model outcomes", () => {
+    const verified = {
+      status: "verified",
+      selection: { provider: "openai", model: "gpt-5" },
+      generation: 3,
+      scope_label: "user",
+      unchanged: false,
+    };
+    expect(defaultModelUpdateOutcomeSchema.safeParse(verified).success).toBe(true);
+    expect(defaultModelUpdateOutcomeSchema.safeParse({ status: "not_requested" }).success).toBe(
+      true,
+    );
+    // The retired shapes claimed a write without proving the effective result.
+    expect(defaultModelUpdateOutcomeSchema.safeParse({ status: "saved" }).success).toBe(false);
+    expect(
+      defaultModelUpdateOutcomeSchema.safeParse({
+        status: "failed",
+        user_message: "nope",
+        diagnostic_code: "x",
+      }).success,
+    ).toBe(false);
+    // A verified outcome without its proof metadata is not acceptable either.
+    expect(
+      defaultModelUpdateOutcomeSchema.safeParse({ status: "verified", scope_label: "user" })
+        .success,
+    ).toBe(false);
   });
 
   it("tolerates and flags an unknown event kind", () => {
@@ -233,11 +299,12 @@ describe("cockpit-proto daemon wire schemas", () => {
           model: "gpt-5",
           reasoning_effort: "",
           persist_as_default: false,
-          initialize_default_if_missing: false,
         },
       }).success,
     ).toBe(false);
 
+    // Plain Enter is session-only, so there is no "initialize if missing"
+    // companion flag to be ambiguous with; an unknown key is rejected outright.
     expect(
       clientEnvelopeSchema.safeParse({
         v: PROTOCOL_VERSION,

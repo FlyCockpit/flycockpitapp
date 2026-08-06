@@ -1391,28 +1391,23 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
         }],
     });
-    let request = |persist_as_default, initialize_default_if_missing| Request::SetActiveModel {
+    let request = |persist_as_default| Request::SetActiveModel {
         selection_id: Uuid::new_v4(),
         provider: "p".into(),
         model: "a".into(),
         persist_as_default,
-        initialize_default_if_missing,
         trigger: proto::ActiveModelSwitchTrigger::Picker,
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
     };
 
-    authorize_request(&request(false, false), &state, &ctx)
+    authorize_request(&request(false), &state, &ctx)
         .await
         .expect("session-only selection remains available to a writer");
-    let error = authorize_request(&request(true, false), &state, &ctx)
+    let error = authorize_request(&request(true), &state, &ctx)
         .await
         .expect_err("durable default mutation must remain owner-only");
-    assert_eq!(error.code, ErrorCode::Authorization);
-    let error = authorize_request(&request(false, true), &state, &ctx)
-        .await
-        .expect_err("conditional default initialization must remain owner-only");
     assert_eq!(error.code, ErrorCode::Authorization);
 }
 
@@ -3970,6 +3965,12 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "provider config favorite changes and refreshed snapshot is emitted",
         },
         MutatingDispatchCase {
+            kind: "set_default_model",
+            effect_class: Durable,
+            observation: "verified effective default persists and one correlated \
+                          DefaultModelUpdateResult is broadcast",
+        },
+        MutatingDispatchCase {
             kind: "set_active_model",
             effect_class: DriverForwarded,
             observation: "SessionWork::SetActiveModel delivered to attached worker",
@@ -4322,6 +4323,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         }
         "open_terminal" => AuthzAllowedOutcome::Error(ErrorCode::RootMissing),
         "set_model_favorite" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // Terminal-by-event: the request Acks and the verified/rejected outcome
+        // arrives as a correlated DefaultModelUpdateResult.
+        "set_default_model" => AuthzAllowedOutcome::Response,
         "send_user_message"
         | "steer_delegation"
         | "remove_queued_user_message"
@@ -4433,6 +4437,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("run_scheduled_job"),
         authz_session_writer("set_active_model"),
         authz_owner_only("set_model_favorite"),
+        authz_owner_only("set_default_model"),
         authz_session_writer("set_agent"),
         authz_session_writer("set_tool_surface_override"),
         authz_session_writer("set_goal_settings_override"),
@@ -5154,6 +5159,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "cancel_turn"
             | "resolve_interrupt"
             | "set_model_favorite"
+            | "set_default_model"
             | "set_active_model"
             | "set_agent"
             | "set_tool_surface_override"
@@ -5467,12 +5473,20 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             model: "gpt-5".into(),
             favorite: true,
         },
+        "set_default_model" => Request::SetDefaultModel {
+            default_update_id: Uuid::new_v4(),
+            provider: Some("p".into()),
+            model: Some("m".into()),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            clear: false,
+        },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::from_u128(3),
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
-            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -6360,6 +6374,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "stop_daemon"
         | "lsp_control" => assert_in_memory_or_global_mutating_happy(case.kind).await,
         "set_model_favorite" => assert_set_model_favorite_happy().await,
+        "set_default_model" => assert_set_default_model_happy().await,
         "send_user_message"
         | "steer_delegation"
         | "remove_queued_user_message"
@@ -6573,6 +6588,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "cancel_turn"
         | "resolve_interrupt"
         | "set_model_favorite"
+        | "set_default_model"
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
@@ -6851,12 +6867,20 @@ async fn assert_worker_delivery_happy(kind: &str) {
             model: "gpt-5".into(),
             favorite: true,
         },
+        "set_default_model" => Request::SetDefaultModel {
+            default_update_id: Uuid::new_v4(),
+            provider: Some("p".into()),
+            model: Some("m".into()),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            clear: false,
+        },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::from_u128(3),
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
-            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -7023,7 +7047,6 @@ async fn assert_worker_delivery_happy(kind: &str) {
                         reasoning_effort,
                         thinking_mode,
                         persist_as_default: _,
-                        initialize_default_if_missing: _,
                         prompt_cache_retention,
                     },
                 ) => {
@@ -7322,12 +7345,20 @@ async fn assert_attached_required_malformed(kind: &str) {
             model: "gpt-5".into(),
             favorite: true,
         },
+        "set_default_model" => Request::SetDefaultModel {
+            default_update_id: Uuid::new_v4(),
+            provider: Some("p".into()),
+            model: Some("m".into()),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            clear: false,
+        },
         "set_active_model" => Request::SetActiveModel {
             selection_id: Uuid::new_v4(),
             provider: "openai".into(),
             model: "gpt-5".into(),
             persist_as_default: false,
-            initialize_default_if_missing: false,
             trigger: proto::ActiveModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -9107,6 +9138,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "steer_delegation",
         "resolve_interrupt",
         "set_model_favorite",
+        "set_default_model",
         "set_active_model",
         "set_agent",
         "set_llm_mode",
@@ -9815,12 +9847,26 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::SetDefaultModel {
+                default_update_id: Uuid::new_v4(),
+                provider: Some("openai".into()),
+                model: Some("gpt".into()),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+                clear: false,
+            },
+            kind: "set_default_model",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::SetActiveModel {
                 selection_id: Uuid::new_v4(),
                 provider: "openai".into(),
                 model: "gpt".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: false,
                 trigger: proto::ActiveModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -10330,6 +10376,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetScheduledJobEnabled,
         RunScheduledJob,
         SetModelFavorite,
+        SetDefaultModel,
         SetActiveModel,
         SetAgent,
         SetLlmMode,
@@ -12050,6 +12097,194 @@ async fn set_model_favorite_writes_config_and_refreshes_daemon_snapshot() {
     assert_set_model_favorite_happy().await;
 }
 
+/// `SetDefaultModel` is attached-context-only, config-only, and terminal.
+///
+/// It must produce exactly one correlated `DefaultModelUpdateResult`, broadcast
+/// the authoritative config snapshot only after verified success, and never
+/// enqueue `SessionWork::SetActiveModel`.
+async fn assert_set_default_model_happy() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    let provider_path =
+        crate::config::providers::provider_file_path_for_config(&config_path, "p").unwrap();
+    std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &provider_path,
+        r#"{"url":"https://example.test","models":[{"id":"a"}]}"#,
+    )
+    .unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    let (mut state, _, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let mut event_rx = state
+        .attached
+        .as_ref()
+        .expect("attached session")
+        .handle
+        .subscribe();
+    let work = tokio::spawn(async move {
+        let mut kinds = Vec::new();
+        while let Some(work) = work_rx.recv().await {
+            match work {
+                SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
+                    kinds.push("replace_config_snapshot");
+                    respond_to.send(1).unwrap();
+                    break;
+                }
+                SessionWork::SetActiveModel { .. } => {
+                    kinds.push("set_active_model");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        kinds
+    });
+
+    let default_update_id = Uuid::new_v4();
+    let response = handle_request(
+        Request::SetDefaultModel {
+            default_update_id,
+            provider: Some("p".to_string()),
+            model: Some("a".to_string()),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            clear: false,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("default model update succeeds");
+    assert!(matches!(response, Response::Ack));
+
+    assert_eq!(
+        work.await.unwrap(),
+        vec!["replace_config_snapshot"],
+        "SetDefaultModel must refresh config and never enqueue session work"
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("exactly one correlated terminal result")
+        .event;
+    match event {
+        proto::Event::DefaultModelUpdateResult {
+            default_update_id: got,
+            outcome:
+                proto::DefaultModelStandaloneOutcome::Applied {
+                    selection,
+                    scope_label,
+                    unchanged,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(got, default_update_id);
+            let selection = selection.expect("a verified reference");
+            assert_eq!(selection.provider, "p");
+            assert_eq!(selection.model, "a");
+            assert_eq!(scope_label, "project");
+            assert!(!unchanged);
+        }
+        other => panic!("expected an applied DefaultModelUpdateResult, got {other:?}"),
+    }
+
+    // A fresh, model-less session in this context resolves the saved default.
+    let effective = crate::config::providers::ConfigDoc::providers_from_paths(&[config_path]);
+    let active = effective.active_model.expect("verified default persisted");
+    assert_eq!(active.provider, "p");
+    assert_eq!(active.model, "a");
+}
+
+#[tokio::test]
+async fn set_default_model_persists_verified_default_without_touching_the_session() {
+    assert_set_default_model_happy().await;
+}
+
+/// Attach is a resolution barrier: a pending default-model journal it cannot
+/// converge must fail the attach closed rather than serve a snapshot that may
+/// disagree with the session's durable model. The error names the repair
+/// command and discloses no configuration content.
+#[tokio::test]
+async fn attach_fails_closed_on_an_unrecoverable_default_model_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    // A journal that cannot be parsed can neither be applied nor discarded.
+    let journal_path = crate::config::providers::journal_path_for_layer(&config_path);
+    std::fs::write(&journal_path, b"{ not a journal record").unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    let project_root = project.path().to_string_lossy().into_owned();
+    let normalized = project
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    ctx.db
+        .write(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .await
+        .unwrap();
+
+    let mut state = owner_state();
+    let error = handle_request(
+        Request::Attach {
+            session_id: None,
+            since_seq: None,
+            project_root: Some(project_root),
+            initial_model: None,
+            no_sandbox: true,
+            interactive: false,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("attach must fail closed behind an unrecoverable journal");
+
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+    assert!(
+        error.message.contains("cockpit doctor"),
+        "the repair diagnostic must be actionable: {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains(&journal_path.display().to_string()),
+        "the transport error must not disclose a path: {}",
+        error.message
+    );
+    assert!(
+        journal_path.exists(),
+        "an unreadable journal is never deleted"
+    );
+}
+
 #[tokio::test]
 async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let home = tempfile::tempdir().unwrap();
@@ -12771,7 +13006,6 @@ async fn serialized_requests_apply_in_receipt_order() {
                     provider: "openai".to_string(),
                     model: "gpt-5".to_string(),
                     persist_as_default: false,
-                    initialize_default_if_missing: false,
                     trigger: proto::ActiveModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -12809,7 +13043,6 @@ async fn serialized_requests_apply_in_receipt_order() {
             reasoning_effort,
             thinking_mode,
             persist_as_default: _,
-            initialize_default_if_missing: _,
             prompt_cache_retention,
         } => {
             assert_eq!(provider, "openai");

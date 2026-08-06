@@ -466,13 +466,23 @@ impl ProviderSetupActions {
                 }
                 None => io.write_line("Security settings unchanged.")?,
             },
-            "model-save" => match apply_model_answers(&self.cwd, run)? {
-                Some(path) => {
+            "model-save" => {
+                let outcome = apply_model_answers(&self.cwd, run)?;
+                if let Some(path) = outcome.model_file.as_ref() {
                     self.model_saved = Some(path.clone());
                     io.write_line(&format!("Saved model settings to {}.", path.display()))?;
                 }
-                None => io.write_line("Model settings unchanged.")?,
-            },
+                // The default is layer-wide policy verified by the daemon-owned
+                // effective-default operation, so it names a scope, not a path.
+                if let Some(scope) = outcome.default_scope.as_ref() {
+                    io.write_line(&format!(
+                        "Set the default model for new sessions in this configuration context ({scope}). Sessions that already exist keep their own saved model."
+                    ))?;
+                }
+                if outcome.changed_nothing() {
+                    io.write_line("Model settings unchanged.")?;
+                }
+            }
             _ => {}
         }
         Ok(())

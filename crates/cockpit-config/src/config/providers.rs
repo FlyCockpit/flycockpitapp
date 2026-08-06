@@ -55,10 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::config::extended::{ComputerUseMode, LlmMode, TextEmbeddedRecovery};
-use crate::config::files::{
-    ConfigMutationLock, PreparedAtomicWrite, atomic_write, prepare_atomic_write,
-    remove_file_nofollow,
-};
+use crate::config::files::{ConfigMutationLock, atomic_write, remove_file_nofollow};
 use crate::config::merge::deep_merge_value;
 
 fn deserialize_nonempty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -239,12 +236,24 @@ pub use fetch_status::{
     ProviderModelFetchDisplayState, format_model_fetch_age, model_fetch_reason_display,
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
 };
-pub use io::{
-    ActiveModelWriteMode, ActiveModelWriteResult, ConfigDoc, PreparedActiveModelWrite,
-    is_xai_grok_provider,
+pub use io::{ActiveModelWriteMode, ConfigDoc, is_xai_grok_provider};
+
+pub(crate) use io::next_load_effective_generation;
+pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count};
+
+/// The one authoritative effective-default mutation API. Nothing else in the
+/// workspace may write `active_model`.
+pub use crate::config::effective_default::{
+    EffectiveDefaultError, EffectiveDefaultMutationResult, EffectiveDefaultScope,
+    JournalDiagnostic, JournalRecovery, RecoveredOutcome, RecoveredSink, RecoveredTransaction,
+    ResolvedTarget, SessionCompensation, SessionDefaultParticipant, SessionRevisionAuthority,
+    TransactionCorrelation, journal_diagnostics, journal_path_for_layer, mutate_effective_default,
+    recover_all_effective_default_journals, recover_effective_default_journal,
+    recover_layer_journals, resolve_effective_default_write_target,
 };
 
-pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count};
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::config::effective_default::{EffectiveDefaultCrashPoint, set_crash_inject};
 
 /// Effective provider config. Global fields are read from layer
 /// `config.json`; provider entries are read from sibling `providers/*.json`

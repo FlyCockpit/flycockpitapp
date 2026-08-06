@@ -157,7 +157,10 @@ libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 assert_cmd = { workspace = true }
-cockpit-config = { path = "../cockpit-config" }
+# `test-support` exposes the effective-default journal's phase-boundary crash
+# seam so daemon-level tests can replay the same failures against real SQLite.
+# Dev-only: a normal build never enables it.
+cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

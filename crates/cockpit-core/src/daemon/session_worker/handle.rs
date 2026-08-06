@@ -1098,6 +1098,53 @@ impl SessionWorkerHandle {
             .clone()
     }
 
+    /// Emit the correlated terminal result for a `/model` selection that a
+    /// recovery pass finished on the driver's behalf.
+    ///
+    /// The originating call deliberately emitted nothing (its transaction was
+    /// still pending recovery), so this is the one terminal result for that
+    /// `selection_id`.
+    pub fn broadcast_model_selection_result(
+        &self,
+        selection_id: uuid::Uuid,
+        requested: &crate::config::providers::ActiveModelRef,
+        outcome: proto::ModelSelectionOutcome,
+    ) {
+        crate::daemon::send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::ModelSelectionResult {
+                session_id: self.session_id,
+                selection_id,
+                provider: requested.provider.clone(),
+                model: requested.model.clone(),
+                reasoning_effort: requested
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|effort| effort.value.clone()),
+                thinking_mode: requested.thinking_mode,
+                prompt_cache_retention: requested.prompt_cache_retention,
+                outcome,
+            },
+        );
+    }
+
+    pub fn broadcast_default_model_update_result(
+        &self,
+        default_update_id: uuid::Uuid,
+        outcome: proto::DefaultModelStandaloneOutcome,
+    ) {
+        crate::daemon::send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::DefaultModelUpdateResult {
+                session_id: self.session_id,
+                default_update_id,
+                outcome,
+            },
+        );
+    }
+
     pub fn broadcast_config_snapshot(&self) {
         let snapshot = self.config_snapshot().to_proto(self.session_id);
         send_current_event(
@@ -1336,6 +1383,12 @@ pub enum SessionWork {
             std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
         >,
     },
+    /// Terminal results for effective-default transactions a recovery pass
+    /// converged for this session. Routed through the driver so each event
+    /// carries the driver's own active-model-state generation.
+    EmitRecoveredDefaultTerminals {
+        transactions: Vec<crate::config::providers::RecoveredTransaction>,
+    },
     SteerDelegation {
         task_call_id: String,
         label: String,
@@ -1382,7 +1435,6 @@ pub enum SessionWork {
         provider: String,
         model: String,
         persist_as_default: bool,
-        initialize_default_if_missing: bool,
         trigger: crate::session::ModelSwitchTrigger,
         reasoning_effort: Option<String>,
         thinking_mode: Option<crate::config::providers::ThinkingMode>,

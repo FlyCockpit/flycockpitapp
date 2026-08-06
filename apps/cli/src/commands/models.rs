@@ -10,12 +10,49 @@ use crate::config::providers::{
 pub async fn run(args: ModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
     let cfg = crate::secret_ref::load_effective(&cwd);
+    print!("{}", render_effective_default(&cwd, &cfg));
     if cfg.providers.is_empty() {
         println!("{}", no_models_message());
         return Ok(());
     }
     print!("{}", render_models(&cfg, args.provider.as_deref())?);
     Ok(())
+}
+
+/// Deterministic, secret-free inspection of the effective default model and the
+/// layer that governs it.
+///
+/// This is the documented way to answer "what will the next *new* session
+/// pick, and which layer decides?" without opening a config file. It prints a
+/// safe scope label only — never a filesystem path, credential, or header.
+pub(crate) fn render_effective_default(cwd: &std::path::Path, cfg: &ProvidersConfig) -> String {
+    let scope = match crate::config::providers::resolve_effective_default_write_target(cwd) {
+        Ok(target) => target.scope_label(),
+        Err(error) => error
+            .scope_label
+            .unwrap_or_else(|| "no writable layer".to_string()),
+    };
+    match cfg.active_model.as_ref() {
+        Some(active) => {
+            let mut line = format!(
+                "default model for new sessions: {}/{} (scope: {scope})",
+                active.provider, active.model
+            );
+            if let Some(effort) = active.reasoning_effort.as_ref() {
+                line.push_str(&format!(" [reasoning={}]", effort.value));
+            }
+            if let Some(mode) = active.thinking_mode {
+                line.push_str(&format!(" [thinking={}]", mode.as_str()));
+            }
+            line.push_str(
+                "\nan existing session keeps its own saved model; this applies to newly created sessions\n\n",
+            );
+            line
+        }
+        None => format!(
+            "default model for new sessions: (unset) (scope: {scope})\na new session resolves its model at creation\n\n"
+        ),
+    }
 }
 
 pub async fn run_provider_catalog_status(args: ProviderCatalogStatusArgs) -> Result<()> {
@@ -225,6 +262,52 @@ mod tests {
             cfg.active_model = Some(serde_json::from_value(active.clone()).unwrap());
         }
         cfg
+    }
+
+    #[test]
+    fn effective_default_line_names_the_reference_and_scope_without_a_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let user = tmp.path().join("home/.config/cockpit");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("config.json"), "{}").unwrap();
+        let _ = &env;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let cfg = ProvidersConfig {
+            active_model: Some(ActiveModelRef {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                reasoning_effort: None,
+                thinking_mode: Some(ThinkingMode::High),
+                prompt_cache_retention: None,
+            }),
+            ..Default::default()
+        };
+
+        let out = render_effective_default(&cwd, &cfg);
+        assert!(out.contains("default model for new sessions: openai/gpt-5"));
+        assert!(out.contains("scope: user"));
+        assert!(out.contains("thinking=high"));
+        assert!(out.contains("existing session keeps its own saved model"));
+        assert!(
+            !out.contains(&tmp.path().display().to_string()),
+            "the diagnostic must name a scope, never a path: {out}"
+        );
+    }
+
+    #[test]
+    fn effective_default_line_states_an_explicit_unset_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let _ = &env;
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let out = render_effective_default(&cwd, &ProvidersConfig::default());
+        assert!(out.contains("default model for new sessions: (unset)"));
+        assert!(out.contains("resolves its model at creation"));
     }
 
     #[test]

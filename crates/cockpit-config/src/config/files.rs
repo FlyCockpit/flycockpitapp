@@ -387,30 +387,45 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
 /// would not serialize the next writer. A separate state-directory lock keeps
 /// the read/merge/replace sequence coherent across provider and extended
 /// configuration writers, including explicit `COCKPIT_CONFIG` targets.
+/// A held cross-process config mutation lock.
+///
+/// Deliberately `!Send`: the re-entrancy depth that lets journal recovery run
+/// under an already-held lock is a *thread-local*. Moving a guard to another
+/// thread would leave the acquiring thread's depth stuck above zero (recovery
+/// would skip a real lock) and the receiving thread's depth below it,
+/// underflowing on drop. Keeping the guard pinned to its acquiring thread
+/// makes that class of corruption unrepresentable.
 pub(crate) struct ConfigMutationLock {
     _file: std::fs::File,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+thread_local! {
+    /// Re-entrancy depth for the cross-process mutation lock on this thread.
+    ///
+    /// The OS lock is per open file description, so a second `acquire` on the
+    /// same thread would deadlock against the guard this thread already holds.
+    /// Journal recovery runs both standalone and inside an in-flight mutation,
+    /// so it consults this depth instead of blindly re-locking.
+    static MUTATION_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 impl ConfigMutationLock {
     pub(crate) fn acquire(_target: &Path) -> Result<Self> {
-        let lock_path = crate::config::resolve::cockpit_state_dir()?
-            .join("config-locks")
-            .join("effective-config.lock");
+        let lock_path = mutation_lock_path()?;
         ensure_parent_dir_private(&lock_path)?;
 
         let file = open_private_lock_file(&lock_path)?;
         file.lock()
             .with_context(|| format!("locking config mutation at {}", lock_path.display()))?;
-        Ok(Self { _file: file })
+        Ok(Self::enter(file))
     }
 
     pub(crate) fn acquire_cancellable(
         _target: &Path,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self> {
-        let lock_path = crate::config::resolve::cockpit_state_dir()?
-            .join("config-locks")
-            .join("effective-config.lock");
+        let lock_path = mutation_lock_path()?;
         ensure_parent_dir_private(&lock_path)?;
 
         let file = open_private_lock_file(&lock_path)?;
@@ -423,7 +438,7 @@ impl ConfigMutationLock {
                     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                         anyhow::bail!("active-model config mutation was cancelled");
                     }
-                    return Ok(Self { _file: file });
+                    return Ok(Self::enter(file));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -435,6 +450,196 @@ impl ConfigMutationLock {
                 }
             }
         }
+    }
+
+    fn enter(file: std::fs::File) -> Self {
+        MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self {
+            _file: file,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// True while this thread already owns the cross-process mutation lock.
+    pub(crate) fn is_held_by_current_thread() -> bool {
+        MUTATION_LOCK_DEPTH.with(std::cell::Cell::get) > 0
+    }
+}
+
+impl Drop for ConfigMutationLock {
+    fn drop(&mut self) {
+        MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn mutation_lock_path() -> Result<PathBuf> {
+    Ok(crate::config::resolve::cockpit_state_dir()?
+        .join("config-locks")
+        .join("effective-config.lock"))
+}
+
+/// Read a file without ever traversing a symlink or reparse point in its final
+/// component. Returns `Ok(None)` when the file does not exist so callers can
+/// fail closed on every other error instead of silently treating an
+/// inaccessible journal as absent.
+pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        let (parent, file_name) = match open_parent_directory_nofollow(path) {
+            Ok(parts) => parts,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match open_file_at_nofollow(
+            &parent,
+            &file_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        read_all(file, path).map(Some)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+
+        let (parent, name) = match open_windows_parent_directory_nofollow(path, false) {
+            Ok(parts) => parts,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match open_windows_relative_nofollow(
+            &parent,
+            &name,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", path.display()));
+            }
+        };
+        reject_windows_reparse_handle(&file, path)?;
+        read_all(file, path).map(Some)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn read_all(mut file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
+}
+
+#[cfg(any(unix, windows))]
+fn root_cause_is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Atomically replace `path` with owner-only private content.
+///
+/// This is the one platform file-security abstraction used for the
+/// effective-default rollback snapshot and journal.
+///
+/// **Unix:** the replacement is created `O_NOFOLLOW`/`O_EXCL` at mode `0600`
+/// and re-`fchmod`ded to `0600` after the rename, so the snapshot is
+/// owner-only regardless of umask. This is enforced and asserted in tests.
+///
+/// **Windows:** every path component is opened relative to a retained parent
+/// handle with `FILE_OPEN_REPARSE_POINT`, and any reparse point is rejected —
+/// no junction or symlink can redirect the snapshot outside its config
+/// directory, and a component swapped after preparation cannot redirect the
+/// commit. The file's DACL is **inherited from its parent directory** rather
+/// than being set explicitly: cockpit-owned config directories are created
+/// through [`ensure_private_dir`], but a user-chosen `COCKPIT_CONFIG`
+/// directory keeps whatever ACL it already had. An explicit owner-only
+/// security descriptor is not applied here; treat Windows confidentiality as
+/// "inherits the config directory's ACL", not "owner-only by construction".
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    prepare_atomic_write(path, contents)?.commit()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (parent, file_name) = open_parent_directory_nofollow(path)?;
+        let file = open_file_at_nofollow(
+            &parent,
+            &file_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", path.display()))?;
+        debug_assert_eq!(
+            file.metadata()
+                .with_context(|| format!("stat {}", path.display()))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    Ok(())
+}
+
+/// fsync a directory so a rename or unlink inside it is durable.
+///
+/// Unlike the best-effort syncs inside [`PreparedAtomicWrite`], a failure here
+/// is propagated: the effective-default journal treats an fsync failure as a
+/// typed failure rather than a silent success.
+///
+/// **Platform limits.** On Unix this is a real `fsync(2)` on a directory
+/// descriptor opened without following symlinks, so a rename or unlink in that
+/// directory is durable when it returns. On Windows there is no directory
+/// flush: `FlushFileBuffers` is not defined for directory handles, and NTFS
+/// orders metadata through its own journal. The Windows branch therefore only
+/// re-validates that the path is still a real directory and not a reparse
+/// point — it detects a swapped component but provides **no** durability
+/// barrier. Crash-consistency claims for Windows rest on NTFS metadata
+/// journaling, not on this call.
+pub(crate) fn fsync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = open_directory_nofollow(path, false, false)?;
+        directory
+            .sync_all()
+            .with_context(|| format!("fsync directory {}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        let directory = open_windows_directory_nofollow(path, false)?;
+        // No durability barrier is available here (see the doc comment).
+        // Confirm the handle is a real directory and not a reparse point so a
+        // swapped component still fails closed.
+        reject_windows_reparse_handle(&directory, path)?;
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let directory = std::fs::File::open(path)
+            .with_context(|| format!("opening directory {}", path.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("fsync directory {}", path.display()))
     }
 }
 
@@ -1220,6 +1425,54 @@ mod tests {
     }
 
     #[test]
+    fn private_file_is_owner_only_and_refuses_a_symlinked_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join(".cockpit-active-model.backup");
+        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the rollback snapshot must stay owner-only"
+        );
+
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        let link = temp.path().join("linked-config-dir");
+        symlink(&attacker, &link).unwrap();
+        let error =
+            super::write_private_file(&link.join(".cockpit-active-model.backup"), b"secret")
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no-follow directory component"),
+            "{error:#}"
+        );
+        assert!(!attacker.join(".cockpit-active-model.backup").exists());
+    }
+
+    #[test]
+    fn read_file_nofollow_refuses_a_symlinked_file_and_reports_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            super::read_file_nofollow(&temp.path().join("missing.json"))
+                .unwrap()
+                .is_none()
+        );
+
+        let outside = temp.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = temp.path().join("journal.json");
+        symlink(&outside, &link).unwrap();
+        let error = super::read_file_nofollow(&link).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no-follow"),
+            "a symlinked journal must fail closed, got {error:#}"
+        );
+    }
+
+    #[test]
     fn prepared_file_removal_stays_bound_to_open_parent_across_symlink_swap() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("providers");
@@ -1320,6 +1573,48 @@ mod windows_tests {
             b"outside",
             "a pre-existing junction must never redirect provider deletion"
         );
+    }
+
+    /// Windows has no owner-only ACL construction here — the file inherits
+    /// its parent directory's DACL. What this asserts is what is actually
+    /// guaranteed: the content lands at the intended path, and no reparse
+    /// point can redirect it.
+    #[test]
+    fn private_file_refuses_a_reparse_point_parent_and_replaces_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".cockpit");
+        std::fs::create_dir(&config_dir).unwrap();
+        let backup = config_dir.join(".cockpit-active-model.backup");
+        super::write_private_file(&backup, b"prior config bytes").unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"prior config bytes");
+
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        let junction = temp.path().join("linked-config-dir");
+        symlink_dir(&attacker, &junction).unwrap();
+        let error =
+            super::write_private_file(&junction.join(".cockpit-active-model.backup"), b"secret")
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("reparse-point component"));
+        assert!(!attacker.join(".cockpit-active-model.backup").exists());
+    }
+
+    #[test]
+    fn read_file_nofollow_refuses_a_reparse_point_and_reports_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            super::read_file_nofollow(&temp.path().join("missing.json"))
+                .unwrap()
+                .is_none()
+        );
+
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        std::fs::write(attacker.join("journal.json"), b"outside").unwrap();
+        let junction = temp.path().join("linked");
+        symlink_dir(&attacker, &junction).unwrap();
+        let error = super::read_file_nofollow(&junction.join("journal.json")).unwrap_err();
+        assert!(format!("{error:#}").contains("reparse-point component"));
     }
 
     #[test]

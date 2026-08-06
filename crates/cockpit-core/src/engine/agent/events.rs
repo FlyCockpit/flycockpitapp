@@ -75,6 +75,11 @@ pub enum TurnEvent {
         prompt_cache_retention: Option<crate::config::providers::PromptCacheRetention>,
         outcome: crate::daemon::proto::ModelSelectionOutcome,
     },
+    /// Terminal result for a config-only default update from Settings.
+    DefaultModelUpdateResult {
+        default_update_id: uuid::Uuid,
+        outcome: crate::daemon::proto::DefaultModelStandaloneOutcome,
+    },
     /// Authoritative daemon-resolved config snapshot for the attached
     /// session (`tui-config-single-source`). Delivered on attach and on every
     /// daemon re-resolution; the TUI renders from it instead of re-reading

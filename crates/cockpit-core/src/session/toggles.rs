@@ -377,6 +377,7 @@ impl Session {
             row.provider = Some(provider.clone());
             row.model = Some(model.clone());
             row.model_selection_json = Some(selection_json.clone());
+            row.active_model_revision = row.active_model_revision.saturating_add(1);
         }) {
             *active = Some(selection);
             return Ok(());
@@ -386,23 +387,95 @@ impl Session {
         let persisted_model = model.clone();
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions
-                        SET provider = ?1, model = ?2, model_selection_json = ?3
-                      WHERE session_id = ?4",
-                    params![
-                        persisted_provider,
-                        persisted_model,
-                        selection_json,
-                        session_id.to_string()
-                    ],
-                )
-                .context("setting session model")?;
+                let changed = conn
+                    .execute(
+                        "UPDATE sessions
+                            SET provider = ?1,
+                                model = ?2,
+                                model_selection_json = ?3,
+                                active_model_revision = active_model_revision + 1
+                          WHERE session_id = ?4",
+                        params![
+                            persisted_provider,
+                            persisted_model,
+                            selection_json,
+                            session_id.to_string()
+                        ],
+                    )
+                    .context("setting session model")?;
+                if changed != 1 {
+                    anyhow::bail!("session {session_id} not found while setting active model");
+                }
                 Ok(())
             })
             .context("persisting active model")?;
         *active = Some(selection);
         Ok(())
+    }
+
+    /// Current durable active-model revision for CAS coordination. Pending
+    /// (not-yet-inserted) sessions return the staged revision.
+    pub fn active_model_revision(&self) -> Result<i64> {
+        if let Some(row) = self.pending_row.lock().unwrap().as_ref() {
+            return Ok(row.active_model_revision);
+        }
+        let session_id = self.id;
+        self.db
+            .blocking_read_for_sync_ui(move |conn| {
+                crate::db::Db::active_model_revision_conn(conn, session_id)?
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))
+            })
+            .context("reading active_model_revision")
+    }
+
+    /// CAS-update the durable session model. On success advances the revision
+    /// and updates the in-memory selection. A zero-row conflict returns
+    /// `Ok(false)` without mutating memory.
+    pub fn cas_set_active_model_ref(
+        &self,
+        expected_revision: i64,
+        selection: crate::config::providers::ActiveModelRef,
+    ) -> Result<bool> {
+        let mut active = self.model_selection.lock().unwrap();
+        let selection_json =
+            serde_json::to_string(&selection).context("encoding session model selection")?;
+        let provider = selection.provider.clone();
+        let model = selection.model.clone();
+        {
+            let mut slot = self.pending_row.lock().unwrap();
+            if let Some(row) = slot.as_mut() {
+                if row.active_model_revision != expected_revision {
+                    return Ok(false);
+                }
+                row.provider = Some(provider.clone());
+                row.model = Some(model.clone());
+                row.model_selection_json = Some(selection_json.clone());
+                row.active_model_revision = expected_revision.saturating_add(1);
+                *active = Some(selection);
+                return Ok(true);
+            }
+        }
+        let session_id = self.id;
+        let persisted_provider = provider.clone();
+        let persisted_model = model.clone();
+        let selection_json_for_db = selection_json.clone();
+        let ok = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                crate::db::Db::cas_set_active_model_conn(
+                    conn,
+                    session_id,
+                    expected_revision,
+                    &persisted_provider,
+                    &persisted_model,
+                    &selection_json_for_db,
+                )
+            })
+            .context("CAS persisting active model")?;
+        if ok {
+            *active = Some(selection);
+        }
+        Ok(ok)
     }
 
     pub fn active_agent(&self) -> String {

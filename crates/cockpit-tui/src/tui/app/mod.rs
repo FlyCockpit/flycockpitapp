@@ -2062,6 +2062,9 @@ pub struct App {
     /// TUI-issued daemon control requests awaiting a response-bearing ack.
     pub(super) pending_control_requests: HashMap<ControlRequestId, PendingControlRequest>,
     pub(super) pending_model_selection: Option<PendingModelSelection>,
+    /// When true, the open model picker saves via SetDefaultModel only.
+    pub(super) default_model_picker_mode: bool,
+    pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
     /// Exact send intent retained after a rejected/expired model selection.
     /// The next picker selection adopts it so git blocks, tag expansions,
     /// images, and display text survive recovery without being rebuilt.
@@ -3206,6 +3209,8 @@ impl App {
             pending_agent_switch_log: None,
             pending_control_requests: HashMap::new(),
             pending_model_selection: None,
+            default_model_picker_mode: false,
+            pending_default_model_update_id: None,
             retry_model_selections: HashMap::new(),
             reopen_model_picker_after_settings: None,
             reopen_model_picker_draft_after_settings: None,

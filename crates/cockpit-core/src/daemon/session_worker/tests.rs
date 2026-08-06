@@ -1185,7 +1185,6 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
             provider: "lmstudio".to_string(),
             model: "assistant-model".to_string(),
             persist_as_default: true,
-            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Picker,
             reasoning_effort: None,
             thinking_mode: None,
@@ -1216,11 +1215,22 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     else {
         panic!("attached trusted-project save should apply, got {outcome:?}");
     };
-    assert_eq!(
-        default_update,
-        proto::DefaultModelUpdateOutcome::Saved,
-        "the spawned driver must persist under the attached policy, not the global policy"
-    );
+    match &default_update {
+        proto::DefaultModelUpdateOutcome::Verified {
+            selection,
+            unchanged: false,
+            ..
+        } => {
+            // The verified default is exactly what this request asked for; the
+            // point of the test is that it persisted under the *attached*
+            // policy at all, rather than being refused by the global one.
+            assert_eq!(selection.provider, "lmstudio");
+            assert_eq!(selection.model, "assistant-model");
+        }
+        other => panic!(
+            "the spawned driver must persist under the attached policy, not the global policy; got {other:?}"
+        ),
+    };
     assert_eq!(active_state.selection.model, "assistant-model");
     assert_eq!(
         active_state

@@ -18,8 +18,23 @@ fn daemon_paths(tmp: &tempfile::TempDir) -> cockpit_core::daemon::DaemonPaths {
 fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
     let cockpit = cwd.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
-    let mut doc = ConfigDoc::load(&cockpit.join("config.json")).unwrap();
+    let path = cockpit.join("config.json");
+    let mut doc = ConfigDoc::load(&path).unwrap();
     doc.write(cfg).unwrap();
+    // `active_model` is layer-wide default policy: an ordinary provider save
+    // can no longer carry it, and only the authoritative effective-default
+    // operation writes it. Seed it directly so this fixture still describes
+    // the on-disk layer it claims to.
+    if let Some(active) = cfg.active_model.as_ref() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["active_model"] = serde_json::to_value(active).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&raw).unwrap()),
+        )
+        .unwrap();
+    }
 }
 
 fn write_raw_config(cwd: &std::path::Path, json: &str) {

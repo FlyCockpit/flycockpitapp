@@ -549,7 +549,6 @@ async fn live_model_switch_routes_next_request_to_new_model() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -618,7 +617,6 @@ async fn model_switch_carries_prompt_cache_retention() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -685,7 +683,6 @@ async fn llm_mode_reresolved_on_model_switch() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -727,7 +724,6 @@ async fn live_model_switch_commits_config_and_session_together() {
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: true,
-            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -752,7 +748,7 @@ async fn live_model_switch_commits_config_and_session_together() {
             outcome:
                 crate::daemon::proto::ModelSelectionOutcome::Applied {
                     active_state,
-                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::Verified { .. },
                 },
             ..
         } => {
@@ -768,8 +764,16 @@ async fn live_model_switch_commits_config_and_session_together() {
     }
 }
 
+/// **Rejected behavior.** Plain Enter must not touch the default at all. The
+/// prompt states it "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), that it "stays session-only and never performs the
+/// effective-default operation" (Desired behavior, line 124), and that it
+/// "remains the consciously separate session-only action" (decision 3). This
+/// test previously tolerated a first-default write; it now fails
+/// deterministically if that behavior returns.
 #[tokio::test]
-async fn initialize_default_if_missing_does_not_replace_existing_default() {
+async fn plain_enter_leaves_an_existing_default_untouched() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
@@ -780,7 +784,6 @@ async fn initialize_default_if_missing_does_not_replace_existing_default() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: true,
                 trigger: crate::session::ModelSwitchTrigger::Picker,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -811,12 +814,21 @@ async fn initialize_default_if_missing_does_not_replace_existing_default() {
             );
             assert!(active_state.diverged);
         }
-        other => panic!("expected conditional default no-op, got {other:?}"),
+        other => panic!("expected a session-only switch, got {other:?}"),
     }
 }
 
+/// **Rejected behavior.** This previously asserted the opposite — that the
+/// first plain-Enter selection saves itself as the default. The prompt forbids
+/// it outright: plain Enter "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), "stays session-only and never performs the effective-default
+/// operation", and remains "the consciously separate session-only action"
+/// (decision 3). Establishing a first default is an explicit act — Ctrl+Enter,
+/// `/settings`, or `/setup model`. The old assertion is inverted here so the
+/// removed behavior fails deterministically if it ever returns.
 #[tokio::test]
-async fn initialize_default_if_missing_saves_first_successful_selection() {
+async fn plain_enter_never_establishes_a_first_default() {
     let (mut driver, _tmp) = model_switch_driver();
     edit_model_switch_config(&mut driver, |cfg| cfg.active_model = None);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -828,7 +840,6 @@ async fn initialize_default_if_missing_saves_first_successful_selection() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: true,
                 trigger: crate::session::ModelSwitchTrigger::Picker,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -838,26 +849,48 @@ async fn initialize_default_if_missing_saves_first_successful_selection() {
         )
         .await;
 
-    assert_config_active_model(&driver, "provider-b", "model-b");
+    assert!(
+        driver
+            .live_providers_config()
+            .unwrap()
+            .active_model
+            .is_none(),
+        "plain Enter must not write a default into any layer"
+    );
     drain_until_active_model_state(&mut rx);
     match rx.try_recv().expect("terminal selection result") {
         TurnEvent::ModelSelectionResult {
             outcome:
                 crate::daemon::proto::ModelSelectionOutcome::Applied {
                     active_state,
-                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::Saved,
+                    default_update: crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
                 },
             ..
         } => {
-            assert_eq!(active_state.default_selection, Some(active_state.selection));
-            assert!(!active_state.diverged);
+            assert_eq!(active_state.selection.provider, "provider-b");
+            assert_eq!(
+                active_state.default_selection, None,
+                "no default may be reported, because none was written"
+            );
         }
-        other => panic!("expected first-selection default save, got {other:?}"),
+        other => panic!("expected a session-only switch with no default write, got {other:?}"),
     }
 }
 
+/// **Rejected behavior.** Plain Enter must not touch the default at all. The
+/// prompt states it "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), that it "stays session-only and never performs the
+/// effective-default operation" (Desired behavior, line 124), and that it
+/// "remains the consciously separate session-only action" (decision 3). This
+/// test previously tolerated a first-default write; it now fails
+/// deterministically if that behavior returns.
+///
+/// Formerly `concurrent_stale_workers_initialize_exactly_one_default`: plain
+/// Enter no longer initializes anything, so the correct invariant is that
+/// *neither* concurrent session-only switch writes a default.
 #[tokio::test]
-async fn concurrent_stale_workers_initialize_exactly_one_default() {
+async fn concurrent_plain_enter_switches_write_no_default_at_all() {
     let (mut driver_a, mut driver_b, shared, _driver_b_tmp) =
         model_switch_drivers_with_shared_disk_config_without_default();
     let (tx_a, mut rx_a) = mpsc::channel::<TurnEvent>(64);
@@ -872,7 +905,6 @@ async fn concurrent_stale_workers_initialize_exactly_one_default() {
             provider: "provider-a".into(),
             model: "model-a".into(),
             persist_as_default: false,
-            initialize_default_if_missing: true,
             trigger: crate::session::ModelSwitchTrigger::Picker,
             reasoning_effort: None,
             thinking_mode: None,
@@ -888,7 +920,6 @@ async fn concurrent_stale_workers_initialize_exactly_one_default() {
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: false,
-            initialize_default_if_missing: true,
             trigger: crate::session::ModelSwitchTrigger::Picker,
             reasoning_effort: None,
             thinking_mode: None,
@@ -898,38 +929,45 @@ async fn concurrent_stale_workers_initialize_exactly_one_default() {
     );
     tokio::join!(a, b);
 
-    let outcome_a = terminal_default_update(&mut rx_a);
-    let outcome_b = terminal_default_update(&mut rx_b);
-    assert_eq!(
-        [outcome_a, outcome_b]
-            .into_iter()
-            .filter(|outcome| {
-                matches!(
-                    outcome,
-                    crate::daemon::proto::DefaultModelUpdateOutcome::Saved
-                )
-            })
-            .count(),
-        1,
-        "only the first serialized initializer may save the default"
-    );
-    let active = crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
-        .unwrap()
-        .providers()
-        .active_model
-        .expect("one initializer persisted a default");
+    let outcomes = [
+        terminal_default_update(&mut rx_a),
+        terminal_default_update(&mut rx_b),
+    ];
     assert!(
-        (active.provider == "provider-a" && active.model == "model-a")
-            || (active.provider == "provider-b" && active.model == "model-b")
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            crate::daemon::proto::DefaultModelUpdateOutcome::NotRequested
+        )),
+        "a session-only switch may never report a default update; outcomes={outcomes:?}"
+    );
+    assert_eq!(
+        crate::config::providers::ConfigDoc::load(&root.join(".cockpit/config.json"))
+            .unwrap()
+            .providers()
+            .active_model,
+        None,
+        "no plain-Enter switch may establish a default"
     );
 }
 
+/// **Rejected behavior.** Plain Enter must not touch the default at all. The
+/// prompt states it "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), that it "stays session-only and never performs the
+/// effective-default operation" (Desired behavior, line 124), and that it
+/// "remains the consciously separate session-only action" (decision 3). This
+/// test previously tolerated a first-default write; it now fails
+/// deterministically if that behavior returns.
+///
+/// Formerly `concurrent_explicit_replace_always_wins_over_stale_initializer`:
+/// the "initializer" is now an ordinary session-only switch, so the explicit
+/// replacement is the *only* writer.
 #[tokio::test]
-async fn concurrent_explicit_replace_always_wins_over_stale_initializer() {
-    let (mut explicit_driver, mut initializing_driver, shared, _initializing_tmp) =
+async fn a_concurrent_plain_enter_cannot_disturb_an_explicit_replace() {
+    let (mut explicit_driver, mut session_only_driver, shared, _session_only_tmp) =
         model_switch_drivers_with_shared_disk_config_without_default();
     let (explicit_tx, _explicit_rx) = mpsc::channel::<TurnEvent>(64);
-    let (initialize_tx, _initialize_rx) = mpsc::channel::<TurnEvent>(64);
+    let (session_only_tx, _session_only_rx) = mpsc::channel::<TurnEvent>(64);
     let root = shared.path();
 
     let explicit = run_control_with_trusted_project_config(
@@ -940,7 +978,6 @@ async fn concurrent_explicit_replace_always_wins_over_stale_initializer() {
             provider: "provider-a".into(),
             model: "model-a".into(),
             persist_as_default: true,
-            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Picker,
             reasoning_effort: None,
             thinking_mode: None,
@@ -948,23 +985,22 @@ async fn concurrent_explicit_replace_always_wins_over_stale_initializer() {
         },
         &explicit_tx,
     );
-    let initialize = run_control_with_trusted_project_config(
-        &mut initializing_driver,
+    let session_only = run_control_with_trusted_project_config(
+        &mut session_only_driver,
         root,
         DriverControl::SetActiveModel {
             selection_id: uuid::Uuid::new_v4(),
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: false,
-            initialize_default_if_missing: true,
             trigger: crate::session::ModelSwitchTrigger::Picker,
             reasoning_effort: None,
             thinking_mode: None,
             prompt_cache_retention: None,
         },
-        &initialize_tx,
+        &session_only_tx,
     );
-    tokio::join!(explicit, initialize);
+    tokio::join!(explicit, session_only);
 
     assert_disk_config_active_model(root, "provider-a", "model-a");
 }
@@ -985,7 +1021,6 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1022,8 +1057,6 @@ async fn expired_model_selection_deadline_rejects_without_mutating_session() {
 
 #[tokio::test]
 async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation() {
-    use crate::config::providers::{ActiveModelRef, ActiveModelWriteMode, ConfigDoc};
-
     let (mut driver, tmp) = model_switch_driver_with_disk_config();
     let root = tmp.path();
     let config_path = root.join(".cockpit/config.json");
@@ -1031,21 +1064,10 @@ async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation(
         root: crate::config::trust::resolve_trust_root(root).unwrap(),
         mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
     };
-    let held = crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
-        ConfigDoc::prepare_effective_active_model_write(
-            root,
-            &config_path,
-            &ActiveModelRef {
-                provider: "provider-a".into(),
-                model: "model-a".into(),
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            },
-            ActiveModelWriteMode::Replace,
-        )
-        .unwrap()
-    });
+    // Hold the shared cross-process mutation lock so the driver's journaled
+    // transaction cannot even reach its durable commit boundary.
+    let held = crate::config::hold_config_mutation_lock(&config_path)
+        .expect("hold the shared config mutation lock");
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
     let selection_id = uuid::Uuid::new_v4();
     let terminal_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1062,7 +1084,6 @@ async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation(
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1082,24 +1103,34 @@ async fn held_config_lock_times_out_before_terminal_claim_without_late_mutation(
     assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
     assert_disk_config_active_model(root, "provider-a", "model-a");
-    match rx.try_recv().expect("held lock deadline rejection") {
-        TurnEvent::ModelSelectionResult {
+    // The deadline is now enforced at commit time, so it reports like any
+    // other commit-time failure: a Notice and a refreshed active-model state
+    // precede the terminal result. Collect everything and assert on the
+    // terminal result specifically, and that there is exactly one.
+    let mut terminals = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let TurnEvent::ModelSelectionResult {
             selection_id: actual,
-            outcome:
-                crate::daemon::proto::ModelSelectionOutcome::Rejected {
-                    diagnostic_code, ..
-                },
+            outcome,
             ..
-        } => {
-            assert_eq!(actual, selection_id);
-            assert_eq!(diagnostic_code, "model_selection_deadline_exceeded");
+        } = event
+        {
+            terminals.push((actual, outcome));
         }
+    }
+    assert_eq!(
+        terminals.len(),
+        1,
+        "deadline must emit exactly one terminal result, got {terminals:?}"
+    );
+    let (actual, outcome) = terminals.remove(0);
+    assert_eq!(actual, selection_id);
+    match outcome {
+        crate::daemon::proto::ModelSelectionOutcome::Rejected {
+            diagnostic_code, ..
+        } => assert_eq!(diagnostic_code, "model_selection_deadline_exceeded"),
         other => panic!("expected deadline rejection, got {other:?}"),
     }
-    assert!(
-        rx.try_recv().is_err(),
-        "deadline must emit one terminal result"
-    );
 
     drop(held);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1127,7 +1158,6 @@ async fn worker_terminal_claim_before_commit_prevents_late_model_mutation() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1165,7 +1195,6 @@ async fn live_model_switch_from_subagent_frame_converges_session_and_parked_root
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1209,7 +1238,6 @@ async fn live_model_switch_persists_requested_reasoning_options() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some(crate::config::providers::ThinkingMode::High),
@@ -1289,7 +1317,6 @@ async fn same_identity_preference_change_is_applied_and_persisted() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: false,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: Some("xhigh".into()),
                 thinking_mode: Some(crate::config::providers::ThinkingMode::High),
@@ -1383,7 +1410,6 @@ async fn live_model_switch_failure_leaves_config_and_session_on_old_model() {
                 provider: "provider-c".into(), // never configured
                 model: "model-c".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1437,7 +1463,6 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1461,10 +1486,10 @@ async fn live_model_switch_session_persist_failure_rolls_back() {
     assert_terminal_model_selection(&mut rx, Some("model_selection_session_persist_failed"));
 }
 
-/// Saving the future default is a secondary outcome: a config write failure
-/// must not undo a successfully-built and durably-persisted session switch.
+/// Ctrl+Enter is all-or-nothing: a config write failure rejects the whole
+/// session+default transaction and preserves both authorities.
 #[tokio::test]
-async fn live_model_switch_config_write_failure_keeps_session_switch() {
+async fn live_model_switch_config_write_failure_rejects_session_and_default() {
     let (mut driver, _tmp) = model_switch_driver();
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     driver.test_fail_next_active_model_config_write = true;
@@ -1476,7 +1501,6 @@ async fn live_model_switch_config_write_failure_keeps_session_switch() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1486,35 +1510,17 @@ async fn live_model_switch_config_write_failure_keeps_session_switch() {
         )
         .await;
 
-    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-b");
-    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-b");
+    assert_eq!(driver.stack[0].agent.model.provider_id(), "provider-a");
+    assert_eq!(driver.stack[0].agent.model.model_id_ref(), "model-a");
     assert_eq!(
         driver.session.active_provider().as_deref(),
-        Some("provider-b")
+        Some("provider-a")
     );
-    assert_eq!(driver.session.active_model().as_deref(), Some("model-b"));
+    assert_eq!(driver.session.active_model().as_deref(), Some("model-a"));
     assert_config_active_model(&driver, "provider-a", "model-a");
-    assert_one_model_switch_event(&driver, "ok", false).await;
+    assert_one_model_switch_event(&driver, "send_failed", true).await;
     drain_until_active_model_state(&mut rx);
-    match rx.try_recv().expect("terminal selection result") {
-        TurnEvent::ModelSelectionResult {
-            outcome:
-                crate::daemon::proto::ModelSelectionOutcome::Applied {
-                    active_state,
-                    default_update:
-                        crate::daemon::proto::DefaultModelUpdateOutcome::Failed {
-                            diagnostic_code,
-                            user_message,
-                        },
-                },
-            ..
-        } => {
-            assert!(active_state.diverged);
-            assert_eq!(diagnostic_code, "default_model_write_failed");
-            assert!(user_message.contains("could not save it as the default"));
-        }
-        other => panic!("expected applied selection with default-save failure, got {other:?}"),
-    }
+    assert_terminal_model_selection(&mut rx, Some("default_model_write_failed"));
     assert!(rx.try_recv().is_err(), "failure is reported exactly once");
 }
 
@@ -1532,7 +1538,6 @@ async fn live_model_switch_to_unconfigured_keeps_current_model() {
                 provider: "provider-c".into(),
                 model: "model-c".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1578,7 +1583,6 @@ async fn live_model_switch_same_model_emits_state_without_rebuild() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1650,7 +1654,6 @@ async fn live_model_switch_same_model_is_noop() {
                 provider: "provider-a".into(),
                 model: "model-a".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1678,7 +1681,6 @@ async fn live_model_switch_emits_active_model_state_event() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -1724,7 +1726,6 @@ async fn live_model_switch_audit_record_failure_does_not_roll_back() {
             provider: "provider-b".into(),
             model: "model-b".into(),
             persist_as_default: true,
-            initialize_default_if_missing: false,
             trigger: crate::session::ModelSwitchTrigger::Daemon,
             reasoning_effort: None,
             thinking_mode: None,
@@ -1917,16 +1918,16 @@ fn write_two_model_config(root: &std::path::Path, provider: &str, model: &str) {
         )
         .unwrap();
     }
-    crate::config::providers::ConfigDoc::load(&config_path)
-        .unwrap()
-        .write_active_model(Some(&crate::config::providers::ActiveModelRef {
-            provider: provider.into(),
-            model: model.into(),
-            reasoning_effort: None,
-            thinking_mode: None,
-            prompt_cache_retention: None,
-        }))
-        .unwrap();
+    // Seed the layer directly: the only runtime writer of `active_model` is
+    // the authoritative effective-default operation, which is under test here.
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    raw["active_model"] = serde_json::json!({ "provider": provider, "model": model });
+    std::fs::write(
+        &config_path,
+        format!("{}\n", serde_json::to_string_pretty(&raw).unwrap()),
+    )
+    .unwrap();
 }
 
 fn assert_disk_config_active_model(root: &std::path::Path, provider: &str, model: &str) {
@@ -2311,7 +2312,6 @@ async fn model_switch_inside_subagent_frame_rebuilds_session_root_only() {
                 provider: "provider-b".into(),
                 model: "model-b".into(),
                 persist_as_default: true,
-                initialize_default_if_missing: false,
                 trigger: crate::session::ModelSwitchTrigger::Daemon,
                 reasoning_effort: None,
                 thinking_mode: None,
@@ -2414,7 +2414,6 @@ async fn malformed_foreground_child_override_does_not_block_session_root_switch(
                     provider: "provider-b".into(),
                     model: "model-b".into(),
                     persist_as_default: true,
-                    initialize_default_if_missing: false,
                     trigger: crate::session::ModelSwitchTrigger::Daemon,
                     reasoning_effort: None,
                     thinking_mode: None,
@@ -2607,4 +2606,215 @@ async fn refresh_failure_is_loud_and_deduped() {
     driver.refresh_active_frame_for_turn(&tx).await;
     rx.try_recv()
         .expect("success clears the dedupe key so the next failure re-notifies");
+}
+
+/// A recovery pass cannot know the driver's active-model-state generation, and
+/// a client's terminal gate compares against exactly that. Routing the
+/// recovered terminal through the driver must therefore stamp a generation
+/// strictly newer than anything the client has already seen — otherwise the
+/// gate silently drops the one terminal event the client is waiting for.
+#[tokio::test]
+async fn recovered_terminals_carry_a_generation_the_client_gate_accepts() {
+    use crate::config::providers::{
+        ActiveModelRef, RecoveredOutcome, RecoveredTransaction, SessionCompensation,
+        TransactionCorrelation,
+    };
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let session_id = driver.session.id;
+    // Whatever the client last observed.
+    driver.active_model_state_generation = 7;
+    let baseline = driver.active_model_state_generation;
+
+    let requested = ActiveModelRef {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let selection_id = uuid::Uuid::new_v4();
+    let default_update_id = uuid::Uuid::new_v4();
+    driver
+        .run_control(
+            DriverControl::EmitRecoveredDefaultTerminals {
+                transactions: vec![
+                    RecoveredTransaction {
+                        correlation: TransactionCorrelation::ModelSelection {
+                            selection_id,
+                            session_id,
+                        },
+                        outcome: RecoveredOutcome::Applied {
+                            // A recovery pass's own stamp; the driver replaces it.
+                            selection: Some(requested.clone()),
+                            generation: 0,
+                        },
+                        scope_label: "user".into(),
+                        requested: Some(requested.clone()),
+                    },
+                    RecoveredTransaction {
+                        correlation: TransactionCorrelation::DefaultUpdate {
+                            default_update_id,
+                            session_id,
+                        },
+                        outcome: RecoveredOutcome::Restored {
+                            restored: None,
+                            session: SessionCompensation::Untouched,
+                        },
+                        scope_label: "user".into(),
+                        requested: Some(requested.clone()),
+                    },
+                    // A transaction for a different session must be ignored.
+                    RecoveredTransaction {
+                        correlation: TransactionCorrelation::DefaultUpdate {
+                            default_update_id: uuid::Uuid::new_v4(),
+                            session_id: uuid::Uuid::new_v4(),
+                        },
+                        outcome: RecoveredOutcome::Restored {
+                            restored: None,
+                            session: SessionCompensation::Untouched,
+                        },
+                        scope_label: "user".into(),
+                        requested: Some(requested.clone()),
+                    },
+                ],
+            },
+            &tx,
+        )
+        .await;
+
+    match rx.try_recv().expect("recovered model-selection terminal") {
+        TurnEvent::ModelSelectionResult {
+            selection_id: got,
+            outcome:
+                crate::daemon::proto::ModelSelectionOutcome::Applied {
+                    active_state,
+                    default_update,
+                },
+            ..
+        } => {
+            assert_eq!(got, selection_id);
+            assert!(
+                active_state.generation > baseline,
+                "a recovered Applied must be newer than the client's baseline: {} vs {baseline}",
+                active_state.generation
+            );
+            match default_update {
+                crate::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                    generation,
+                    scope_label,
+                    ..
+                } => {
+                    assert!(generation > baseline);
+                    assert_eq!(scope_label, "user");
+                }
+                other => panic!("expected a verified default update, got {other:?}"),
+            }
+        }
+        other => panic!("expected a recovered ModelSelectionResult, got {other:?}"),
+    }
+
+    match rx.try_recv().expect("recovered default-update terminal") {
+        TurnEvent::DefaultModelUpdateResult {
+            default_update_id: got,
+            outcome:
+                crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                    user_message,
+                    diagnostic_code,
+                },
+        } => {
+            assert_eq!(got, default_update_id);
+            assert_eq!(diagnostic_code, "effective_default_restored_after_boundary");
+            assert!(
+                user_message.contains("the session model was never changed"),
+                "a restoration must describe the session half truthfully: {user_message}"
+            );
+        }
+        other => panic!("expected a recovered DefaultModelUpdateResult, got {other:?}"),
+    }
+
+    assert!(
+        rx.try_recv().is_err(),
+        "a transaction for another session must not be emitted here"
+    );
+}
+
+/// A recovered `SetDefaultModel` is config-only by contract: `/settings`
+/// changes the default for *new* sessions and must never switch the running
+/// one (AC6/AC9). Only a `ModelSelection` correlation — the Ctrl+Enter
+/// session+default transaction — may adopt the recovered model into the live
+/// root agent.
+#[tokio::test]
+async fn a_recovered_default_update_never_switches_the_live_session() {
+    use crate::config::providers::{
+        ActiveModelRef, RecoveredOutcome, RecoveredTransaction, TransactionCorrelation,
+    };
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let session_id = driver.session.id;
+    let running_before = driver.stack[0].agent.model.provider_id().to_string();
+    let session_model_before = driver.session.active_model_ref();
+    assert_eq!(running_before, "provider-a");
+
+    let recovered = ActiveModelRef {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let default_update_id = uuid::Uuid::new_v4();
+    driver
+        .run_control(
+            DriverControl::EmitRecoveredDefaultTerminals {
+                transactions: vec![RecoveredTransaction {
+                    correlation: TransactionCorrelation::DefaultUpdate {
+                        default_update_id,
+                        session_id,
+                    },
+                    outcome: RecoveredOutcome::Applied {
+                        selection: Some(recovered.clone()),
+                        generation: 3,
+                    },
+                    scope_label: "user".into(),
+                    requested: Some(recovered.clone()),
+                }],
+            },
+            &tx,
+        )
+        .await;
+
+    assert_eq!(
+        driver.stack[0].agent.model.provider_id(),
+        "provider-a",
+        "a config-only default recovery must not rebuild the live root agent"
+    );
+    assert_eq!(
+        driver.session.active_model_ref(),
+        session_model_before,
+        "a config-only default recovery must not touch the session model"
+    );
+
+    match rx.try_recv().expect("recovered default-update terminal") {
+        TurnEvent::DefaultModelUpdateResult {
+            default_update_id: got,
+            outcome:
+                crate::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+                    selection,
+                    scope_label,
+                    ..
+                },
+        } => {
+            assert_eq!(got, default_update_id);
+            assert_eq!(selection.as_ref(), Some(&recovered));
+            assert_eq!(scope_label, "user");
+        }
+        other => panic!("expected a recovered DefaultModelUpdateResult, got {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a config-only default recovery emits exactly one event and no state change"
+    );
 }

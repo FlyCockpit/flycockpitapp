@@ -9,14 +9,17 @@
 //! follow-up "level" picker appears using the provider-native values. Legacy
 //! `thinking_modes` still get their original `off` / `low` / `medium` /
 //! `high` picker. The result is sent to the daemon, which owns the active
-//! model transaction and performs a config write for an explicit
-//! make-default action or when no default exists yet.
+//! model transaction and performs a config write only for an explicit
+//! make-default action.
 //!
 //! The dialog is independent of `tui/settings.rs` to keep that file’s state
-//! machine focused on configuration editing. Enter uses the model for the
-//! session and establishes the default when none exists. Once a default
-//! exists, Enter is session-only; Ctrl+Enter explicitly asks the daemon to
-//! replace the future-session default.
+//! machine focused on configuration editing. Enter is **always** session-only:
+//! it never writes `active_model` in any layer, even when no default exists
+//! yet. Ctrl+Enter asks the daemon for one
+//! all-or-nothing transaction that switches this session **and** sets the
+//! default for **new sessions** in the current configuration context. It
+//! never changes the persisted model of an already-existing session, and the
+//! completion line appears only after the daemon reports a verified result.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -1759,6 +1762,17 @@ mod tests {
         assert_eq!(typing.take_add_model_provider(), None);
     }
 
+    fn seed_active_model(config_path: &std::path::Path, provider: &str, model: &str) {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        raw["active_model"] = serde_json::json!({ "provider": provider, "model": model });
+        fs::write(
+            config_path,
+            format!("{}\n", serde_json::to_string_pretty(&raw).unwrap()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn cycle_active_favorite_skips_nonfavorites_and_wraps() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1775,16 +1789,9 @@ mod tests {
             r#"{"url":"https://example.test","models":[{"id":"a","favorite":true},{"id":"b"},{"id":"c","favorite":true}]}"#,
         )
         .unwrap();
-        ConfigDoc::load(&config_path)
-            .unwrap()
-            .write_active_model(Some(&ActiveModelRef {
-                provider: "p".into(),
-                model: "a".into(),
-                reasoning_effort: None,
-                thinking_mode: None,
-                prompt_cache_retention: None,
-            }))
-            .unwrap();
+        // `active_model` is only ever written by the authoritative
+        // effective-default operation; this fixture seeds the layer directly.
+        seed_active_model(&config_path, "p", "a");
 
         let mut cfg = providers_at(tmp.path());
         cfg.active_model = Some(ActiveModelRef {
@@ -1799,10 +1806,7 @@ mod tests {
             .expect("next favorite");
         assert_eq!(next.provider, "p");
         assert_eq!(next.model, "c");
-        ConfigDoc::load(&config_path)
-            .unwrap()
-            .write_active_model(Some(&next))
-            .unwrap();
+        seed_active_model(&config_path, &next.provider, &next.model);
 
         cfg.active_model = Some(next.clone());
         let prev = cycle_active_favorite(&cfg, cfg.active_model.as_ref(), &HashMap::new(), false)

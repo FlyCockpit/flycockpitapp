@@ -52,13 +52,24 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
         thinking_mode: active.thinking_mode,
         prompt_cache_retention: active.prompt_cache_retention,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: active.clone(),
                 default_selection: Some(active.clone()),
                 diverged: false,
                 generation: 4,
+            }),
+            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                selection: cockpit_config::providers::ActiveModelRef {
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                    prompt_cache_retention: None,
+                },
+                generation: 1,
+                scope_label: "user".into(),
+                unchanged: false,
             },
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Saved,
         },
     });
 
@@ -82,12 +93,12 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
         thinking_mode: None,
         prompt_cache_retention: None,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: older.clone(),
                 default_selection: Some(older),
                 diverged: false,
                 generation: 3,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -245,7 +256,6 @@ async fn model_control_is_not_sent_while_session_switch_is_pending() {
         "/quick",
         requested.clone(),
         false,
-        false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
     ));
 
@@ -294,14 +304,13 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
             provider,
             model,
             persist_as_default: true,
-            initialize_default_if_missing: false,
             ..
         } if provider == "p" && model == "a"
     ));
     assert!(app.pending_model_selection.is_some());
     assert!(matches!(app.overlay, Overlay::None));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session and saving it as the default")),
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session; saving default")),
         "history: {:?}",
         app.history.last()
     );
@@ -309,10 +318,74 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
         &cockpit_config::dirs::config_file_paths_for_load(tmp.path()),
     )
     .active_model;
-    assert_eq!(active, None);
+    assert_eq!(
+        active, None,
+        "TUI must not write config before verified terminal result"
+    );
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session and saving it as the default"))
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session; saving default"))
+    );
+
+    // Simulated verified terminal result — completion wording only after Applied.
+    let selection_id = app
+        .pending_model_selection
+        .as_ref()
+        .expect("pending")
+        .selection_id;
+    let verified = cockpit_config::providers::ActiveModelRef {
+        provider: "p".into(),
+        model: "a".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+        selection_id,
+        provider: "p".into(),
+        model: "a".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+                selection: verified.clone(),
+                default_selection: Some(verified.clone()),
+                diverged: false,
+                generation: app
+                    .pending_model_selection
+                    .as_ref()
+                    .map(|p| p.minimum_generation)
+                    .unwrap_or(1)
+                    .max(1),
+            }),
+            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                selection: verified,
+                generation: 1,
+                scope_label: "user".into(),
+                unchanged: false,
+            },
+        },
+    });
+    assert!(
+        matches!(
+            app.history.iter().rev().find_map(|entry| match entry {
+                HistoryEntry::Plain { line } if line.contains("default for new sessions") => {
+                    Some(line.as_str())
+                }
+                _ => None
+            }),
+            Some(line) if line.contains("p/a") && line.contains("user")
+        ),
+        "history after verified: {:?}",
+        app.history.iter().rev().take(5).collect::<Vec<_>>()
+    );
+    assert!(
+        !app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line } if line.contains("default updated") && !line.contains("new sessions")
+        )),
+        "must not claim 'default updated' without verified metadata"
     );
 }
 
@@ -346,7 +419,7 @@ fn picker_default_intent_waits_for_daemon_without_local_write() {
     assert!(app.pending_model_selection.is_some());
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session and saving it as the default"))
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session; saving default"))
     );
 }
 
@@ -380,7 +453,6 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
     assert!(app.request_model_selection(
         "/model",
         requested.clone(),
-        false,
         false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
     ));
@@ -455,7 +527,6 @@ fn reopening_model_picker_expires_stale_request_and_carries_queued_submission() 
         "/model",
         selection("p", "a"),
         false,
-        false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
     ));
     let pending = app.pending_model_selection.as_mut().unwrap();
@@ -495,7 +566,6 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
         "/model",
         requested.clone(),
         false,
-        true,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
     ));
     let queued = exact_queued_submission();
@@ -801,7 +871,6 @@ fn quick_model_change_waits_for_terminal_confirmation() {
         cockpit_core::daemon::proto::Request::SetActiveModel {
             selection_id: actual,
             persist_as_default,
-            initialize_default_if_missing,
             trigger,
             reasoning_effort,
             thinking_mode,
@@ -819,7 +888,6 @@ fn quick_model_change_waits_for_terminal_confirmation() {
                 Some(cockpit_config::providers::PromptCacheRetention::Extended)
             );
             assert!(!persist_as_default);
-            assert!(!initialize_default_if_missing);
             assert_eq!(
                 trigger,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick
@@ -852,12 +920,12 @@ fn quick_model_change_waits_for_terminal_confirmation() {
         thinking_mode: None,
         prompt_cache_retention: None,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: confirmed,
                 default_selection: None,
                 diverged: true,
                 generation: 1,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -921,7 +989,6 @@ fn transport_send_failure_retains_complete_queued_submission() {
     assert!(!app.request_model_selection(
         "/quick",
         selection("p", "a"),
-        false,
         false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
     ));
@@ -1002,7 +1069,6 @@ fn assert_control_failure_retains_complete_submission(
     assert!(app.request_model_selection(
         "/quick",
         selection("p", "a"),
-        false,
         false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
     ));
@@ -1143,12 +1209,12 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
         thinking_mode: None,
         prompt_cache_retention: None,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: confirmed,
                 default_selection: None,
                 diverged: true,
                 generation: 1,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -1207,12 +1273,12 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -1281,6 +1347,14 @@ fn second_submit_waiting_on_model_preserves_all_unconsumed_metadata() {
     );
 }
 
+/// **Rejected behavior.** Plain Enter must not touch the default at all. The
+/// prompt states it "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), that it "stays session-only and never performs the
+/// effective-default operation" (Desired behavior, line 124), and that it
+/// "remains the consciously separate session-only action" (decision 3). This
+/// test previously tolerated a first-default write; it now fails
+/// deterministically if that behavior returns.
 #[test]
 fn model_picker_selection_records_summary() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1307,15 +1381,14 @@ fn model_picker_selection_records_summary() {
             provider,
             model,
             persist_as_default: false,
-            initialize_default_if_missing: true,
             ..
         } if provider == "p" && model == "a"
     ));
     assert!(app.pending_model_selection.is_some());
     assert_eq!(app.usage_models.get("p/a"), Some(&1));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line.contains("Selecting p/a for this session (and as the default if none is configured)")),
-        "expected model summary line, got {:?}",
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "Selecting p/a for this session…"),
+        "plain Enter is session-only and must not promise a default; got {:?}",
         app.history.last()
     );
     let active = cockpit_config::providers::ConfigDoc::load(&config_path)
@@ -1325,8 +1398,16 @@ fn model_picker_selection_records_summary() {
     assert_eq!(active, None);
 }
 
+/// **Rejected behavior.** Plain Enter must not touch the default at all. The
+/// prompt states it "sends a session-only request and never invokes the
+/// effective-default mutation API" and "cannot alter `active_model` in any
+/// layer" (AC7), that it "stays session-only and never performs the
+/// effective-default operation" (Desired behavior, line 124), and that it
+/// "remains the consciously separate session-only action" (decision 3). This
+/// test previously tolerated a first-default write; it now fails
+/// deterministically if that behavior returns.
 #[test]
-fn ordinary_picker_selection_delegates_conditional_default_initialization_to_daemon() {
+fn ordinary_picker_selection_is_session_only_and_promises_no_default() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let cockpit = tmp.path().join(".cockpit");
@@ -1348,12 +1429,11 @@ fn ordinary_picker_selection_delegates_conditional_default_initialization_to_dae
             provider,
             model,
             persist_as_default: false,
-            initialize_default_if_missing: true,
             ..
         } if provider == "p" && model == "a"
     ));
     assert!(
-        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "Selecting p/a for this session (and as the default if none is configured)…"),
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "Selecting p/a for this session…"),
         "expected session-only summary line, got {:?}",
         app.history.last()
     );
@@ -1611,7 +1691,6 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             "/quick",
             pending_requested,
             false,
-            false,
             cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
         ));
         assert!(
@@ -1633,7 +1712,6 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     assert!(app.request_model_selection(
         "/quick",
         requested.clone(),
-        false,
         false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
     ));
@@ -1662,12 +1740,12 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -1824,7 +1902,6 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         "/quick",
         requested.clone(),
         false,
-        false,
         cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
     ));
     control_rx
@@ -1842,12 +1919,12 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
         outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: cockpit_core::daemon::proto::ModelSelectionActiveState {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
-            },
+            }),
             default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
@@ -1860,4 +1937,214 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
             .contains_key(&Some(old_session_id))
     );
     assert_eq!(app.active_model_state_generation, 1);
+}
+
+/// Build the exact state a Ctrl+Enter picker selection leaves behind: one
+/// correlated pending intent, no local config write, and progress-only wording.
+fn picker_app_awaiting_default_terminal(
+    tmp: &tempfile::TempDir,
+) -> (
+    App,
+    mpsc::Receiver<crate::tui::agent_runner::ControlRequest>,
+    uuid::Uuid,
+) {
+    let cockpit = tmp.path().join("config").join("cockpit");
+    fs::create_dir_all(&cockpit).unwrap();
+    let config_path = cockpit.join("config.json");
+    write_config(&config_path);
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    let (control_tx, control_rx) = mpsc::channel(4);
+    app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
+    let picker = crate::tui::model_picker::ModelPickerDialog::open_with_failures(
+        cockpit_config::providers::ConfigDoc::load(&config_path)
+            .unwrap()
+            .providers(),
+        None,
+        &app.usage_models,
+        &Default::default(),
+        chrono::Utc::now().timestamp(),
+    )
+    .unwrap();
+    app.overlay = Overlay::ModelPicker(picker);
+    assert!(!app.handle_key(ctrl_press(KeyCode::Enter)));
+    let selection_id = app
+        .pending_model_selection
+        .as_ref()
+        .expect("pending intent")
+        .selection_id;
+    (app, control_rx, selection_id)
+}
+
+/// AC8: `unchanged`-verified is distinguishable from `applied`-verified and
+/// still never claims that a write occurred.
+#[test]
+fn picker_unchanged_verified_default_reports_already_set_without_claiming_a_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let (mut app, _control_rx, selection_id) = picker_app_awaiting_default_terminal(&tmp);
+
+    let verified = selection("p", "a");
+    let minimum_generation = app
+        .pending_model_selection
+        .as_ref()
+        .map(|pending| pending.minimum_generation)
+        .unwrap_or(1)
+        .max(1);
+    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+        selection_id,
+        provider: "p".into(),
+        model: "a".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+                selection: verified.clone(),
+                default_selection: Some(verified.clone()),
+                diverged: false,
+                generation: minimum_generation,
+            }),
+            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                selection: verified,
+                generation: 1,
+                scope_label: "user".into(),
+                unchanged: true,
+            },
+        },
+    });
+
+    assert!(
+        app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line }
+                if line.contains("default for new sessions already set") && line.contains("user")
+        )),
+        "history: {:?}",
+        app.history
+    );
+    assert!(
+        !app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line } if line.contains("and set it as the default")
+        )),
+        "an unchanged result must not claim a write occurred"
+    );
+}
+
+/// AC4/AC8: a rejected default retains the picker intent, states that the
+/// default did not change, and writes nothing locally.
+#[test]
+fn picker_rejected_default_retains_intent_and_states_the_default_did_not_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let (mut app, _control_rx, selection_id) = picker_app_awaiting_default_terminal(&tmp);
+
+    app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
+        selection_id,
+        provider: "p".into(),
+        model: "a".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
+            user_message: "Could not make `p/a` the default for new sessions — the highest-precedence config layer (project) is not writable. The default was not changed and this session kept its model."
+                .into(),
+            diagnostic_code: "effective_default_target_unwritable".into(),
+        },
+    });
+
+    assert!(
+        matches!(&app.overlay, Overlay::ModelPicker(picker)
+        if picker.error_text().is_some_and(|error| {
+            error.contains("The default was not changed") && error.contains("not writable")
+        })),
+        "a rejection retains the picker intent and shows the actionable daemon error"
+    );
+    assert!(
+        !app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line } if line.contains("set it as the default")
+        )),
+        "a rejection must never render completion wording"
+    );
+    let active = cockpit_config::providers::ConfigDoc::providers_from_paths(
+        &cockpit_config::dirs::config_file_paths_for_load(tmp.path()),
+    )
+    .active_model;
+    assert_eq!(active, None, "a rejected default writes no config bytes");
+}
+
+/// A standalone Settings default update is correlated by its own operation id
+/// and never touches session model state.
+#[test]
+fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() {
+    let mut app = App::new(None, false);
+    let mine = uuid::Uuid::new_v4();
+    app.pending_default_model_update_id = Some(mine);
+
+    // A late result for a different operation is ignored entirely.
+    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+        default_update_id: uuid::Uuid::new_v4(),
+        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+            selection: Some(selection("other", "model")),
+            generation: 1,
+            scope_label: "user".into(),
+            unchanged: false,
+        },
+    });
+    assert_eq!(app.pending_default_model_update_id, Some(mine));
+    assert!(
+        !app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line } if line.contains("other/model")
+        )),
+        "a stale terminal event must not produce misleading feedback"
+    );
+    assert!(app.pending_model_selection.is_none());
+
+    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+        default_update_id: mine,
+        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+            selection: Some(selection("p", "a")),
+            generation: 2,
+            scope_label: "project".into(),
+            unchanged: false,
+        },
+    });
+    assert_eq!(app.pending_default_model_update_id, None);
+    assert!(
+        app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line }
+                if line.contains("Default model for new sessions set to p/a")
+                    && line.contains("project")
+        )),
+        "history: {:?}",
+        app.history
+    );
+    assert!(
+        app.pending_model_selection.is_none(),
+        "a Settings default update never creates session model intent"
+    );
+
+    // A rejection claims no change and names only a scope.
+    let second = uuid::Uuid::new_v4();
+    app.pending_default_model_update_id = Some(second);
+    app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
+        default_update_id: second,
+        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+            user_message: "the highest-precedence config layer (project) is not writable".into(),
+            diagnostic_code: "effective_default_target_unwritable".into(),
+        },
+    });
+    assert!(
+        app.history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::Plain { line } if line.contains("Default model was not changed")
+        )),
+        "history: {:?}",
+        app.history
+    );
 }

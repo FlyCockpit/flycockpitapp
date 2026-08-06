@@ -175,6 +175,24 @@ pub(super) async fn handle_serialized_request(
             )
             .await;
         }
+        // `SetDefaultModel` is terminal-by-event: a bare authorization error
+        // would leave a remote/shared client waiting for a correlated result
+        // that never arrives. Emit the typed rejection instead — no scope
+        // label, no path, no configuration content, and no mutation.
+        if let Request::SetDefaultModel {
+            default_update_id, ..
+        } = &request
+            && let Some(att) = state.attached.as_ref()
+        {
+            att.handle.broadcast_default_model_update_result(
+                *default_update_id,
+                proto::DefaultModelStandaloneOutcome::Rejected {
+                    user_message: "Changing the default model for new sessions requires the                                    local owner of this workspace."
+                        .to_string(),
+                    diagnostic_code: "effective_default_local_owner_only".to_string(),
+                },
+            );
+        }
         return Err(error);
     }
     if audit_remote {
@@ -1132,12 +1150,104 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::Ack)
         }
 
+        Request::SetDefaultModel {
+            default_update_id,
+            provider,
+            model,
+            reasoning_effort,
+            thinking_mode,
+            prompt_cache_retention,
+            clear,
+        } => {
+            let att = require_attached(state)?;
+            let trust_policy = attached_trust_policy(ctx, att).await?;
+            let cwd = att.handle.project_root.clone();
+            let session_id = att.handle.session_id;
+            // Project root and trust come solely from the authenticated
+            // attachment; a caller can never name a filesystem target.
+            let requested = if clear {
+                None
+            } else {
+                Some(crate::config::providers::ActiveModelRef {
+                    provider: provider.unwrap_or_default(),
+                    model: model.unwrap_or_default(),
+                    reasoning_effort: reasoning_effort
+                        .map(|value| crate::config::providers::ActiveReasoningEffort { value }),
+                    thinking_mode,
+                    prompt_cache_retention,
+                })
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let write = || {
+                    crate::config::providers::mutate_effective_default(
+                        &cwd,
+                        requested.as_ref(),
+                        crate::config::providers::ActiveModelWriteMode::Replace,
+                        None,
+                        None,
+                        Some(
+                            crate::config::providers::TransactionCorrelation::DefaultUpdate {
+                                default_update_id,
+                                session_id,
+                            },
+                        ),
+                    )
+                };
+                crate::config::trust::with_workspace_trust_policy(trust_policy, write)
+            })
+            .await
+            .map_err(internal)?;
+            let outcome = match result {
+                Ok(result) => {
+                    // The write is verified; the snapshot refresh is a
+                    // best-effort follow-up. A refresh failure must never
+                    // replace the correlated terminal result with a bare
+                    // transport error — the client would wait forever.
+                    if let Err(error) = crate::daemon::config_refresh::refresh_session_config(
+                        &ctx.db,
+                        ctx.config_source(),
+                        &att.handle,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "default model verified but the config snapshot refresh failed"
+                        );
+                    }
+                    proto::DefaultModelStandaloneOutcome::Applied {
+                        selection: result.selection,
+                        generation: result.generation,
+                        scope_label: result.scope_label,
+                        unchanged: result.unchanged,
+                    }
+                }
+                // A transaction still pending recovery is not terminal: the
+                // recovery pass that converges the journal emits the one
+                // correlated result. Ack the request and emit nothing here.
+                Err(error) if error.recovery_pending => {
+                    tracing::warn!(
+                        diagnostic_code = error.diagnostic_code,
+                        "default model update is pending recovery; no terminal result emitted"
+                    );
+                    return Ok(Response::Ack);
+                }
+                Err(error) => proto::DefaultModelStandaloneOutcome::Rejected {
+                    user_message: error.user_message,
+                    diagnostic_code: error.diagnostic_code.to_string(),
+                },
+            };
+            att.handle
+                .broadcast_default_model_update_result(default_update_id, outcome);
+            Ok(Response::Ack)
+        }
+
         Request::SetActiveModel {
             selection_id,
             provider,
             model,
             persist_as_default,
-            initialize_default_if_missing,
             trigger,
             reasoning_effort,
             thinking_mode,
@@ -1152,7 +1262,6 @@ pub(super) async fn handle_serialized_request(
                     provider,
                     model,
                     persist_as_default,
-                    initialize_default_if_missing,
                     trigger: active_model_trigger_from_proto(trigger),
                     reasoning_effort,
                     thinking_mode,
@@ -2497,6 +2606,37 @@ pub(super) async fn attach(
     };
 
     let cfg_root = cfg_root.expect("resolved above");
+    // Terminal results for transactions this attach converged. Delivered
+    // through the worker below, once a handle exists to stamp the generation.
+    let recovered_default_transactions;
+    // Resolution barrier: finish any pending effective-default transaction —
+    // including its guarded session half — before this attach can serve a
+    // session or default snapshot. Failing closed here is deliberate: a
+    // journal that cannot be converged means the durable default and the
+    // session model may disagree, which is exactly what attach must not show.
+    {
+        let trust_policy =
+            crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cfg_root)
+                .await
+                .ok();
+        recovered_default_transactions =
+            crate::daemon::effective_default_recovery::recover_effective_default_journals(
+                &ctx.db,
+                &cfg_root,
+                trust_policy,
+            )
+            .await
+            .map_err(|error| {
+            tracing::error!(%error, "effective-default journal recovery failed during attach");
+            ErrorPayload {
+                code: ErrorCode::InvalidConfig,
+                    message:
+                        "a pending default-model update could not be recovered; run `cockpit doctor` \
+                         to inspect the pending journal for this configuration layer"
+                            .to_string(),
+                }
+            })?;
+    }
     let remote_readonly_attach = !principal.is_owner()
         && !principal.can_agent_write_project(&cfg_root.to_string_lossy())
         && principal.can_agent_read_project(&cfg_root.to_string_lossy());
@@ -2537,6 +2677,14 @@ pub(super) async fn attach(
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
     // already performed the post-claim DB read-through.
+    // The worker exists now, so any transaction this attach converged can be
+    // delivered as a correlated terminal result stamped with the driver's own
+    // generation.
+    crate::daemon::effective_default_recovery::deliver_recovered_terminals(
+        ctx,
+        recovered_default_transactions,
+    )
+    .await;
     let config_snapshot = handle.config_snapshot();
     let extended_cfg = config_snapshot.extended.clone();
 

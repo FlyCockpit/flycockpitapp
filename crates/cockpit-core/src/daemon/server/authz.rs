@@ -97,14 +97,12 @@ pub(super) async fn authorize_set_active_model(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
     let Request::SetActiveModel {
-        persist_as_default,
-        initialize_default_if_missing,
-        ..
+        persist_as_default, ..
     } = request
     else {
         unreachable!("authorize_set_active_model called for non-SetActiveModel request");
     };
-    if *persist_as_default || *initialize_default_if_missing {
+    if *persist_as_default {
         return Err(authorization_error(
             "saving the default model requires the local owner",
         ));
@@ -634,11 +632,9 @@ pub(super) async fn authorize_shared_custom(
             }
         }
         Request::SetActiveModel {
-            persist_as_default,
-            initialize_default_if_missing,
-            ..
+            persist_as_default, ..
         } => {
-            if *persist_as_default || *initialize_default_if_missing {
+            if *persist_as_default {
                 Err(authorization_error(
                     "saving the default model requires the local owner",
                 ))

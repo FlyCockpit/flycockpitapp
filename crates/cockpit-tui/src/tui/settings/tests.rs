@@ -1390,12 +1390,142 @@ fn save_config_preserves_untouched_provider_file_disk_edits() {
         .providers();
     assert_eq!(reloaded.providers["vendor"].url, "https://out-of-band");
     assert_eq!(
-        reloaded
-            .active_model
-            .as_ref()
-            .map(|active| active.model.as_str()),
-        Some("m1")
+        reloaded.active_model, None,
+        "`/settings` must never write `active_model` directly; the daemon owns it"
     );
+    let staged_id = d.pending_default_model_update_id;
+    match d.pending_daemon_request.take() {
+        Some(Request::SetDefaultModel {
+            provider,
+            model,
+            clear,
+            default_update_id,
+            ..
+        }) => {
+            assert_eq!(provider.as_deref(), Some("vendor"));
+            assert_eq!(model.as_deref(), Some("m1"));
+            assert!(!clear);
+            assert_eq!(staged_id, Some(default_update_id));
+        }
+        other => panic!("expected a staged SetDefaultModel request, got {other:?}"),
+    }
+}
+
+#[test]
+fn root_menu_exposes_the_default_model_row_first() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let d = SettingsDialog::open(path);
+    assert_eq!(root_nodes()[0].title, DEFAULT_MODEL_TITLE);
+    assert!(matches!(d.test_page(), TestPageRef::Root { cursor: 0 }));
+}
+
+#[test]
+fn default_model_row_shows_the_effective_default_and_opens_the_shared_picker() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut d = SettingsDialog::open(path);
+    d.config.active_model = Some(cockpit_config::providers::ActiveModelRef {
+        provider: "vendor".into(),
+        model: "m1".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.page.test_name(), "DefaultModel");
+    let text = render_settings_rows(&d, 100, 24).join("\n");
+    assert!(text.contains("Effective default: vendor/m1"), "{text}");
+    assert!(text.contains("Scope:"), "{text}");
+    assert!(
+        text.contains("newly created sessions only"),
+        "the row must distinguish new sessions from reattachment: {text}"
+    );
+
+    // Enter opens the same provider-scoped picker `/model` uses.
+    d.handle_key(press(KeyCode::Enter));
+    assert!(d.pending_default_model_picker);
+    assert!(
+        d.pending_daemon_request.take().is_none(),
+        "opening the picker must not mutate anything"
+    );
+}
+
+#[test]
+fn default_model_row_shows_an_explicit_unset_state() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut d = SettingsDialog::open(path);
+
+    d.handle_key(press(KeyCode::Enter));
+    let text = render_settings_rows(&d, 100, 24).join("\n");
+    assert!(text.contains("Effective default: (unset"), "{text}");
+}
+
+#[test]
+fn clearing_the_default_from_settings_delegates_to_the_daemon_operation() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut d = SettingsDialog::open(path);
+    d.config.active_model = Some(cockpit_config::providers::ActiveModelRef {
+        provider: "vendor".into(),
+        model: "m1".into(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    d.original_config.active_model = d.config.active_model.clone();
+
+    d.handle_key(press(KeyCode::Enter));
+    d.handle_key(press(KeyCode::Char('x')));
+
+    let staged_id = d.pending_default_model_update_id;
+    match d.pending_daemon_request.take() {
+        Some(Request::SetDefaultModel {
+            clear,
+            default_update_id,
+            provider,
+            model,
+            ..
+        }) => {
+            assert!(clear);
+            assert_eq!(provider, None, "a clear carries no reference");
+            assert_eq!(model, None);
+            assert_eq!(
+                staged_id,
+                Some(default_update_id),
+                "the clear must stage its correlation id so the terminal event matches"
+            );
+        }
+        other => panic!("expected a staged clear request, got {other:?}"),
+    }
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&d.config_path)
+        .unwrap()
+        .providers();
+    assert_eq!(
+        reloaded.active_model, None,
+        "clearing must not be a local ConfigDoc mutation"
+    );
+}
+
+#[test]
+fn clearing_an_already_unset_default_stages_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut d = SettingsDialog::open(path);
+
+    d.handle_key(press(KeyCode::Enter));
+    d.handle_key(press(KeyCode::Char('x')));
+
+    assert!(d.pending_daemon_request.take().is_none());
+    let text = render_settings_rows(&d, 100, 24).join("\n");
+    assert!(text.contains("No default is set"), "{text}");
 }
 
 #[test]

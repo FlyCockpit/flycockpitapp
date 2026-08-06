@@ -37,10 +37,27 @@ impl SecretRefNotice {
 /// opaque; this boundary performs the credential-store migration before the
 /// values can be used by request construction.
 pub fn load_effective(cwd: &Path) -> ProvidersConfig {
+    try_load_effective(cwd).unwrap_or_else(|error| {
+        // Infallible callers still must not observe a half-committed default;
+        // the degraded resolution drops the pending layer's `active_model`.
+        tracing::error!(%error, "serving a degraded effective provider config");
+        let paths = crate::config::dirs::config_file_paths_for_load(cwd);
+        ConfigDoc::load_effective_from_paths(&paths)
+    })
+}
+
+/// Fallible variant for daemon-facing loads.
+///
+/// Fails closed when a configuration layer has a pending default-model
+/// transaction that can neither be recovered nor masked, so attach reports a
+/// typed error rather than serving a snapshot that might disagree with the
+/// session's durable model.
+pub fn try_load_effective(cwd: &Path) -> anyhow::Result<ProvidersConfig> {
     if let Err(error) = migrate_effective_layers_once(cwd) {
         tracing::warn!(%error, "provider secret migration could not complete");
     }
-    ConfigDoc::load_effective(cwd)
+    let paths = crate::config::dirs::config_file_paths_for_load(cwd);
+    ConfigDoc::try_load_effective_from_paths(&paths)
 }
 
 /// Project a resolved [`ProvidersConfig`] to the redacted view the daemon
@@ -118,7 +135,10 @@ fn load_paths_with_secret_migration(
     store_path: &Path,
 ) -> Result<(ProvidersConfig, Option<SecretRefNotice>)> {
     let notice = migrate_provider_files(config_paths, store_path)?;
-    let providers = ConfigDoc::providers_from_paths(config_paths);
+    // Same barrier as every other effective resolution, and fallible here so
+    // the daemon's config source reports a typed error rather than serving an
+    // ambiguous snapshot behind an unmaskable pending transaction.
+    let providers = ConfigDoc::try_load_effective_from_paths(config_paths)?;
     Ok((providers, notice))
 }
 

@@ -35,6 +35,8 @@ pub struct SessionRow {
     /// provider/model projection so reasoning, thinking, and cache choices
     /// survive resume without making cockpit-db depend on cockpit-config.
     pub model_selection_json: Option<String>,
+    /// Monotonic CAS token advanced on every durable active-model mutation.
+    pub active_model_revision: i64,
     pub session_llm_mode: Option<String>,
     pub tool_surface_override_json: Option<String>,
     pub goal_settings_override_json: Option<String>,
@@ -138,6 +140,7 @@ impl SessionRow {
             provider: row.get("provider")?,
             model: row.get("model")?,
             model_selection_json: row.get("model_selection_json")?,
+            active_model_revision: row.get::<_, i64>("active_model_revision").unwrap_or(0),
             session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
@@ -298,11 +301,12 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
     conn.execute(
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at, last_active_at, active_agent,
-          short_id, provider, model, model_selection_json, session_llm_mode,
+          short_id, provider, model, model_selection_json, active_model_revision,
+          session_llm_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
           assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -314,6 +318,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.provider,
             row.model,
             row.model_selection_json,
+            row.active_model_revision,
             row.session_llm_mode,
             row.tool_surface_override_json,
             row.goal_settings_override_json,
@@ -362,8 +367,8 @@ fn execute_fork_insert(
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
-          model_system_prompt_snapshot_json, assistant_name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+          model_system_prompt_snapshot_json, assistant_name, active_model_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -392,6 +397,7 @@ fn execute_fork_insert(
             row.model_selection_json,
             row.model_system_prompt_snapshot_json,
             row.assistant_name,
+            row.active_model_revision,
         ],
     )?;
     Ok(())
@@ -466,6 +472,7 @@ fn build_session_row(
         provider: None,
         model: None,
         model_selection_json: None,
+        active_model_revision: 0,
         session_llm_mode: None,
         tool_surface_override_json: None,
         goal_settings_override_json: None,
@@ -945,6 +952,7 @@ impl Db {
                 provider: parent.provider,
                 model: parent.model,
                 model_selection_json: parent.model_selection_json,
+                active_model_revision: 0,
                 session_llm_mode: parent.session_llm_mode,
                 tool_surface_override_json: parent.tool_surface_override_json,
                 goal_settings_override_json: parent.goal_settings_override_json,
@@ -1052,6 +1060,7 @@ impl Db {
             provider: parent.provider,
             model: parent.model,
             model_selection_json: parent.model_selection_json,
+            active_model_revision: 0,
             session_llm_mode: parent.session_llm_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
@@ -1106,6 +1115,54 @@ impl Db {
 
     pub fn get_session_conn(conn: &Connection, session_id: Uuid) -> Result<Option<SessionRow>> {
         Ok(get_session_inner(conn, session_id)?)
+    }
+
+    /// Compare-and-swap the durable session active model. Succeeds only when
+    /// `active_model_revision` still equals `expected_revision`, then advances
+    /// the revision by one. Returns `Ok(true)` on success, `Ok(false)` on a
+    /// concurrent conflict (zero rows), and `Err` for SQL failures.
+    pub fn cas_set_active_model_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        expected_revision: i64,
+        provider: &str,
+        model: &str,
+        model_selection_json: &str,
+    ) -> Result<bool> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions
+                    SET provider = ?1,
+                        model = ?2,
+                        model_selection_json = ?3,
+                        active_model_revision = active_model_revision + 1
+                  WHERE session_id = ?4
+                    AND active_model_revision = ?5",
+                params![
+                    provider,
+                    model,
+                    model_selection_json,
+                    session_id.to_string(),
+                    expected_revision,
+                ],
+            )
+            .context("CAS updating session active model")?;
+        Ok(changed == 1)
+    }
+
+    /// Read the current active-model revision for a session, or `None` when
+    /// the row is missing.
+    pub fn active_model_revision_conn(conn: &Connection, session_id: Uuid) -> Result<Option<i64>> {
+        let result = conn.query_row(
+            "SELECT active_model_revision FROM sessions WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(revision) => Ok(Some(revision)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error).context("reading active_model_revision"),
+        }
     }
 
     /// Lookup by short id within a project. Used by CLI/RPC paths where
@@ -2642,6 +2699,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_session_row_round_trips_the_active_model_cas_revision() {
+        // A pending session stages active-model mutations in memory before its
+        // first INSERT. If the insert dropped `active_model_revision`, a later
+        // CAS would guard against 0 while the caller held the staged token, so
+        // recovery could silently overwrite a newer selection.
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
+        row.provider = Some("anthropic".into());
+        row.model = Some("opus".into());
+        row.active_model_revision = 3;
+        db.insert_session_row(&row).await.unwrap();
+
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
+        assert_eq!(got.active_model_revision, 3);
+
+        // The staged token is the only one that may commit.
+        let stale = db
+            .write({
+                let id = row.session_id;
+                move |conn| {
+                    crate::db::Db::cas_set_active_model_conn(
+                        conn,
+                        id,
+                        0,
+                        "p2",
+                        "m2",
+                        r#"{"provider":"p2","model":"m2"}"#,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert!(!stale, "a pre-insert revision must not be able to commit");
+        let fresh = db
+            .write({
+                let id = row.session_id;
+                move |conn| {
+                    crate::db::Db::cas_set_active_model_conn(
+                        conn,
+                        id,
+                        3,
+                        "p3",
+                        "m3",
+                        r#"{"provider":"p3","model":"m3"}"#,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert!(fresh);
+        let got = db.get_session(row.session_id).await.unwrap().unwrap();
+        assert_eq!(got.active_model_revision, 4);
+        assert_eq!(got.provider.as_deref(), Some("p3"));
+    }
+
+    #[tokio::test]
     async fn insert_session_row_round_trips_model_system_prompt_snapshot_json() {
         let db = Db::open_in_memory().unwrap();
         let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
@@ -4039,5 +4152,54 @@ mod tests {
         assert!(log.contains(&blocked.session_id.to_string()));
         assert!(db.get_session(blocked.session_id).await.unwrap().is_some());
         assert!(db.get_session(removed.session_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cas_set_active_model_conn_advances_revision_and_rejects_stale() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let row = db
+            .create_session("proj", "/tmp/proj", "orchestrator-build")
+            .await
+            .unwrap();
+        let ok = db
+            .write({
+                let id = row.session_id;
+                move |conn| {
+                    crate::db::Db::cas_set_active_model_conn(
+                        conn,
+                        id,
+                        0,
+                        "p",
+                        "m",
+                        r#"{"provider":"p","model":"m"}"#,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert!(ok);
+        let loaded = db.get_session(row.session_id).await.unwrap().unwrap();
+        assert_eq!(loaded.active_model_revision, 1);
+        assert_eq!(loaded.provider.as_deref(), Some("p"));
+        let stale = db
+            .write({
+                let id = row.session_id;
+                move |conn| {
+                    crate::db::Db::cas_set_active_model_conn(
+                        conn,
+                        id,
+                        0,
+                        "p2",
+                        "m2",
+                        r#"{"provider":"p2","model":"m2"}"#,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        assert!(!stale);
+        let loaded = db.get_session(row.session_id).await.unwrap().unwrap();
+        assert_eq!(loaded.active_model_revision, 1);
+        assert_eq!(loaded.provider.as_deref(), Some("p"));
     }
 }

@@ -547,12 +547,12 @@ const MODEL_PICKER: KeyGroup = KeyGroup {
         KeyBinding {
             key: "Enter",
             action: "select",
-            desc: "switch session; set default if none exists",
+            desc: "switch this session only; never changes the default",
         },
         KeyBinding {
             key: "Ctrl+Enter",
             action: "make default",
-            desc: "switch this session and save the future-session default",
+            desc: "switch this session and set the default for new sessions in this config context",
         },
         KeyBinding {
             key: "Ctrl+A",

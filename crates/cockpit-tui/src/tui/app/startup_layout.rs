@@ -79,7 +79,6 @@ impl App {
                             if self.notify_active_model_selected(
                                 active,
                                 false,
-                                false,
                                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
                             ) {
                                 self.submit_after_model_selection = false;

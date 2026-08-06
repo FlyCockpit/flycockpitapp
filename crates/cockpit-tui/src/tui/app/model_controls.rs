@@ -108,7 +108,17 @@ impl App {
     }
 
     pub(super) fn open_model_picker(&mut self) {
+        self.default_model_picker_mode = false;
         self.open_model_picker_highlighting(None);
+    }
+
+    pub(super) fn open_default_model_picker_from_settings(&mut self) {
+        self.default_model_picker_mode = true;
+        let current = self.config_snapshot.providers.active_model.clone();
+        self.open_model_picker_highlighting(current.as_ref());
+        self.push_plain(
+            "Choose the default model for new sessions (does not switch this session).",
+        );
     }
 
     pub(super) fn open_model_picker_highlighting(
@@ -376,24 +386,29 @@ impl App {
             self.submit_after_model_selection = false;
         }
         if let Some((active, explicitly_persist_as_default)) = selected {
+            if self.default_model_picker_mode {
+                self.default_model_picker_mode = false;
+                self.request_default_model_only(active);
+                return;
+            }
+            // Plain Enter is the consciously separate session-only action: it
+            // never invokes the effective-default mutation API and cannot
+            // alter `active_model` in any layer. Establishing a first default
+            // is an explicit act (`Ctrl+Enter`, `/settings`, `/setup model`).
             let persist_as_default = explicitly_persist_as_default;
-            let initialize_default_if_missing = !explicitly_persist_as_default;
             let provider = active.provider.clone();
             let model = active.model.clone();
             if self.notify_active_model_selected(
                 active,
                 persist_as_default,
-                initialize_default_if_missing,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
             ) {
                 let scope = if persist_as_default {
-                    " for this session and saving it as the default"
-                } else if initialize_default_if_missing {
-                    " for this session (and as the default if none is configured)"
+                    format!("Selecting {provider}/{model} for this session; saving default…")
                 } else {
-                    " for this session"
+                    format!("Selecting {provider}/{model} for this session…")
                 };
-                self.push_plain(format!("Selecting {provider}/{model}{scope}…"));
+                self.push_plain(scope);
                 if self.submit_after_model_selection {
                     self.submit_after_model_selection = false;
                     let _ = self.submit_input();
@@ -406,7 +421,6 @@ impl App {
         &mut self,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        initialize_default_if_missing: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) -> bool {
         let provider = active.provider.clone();
@@ -416,13 +430,7 @@ impl App {
             format!("{provider}/{model}"),
             None,
         );
-        self.request_model_selection(
-            "/model",
-            active,
-            persist_as_default,
-            initialize_default_if_missing,
-            trigger,
-        )
+        self.request_model_selection("/model", active, persist_as_default, trigger)
     }
 
     pub(super) fn request_model_selection(
@@ -430,7 +438,6 @@ impl App {
         label: &str,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        initialize_default_if_missing: bool,
         trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
     ) -> bool {
         if self.has_pending_session_switch_action() {
@@ -498,13 +505,7 @@ impl App {
         });
         self.send_daemon_request(
             label,
-            active_model_request(
-                selection_id,
-                active,
-                persist_as_default,
-                initialize_default_if_missing,
-                trigger,
-            ),
+            active_model_request(selection_id, active, persist_as_default, trigger),
             ControlApplied::ModelSelection { selection_id },
         );
         self.pending_model_selection
@@ -542,7 +543,6 @@ impl App {
                 let model = active.model.clone();
                 if self.notify_active_model_selected(
                     active,
-                    false,
                     false,
                     cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
                 ) {
@@ -682,7 +682,6 @@ impl App {
             self.request_model_selection(
                 "/quick",
                 active,
-                false,
                 false,
                 cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
             );
@@ -1023,11 +1022,34 @@ impl App {
     }
 }
 
+impl super::App {
+    pub(super) fn request_default_model_only(
+        &mut self,
+        active: cockpit_config::providers::ActiveModelRef,
+    ) {
+        let default_update_id = uuid::Uuid::new_v4();
+        let provider = active.provider.clone();
+        let model = active.model.clone();
+        self.push_plain(format!("Saving default for {provider}/{model}…"));
+        let req = cockpit_core::daemon::proto::Request::SetDefaultModel {
+            default_update_id,
+            provider: Some(active.provider),
+            model: Some(active.model),
+            reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
+            thinking_mode: active.thinking_mode,
+            prompt_cache_retention: active.prompt_cache_retention,
+            clear: false,
+        };
+        self.send_daemon_request("/settings default model", req, ControlApplied::None);
+        // Stash id for terminal handling.
+        self.pending_default_model_update_id = Some(default_update_id);
+    }
+}
+
 fn active_model_request(
     selection_id: uuid::Uuid,
     active: cockpit_config::providers::ActiveModelRef,
     persist_as_default: bool,
-    initialize_default_if_missing: bool,
     trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
 ) -> cockpit_core::daemon::proto::Request {
     cockpit_core::daemon::proto::Request::SetActiveModel {
@@ -1035,7 +1057,6 @@ fn active_model_request(
         provider: active.provider,
         model: active.model,
         persist_as_default,
-        initialize_default_if_missing,
         trigger,
         reasoning_effort: active.reasoning_effort.map(|effort| effort.value),
         thinking_mode: active.thinking_mode,

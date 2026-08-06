@@ -288,6 +288,27 @@ const requestParamSchemas = {
   get_run_invocation_status: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   cancel_run_invocation: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   session_live_status: z.object({ session_ids: z.array(uuidSchema) }).strict(),
+  // `provider`/`model` are absent exactly when `clear` is set; the daemon
+  // rejects any other combination. It derives the target layer from the
+  // authenticated attachment, never from the request.
+  set_default_model: z
+    .object({
+      default_update_id: uuidSchema,
+      provider: z.string().min(1).optional(),
+      model: z.string().min(1).optional(),
+      reasoning_effort: z.string().min(1).optional(),
+      thinking_mode: thinkingModeSchema.optional(),
+      prompt_cache_retention: promptCacheRetentionSchema.optional(),
+      clear: z.boolean().optional(),
+    })
+    .strict()
+    .refine(
+      (params) =>
+        params.clear === true
+          ? params.provider === undefined && params.model === undefined
+          : params.provider !== undefined && params.model !== undefined,
+      { message: "provider and model are required unless clear is set" },
+    ),
   set_model_favorite: z
     .object({
       provider: z.string().min(1),
@@ -305,12 +326,9 @@ const requestParamSchemas = {
       thinking_mode: thinkingModeSchema.optional(),
       prompt_cache_retention: promptCacheRetentionSchema.optional(),
       persist_as_default: z.boolean(),
-      initialize_default_if_missing: z.boolean(),
     })
     .strict()
-    .refine((value) => !(value.persist_as_default && value.initialize_default_if_missing), {
-      message: "persist_as_default and initialize_default_if_missing cannot both be true",
-    }),
+    .strict(),
   set_agent: z.object({ name: z.string().min(1) }).strict(),
   share_session: z.object({ session_id: uuidSchema, shared: z.boolean() }).strict(),
   stats_rollup: z
@@ -376,6 +394,7 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("get_run_invocation_status", requestParamSchemas.get_run_invocation_status),
   requestVariant("cancel_run_invocation", requestParamSchemas.cancel_run_invocation),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
+  requestVariant("set_default_model", requestParamSchemas.set_default_model),
   requestVariant("set_model_favorite", requestParamSchemas.set_model_favorite),
   requestVariant("set_active_model", requestParamSchemas.set_active_model),
   requestVariant("set_agent", requestParamSchemas.set_agent),
@@ -954,6 +973,7 @@ export const knownEventKindSchema = z.enum([
   "connector_status",
   "context_projection",
   "daemon_draining",
+  "default_model_update_result",
   "delegation_recursion_state",
   "env_drift_warning",
   "event_stream_lagged",
@@ -1104,18 +1124,56 @@ export const sessionPersistFailedDataSchema = z
   })
   .passthrough();
 export type SessionPersistFailedData = z.infer<typeof sessionPersistFailedDataSchema>;
+// The default half of a model selection is only ever `not_requested` or a
+// *verified* update: the daemon proves that a post-commit reload of the
+// effective configuration resolves to exactly this reference before reporting
+// it. There is no "saved without proof" state.
 export const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("not_requested") }).passthrough(),
-  z.object({ status: z.literal("saved") }).passthrough(),
   z
     .object({
-      status: z.literal("failed"),
+      status: z.literal("verified"),
+      selection: activeModelRefSchema,
+      generation: z.number().int().nonnegative(),
+      scope_label: z.string(),
+      // Absent means false: the effective default already matched and no
+      // bytes were written.
+      unchanged: z.boolean().optional(),
+    })
+    .passthrough(),
+]);
+export type DefaultModelUpdateOutcome = z.infer<typeof defaultModelUpdateOutcomeSchema>;
+
+/// Terminal outcome of the config-only `set_default_model` operation.
+export const defaultModelStandaloneOutcomeSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("applied"),
+      // Null when the default was cleared and nothing is inherited.
+      selection: activeModelRefSchema.nullable().optional(),
+      generation: z.number().int().nonnegative(),
+      scope_label: z.string(),
+      unchanged: z.boolean().optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      status: z.literal("rejected"),
       user_message: z.string(),
       diagnostic_code: z.string().min(1),
     })
     .passthrough(),
 ]);
-export type DefaultModelUpdateOutcome = z.infer<typeof defaultModelUpdateOutcomeSchema>;
+export type DefaultModelStandaloneOutcome = z.infer<typeof defaultModelStandaloneOutcomeSchema>;
+
+export const defaultModelUpdateResultDataSchema = z
+  .object({
+    session_id: uuidSchema,
+    default_update_id: uuidSchema,
+    outcome: defaultModelStandaloneOutcomeSchema,
+  })
+  .passthrough();
+export type DefaultModelUpdateResultData = z.infer<typeof defaultModelUpdateResultDataSchema>;
 
 export const modelSelectionOutcomeSchema = z.discriminatedUnion("status", [
   z
@@ -1151,6 +1209,7 @@ export type ModelSelectionResultData = z.infer<typeof modelSelectionResultDataSc
 
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
+  default_model_update_result: defaultModelUpdateResultDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
   interrupt_raised: interruptRaisedDataSchema,

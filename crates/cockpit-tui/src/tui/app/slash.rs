@@ -460,7 +460,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "model",
-        description: "Switch the active model",
+        description: "Switch this session's model (Ctrl+Enter also sets the default for new sessions)",
         takes_args: false,
         run: run_model,
         available: available_always,
@@ -668,7 +668,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "settings",
-        description: "Open the settings dialog",
+        description: "Open the settings dialog (includes the default model for new sessions)",
         takes_args: false,
         run: run_settings,
         available: available_always,

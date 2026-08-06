@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -74,15 +74,11 @@ impl Db {
             .await
     }
 
-    /// Internal injection-only resolution.  Metadata/listing APIs never
-    /// expose literals; callers must not send this result to a model or proto.
-    pub async fn resolve_sealed_value_for_injection(
-        &self,
-        session_id: Uuid,
-        value_id: &str,
-    ) -> Result<Option<String>> {
+    /// Existence check only — sealed literals are never returned to callers
+    /// (child-environment injection is retired).
+    pub async fn sealed_value_exists(&self, session_id: Uuid, value_id: &str) -> Result<bool> {
         let value_id = value_id.to_owned();
-        self.read(move |conn| resolve_conn(conn, session_id, &value_id))
+        self.read(move |conn| exists_conn(conn, session_id, &value_id))
             .await
     }
 }
@@ -108,18 +104,15 @@ fn list_metadata_conn(
     .context("listing sealed value metadata")
 }
 
-fn resolve_conn(
-    conn: &rusqlite::Connection,
-    session_id: Uuid,
-    value_id: &str,
-) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
-        params![session_id.to_string(), value_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .context("resolving sealed value")
+fn exists_conn(conn: &rusqlite::Connection, session_id: Uuid, value_id: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
+            params![session_id.to_string(), value_id],
+            |row| row.get(0),
+        )
+        .context("checking sealed value existence")?;
+    Ok(count > 0)
 }
 
 #[cfg(test)]
@@ -143,23 +136,21 @@ mod tests {
         assert_eq!(metadata.value_id, "prod_token");
         assert_eq!(metadata.reason, "deployment credential");
         let child = db.create_fork(parent.session_id, None).await.unwrap();
-        assert_eq!(
-            db.resolve_sealed_value_for_injection(child.session_id, "prod_token")
+        assert!(
+            db.sealed_value_exists(child.session_id, "prod_token")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("long-high-entropy-token")
         );
         assert!(
             db.delete_sealed_value(parent.session_id, "prod_token")
                 .await
                 .unwrap()
         );
-        assert_eq!(
-            db.resolve_sealed_value_for_injection(child.session_id, "prod_token")
+        // Child snapshot still has the value after parent delete.
+        assert!(
+            db.sealed_value_exists(child.session_id, "prod_token")
                 .await
-                .unwrap(),
-            Some("long-high-entropy-token".into())
+                .unwrap()
         );
     }
 }

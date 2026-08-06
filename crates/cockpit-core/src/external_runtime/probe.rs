@@ -201,6 +201,16 @@ fn run_bounded_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Child-environment injection retired: never forward ambient SEALED_*.
+    // vars_os: never panic on non-Unicode ambient values (unlike vars()).
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if key.starts_with("SEALED_") || crate::redact::env_scrub_patterns(key) {
+            cmd.env_remove(key);
+        }
+    }
 
     #[cfg(unix)]
     {

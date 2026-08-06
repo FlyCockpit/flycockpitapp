@@ -183,7 +183,7 @@ async fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
         ("apiKey".to_string(), "camel-api-key-value".to_string()),
         ("REGION".to_string(), "us-east-1".to_string()),
     ]);
-    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env, &[])
+    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env)
         .into_iter()
         .map(|(key, _)| key)
         .collect();
@@ -194,17 +194,16 @@ async fn bash_scrub_overrides_matches_bare_and_camel_secret_names() {
 }
 
 #[test]
-fn sealed_env_names_are_deterministic_and_forced_into_scrubbing() {
-    let name = sealed_env_name("dburl-prod");
-    assert_eq!(name, "SEALED_DBURL_PROD");
+fn sealed_shell_injection_removed_scrubs_legacy_sealed_env_keys() {
+    let name = "SEALED_DBURL_PROD".to_string();
     let env = std::collections::HashMap::from([(name.clone(), "secret".to_string())]);
-    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env, &[])
+    let scrubbed: std::collections::BTreeSet<_> = scrub_overrides(&env)
         .into_iter()
         .map(|(key, _)| key)
         .collect();
     assert!(
-        !scrubbed.contains(&name),
-        "sealed variables must not be removed before child spawn"
+        scrubbed.contains(&name),
+        "legacy SEALED_* keys must be scrubbed; injection is retired"
     );
 }
 
@@ -1148,7 +1147,58 @@ async fn bash_child_receives_session_env_overlay() {
 }
 
 #[tokio::test]
-async fn bash_injects_sealed_value_for_one_call_without_mutating_overlay() {
+async fn sealed_child_injection_is_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = ctx_with_store(tmp.path());
+    ctx.session.set_sandbox_enabled(false);
+    let command = "printf ok";
+    grant_command(&ctx, command, Scope::Session).await;
+    ctx.session
+        .set_sealed_value(
+            &ctx.redact,
+            "prod-token",
+            "very-secret-literal",
+            "deploy",
+            "user",
+        )
+        .await
+        .unwrap();
+    // Legacy binding field is rejected before sealed lookup or dispatch.
+    let err = BashTool::new()
+        .call(
+            serde_json::json!({ "command": command, "sealed_values": ["prod-token"] }),
+            &ctx,
+        )
+        .await
+        .expect_err("sealed_values must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("retired") || msg.contains("not accepted"),
+        "{msg}"
+    );
+    // Aliases are also rejected.
+    for key in ["sealedValues", "sealed_env", "sealedEnv"] {
+        let mut args = serde_json::json!({ "command": command });
+        args[key] = serde_json::json!(["prod-token"]);
+        let err = BashTool::new()
+            .call(args, &ctx)
+            .await
+            .expect_err("legacy sealed binding alias must be rejected");
+        assert!(
+            err.to_string().contains("retired") || err.to_string().contains("not accepted"),
+            "{key}: {err}"
+        );
+    }
+    // Schema has no sealed_values property.
+    let params = BashTool::new().parameters();
+    assert!(params["properties"].get("sealed_values").is_none());
+    if let Some(def) = BashTool::new().defensive_parameters() {
+        assert!(def["properties"].get("sealed_values").is_none());
+    }
+}
+
+#[tokio::test]
+async fn sealed_shell_injection_removed() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = ctx_with_store(tmp.path());
     ctx.session.set_sandbox_enabled(false);
@@ -1164,53 +1214,38 @@ async fn bash_injects_sealed_value_for_one_call_without_mutating_overlay() {
         )
         .await
         .unwrap();
+    // Without sealed_values, command runs but secret is never injected.
     let out = BashTool::new()
-        .call(
-            serde_json::json!({ "command": command, "sealed_values": ["prod-token"] }),
-            &ctx,
-        )
+        .call(serde_json::json!({ "command": command }), &ctx)
         .await
         .unwrap();
-    let model_output = ctx
-        .redact
-        .with_forced_literal(
-            "very-secret-literal".to_string(),
-            "sealed:prod-token".to_string(),
-        )
-        .unwrap()
-        .scrub(&out.content);
-    assert!(!model_output.contains("very-secret-literal"));
-    assert!(model_output.contains("REDACTED"), "{model_output}");
+    assert!(
+        !out.content.contains("very-secret-literal"),
+        "secret must not appear in shell output: {}",
+        out.content
+    );
     assert!(
         !ctx.env_overlay
             .read()
             .unwrap()
             .contains_key("SEALED_PROD_TOKEN")
     );
-}
-
-#[tokio::test]
-async fn sealed_injection_rejects_unknown_ids_and_overlay_collisions() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ctx = ctx_with_store(tmp.path());
-    let mut env = std::collections::HashMap::new();
-    let unknown = inject_sealed_values(
-        &serde_json::json!({ "sealed_values": ["missing"] }),
-        &ctx,
-        &mut env,
-    )
-    .await
-    .unwrap_err();
-    assert!(unknown.to_string().contains("missing"));
-    env.insert("SEALED_PROD_TOKEN".to_string(), "ordinary".to_string());
-    let collision = inject_sealed_values(
-        &serde_json::json!({ "sealed_values": ["prod-token"] }),
-        &ctx,
-        &mut env,
-    )
-    .await
-    .unwrap_err();
-    assert!(collision.to_string().contains("SEALED_PROD_TOKEN"));
+    // Binding still rejected if present even when overlay already has SEALED_*.
+    {
+        let mut overlay = ctx.env_overlay.write().unwrap();
+        overlay.insert(
+            "SEALED_PROD_TOKEN".to_string(),
+            "should-not-reach-child".to_string(),
+        );
+    }
+    let err = BashTool::new()
+        .call(
+            serde_json::json!({ "command": "printf ok", "sealed_values": ["prod-token"] }),
+            &ctx,
+        )
+        .await
+        .expect_err("must reject before dispatch");
+    assert!(err.to_string().contains("retired") || err.to_string().contains("not accepted"));
 }
 
 #[tokio::test]
@@ -3329,5 +3364,127 @@ async fn windows_no_approver_fails_closed() {
             .sandbox
             .expect("bash records sandbox metadata")
             .confined
+    );
+}
+
+/// AC4: production secret-to-child boundaries must not construct SEALED_* env
+/// or accept sealed binding schemas after retirement.
+#[test]
+fn retirement_structural_inventory() {
+    let bash_mod = include_str!("mod.rs");
+    assert!(
+        !bash_mod.contains("inject_sealed_values"),
+        "bash must not contain inject_sealed_values"
+    );
+    assert!(
+        !bash_mod.contains("sealed_env_name"),
+        "bash must not construct SEALED_* names"
+    );
+    assert!(
+        !bash_mod.contains("\"SEALED_{}"),
+        "bash must not format SEALED_* environment keys"
+    );
+    assert!(
+        bash_mod.contains("reject_retired_sealed_child_bindings"),
+        "bash must reject legacy sealed bindings"
+    );
+    // Schema must not advertise sealed_values (rejection path may name the field).
+    let params_snippet = bash_mod.split("fn parameters").nth(1).unwrap_or_default();
+    let normal_params = params_snippet
+        .split("fn defensive_parameters")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        !normal_params.contains("\"sealed_values\":"),
+        "parameters() must not declare sealed_values property"
+    );
+    let defensive = bash_mod
+        .split("fn defensive_parameters")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        !defensive
+            .split("fn presentation")
+            .next()
+            .unwrap_or_default()
+            .contains("\"sealed_values\":"),
+        "defensive_parameters() must not declare sealed_values"
+    );
+
+    let harness_env = include_str!("../../harness/env.rs");
+    assert!(
+        harness_env.contains("SEALED_"),
+        "harness env must explicitly filter SEALED_*"
+    );
+    assert!(
+        harness_env.contains("starts_with(\"SEALED_\")"),
+        "harness must skip SEALED_* keys"
+    );
+
+    let stdio = include_str!("../../mcp/transport/stdio.rs");
+    assert!(
+        stdio.contains("starts_with(\"SEALED_\")"),
+        "mcp stdio must filter SEALED_* from child env"
+    );
+
+    let shell_sandbox = include_str!("../shell_sandbox.rs");
+    assert!(
+        shell_sandbox.contains("starts_with(\"SEALED_\")"),
+        "shell_sandbox must filter SEALED_* from confined child env and probe env"
+    );
+
+    let container = include_str!("../../container/mod.rs");
+    assert!(
+        container.contains("fn runtime_command") && container.contains("starts_with(\"SEALED_\")"),
+        "container runtime_command must scrub ambient SEALED_*"
+    );
+
+    let mcp_config = include_str!("../../mcp/config.rs");
+    assert!(
+        mcp_config.contains("reject_retired_sealed_bindings_in_mcp_value")
+            || mcp_config.contains("RETIRED_SEALED_BINDING_FIELDS"),
+        "MCP config parse must reject retired sealed binding fields"
+    );
+
+    // No injection construction or resolver on production child-env paths.
+    let scan_roots = [
+        include_str!("mod.rs"),
+        include_str!("../../harness/env.rs"),
+        include_str!("../../harness/spawn.rs"),
+        include_str!("../../mcp/transport/stdio.rs"),
+        include_str!("../custom.rs"),
+        include_str!("../shell_sandbox.rs"),
+        include_str!("../../engine/schedule/background.rs"),
+        include_str!("../../external_runtime/probe.rs"),
+        include_str!("../../session/sealed_values.rs"),
+        include_str!("../../daemon/session_worker/handle.rs"),
+        include_str!("../../container/mod.rs"),
+        include_str!("../../envref.rs"),
+        include_str!("../../mcp/config.rs"),
+    ];
+    for src in scan_roots {
+        // Match production definitions, not test assertion string literals.
+        assert!(
+            !src.contains("fn inject_sealed_values")
+                && !src.contains("fn resolve_sealed_value_for_injection")
+                && !src.contains("async fn resolve_sealed_value_for_injection")
+                && !src.contains("format!(\"SEALED_"),
+            "no SEALED_ injection construction or injection resolver in child-env paths"
+        );
+    }
+    let db_sealed = include_str!("../../../../cockpit-db/src/db/sealed_values.rs");
+    assert!(
+        !db_sealed.contains("resolve_sealed_value_for_injection")
+            && db_sealed.contains("sealed_value_exists"),
+        "db API must expose existence only, not injection resolver"
+    );
+    let envref = include_str!("../../envref.rs");
+    assert!(
+        envref.contains("SEALED_"),
+        "envref must refuse expanding ambient SEALED_* for MCP/harness config"
+    );
+    assert!(
+        include_str!("../../redact/mod.rs").contains("SEALED_"),
+        "env scrub must treat SEALED_* as sensitive"
     );
 }

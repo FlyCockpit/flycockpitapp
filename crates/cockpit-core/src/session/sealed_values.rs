@@ -1,4 +1,5 @@
-//! Validation and injection-only types for session sealed values.
+//! Validation and store helpers for session sealed values.
+//! Child-environment injection of sealed literals is retired.
 
 use std::fmt;
 
@@ -59,20 +60,6 @@ pub fn validate_sealed_value(value_id: &str, value: &str) -> Result<(), SealedVa
     Ok(())
 }
 
-/// Deliberately non-Debug/Display wrapper used only by injection consumers.
-#[allow(dead_code)]
-pub struct SealedValueForInjection(String);
-
-#[allow(dead_code)]
-impl SealedValueForInjection {
-    pub(crate) fn new(value: String) -> Self {
-        Self(value)
-    }
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl Session {
     /// Store a sealed literal only after its unioned redaction table has been
     /// persisted.  The caller installs the returned table into the live worker
@@ -104,15 +91,10 @@ impl Session {
         self.db.delete_sealed_value(self.id, value_id).await
     }
 
-    pub async fn resolve_sealed_value_for_injection(
-        &self,
-        value_id: &str,
-    ) -> Result<Option<SealedValueForInjection>> {
-        Ok(self
-            .db
-            .resolve_sealed_value_for_injection(self.id, value_id)
-            .await?
-            .map(SealedValueForInjection::new))
+    /// Existence check only — sealed literals are never returned for injection
+    /// or generic child handoff (child-environment injection is retired).
+    pub async fn sealed_value_exists(&self, value_id: &str) -> Result<bool> {
+        self.db.sealed_value_exists(self.id, value_id).await
     }
 }
 
@@ -140,10 +122,6 @@ mod tests {
         assert_eq!(
             validate_sealed_value("UPPER", "high-entropy-value-123"),
             Err(SealedValueError::InvalidId)
-        );
-        assert_eq!(
-            SealedValueForInjection::new("high-entropy-value-123".into()).as_str(),
-            "high-entropy-value-123"
         );
     }
 
@@ -184,23 +162,9 @@ mod tests {
                 .scrub("first-high-entropy-token")
                 .contains("first-high-entropy-token")
         );
-        assert_eq!(
-            session
-                .resolve_sealed_value_for_injection("prod_token")
-                .await
-                .unwrap()
-                .unwrap()
-                .as_str(),
-            "second-high-entropy-token"
-        );
+        assert!(session.sealed_value_exists("prod_token").await.unwrap());
         session.delete_sealed_value("prod_token").await.unwrap();
-        assert!(
-            session
-                .resolve_sealed_value_for_injection("prod_token")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!session.sealed_value_exists("prod_token").await.unwrap());
         let resumed = Session::resume(db, session.id).unwrap().unwrap();
         assert!(
             !resumed
@@ -228,13 +192,7 @@ mod tests {
             .await
             .unwrap();
         let child = Session::create_fork(db, parent.id, None).unwrap();
-        assert!(
-            child
-                .resolve_sealed_value_for_injection("before")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(child.sealed_value_exists("before").await.unwrap());
         let parent_table = parent.persisted_redaction_table().unwrap().unwrap();
         parent
             .set_sealed_value(
@@ -246,49 +204,28 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            child
-                .resolve_sealed_value_for_injection("after")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!child.sealed_value_exists("after").await.unwrap());
     }
 
-    /// Source inspection for the repair acceptance gate: no public literal-read
-    /// API, no printable wrapper, no schema/migration expansion in this module.
+    /// Source inspection: no injection resolver or literal-return API remains.
     #[test]
     fn sealed_value_surface_has_no_public_literal_read_or_migration() {
-        // Inspect production source only so this test's own string literals cannot
-        // self-match the forbidden Debug/Display patterns.
         let source = include_str!("sealed_values.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("production module precedes test module");
-        let debug_impl = format!("impl fmt::{} for SealedValueForInjection", "Debug");
-        let display_impl = format!("impl fmt::{} for SealedValueForInjection", "Display");
         assert!(
-            !production.contains(&debug_impl),
-            "SealedValueForInjection must not gain Debug"
+            !production.contains("resolve_sealed_value_for_injection"),
+            "injection resolver must be retired from session API"
         );
         assert!(
-            !production.contains(&display_impl),
-            "SealedValueForInjection must not gain Display"
-        );
-        // Injection wrapper declaration must not derive printable traits.
-        let after_struct = production
-            .split("struct SealedValueForInjection")
-            .nth(1)
-            .unwrap_or_default();
-        let struct_header = after_struct.split('{').next().unwrap_or_default();
-        assert!(
-            !struct_header.contains("Debug") && !struct_header.contains("Display"),
-            "SealedValueForInjection must not derive Debug/Display"
+            !production.contains("SealedValueForInjection"),
+            "injection wrapper type must be removed"
         );
         assert!(
-            production.contains("pub(crate) fn as_str"),
-            "literal access stays crate-private on the injection wrapper"
+            production.contains("sealed_value_exists"),
+            "existence check is the remaining public store API"
         );
         assert!(
             !production.contains("pub async fn get_sealed_value")

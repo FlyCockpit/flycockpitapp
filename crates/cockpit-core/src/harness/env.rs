@@ -60,6 +60,10 @@ fn push_allowed_value(out: &mut Vec<(String, String)>, key: &str, value: Option<
     let Some(value) = value else {
         return;
     };
+    // Sealed child-environment injection is retired: never forward SEALED_* keys.
+    if key.starts_with("SEALED_") {
+        return;
+    }
     if out.iter().any(|(existing, _)| existing == key) {
         return;
     }
@@ -122,6 +126,29 @@ mod tests {
         assert!(
             env.iter()
                 .any(|(key, value)| key == "TOKEN" && value == "overlay")
+        );
+    }
+
+    #[test]
+    fn sealed_bindings_and_noninference_process_egress_are_absent_for_harness() {
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            "SEALED_PROD_TOKEN".to_string(),
+            "very-secret-sentinel-value".to_string(),
+        );
+        overlay.insert("TOKEN".to_string(), "ok".to_string());
+        let env = harness_child_env(&cfg(vec!["TOKEN", "SEALED_PROD_TOKEN"]), Some(&overlay));
+        assert!(
+            !env.iter().any(|(key, _)| key.starts_with("SEALED_")),
+            "harness child must never receive SEALED_* keys: {env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|(_, value)| value.contains("very-secret-sentinel-value"))
+        );
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "TOKEN" && value == "ok")
         );
     }
 }

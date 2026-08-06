@@ -833,10 +833,10 @@ impl Driver {
             sealed_fetch.existed_before = match self
                 .session
                 .db
-                .resolve_sealed_value_for_injection(self.session.id, &sealed_fetch.value_id)
+                .sealed_value_exists(self.session.id, &sealed_fetch.value_id)
                 .await
             {
-                Ok(value) => value.is_some(),
+                Ok(exists) => exists,
                 Err(error) => {
                     tracing::warn!(error = %error, task_call_id, "inspect sealed-fetch target failed");
                     return Ok(Message::tool_result_with_call_id(
@@ -1556,9 +1556,8 @@ impl Driver {
             } else {
                 self.session
                     .db
-                    .resolve_sealed_value_for_injection(self.session.id, &sealed_fetch.value_id)
+                    .sealed_value_exists(self.session.id, &sealed_fetch.value_id)
                     .await
-                    .map(|value| value.is_some())
             };
             let sealed_fetch_failed = failed || lookup.is_err();
             if let Err(error) = &lookup {

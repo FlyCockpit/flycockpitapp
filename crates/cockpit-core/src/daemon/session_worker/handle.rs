@@ -997,26 +997,12 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
-    pub async fn resolve_sealed_value_for_injection(
-        &self,
-        value_id: &str,
-    ) -> anyhow::Result<Option<crate::session::sealed_values::SealedValueForInjection>> {
-        if let Some(value) = self.sealed_values.lock().unwrap().get(value_id).cloned() {
-            return Ok(Some(
-                crate::session::sealed_values::SealedValueForInjection::new(value),
-            ));
+    /// Existence only — sealed child-environment injection is retired.
+    pub async fn sealed_value_exists(&self, value_id: &str) -> anyhow::Result<bool> {
+        if self.sealed_values.lock().unwrap().contains_key(value_id) {
+            return Ok(true);
         }
-        let value = self
-            .session
-            .resolve_sealed_value_for_injection(value_id)
-            .await?;
-        if let Some(value) = &value {
-            self.sealed_values
-                .lock()
-                .unwrap()
-                .insert(value_id.to_owned(), value.as_str().to_owned());
-        }
-        Ok(value)
+        self.session.sealed_value_exists(value_id).await
     }
 
     /// Create or overwrite a sealed value. Install its literal into the live

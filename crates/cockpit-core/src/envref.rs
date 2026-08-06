@@ -97,6 +97,14 @@ where
     F: Fn(&str) -> Option<String>,
     S: Fn(&str) -> Option<String>,
 {
+    // Child-environment injection retired: never expand SEALED_* names via any
+    // public resolve entry point ($SEALED_X / ${SEALED_X}).
+    let env_lookup = |name: &str| -> Option<String> {
+        if name.starts_with("SEALED_") {
+            return None;
+        }
+        env_lookup(name)
+    };
     let expanded_input = expand_leading_tilde(input, home);
     let input = expanded_input.as_str();
     let bytes = input.as_bytes();
@@ -412,5 +420,18 @@ mod tests {
         assert!(!r.has_missing());
         r.missing.push("X".into());
         assert!(r.has_missing());
+    }
+
+    #[test]
+    fn sealed_bindings_and_noninference_process_egress_are_absent_envref() {
+        let guard = crate::test_env::lock();
+        guard.set_var("SEALED_PROD_TOKEN", "very-secret-sentinel-value");
+        let r = resolve("$SEALED_PROD_TOKEN");
+        assert!(
+            !r.value.contains("very-secret-sentinel-value"),
+            "must not expand ambient SEALED_*: {}",
+            r.value
+        );
+        assert!(r.has_missing() || r.value.contains("$SEALED_PROD_TOKEN"));
     }
 }

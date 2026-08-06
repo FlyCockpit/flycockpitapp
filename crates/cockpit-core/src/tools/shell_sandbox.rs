@@ -230,6 +230,10 @@ pub async fn build_sandboxed_command(
         .allow_read(cwd.to_path_buf());
 
     for (key, value) in session_env {
+        // Sealed child-environment injection is retired: never forward SEALED_*.
+        if key.starts_with("SEALED_") {
+            continue;
+        }
         sandbox = sandbox.env(key.clone(), value.clone());
     }
 
@@ -259,6 +263,9 @@ pub async fn build_sandboxed_command(
     // vars) on top of the inherited env. Applied after the TMPDIR override
     // above; the scrub set never includes the temp-dir vars, so they stand.
     for (k, v) in extra_env {
+        if k.starts_with("SEALED_") {
+            continue;
+        }
         sandbox = sandbox.env(k.clone(), v.clone());
     }
 
@@ -381,7 +388,16 @@ async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
         }
     };
 
-    let probe_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // vars_os + lossy values: never panic on non-Unicode ambient values.
+    let probe_env: std::collections::HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?.to_string();
+            if key.starts_with("SEALED_") || crate::redact::env_scrub_patterns(&key) {
+                return None;
+            }
+            Some((key, value.to_string_lossy().into_owned()))
+        })
+        .collect();
     let mut cmd = match build_sandboxed_command("true", cwd, None, &[], &probe_env, &[], None).await
     {
         Ok(c) => c,
@@ -831,5 +847,51 @@ mod tests {
         assert!(paths.contains(&std::path::PathBuf::from("/home/alice/.nvm")));
         assert!(paths.contains(&std::path::PathBuf::from("/home/alice/.asdf")));
         assert!(!paths.contains(&std::path::PathBuf::from("/home/alice")));
+    }
+
+    /// AC2: confined sandbox command env must never carry SEALED_* keys or
+    /// sentinel sealed values, even if a caller forgets to scrub first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sealed_bindings_and_noninference_process_egress_are_absent_for_shell_sandbox() {
+        init();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut session_env = std::collections::HashMap::new();
+        session_env.insert("PATH".to_string(), "/usr/bin".to_string());
+        session_env.insert(
+            "SEALED_PROD_TOKEN".to_string(),
+            "very-secret-sentinel-value".to_string(),
+        );
+        let extra_env = [(
+            "SEALED_EXTRA".to_string(),
+            "very-secret-sentinel-value".to_string(),
+        )];
+        let cmd = build_sandboxed_command(
+            "true",
+            cwd.path(),
+            None,
+            &extra_env,
+            &session_env,
+            &[],
+            None,
+        )
+        .await
+        .expect("sandbox command builds");
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert!(
+            !envs.keys().any(|k| k.starts_with("SEALED_")),
+            "confined child must not receive SEALED_* keys: {envs:?}"
+        );
+        assert!(
+            !envs
+                .values()
+                .any(|v| v.contains("very-secret-sentinel-value")),
+            "confined child must not receive sealed sentinel: {envs:?}"
+        );
+        assert_eq!(envs.get("PATH").map(String::as_str), Some("/usr/bin"));
     }
 }

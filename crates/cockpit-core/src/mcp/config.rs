@@ -273,13 +273,72 @@ pub struct McpConfig {
     pub servers: BTreeMap<String, ServerConfig>,
 }
 
+/// Retired sealed child-environment binding field names. MCP config must
+/// reject these before any server dispatch (no silent ignore).
+const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
+    &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
+
+fn reject_retired_sealed_bindings_in_mcp_value(value: &serde_json::Value) -> Result<()> {
+    let Some(root) = value.as_object() else {
+        return Ok(());
+    };
+    for key in RETIRED_SEALED_BINDING_FIELDS {
+        if root.contains_key(*key) {
+            anyhow::bail!(
+                "sealed child-environment injection is retired; `{key}` is not accepted in mcp.json"
+            );
+        }
+    }
+    let Some(servers) = root.get("servers").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (server_name, server) in servers {
+        let Some(obj) = server.as_object() else {
+            continue;
+        };
+        for key in RETIRED_SEALED_BINDING_FIELDS {
+            if obj.contains_key(*key) {
+                anyhow::bail!(
+                    "MCP server `{server_name}`: sealed child-environment injection is retired; `{key}` is not accepted"
+                );
+            }
+        }
+        // Configured env maps must not declare SEALED_* keys either.
+        for env_field in ["env", "env_credential_refs"] {
+            if let Some(env_map) = obj.get(env_field).and_then(|v| v.as_object()) {
+                for env_key in env_map.keys() {
+                    if env_key.starts_with("SEALED_") {
+                        anyhow::bail!(
+                            "MCP server `{server_name}`: sealed child-environment injection is retired; env key `{env_key}` is not accepted"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(auth) = obj.get("auth").and_then(|v| v.as_object())
+            && let Some(vars) = auth.get("vars").and_then(|v| v.as_object())
+        {
+            for env_key in vars.keys() {
+                if env_key.starts_with("SEALED_") {
+                    anyhow::bail!(
+                        "MCP server `{server_name}`: sealed child-environment injection is retired; auth env key `{env_key}` is not accepted"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl McpConfig {
     /// Parse an `mcp.json` from a string.
     pub fn parse(raw: &str) -> Result<Self> {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
-        serde_json::from_str(raw).context("parsing mcp.json")
+        let value: serde_json::Value = serde_json::from_str(raw).context("parsing mcp.json")?;
+        reject_retired_sealed_bindings_in_mcp_value(&value)?;
+        serde_json::from_value(value).context("parsing mcp.json")
     }
 
     /// Load and merge every parseable `mcp.json` layer for `cwd`, or defaults
@@ -509,6 +568,52 @@ mod tests {
         let fast = &cfg.servers["fast"];
         assert_eq!(fast.connect_timeout_secs(), 2);
         assert_eq!(fast.request_timeout_secs(), 5);
+    }
+
+    #[test]
+    fn sealed_child_injection_is_absent_from_mcp_config() {
+        // AC1: MCP server config rejects retired sealed-binding fields/aliases
+        // and SEALED_* env keys before any dispatch path can use them.
+        for field in ["sealed_values", "sealedValues", "sealed_env", "sealedEnv"] {
+            let raw = format!(
+                r#"{{ "servers": {{
+                  "s": {{ "transport": "stdio", "command": "echo", "{field}": ["prod-token"] }}
+                }} }}"#
+            );
+            let err = McpConfig::parse(&raw).expect_err(field);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("sealed") || msg.contains(field),
+                "field `{field}` must be rejected, got: {msg}"
+            );
+        }
+
+        let env_err = McpConfig::parse(
+            r#"{ "servers": {
+              "s": {
+                "transport": "stdio",
+                "command": "echo",
+                "env": { "SEALED_PROD_TOKEN": "very-secret-sentinel-value" }
+              }
+            } }"#,
+        )
+        .expect_err("SEALED_* env keys");
+        assert!(
+            format!("{env_err:#}").contains("SEALED_"),
+            "SEALED_* env keys must be rejected: {env_err:#}"
+        );
+
+        // Valid config still parses.
+        let ok = McpConfig::parse(
+            r#"{ "servers": {
+              "s": { "transport": "stdio", "command": "echo", "env": { "TOKEN": "ok" } }
+            } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.servers["s"].env.get("TOKEN").map(String::as_str),
+            Some("ok")
+        );
     }
 
     #[test]

@@ -3220,14 +3220,12 @@ mod tests {
                 .iter()
                 .any(|event| format!("{event:?}").contains(answer))
         );
-        assert_eq!(
+        assert!(
             ctx.session
-                .resolve_sealed_value_for_injection("deploy-token")
+                .sealed_value_exists("deploy-token")
                 .await
-                .unwrap()
-                .unwrap()
-                .as_str(),
-            answer
+                .unwrap(),
+            "sealed value must be stored after successful request"
         );
     }
 
@@ -3287,13 +3285,7 @@ mod tests {
             crate::daemon::proto::ResolveResponse::Cancel
         ));
         assert_eq!(task.await.unwrap().unwrap()["status"], "declined");
-        assert!(
-            ctx.session
-                .resolve_sealed_value_for_injection("declined")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!ctx.session.sealed_value_exists("declined").await.unwrap());
         let headless = HostContext::from_tool_ctx(&crate::tools::common::test_ctx(tmp.path()));
         let error = invoke(
             &headless,

@@ -320,6 +320,7 @@ impl Tool for HarnessInvokeTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        crate::tools::bash::reject_retired_sealed_child_bindings(&args)?;
         let args: HarnessInvokeArgs = typed_args(args)?;
         let harness_name = normalize_harness_selector(&args.harness, &ctx.config)?;
         if args.prompt.trim().is_empty() {

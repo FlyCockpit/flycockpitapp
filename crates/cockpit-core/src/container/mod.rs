@@ -37,6 +37,21 @@ pub struct ContainerRuntime {
     pub binary: PathBuf,
 }
 
+/// Build a container-runtime command that never inherits ambient SEALED_*.
+fn runtime_command(binary: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(binary);
+    // vars_os: never panic on non-Unicode ambient values (unlike vars()).
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if key.starts_with("SEALED_") || crate::redact::env_scrub_patterns(key) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 #[cfg(test)]
 pub fn detect_runtime_with<F>(mut which: F, harness_in_container: bool) -> ContainerAvailability
 where
@@ -284,7 +299,7 @@ impl ContainerManager {
     }
 
     pub async fn image_exists(&self, tag: &str, runtime: &ContainerRuntime) -> Result<bool> {
-        let status = tokio::process::Command::new(&runtime.binary)
+        let status = runtime_command(&runtime.binary)
             .arg("image")
             .arg("inspect")
             .arg(tag)
@@ -309,7 +324,7 @@ impl ContainerManager {
             return Ok(tag);
         }
         let context = dockerfile.parent().unwrap_or_else(|| Path::new("."));
-        let output = tokio::process::Command::new(&runtime.binary)
+        let output = runtime_command(&runtime.binary)
             .arg("build")
             .arg("-t")
             .arg(&tag)
@@ -337,7 +352,7 @@ impl ContainerManager {
     }
 
     pub async fn container_exists(&self, name: &str, runtime: &ContainerRuntime) -> Result<bool> {
-        let status = tokio::process::Command::new(&runtime.binary)
+        let status = runtime_command(&runtime.binary)
             .arg("container")
             .arg("inspect")
             .arg(name)
@@ -376,7 +391,7 @@ impl ContainerManager {
             network_enabled,
             HostPlatform::current(),
         );
-        let output = tokio::process::Command::new(&runtime.binary)
+        let output = runtime_command(&runtime.binary)
             .args(args)
             .output()
             .await
@@ -407,7 +422,7 @@ impl ContainerManager {
         }
         let name = container_name(session_id);
         for binary in binaries {
-            let _ = tokio::process::Command::new(&binary)
+            let _ = runtime_command(&binary)
                 .arg("rm")
                 .arg("-f")
                 .arg(&name)
@@ -427,8 +442,14 @@ impl ContainerManager {
         command: &str,
         runtime: &ContainerRuntime,
     ) -> Result<tokio::process::Command> {
-        let mut cmd = tokio::process::Command::new(&runtime.binary);
-        cmd.args(build_exec_args(container, cwd, env, command));
+        // Never forward retired SEALED_* child bindings into container runtime launches.
+        let filtered: BTreeMap<String, String> = env
+            .iter()
+            .filter(|(k, _)| !k.starts_with("SEALED_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut cmd = runtime_command(&runtime.binary);
+        cmd.args(build_exec_args(container, cwd, &filtered, command));
         Ok(cmd)
     }
 }
@@ -970,6 +991,52 @@ mod tests {
             Some(ContainerRuntimeKind::Docker)
         );
         assert!(prefer_docker.availability.available);
+    }
+
+    #[test]
+    fn sealed_bindings_and_noninference_process_egress_are_absent_for_container_runtime() {
+        // AC2: every container-runtime process (inspect/build/exec) is built
+        // via runtime_command, which strips ambient SEALED_* before spawn.
+        let guard = crate::test_env::lock();
+        guard.set_var("SEALED_PROD_TOKEN", "very-secret-sentinel-value");
+        guard.set_var("PATH", "/usr/bin");
+
+        let cmd = runtime_command("true");
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        // env_remove leaves an explicit None override so the child does not inherit.
+        let sealed_removed = envs
+            .iter()
+            .any(|(k, v)| k.to_str() == Some("SEALED_PROD_TOKEN") && v.is_none());
+        assert!(
+            sealed_removed,
+            "runtime_command must env_remove ambient SEALED_*: {envs:?}"
+        );
+        // Explicit SEALED_* env maps must also be dropped on exec.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "SEALED_EXEC".to_string(),
+            "very-secret-sentinel-value".to_string(),
+        );
+        env.insert("OK".to_string(), "keep".to_string());
+        let manager = ContainerManager::detect();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeKind::Docker,
+            binary: PathBuf::from("docker"),
+        };
+        let exec = manager
+            .exec_command("c1", Path::new("/work"), &env, "true", &runtime)
+            .unwrap();
+        let args: Vec<String> = exec
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains("SEALED_") && !joined.contains("very-secret-sentinel-value"),
+            "container exec argv must not carry sealed bindings: {joined}"
+        );
+        assert!(joined.contains("OK=keep") || joined.contains("-e") && joined.contains("OK"));
     }
 
     #[test]

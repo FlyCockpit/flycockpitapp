@@ -427,21 +427,9 @@ async fn deleting_sealed_value_evicts_live_injection_cache() {
     .await
     .unwrap();
     let handle = SessionWorkerHandle::test_handle(session, Arc::new(LockManager::in_memory(db)));
-    assert!(
-        handle
-            .resolve_sealed_value_for_injection("prod_token")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(handle.sealed_value_exists("prod_token").await.unwrap());
     assert!(handle.delete_sealed_value("prod_token").await.unwrap());
-    assert!(
-        handle
-            .resolve_sealed_value_for_injection("prod_token")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(!handle.sealed_value_exists("prod_token").await.unwrap());
 }
 
 #[tokio::test]
@@ -458,13 +446,7 @@ async fn creating_sealed_value_updates_live_redaction_before_returning() {
 
     let scrubbed = handle.redaction_table().scrub("very-high-entropy-token");
     assert!(!scrubbed.contains("very-high-entropy-token"));
-    assert!(
-        handle
-            .resolve_sealed_value_for_injection("prod_token")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(handle.sealed_value_exists("prod_token").await.unwrap());
 }
 
 fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUserMessage {

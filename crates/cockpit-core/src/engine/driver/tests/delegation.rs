@@ -341,13 +341,9 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
         "fork history (model-facing seed) must not carry the sealed literal"
     );
 
-    let resolved = child
-        .resolve_sealed_value_for_injection("parent_pre")
-        .await
-        .unwrap();
     assert!(
-        resolved.is_some(),
-        "subagent must inject parent value sealed before fork point"
+        child.sealed_value_exists("parent_pre").await.unwrap(),
+        "subagent must inherit parent value sealed before fork point"
     );
     // Availability only — do not read the literal-bearing wrapper via as_str.
     // Prove the sealed literal is redacted and never appears on metadata/events.
@@ -429,11 +425,7 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
 
     let (child, _history) = driver.prepare_fork_task_context().await.unwrap();
     assert!(
-        child
-            .resolve_sealed_value_for_injection("early_token")
-            .await
-            .unwrap()
-            .is_some(),
+        child.sealed_value_exists("early_token").await.unwrap(),
         "value sealed before fork remains injectable on the child"
     );
 
@@ -447,19 +439,14 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     assert!(
         driver
             .session
-            .resolve_sealed_value_for_injection("late_token")
+            .sealed_value_exists("late_token")
             .await
-            .unwrap()
-            .is_some(),
+            .unwrap(),
         "parent must resolve its own late value"
     );
     assert!(
-        child
-            .resolve_sealed_value_for_injection("late_token")
-            .await
-            .unwrap()
-            .is_none(),
-        "subagent must not resolve parent values written after the fork point"
+        !child.sealed_value_exists("late_token").await.unwrap(),
+        "subagent must not see parent values written after the fork point"
     );
     let child_meta = child.list_sealed_value_metadata().await.unwrap();
     assert!(

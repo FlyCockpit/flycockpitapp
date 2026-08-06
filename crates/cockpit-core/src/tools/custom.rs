@@ -436,8 +436,11 @@ fn custom_tool_environment(ctx: &ToolCtx) -> (HashMap<String, String>, Vec<(Stri
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let sensitive = std::env::vars()
-        .map(|(name, _)| name)
+    // Child-environment injection retired: never forward SEALED_* keys.
+    env.retain(|name, _| !name.starts_with("SEALED_"));
+    // vars_os: never panic on non-Unicode ambient values (unlike vars()).
+    let sensitive = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
         .chain(env.keys().cloned())
         .filter(|name| crate::redact::env_scrub_patterns(name))
         .collect::<BTreeSet<_>>();

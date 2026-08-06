@@ -581,9 +581,13 @@ fn scrub_env(cmd: &mut Command) {
     for var in FIXED_REMOVE {
         cmd.env_remove(var);
     }
-    for (k, _v) in std::env::vars() {
-        if crate::redact::env_scrub_patterns(&k) {
-            cmd.env_remove(&k);
+    // vars_os: never panic on non-Unicode ambient values (unlike vars()).
+    for (k, _v) in std::env::vars_os() {
+        let Some(k) = k.to_str() else {
+            continue;
+        };
+        if crate::redact::env_scrub_patterns(k) || k.starts_with("SEALED_") {
+            cmd.env_remove(k);
         }
     }
 }

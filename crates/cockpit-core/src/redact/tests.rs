@@ -1852,3 +1852,11 @@ fn secret_file_registration_uses_parsed_values() {
         .unwrap();
     assert_eq!(table.scrub(contents), "TOKEN=***REDACT***\n");
 }
+
+#[test]
+fn sealed_bindings_and_noninference_process_egress_are_absent_env_scrub() {
+    // AC2: SEALED_* is treated as sensitive for every child env scrub path.
+    assert!(crate::redact::env_scrub_patterns("SEALED_PROD_TOKEN"));
+    assert!(crate::redact::env_scrub_patterns("SEALED_DBURL_PROD"));
+    assert!(!crate::redact::env_scrub_patterns("PATH"));
+}

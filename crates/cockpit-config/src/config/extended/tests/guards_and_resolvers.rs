@@ -475,6 +475,43 @@ fn resolve_harnesses_unions_distinct_names_and_skips_garbage() {
     assert!(!merged.contains_key("bad"), "unparseable entry dropped");
 }
 
+#[test]
+fn sealed_child_injection_is_absent_from_harness_config() {
+    // AC1: harness config schemas reject retired sealed-binding fields/aliases
+    // rather than silently accepting and ignoring them.
+    for field in ["sealed_values", "sealedValues", "sealed_env", "sealedEnv"] {
+        let raw = serde_json::json!({
+            "command": "codex",
+            field: ["prod-token"],
+        });
+        let err = parse_harness_config(raw).expect_err(field);
+        assert!(
+            err.contains("sealed") || err.contains(field),
+            "field `{field}` must be rejected, got: {err}"
+        );
+    }
+    // Clean entry still parses.
+    parse_harness_config(serde_json::json!({"command": "codex"})).unwrap();
+
+    // resolve_harnesses drops entries that carry retired sealed bindings.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"harnesses":{
+          "clean":{"command":"codex"},
+          "sealed":{"command":"codex","sealed_values":["prod-token"]}
+        }}"#,
+    )
+    .unwrap();
+    let merged = resolve_harnesses_from_paths(&[path]);
+    assert!(merged.contains_key("clean"));
+    assert!(
+        !merged.contains_key("sealed"),
+        "harness with sealed_values must not be accepted for dispatch"
+    );
+}
+
 /// `gitignore_allow` resolves as a de-duplicated **union** across layers in
 /// walk order — not a more-specific-wins override (it's a list-valued
 /// field like skills `scan_dirs`).

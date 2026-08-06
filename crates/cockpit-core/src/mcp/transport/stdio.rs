@@ -104,7 +104,13 @@ impl StdioClient {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .env_clear()
-            .envs(stdio_child_env(std::env::vars(), env));
+            .envs(stdio_child_env(
+                std::env::vars_os().filter_map(|(k, v)| {
+                    let k = k.into_string().ok()?;
+                    Some((k, v.to_string_lossy().into_owned()))
+                }),
+                env,
+            ));
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = match cmd.spawn() {
@@ -530,11 +536,15 @@ fn stdio_child_env(
 ) -> BTreeMap<String, String> {
     let mut child = BTreeMap::new();
     for (key, value) in parent {
-        if inherit_stdio_env_var(&key) {
+        if inherit_stdio_env_var(&key) && !key.starts_with("SEALED_") {
             child.insert(key, value);
         }
     }
     for (key, value) in explicit {
+        // Sealed child-environment injection is retired.
+        if key.starts_with("SEALED_") {
+            continue;
+        }
         child.insert(key.clone(), value.clone());
     }
     child
@@ -622,6 +632,35 @@ mod tests {
         assert_eq!(child.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
         assert!(!child.contains_key("OPENAI_API_KEY"));
         assert!(!child.contains_key("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn sealed_bindings_and_noninference_process_egress_are_absent_for_stdio() {
+        let parent = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                "SEALED_PARENT".to_string(),
+                "very-secret-sentinel-value".to_string(),
+            ),
+        ];
+        let mut explicit = BTreeMap::new();
+        explicit.insert(
+            "SEALED_EXPLICIT".to_string(),
+            "very-secret-sentinel-value".to_string(),
+        );
+        explicit.insert("SERVER_TOKEN".to_string(), "configured".to_string());
+        let child = stdio_child_env(parent, &explicit);
+        assert!(!child.keys().any(|k| k.starts_with("SEALED_")));
+        assert!(
+            !child
+                .values()
+                .any(|v| v.contains("very-secret-sentinel-value"))
+        );
+        assert_eq!(
+            child.get("SERVER_TOKEN").map(String::as_str),
+            Some("configured")
+        );
+        assert_eq!(child.get("PATH").map(String::as_str), Some("/usr/bin"));
     }
 
     #[test]

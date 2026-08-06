@@ -64,7 +64,7 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR. Sealed: `sealed_values` injects unreadable `SEALED_<ID>`; do not transform."
+        let description = "Run shell command. Fresh shell: cd/env do NOT persist; use cwd or &&. Prefer read/search/code over cat/grep/ls/find. Non-interactive: stdin is /dev/null, so pagers/editors, -i, watch, tail -f and servers only burn timeout. 120s default (max 600s). Output capped at 8 KB; declare resources; log to $TMPDIR."
             .to_string();
 
         // The defensive, explicitly-steering form (`llm-modes-
@@ -162,8 +162,7 @@ impl Tool for BashTool {
                 "cwd":        { "type": "string", "description": "Working directory; defaults to session cwd" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard timeout in ms; defaults to 120000, min 1000, max 600000" },
                 "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional timeout in ms while waiting for resource scheduler permits" },
-                "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}"),
-                "sealed_values": { "type": "array", "items": { "type": "string" }, "description": "Optional sealed value ids to inject for this call only as SEALED_<ID> environment variables. You cannot read these values; do not transform or print them because transformations defeat redaction." }
+                "resources": resources_schema("Optional resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1}")
             },
             "required": ["command"]
         })
@@ -171,19 +170,17 @@ impl Tool for BashTool {
 
     fn defensive_parameters(&self) -> Option<Value> {
         Some(serde_json::json!({
-                    "type": "object",
-                    "x-cockpit-primary-field": "command",
-                    "properties": {
-                        "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
-                        "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
-                        "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, minimum 1000, maximum 600000. Raise it for long builds/test runs" },
-                        "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
-                        "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
-        ,
-                        "sealed_values": { "type": "array", "items": { "type": "string" }, "description": "Optional sealed value ids to inject for this call only as SEALED_<ID> environment variables. You cannot read these values; do not transform or print them because transformations defeat redaction." }
-                    },
-                    "required": ["command"]
-                }))
+            "type": "object",
+            "x-cockpit-primary-field": "command",
+            "properties": {
+                "command":    { "type": "string", "x-cockpit-aliases": ["cmd", "shell", "script", "commandLine"], "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
+                "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
+                "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Hard wall-clock timeout in milliseconds after the command starts before it is killed; defaults to 120000, minimum 1000, maximum 600000. Raise it for long builds/test runs" },
+                "queue_timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": MIN_QUEUE_TIMEOUT_MS, "maximum": MAX_TIMEOUT_MS, "description": "Optional milliseconds to wait for declared resource permits before giving up; this is separate from process runtime timeout" },
+                "resources": resources_schema("Declare resource permits for expensive commands, e.g. {\"cpu\":1,\"memory\":1} for builds, tests, or other CPU/RAM-heavy work")
+            },
+            "required": ["command"]
+        }))
     }
 
     fn presentation(&self, args: &Value) -> ToolPresentation {
@@ -301,58 +298,18 @@ fn normalize_bash_timeouts(args: &Value) -> BashTimeouts {
     }
 }
 
-fn sealed_env_name(value_id: &str) -> String {
-    format!(
-        "SEALED_{}",
-        value_id.to_ascii_uppercase().replace(char::from(45), "_")
-    )
-}
-
-async fn inject_sealed_values(
-    args: &Value,
-    ctx: &ToolCtx,
-    session_env: &mut std::collections::HashMap<String, String>,
-) -> Result<Vec<String>> {
-    let Some(raw_ids) = args.get("sealed_values") else {
-        return Ok(Vec::new());
-    };
-    let ids = raw_ids.as_array().ok_or_else(|| {
-        crate::engine::tool::invalid_input("`sealed_values` must be an array of strings")
-    })?;
-    let mut names = Vec::with_capacity(ids.len());
-    for raw_id in ids {
-        let value_id = raw_id.as_str().ok_or_else(|| {
-            crate::engine::tool::invalid_input("`sealed_values` must contain only strings")
-        })?;
-        let name = sealed_env_name(value_id);
-        if session_env.contains_key(&name)
-            || [
-                "BASH_ENV",
-                "ENV",
-                "PROMPT_COMMAND",
-                "NODE_OPTIONS",
-                "SHELLOPTS",
-                "BASHOPTS",
-                "GREP_OPTIONS",
-                "GREP_COLORS",
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-            ]
-            .contains(&name.as_str())
-        {
-            anyhow::bail!(
-                "sealed value `{value_id}` derives colliding environment variable `{name}`"
-            );
+/// Legacy sealed child-environment bindings are retired. Reject before any
+/// sealed lookup or shell dispatch (no SEALED_* injection path remains).
+pub(crate) fn reject_retired_sealed_child_bindings(args: &Value) -> Result<()> {
+    // Known retired binding field names (no aliases accepted).
+    for key in ["sealed_values", "sealedValues", "sealed_env", "sealedEnv"] {
+        if args.get(key).is_some() {
+            return Err(crate::engine::tool::invalid_input(
+                "sealed child-environment injection is retired; `sealed_values` and related binding fields are not accepted",
+            ));
         }
-        let value = ctx
-            .session
-            .resolve_sealed_value_for_injection(value_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("sealed value `{value_id}` is unknown"))?;
-        session_env.insert(name.clone(), value.as_str().to_string());
-        names.push(name);
     }
-    Ok(names)
+    Ok(())
 }
 
 pub(crate) async fn rerun_escalated_bash(
@@ -483,12 +440,15 @@ async fn call_bash_inner(
     let escalation_preauthorized = escalation_preauthorized_scope.is_some();
 
     let is_container_run = !options.force_unconfined && ctx.session.sandbox_mode().is_container();
+    // Reject legacy sealed binding fields before any lookup or spawn.
+    reject_retired_sealed_child_bindings(&args)?;
     let mut session_env = ctx
         .env_overlay
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let sealed_env_names = inject_sealed_values(&args, ctx, &mut session_env).await?;
+    // Defense in depth: never forward SEALED_* keys into the child env.
+    session_env.retain(|key, _| !key.starts_with("SEALED_"));
     let jq_shim_paths =
         if should_prepare_jq_shim(options.force_unconfined, ctx.session.sandbox_mode()) {
             crate::tools::jq_shim::prepare_host_jq_shim(&ctx.session, &mut session_env)
@@ -496,7 +456,7 @@ async fn call_bash_inner(
             Vec::new()
         };
     let tmp_dir = ctx.session.tmp_dir();
-    let scrub = scrub_overrides(&session_env, &sealed_env_names);
+    let scrub = scrub_overrides(&session_env);
     let command_classification = crate::approval::classify::classify(command);
     let extended_config = ctx.config.extended();
     let profile_introspector =
@@ -2754,7 +2714,6 @@ fn format_combined(stdout: &str, stderr: &str, exit: i32, signaled: bool) -> Str
 /// unconfined path removes.
 fn scrub_overrides(
     session_env: &std::collections::HashMap<String, String>,
-    sealed_env_names: &[String],
 ) -> Vec<(String, String)> {
     session_env
         .keys()
@@ -2771,7 +2730,7 @@ fn scrub_overrides(
             "AWS_ACCESS_KEY_ID".to_string(),
             "AWS_SECRET_ACCESS_KEY".to_string(),
         ])
-        .filter(|k| !sealed_env_names.contains(k) && crate::redact::env_scrub_patterns(k))
+        .filter(|k| k.starts_with("SEALED_") || crate::redact::env_scrub_patterns(k))
         .map(|k| (k, String::new()))
         .collect()
 }

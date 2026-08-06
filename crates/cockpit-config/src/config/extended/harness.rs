@@ -47,7 +47,7 @@ pub(super) fn resolve_harnesses_from_paths(paths: &[PathBuf]) -> HashMap<String,
     }
     let mut out = HashMap::new();
     for (name, val) in merged {
-        match serde_json::from_value::<HarnessConfig>(val) {
+        match parse_harness_config(val) {
             Ok(hc) => {
                 out.insert(name, hc);
             }
@@ -57,6 +57,25 @@ pub(super) fn resolve_harnesses_from_paths(paths: &[PathBuf]) -> HashMap<String,
         }
     }
     out
+}
+
+/// Retired sealed child-environment binding field names. Config must reject
+/// these before harness dispatch (no silent ignore).
+const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
+    &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
+
+/// Parse one harness entry, rejecting retired sealed-binding fields first.
+pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> {
+    if let Some(obj) = val.as_object() {
+        for key in RETIRED_SEALED_BINDING_FIELDS {
+            if obj.contains_key(*key) {
+                return Err(format!(
+                    "sealed child-environment injection is retired; `{key}` is not accepted on harness config"
+                ));
+            }
+        }
+    }
+    serde_json::from_value(val).map_err(|e| e.to_string())
 }
 
 /// Recursively deep-merge `overlay` into `base`: for two objects, recurse

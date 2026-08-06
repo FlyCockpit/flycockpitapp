@@ -157,6 +157,10 @@ const FIXED_SHELL_INJECTION_NAMES: &[&str] = &[
 
 pub(crate) fn env_scrub_patterns(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
+    // Retired sealed child-environment bindings never reach any child.
+    if upper.starts_with("SEALED_") {
+        return true;
+    }
     FIXED_SHELL_INJECTION_NAMES
         .iter()
         .any(|fixed| upper == *fixed)

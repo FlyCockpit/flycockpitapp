@@ -322,6 +322,10 @@ async fn dispatch(
                 None | Some(MontyObject::None) => Value::Object(Default::default()),
                 Some(obj) => monty_to_json(obj),
             };
+            if let Err(error) = crate::tools::bash::reject_retired_sealed_child_bindings(&call_args)
+            {
+                return Err(format!("mcp.invoke failed: {error}"));
+            }
             if super::builtin::is_builtin_server(&server) {
                 let tools = super::builtin::available_descriptors(host);
                 match crate::mcp::invoke_prep::repair_invoke_args_from_tools(

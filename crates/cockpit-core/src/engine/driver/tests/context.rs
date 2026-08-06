@@ -1895,13 +1895,12 @@ async fn sealed_value_survives_completed_compaction() {
     }
     assert!(saw_ready, "completed compaction must emit CompactReady");
 
-    let resolved = driver
-        .session
-        .resolve_sealed_value_for_injection("compact_keep")
-        .await
-        .unwrap();
     assert!(
-        resolved.is_some(),
+        driver
+            .session
+            .sealed_value_exists("compact_keep")
+            .await
+            .unwrap(),
         "sealed value must remain injectable after completed compaction"
     );
     let table = driver
@@ -1953,12 +1952,8 @@ async fn sealed_value_survives_compaction_and_resume() {
     let resumed = Session::resume(db, session_id)
         .unwrap()
         .expect("session must resume after compaction");
-    let resolved = resumed
-        .resolve_sealed_value_for_injection("resume_keep")
-        .await
-        .unwrap();
     assert!(
-        resolved.is_some(),
+        resumed.sealed_value_exists("resume_keep").await.unwrap(),
         "resumed session must inject the pre-compaction sealed value"
     );
     let scrubbed = resumed
@@ -2026,13 +2021,12 @@ async fn failed_compaction_does_not_change_sealed_state() {
         "failed compaction must surface the unchanged-history notice"
     );
 
-    let after = driver
-        .session
-        .resolve_sealed_value_for_injection("fail_keep")
-        .await
-        .unwrap();
     assert!(
-        after.is_some(),
+        driver
+            .session
+            .sealed_value_exists("fail_keep")
+            .await
+            .unwrap(),
         "failed compaction must keep the pre-attempt sealed value injectable"
     );
     let after_meta = driver.session.list_sealed_value_metadata().await.unwrap();

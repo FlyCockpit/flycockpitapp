@@ -68,7 +68,7 @@ pub use tui::{
 #[cfg(test)]
 use guards::{resolve_injection_guard_from_paths, resolve_preflight_from_paths};
 #[cfg(test)]
-use harness::resolve_harnesses_from_paths;
+use harness::{parse_harness_config, resolve_harnesses_from_paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfig {

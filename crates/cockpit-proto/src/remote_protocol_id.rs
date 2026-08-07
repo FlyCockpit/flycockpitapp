@@ -15,12 +15,36 @@ pub enum RemoteProtocolIdKind {
     Account,
     Instance,
     Project,
+    /// Ephemeral per-frame identifier (`RemoteTransportFrameV1.frameId`).
+    Frame,
+    /// Ephemeral per-transfer identifier (`RemoteBulk*.transferId`).
+    Transfer,
 }
 
-/// Marker ZSTs for nominal kind separation (sealed to the closed four kinds).
+impl RemoteProtocolIdKind {
+    /// Stable snake_case spelling shared with the TypeScript mirror.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RemoteProtocolIdKind::Tenant => "tenant",
+            RemoteProtocolIdKind::Account => "account",
+            RemoteProtocolIdKind::Instance => "instance",
+            RemoteProtocolIdKind::Project => "project",
+            RemoteProtocolIdKind::Frame => "frame",
+            RemoteProtocolIdKind::Transfer => "transfer",
+        }
+    }
+}
+
+/// Marker ZSTs for nominal kind separation (sealed to the closed kind set).
+///
+/// `Frame` and `Transfer` are the ephemeral transport kinds added by
+/// `remote-transport-logical-lanes`. They deliberately reuse this codec rather
+/// than introducing a second 16-byte identifier encoding.
 pub mod kind {
-    /// Sealed: only the four closed kinds implement this.
-    pub trait ProtocolIdKind: sealed::Sealed + Copy + Send + Sync + 'static {}
+    /// Sealed: only the closed kind set implements this.
+    pub trait ProtocolIdKind: sealed::Sealed + Copy + Send + Sync + 'static {
+        const KIND: super::RemoteProtocolIdKind;
+    }
 
     mod sealed {
         pub trait Sealed {}
@@ -34,15 +58,31 @@ pub mod kind {
     pub struct Instance;
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct Project;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct Frame;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct Transfer;
 
-    impl sealed::Sealed for Tenant {}
-    impl sealed::Sealed for Account {}
-    impl sealed::Sealed for Instance {}
-    impl sealed::Sealed for Project {}
-    impl ProtocolIdKind for Tenant {}
-    impl ProtocolIdKind for Account {}
-    impl ProtocolIdKind for Instance {}
-    impl ProtocolIdKind for Project {}
+    macro_rules! seal_kind {
+        ($($ty:ident => $variant:ident),+ $(,)?) => {
+            $(
+                impl sealed::Sealed for $ty {}
+                impl ProtocolIdKind for $ty {
+                    const KIND: super::RemoteProtocolIdKind =
+                        super::RemoteProtocolIdKind::$variant;
+                }
+            )+
+        };
+    }
+
+    seal_kind! {
+        Tenant => Tenant,
+        Account => Account,
+        Instance => Instance,
+        Project => Project,
+        Frame => Frame,
+        Transfer => Transfer,
+    }
 }
 
 /// Kind-branded 16-byte protocol id.
@@ -151,6 +191,27 @@ pub fn tag_protocol_id_bytes<K: kind::ProtocolIdKind>(
         _kind: PhantomData,
     })
 }
+
+/// JSON form of every kind-branded id is the 22-character unpadded base64url
+/// spelling — the single identifier codec, with no per-kind mapping row.
+impl<K: kind::ProtocolIdKind> serde::Serialize for RemoteProtocolId<K> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = encode_protocol_id_base64url(&self.bytes).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de, K: kind::ProtocolIdKind> serde::Deserialize<'de> for RemoteProtocolId<K> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        decode_protocol_id_as_kind::<K>(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Ephemeral 16-byte frame identifier carried raw in binary frames.
+pub type RemoteFrameId = RemoteProtocolId<kind::Frame>;
+/// Ephemeral 16-byte bulk-transfer identifier carried raw in binary frames.
+pub type RemoteTransferId = RemoteProtocolId<kind::Transfer>;
 
 /// Nominal CanonicalU64DecimalStringV1 wire type (never a JSON number).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

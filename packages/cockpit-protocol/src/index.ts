@@ -1,6 +1,62 @@
 import { z } from "zod";
+import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
 export const PROTOCOL_VERSION = 6 as const;
+
+/**
+ * JSON form of a bulk transfer reference, mirroring Rust
+ * `RemoteBulkTransferRef`. Application messages carry this instead of inline
+ * bytes; the bytes themselves travel as bulk-lane chunks.
+ */
+/**
+ * A 22-character opaque id, validated by the landed codec rather than by shape.
+ *
+ * A regex alone accepts spellings Rust rejects — notably the all-zero id
+ * `"AAAAAAAAAAAAAAAAAAAAAA"` and non-canonical trailing bits — so the wire
+ * schema must run the same decoder the binary path does.
+ */
+const opaqueProtocolIdSchema = z.string().superRefine((value, ctx) => {
+  try {
+    decodeProtocolIdBase64Url(value);
+  } catch (error) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: error instanceof Error ? error.message : "invalid protocol id",
+    });
+  }
+});
+
+/** A `u32` wire field: Rust bounds this by type, so the schema must too. */
+const u32Schema = z.number().int().nonnegative().max(0xffffffff);
+
+export const bulkTransferRefSchema = z
+  .object({
+    /** 22-character unpadded base64url, via the landed identifier codec. */
+    transfer_id: opaqueProtocolIdSchema,
+    /** CanonicalU64DecimalStringV1 — never a JSON number. */
+    total_length: canonicalU64DecimalStringSchema,
+    /** Lowercase hex SHA-256 of the transferred bytes. */
+    sha256: z
+      .string()
+      .length(64)
+      .regex(/^[0-9a-f]{64}$/),
+    mime_class: z.enum(["image", "image_set", "archive", "export", "opaque"]),
+  })
+  .strict();
+export type BulkTransferRef = z.infer<typeof bulkTransferRefSchema>;
+
+/** Export metadata plus a bounded reference to the exported bytes. */
+export const exportSessionDataSchema = z
+  .object({
+    session_id: z.string().uuid(),
+    kind: z.enum(["transcript_json", "debug_bundle"]),
+    filename_extension: z.string(),
+    mime: z.string(),
+    transfer: bulkTransferRefSchema,
+    session_count: z.number().int().nonnegative().optional(),
+    redacted: z.boolean(),
+  })
+  .passthrough();
 
 export const uuidSchema = z.string().uuid();
 const clientSubmissionIdSchema = uuidSchema.refine(
@@ -339,6 +395,22 @@ const requestParamSchemas = {
     })
     .strict(),
   unarchive_session: z.object({ session_id: uuidSchema }).strict(),
+  import_session_archive: z
+    .object({ transfer: bulkTransferRefSchema, as_new: z.boolean().optional() })
+    .strict(),
+  write_bulk_transfer_chunk: z
+    .object({
+      transfer: bulkTransferRefSchema,
+      chunk_index: u32Schema,
+      data_base64: z.string(),
+    })
+    .strict(),
+  read_bulk_transfer_chunk: z
+    .object({
+      transfer_id: opaqueProtocolIdSchema,
+      chunk_index: u32Schema,
+    })
+    .strict(),
 } as const;
 
 type RequestParamSchemas = typeof requestParamSchemas;
@@ -374,6 +446,9 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // construction.
 const clientRequestVariants = [
   requestVariant("archive_session", requestParamSchemas.archive_session),
+  requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
+  requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
+  requestVariant("read_bulk_transfer_chunk", requestParamSchemas.read_bulk_transfer_chunk),
   requestVariant("attach", requestParamSchemas.attach),
   requestVariant("cancel_paused_work", requestParamSchemas.cancel_paused_work),
   requestVariant("delete_session", requestParamSchemas.delete_session),
@@ -520,6 +595,9 @@ export const responseNameSchema = z.enum([
   "stats_rollup",
   "subagent_history_page",
   "user_message_queued",
+  "export_session_data",
+  "bulk_transfer_chunk_accepted",
+  "bulk_transfer_chunk",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -813,6 +891,29 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
   responseVariant("attached", attachedDataSchema),
+  responseVariant("export_session_data", z.object({ data: exportSessionDataSchema }).passthrough()),
+  responseVariant(
+    "bulk_transfer_chunk_accepted",
+    z
+      .object({
+        next_chunk_index: u32Schema,
+        received_bytes: canonicalU64DecimalStringSchema,
+        complete: z.boolean(),
+        /** Advertised deadline: how long the daemon holds an idle transfer. */
+        idle_timeout_ms: u32Schema,
+      })
+      .passthrough(),
+  ),
+  responseVariant(
+    "bulk_transfer_chunk",
+    z
+      .object({
+        chunk_index: u32Schema,
+        data_base64: z.string(),
+        last: z.boolean(),
+      })
+      .passthrough(),
+  ),
   responseVariant(
     "sessions",
     z.object({ sessions: z.array(sessionSummaryWireSchema) }).passthrough(),
@@ -1457,3 +1558,4 @@ export function createEnvelope(id: string, request: ClientRequest): ClientEnvelo
 }
 
 export * from "./remote-protocol-id";
+export * from "./remote-transport-lanes";

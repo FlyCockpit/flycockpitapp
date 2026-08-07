@@ -459,6 +459,11 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_assistant_summary(assistant, redact)
         }
         proto::Response::ImportSessionArchive { .. } => {}
+        // Opaque staged transfer bytes. Redaction is applied when the
+        // export is built, not to the base64 body, which must stay
+        // byte-exact so its SHA-256 still verifies.
+        proto::Response::BulkTransferChunk { .. }
+        | proto::Response::BulkTransferChunkAccepted { .. } => {}
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. } => {}
@@ -1770,6 +1775,7 @@ impl DaemonContext {
         let container = Arc::new(crate::container::ContainerManager::detect());
         let _ = crate::container::container_manager().set((*container).clone());
         spawn_terminal_reaper(terminal_host.clone(), shutdown.clone());
+        crate::daemon::bulk_staging::spawn_reaper(shutdown.clone());
         registry
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());

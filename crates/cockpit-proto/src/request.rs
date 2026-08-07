@@ -362,11 +362,33 @@ pub enum Request {
         include_sensitive: bool,
     },
 
-    // Import a ZIP archive through the daemon-owned database writer.
+    /// Import a ZIP archive through the daemon-owned database writer.
+    ///
+    /// The archive never travels inline. `transfer` references a completed
+    /// bulk-lane transfer; the daemon reads the bytes from there after the
+    /// transfer's digest and length have been verified.
     ImportSessionArchive {
-        archive_base64: String,
+        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
         #[serde(default)]
         as_new: bool,
+    },
+
+    /// Push one chunk of a bulk transfer into daemon-side staging.
+    ///
+    /// `transfer` describes the whole transfer (length, digest, class), so no
+    /// separate begin round trip is needed. Chunks are contiguous from index 0
+    /// and each body is bounded by [`crate::MAX_ATTACHMENT_CHUNK_BASE64_BYTES`],
+    /// which keeps the encoded frame inside one bulk-lane logical payload.
+    WriteBulkTransferChunk {
+        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
+        chunk_index: u32,
+        data_base64: String,
+    },
+
+    /// Pull one chunk of a staged bulk transfer.
+    ReadBulkTransferChunk {
+        transfer_id: crate::remote_protocol_id::RemoteTransferId,
+        chunk_index: u32,
     },
 
     /// Execute a daemon-owned skill curator operation for a trusted project.
@@ -1153,6 +1175,8 @@ macro_rules! request_variants {
             (Request::AutoTitle { .. }, "auto_title");
             (Request::ExportSessionData { .. }, "export_session_data");
             (Request::ImportSessionArchive { .. }, "import_session_archive");
+            (Request::WriteBulkTransferChunk { .. }, "write_bulk_transfer_chunk");
+            (Request::ReadBulkTransferChunk { .. }, "read_bulk_transfer_chunk");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
             (Request::FsList { .. }, "fs_list");
@@ -1290,6 +1314,8 @@ macro_rules! command {
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, concurrent, none);
             (Request::ImportSessionArchive { .. }, "import_session_archive", owner_only, none, true, serialized, none);
+            (Request::WriteBulkTransferChunk { .. }, "write_bulk_transfer_chunk", owner_only, none, true, serialized, none);
+            (Request::ReadBulkTransferChunk { .. }, "read_bulk_transfer_chunk", owner_only, none, false, concurrent, none);
             (Request::Curator { project_root, .. }, "curator", owner_only, none, true, serialized, path(project_root));
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, serialized, none);
             (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, concurrent, none);
@@ -1407,6 +1433,76 @@ pub enum AttachmentPurpose {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ImportSessionArchive` must not be able to carry archive bytes inline.
+    ///
+    /// Before this prompt the variant was
+    /// `ImportSessionArchive { archive_base64: String, as_new: bool }`, so a
+    /// whole ZIP rode one NDJSON frame bounded only by the retired 8 MiB
+    /// `MAX_FRAME_BYTES`. The corrected expectation rejects that shape
+    /// outright: the old wire form no longer deserializes, and the type system
+    /// offers nowhere to put the bytes.
+    #[test]
+    fn import_session_archive_rejects_inline_bytes() {
+        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+
+        // The retired inline shape fails to parse. This is the assertion the
+        // pre-migration production code could not satisfy.
+        let legacy = serde_json::json!({
+            "request": "import_session_archive",
+            "params": { "archive_base64": "UEsDBAoAAAAA", "as_new": true },
+        });
+        assert!(
+            serde_json::from_value::<Request>(legacy).is_err(),
+            "inline archive_base64 must no longer be accepted"
+        );
+
+        // A very large inline archive is likewise unrepresentable.
+        let huge = serde_json::json!({
+            "request": "import_session_archive",
+            "params": { "archive_base64": "A".repeat(1024 * 1024), "as_new": false },
+        });
+        assert!(serde_json::from_value::<Request>(huge).is_err());
+
+        // The accepted shape is a bounded typed transfer reference.
+        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
+            crate::remote_protocol_id::kind::Transfer,
+        >([9u8; 16])
+        .unwrap();
+        let request = Request::ImportSessionArchive {
+            transfer: RemoteBulkTransferRef::new(
+                transfer_id,
+                64 * 1024 * 1024,
+                [0xAB; 32],
+                RemoteBulkMimeClass::Archive,
+            )
+            .unwrap(),
+            as_new: true,
+        };
+        assert_eq!(request.wire_tag(), "import_session_archive");
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        // A 64 MiB archive now produces a tiny request frame.
+        assert!(
+            encoded.len() < 1024,
+            "a transfer reference must stay small, got {} bytes",
+            encoded.len()
+        );
+        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        // No base64 blob field survives anywhere in the encoding.
+        assert!(!encoded.contains("archive_base64"));
+
+        let round_tripped: Request = serde_json::from_str(&encoded).unwrap();
+        match round_tripped {
+            Request::ImportSessionArchive { transfer, as_new } => {
+                assert!(as_new);
+                assert_eq!(transfer.total_length_value(), 64 * 1024 * 1024);
+                assert_eq!(transfer.mime_class, RemoteBulkMimeClass::Archive);
+            }
+            other => panic!("unexpected variant: {}", other.wire_tag()),
+        }
+    }
 
     fn active_model(
         provider: &str,

@@ -736,10 +736,18 @@ pub(super) async fn handle_serialized_request(
             .await
         }
 
-        Request::ImportSessionArchive {
-            archive_base64,
-            as_new,
-        } => import_session_archive(ctx, &archive_base64, as_new).await,
+        Request::ImportSessionArchive { transfer, as_new } => {
+            import_session_archive(ctx, &transfer, as_new).await
+        }
+        Request::WriteBulkTransferChunk {
+            transfer,
+            chunk_index,
+            data_base64,
+        } => write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64).await,
+        Request::ReadBulkTransferChunk {
+            transfer_id,
+            chunk_index,
+        } => read_bulk_transfer_chunk(&transfer_id, chunk_index).await,
 
         Request::Curator {
             project_root,
@@ -1874,10 +1882,18 @@ pub(super) async fn handle_concurrent_request(
             .await
         }
 
-        Request::ImportSessionArchive {
-            archive_base64,
-            as_new,
-        } => import_session_archive(&ctx, &archive_base64, as_new).await,
+        Request::ImportSessionArchive { transfer, as_new } => {
+            import_session_archive(&ctx, &transfer, as_new).await
+        }
+        Request::WriteBulkTransferChunk {
+            transfer,
+            chunk_index,
+            data_base64,
+        } => write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64).await,
+        Request::ReadBulkTransferChunk {
+            transfer_id,
+            chunk_index,
+        } => read_bulk_transfer_chunk(&transfer_id, chunk_index).await,
         Request::FsList {
             project_root,
             path,
@@ -3087,17 +3103,67 @@ pub(super) async fn stats_rollup(
     Ok(Response::StatsRollup { rollup })
 }
 
-pub(super) async fn import_session_archive(
-    ctx: &Arc<DaemonContext>,
-    archive_base64: &str,
-    as_new: bool,
+fn staging_error(error: crate::daemon::bulk_staging::BulkStagingError) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: format!("bulk transfer rejected: {error}"),
+    }
+}
+
+/// Accept one pushed chunk of a bulk transfer into daemon-side staging.
+pub(super) async fn write_bulk_transfer_chunk(
+    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    chunk_index: u32,
+    data_base64: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(archive_base64)
+    if data_base64.len() > cockpit_proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "bulk transfer chunk exceeds the advertised chunk bound".to_string(),
+        });
+    }
+    let chunk = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
         .map_err(|error| ErrorPayload {
             code: ErrorCode::BadRequest,
-            message: format!("invalid session import archive encoding: {error}"),
+            message: format!("invalid bulk transfer chunk encoding: {error}"),
         })?;
+    let accepted = crate::daemon::bulk_staging::write_chunk(transfer, chunk_index, &chunk)
+        .map_err(staging_error)?;
+    Ok(Response::BulkTransferChunkAccepted {
+        next_chunk_index: accepted.next_chunk_index,
+        received_bytes: cockpit_proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+            accepted.received_bytes,
+        ),
+        complete: accepted.complete,
+        // Advertise the deadline so the peer is never surprised by expiry.
+        idle_timeout_ms: crate::daemon::bulk_staging::STAGED_TRANSFER_TTL_MS as u32,
+    })
+}
+
+/// Serve one chunk of a staged bulk transfer.
+pub(super) async fn read_bulk_transfer_chunk(
+    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    chunk_index: u32,
+) -> std::result::Result<Response, ErrorPayload> {
+    let (chunk, last) =
+        crate::daemon::bulk_staging::read_chunk(*transfer_id.as_bytes(), chunk_index)
+            .map_err(staging_error)?;
+    Ok(Response::BulkTransferChunk {
+        chunk_index,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&chunk),
+        last,
+    })
+}
+
+pub(super) async fn import_session_archive(
+    ctx: &Arc<DaemonContext>,
+    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    as_new: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    // The archive bytes were staged by prior WriteBulkTransferChunk calls; the
+    // staging layer verified their length and SHA-256 before releasing them.
+    let bytes = crate::daemon::bulk_staging::take(transfer).map_err(staging_error)?;
     let archive =
         crate::session::import::read_archive_bytes(&bytes).map_err(|error| ErrorPayload {
             code: ErrorCode::BadRequest,
@@ -3110,6 +3176,26 @@ pub(super) async fn import_session_archive(
         imported: result.imported,
         redacted: result.redacted,
     })
+}
+
+/// Stage exported bytes for bulk pull and return their bounded reference.
+fn stage_export_bytes(
+    bytes: &[u8],
+) -> std::result::Result<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef, ErrorPayload>
+{
+    use rand::RngExt as _;
+    let mut transfer_id = [0u8; 16];
+    rand::rng().fill(&mut transfer_id[..]);
+    // A random 128-bit id is never all-zero in practice; force it if it is.
+    if transfer_id.iter().all(|b| *b == 0) {
+        transfer_id[0] = 1;
+    }
+    crate::daemon::bulk_staging::stage(
+        bytes,
+        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        transfer_id,
+    )
+    .map_err(staging_error)
 }
 
 pub(super) async fn export_session_data(
@@ -3148,13 +3234,13 @@ pub(super) async fn export_session_data(
             }
             messages.sort_by_key(|message| message.seq);
             let bytes = serde_json::to_vec_pretty(&messages).map_err(internal)?;
+            let transfer = stage_export_bytes(&bytes)?;
             Ok(proto::ExportSessionData {
                 session_id,
                 kind,
                 filename_extension: "json".to_string(),
                 mime: "application/json".to_string(),
-                content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                byte_len: bytes.len(),
+                transfer,
                 session_count: Some(1),
                 redacted: true,
             })
@@ -3168,13 +3254,13 @@ pub(super) async fn export_session_data(
             )
             .await
             .map_err(internal)?;
+            let transfer = stage_export_bytes(&bundle.bytes)?;
             Ok(proto::ExportSessionData {
                 session_id,
                 kind,
                 filename_extension: "zip".to_string(),
                 mime: "application/zip".to_string(),
-                content_base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
-                byte_len: bundle.summary.byte_len,
+                transfer,
                 session_count: Some(bundle.summary.session_count),
                 redacted: !include_sensitive,
             })

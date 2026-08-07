@@ -8,6 +8,17 @@ export const REMOTE_PROTOCOL_ID_BYTES = 16;
 export const REMOTE_PROTOCOL_ID_B64URL_LEN = 22;
 export const U64_MAX = 18446744073709551615n;
 
+/**
+ * Kinds of *persisted* protocol identifier. This set is mirrored by the
+ * `RemoteProtocolIdentifierKind` Prisma enum, so it must not grow for
+ * process-local uses.
+ *
+ * The ephemeral transport identifiers (`frameId`, `transferId`) reuse this
+ * module's byte/base64url codec but are deliberately not kinds here: they are
+ * never stored, never authorized, and never reach the database. Rust brands
+ * them with marker types for compile-time separation; TypeScript carries them
+ * as raw `Uint8Array`.
+ */
 export type RemoteProtocolIdKind = "tenant" | "account" | "instance" | "project";
 
 export const REMOTE_PROTOCOL_ID_KINDS: readonly RemoteProtocolIdKind[] = [
@@ -36,7 +47,7 @@ function isAllZero(bytes: Uint8Array): boolean {
 }
 
 export function isRemoteProtocolIdKind(value: unknown): value is RemoteProtocolIdKind {
-  return value === "tenant" || value === "account" || value === "instance" || value === "project";
+  return (REMOTE_PROTOCOL_ID_KINDS as readonly unknown[]).includes(value);
 }
 
 const B64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

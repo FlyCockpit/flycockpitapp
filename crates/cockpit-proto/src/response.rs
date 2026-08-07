@@ -220,6 +220,29 @@ pub enum Response {
         redacted: bool,
     },
 
+    /// Acknowledgement for [`crate::Request::WriteBulkTransferChunk`].
+    BulkTransferChunkAccepted {
+        next_chunk_index: u32,
+        received_bytes: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+        /// True once the staged bytes match the reference's length and digest.
+        complete: bool,
+        /// How long the daemon will hold this transfer without further
+        /// activity before reclaiming it.
+        ///
+        /// The deadline is advertised rather than implicit: a peer that may be
+        /// backpressured or stalled knows exactly how long it has, and can
+        /// resume, keep the transfer alive, or restart it deliberately instead
+        /// of discovering an unannounced expiry as a mysterious failure.
+        idle_timeout_ms: u32,
+    },
+
+    /// One chunk of a staged bulk transfer.
+    BulkTransferChunk {
+        chunk_index: u32,
+        data_base64: String,
+        last: bool,
+    },
+
     Curator {
         result: CuratorResult,
     },
@@ -653,6 +676,8 @@ macro_rules! response_variants {
             (Response::AutoTitle { .. }, "auto_title");
             (Response::ExportSessionData { .. }, "export_session_data");
             (Response::ImportSessionArchive { .. }, "import_session_archive");
+            (Response::BulkTransferChunkAccepted { .. }, "bulk_transfer_chunk_accepted");
+            (Response::BulkTransferChunk { .. }, "bulk_transfer_chunk");
             (Response::Curator { .. }, "curator");
             (Response::SessionLiveStatus { .. }, "session_live_status");
             (Response::Forked { .. }, "forked");
@@ -709,6 +734,82 @@ impl Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `ExportSessionData` must reference a bulk transfer, not embed the export.
+    ///
+    /// Before this prompt `ExportSessionData` carried
+    /// `content_base64: String` — the entire transcript JSON or debug-bundle
+    /// ZIP, base64-encoded, bounded only by the retired 8 MiB
+    /// `MAX_FRAME_BYTES`. The corrected expectation rejects that shape: the old
+    /// wire form no longer deserializes and the response frame is now bounded
+    /// regardless of export size.
+    #[test]
+    fn export_session_data_uses_bulk_transfer() {
+        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+
+        // The retired inline shape fails to parse.
+        let legacy = json!({
+            "response": "export_session_data",
+            "data": { "data": {
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "kind": "transcript_json",
+                "filename_extension": "json",
+                "mime": "application/json",
+                "content_base64": "Zmlyc3QgZGF0YQ==",
+                "byte_len": 12,
+                "redacted": true,
+            }},
+        });
+        assert!(
+            serde_json::from_value::<Response>(legacy).is_err(),
+            "inline content_base64 must no longer be accepted"
+        );
+
+        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
+            crate::remote_protocol_id::kind::Transfer,
+        >([7u8; 16])
+        .unwrap();
+        // A 300 MiB debug bundle: far beyond anything an 8 MiB frame allowed.
+        let total_length = 300 * 1024 * 1024;
+        let response = Response::ExportSessionData {
+            data: ExportSessionData {
+                session_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+                kind: ExportSessionKind::DebugBundle,
+                filename_extension: "zip".into(),
+                mime: "application/zip".into(),
+                transfer: RemoteBulkTransferRef::new(
+                    transfer_id,
+                    total_length,
+                    [0x5C; 32],
+                    RemoteBulkMimeClass::Export,
+                )
+                .unwrap(),
+                session_count: Some(3),
+                redacted: false,
+            },
+        };
+        assert_eq!(response.wire_tag(), "export_session_data");
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(
+            encoded.len() < 1024,
+            "an export reference must stay small, got {} bytes",
+            encoded.len()
+        );
+        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(!encoded.contains("content_base64"));
+
+        let round_tripped: Response = serde_json::from_str(&encoded).unwrap();
+        match round_tripped {
+            Response::ExportSessionData { data } => {
+                assert_eq!(data.byte_len(), total_length);
+                assert_eq!(data.transfer.mime_class, RemoteBulkMimeClass::Export);
+                assert_eq!(data.session_count, Some(3));
+            }
+            other => panic!("unexpected variant: {}", other.wire_tag()),
+        }
+    }
 
     #[test]
     fn sealed_values_response_is_registered() {

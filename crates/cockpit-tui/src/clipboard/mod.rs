@@ -7,14 +7,18 @@
 
 mod display;
 mod executable;
+pub mod feedback;
+pub mod file_publish;
 mod native;
 mod osc52;
+pub mod recovery;
 mod service;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+pub use recovery::ClipboardRecovery;
 pub use service::{ClipboardService, attached_client_route_exists};
 pub use types::{
     AttemptOutcome, AttemptRecord, Confidence, CopyError, CopyRequest, DeliveryResult, Downgrade,
@@ -26,9 +30,14 @@ pub use types::{
 ///
 /// Returns `Ok(result)` when confidence is Confirmed or Unverified, and
 /// `Err` only for Failed (including empty/over-limit pre-route failures).
-pub fn copy_plain(text: &str) -> Result<DeliveryResult, CopyError> {
+/// `recovery` is `tui.clipboard_recovery`: when
+/// [`ClipboardRecovery::PrivateFile`], a failed/unverified delivery also
+/// writes one private bounded recovery artifact (never on a Confirmed
+/// delivery, and never any filesystem operation at all when `Off`).
+pub fn copy_plain(text: &str, recovery: ClipboardRecovery) -> Result<DeliveryResult, CopyError> {
     let mut svc = ClipboardService::system();
     let result = svc.deliver_plain(text);
+    self::recovery::observe_delivery(recovery, result.confidence, text);
     if result.delivered() {
         Ok(result)
     } else if text.is_empty() {
@@ -41,18 +50,27 @@ pub fn copy_plain(text: &str) -> Result<DeliveryResult, CopyError> {
 /// Copy rich text (HTML + plain) with [`RichPolicy::AllowPlainDowngrade`].
 ///
 /// Preferred entry for UI actions that should visibly fall back to plain.
-pub fn copy_rich(plain: &str, html: &str) -> Result<DeliveryResult, CopyError> {
-    copy_rich_with_policy(plain, html, RichPolicy::AllowPlainDowngrade)
+/// See [`copy_plain`] for the `recovery` parameter.
+pub fn copy_rich(
+    plain: &str,
+    html: &str,
+    recovery: ClipboardRecovery,
+) -> Result<DeliveryResult, CopyError> {
+    copy_rich_with_policy(plain, html, RichPolicy::AllowPlainDowngrade, recovery)
 }
 
-/// Copy rich text with an explicit policy.
+/// Copy rich text with an explicit policy. See [`copy_plain`] for the
+/// `recovery` parameter — the recovery artifact always holds the plain
+/// text alternative, never the HTML.
 pub fn copy_rich_with_policy(
     plain: &str,
     html: &str,
     policy: RichPolicy,
+    recovery: ClipboardRecovery,
 ) -> Result<DeliveryResult, CopyError> {
     let mut svc = ClipboardService::system();
     let result = svc.deliver_rich(plain, html, policy);
+    self::recovery::observe_delivery(recovery, result.confidence, plain);
     if result.delivered() {
         Ok(result)
     } else {

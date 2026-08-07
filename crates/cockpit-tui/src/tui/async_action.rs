@@ -171,6 +171,18 @@ pub enum AsyncActionPayload {
     OAuthGrokComplete {
         logged_in: bool,
     },
+    /// `/copy … file <path>` published successfully. Metadata only — never
+    /// the copied content. `durability_confirmed` is `false` only when the
+    /// atomic rename itself succeeded but the follow-up parent-directory
+    /// fsync failed: the file is genuinely on disk, but that fact is not
+    /// yet guaranteed to survive a crash. The UI must show this
+    /// differently from an ordinary success, and must never show it as a
+    /// failure — the copy did not fail.
+    CopyToFile {
+        path: std::path::PathBuf,
+        bytes_written: u64,
+        durability_confirmed: bool,
+    },
 }
 
 #[derive(Debug)]

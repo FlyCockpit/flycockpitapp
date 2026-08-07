@@ -1981,10 +1981,21 @@ impl App {
             }),
             sandbox_enabled: Some(!self.no_sandbox),
         };
-        match cockpit_core::diagnostics::tui_snapshot(input) {
-            Ok(snapshot) => self.push_plain(cockpit_core::diagnostics::render(&snapshot)),
-            Err(error) => self.push_plain(format!("/doctor: {error}")),
+        let mut rendered = match cockpit_core::diagnostics::tui_snapshot(input) {
+            Ok(snapshot) => cockpit_core::diagnostics::render(&snapshot),
+            Err(error) => format!("/doctor: {error}"),
+        };
+        // Clipboard recovery lives entirely in `crates/cockpit-tui`, which
+        // sits *above* `cockpit-core` in the crate graph — `diagnostics.rs`
+        // cannot depend on it — so its section is appended here instead of
+        // inside `cockpit_core::diagnostics::render`. Metadata only — see
+        // `crate::clipboard::recovery::doctor_lines`.
+        if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
+            let (lines, _) = crate::clipboard::recovery::doctor_lines(self.clipboard_recovery, &dir);
+            rendered.push('\n');
+            rendered.push_str(&lines.join("\n"));
         }
+        self.push_plain(rendered);
     }
 
     /// `/preflight [on|off]`: flip request preflight for the running session
@@ -2101,66 +2112,152 @@ impl App {
         );
     }
 
-    /// `/copy [format]` — copy the last assistant response (message text,
-    /// excluding tool-call chrome) to the system clipboard. Default
-    /// format is `markdown` (the raw response verbatim); `plain` strips
-    /// the markdown; `rich` copies HTML. Mirrors the context-menu copy
-    /// path (`execute_context_menu_action`) and reuses the clipboard
-    /// module. Surfaces feedback via a toast.
+    /// `/copy [N] [markdown|plain|rich] [file <path>]` — copy an earlier
+    /// assistant response to the system clipboard, or (with the `file`
+    /// form) write it to a user path with an atomic no-clobber guarantee.
+    /// `N` selects newest-first among nonempty assistant messages (`1` is
+    /// the last response, the bare-`/copy` default). Default format is
+    /// `markdown` (the raw response verbatim); `plain` strips the
+    /// markdown; `rich` copies HTML to the clipboard or writes the HTML
+    /// rendering to a file. Clipboard forms mirror the context-menu copy
+    /// path (`execute_context_menu_action`) and reuse the clipboard
+    /// module; the file form runs off the event loop (GOALS: input stays
+    /// responsive) via [`Self::start_copy_to_file_action`]. Surfaces
+    /// feedback via a toast.
     pub(super) fn handle_copy_command(&mut self, arg: &str) {
         if arg.trim().eq_ignore_ascii_case("pick") {
             self.enter_copy_pick_mode();
             return;
         }
-        let format = match parse_copy_format(arg) {
-            Some(f) => f,
-            None => {
+        let command = match parse_copy_command(arg) {
+            Ok(c) => c,
+            Err(e) => {
                 self.show_toast(
-                    "Usage: `/copy [markdown|plain|rich]` (markdown is the default)",
+                    format!(
+                        "{e}. Usage: `/copy [N] [markdown|plain|rich] [file <path>]`"
+                    ),
                     ToastKind::Info,
                 );
                 return;
             }
         };
-        let Some(text) = last_agent_text(&self.history) else {
-            self.show_toast("No response to copy yet.", ToastKind::Info);
+        let Some(text) = select_agent_text(&self.history, command.n) else {
+            self.show_toast(
+                match command.n {
+                    Some(n) => format!("/copy: no assistant response at position {n}."),
+                    None => "No response to copy yet.".to_string(),
+                },
+                ToastKind::Info,
+            );
             return;
         };
-        let (msg, kind) = match format {
-            CopyFormat::Markdown => match crate::clipboard::copy_plain(&text) {
-                Ok(_) => (
+
+        if let Some(path) = command.file {
+            self.start_copy_to_file_action(path, command.format, text);
+            return;
+        }
+
+        let (msg, kind) = match command.format {
+            CopyFormat::Markdown => match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
+                Ok(result) => super::copy_actions::describe_delivered(
+                    &result,
                     "Copied last response (markdown).".to_string(),
-                    ToastKind::Success,
                 ),
                 Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
             },
             CopyFormat::Plain => {
                 let plain = crate::clipboard::markdown_to_plain(&text);
-                match crate::clipboard::copy_plain(&plain) {
-                    Ok(_) => (
+                match crate::clipboard::copy_plain(&plain, self.clipboard_recovery) {
+                    Ok(result) => super::copy_actions::describe_delivered(
+                        &result,
                         "Copied last response (plain).".to_string(),
-                        ToastKind::Success,
                     ),
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
             CopyFormat::Rich => {
                 let html = crate::clipboard::markdown_to_html(&text);
-                match crate::clipboard::copy_rich(&text, &html) {
-                    Ok(result) if result.downgrade.is_some() => (
-                        "Copied last response as plain text                          (rich copy unavailable on this route)."
-                            .to_string(),
-                        ToastKind::Success,
-                    ),
-                    Ok(_) => (
+                match crate::clipboard::copy_rich(&text, &html, self.clipboard_recovery) {
+                    Ok(result) if crate::clipboard::feedback::classify(&result).downgraded => {
+                        super::copy_actions::describe_delivered(
+                            &result,
+                            "Copied last response as plain text                          (rich copy unavailable on this route)."
+                                .to_string(),
+                        )
+                    }
+                    Ok(result) => super::copy_actions::describe_delivered(
+                        &result,
                         "Copied last response (rich).".to_string(),
-                        ToastKind::Success,
                     ),
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
         };
         self.show_toast(msg, kind);
+    }
+
+    /// The exact bytes `/copy … file` would publish for `text` rendered in
+    /// `format`. Pure so the parser/selection/render pipeline is testable
+    /// without touching the filesystem.
+    pub(super) fn render_copy_file_payload(format: CopyFormat, text: &str) -> Vec<u8> {
+        match format {
+            CopyFormat::Markdown => text.as_bytes().to_vec(),
+            CopyFormat::Plain => crate::clipboard::markdown_to_plain(text).into_bytes(),
+            CopyFormat::Rich => crate::clipboard::markdown_to_html(text).into_bytes(),
+        }
+    }
+
+    /// Dispatch `/copy … file <path>` off the event loop. A second
+    /// `/copy … file` request before this one finishes replaces it
+    /// ([`crate::tui::async_action::AsyncActionPolicy::Replace`]): the
+    /// first request's disk write may still complete, but its result is
+    /// discarded by the runner (never applied to a since-changed view) —
+    /// see `crate::tui::app::async_actions::apply_async_action_result`.
+    pub(super) fn start_copy_to_file_action(&mut self, path: String, format: CopyFormat, text: String) {
+        let target = std::path::PathBuf::from(&path);
+        let payload = Self::render_copy_file_payload(format, &text);
+        if payload.len() > crate::clipboard::file_publish::MAX_PAYLOAD_BYTES {
+            self.show_toast(
+                format!(
+                    "/copy file: selection too large ({} bytes, max {}).",
+                    payload.len(),
+                    crate::clipboard::file_publish::MAX_PAYLOAD_BYTES
+                ),
+                ToastKind::Error,
+            );
+            return;
+        }
+        self.show_toast(format!("/copy file {path}: writing…"), ToastKind::Info);
+
+        // M7: signal cancellation to whatever `/copy … file` publish is
+        // still in flight (if any) before superseding it — otherwise the
+        // superseded publish always runs to completion unnoticed even
+        // though `AsyncActionPolicy::Replace` (below) means its result
+        // will never reach a toast. Real cancellation, not merely
+        // discarding the eventual result: at its one checkpoint (temp file
+        // durable, before the atomic rename) it can still abandon before
+        // ever touching the target name.
+        if let Some(previous) = self.copy_file_cancel.take() {
+            previous.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.copy_file_cancel = Some(std::sync::Arc::clone(&cancel));
+
+        self.async_actions.start_blocking(
+            AsyncActionKind::Blocking("copy.file"),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("copy.file")),
+            move || {
+                crate::clipboard::file_publish::publish_no_clobber(&target, &payload, &move || {
+                    cancel.load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .map(|published| AsyncActionPayload::CopyToFile {
+                    path: published.path,
+                    bytes_written: published.bytes_written,
+                    durability_confirmed: published.durability_confirmed,
+                })
+                .map_err(|error| error.to_string())
+            },
+        );
     }
 
     /// `/rename <title>` manually renames the current session. `/rename`
@@ -2471,14 +2568,111 @@ pub(super) fn parse_copy_format(arg: &str) -> Option<CopyFormat> {
     }
 }
 
-/// The text of the last assistant response in `history`, excluding
-/// tool-call chrome (tool calls are non-`Agent` history variants).
-/// `None` when no assistant message with text exists yet.
-pub(super) fn last_agent_text(history: &[HistoryEntry]) -> Option<String> {
-    history.iter().rev().find_map(|e| match e {
-        HistoryEntry::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-        _ => None,
-    })
+/// Newest-first among nonempty assistant messages. `n` is 1-indexed (`1` is
+/// the most recent, matching bare `/copy`); `None` behaves as `Some(1)`.
+/// `Some(0)` and an `n` beyond the number of assistant messages are both
+/// `None` — out of range, not an error the parser can see in isolation.
+pub(super) fn select_agent_text(history: &[HistoryEntry], n: Option<usize>) -> Option<String> {
+    let index = n.unwrap_or(1);
+    if index == 0 {
+        return None;
+    }
+    history
+        .iter()
+        .rev()
+        .filter_map(|e| match e {
+            HistoryEntry::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        })
+        .nth(index - 1)
+}
+
+/// Parsed `/copy [N] [markdown|plain|rich] [file <path>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CopyCommand {
+    /// 1-indexed, newest-first among nonempty assistant messages. `None`
+    /// means "the last response" (same as bare `/copy`).
+    pub(super) n: Option<usize>,
+    pub(super) format: CopyFormat,
+    /// Present only when the `file <path>` form was used. The path is the
+    /// *raw remainder* of the line after `file ` — not further tokenized,
+    /// so it may contain spaces.
+    pub(super) file: Option<String>,
+}
+
+/// Split off the first whitespace-delimited token, returning it and the
+/// (not-yet-trimmed) remainder.
+fn split_first_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(char::is_whitespace) {
+        Some(idx) => Some((&s[..idx], &s[idx..])),
+        None => Some((s, "")),
+    }
+}
+
+/// Parse the full `/copy` grammar. `"pick"` is handled by the caller before
+/// this is reached (it is not part of this grammar). Every recognized
+/// legacy form (`/copy`, `/copy markdown`, `/copy plain`, `/copy rich`)
+/// still parses to `CopyCommand { n: None, file: None, .. }` exactly as
+/// before.
+pub(super) fn parse_copy_command(arg: &str) -> Result<CopyCommand, String> {
+    let mut rest = arg.trim();
+    let mut n = None;
+    if let Some((first, tail)) = split_first_token(rest)
+        && let Ok(parsed) = first.parse::<usize>()
+    {
+        // Positions are 1-indexed ("1" is the most recent response); `0`
+        // has no meaning here and must be rejected at parse time rather
+        // than accepted and only later found to have no selection —
+        // `select_agent_text` already treats `Some(0)` as out of range,
+        // but a parse-time rejection gives a clearer, immediate error
+        // instead of "no response at position 0".
+        if parsed == 0 {
+            return Err("N must be 1 or greater (1 is the most recent response)".to_string());
+        }
+        n = Some(parsed);
+        rest = tail;
+    }
+
+    let mut format = CopyFormat::Markdown;
+    if let Some((first, tail)) = split_first_token(rest)
+        && !first.eq_ignore_ascii_case("file")
+    {
+        match parse_copy_format(first) {
+            Some(f) => {
+                format = f;
+                rest = tail;
+            }
+            None => {
+                return Err(format!(
+                    "unknown /copy argument `{first}` (expected a number, markdown/plain/rich, or `file <path>`)"
+                ));
+            }
+        }
+    }
+
+    let mut file = None;
+    if let Some((first, tail)) = split_first_token(rest) {
+        if first.eq_ignore_ascii_case("file") {
+            let path = tail.trim();
+            if path.is_empty() {
+                return Err("`/copy … file` requires a path".to_string());
+            }
+            file = Some(path.to_string());
+            rest = "";
+        } else {
+            return Err(format!("unknown /copy argument `{first}`"));
+        }
+    }
+
+    if !rest.trim().is_empty() {
+        return Err(format!("unexpected trailing text `{}`", rest.trim()));
+    }
+
+    Ok(CopyCommand { n, format, file })
 }
 
 pub(super) fn slash_args(raw: &str) -> String {

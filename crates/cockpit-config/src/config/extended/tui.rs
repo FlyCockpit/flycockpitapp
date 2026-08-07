@@ -78,6 +78,28 @@ pub struct TuiConfig {
     /// optional terminal bell, optional desktop notification.
     #[serde(default)]
     pub attention: AttentionConfig,
+    /// Opt-in private recovery artifact for failed/unverified clipboard
+    /// deliveries. `Off` (default) performs zero content filesystem
+    /// operations. `PrivateFile` writes one bounded owner-only artifact
+    /// through the central copy service; diagnostics only ever read its
+    /// metadata, never its content. No environment override exists —
+    /// persisted layered config is the sole setting.
+    #[serde(default)]
+    pub clipboard_recovery: ClipboardRecovery,
+}
+
+/// Opt-in disk fallback for clipboard deliveries that fail or land
+/// unverified (e.g. an unacknowledged OSC52 emission). See
+/// [`TuiConfig::clipboard_recovery`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipboardRecovery {
+    /// No recovery artifact is ever written. The default.
+    #[default]
+    Off,
+    /// Write one bounded, owner-only recovery file per failed/unverified
+    /// delivery, replacing the previous one.
+    PrivateFile,
 }
 
 /// User-tunable attention settings (persisted under `tui.attention`).
@@ -390,6 +412,7 @@ impl Default for TuiConfig {
             use_emojis: false,
             caffeinate_display_awake: false,
             attention: AttentionConfig::default(),
+            clipboard_recovery: ClipboardRecovery::default(),
         }
     }
 }

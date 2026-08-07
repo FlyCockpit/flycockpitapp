@@ -1848,12 +1848,16 @@ fn apply_fetch_result_save_failure_surfaces() {
 #[test]
 fn copy_oauth_url_reports_success_error_and_missing_url() {
     let mut status = None;
+    // Confirmed, not Unverified: this exercises the plain "copied OAuth
+    // URL" wording specifically. `copy_oauth_url_reports_unverified_delivery_distinctly`
+    // (below) covers the Unverified case, which now has different wording
+    // — see the follow-up finding on M5's toast-based sibling.
     let copied = crate::clipboard::DeliveryResult {
         attempts: vec![],
         requested_representation: crate::clipboard::Representation::Plain,
         delivered_representation: crate::clipboard::Representation::Plain,
         downgrade: None,
-        confidence: crate::clipboard::Confidence::Unverified,
+        confidence: crate::clipboard::Confidence::Confirmed,
     };
     copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
         Ok(copied.clone())
@@ -1867,6 +1871,33 @@ fn copy_oauth_url_reports_success_error_and_missing_url() {
         Err(crate::clipboard::CopyError::Backend)
     });
     assert_eq!(status, Some(Err("clipboard backend error".to_string())));
+}
+
+/// The finding this proves against: `copy_oauth_url_with` used to report
+/// "copied OAuth URL" for both Confirmed and Unverified deliveries —
+/// exactly the class of gap `describe_delivered` exists to close for the
+/// toast-based copy paths, just on a status-line path that has no
+/// `ToastKind` of its own.
+#[test]
+fn copy_oauth_url_reports_unverified_delivery_distinctly() {
+    let mut status = None;
+    let unverified = crate::clipboard::DeliveryResult {
+        attempts: vec![],
+        requested_representation: crate::clipboard::Representation::Plain,
+        delivered_representation: crate::clipboard::Representation::Plain,
+        downgrade: None,
+        confidence: crate::clipboard::Confidence::Unverified,
+    };
+    copy_oauth_url_with(Some("https://example.test/oauth"), &mut status, |_| {
+        Ok(unverified.clone())
+    });
+    let message = status.unwrap().unwrap();
+    assert_ne!(
+        message, "copied OAuth URL",
+        "an Unverified delivery must not read identically to a Confirmed one"
+    );
+    assert!(message.contains("copied OAuth URL"));
+    assert!(message.to_lowercase().contains("unverified"));
 }
 
 static OAUTH_EFFECTS_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

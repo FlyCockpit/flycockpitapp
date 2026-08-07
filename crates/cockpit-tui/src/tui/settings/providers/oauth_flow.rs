@@ -188,10 +188,41 @@ pub(crate) struct OAuthEffects {
     pub(super) bind: fn(u16) -> anyhow::Result<tokio::net::TcpListener>,
 }
 
+/// Deliberate, not an oversight: this is always
+/// [`crate::clipboard::ClipboardRecovery::Off`], never the user's
+/// persisted `tui.clipboard_recovery` setting.
+///
+/// Two things justify it, not one:
+/// 1. What actually flows through `OAuthEffects.copy` here is never a
+///    bearer credential — it is a device-flow pairing `user_code` (e.g.
+///    `login.user_code` in `apply_begin`) or a public authorize/
+///    verification URL (`copy_oauth_url_with`). A pairing code is
+///    short-lived and useless without also completing the flow in a
+///    browser; a URL is not a secret at all. This is a materially lower
+///    sensitivity bar than the doc comment this replaced implied.
+/// 2. `OAuthEffects` is constructed at four call sites
+///    (`settings/mod.rs::apply_oauth_begin`, `async_actions.rs`'s
+///    `oauth.grok.begin` handler, `OAuthFlowState::new`, and
+///    `handle_oauth_flow_key`), two of which — `OAuthFlowState::new` and
+///    the free function `handle_oauth_flow_key` — are general
+///    constructors/dispatchers with no `App`/config access at all today.
+///    Threading a real `ClipboardRecovery` through honestly would mean
+///    adding that parameter to all four and every one of their own
+///    callers, not a local change — a real refactor, not a one-line fix,
+///    and not proportionate to content this low-sensitivity.
+///
+/// If a future prompt gives OAuth flow state routine access to the
+/// session's config (rather than this static effect table), revisit this.
+fn copy_plain_no_recovery(
+    text: &str,
+) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError> {
+    crate::clipboard::copy_plain(text, crate::clipboard::ClipboardRecovery::Off)
+}
+
 impl OAuthEffects {
     pub(crate) fn production() -> Self {
         Self {
-            copy: crate::clipboard::copy_plain,
+            copy: copy_plain_no_recovery,
             is_ssh: cockpit_core::sysinfo::is_ssh,
             open: cockpit_core::browser::open,
             bind: cockpit_core::auth::xai_oauth::bind_callback_listener,
@@ -437,27 +468,52 @@ impl OAuthFlowState {
     ) -> Option<OAuthFlowRequest> {
         match (self.provider, result) {
             (OAuthProvider::Codex, OAuthBeginResult::Device(Ok(login))) => {
-                let copied = (effects.copy)(&login.user_code).is_ok();
+                let copy_result = (effects.copy)(&login.user_code);
+                let copied = copy_result.is_ok();
+                // `copied` alone used to collapse Confirmed and Unverified
+                // into the same "Code copied" wording — the same gap
+                // `describe_delivered` exists to close for the toast-based
+                // copy paths elsewhere in the crate. This status line has
+                // no toast/`ToastKind` of its own, so the fix here is a
+                // wording qualifier rather than a shared helper; the code
+                // itself is also always rendered on screen (see the
+                // `Span::styled(login.user_code...)` a few lines below in
+                // the render path), so an unverified copy still leaves the
+                // user able to read and type it, unlike the chat-copy
+                // toast paths where the clipboard is the only way out.
+                let unverified = copy_result
+                    .as_ref()
+                    .is_ok_and(|r| crate::clipboard::feedback::classify(r).is_unverified());
                 let ssh = (effects.is_ssh)();
                 self.ssh = ssh;
                 let opened = ssh || (effects.open)(&login.verification_uri).is_ok();
+                let copied_suffix = if unverified {
+                    " (unverified — also shown above if the paste doesn't work)"
+                } else {
+                    ""
+                };
                 let status = if ssh {
                     if copied {
-                        "Code copied. Open the link and enter the code. Waiting for approval..."
+                        format!(
+                            "Code copied{copied_suffix}. Open the link and enter the code. Waiting for approval..."
+                        )
                     } else {
                         "Open the link and enter the code. Waiting for approval (code copy failed)."
+                            .to_string()
                     }
                 } else if copied && opened {
-                    "Opened browser; code copied. Waiting for approval..."
+                    format!("Opened browser; code copied{copied_suffix}. Waiting for approval...")
                 } else if opened {
-                    "Opened browser. Waiting for approval (code copy failed)."
+                    "Opened browser. Waiting for approval (code copy failed).".to_string()
                 } else if copied {
-                    "Code copied. Open the link manually. Waiting for approval..."
+                    format!(
+                        "Code copied{copied_suffix}. Open the link manually. Waiting for approval..."
+                    )
                 } else {
-                    "Open the link manually. Waiting for approval (code copy failed)."
+                    "Open the link manually. Waiting for approval (code copy failed).".to_string()
                 };
                 self.polling = true;
-                self.status = Some(Ok(status.to_string()));
+                self.status = Some(Ok(status));
                 self.session = OAuthSession::Device(login.clone());
                 Some(OAuthFlowRequest {
                     provider: OAuthProvider::Codex,

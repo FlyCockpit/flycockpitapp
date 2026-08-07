@@ -81,6 +81,7 @@ impl App {
         self.diff_style = tui_cfg.diff_style;
         self.exit_tail_lines = tui_cfg.exit_tail_lines;
         self.rich_text_copy = tui_cfg.rich_text_copy;
+        self.clipboard_recovery = tui_cfg.clipboard_recovery;
         self.use_emojis = tui_cfg.use_emojis;
         // Attention notification settings (implementation note):
         // pick up a `/settings` change so it takes effect immediately. The

@@ -1,12 +1,44 @@
 use super::*;
 
+/// The `(message, ToastKind)` for a delivered (Confirmed or Unverified —
+/// never Failed, which every call site's `Err` arm already handles
+/// separately) result, given the caller's wording for the confirmed case.
+/// Every copy call site special-cased `classify(&result).downgraded` (a
+/// rich request that fell back to plain) but nothing else, so an
+/// Unverified delivery (an unacknowledged OSC52 emission — the terminal
+/// was *told* to put it on the clipboard, but never confirmed it did) was
+/// shown with exactly the same "Copied" wording and `Success` tone as a
+/// Confirmed one. This is the one place every caller gets that
+/// distinction from; the downgrade special-case at each call site is
+/// unchanged and unrelated (it fires before this ever runs).
+pub(super) fn describe_delivered(
+    result: &crate::clipboard::DeliveryResult,
+    confirmed_message: String,
+) -> (String, ToastKind) {
+    if crate::clipboard::feedback::classify(result).is_unverified() {
+        (
+            format!("{confirmed_message} (unverified — could not confirm delivery)"),
+            ToastKind::Warning,
+        )
+    } else {
+        (confirmed_message, ToastKind::Success)
+    }
+}
+
 impl App {
     pub(super) fn copy_persistent_notice_fix_command(&mut self) {
         let Some(command) = self.persistent_notice_fix_command().map(str::to_string) else {
             return;
         };
-        match crate::clipboard::copy_plain(&command) {
-            Ok(_) => self.show_copy_ok_or_tmux_hint("Copied fix command.".to_string()),
+        match crate::clipboard::copy_plain(&command, self.clipboard_recovery) {
+            Ok(result) => {
+                let (msg, kind) = describe_delivered(&result, "Copied fix command.".to_string());
+                if matches!(kind, ToastKind::Success) {
+                    self.show_copy_ok_or_tmux_hint(msg);
+                } else {
+                    self.show_toast(msg, kind);
+                }
+            }
             Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
         }
     }
@@ -65,20 +97,24 @@ impl App {
                     pins::CopyShape::CodeBlock => format!("```\n{text}```\n"),
                 };
                 let html = crate::clipboard::markdown_to_html(&rich_source);
-                match crate::clipboard::copy_rich(&rich_source, &html) {
-                    Ok(result) if result.downgrade.is_some() => (
-                        format!(
-                            "Copied {title} as plain text \
-                             (rich-text unavailable on this route)."
-                        ),
-                        ToastKind::Success,
-                    ),
-                    Ok(_) => (format!("Copied {title} as rich text."), ToastKind::Success),
+                match crate::clipboard::copy_rich(&rich_source, &html, self.clipboard_recovery) {
+                    Ok(result) if crate::clipboard::feedback::classify(&result).downgraded => {
+                        describe_delivered(
+                            &result,
+                            format!(
+                                "Copied {title} as plain text \
+                                 (rich-text unavailable on this route)."
+                            ),
+                        )
+                    }
+                    Ok(result) => {
+                        describe_delivered(&result, format!("Copied {title} as rich text."))
+                    }
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
-            ContextMenuAction::CopyAsMarkdown => match crate::clipboard::copy_plain(&text) {
-                Ok(_) => (format!("Copied {title} as markdown."), ToastKind::Success),
+            ContextMenuAction::CopyAsMarkdown => match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
+                Ok(result) => describe_delivered(&result, format!("Copied {title} as markdown.")),
                 Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
             },
             ContextMenuAction::CopyAsPlainText => {
@@ -86,8 +122,10 @@ impl App {
                     pins::CopyShape::Message => crate::clipboard::markdown_to_plain(&text),
                     pins::CopyShape::CodeBlock => text.clone(),
                 };
-                match crate::clipboard::copy_plain(&plain) {
-                    Ok(_) => (format!("Copied {title} as plain text."), ToastKind::Success),
+                match crate::clipboard::copy_plain(&plain, self.clipboard_recovery) {
+                    Ok(result) => {
+                        describe_delivered(&result, format!("Copied {title} as plain text."))
+                    }
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
@@ -132,7 +170,8 @@ impl App {
     }
 
     pub(super) fn copy_selection_plaintext(&mut self) {
-        self.copy_selection_plaintext_with(crate::clipboard::copy_plain);
+        let recovery = self.clipboard_recovery;
+        self.copy_selection_plaintext_with(move |text| crate::clipboard::copy_plain(text, recovery));
     }
 
     pub(super) fn copy_selection_plaintext_with(
@@ -182,11 +221,16 @@ impl App {
             return;
         }
         match copy_plain(&text_to_copy) {
-            Ok(_) => {
-                self.show_copy_ok_or_tmux_hint(format!(
-                    "Copied {} chars to clipboard.",
-                    text_to_copy.chars().count()
-                ));
+            Ok(result) => {
+                let (msg, kind) = describe_delivered(
+                    &result,
+                    format!("Copied {} chars to clipboard.", text_to_copy.chars().count()),
+                );
+                if matches!(kind, ToastKind::Success) {
+                    self.show_copy_ok_or_tmux_hint(msg);
+                } else {
+                    self.show_toast(msg, kind);
+                }
                 // Clear selection after an accepted copy — the user got
                 // what they wanted; leaving it highlighted just gets in the
                 // way of the next interaction.
@@ -223,17 +267,71 @@ impl App {
             return;
         };
         let html = crate::clipboard::markdown_to_html(&text);
-        match crate::clipboard::copy_rich(&text, &html) {
-            Ok(result) if result.downgrade.is_some() => self.show_copy_ok_or_tmux_hint(
-                "Copied as plain text (rich-text unavailable on this route).".to_string(),
-            ),
-            Ok(_) => self
-                .show_copy_ok_or_tmux_hint("Copied last agent message as rich text.".to_string()),
+        match crate::clipboard::copy_rich(&text, &html, self.clipboard_recovery) {
+            Ok(result) if crate::clipboard::feedback::classify(&result).downgraded => {
+                let (msg, kind) = describe_delivered(
+                    &result,
+                    "Copied as plain text (rich-text unavailable on this route).".to_string(),
+                );
+                if matches!(kind, ToastKind::Success) {
+                    self.show_copy_ok_or_tmux_hint(msg);
+                } else {
+                    self.show_toast(msg, kind);
+                }
+            }
+            Ok(result) => {
+                let (msg, kind) = describe_delivered(
+                    &result,
+                    "Copied last agent message as rich text.".to_string(),
+                );
+                if matches!(kind, ToastKind::Success) {
+                    self.show_copy_ok_or_tmux_hint(msg);
+                } else {
+                    self.show_toast(msg, kind);
+                }
+            }
             Err(crate::clipboard::CopyError::TooLarge { .. }) => self.show_toast(
                 "Selection too large to copy (max sequence size) — copy a smaller range.",
                 ToastKind::Error,
             ),
             Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
         }
+    }
+}
+
+#[cfg(test)]
+mod describe_delivered_tests {
+    use super::*;
+    use crate::clipboard::{Confidence, DeliveryResult, Representation};
+
+    fn result(confidence: Confidence) -> DeliveryResult {
+        DeliveryResult {
+            attempts: Vec::new(),
+            requested_representation: Representation::Plain,
+            delivered_representation: Representation::Plain,
+            downgrade: None,
+            confidence,
+        }
+    }
+
+    /// The finding this proves against: `describe_delivered` used to be
+    /// consulted only for the rich-downgrade special case, so an
+    /// Unverified delivery was indistinguishable from a Confirmed one —
+    /// every call site showed the same "Copied" wording at `Success` tone
+    /// either way.
+    #[test]
+    fn confirmed_and_unverified_produce_visibly_different_feedback() {
+        let confirmed = describe_delivered(&result(Confidence::Confirmed), "Copied x.".to_string());
+        assert_eq!(confirmed, ("Copied x.".to_string(), ToastKind::Success));
+
+        let unverified =
+            describe_delivered(&result(Confidence::Unverified), "Copied x.".to_string());
+        assert_eq!(unverified.1, ToastKind::Warning);
+        assert!(unverified.0.contains("Copied x."));
+        assert!(unverified.0.to_lowercase().contains("unverified"));
+        assert_ne!(
+            confirmed, unverified,
+            "confirmed and unverified deliveries must not produce identical feedback"
+        );
     }
 }

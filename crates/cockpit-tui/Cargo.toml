@@ -68,9 +68,23 @@ vt100 = "0.16"
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# Pin matches crates/cockpit-config and crates/cockpit-core (see their
+# Cargo.toml comments). Wdk_Storage_FileSystem/Wdk_Foundation are for the
+# NtCreateFile handle-relative opens shared with cockpit-config's atomic
+# writer; Win32_Security_Authorization is for the clipboard recovery
+# artifact's explicit owner-only DACL (SetSecurityInfo/GetSecurityInfo/
+# ConvertStringSecurityDescriptorToSecurityDescriptorW) and the `/copy file`
+# atomic no-clobber publish's FileRenameInfoEx.
 windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

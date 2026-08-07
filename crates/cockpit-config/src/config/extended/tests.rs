@@ -1996,4 +1996,156 @@ fn copy_on_release_omission_preserves_sibling_tui_values() {
     assert!(!cfg.tui.show_cwd);
 }
 
+#[test]
+fn clipboard_recovery_config_defaults_off_when_omitted() {
+    // Absent tui block.
+    let empty: ExtendedConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty.tui.clipboard_recovery, ClipboardRecovery::Off);
+
+    // Present tui block, key omitted; sibling still parses.
+    let partial: ExtendedConfig =
+        serde_json::from_str(r#"{"tui":{"mouse_capture":false}}"#).unwrap();
+    assert_eq!(partial.tui.clipboard_recovery, ClipboardRecovery::Off);
+    assert!(!partial.tui.mouse_capture);
+}
+
+#[test]
+fn clipboard_recovery_config_struct_default_is_off() {
+    assert_eq!(TuiConfig::default().clipboard_recovery, ClipboardRecovery::Off);
+    assert_eq!(
+        ExtendedConfig::default().tui.clipboard_recovery,
+        ClipboardRecovery::Off
+    );
+}
+
+#[test]
+fn clipboard_recovery_config_parses_private_file() {
+    let cfg: ExtendedConfig =
+        serde_json::from_str(r#"{"tui":{"clipboard_recovery":"private-file"}}"#).unwrap();
+    assert_eq!(cfg.tui.clipboard_recovery, ClipboardRecovery::PrivateFile);
+}
+
+#[test]
+fn clipboard_recovery_config_rejects_invalid_values() {
+    for bad in [
+        r#"{"tui":{"clipboard_recovery":"on"}}"#,
+        r#"{"tui":{"clipboard_recovery":"private_file"}}"#,
+        r#"{"tui":{"clipboard_recovery":true}}"#,
+        r#"{"tui":{"clipboard_recovery":1}}"#,
+        r#"{"tui":{"clipboard_recovery":null}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ExtendedConfig>(bad).is_err(),
+            "expected {bad} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn clipboard_recovery_config_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg = doc.config();
+    cfg.tui.clipboard_recovery = ClipboardRecovery::PrivateFile;
+    doc.write(&cfg).unwrap();
+
+    let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(reloaded.tui.clipboard_recovery, ClipboardRecovery::PrivateFile);
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("\"clipboard_recovery\": \"private-file\"")
+            || on_disk.contains("\"clipboard_recovery\":\"private-file\""),
+        "{on_disk}"
+    );
+
+    // Explicit off after private-file round-trips as well.
+    let mut doc2 = ExtendedConfigDoc::load(&path).unwrap();
+    let mut cfg2 = doc2.config();
+    cfg2.tui.clipboard_recovery = ClipboardRecovery::Off;
+    doc2.write(&cfg2).unwrap();
+    assert_eq!(
+        ExtendedConfigDoc::load(&path).unwrap().config().tui.clipboard_recovery,
+        ClipboardRecovery::Off
+    );
+
+    // Layering: project layer overrides home in both directions, and an
+    // omitted sibling still inherits the home layer (no environment
+    // override/kill switch exists — persisted layered config is the sole
+    // setting).
+    for (home_val, project_val) in [
+        (ClipboardRecovery::Off, ClipboardRecovery::PrivateFile),
+        (ClipboardRecovery::PrivateFile, ClipboardRecovery::Off),
+    ] {
+        let layer_tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(layer_tmp.path());
+        let home_cfg = layer_tmp.path().join("home/.config/cockpit/config.json");
+        std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+        std::fs::write(
+            &home_cfg,
+            format!(
+                r#"{{"tui":{{"clipboard_recovery":{:?},"mouse_capture":true}}}}"#,
+                serde_kebab(home_val)
+            ),
+        )
+        .unwrap();
+        let project = layer_tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+        std::fs::write(
+            project.join(".cockpit/config.json"),
+            format!(
+                r#"{{"tui":{{"clipboard_recovery":{:?}}}}}"#,
+                serde_kebab(project_val)
+            ),
+        )
+        .unwrap();
+        let layered = trusted_load_for_cwd(&project);
+        assert_eq!(
+            layered.tui.clipboard_recovery, project_val,
+            "project layer must override home clipboard_recovery (home={home_val:?} project={project_val:?})"
+        );
+        assert!(
+            layered.tui.mouse_capture,
+            "omitted nested sibling inherits home layer"
+        );
+    }
+}
+
+fn serde_kebab(value: ClipboardRecovery) -> &'static str {
+    match value {
+        ClipboardRecovery::Off => "off",
+        ClipboardRecovery::PrivateFile => "private-file",
+    }
+}
+
+#[test]
+fn clipboard_recovery_config_omission_preserves_sibling_tui_values() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "tui": {
+                "mouse_capture": false,
+                "rich_text_copy": false,
+                "hyperlinks": false,
+                "show_cwd": false
+            }
+        }"#,
+    )
+    .unwrap();
+    let cfg = ExtendedConfigDoc::load(&path).unwrap().config();
+    assert_eq!(
+        cfg.tui.clipboard_recovery,
+        ClipboardRecovery::Off,
+        "omitted key defaults off"
+    );
+    assert!(!cfg.tui.mouse_capture);
+    assert!(!cfg.tui.rich_text_copy);
+    assert!(!cfg.tui.hyperlinks);
+    assert!(!cfg.tui.show_cwd);
+}
+
 mod guards_and_resolvers;

@@ -347,10 +347,35 @@
   },
   "import_session_archive": {
     "params": {
-      "archive_base64": "UEsDBAoAAAAA",
-      "as_new": true
+      "as_new": true,
+      "transfer": {
+        "mime_class": "archive",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "12",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
     },
     "request": "import_session_archive"
+  },
+  "write_bulk_transfer_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "data_base64": "data_base64-fixture",
+      "transfer": {
+        "mime_class": "archive",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "12",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
+    },
+    "request": "write_bulk_transfer_chunk"
+  },
+  "read_bulk_transfer_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+    },
+    "request": "read_bulk_transfer_chunk"
   },
   "list_assistants": {
     "request": "list_assistants"

@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_protocol_id;
+pub mod remote_transport;
 pub mod terminal;
 
 use std::collections::{BTreeMap, HashMap};
@@ -492,18 +493,26 @@ pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 6;
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Max length of a single NDJSON frame. Tool args + read payloads can
-/// be large; keep this generous so a `read` of an 8 KB-capped file
-/// plus the envelope wrapper has headroom.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Max length of a single local NDJSON frame.
+///
+/// Successor to the retired 8 MiB `MAX_FRAME_BYTES`. Every application payload
+/// above 512 KiB now travels as typed windowed bulk chunks
+/// ([`remote_transport::bulk`]), so the largest legal NDJSON frame carries a
+/// 512 KiB (524,288-byte) binary payload. That base64-inflates to
+/// 4 × ⌈524,288 / 3⌉ = 699,052 bytes; the JSON envelope (field names, ids,
+/// escaping) fits comfortably in the remaining 349,524 bytes. 1 MiB is the
+/// smallest clean power-of-two bound with that headroom.
+pub const MAX_NDJSON_FRAME_BYTES: usize = 1_048_576;
 
 /// Pasted-image upload limits. Chunks are base64 strings inside JSON frames,
-/// so keep the base64 payload well below [`MAX_FRAME_BYTES`].
+/// so keep the base64 payload below the bulk lane's 512 KiB logical cap.
 pub const MAX_SINGLE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_IMAGES_PER_USER_MESSAGE: usize = 4;
 pub const MAX_IMAGE_DIMENSION_PIXELS: u32 = 8192;
-pub const MAX_ATTACHMENT_CHUNK_BASE64_BYTES: usize = 512 * 1024;
+/// One attachment chunk's base64 body. Sized so the encoded chunk frame fits
+/// inside a single 512 KiB bulk-lane logical payload with envelope headroom.
+pub const MAX_ATTACHMENT_CHUNK_BASE64_BYTES: usize = 256 * 1024;
 pub const PENDING_ATTACHMENT_TTL_SECS: u64 = 10 * 60;
 pub const IMAGE_ATTACHMENT_MIME_PNG: &str = "image/png";
 pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
@@ -1366,18 +1375,30 @@ pub enum ExportSessionKind {
     DebugBundle,
 }
 
+/// Export metadata plus a bounded reference to the exported bytes.
+///
+/// The bytes themselves never ride an application frame: they travel as a
+/// bulk-lane begin/chunk/complete transfer, and `transfer` names it. This is
+/// what keeps a debug-bundle export from starving the control lane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportSessionData {
     pub session_id: Uuid,
     pub kind: ExportSessionKind,
     pub filename_extension: String,
     pub mime: String,
-    pub content_base64: String,
-    pub byte_len: usize,
+    /// Typed bulk transfer reference; carries the length and SHA-256 digest.
+    pub transfer: remote_transport::bulk::RemoteBulkTransferRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_count: Option<usize>,
     #[serde(default)]
     pub redacted: bool,
+}
+
+impl ExportSessionData {
+    /// Length of the exported payload, from the transfer reference.
+    pub fn byte_len(&self) -> u64 {
+        self.transfer.total_length_value()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1631,7 +1652,10 @@ where
 
     pub fn with_version(stream: S, version: u32) -> Self {
         Self {
-            framed: Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+            framed: Framed::new(
+                stream,
+                LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+            ),
             version,
         }
     }
@@ -1641,10 +1665,16 @@ where
         let (read, write) = tokio::io::split(self.framed.into_inner());
         (
             ProtoReadHalf {
-                framed: FramedRead::new(read, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+                framed: FramedRead::new(
+                    read,
+                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+                ),
             },
             ProtoWriteHalf {
-                framed: FramedWrite::new(write, LinesCodec::new_with_max_length(MAX_FRAME_BYTES)),
+                framed: FramedWrite::new(
+                    write,
+                    LinesCodec::new_with_max_length(MAX_NDJSON_FRAME_BYTES),
+                ),
                 version,
             },
         )
@@ -1852,7 +1882,7 @@ fn codec_error(err: LinesCodecError) -> io::Error {
         LinesCodecError::Io(e) => e,
         LinesCodecError::MaxLineLengthExceeded => io::Error::new(
             io::ErrorKind::InvalidData,
-            "NDJSON frame exceeded MAX_FRAME_BYTES",
+            "NDJSON frame exceeded MAX_NDJSON_FRAME_BYTES",
         ),
     }
 }
@@ -2228,6 +2258,12 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     const REQUEST_ALLOWLIST: &[&str] = &[
         "archive_session",
+        // Migrated to a typed bulk transfer reference by
+        // `remote-transport-logical-lanes`; mirrored so the TypeScript schemas
+        // see the post-migration shape.
+        "import_session_archive",
+        "read_bulk_transfer_chunk",
+        "write_bulk_transfer_chunk",
         "attach",
         "cancel_paused_work",
         "cancel_run_invocation",
@@ -2265,6 +2301,10 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     const RESPONSE_ALLOWLIST: &[&str] = &[
         "ack",
+        "bulk_transfer_chunk",
+        "bulk_transfer_chunk_accepted",
+        // Migrated to a typed bulk transfer reference.
+        "export_session_data",
         "attached",
         "forked",
         "fs_list",
@@ -3507,8 +3547,24 @@ mod tests {
         );
     }
 
+    /// Replaces `attachment_chunk_frame_stays_below_max_frame_with_headroom`.
+    ///
+    /// The retired test asserted only `json.len() < MAX_FRAME_BYTES / 4`, i.e.
+    /// under 2 MiB of an 8 MiB budget. That bound is four times the bulk lane's
+    /// 512 KiB logical payload cap, so it passed for every frame that could
+    /// starve authorization, cancellation, or terminal input — it could not
+    /// have caught the behaviour this prompt exists to fix. The corrected
+    /// expectation is the lane cap itself, and the pre-migration constants fail
+    /// it.
     #[test]
-    fn attachment_chunk_frame_stays_below_max_frame_with_headroom() {
+    fn remote_transport_correct_legacy_frame_tests_first() {
+        use remote_transport::lane::{MAX_LOGICAL_PAYLOAD_BYTES, RemoteLane};
+
+        // The 8 MiB frame budget is gone; the settled successor is 1 MiB.
+        assert_eq!(MAX_NDJSON_FRAME_BYTES, 1_048_576);
+        assert_eq!(MAX_NDJSON_FRAME_BYTES, 1024 * 1024);
+        const { assert!(MAX_NDJSON_FRAME_BYTES < 8 * 1024 * 1024) };
+
         let data_base64 = "A".repeat(MAX_ATTACHMENT_CHUNK_BASE64_BYTES);
         let env = Envelope::request(
             Uuid::new_v4(),
@@ -3519,7 +3575,38 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&env).unwrap();
-        assert!(json.len() < MAX_FRAME_BYTES / 4);
+
+        // The old assertion is still satisfied — which is exactly why it was
+        // worthless: it cannot distinguish a compliant frame from one four
+        // times the lane cap.
+        assert!(json.len() < 2 * 1024 * 1024);
+
+        // Corrected: an attachment chunk fits one bulk-lane logical payload,
+        // so it occupies exactly one scheduled frame and cannot monopolise
+        // the carrier.
+        assert!(json.len() <= MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(json.len() <= RemoteLane::Bulk.max_payload_bytes());
+        assert!(json.len() < MAX_NDJSON_FRAME_BYTES);
+
+        // Proof the old production behaviour fails the corrected assertion:
+        // the pre-migration 512 KiB base64 chunk plus its envelope exceeded
+        // the lane cap.
+        let legacy_env = Envelope::request(
+            Uuid::new_v4(),
+            Request::UploadAttachmentChunk {
+                upload_id: Uuid::new_v4(),
+                offset: 0,
+                data_base64: "A".repeat(512 * 1024),
+            },
+        );
+        let legacy_json = serde_json::to_string(&legacy_env).unwrap();
+        assert!(
+            legacy_json.len() > MAX_LOGICAL_PAYLOAD_BYTES,
+            "the retired 512 KiB base64 chunk must exceed the 512 KiB lane cap"
+        );
+        // It also would not have fit the successor NDJSON cap's headroom rule
+        // once base64 inflation is accounted for at the old 8 MiB sizes.
+        assert!(legacy_json.len() < MAX_NDJSON_FRAME_BYTES);
     }
 
     #[test]

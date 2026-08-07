@@ -2174,9 +2174,8 @@ async fn export_rpc_returns_redacted_data() {
     assert_eq!(data.kind, proto::ExportSessionKind::TranscriptJson);
     assert_eq!(data.filename_extension, "json");
     assert!(data.redacted);
-    let transcript = base64::engine::general_purpose::STANDARD
-        .decode(data.content_base64.as_bytes())
-        .unwrap();
+    let transcript =
+        crate::daemon::bulk_staging::take(&data.transfer).expect("staged transcript bytes");
     let transcript_json: serde_json::Value = serde_json::from_slice(&transcript).unwrap();
     assert!(transcript_json.to_string().contains("[redacted]"));
     assert!(!transcript_json.to_string().contains("sk-"));
@@ -2200,13 +2199,9 @@ async fn export_rpc_returns_redacted_data() {
     assert_eq!(data.filename_extension, "zip");
     assert_eq!(data.mime, "application/zip");
     assert_eq!(data.session_count, Some(1));
-    assert_eq!(
-        data.byte_len,
-        base64::engine::general_purpose::STANDARD
-            .decode(data.content_base64.as_bytes())
-            .unwrap()
-            .len()
-    );
+    let bundle_bytes =
+        crate::daemon::bulk_staging::take(&data.transfer).expect("staged bundle bytes");
+    assert_eq!(data.byte_len(), bundle_bytes.len() as u64);
     assert!(data.redacted);
 }
 
@@ -3555,6 +3550,7 @@ fn dispatch_matrix_class_for_command(
         | ("list_assistants", "owner_only", false)
         | ("list_sealed_values", "owner_only", false)
         | ("export_session_data", "owner_only", false)
+        | ("read_bulk_transfer_chunk", "owner_only", false)
         | ("get_usage_counts", "owner_only", false)
         | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
         ("count_pinned_messages", "session_row_reader", false)
@@ -3835,6 +3831,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "import_session_archive",
             effect_class: Durable,
             observation: "valid archive creates its session rows atomically",
+        },
+        MutatingDispatchCase {
+            kind: "write_bulk_transfer_chunk",
+            effect_class: Durable,
+            observation: "a staged chunk is retained and acknowledged with its next index",
         },
         MutatingDispatchCase {
             kind: "curator",
@@ -4253,6 +4254,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clear_goal"
         | "list_assistants"
         | "export_session_data"
+        | "write_bulk_transfer_chunk"
         | "curator"
         | "resume_paused_work"
         | "cancel_paused_work"
@@ -4319,7 +4321,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
         | "set_goal_status"
-        | "import_session_archive" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        | "import_session_archive"
+        // An unstaged transfer reference is a bad request, not an authz failure.
+        | "read_bulk_transfer_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "set_project_note_content" | "rename_project_note" | "delete_project_note" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
@@ -4398,6 +4402,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
         authz_owner_only("import_session_archive"),
+        authz_owner_only("write_bulk_transfer_chunk"),
+        authz_owner_only("read_bulk_transfer_chunk"),
         authz_owner_only("curator"),
         authz_session_writer("cancel_turn"),
         authz_project_files("fs_list"),
@@ -5397,8 +5403,17 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             limit: 20,
         },
         "import_session_archive" => Request::ImportSessionArchive {
-            archive_base64: "not-base64".to_string(),
+            transfer: archive_transfer_ref(b"not-staged"),
             as_new: false,
+        },
+        "write_bulk_transfer_chunk" => Request::WriteBulkTransferChunk {
+            transfer: archive_transfer_ref(b"chunk"),
+            chunk_index: 0,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"chunk"),
+        },
+        "read_bulk_transfer_chunk" => Request::ReadBulkTransferChunk {
+            transfer_id: archive_transfer_ref(b"not-staged").transfer_id,
+            chunk_index: 0,
         },
         "archive_session" => Request::ArchiveSession {
             session_id,
@@ -6348,6 +6363,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
         "import_session_archive" => assert_import_session_archive_happy().await,
+        "write_bulk_transfer_chunk" => assert_write_bulk_transfer_chunk_happy().await,
         "curator" => assert_curator_mutating_happy().await,
         "archive_session"
         | "unarchive_session"
@@ -6532,6 +6548,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         }
         "auto_title" => assert_auto_title_mutating_malformed().await,
         "import_session_archive" => assert_import_session_archive_malformed().await,
+        "write_bulk_transfer_chunk" => assert_write_bulk_transfer_chunk_malformed().await,
         "curator" => {
             let ctx = test_ctx();
             let tmp = tempfile::tempdir().unwrap();
@@ -8190,13 +8207,114 @@ fn minimal_import_archive_base64() -> (Uuid, String) {
     (session_id, encoded)
 }
 
+/// Build a bulk transfer reference for `bytes` and stage them, as a peer would
+/// via `WriteBulkTransferChunk` before sending `ImportSessionArchive`.
+fn stage_archive_transfer(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+    let reference = archive_transfer_ref(bytes);
+    let chunk_size = crate::daemon::bulk_staging::STAGED_CHUNK_BYTES;
+    if bytes.is_empty() {
+        crate::daemon::bulk_staging::write_chunk(&reference, 0, &[]).expect("stage empty archive");
+        return reference;
+    }
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        crate::daemon::bulk_staging::write_chunk(&reference, index as u32, chunk)
+            .expect("stage chunk");
+    }
+    reference
+}
+
+/// A reference whose bytes were never staged: the daemon must reject it.
+fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
+    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+    use rand::RngExt as _;
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&hasher.finalize());
+    let mut id = [0u8; 16];
+    rand::rng().fill(&mut id[..]);
+    if id.iter().all(|b| *b == 0) {
+        id[0] = 1;
+    }
+    RemoteBulkTransferRef::new(
+        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+        bytes.len() as u64,
+        digest,
+        RemoteBulkMimeClass::Archive,
+    )
+    .expect("archive transfer reference")
+}
+
+/// A staged chunk is retained and acknowledged with its next index.
+async fn assert_write_bulk_transfer_chunk_happy() {
+    let ctx = test_ctx();
+    let body = b"bulk-transfer-chunk-body".to_vec();
+    let reference = archive_transfer_ref(&body);
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::WriteBulkTransferChunk {
+            transfer: reference.clone(),
+            chunk_index: 0,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&body),
+        },
+    )
+    .await
+    .expect("a well-formed chunk is accepted");
+    match response {
+        Response::BulkTransferChunkAccepted {
+            next_chunk_index,
+            complete,
+            idle_timeout_ms,
+            ..
+        } => {
+            assert_eq!(next_chunk_index, 1);
+            assert!(
+                complete,
+                "a single chunk covering the whole length completes"
+            );
+            assert!(
+                idle_timeout_ms > 0,
+                "the peer must be told the deadline it is held to"
+            );
+        }
+        other => panic!("unexpected response to a bulk transfer chunk: {other:?}"),
+    }
+    // The bytes really are staged: they can be taken back out intact.
+    assert_eq!(
+        crate::daemon::bulk_staging::take(&reference).expect("staged bytes"),
+        body
+    );
+}
+
+/// A chunk whose body is not valid base64 is refused.
+async fn assert_write_bulk_transfer_chunk_malformed() {
+    let ctx = test_ctx();
+    let error = dispatch_matrix_request(
+        &ctx,
+        Request::WriteBulkTransferChunk {
+            transfer: archive_transfer_ref(b"body"),
+            chunk_index: 0,
+            data_base64: "not-base64".to_string(),
+        },
+    )
+    .await
+    .expect_err("an invalid chunk encoding is rejected");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+}
+
 async fn assert_import_session_archive_happy() {
     let ctx = test_ctx();
     let (session_id, archive_base64) = minimal_import_archive_base64();
+    let archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(archive_base64.as_bytes())
+        .expect("fixture archive decodes");
     let response = dispatch_matrix_request(
         &ctx,
         Request::ImportSessionArchive {
-            archive_base64,
+            transfer: stage_archive_transfer(&archive_bytes),
             as_new: false,
         },
     )
@@ -8215,12 +8333,13 @@ async fn assert_import_session_archive_malformed() {
     let error = dispatch_matrix_request(
         &ctx,
         Request::ImportSessionArchive {
-            archive_base64: "not-base64".to_string(),
+            // Never staged: the daemon has no bytes for this reference.
+            transfer: archive_transfer_ref(b"not-staged"),
             as_new: false,
         },
     )
     .await
-    .expect_err("invalid archive encoding is rejected");
+    .expect_err("an unstaged archive reference is rejected");
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
@@ -9112,6 +9231,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "list_sessions",
         "count_pinned_messages",
         "pinned_message_state",
+        "read_bulk_transfer_chunk",
         "read_history_page",
         "read_subagent_history_page",
         "read_session_messages",
@@ -9462,13 +9582,34 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::ImportSessionArchive {
-                archive_base64: "UEsDB".into(),
+                transfer: archive_transfer_ref(b"UEsDB"),
                 as_new: false,
             },
             kind: "import_session_archive",
             session_id: None,
             audit_path: None,
             mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::WriteBulkTransferChunk {
+                transfer: archive_transfer_ref(b"UEsDB"),
+                chunk_index: 0,
+                data_base64: String::new(),
+            },
+            kind: "write_bulk_transfer_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ReadBulkTransferChunk {
+                transfer_id: archive_transfer_ref(b"UEsDB").transfer_id,
+                chunk_index: 0,
+            },
+            kind: "read_bulk_transfer_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
         },
         CommandMetadataCase {
             request: Request::Curator {
@@ -10297,6 +10438,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             };
         }
     request_variants!(
+        WriteBulkTransferChunk,
+        ReadBulkTransferChunk,
         Attach,
         SubagentTranscript,
         SendUserMessage,
@@ -13433,7 +13576,7 @@ async fn client_io_split_writer_is_sole_socket_writer() {
 #[tokio::test]
 async fn client_io_split_reader_eof_tears_down_all_tasks() {
     let ctx = test_ctx();
-    let (server, client) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
+    let (server, client) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
     let task = tokio::spawn(handle_client_transport_as(
         server,
         ctx,
@@ -14578,7 +14721,7 @@ async fn send_user_message_refused_while_draining() {
 #[tokio::test]
 async fn resync_drain_state_sends_nothing_while_running() {
     let ctx = test_ctx();
-    let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
+    let (left, right) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
     let mut server = ProtoStream::new(left);
     let mut client = ProtoStream::new(right);
 
@@ -14593,7 +14736,7 @@ async fn resync_drain_state_sends_nothing_while_running() {
 #[tokio::test]
 async fn resync_drain_state_replays_draining_and_forced() {
     let ctx = test_ctx();
-    let (left, right) = tokio::io::duplex(proto::MAX_FRAME_BYTES);
+    let (left, right) = tokio::io::duplex(proto::MAX_NDJSON_FRAME_BYTES);
     let mut server = ProtoStream::new(left);
     let mut client = ProtoStream::new(right);
 

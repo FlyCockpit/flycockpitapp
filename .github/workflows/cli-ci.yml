@@ -9,6 +9,9 @@ name: CLI CI
     paths:
       - "apps/cli/**"
       - "crates/**"
+      # Rust tests read the shared cross-language protocol fixtures, so a
+      # change to them must trigger the Rust gate as well as the TS one.
+      - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"
@@ -16,6 +19,9 @@ name: CLI CI
     paths:
       - "apps/cli/**"
       - "crates/**"
+      # Rust tests read the shared cross-language protocol fixtures, so a
+      # change to them must trigger the Rust gate as well as the TS one.
+      - "packages/cockpit-protocol/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"

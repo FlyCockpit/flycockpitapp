@@ -115,9 +115,9 @@ async fn export_via_attached_daemon(
             "{command}: daemon request failed: unexpected daemon response"
         ));
     };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.content_base64)
-        .map_err(|error| format!("{command}: decoding export data failed: {error}"))?;
+    // The export bytes never rode the response frame: pull them as bounded
+    // bulk chunks, then verify the transfer's length and digest before writing.
+    let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command).await?;
     let out_path = exports_dir.join(format!("{file_stem}.{}", data.filename_extension));
     tokio::fs::create_dir_all(&exports_dir)
         .await
@@ -129,17 +129,89 @@ async fn export_via_attached_daemon(
     Ok(match kind {
         ExportSessionKind::TranscriptJson => format!(
             "Exported conversation ({} bytes) → {}",
-            data.byte_len,
+            data.byte_len(),
             out_path.display()
         ),
         ExportSessionKind::DebugBundle => format!(
             "Exported debug bundle ({} session{}, {} bytes) → {}",
             sessions,
             if sessions == 1 { "" } else { "s" },
-            data.byte_len,
+            data.byte_len(),
             out_path.display()
         ),
     })
+}
+
+/// Pull a staged bulk transfer chunk by chunk and verify it end to end.
+///
+/// The reference carries the authoritative length and SHA-256; a transfer that
+/// does not reproduce both exactly is rejected rather than written to disk.
+async fn pull_bulk_transfer(
+    attached_request: &AttachedRequestBinding,
+    transfer: &cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef,
+    command: &'static str,
+) -> Result<Vec<u8>, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let expected_len = transfer.total_length_value();
+    // Deliberately NOT `with_capacity(expected_len)`: the length arrives on the
+    // wire, and sizing a buffer from it hands a peer an allocation primitive.
+    // `RemoteBulkTransferRef` already refuses a length above its class limit at
+    // deserialization, so this is defence in depth — the buffer still only ever
+    // grows with bytes that actually arrived, and the loop below refuses to
+    // exceed the declared length.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk_index: u32 = 0;
+    loop {
+        let response = attached_request
+            .request(Request::ReadBulkTransferChunk {
+                transfer_id: transfer.transfer_id,
+                chunk_index,
+            })
+            .await
+            .map_err(|error| format!("{command}: reading export data failed: {error}"))?;
+        let Response::BulkTransferChunk {
+            chunk_index: got,
+            data_base64,
+            last,
+        } = response
+        else {
+            return Err(format!(
+                "{command}: reading export data failed: unexpected daemon response"
+            ));
+        };
+        if got != chunk_index {
+            return Err(format!(
+                "{command}: reading export data failed: out-of-order chunk"
+            ));
+        }
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|error| format!("{command}: decoding export data failed: {error}"))?;
+        if bytes.len() as u64 + chunk.len() as u64 > expected_len {
+            return Err(format!(
+                "{command}: reading export data failed: transfer overran its declared length"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+        if last {
+            break;
+        }
+        chunk_index += 1;
+    }
+    if bytes.len() as u64 != expected_len {
+        return Err(format!(
+            "{command}: reading export data failed: transfer length mismatch"
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    if hasher.finalize().as_slice() != transfer.sha256 {
+        return Err(format!(
+            "{command}: reading export data failed: transfer digest mismatch"
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -147,6 +219,7 @@ mod tests {
     use super::*;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use cockpit_core::daemon::proto::ExportSessionData;
+    use cockpit_core::daemon::proto::remote_transport::bulk as proto_bulk;
     use std::sync::{Arc, Mutex};
 
     fn last_plain(app: &App) -> &str {
@@ -197,6 +270,29 @@ mod tests {
         }
     }
 
+    fn digest_of(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&hasher.finalize());
+        digest
+    }
+
+    fn transfer_ref(bytes: &[u8]) -> proto_bulk::RemoteBulkTransferRef {
+        let transfer_id = cockpit_core::daemon::proto::remote_protocol_id::tag_protocol_id_bytes::<
+            cockpit_core::daemon::proto::remote_protocol_id::kind::Transfer,
+        >([0x2A; 16])
+        .unwrap();
+        proto_bulk::RemoteBulkTransferRef::new(
+            transfer_id,
+            bytes.len() as u64,
+            digest_of(bytes),
+            proto_bulk::RemoteBulkMimeClass::Export,
+        )
+        .unwrap()
+    }
+
     fn response(
         session_id: uuid::Uuid,
         kind: ExportSessionKind,
@@ -209,12 +305,25 @@ mod tests {
                 kind,
                 filename_extension: extension.to_string(),
                 mime: "application/octet-stream".to_string(),
-                content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                byte_len: bytes.len(),
+                transfer: transfer_ref(bytes),
                 session_count: Some(1),
                 redacted: true,
             },
         }
+    }
+
+    /// Answer the follow-up bulk pull with `bytes` as a single final chunk.
+    async fn serve_bulk_chunk(rx: &mut mpsc::Receiver<AttachedRequest>, bytes: &[u8]) {
+        let request = rx.recv().await.unwrap();
+        let Request::ReadBulkTransferChunk { chunk_index, .. } = request.request else {
+            panic!("expected a ReadBulkTransferChunk pull");
+        };
+        assert_eq!(chunk_index, 0);
+        let _ = request.response_tx.send(Ok(Response::BulkTransferChunk {
+            chunk_index: 0,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            last: true,
+        }));
     }
 
     async fn drain_until_idle(app: &mut App) {
@@ -280,6 +389,7 @@ mod tests {
                 b"[]",
             )))
             .unwrap();
+        serve_bulk_chunk(&mut rx, b"[]").await;
         drain_until_idle(&mut app).await;
         assert_eq!(
             std::fs::read(exports_dir.join("conversation.daemon-json")).unwrap(),
@@ -306,6 +416,7 @@ mod tests {
                 b"zip",
             )))
             .unwrap();
+        serve_bulk_chunk(&mut rx, b"zip").await;
         drain_until_idle(&mut app).await;
         assert_eq!(
             std::fs::read(exports_dir.join("conversation.daemon-zip")).unwrap(),
@@ -327,21 +438,22 @@ mod tests {
             "/export",
         ));
         let request = rx.recv().await.unwrap();
-        let Response::ExportSessionData { mut data } =
-            response(session_id, ExportSessionKind::TranscriptJson, "json", b"ok")
-        else {
-            unreachable!()
-        };
-        data.content_base64 = "not-base64".to_string();
         request
             .response_tx
-            .send(Ok(Response::ExportSessionData { data }))
+            .send(Ok(response(
+                session_id,
+                ExportSessionKind::TranscriptJson,
+                "json",
+                b"ok",
+            )))
             .unwrap();
+        // The transfer promised the digest of b"ok" but the carrier delivers
+        // different bytes of the same length: the pull must refuse to write.
+        serve_bulk_chunk(&mut rx, b"NO").await;
+        let error = task.await.unwrap().unwrap_err();
         assert!(
-            task.await
-                .unwrap()
-                .unwrap_err()
-                .contains("decoding export data failed")
+            error.contains("transfer digest mismatch"),
+            "unexpected error: {error}"
         );
         assert!(!tmp.path().join("exports/x.json").exists());
     }
@@ -378,6 +490,7 @@ mod tests {
                 b"second",
             )))
             .unwrap();
+        serve_bulk_chunk(&mut rx, b"second").await;
         drain_until_idle(&mut app).await;
         let lines = app
             .history

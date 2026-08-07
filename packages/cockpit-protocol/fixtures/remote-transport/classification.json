@@ -1,0 +1,1905 @@
+{
+  "_comment": "Generated from the Rust request/response/event variant tables. Do not hand edit.",
+  "classLanes": [
+    {
+      "class": "auth_completion",
+      "lane": "control"
+    },
+    {
+      "class": "capability_version",
+      "lane": "control"
+    },
+    {
+      "class": "lease_revocation",
+      "lane": "control"
+    },
+    {
+      "class": "liveness",
+      "lane": "control"
+    },
+    {
+      "class": "cancel",
+      "lane": "control"
+    },
+    {
+      "class": "resume_window",
+      "lane": "control"
+    },
+    {
+      "class": "bounded_request_response",
+      "lane": "interactive"
+    },
+    {
+      "class": "bounded_event",
+      "lane": "interactive"
+    },
+    {
+      "class": "terminal_io",
+      "lane": "interactive"
+    },
+    {
+      "class": "approval",
+      "lane": "interactive"
+    },
+    {
+      "class": "model_delta",
+      "lane": "interactive"
+    },
+    {
+      "class": "bulk_chunk",
+      "lane": "bulk"
+    }
+  ],
+  "counts": {
+    "event": 76,
+    "request": 114,
+    "response": 72
+  },
+  "messages": {
+    "event": [
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "env_drift_warning"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "config_snapshot"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "queue_updated"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "foreground_input_target"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "active_model_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "model_selection_result"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "default_model_update_result"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "thinking_started"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "reconnecting"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "inference_warning"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_text_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "reasoning_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_text"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "user_message_recorded"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "queued_user_messages_folded"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "session_persist_failed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "session_driver_failed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "preflight_started"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "user_messages_terminated"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "user_message_retracted"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "notice"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "lsp_notice"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "event_stream_lagged"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "skill_auto_injected"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "tool_start"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "tool_progress"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "tool_end"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resource_wait"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resource_start"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resource_clear"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "tool_error"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "inference_failed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "inference_succeeded"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "backup_used"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "subagent_spawned"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "subagent_routing"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "subagent_report"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "nested_turn"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "usage"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "interrupt_raised"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "interrupt_queue_changed"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "interrupt_resolved"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "history_replay"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_idle"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "goal_verification_progress"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "primary_swapped"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "llm_mode_changed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "session_ended"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "schedule_started"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "schedule_progress"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "schedule_note"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "schedule_completed"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "context_projection"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "pruned"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "compact_ready"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sandbox_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sandbox_escalation_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sandbox_unavailable"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "command_capability_unavailable"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "redaction_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "preflight_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "longcache_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "approval_mode_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delegation_recursion_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "tandem_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "gitignore_allow"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "caffeinate_state"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "connector_status"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "terminal_output"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "terminal_clipboard"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_viewers"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_closed"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "osc52_protocol_violation"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "daemon_draining"
+      },
+      {
+        "class": "resume_window",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "paused_work_available"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "waiting_for_lock"
+      }
+    ],
+    "request": [
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "attach"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "subagent_transcript"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "send_user_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_run_invocation_status"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_run_invocation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "steer_delegation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "begin_attachment_upload"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "bulk",
+        "tag": "upload_attachment_chunk"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "finish_attachment_upload"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_attachment_upload"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remove_queued_user_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remove_newest_queued_user_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remove_editable_queued_user_messages"
+      },
+      {
+        "class": "resume_window",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "resume_paused_work"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_paused_work"
+      },
+      {
+        "class": "resume_window",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "repair_resume"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "goal_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_goal_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "clear_goal"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "unpin_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "toggle_pinned_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "count_pinned_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_pinned_message_seqs"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_pinned_messages_with_text"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pinned_message_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_sealed_values"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delete_sealed_value"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_project_notes"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "create_project_note"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "set_project_note_content"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "rename_project_note"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delete_project_note"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_assistants"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "upsert_assistant"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "create_assistant_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "auto_title"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "export_session_data"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "interactive",
+        "tag": "import_session_archive"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "bulk",
+        "tag": "write_bulk_transfer_chunk"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bounded",
+        "lane": "bulk",
+        "tag": "read_bulk_transfer_chunk"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "curator"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_turn"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_stat"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "fs_write"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_create_dir"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_rename"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_delete"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_diff_file"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "open_terminal"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "attach_terminal"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "terminal_input"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_resize"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "close_terminal"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "lsp_control"
+      },
+      {
+        "class": "approval",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "resolve_interrupt"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_sessions"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_session_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_history_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "read_subagent_history_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "session_live_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "archive_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "unarchive_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fork_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "discard_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "create_btw_fork"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "end_btw_fork"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "rename_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "share_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "record_session_note"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delete_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_inventory_bundle"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resource_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "promote_resource"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "create_scheduled_job"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "list_scheduled_jobs"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delete_scheduled_job"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_scheduled_job_enabled"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "run_scheduled_job"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_model_favorite"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_default_model"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_active_model"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_agent"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_llm_mode"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_session_llm_mode"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "set_tool_surface_override"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "set_goal_settings_override"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_approval_mode"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_delegation_recursion"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_sandbox"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_sandbox_escalation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_preflight"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_longcache"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_redaction"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_tandem_models"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_caffeinate"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_schedule"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "prune"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "compact"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "pin"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "store_flycockpit_credential"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "clear_flycockpit_credential"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "daemon_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "refresh_env"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "refresh_config"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "record_usage"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_usage_counts"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "stats_rollup"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "guidance_estimate"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "stop_daemon"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "restart_if_idle"
+      }
+    ],
+    "response": [
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "ack"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "restart_decision"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "user_message_queued"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delegation_steer"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "attachment_upload_started"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bounded",
+        "lane": "bulk",
+        "tag": "attachment_chunk_accepted"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "attachment_uploaded"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_paste_image"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "remove_queued_user_message_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "remove_queued_user_messages_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "attached"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "subagent_transcript"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "sessions"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "session_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "history_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "subagent_history_page"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "note_recorded"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "goal_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "goal_updated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "goal_cleared"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_changed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_toggled"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_count"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_seqs"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "pins_with_text"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "pin_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sealed_values"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "project_notes"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "project_note_created"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "project_note_renamed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "assistants"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "assistant_upserted"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_session_created"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "auto_title"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "interactive",
+        "tag": "export_session_data"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "import_session_archive"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bounded",
+        "lane": "bulk",
+        "tag": "bulk_transfer_chunk_accepted"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "bulk",
+        "tag": "bulk_transfer_chunk"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "curator"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "session_live_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "forked"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "btw_fork"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "inventory_bundle"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "resource_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "promote_resource_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "scheduled_job"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "scheduled_jobs"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "scheduled_job_deleted"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "scheduled_job_run_queued"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_stat"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "fs_write"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "git_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "git_diff_file"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_opened"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "lsp_control_result"
+      },
+      {
+        "class": "liveness",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "daemon_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "usage_counts"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "stats_rollup"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "guidance_estimate"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sandbox_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "sandbox_escalation_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "redaction_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "preflight_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "longcache_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "approval_mode_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delegation_recursion_state"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "caffeinate_state"
+      },
+      {
+        "class": "resume_window",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "paused_work"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "run_invocation_status"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "run_invocation_cancel_result"
+      }
+    ]
+  },
+  "oversizedInventory": [
+    {
+      "kind": "request",
+      "tag": "attach"
+    },
+    {
+      "kind": "request",
+      "tag": "send_user_message"
+    },
+    {
+      "kind": "request",
+      "tag": "steer_delegation"
+    },
+    {
+      "kind": "request",
+      "tag": "upload_attachment_chunk"
+    },
+    {
+      "kind": "request",
+      "tag": "set_project_note_content"
+    },
+    {
+      "kind": "request",
+      "tag": "upsert_assistant"
+    },
+    {
+      "kind": "request",
+      "tag": "create_assistant_session"
+    },
+    {
+      "kind": "request",
+      "tag": "import_session_archive"
+    },
+    {
+      "kind": "request",
+      "tag": "write_bulk_transfer_chunk"
+    },
+    {
+      "kind": "request",
+      "tag": "fs_write"
+    },
+    {
+      "kind": "request",
+      "tag": "terminal_input"
+    },
+    {
+      "kind": "request",
+      "tag": "resolve_interrupt"
+    },
+    {
+      "kind": "request",
+      "tag": "session_live_status"
+    },
+    {
+      "kind": "request",
+      "tag": "record_session_note"
+    },
+    {
+      "kind": "request",
+      "tag": "create_scheduled_job"
+    },
+    {
+      "kind": "request",
+      "tag": "set_tool_surface_override"
+    },
+    {
+      "kind": "request",
+      "tag": "set_goal_settings_override"
+    },
+    {
+      "kind": "request",
+      "tag": "pin"
+    },
+    {
+      "kind": "request",
+      "tag": "refresh_env"
+    },
+    {
+      "kind": "response",
+      "tag": "user_message_queued"
+    },
+    {
+      "kind": "response",
+      "tag": "remove_queued_user_message_result"
+    },
+    {
+      "kind": "response",
+      "tag": "remove_queued_user_messages_result"
+    },
+    {
+      "kind": "response",
+      "tag": "attached"
+    },
+    {
+      "kind": "response",
+      "tag": "subagent_transcript"
+    },
+    {
+      "kind": "response",
+      "tag": "sessions"
+    },
+    {
+      "kind": "response",
+      "tag": "session_messages"
+    },
+    {
+      "kind": "response",
+      "tag": "history_page"
+    },
+    {
+      "kind": "response",
+      "tag": "subagent_history_page"
+    },
+    {
+      "kind": "response",
+      "tag": "pins_with_text"
+    },
+    {
+      "kind": "response",
+      "tag": "project_notes"
+    },
+    {
+      "kind": "response",
+      "tag": "project_note_created"
+    },
+    {
+      "kind": "response",
+      "tag": "assistants"
+    },
+    {
+      "kind": "response",
+      "tag": "assistant_upserted"
+    },
+    {
+      "kind": "response",
+      "tag": "export_session_data"
+    },
+    {
+      "kind": "response",
+      "tag": "bulk_transfer_chunk"
+    },
+    {
+      "kind": "response",
+      "tag": "curator"
+    },
+    {
+      "kind": "response",
+      "tag": "inventory_bundle"
+    },
+    {
+      "kind": "response",
+      "tag": "resource_snapshot"
+    },
+    {
+      "kind": "response",
+      "tag": "promote_resource_result"
+    },
+    {
+      "kind": "response",
+      "tag": "scheduled_job"
+    },
+    {
+      "kind": "response",
+      "tag": "scheduled_jobs"
+    },
+    {
+      "kind": "response",
+      "tag": "git_status"
+    },
+    {
+      "kind": "response",
+      "tag": "usage_counts"
+    },
+    {
+      "kind": "event",
+      "tag": "env_drift_warning"
+    },
+    {
+      "kind": "event",
+      "tag": "config_snapshot"
+    },
+    {
+      "kind": "event",
+      "tag": "queue_updated"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_text_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "reasoning_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_text"
+    },
+    {
+      "kind": "event",
+      "tag": "user_message_recorded"
+    },
+    {
+      "kind": "event",
+      "tag": "queued_user_messages_folded"
+    },
+    {
+      "kind": "event",
+      "tag": "tool_start"
+    },
+    {
+      "kind": "event",
+      "tag": "tool_progress"
+    },
+    {
+      "kind": "event",
+      "tag": "tool_end"
+    },
+    {
+      "kind": "event",
+      "tag": "tool_error"
+    },
+    {
+      "kind": "event",
+      "tag": "subagent_spawned"
+    },
+    {
+      "kind": "event",
+      "tag": "subagent_report"
+    },
+    {
+      "kind": "event",
+      "tag": "nested_turn"
+    },
+    {
+      "kind": "event",
+      "tag": "interrupt_raised"
+    },
+    {
+      "kind": "event",
+      "tag": "history_replay"
+    },
+    {
+      "kind": "event",
+      "tag": "schedule_note"
+    },
+    {
+      "kind": "event",
+      "tag": "pruned"
+    },
+    {
+      "kind": "event",
+      "tag": "compact_ready"
+    },
+    {
+      "kind": "event",
+      "tag": "gitignore_allow"
+    },
+    {
+      "kind": "event",
+      "tag": "terminal_output"
+    },
+    {
+      "kind": "event",
+      "tag": "terminal_clipboard"
+    }
+  ],
+  "unknownMessageTag": "__unknown"
+}

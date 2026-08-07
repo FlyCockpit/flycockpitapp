@@ -28,7 +28,7 @@ use crate::jitter::{JitterSource, SystemJitter};
 
 const CHANNEL_BUFFER: usize = 128;
 const OUTBOUND_BUFFER: usize = 256;
-const CHANNEL_DUPLEX_BYTES: usize = proto::MAX_FRAME_BYTES;
+const CHANNEL_DUPLEX_BYTES: usize = proto::MAX_NDJSON_FRAME_BYTES;
 const PRESENCE_EVENT: &str = "presence";
 const HEARTBEAT_SECS: u64 = 30;
 const TOKEN_REFRESH_SKEW_SECS: u64 = 60;

@@ -308,6 +308,7 @@ mod tests {
             "list_assistants",
             "list_scheduled_jobs",
             "list_sessions",
+            "read_bulk_transfer_chunk",
             "read_history_page",
             "read_session_messages",
             "read_subagent_history_page",

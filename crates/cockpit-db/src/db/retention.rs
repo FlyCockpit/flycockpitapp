@@ -75,7 +75,11 @@ impl Db {
         if session_cutoff_secs <= 0 {
             return Ok(0);
         }
-        self.write(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
+        // `transaction`: each `delete_session_conn` writes an external
+        // side-effect tombstone before deleting, and the pair must commit or
+        // roll back together. One transaction for the pass also means a
+        // failure part-way cannot leave the sweep half-applied.
+        self.transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
             .await
     }
 

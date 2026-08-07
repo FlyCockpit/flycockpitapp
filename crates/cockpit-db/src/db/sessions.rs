@@ -703,7 +703,26 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
     })
 }
 
+/// Delete a session, first recording an external side-effect tombstone.
+///
+/// Session deletion cannot delete unresolved external operations: a provider
+/// may already have accepted work on this session's behalf, and the record has
+/// to survive so late evidence still resolves it exactly once. The tombstone
+/// is what lets resolution after deletion emit owner-visible recovery status
+/// without recreating session content. It is written in the caller's
+/// transaction, so a session can never be removed without one.
 pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    // The delete cascades to descendant forks and `/btw` rows, so every member
+    // of the cascade set needs a tombstone — not just the requested root. A
+    // descendant deleted without one loses the owner-visible marker for its
+    // unresolved external operations, which survive the deletion.
+    let now_ms = crate::db::session_log::now_ms();
+    for member in collect_subtree(conn, session_id)? {
+        crate::db::external_journal::tombstone_external_journal_session_id_conn(
+            conn, member, now_ms,
+        )
+        .context("recording external journal session tombstone")?;
+    }
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         [session_id.to_string()],
@@ -1004,7 +1023,12 @@ impl Db {
     }
 
     pub async fn end_btw_fork(&self, parent_session_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        // `transaction`, not `write`: `delete_session_conn` writes an external
+        // side-effect tombstone and then deletes the row, and under `write`
+        // each statement autocommits separately — a failure between them would
+        // leave a tombstone for a session that still exists, or a deleted
+        // session with no owner-visible marker for its unresolved operations.
+        self.transaction(move |conn| {
             let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? else {
                 return Ok(false);
             };
@@ -1428,7 +1452,8 @@ impl Db {
                 }
             }
         }
-        self.write(move |conn| delete_session_conn(conn, session_id))
+        // One transaction so the tombstone and the deletion commit together.
+        self.transaction(move |conn| delete_session_conn(conn, session_id))
             .await?;
         for path in sidecars {
             match std::fs::remove_file(&path) {
@@ -1450,7 +1475,9 @@ impl Db {
     /// stray discard can never delete a persisted session. Returns `true`
     /// when an ephemeral row was deleted.
     pub async fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
-        self.write(move |conn| {
+        // `transaction` so the guard read, the tombstone, and the deletion are
+        // one atomic step.
+        self.transaction(move |conn| {
             // Guard on the typed row flag — only an ephemeral session is ever
             // discarded this way, so a stray call can't drop a persisted one.
             match get_session_inner(conn, session_id)? {
@@ -2182,24 +2209,45 @@ fn summary_pin_count_or_zero(session_id: Uuid, result: Result<i64>) -> u32 {
 /// Collect a session and every descendant fork (depth-unbounded),
 /// root-first. Shared by `delete_session`, `archive_session`, and
 /// `count_descendants` so the subtree walk lives in exactly one place.
+/// Every session id that `DELETE FROM sessions WHERE session_id = root`
+/// removes, including the root.
+///
+/// This mirrors the database's own cascade rule rather than a subset of it:
+/// `sessions` cascades on **both** `parent_session_id` and
+/// `btw_parent_session_id`, so the walk follows both. A `/btw` row currently
+/// sets both columns, which made a parent-only walk accidentally correct — but
+/// the delete does not depend on that invariant and neither should this. The
+/// walk that misses a descendant is the walk that deletes it without a
+/// tombstone.
+///
+/// The anchor selects *from* `sessions` rather than echoing the argument, so
+/// an unknown id yields an empty set. Echoing it would report a delete set for
+/// a session that does not exist, and `delete_session_conn` would write a
+/// tombstone for a row whose deletion cascades nothing.
 fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
-    let mut all = vec![root];
-    let mut frontier = vec![root];
-    while let Some(parent) = frontier.pop() {
-        let mut stmt = conn
-            .prepare("SELECT session_id FROM sessions WHERE parent_session_id = ?1")
-            .context("preparing fork-walk")?;
-        let children = stmt
-            .query_map([parent.to_string()], |row| {
-                let s: String = row.get(0)?;
-                parse_uuid(&s)
-            })
-            .context("querying fork-walk")?;
-        for child in children {
-            let id = child.context("decoding fork child")?;
-            all.push(id);
-            frontier.push(id);
-        }
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE cascade(session_id) AS (
+                 SELECT session_id FROM sessions WHERE session_id = ?1
+                 UNION
+                 SELECT s.session_id
+                   FROM sessions AS s
+                   JOIN cascade AS c
+                     ON s.parent_session_id = c.session_id
+                     OR s.btw_parent_session_id = c.session_id
+             )
+             SELECT session_id FROM cascade",
+        )
+        .context("preparing cascade walk")?;
+    let rows = stmt
+        .query_map([root.to_string()], |row| {
+            let raw: String = row.get(0)?;
+            parse_uuid(&raw)
+        })
+        .context("querying cascade walk")?;
+    let mut all = Vec::new();
+    for row in rows {
+        all.push(row.context("decoding cascade member")?);
     }
     Ok(all)
 }

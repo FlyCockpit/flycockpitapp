@@ -3286,7 +3286,9 @@ async fn boot_ephemeral_sweep_continues_after_delete_failure() {
         .await
         .unwrap();
 
-    assert_eq!(sweep_ephemeral_sessions_blocking(&db).unwrap(), 1);
+    // The boot sweep now runs through the transactional accessor; its
+    // continue-past-a-failed-delete behaviour is unchanged.
+    assert_eq!(db.sweep_ephemeral_sessions().await.unwrap(), 1);
 
     assert!(
         db.write(move |conn| crate::db::Db::get_session_conn(conn, blocked.session_id))
@@ -13817,6 +13819,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
+        external_journal: None,
         process_containment: None,
         _process_containment_actor: None,
     });
@@ -13881,6 +13884,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
+        external_journal: None,
         process_containment: None,
         _process_containment_actor: None,
     });

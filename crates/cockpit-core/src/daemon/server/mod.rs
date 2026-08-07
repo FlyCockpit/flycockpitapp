@@ -1704,6 +1704,11 @@ pub struct DaemonContext {
     pub secure_key: Option<crate::secure_key::SecureKeyHandle>,
     /// Owns the actor thread; kept so Drop drains before unset_default_store.
     _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
+    /// Generic durable journal for ambiguous external side effects
+    /// (`external-side-effect-journal`). `None` until startup recovery has run
+    /// and revalidated recovery capacity; every consumer must treat `None` as
+    /// "external dispatch is not enabled".
+    pub external_journal: Option<std::sync::Arc<crate::external_journal::ExternalJournal>>,
     /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
     pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     _process_containment_actor: Option<crate::process_containment::ProcessContainmentActor>,
@@ -1808,6 +1813,7 @@ impl DaemonContext {
             config_source,
             secure_key: None,
             _secure_key_actor: None,
+            external_journal: None,
             process_containment: None,
             _process_containment_actor: None,
         }
@@ -2018,7 +2024,18 @@ pub(crate) async fn boot_with_db(
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
-                let result = crate::secure_key::SecureKeyActor::start_production(db_for_keys);
+                // The journal is the first real secure-key consumer, so the
+                // actor gets a reconciler that resolves its kind against the
+                // capsule ledger instead of failing closed on it.
+                let reconciler = std::sync::Arc::new(
+                    crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
+                        db_for_keys.clone(),
+                    ),
+                );
+                let result = crate::secure_key::SecureKeyActor::start_production_with_reconciler(
+                    db_for_keys,
+                    reconciler,
+                );
                 let _ = boot_tx.send(result);
             }) {
             Ok(_handle) => match boot_rx.await {
@@ -2082,6 +2099,59 @@ pub(crate) async fn boot_with_db(
         let _ = db;
         timer.phase("process_containment_actor_skipped");
     }
+    // External side-effect journal: recover the capsule spool and revalidate
+    // recovery capacity BEFORE any external dispatch can be enabled. The
+    // handle is published only once both succeed, so a consumer that cannot
+    // see `ctx.external_journal` cannot start a non-idempotent external
+    // action. Startup needs the secure-key handle for spool HMAC material.
+    #[cfg(not(test))]
+    {
+        match &ctx.secure_key {
+            Some(secure_key) => {
+                let now_wall_ms = chrono::Utc::now().timestamp_millis();
+                match crate::external_journal::ExternalJournal::start(
+                    ctx.db.clone(),
+                    secure_key,
+                    now_wall_ms,
+                )
+                .await
+                {
+                    Ok((journal, report)) => {
+                        tracing::info!(
+                            scanned = report.scanned,
+                            imported = report.imported,
+                            quarantined = report.quarantined,
+                            converted = report.converted,
+                            released_without_medium = report.released_without_medium,
+                            "external side-effect journal recovery finished"
+                        );
+                        ctx.external_journal = Some(std::sync::Arc::new(journal));
+                        timer.phase("external_journal");
+                    }
+                    Err(error) => {
+                        // Fail closed: no handle means no new external effects.
+                        tracing::warn!(
+                            error = %error,
+                            "external side-effect journal startup failed; \
+                             non-idempotent external actions stay disabled"
+                        );
+                        timer.phase("external_journal_blocked");
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "native secure keys unavailable; external side-effect journal \
+                     stays disabled and non-idempotent external actions are refused"
+                );
+                timer.phase("external_journal_skipped");
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        timer.phase("external_journal_skipped");
+    }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
     {
@@ -2136,7 +2206,12 @@ async fn run_boot_housekeeping(db: &Db) {
     // SIGKILL backstop for `/side`: a side conversation whose owning process
     // died uncatchably can orphan an ephemeral session row. Sweep them on
     // boot so ephemeral sessions never accumulate. Best-effort.
-    match sweep_ephemeral_sessions_blocking(db) {
+    // The async accessor deletes each session in its own transaction, so the
+    // external side-effect tombstone and the deletion commit together. The
+    // former blocking duplicate here issued a raw `DELETE` loop under
+    // `blocking_write_for_sync_maintenance`, where every statement
+    // autocommitted separately.
+    match db.sweep_ephemeral_sessions().await {
         Ok(n) if n > 0 => tracing::info!(count = n, "swept orphaned ephemeral sessions on boot"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
@@ -2156,42 +2231,6 @@ async fn run_boot_housekeeping(db: &Db) {
             tracing::warn!(error = %e, "reconciling orphaned task delegations on boot failed")
         }
     }
-}
-
-fn sweep_ephemeral_sessions_blocking(db: &Db) -> Result<usize> {
-    db.blocking_write_for_sync_maintenance(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT session_id
-                   FROM sessions
-                  WHERE ephemeral = 1
-                    AND btw_parent_session_id IS NULL",
-            )
-            .context("preparing ephemeral sweep")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("querying ephemeral sweep")?;
-        let mut roots = Vec::new();
-        for row in rows {
-            let id = row.context("decoding ephemeral row")?;
-            roots.push(uuid::Uuid::parse_str(&id).context("parsing ephemeral session id")?);
-        }
-        drop(stmt);
-        let mut removed = 0;
-        for id in roots {
-            match crate::db::sessions::delete_session_conn(conn, id)
-                .with_context(|| format!("sweeping ephemeral session {id}"))
-            {
-                Ok(_) => removed += 1,
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    session_id = %id,
-                    "ephemeral session sweep delete failed"
-                ),
-            }
-        }
-        Ok(removed)
-    })
 }
 
 /// Bind the Unix socket and run the accept loop until the daemon's

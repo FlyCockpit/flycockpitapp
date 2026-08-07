@@ -45,6 +45,8 @@ pub struct DiagnosticsSnapshot {
     /// emits: it names the file to inspect, its phase, and whether a running
     /// daemon is required to finish it. Never any configuration content.
     pub default_model_journals: Vec<String>,
+    /// Exact external side-effect journal record/byte/age counts.
+    pub external_journal: Vec<String>,
     pub has_failures: bool,
 }
 
@@ -127,6 +129,7 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
             &snapshot.default_model_journals,
         );
     }
+    push_section(&mut out, "external journal", &snapshot.external_journal);
     out
 }
 
@@ -145,6 +148,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
 
     let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
     let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
+    let (external_journal, external_journal_failed) = external_journal_lines();
 
     // Settings/doctor composition: register catalog + configured harness/LSP/MCP
     // into shared external-runtime health (resolution-only for configured cmds).
@@ -207,7 +211,8 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
             &extended,
         ),
         default_model_journals: default_model_journal_lines(&input.cwd),
-        has_failures: provider_failures,
+        external_journal,
+        has_failures: provider_failures || external_journal_failed,
     })
 }
 
@@ -244,6 +249,117 @@ fn default_model_journal_lines(cwd: &Path) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// What the doctor could learn about the capsule spool on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalJournalSpoolHealth {
+    /// Owner-only, containment-checked, with these on-disk facts.
+    Healthy {
+        allocated_bytes: u64,
+        quarantined_entries: usize,
+    },
+    /// Never created. Nothing has been dispatched on this installation.
+    Absent,
+    /// Present but unusable: insecure permissions, a containment failure, or
+    /// an unreadable directory. New external work must be refused.
+    Unhealthy { detail: String },
+}
+
+/// Render the external side-effect journal section.
+///
+/// Pure so the failure branches doctor must exit non-zero on — quarantine, a
+/// full partition, unresolved work past 24h, and an insecure spool — are
+/// directly testable without a real database or filesystem.
+pub fn external_journal_section(
+    capacity: crate::db::external_journal::ExternalJournalCapacity,
+    age: crate::db::external_journal::ExternalJournalAgeReport,
+    spool: &ExternalJournalSpoolHealth,
+    integrity_failure: Option<String>,
+) -> (Vec<String>, bool) {
+    let (allocated_bytes, quarantined_entries, spool_line, spool_failed) = match spool {
+        ExternalJournalSpoolHealth::Healthy {
+            allocated_bytes,
+            quarantined_entries,
+        } => (
+            *allocated_bytes,
+            *quarantined_entries,
+            "spool: ok (owner-only)".to_string(),
+            false,
+        ),
+        ExternalJournalSpoolHealth::Absent => {
+            (0, 0, "spool: none (not yet created)".to_string(), false)
+        }
+        ExternalJournalSpoolHealth::Unhealthy { detail } => {
+            (0, 0, format!("spool: FAILED ({})", one_line(detail)), true)
+        }
+    };
+    let status = crate::external_journal::ExternalJournalStatus {
+        capacity,
+        age,
+        spool_allocated_bytes: allocated_bytes,
+        quarantined_entries,
+        integrity_failure,
+    };
+    let mut lines = status.render_lines();
+    lines.push(spool_line);
+    (lines, status.is_critical() || spool_failed)
+}
+
+/// External side-effect journal capacity/age status for doctor, headless, and
+/// TUI surfaces.
+///
+/// Reporting needs no spool HMAC key material, so this deliberately reads only
+/// SQLite counts plus on-disk capsule/quarantine sizes and never resolves a
+/// key: diagnostics output can never disclose one.
+fn external_journal_lines() -> (Vec<String>, bool) {
+    let Ok(db) = crate::db::Db::open_default() else {
+        return (
+            vec!["status: unresolved (database unavailable)".to_string()],
+            false,
+        );
+    };
+    let now_wall_ms = chrono::Utc::now().timestamp_millis();
+    // The journal's integrity latch is persisted, so a doctor run that holds
+    // no journal instance — and one after a restart — still reports critical.
+    let counts = db.blocking_read_for_sync_ui(move |conn| {
+        Ok((
+            crate::db::external_journal::external_journal_capacity_conn(conn)?,
+            crate::db::external_journal::external_journal_age_report_conn(conn, now_wall_ms)?,
+            crate::db::external_journal::external_journal_integrity_fault_conn(conn)?,
+        ))
+    });
+    let (capacity, age, integrity_failure) = match counts {
+        Ok(counts) => counts,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "status: FAILED ({})",
+                    one_line(&format!("{error:#}"))
+                )],
+                true,
+            );
+        }
+    };
+
+    // Inspection is read-only: it creates nothing and repairs nothing, so an
+    // insecure spool is reported rather than silently fixed.
+    let spool = match crate::external_journal::spool::Spool::inspect_default() {
+        Ok(Some(spool)) => match (spool.allocated_bytes(), spool.list_quarantined()) {
+            (Ok(allocated_bytes), Ok(quarantined)) => ExternalJournalSpoolHealth::Healthy {
+                allocated_bytes,
+                quarantined_entries: quarantined.len(),
+            },
+            (Err(error), _) | (_, Err(error)) => ExternalJournalSpoolHealth::Unhealthy {
+                detail: error.to_string(),
+            },
+        },
+        Ok(None) => ExternalJournalSpoolHealth::Absent,
+        Err(error) => ExternalJournalSpoolHealth::Unhealthy {
+            detail: error.to_string(),
+        },
+    };
+    external_journal_section(capacity, age, &spool, integrity_failure)
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
@@ -1698,6 +1814,206 @@ mod tests {
         assert!(
             !rendered.contains("sk-not-in-doctor-output"),
             "doctor must never render configuration content: {rendered}"
+        );
+    }
+
+    // ---- external side-effect journal doctor coverage --------------------
+
+    use crate::db::external_journal::{
+        EXTERNAL_JOURNAL_ADMISSION_BYTES, EXTERNAL_JOURNAL_ADMISSION_CAPSULES,
+        EXTERNAL_JOURNAL_RECOVERY_RESERVE_CAPSULES, ExternalJournalAgeReport,
+        ExternalJournalCapacity,
+    };
+
+    fn healthy_spool() -> ExternalJournalSpoolHealth {
+        ExternalJournalSpoolHealth::Healthy {
+            allocated_bytes: 65_536,
+            quarantined_entries: 0,
+        }
+    }
+
+    #[test]
+    fn external_journal_doctor_section_is_clean_when_nothing_is_wrong() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity {
+                admission_capsules: 1,
+                admission_bytes: 65_536,
+                ..ExternalJournalCapacity::default()
+            },
+            ExternalJournalAgeReport::default(),
+            &healthy_spool(),
+            None,
+        );
+        assert!(!failed, "{lines:?}");
+        assert!(lines.iter().any(|line| line == "admission: ok"));
+        assert!(lines.iter().any(|line| line == "age: ok"));
+        assert!(lines.iter().any(|line| line == "spool: ok (owner-only)"));
+    }
+
+    #[test]
+    fn external_journal_doctor_section_fails_on_quarantine() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport::default(),
+            &ExternalJournalSpoolHealth::Healthy {
+                allocated_bytes: 65_536,
+                quarantined_entries: 2,
+            },
+            None,
+        );
+        assert!(failed, "quarantine must make doctor exit non-zero");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("quarantine: FAILED")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_fails_on_full_admission_partition() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity {
+                admission_capsules: EXTERNAL_JOURNAL_ADMISSION_CAPSULES,
+                admission_bytes: EXTERNAL_JOURNAL_ADMISSION_BYTES,
+                ..ExternalJournalCapacity::default()
+            },
+            ExternalJournalAgeReport::default(),
+            &healthy_spool(),
+            None,
+        );
+        assert!(failed);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("admission: FAILED")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_fails_on_full_recovery_reserve() {
+        // The reserve exists so a successful handoff always has somewhere to
+        // write its fallback; exhausting it must block new work too.
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity {
+                recovery_capsules: EXTERNAL_JOURNAL_RECOVERY_RESERVE_CAPSULES,
+                ..ExternalJournalCapacity::default()
+            },
+            ExternalJournalAgeReport::default(),
+            &healthy_spool(),
+            None,
+        );
+        assert!(failed);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("admission: FAILED")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_fails_on_unresolved_work_past_24h() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport {
+                unresolved: 3,
+                warning: 1,
+                critical: 2,
+                oldest_age_ms: 90_000_000,
+            },
+            &healthy_spool(),
+            None,
+        );
+        assert!(failed);
+        assert!(
+            lines.iter().any(|line| line.starts_with("age: FAILED")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("3 record(s); 1 warning, 2 critical")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_warns_without_failing_at_15m() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport {
+                unresolved: 1,
+                warning: 1,
+                critical: 0,
+                oldest_age_ms: 900_000,
+            },
+            &healthy_spool(),
+            None,
+        );
+        assert!(!failed, "a 15m warning must not fail the doctor run");
+        assert!(
+            lines.iter().any(|line| line.starts_with("age: WARNING")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_fails_on_insecure_spool() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport::default(),
+            &ExternalJournalSpoolHealth::Unhealthy {
+                detail: "spool directory /x/capsules has mode 755".to_string(),
+            },
+            None,
+        );
+        assert!(failed, "an insecure spool must make doctor exit non-zero");
+        assert!(
+            lines.iter().any(|line| line.starts_with("spool: FAILED")),
+            "{lines:?}"
+        );
+    }
+
+    /// The durable latch is the delivery mechanism: a simultaneous
+    /// database-and-spool failure recorded by some earlier process must make a
+    /// later doctor run critical even though nothing here holds a journal
+    /// instance and everything else looks healthy.
+    #[test]
+    fn external_journal_doctor_section_fails_on_a_persisted_integrity_fault() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport::default(),
+            &healthy_spool(),
+            Some("database and spool both failed after handoff".to_string()),
+        );
+        assert!(
+            failed,
+            "a persisted integrity fault must fail the doctor run"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("integrity: FAILED")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn external_journal_doctor_section_reports_absent_spool_without_failing() {
+        let (lines, failed) = external_journal_section(
+            ExternalJournalCapacity::default(),
+            ExternalJournalAgeReport::default(),
+            &ExternalJournalSpoolHealth::Absent,
+            None,
+        );
+        assert!(!failed);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "spool: none (not yet created)"),
+            "{lines:?}"
         );
     }
 }

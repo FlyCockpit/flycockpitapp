@@ -483,6 +483,21 @@ impl SecureKeyActor {
         Self::start_inner(db, None, Arc::new(FailClosedReconciler), true)
     }
 
+    /// Production composition with a reconciler that knows the consumer kinds
+    /// this build actually registers.
+    ///
+    /// `start_production` is fail-closed for every kind, which is correct while
+    /// no consumer exists but would leave a real consumer's references
+    /// permanently unreconcilable. Composition points pass a reconciler that
+    /// resolves the kinds they own and delegates the rest, so fail-closed stays
+    /// the default for anything unregistered.
+    pub fn start_production_with_reconciler(
+        db: Db,
+        reconciler: Arc<dyn ConsumerReconciler>,
+    ) -> Result<Self, SecureKeyError> {
+        Self::start_inner(db, None, reconciler, true)
+    }
+
     /// Test/injection path: never registers or unsets the process-global default store.
     /// Ownership of `set_default_store` is exclusive to [`Self::start_production`].
     pub fn start_with_store(

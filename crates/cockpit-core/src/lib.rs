@@ -32,6 +32,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod env_snapshot;
 pub mod envref;
+pub mod external_journal;
 pub mod external_runtime;
 pub mod git;
 pub mod gitignore;

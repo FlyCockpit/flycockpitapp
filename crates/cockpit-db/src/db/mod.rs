@@ -41,6 +41,7 @@ pub mod assistants;
 pub mod compressed_results;
 pub mod connector;
 pub mod execution_containments;
+pub mod external_journal;
 mod files;
 pub mod guidance;
 pub mod inference_calls;

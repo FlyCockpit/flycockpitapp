@@ -1719,3 +1719,337 @@ CREATE INDEX idx_execution_containments_session_state
 CREATE INDEX idx_execution_containments_nonempty
     ON execution_containments (session_id)
     WHERE state NOT IN ('empty');
+
+
+-- ---- external side-effect journal ------------------------------------------
+-- One bounded, restart-safe, idempotent journal for non-idempotent external
+-- actions (computer input, transcription, sidecars, image generation,
+-- inference recovery) so no consumer invents a second spool. SQLite is
+-- authoritative; the 64-KiB two-slot filesystem capsule owned by
+-- `cockpit-core::external_journal` only carries the minimum sanitized
+-- projection needed when the database cannot record a post-handoff
+-- transition.
+--
+-- Identity is (operation_kind, owner_session_id, idempotency_key) with an
+-- immutable payload digest and a monotonically increasing version. Rows hold
+-- digests and bounded tokens only — never prompts, typed input, pixels, raw
+-- paths/URLs, credentials, headers, provider payloads, or signed query
+-- values, and never spool HMAC key material.
+--
+-- Deliberately NOT `ON DELETE CASCADE` from sessions: session deletion writes
+-- an external_journal_session_tombstones row and unresolved operations
+-- survive it, so late provider evidence still resolves exactly once without
+-- recreating session content.
+
+CREATE TABLE external_journal_operations (
+    operation_id                      TEXT    PRIMARY KEY,
+    operation_kind                    TEXT    NOT NULL,
+    owner_session_id                  TEXT    NOT NULL,
+    idempotency_key                   TEXT    NOT NULL,
+    -- Immutable canonical projection facts. Length is capped at the encoder
+    -- bound (24 KiB) that the capsule slot body is sized for.
+    payload_digest                    TEXT    NOT NULL,
+    payload_len                       INTEGER NOT NULL CHECK (
+        payload_len >= 0 AND payload_len <= 24576
+    ),
+    state                             TEXT    NOT NULL CHECK (state IN (
+        'prepared', 'dispatching', 'accepted', 'rejected',
+        'submission_unknown', 'reconciling', 'cancellation_requested',
+        'cancelled', 'expired', 'completed_after_cancel',
+        'succeeded', 'failed'
+    )),
+    -- Monotonic compare-and-set version. Every committed transition bumps it.
+    version                           INTEGER NOT NULL CHECK (version >= 1),
+    -- Provider idempotency may permit retry only when BOTH the key and the
+    -- contract it was issued under are recorded.
+    provider_idempotency_key          TEXT,
+    provider_idempotency_contract     TEXT,
+    -- Orthogonal monotonic cancellation fact. Set exactly once by the first
+    -- cancellation request; no later transition may clear or replace it.
+    cancellation_requested_at_wall_ms INTEGER,
+    cancellation_requested_version    INTEGER,
+    created_at_wall_ms                INTEGER NOT NULL,
+    updated_at_wall_ms                INTEGER NOT NULL,
+    -- Durable proof of whether external handoff could have begun. `expired`
+    -- is legal only while this stays NULL.
+    dispatch_started_at_wall_ms       INTEGER,
+    terminal_at_wall_ms               INTEGER,
+    UNIQUE (operation_kind, owner_session_id, idempotency_key),
+    CHECK (
+        (cancellation_requested_at_wall_ms IS NULL)
+        = (cancellation_requested_version IS NULL)
+    ),
+    CHECK (
+        provider_idempotency_key IS NULL
+        OR provider_idempotency_contract IS NOT NULL
+    ),
+    CHECK (state <> 'expired' OR dispatch_started_at_wall_ms IS NULL),
+    CHECK (state <> 'succeeded' OR cancellation_requested_at_wall_ms IS NULL)
+);
+
+CREATE INDEX idx_external_journal_ops_session
+    ON external_journal_operations (owner_session_id);
+CREATE INDEX idx_external_journal_ops_state
+    ON external_journal_operations (state, updated_at_wall_ms);
+CREATE INDEX idx_external_journal_ops_unresolved
+    ON external_journal_operations (updated_at_wall_ms)
+    WHERE state IN (
+        'dispatching', 'accepted', 'submission_unknown',
+        'cancellation_requested', 'reconciling'
+    );
+CREATE INDEX idx_external_journal_ops_prepared
+    ON external_journal_operations (created_at_wall_ms)
+    WHERE state = 'prepared';
+
+-- Append-only transition log. The partial unique index is the database-level
+-- proof that an operation emits at most one terminal event: a duplicate
+-- transition returns the current record instead of writing a second row.
+
+CREATE TABLE external_journal_events (
+    event_id                          TEXT    PRIMARY KEY,
+    operation_id                      TEXT    NOT NULL,
+    version                           INTEGER NOT NULL CHECK (version >= 1),
+    from_state                        TEXT    NOT NULL,
+    to_state                          TEXT    NOT NULL,
+    terminal                          INTEGER NOT NULL CHECK (terminal IN (0, 1)),
+    -- Cancellation-aware projection: accepted/reconciling/failed terminals
+    -- keep exposing the original cancellation fact.
+    cancellation_requested_at_wall_ms INTEGER,
+    emitted_at_wall_ms                INTEGER NOT NULL,
+    FOREIGN KEY (operation_id)
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX uq_external_journal_events_version
+    ON external_journal_events (operation_id, version);
+CREATE UNIQUE INDEX uq_external_journal_events_terminal
+    ON external_journal_events (operation_id)
+    WHERE terminal = 1;
+CREATE INDEX idx_external_journal_events_operation
+    ON external_journal_events (operation_id, emitted_at_wall_ms);
+
+-- Capsule capacity ledger. Admission and recovery draw from one fixed
+-- partition each (3,072 capsules / 192 MiB admission, 1,024 / 64 MiB reserved)
+-- so a successful handoff can never discover that no durable fallback
+-- capacity remains. Every capsule is exactly 65,536 bytes.
+
+CREATE TABLE external_journal_spool_capsules (
+    operation_id       TEXT    PRIMARY KEY,
+    capsule_uuid       TEXT    NOT NULL UNIQUE,
+    key_version        INTEGER NOT NULL CHECK (key_version >= 1),
+    allocated_bytes    INTEGER NOT NULL CHECK (allocated_bytes = 65536),
+    capacity_partition TEXT    NOT NULL CHECK (capacity_partition IN (
+        'admission', 'recovery'
+    )),
+    quarantined        INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1)),
+    created_at_wall_ms INTEGER NOT NULL,
+    FOREIGN KEY (operation_id)
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_external_journal_capsules_partition
+    ON external_journal_spool_capsules (capacity_partition);
+CREATE INDEX idx_external_journal_capsules_key_version
+    ON external_journal_spool_capsules (key_version);
+CREATE INDEX idx_external_journal_capsules_quarantined
+    ON external_journal_spool_capsules (created_at_wall_ms)
+    WHERE quarantined = 1;
+
+-- Consumer-owned queued domain records that have not yet created a
+-- dispatching journal state. These expire in their OWN terminal state and
+-- never invent an external-journal operation row.
+
+CREATE TABLE external_journal_queue_entries (
+    queue_entry_id       TEXT    PRIMARY KEY,
+    operation_kind       TEXT    NOT NULL,
+    owner_session_id     TEXT    NOT NULL,
+    idempotency_key      TEXT    NOT NULL,
+    state                TEXT    NOT NULL CHECK (state IN (
+        'queued', 'journaled', 'cancelled', 'expired'
+    )),
+    journal_operation_id TEXT,
+    created_at_wall_ms   INTEGER NOT NULL,
+    updated_at_wall_ms   INTEGER NOT NULL,
+    UNIQUE (operation_kind, owner_session_id, idempotency_key),
+    CHECK ((state = 'journaled') = (journal_operation_id IS NOT NULL))
+);
+
+CREATE INDEX idx_external_journal_queue_queued
+    ON external_journal_queue_entries (created_at_wall_ms)
+    WHERE state = 'queued';
+
+-- Session deletion tombstone. Writing one never deletes an unresolved
+-- operation; resolution afterwards emits owner-visible recovery status
+-- without recreating session content.
+
+-- Durable integrity latch. The in-memory latch dies with the process, but a
+-- spool that failed verification, an unreachable authenticated outcome, or a
+-- simultaneous database+spool failure must keep doctor critical across
+-- restarts and must be visible to a doctor run that holds no journal
+-- instance. Single row by construction.
+
+CREATE TABLE external_journal_integrity_faults (
+    fault_id           TEXT    PRIMARY KEY CHECK (fault_id = 'current'),
+    detail             TEXT    NOT NULL,
+    observed_at_wall_ms INTEGER NOT NULL
+);
+
+CREATE TABLE external_journal_session_tombstones (
+    owner_session_id       TEXT    PRIMARY KEY,
+    deleted_at_wall_ms     INTEGER NOT NULL,
+    unresolved_at_deletion INTEGER NOT NULL CHECK (unresolved_at_deletion >= 0)
+);
+
+-- Integrity that SQLite can enforce on its own, so a writer that bypasses
+-- `crates/cockpit-db/src/db/external_journal.rs` still cannot create an
+-- impossible history. The module validates the same rules first and returns
+-- typed errors; these triggers are the backstop, not the primary check.
+
+-- The exact edge set from the state graph. `from_state = to_state` is the
+-- creation event a `prepared` insert emits and is deliberately exempt.
+CREATE TRIGGER external_journal_events_legal_edge
+BEFORE INSERT ON external_journal_events
+WHEN NEW.from_state <> NEW.to_state
+ AND (NEW.from_state || '>' || NEW.to_state) NOT IN (
+     'prepared>dispatching',
+     'prepared>cancelled',
+     'prepared>expired',
+     'dispatching>accepted',
+     'dispatching>rejected',
+     'dispatching>submission_unknown',
+     'dispatching>cancellation_requested',
+     'accepted>succeeded',
+     'accepted>completed_after_cancel',
+     'accepted>failed',
+     'accepted>cancellation_requested',
+     'submission_unknown>reconciling',
+     'submission_unknown>cancellation_requested',
+     'reconciling>accepted',
+     'reconciling>rejected',
+     'reconciling>submission_unknown',
+     'reconciling>failed',
+     'reconciling>cancellation_requested',
+     'cancellation_requested>cancelled',
+     'cancellation_requested>accepted',
+     'cancellation_requested>completed_after_cancel',
+     'cancellation_requested>failed',
+     'cancellation_requested>submission_unknown',
+     'cancellation_requested>reconciling'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'illegal external journal transition');
+END;
+
+-- The terminal flag must agree with the terminal state set, or the partial
+-- unique index that proves "at most one terminal event" could be bypassed by
+-- simply writing terminal = 0.
+CREATE TRIGGER external_journal_events_terminal_flag
+BEFORE INSERT ON external_journal_events
+WHEN NEW.terminal <> (NEW.to_state IN (
+    'cancelled', 'expired', 'completed_after_cancel',
+    'succeeded', 'failed', 'rejected'
+))
+BEGIN
+    SELECT RAISE(ABORT, 'external journal terminal flag disagrees with state');
+END;
+
+-- Plain `succeeded` is unreachable once cancellation was requested; the
+-- authoritative successful completion is `completed_after_cancel`.
+CREATE TRIGGER external_journal_events_succeeded_after_cancel
+BEFORE INSERT ON external_journal_events
+WHEN NEW.to_state = 'succeeded'
+ AND NEW.cancellation_requested_at_wall_ms IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'succeeded is forbidden after a cancellation request');
+END;
+
+-- The operations-table triggers below deliberately carry NO `OF <column>`
+-- list. A `BEFORE UPDATE OF x` trigger fires only when the statement's SET
+-- list mentions `x`, so a writer that changed `state` without mentioning
+-- `version` — or that never wrote a matching event row — would slip past
+-- column-scoped guards entirely. These fire on every update of the table.
+
+-- The cancellation fact is monotonic: the first request sets it and no later
+-- transition may clear or replace it.
+CREATE TRIGGER external_journal_ops_cancellation_immutable
+BEFORE UPDATE ON external_journal_operations
+WHEN OLD.cancellation_requested_at_wall_ms IS NOT NULL
+ AND (NEW.cancellation_requested_at_wall_ms IS NOT OLD.cancellation_requested_at_wall_ms
+   OR NEW.cancellation_requested_version IS NOT OLD.cancellation_requested_version)
+BEGIN
+    SELECT RAISE(ABORT, 'external journal cancellation fact is immutable');
+END;
+
+-- Versions are monotonic, which is what makes every transition a genuine
+-- compare-and-set rather than a last-writer-wins overwrite.
+CREATE TRIGGER external_journal_ops_version_monotonic
+BEFORE UPDATE ON external_journal_operations
+WHEN NEW.version < OLD.version
+BEGIN
+    SELECT RAISE(ABORT, 'external journal version must increase');
+END;
+
+-- Any state change is a transition, so it must bump the version even if the
+-- writer never inserted an event row.
+CREATE TRIGGER external_journal_ops_state_change_bumps_version
+BEFORE UPDATE ON external_journal_operations
+WHEN NEW.state <> OLD.state AND NEW.version <= OLD.version
+BEGIN
+    SELECT RAISE(ABORT, 'external journal state change must increase the version');
+END;
+
+-- The edge set, enforced on the row itself rather than only on the event.
+CREATE TRIGGER external_journal_ops_legal_edge
+BEFORE UPDATE ON external_journal_operations
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+     'prepared>dispatching',
+     'prepared>cancelled',
+     'prepared>expired',
+     'dispatching>accepted',
+     'dispatching>rejected',
+     'dispatching>submission_unknown',
+     'dispatching>cancellation_requested',
+     'accepted>succeeded',
+     'accepted>completed_after_cancel',
+     'accepted>failed',
+     'accepted>cancellation_requested',
+     'submission_unknown>reconciling',
+     'submission_unknown>cancellation_requested',
+     'reconciling>accepted',
+     'reconciling>rejected',
+     'reconciling>submission_unknown',
+     'reconciling>failed',
+     'reconciling>cancellation_requested',
+     'cancellation_requested>cancelled',
+     'cancellation_requested>accepted',
+     'cancellation_requested>completed_after_cancel',
+     'cancellation_requested>failed',
+     'cancellation_requested>submission_unknown',
+     'cancellation_requested>reconciling'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'illegal external journal transition');
+END;
+
+-- Durable no-dispatch proof is one-way. Once a record records that handoff
+-- could have begun, nothing may erase or rewrite that fact, because `expired`
+-- and `cancelled`-while-prepared both depend on it.
+CREATE TRIGGER external_journal_ops_dispatch_proof_immutable
+BEFORE UPDATE ON external_journal_operations
+WHEN OLD.dispatch_started_at_wall_ms IS NOT NULL
+ AND NEW.dispatch_started_at_wall_ms IS NOT OLD.dispatch_started_at_wall_ms
+BEGIN
+    SELECT RAISE(ABORT, 'external journal dispatch proof is immutable');
+END;
+
+-- Terminal states accept no further transition.
+CREATE TRIGGER external_journal_ops_terminal_is_final
+BEFORE UPDATE ON external_journal_operations
+WHEN OLD.state IN (
+    'cancelled', 'expired', 'completed_after_cancel',
+    'succeeded', 'failed', 'rejected'
+) AND NEW.state <> OLD.state
+BEGIN
+    SELECT RAISE(ABORT, 'external journal terminal state is final');
+END;

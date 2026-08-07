@@ -1900,10 +1900,10 @@ mod tests {
                     assert!(!reason.contains("SECRET"));
                     closed += 1;
                 }
-                proto::Event::TerminalOutput { bytes, .. } => {
-                    if bytes.windows(6).any(|w| w == b"SECRET") {
-                        saw_secret = true;
-                    }
+                proto::Event::TerminalOutput { bytes, .. }
+                    if bytes.windows(6).any(|w| w == b"SECRET") =>
+                {
+                    saw_secret = true;
                 }
                 proto::Event::TerminalClipboard { text, .. } => {
                     assert!(!text.contains("SECRET"));

@@ -1709,7 +1709,7 @@ fn configured_denylist_scrubs_multiple_layer_values() {
 #[test]
 fn ssh_entries_are_not_persisted() {
     let dir = TempDir::new().unwrap();
-    let key = "-----BEGIN PRIVATE KEY-----\nvery-private-ssh-material-123456789\n-----END PRIVATE KEY-----\n";
+    let key = "-----BEGIN PRIVATE KEY-----\nvery-private-ssh-material-123456789\n-----END PRIVATE KEY-----\n"; // allowlist secret: redaction fixture
     std::fs::write(dir.path().join("id_test"), key).unwrap();
     let table = RedactionTable::build(&ssh_cfg(dir.path()), dir.path()).unwrap();
     let json = table.to_persisted_json().unwrap();
@@ -1793,7 +1793,7 @@ fn short_entries_are_refused_from_all_sources() {
     std::fs::write(dir.path().join(".env"), "TOKEN=x\n").unwrap();
     std::fs::write(
         dir.path().join("id_test"),
-        "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n", // allowlist secret: redaction fixture
     )
     .unwrap();
     let mut cfg = ssh_cfg(dir.path());

@@ -26,8 +26,9 @@ pub fn cockpit_data_dir() -> Result<PathBuf> {
 /// set), `%LOCALAPPDATA%\cockpit\state` on Windows. Holds the daemon
 /// pid file, lock-state mirror snapshots, and rotating logs
 /// (implementation notes §5).
-// State-dir resolver; retained for the daemon state paths (implementation notes §5).
-#[allow(dead_code)]
+/// State-dir resolver, used by the daemon state paths (implementation
+/// notes §5) and by the TUI's private clipboard recovery artifact
+/// directory (`crates/cockpit-tui/src/clipboard/recovery`).
 pub fn cockpit_state_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_STATE_HOME")
         && !s.trim().is_empty()

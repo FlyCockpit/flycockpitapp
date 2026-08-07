@@ -3315,7 +3315,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let _ = crate::clipboard::copy_plain(text);
+        let _ = crate::clipboard::copy_plain(text, self.clipboard_recovery);
     }
 
     /// Pull the OS clipboard into the register when it differs from the

@@ -714,6 +714,19 @@ fn copy_oauth_url_with(
         return;
     };
     *status = Some(match copy(url) {
+        // `Ok(_)` used to collapse Confirmed and Unverified into the same
+        // "copied OAuth URL" wording. This status has no `ToastKind` of
+        // its own (unlike the chat-copy toast paths, where
+        // `describe_delivered` handles this), so the fix is a wording
+        // qualifier rather than a shared helper; the URL is also always
+        // reachable another way (rendered directly for the device-code
+        // flow, or auto-opened plus a separate "Open" trigger for the
+        // browser flow — see `render_device_code_session` and the
+        // `authorize_url` render block in this module), so an unverified
+        // copy still leaves the user with a working path forward.
+        Ok(result) if crate::clipboard::feedback::classify(&result).is_unverified() => Ok(
+            "copied OAuth URL (unverified — also reachable via the Open link above)".to_string(),
+        ),
         Ok(_) => Ok("copied OAuth URL".to_string()),
         Err(e) => Err(e.to_string()),
     });

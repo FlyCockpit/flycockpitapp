@@ -652,6 +652,39 @@ impl App {
                 Ok(_) => self.push_plain("local command: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("local command: {e}")),
             },
+            AsyncActionKind::Blocking("copy.file") => match result.payload {
+                Ok(AsyncActionPayload::CopyToFile {
+                    path,
+                    bytes_written,
+                    durability_confirmed: true,
+                }) => {
+                    self.show_toast(
+                        format!("Wrote {bytes_written} bytes to {}", path.display()),
+                        ToastKind::Success,
+                    );
+                }
+                Ok(AsyncActionPayload::CopyToFile {
+                    path,
+                    bytes_written,
+                    durability_confirmed: false,
+                }) => {
+                    // The file is genuinely on disk — this is not a failed
+                    // copy — but the directory-fsync durability barrier did
+                    // not confirm, so it is not an ordinary success either.
+                    self.show_toast(
+                        format!(
+                            "Wrote {bytes_written} bytes to {} (durability unconfirmed — a crash before the next fsync could lose the directory entry; verify the file)",
+                            path.display()
+                        ),
+                        ToastKind::Warning,
+                    );
+                }
+                Ok(_) => self.show_toast(
+                    "copy file: unexpected async response".to_string(),
+                    ToastKind::Error,
+                ),
+                Err(e) => self.show_toast(format!("copy file: {e}"), ToastKind::Error),
+            },
             AsyncActionKind::Refresh("display.daemon.probe") => match result.payload {
                 Ok(AsyncActionPayload::DaemonProbe { cwd, status }) => {
                     self.apply_display_daemon_probe_result(cwd, status);

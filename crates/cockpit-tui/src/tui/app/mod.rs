@@ -66,10 +66,11 @@ use input::accepts_key;
 use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};
 #[cfg(test)]
 use slash::{
-    AgentCommandOutcome, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
+    AgentCommandOutcome, CopyCommand, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
     SandboxEscalationCommand, SkillDispatch, agent_command_outcome, builtin_slash_name_taken,
-    last_agent_text, next_sandbox_mode, parse_copy_format, parse_mcp_action, parse_pane_side,
-    parse_sandbox_arg, parse_sandbox_escalation_arg, resolve_skill_dispatch, slash_matches,
+    next_sandbox_mode, parse_copy_command, parse_copy_format, parse_mcp_action, parse_pane_side,
+    parse_sandbox_arg, parse_sandbox_escalation_arg, resolve_skill_dispatch, select_agent_text,
+    slash_matches,
 };
 use slash::{
     SkillCommand, SlashCommand, SlashEntry, SlashMenuCache, bare_skill_commands_from,
@@ -2124,6 +2125,17 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
+    /// User's `tui.clipboard_recovery` setting. Passed to every clipboard
+    /// delivery call so a failed/unverified copy writes its private
+    /// recovery artifact only when explicitly opted in.
+    pub(super) clipboard_recovery: cockpit_config::extended::ClipboardRecovery,
+    /// Cancellation flag for the currently in-flight `/copy … file`
+    /// publish, if any. A superseding request sets this to `true` before
+    /// starting its own (fresh) flag, so the superseded publish observes
+    /// cancellation at its one checkpoint (after its temp file is durable,
+    /// before the atomic rename) instead of always running to completion
+    /// unnoticed.
+    pub(super) copy_file_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// True once the per-session tmux OSC52 discoverability hint has
     /// been shown; suppresses repeats for the rest of the session
     /// (resets on restart, never persisted).
@@ -3053,6 +3065,17 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let clipboard_recovery = tui_cfg.clipboard_recovery;
+        // Startup reconciliation (spec: "startup retains newest/removes
+        // older after containment checks"). `Off` never reaches this
+        // branch, so it stays entirely filesystem-free; a reconcile
+        // failure is swallowed (best-effort, never blocks startup) —
+        // `/doctor` still reports the directory's live state independently.
+        if clipboard_recovery == cockpit_config::extended::ClipboardRecovery::PrivateFile
+            && let Ok(dir) = crate::clipboard::recovery::recovery_dir_path()
+        {
+            let _ = crate::clipboard::recovery::reconcile_startup(&dir);
+        }
         let use_emojis = tui_cfg.use_emojis;
         let attention = tui_cfg.attention;
         let longcache_supported = launch
@@ -3228,6 +3251,8 @@ impl App {
             link_registry: crate::tui::links::LinkRegistry::default(),
             exit_tail_lines,
             rich_text_copy,
+            clipboard_recovery,
+            copy_file_cancel: None,
             tmux_copy_hint_shown: false,
             context_menu: None,
             toast: None,
@@ -3704,6 +3729,8 @@ mod caffeinate_toast_tests;
 mod config_snapshot_tests;
 #[cfg(test)]
 mod copy_cmd_tests;
+#[cfg(test)]
+mod copy_file_off_loop_tests;
 #[cfg(test)]
 mod ctrl_c_tests;
 #[cfg(test)]

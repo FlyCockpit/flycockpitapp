@@ -63,8 +63,14 @@ impl App {
                 .map(|link| link.url.clone())
         {
             if cockpit_core::sysinfo::is_ssh() {
-                match crate::clipboard::copy_plain(&url) {
-                    Ok(_) => self.show_toast("Link copied (SSH session)", ToastKind::Success),
+                match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
+                    Ok(result) => {
+                        let (msg, kind) = super::copy_actions::describe_delivered(
+                            &result,
+                            "Link copied (SSH session).".to_string(),
+                        );
+                        self.show_toast(msg, kind);
+                    }
                     Err(error) => {
                         self.show_toast(format!("Copy failed: {error}"), ToastKind::Error)
                     }

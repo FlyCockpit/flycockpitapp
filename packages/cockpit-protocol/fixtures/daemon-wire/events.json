@@ -269,6 +269,7 @@
               "enabled": true
             },
             "caffeinate_display_awake": false,
+            "clipboard_recovery": "off",
             "copy_on_release": true,
             "diff_style": "side-by-side",
             "exit_tail_lines": 100,

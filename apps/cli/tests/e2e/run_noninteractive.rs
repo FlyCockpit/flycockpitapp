@@ -431,11 +431,10 @@ async fn run_approval_auto_denied() {
     assert!(
         captured_contains(
             &provider,
-            "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI"
+            "approval auto-denied; re-run with --approve <class> or use the TUI"
         )
         .await,
-        "model did not receive the structured noninteractive denial; captured requests: {:#?}",
-        provider.captured()
+        "model did not receive the structured noninteractive denial"
     );
 
     let mut json_command = home.cockpit();

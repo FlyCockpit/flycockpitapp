@@ -303,6 +303,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn chat_auth_check_failures_are_redacted_and_template_documented() {
+        let _env = crate::test_env::lock_async().await;
         const LEAK: &str = "sk-leaked-body-secret";
         const LEAK_BODY: &str = r#"{"error":"sk-leaked-body-secret"}"#;
         for template in chat_templates() {

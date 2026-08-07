@@ -1290,6 +1290,7 @@ mod tests {
             let side = info(false);
             let mut app = App::new(None, false);
             app.daemon_prompt = None;
+            app.dialog = crate::tui::settings::Dialog::None;
             app.open_btw_pane_from_info(side.clone(), false);
             app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
             assert_eq!(app.composer.text(), "x");

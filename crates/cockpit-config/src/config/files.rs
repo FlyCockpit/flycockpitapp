@@ -1231,7 +1231,7 @@ fn rename_open_file_on_windows(
         FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
     };
 
-    let destination_wide = destination.encode_wide().collect::<Vec<_>>();
+    let mut destination_wide = destination.encode_wide().collect::<Vec<_>>();
     if destination_wide.contains(&0) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1249,8 +1249,13 @@ fn rename_open_file_on_windows(
             )
         })?;
     let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    // `FileNameLength` excludes the terminator, but the kernel's
+    // FileRenameInformation parser requires one to be present in the buffer.
+    // Supplying only the counted UTF-16 units is rejected by Windows with
+    // ERROR_INVALID_PARAMETER.
+    destination_wide.push(0);
     let total_bytes = header_bytes
-        .checked_add(name_bytes as usize)
+        .checked_add(destination_wide.len() * std::mem::size_of::<u16>())
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

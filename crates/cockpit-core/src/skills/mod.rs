@@ -440,8 +440,19 @@ fn ensure_no_skill_symlink(target: &SkillPackageTarget) -> Result<()> {
 }
 
 fn lexical_absolute_against(path: &Path, cwd: &Path) -> PathBuf {
+    let lexical_cwd = lexical_normalize(cwd);
+    // Canonicalize only the workspace root, then append the requested path
+    // lexically. On macOS, `/var` is an alias for `/private/var`; resolving
+    // the root keeps a tempdir-based workspace and the manifest discovered
+    // beneath it in the same namespace. Do not canonicalize the requested
+    // path itself: that could follow a package-file symlink before the
+    // managed-skill symlink guard has a chance to reject it.
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| lexical_cwd.clone());
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        let path = lexical_normalize(path);
+        path.strip_prefix(&lexical_cwd)
+            .map(|relative| cwd.join(relative))
+            .unwrap_or(path)
     } else {
         cwd.join(path)
     };
@@ -1888,6 +1899,32 @@ mod tests {
         let cfg = skills_cfg(vec!["skills"], false);
 
         assert!(package_target_for_path(&lookalike.join("SKILL.md"), tmp.path(), &cfg).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_target_for_path_handles_canonical_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let scan = workspace.join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let alias = tmp.path().join("workspace-alias");
+        symlink(&workspace, &alias).unwrap();
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+
+        let target =
+            package_target_for_path(&alias.join(".agents/skills/target/SKILL.md"), &alias, &cfg)
+                .expect("workspace aliases should still identify managed skill packages");
+
+        assert_eq!(target.name, "target");
     }
 
     #[test]

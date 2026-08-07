@@ -772,9 +772,12 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                 );
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
+                #[cfg(unix)]
                 let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
                     let _ = std::fs::remove_file(&endpoint);
                 });
+                #[cfg(not(unix))]
+                let status = status_for_unreachable_pid(&canonical);
                 return DaemonProbe::new(status, recorded);
             }
         }

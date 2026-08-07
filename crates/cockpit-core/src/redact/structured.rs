@@ -11,15 +11,11 @@ pub(super) fn collect_json_strings(
     out: &mut Vec<Candidate>,
 ) {
     match value {
-        serde_json::Value::String(s) => {
-            if under_secret_key {
-                out.push(Candidate::prunable(
-                    s.clone(),
-                    format!("{display} (json)"),
-                    length_exempt,
-                ));
-            }
-        }
+        serde_json::Value::String(s) if under_secret_key => out.push(Candidate::prunable(
+            s.clone(),
+            format!("{display} (json)"),
+            length_exempt,
+        )),
         serde_json::Value::Array(items) => {
             for item in items {
                 collect_json_strings(item, display, length_exempt, under_secret_key, out);

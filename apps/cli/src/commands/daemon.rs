@@ -63,6 +63,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 client
                     .request_ok(Request::StopDaemon { grace_secs: grace })
                     .await?;
+                drop(client);
                 if !daemon::wait_for_restart_release(
                     &paths,
                     old_pid,
@@ -111,6 +112,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     client
                         .request_ok(Request::StopDaemon { grace_secs: grace })
                         .await?;
+                    drop(client);
                     true
                 } else {
                     let _ = daemon::stop(&paths)?;

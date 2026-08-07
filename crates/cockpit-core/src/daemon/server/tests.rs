@@ -7957,6 +7957,7 @@ async fn assert_create_assistant_session_happy() {
     );
 }
 
+#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -8045,6 +8046,7 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
     );
 }
 
+#[cfg(unix)]
 async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
@@ -8167,6 +8169,7 @@ async fn assert_auto_title_mutating_malformed() {
     assert!(!row.user_renamed);
 }
 
+#[cfg(unix)]
 fn minimal_import_archive_base64() -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
@@ -8305,6 +8308,7 @@ async fn assert_write_bulk_transfer_chunk_malformed() {
     assert_eq!(error.code, ErrorCode::BadRequest);
 }
 
+#[cfg(unix)]
 async fn assert_import_session_archive_happy() {
     let ctx = test_ctx();
     let (session_id, archive_base64) = minimal_import_archive_base64();
@@ -8328,6 +8332,7 @@ async fn assert_import_session_archive_happy() {
     assert!(ctx.db.get_session(session_id).await.unwrap().is_some());
 }
 
+#[cfg(unix)]
 async fn assert_import_session_archive_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(
@@ -9009,7 +9014,6 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
     }
 }
 
-#[cfg(unix)]
 fn attach_existing_request(session_id: Uuid, project_root: &Path) -> Request {
     Request::Attach {
         session_id: Some(session_id),
@@ -15234,6 +15238,7 @@ async fn reconnect_attach_uses_authoritative_default_correction_before_config_wa
     assert_eq!(active.generation, 0, "attach starts a new client epoch");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn server_answers_too_new_request_with_protocol_version_error() {
     let ctx = test_ctx();
@@ -15273,6 +15278,7 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
     server.await.unwrap().unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn server_responses_use_negotiated_client_protocol_version() {
     let ctx = test_ctx();
@@ -15317,6 +15323,7 @@ async fn server_responses_use_negotiated_client_protocol_version() {
     server.await.unwrap().unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() {
     let ctx = test_ctx();
@@ -15378,6 +15385,7 @@ async fn unknown_frame_request_gets_unsupported_error_and_connection_survives() 
     server.await.unwrap().unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn unknown_frame_event_is_dropped_and_connection_survives() {
     let ctx = test_ctx();

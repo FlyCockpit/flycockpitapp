@@ -89,6 +89,16 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # The dependency-inventory test intentionally resolves every supported
+      # target with `--offline`; a host build fetches only its own target's
+      # optional crates. Populate the registry cache first on the Unix jobs.
+      - name: Fetch cross-platform metadata dependencies
+        if: contains(matrix.os, 'windows') == false
+        run: |
+          cargo fetch --locked --target aarch64-apple-darwin
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+
       - name: Test
         run: cargo nextest run --locked --workspace
 

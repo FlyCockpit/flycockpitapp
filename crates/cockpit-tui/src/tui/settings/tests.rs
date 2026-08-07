@@ -2037,7 +2037,6 @@ fn security_setup_wizard_tui_edits_redaction_number() {
 
     d.handle_key(press(KeyCode::Enter)); // sandbox default
     d.handle_key(press(KeyCode::Enter)); // approval default
-    d.handle_key(press(KeyCode::Enter)); // redaction default
     for _ in 0..8 {
         d.handle_key(press(KeyCode::Backspace));
     }

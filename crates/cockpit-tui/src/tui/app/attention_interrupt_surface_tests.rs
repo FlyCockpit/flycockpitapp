@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
-    App::new(Some(tmp.path()), false)
+    let mut app = App::new(Some(tmp.path()), false);
+    // These tests exercise composer input, not the startup daemon chooser.
+    app.daemon_prompt = None;
+    app
 }
 
 fn question_set(permission: bool) -> InterruptQuestionSet {

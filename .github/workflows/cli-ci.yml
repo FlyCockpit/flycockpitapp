@@ -40,13 +40,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: blacksmith-8vcpu-ubuntu-2404
             toolchain: stable
-          - os: macos-latest
+          - os: blacksmith-6vcpu-macos-latest
             toolchain: stable
-          - os: windows-latest
+          - os: blacksmith-8vcpu-windows-2025
             toolchain: stable
-          - os: ubuntu-latest
+          - os: blacksmith-8vcpu-ubuntu-2404
             # Keep this pinned to apps/cli/Cargo.toml's rust-version.
             toolchain: 1.95.0
 
@@ -73,11 +73,11 @@ jobs:
           workspaces: . -> target
 
       - name: Build
-        if: matrix.os != 'windows-latest'
+        if: contains(matrix.os, 'windows') == false
         run: cargo build --locked --workspace
 
       - name: Build Windows target
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         run: cargo build --locked --workspace --target x86_64-pc-windows-msvc
 
       - name: Install nextest
@@ -93,19 +93,19 @@ jobs:
         run: cargo test --locked --workspace --doc
 
       - name: Clippy
-        if: matrix.os != 'windows-latest'
+        if: contains(matrix.os, 'windows') == false
         run: cargo clippy --locked --workspace --tests -- -D warnings
 
       - name: Clippy Windows target
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         run: cargo clippy --locked --workspace --tests --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Clippy examples
-        if: matrix.os != 'windows-latest'
+        if: contains(matrix.os, 'windows') == false
         run: cargo clippy --locked --workspace --examples -- -D warnings
 
       - name: Clippy examples Windows target
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         run: cargo clippy --locked --workspace --examples --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Format

@@ -42,6 +42,19 @@ pr-run-mode = "plan"
 # Release requests must pass the root release-preflight workflow before artifacts build.
 plan-jobs = ["./release-preflight"]
 
+
+# Blacksmith runners for cargo-dist local artifact builds (feeds release.yml
+# matrix.runner). Linux stays on 22.04-class images for glibc compatibility
+# with cargo-dist defaults. x86_64-apple-darwin stays on GitHub-hosted
+# macos-15-intel — Blacksmith has Apple Silicon macOS only.
+[dist.github-custom-runners]
+global = "blacksmith-4vcpu-ubuntu-2204"
+x86_64-unknown-linux-gnu = "blacksmith-8vcpu-ubuntu-2204"
+aarch64-unknown-linux-gnu = "blacksmith-8vcpu-ubuntu-2204-arm"
+aarch64-apple-darwin = "blacksmith-12vcpu-macos-latest"
+x86_64-apple-darwin = "macos-15-intel"
+x86_64-pc-windows-msvc = "blacksmith-8vcpu-windows-2025"
+
 [dist.github-action-commits]
 "actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10"
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"

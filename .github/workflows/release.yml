@@ -18,7 +18,7 @@ concurrency:
 jobs:
   validate:
     name: Validate release request
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -69,7 +69,7 @@ jobs:
     needs:
       - validate
       - release-preflight
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ needs.validate.outputs.tag }}
@@ -197,7 +197,7 @@ jobs:
     needs:
       - plan-cli-release
       - build-cli-local-artifacts
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-8vcpu-ubuntu-2204
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -263,7 +263,7 @@ jobs:
     if: ${{ always() && needs.plan-cli-release.result == 'success' && (needs.build-cli-global-artifacts.result == 'skipped' || needs.build-cli-global-artifacts.result == 'success') && (needs.build-cli-local-artifacts.result == 'skipped' || needs.build-cli-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -349,7 +349,7 @@ jobs:
     needs:
       - validate
       - publish-cli-release
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     environment: release
     steps:
       - name: Validate tap token
@@ -421,7 +421,7 @@ jobs:
       - publish-cli-release
       - publish-homebrew-formula
     if: ${{ always() && needs.publish-cli-release.result == 'success' && needs.publish-homebrew-formula.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Write summary
         shell: bash

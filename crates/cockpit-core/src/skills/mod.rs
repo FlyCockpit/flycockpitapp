@@ -370,7 +370,11 @@ fn package_target_for_path_with_skill(
     cfg: &SkillsConfig,
 ) -> Option<(SkillPackageTarget, Skill)> {
     let path = lexical_absolute_against(path, cwd);
-    let scan_dirs = resolve_scan_dirs(cwd, cfg);
+    // Write validation must inspect every configured package, even when the
+    // current workspace is untrusted and normal skill discovery suppresses
+    // its contents. Otherwise an untrusted-policy gap would let a write
+    // bypass package integrity and read-only provenance checks.
+    let scan_dirs = resolve_configured_scan_dirs(cwd, cfg);
     if !scan_dirs
         .iter()
         .map(|dir| lexical_absolute_against(dir, cwd))
@@ -378,7 +382,7 @@ fn package_target_for_path_with_skill(
     {
         return None;
     }
-    let skills = discover(cwd, cfg).ok()?;
+    let skills = discover_uncached(&scan_dirs);
     for skill in skills {
         let package_root = lexical_absolute_against(package_root(&skill), cwd);
         if !path.starts_with(&package_root) || path == package_root {
@@ -505,22 +509,7 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     if let Some(entry) = cache.lock().unwrap().get(&dirs) {
         return Ok(entry.skills.clone());
     }
-    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
-    let mut skills: Vec<Skill> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for manifest in manifests {
-        match parse_skill(&manifest) {
-            Ok(skill) => {
-                if seen.insert(skill.frontmatter.name.clone()) {
-                    skills.push(skill);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %manifest.display(), error = %e, "skipping malformed SKILL.md");
-            }
-        }
-    }
+    let skills = discover_uncached(&dirs);
 
     cache.lock().unwrap().insert(
         dirs,
@@ -529,6 +518,23 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
         },
     );
     Ok(skills)
+}
+
+fn discover_uncached(dirs: &[PathBuf]) -> Vec<Skill> {
+    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
+    let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for manifest in manifests {
+        match parse_skill(&manifest) {
+            Ok(skill) if seen.insert(skill.frontmatter.name.clone()) => skills.push(skill),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(path = %manifest.display(), %error, "skipping malformed SKILL.md");
+            }
+        }
+    }
+    skills
 }
 
 /// Return every package manifest beneath one configured root in deterministic
@@ -874,6 +880,13 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
 /// Returned paths are absolute and may not exist — [`discover`] tolerates
 /// missing dirs.
 pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
+    resolve_configured_scan_dirs(cwd, cfg)
+        .into_iter()
+        .filter(|dir| skill_scan_dir_allowed_by_trust(dir))
+        .collect()
+}
+
+fn resolve_configured_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in &cfg.scan_dirs {
         resolve_dir_entry(entry, cwd, cfg.ancestor_walk, &mut out);
@@ -881,9 +894,7 @@ pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
     for entry in &cfg.external_dirs {
         resolve_dir_entry(entry, cwd, false, &mut out);
     }
-    out.into_iter()
-        .filter(|dir| skill_scan_dir_allowed_by_trust(dir))
-        .collect()
+    out
 }
 
 fn skill_scan_dir_allowed_by_trust(dir: &Path) -> bool {

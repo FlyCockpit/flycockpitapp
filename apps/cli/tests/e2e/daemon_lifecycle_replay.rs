@@ -666,6 +666,7 @@ fn lifecycle_restart_command_preserves_parked_session_and_starts_when_absent() {
             wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
             interrupt_id
         );
+        drop(client);
 
         let stop = daemon
             .command()

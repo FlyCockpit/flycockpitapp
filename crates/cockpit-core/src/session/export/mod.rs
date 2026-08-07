@@ -1501,6 +1501,7 @@ fn tool_provider_identity_json(tool_call: &ToolCallEvent) -> Result<Value> {
                     tool_call.wire_api.as_deref().unwrap_or("unknown")
                 );
             }
+            Some("completions") | Some("responses") => {}
             Some(other) => {
                 anyhow::bail!(
                     "invalid provider identity for tool_call row {}: unsupported wire_api `{}`",

@@ -931,6 +931,23 @@ fn windows_absolute_path_parts(path: &Path) -> Result<(PathBuf, Vec<std::ffi::Os
 
 #[cfg(windows)]
 fn open_windows_directory_nofollow(path: &Path, create_missing: bool) -> Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+
+    open_windows_directory_nofollow_with_final_access(
+        path,
+        create_missing,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    )
+}
+
+#[cfg(windows)]
+fn open_windows_directory_nofollow_with_final_access(
+    path: &Path,
+    create_missing: bool,
+    final_desired_access: u32,
+) -> Result<std::fs::File> {
     use windows_sys::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_OPEN};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
@@ -941,9 +958,14 @@ fn open_windows_directory_nofollow(path: &Path, create_missing: bool) -> Result<
         .with_context(|| format!("opening Windows path anchor {}", anchor.display()))?;
     reject_windows_reparse_handle(&directory, &anchor)?;
     let mut traversed = anchor;
-    for name in names {
+    let final_index = names.len().saturating_sub(1);
+    for (index, name) in names.into_iter().enumerate() {
         traversed.push(&name);
-        let desired_access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let desired_access = if index == final_index {
+            final_desired_access
+        } else {
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        };
         directory = match open_windows_relative_nofollow(
             &directory,
             &name,
@@ -1008,6 +1030,29 @@ fn open_windows_parent_directory_nofollow(
         .ok_or_else(|| anyhow::anyhow!("Windows path has no file name: {}", path.display()))?;
     Ok((
         open_windows_directory_nofollow(parent, create_missing)?,
+        name.to_os_string(),
+    ))
+}
+
+#[cfg(windows)]
+fn open_windows_parent_directory_for_rename_nofollow(
+    path: &Path,
+    create_missing: bool,
+) -> Result<(std::fs::File, std::ffi::OsString)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Windows path has no file name: {}", path.display()))?;
+    Ok((
+        open_windows_directory_nofollow_with_final_access(
+            parent,
+            create_missing,
+            FILE_ADD_FILE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?,
         name.to_os_string(),
     ))
 }
@@ -1302,7 +1347,8 @@ fn prepare_atomic_write_in_existing_parent(
     #[cfg(unix)]
     let (parent_dir, destination_name) = open_parent_directory_nofollow(path)?;
     #[cfg(windows)]
-    let (parent_dir, destination_name) = open_windows_parent_directory_nofollow(path, false)?;
+    let (parent_dir, destination_name) =
+        open_windows_parent_directory_for_rename_nofollow(path, false)?;
     #[cfg(any(unix, windows))]
     let tmp_name =
         std::ffi::OsString::from(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));

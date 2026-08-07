@@ -259,9 +259,11 @@ describe("cockpit-proto daemon wire schemas", () => {
         status: "applied",
         active_state: activeState,
         default_update: {
-          status: "failed",
-          user_message: "Session changed, but the default write failed.",
-          diagnostic_code: "default_model_write_failed",
+          status: "verified",
+          selection: activeState.selection,
+          generation: 3,
+          scope_label: "user",
+          unchanged: false,
         },
       },
       {

@@ -699,7 +699,16 @@ export function reduceNativeSessionEvent(
     const activeModel = activeModelInputFromRecord(parsedResult.data.outcome.active_state);
     if (!activeModel) return { state, warning: eventWarning(event.event) };
     // Terminal applied results may correct default/divergence fields at the
-    // same generation after a successful default save.
+    // same generation after a verified default save, so equality is accepted.
+    // A strictly older generation is still stale and must not clobber newer
+    // state — same rule as `active_model_state` above, and as the web client.
+    if (
+      state.activeModel &&
+      typeof activeModel.generation === "number" &&
+      activeModel.generation < state.activeModel.generation
+    ) {
+      return { state };
+    }
     return {
       state: {
         ...state,

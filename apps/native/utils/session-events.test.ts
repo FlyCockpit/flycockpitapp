@@ -310,7 +310,19 @@ describe("native session event helpers", () => {
             diverged: false,
             generation: 7,
           },
-          default_update: { status: "saved" },
+          default_update: {
+            status: "verified",
+            selection: {
+              provider: "openai",
+              model: "gpt-5",
+              reasoning_effort: { value: "high" },
+              thinking_mode: "high",
+              prompt_cache_retention: "extended",
+            },
+            generation: 7,
+            scope_label: "user",
+            unchanged: false,
+          },
         },
       },
     });

@@ -366,7 +366,13 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
   return z.object({ request: z.literal(request) }).strict();
 }
 
-export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnion("request", [
+// Kept as its own array (rather than reading `clientRequestSchema.options`)
+// because `clientRequestSchema` is annotated as the wider `z.ZodType<...>`
+// below for external callers, which erases the discriminated-union member
+// type and, with it, `.options`. `clientEnvelopeSchema` below reuses this
+// array directly so it stays in sync with `clientRequestSchema` by
+// construction.
+const clientRequestVariants = [
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("attach", requestParamSchemas.attach),
   requestVariant("cancel_paused_work", requestParamSchemas.cancel_paused_work),
@@ -401,13 +407,40 @@ export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnio
   requestVariant("share_session", requestParamSchemas.share_session),
   requestVariant("stats_rollup", requestParamSchemas.stats_rollup),
   requestVariant("unarchive_session", requestParamSchemas.unarchive_session),
-]);
+] as const;
 
-export const clientEnvelopeSchema = z.intersection(
+export const clientRequestSchema: z.ZodType<ClientRequest> = z.discriminatedUnion(
+  "request",
+  clientRequestVariants,
+);
+
+// Built as a single strict object per request variant (envelope fields merged
+// directly into each member) rather than `z.intersection(envelopeShape,
+// clientRequestSchema)`. zod's intersection only reports an `unrecognized_keys`
+// issue when BOTH sides flag the same key name, regardless of path; since the
+// envelope-only schema has no `params` field at all, it never co-flags a
+// bogus key nested inside `params`, so unknown keys inside `params` silently
+// passed through. Merging into one object schema per variant makes the
+// nested `.strict()` on `params` the sole source of truth again.
+const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
   z
-    .object({ v: z.literal(PROTOCOL_VERSION), kind: z.literal("req"), id: requestIdSchema })
+    .object({
+      v: z.literal(PROTOCOL_VERSION),
+      kind: z.literal("req"),
+      id: requestIdSchema,
+      ...variant.shape,
+    })
     .strict(),
-  clientRequestSchema,
+);
+export const clientEnvelopeSchema = z.discriminatedUnion(
+  "request",
+  // `.map` widens the source tuple to a plain array; cast back to the
+  // non-empty tuple shape `z.discriminatedUnion` expects. Safe because
+  // `clientRequestVariants` is a statically-known non-empty literal array.
+  clientEnvelopeVariants as [
+    (typeof clientEnvelopeVariants)[number],
+    ...(typeof clientEnvelopeVariants)[number][],
+  ],
 );
 export type ClientEnvelope = z.infer<typeof clientEnvelopeSchema>;
 

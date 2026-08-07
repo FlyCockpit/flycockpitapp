@@ -844,16 +844,14 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     // Advance past the opening `---` line.
-    let after_open = match rest.find('\n') {
-        Some(nl) => {
-            // Ensure the opening line is *only* `---` (allow trailing CR).
-            let first_line = rest[..nl].trim_end_matches('\r');
-            if first_line != "---" {
-                return None;
-            }
-            &rest[nl + 1..]
+    let after_open = {
+        let nl = rest.find('\n')?;
+        // Ensure the opening line is *only* `---` (allow trailing CR).
+        let first_line = rest[..nl].trim_end_matches('\r');
+        if first_line != "---" {
+            return None;
         }
-        None => return None,
+        &rest[nl + 1..]
     };
 
     // Find the closing fence: a line consisting solely of `---`.

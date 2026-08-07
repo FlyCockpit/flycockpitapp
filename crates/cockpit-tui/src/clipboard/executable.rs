@@ -239,24 +239,6 @@ pub fn verify_unix_candidate(path: &Path) -> Result<(), SafeErrorKind> {
 fn windows_clip_path() -> Result<PathBuf, SafeErrorKind> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStringExt;
-        let mut buf = [0u16; 260];
-        // SAFETY: GetSystemDirectoryW writes at most `buf.len()` UTF-16 units.
-        let len = unsafe {
-            windows_sys::Win32::System::SystemServices::GetSystemDirectoryW(
-                // Actually it's in Win32_Storage? No — GetSystemDirectoryW is in
-                // Win32_System_SystemInformation or Win32_UI? It's in
-                // windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW
-                // Using a safer approach via GetSystemDirectory if feature available.
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-            )
-        };
-        // Fallback: hard-code is forbidden for env-provided system root.
-        // If API unavailable at compile time, use a minimal windows-sys call.
-        let _ = len;
-        let _ = OsStringExt::from_wide;
-        // Use std approach via known API.
         system_directory_clip()
     }
     #[cfg(not(windows))]

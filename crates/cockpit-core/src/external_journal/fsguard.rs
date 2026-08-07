@@ -611,10 +611,8 @@ mod imp {
             // unstable. Query the same value from the already-open handle so
             // the containment check remains effective on stable Rust.
             let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            unsafe {
-                GetFileInformationByHandle(HANDLE(file.as_raw_handle() as isize), &mut information)
-            }
-            .map_err(|error| {
+            unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+                .map_err(|error| {
                 ExternalJournalError::Containment(format!(
                     "could not inspect capsule {name} link count: {error}"
                 ))

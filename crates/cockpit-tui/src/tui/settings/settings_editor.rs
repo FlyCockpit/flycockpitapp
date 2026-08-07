@@ -283,7 +283,7 @@ impl ProviderSettingId {
                 "extract strips literal <think> blocks from assistant text, stores them as reasoning, and leaves display to Interface -> Thinking display. It does not request more reasoning from the model.",
             ),
             Self::Mode => Some(
-                "Steering tier for new turns: defensive (weaker models, explicit guidance), normal (strong models, terse), frontier (top-tier models, high autonomy). inherit falls through to the provider, then the global llm mode. Separate from Interface -> Thinking display.",
+                "Steering tier for new turns: defensive (weaker models, explicit guidance), normal (strong models, terse), frontier (top-tier models, high autonomy). inherit falls through to the provider, then the global llm mode. Steering only: mode never changes provider eligibility, data custody, or redaction — Trust alone decides whether inference requests are sent raw, and no mode or locality implies trust. Separate from Interface -> Thinking display.",
             ),
             Self::DefaultThinkingMode => Some(
                 "Legacy thinking-mode default for models that support thinking modes but not typed reasoning effort. Active /model thinking selections still win.",
@@ -352,7 +352,7 @@ impl ProviderSettingId {
                 "Fallback request target used after inference thresholds; leave blank for no backup.",
             ),
             Self::TrustPolicy => Some(
-                "Trusted models may receive unsanitized prompts and tool results; untrusted models keep outbound redaction.",
+                "Data custody only, independent of Mode and locality: inference requests to a trusted model may be sent raw, including secrets and environment values, while inference requests to an untrusted model are redacted. Trusted is meant for a self-hosted or no-log endpoint you are content to hold raw content. Marking an external provider trusted sends it raw secrets and environment values. Exports and client display stay redacted regardless of trust.",
             ),
             Self::Location => {
                 Some("Locality is routing metadata only; local and trusted are separate decisions.")
@@ -1198,7 +1198,7 @@ impl SettingsEditor {
                     };
                     self.status = if self.trust == Some(ModelTrust::Trusted) {
                         Some(
-                            "trusted models may receive unsanitized prompts and tool results"
+                            "trusted: inference requests may be sent raw, including secrets and environment values"
                                 .to_string(),
                         )
                     } else {
@@ -1219,7 +1219,7 @@ impl SettingsEditor {
                             .is_some_and(|ready_at| Instant::now() < ready_at)
                         {
                             self.status = Some(
-                                "wait before confirming provider trust; future fetched models inherit unredacted access"
+                                "wait before confirming provider trust; future fetched models inherit raw-custody access to secrets and environment values"
                                     .to_string(),
                             );
                             return;
@@ -1228,7 +1228,7 @@ impl SettingsEditor {
                         self.provider_trust_confirm_pending = false;
                         self.provider_trust_confirm_ready_at = None;
                         self.status = Some(
-                            "provider trusted: future fetched models inherit unredacted access"
+                            "provider trusted: it now receives raw secrets and environment values in inference requests, and future fetched models inherit that"
                                 .to_string(),
                         );
                     }
@@ -1237,7 +1237,7 @@ impl SettingsEditor {
                         self.provider_trust_confirm_ready_at =
                             Some(Instant::now() + self.provider_trust_confirm_lockout);
                         self.status = Some(
-                            "press Enter again to mark the provider trusted; future fetched models inherit unredacted access"
+                            "press Enter again to mark the provider trusted; it will receive raw secrets and environment values in inference requests, and future fetched models inherit that"
                                 .to_string(),
                         );
                     }
@@ -2556,6 +2556,51 @@ impl SettingStore for SettingsEditor {
 mod tests {
 
     use super::*;
+
+    /// AC6 (provider/model editor half). Custody language and harness posture
+    /// stay in separate rows with separate copy, and the trust row carries the
+    /// explicit raw-secrets warning.
+    #[test]
+    fn trust_and_mode_help_stay_orthogonal() {
+        let trust = ProviderSettingId::TrustPolicy
+            .help_text()
+            .expect("trust row has help");
+        assert!(
+            trust.contains("Data custody only, independent of Mode and locality"),
+            "trust help: {trust}"
+        );
+        assert!(
+            trust.contains("may be sent raw, including secrets and environment values"),
+            "trust help: {trust}"
+        );
+        assert!(
+            trust.contains(
+                "Marking an external provider trusted sends it raw secrets and environment values"
+            ),
+            "trust help must carry the explicit warning: {trust}"
+        );
+        assert!(
+            trust.contains("Exports and client display stay redacted regardless of trust"),
+            "trust help: {trust}"
+        );
+
+        let mode = ProviderSettingId::Mode
+            .help_text()
+            .expect("mode row has help");
+        assert!(
+            mode.contains("mode never changes provider eligibility, data custody, or redaction"),
+            "mode help: {mode}"
+        );
+        assert!(
+            mode.contains("no mode or locality implies trust"),
+            "mode help: {mode}"
+        );
+        assert!(
+            !mode.to_ascii_lowercase().contains("self-hosted"),
+            "mode help must not recommend trust by locality: {mode}"
+        );
+    }
+
     #[test]
     fn every_provider_setting_id_has_descriptor() {
         for id in ALL_PROVIDER_SETTING_IDS {
@@ -3114,7 +3159,12 @@ mod tests {
         e.handle_key(press(KeyCode::Enter));
         assert_eq!(e.value_str(ProviderSettingId::TrustPolicy), "trusted");
         assert!(e.is_overridden(ProviderSettingId::TrustPolicy));
-        assert!(e.status.as_deref().unwrap_or("").contains("unsanitized"));
+        let status = e.status.as_deref().unwrap_or("");
+        assert!(status.contains("sent raw"), "{status}");
+        assert!(
+            status.contains("secrets and environment values"),
+            "{status}"
+        );
         let mut entry_off = entry.clone();
         e.write_into(&mut entry_off);
         let m = entry_off.models.iter().find(|m| m.id == "m1").unwrap();
@@ -3130,6 +3180,111 @@ mod tests {
             .find(|m| m.id == "m1")
             .unwrap();
         assert_eq!(m.trust, Some(ModelTrust::Untrusted));
+    }
+
+    /// AC3, picker surface. All six trust/mode pairs must go *through the
+    /// editor* — cycled with real key events, read back through the rendered
+    /// row values, and written into the entry — and come out as exactly the
+    /// pair that was submitted.
+    ///
+    /// The failure this prevents is a picker change that silently rejects,
+    /// rewrites, or hides a combination. `trusted + defensive` is the one most
+    /// at risk: a "defensive posture means a cloud model, so it cannot be
+    /// trusted" shortcut would drop it, and a
+    /// "trusted means self-hosted, so it must be frontier" shortcut would
+    /// rewrite it. Custody and posture are independent, so neither is allowed.
+    #[test]
+    fn trust_mode_cartesian_configuration_through_the_picker() {
+        /// Model scope cycles `inherit → trusted → untrusted → inherit`.
+        fn trust_presses(trust: ModelTrust) -> usize {
+            match trust {
+                ModelTrust::Trusted => 1,
+                ModelTrust::Untrusted => 2,
+            }
+        }
+        /// Model scope cycles `inherit → defensive → normal → frontier →
+        /// inherit`.
+        fn mode_presses(mode: LlmMode) -> usize {
+            match mode {
+                LlmMode::Defensive => 1,
+                LlmMode::Normal => 2,
+                LlmMode::Frontier => 3,
+            }
+        }
+        fn cycle_to(e: &mut SettingsEditor, field: ProviderSettingId, times: usize) {
+            e.cursor = e.fields().iter().position(|f| *f == field).unwrap();
+            for _ in 0..times {
+                e.handle_key(press(KeyCode::Enter));
+            }
+        }
+
+        let combos = [
+            (ModelTrust::Trusted, LlmMode::Defensive),
+            (ModelTrust::Trusted, LlmMode::Normal),
+            (ModelTrust::Trusted, LlmMode::Frontier),
+            (ModelTrust::Untrusted, LlmMode::Defensive),
+            (ModelTrust::Untrusted, LlmMode::Normal),
+            (ModelTrust::Untrusted, LlmMode::Frontier),
+        ];
+        assert_eq!(combos.len(), 6, "the product must stay complete");
+
+        for (trust, mode) in combos {
+            let entry = provider_with_model();
+
+            // Submit both dimensions in each order: neither may depend on
+            // having been set before the other.
+            for mode_first in [true, false] {
+                let mut e = SettingsEditor::for_model("p", &entry, "m1");
+                assert!(e.fields().contains(&ProviderSettingId::TrustPolicy));
+                assert!(
+                    e.fields().contains(&ProviderSettingId::Mode),
+                    "{trust:?}/{mode:?}: neither row may be hidden by the other dimension"
+                );
+
+                if mode_first {
+                    cycle_to(&mut e, ProviderSettingId::Mode, mode_presses(mode));
+                    cycle_to(&mut e, ProviderSettingId::TrustPolicy, trust_presses(trust));
+                } else {
+                    cycle_to(&mut e, ProviderSettingId::TrustPolicy, trust_presses(trust));
+                    cycle_to(&mut e, ProviderSettingId::Mode, mode_presses(mode));
+                }
+
+                // Rendered rows show exactly what was submitted.
+                let expected_trust = match trust {
+                    ModelTrust::Trusted => "trusted",
+                    ModelTrust::Untrusted => "untrusted",
+                };
+                assert_eq!(
+                    e.value_str(ProviderSettingId::TrustPolicy),
+                    expected_trust,
+                    "{trust:?}/{mode:?} (mode_first={mode_first}): the picker must not rewrite trust"
+                );
+                assert_eq!(
+                    e.value_str(ProviderSettingId::Mode),
+                    mode.as_str(),
+                    "{trust:?}/{mode:?} (mode_first={mode_first}): the picker must not rewrite mode"
+                );
+
+                // Written state keeps both, and the effective config resolves
+                // back to the submitted pair.
+                let mut written = entry.clone();
+                e.write_into(&mut written);
+                let m = written.models.iter().find(|m| m.id == "m1").unwrap();
+                assert_eq!(m.trust, Some(trust), "{trust:?}/{mode:?}");
+                assert_eq!(m.mode, Some(mode), "{trust:?}/{mode:?}");
+
+                let mut cfg = ProvidersConfig::default();
+                cfg.providers.insert("p".into(), written);
+                assert_eq!(cfg.resolve_trust("p", "m1"), trust, "{trust:?}/{mode:?}");
+                for global in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+                    assert_eq!(
+                        cfg.resolve_mode("p", "m1", global),
+                        mode,
+                        "{trust:?}/{mode:?}: the submitted mode survives any global posture"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

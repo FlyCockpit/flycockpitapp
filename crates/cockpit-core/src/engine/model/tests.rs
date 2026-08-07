@@ -1,3 +1,5 @@
+mod custody_boundary;
+
 use super::*;
 use crate::config::providers::{ModelEntry, ProviderEntry, TimeoutConfig, WireApi};
 use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage, WireDialect};

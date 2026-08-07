@@ -57,6 +57,10 @@ The setup wizard can test credentials before saving. A failed test reports a san
 
 ## Trust And Redaction
 
-Workspace trust controls whether project `.cockpit/` config and project approvals are honored. Model trust is the sole model trust posture: trusted models disable outbound redaction, while untrusted models keep it enabled. Trusted models are intended for self-hosted providers; trusting an external provider is permitted and is the user's decision.
+Workspace trust controls whether project `.cockpit/` config and project approvals are honored. Model trust is the sole model data-custody setting: inference requests to a trusted model may be sent raw, including secrets and environment values, while inference requests to an untrusted model are redacted. Missing trust resolves to untrusted.
 
-Secrets are scrubbed through Cockpit's redaction table before they leave the machine for model requests, exports, sync, or client display boundaries. Redaction is a safety boundary, but it is not a substitute for choosing providers and trust settings deliberately.
+Trusted is meant for an endpoint you are content to hold raw content — typically a self-hosted or contractually no-log provider — and raw content reaching such an endpoint is the intended outcome, not a failure. Untrusted is the conservative default and is meant for cloud endpoints. Marking an external provider trusted sends that provider raw secrets and environment values in inference requests; that is permitted and is your decision. Trust is only ever set explicitly: nothing else implies it, and a local, self-hosted, defensive, normal, or frontier model stays untrusted until you configure it as trusted.
+
+Model class (`defensive`, `normal`, `frontier`) is a harness-steering posture only. It changes context rules, prompt and decomposition guidance, and defensive tool descriptions. It never changes provider eligibility, data custody, redaction, or whether a request containing secrets may be sent. Locality is descriptive and never implies trust — `local`, `remote`, and `private_remote` say where a provider runs, not what it may hold. Every trust/class combination is a valid configuration.
+
+Exports and client display stay redacted regardless of trust. Secrets are scrubbed through Cockpit's redaction table before they leave the machine for exports, sync, or client display boundaries, and for inference requests to untrusted models. Redaction is a safety boundary, but it is not a substitute for choosing providers and trust settings deliberately.

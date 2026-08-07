@@ -71,7 +71,7 @@ impl Tool for SpawnTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional child model selector (`provider/model` or `provider:model`)"
+                    "description": "Optional child model selector (`provider/model` or `provider:model`). Capability/cost only: data custody is host policy, so a trusted (raw-custody) child cannot be requested here and delegated routing always applies the redacted untrusted filter"
                 }
             },
             "required": ["prompt", "output_dir"]

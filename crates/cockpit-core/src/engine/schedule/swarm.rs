@@ -32,8 +32,8 @@ use crate::engine::agent::{Agent, TurnEvent, TurnOutcome};
 use crate::engine::builtin::SpawnArgs;
 use crate::engine::message::{Message, extract_text};
 use crate::engine::schedule::authority::{
-    MAX_SWARM_PROMPT_BYTES, ScheduleCommand, ScheduleContext, ScheduleEvent, SpawnSpec,
-    SpawnWorkerKind,
+    MAX_SWARM_PROMPT_BYTES, ScheduleCommand, ScheduleContext, ScheduleEvent, SpawnModelOrigin,
+    SpawnSpec, SpawnWorkerKind,
 };
 use crate::engine::schedule::spec::ScheduleKind;
 use crate::intel::budget::BudgetedWriter;
@@ -112,9 +112,16 @@ async fn run_swarm_loop(
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
 ) -> anyhow::Result<String> {
-    let agent = Arc::new(build_swarm_child(spec, ctx)?);
+    let child = build_swarm_child(spec, ctx)?;
+    let custody = child.custody;
+    let agent = Arc::new(child.agent);
     let mut history: Vec<Message> = Vec::new();
-    let brief = compose_child_brief(spec);
+    let brief = swarm_child_brief(spec, &custody);
+    tracing::debug!(
+        custody = ?custody.custody(),
+        routing = %custody.routing_diagnostics_json(),
+        "swarm child custody"
+    );
     let mut next_prompt = Message::user(brief);
 
     // A background swarm child is a leaf with no human on the other end:
@@ -241,12 +248,29 @@ async fn route_child_spawn(
             MAX_SWARM_PROMPT_BYTES
         );
     }
+    // Provenance never launders through a nested fan-out. `model` here is the
+    // grandchild's `spawn` **tool argument** — model-authored — so it is always
+    // `ModelDirected`, even when the parent spec was host config. Only an
+    // unchanged inherited selector (the child supplied none, or repeated the
+    // parent's host-config value verbatim) keeps `HostConfig`. Without this a
+    // host-config skeptic holding `spawn` could name any trusted model and
+    // obtain raw custody plus a real grant.
+    let model_origin = match (&model, &spec.model) {
+        (None, _) => spec.model_origin,
+        (Some(child_model), Some(parent_model))
+            if child_model == parent_model && spec.model_origin == SpawnModelOrigin::HostConfig =>
+        {
+            SpawnModelOrigin::HostConfig
+        }
+        _ => SpawnModelOrigin::ModelDirected,
+    };
     let child = SpawnSpec {
         job_id: None,
         worker: spec.worker,
         prompt: prompt.to_string(),
         output_dir: output_dir.to_string(),
         model,
+        model_origin,
         depth: child_depth,
         max_depth: spec.max_depth,
     };
@@ -277,20 +301,59 @@ async fn route_child_spawn(
 
 /// Build the recursive `Swarm` child agent at the spec's depth, so its own
 /// `spawn` description carries the remaining-budget hint (GOALS §24).
-fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<Agent> {
-    let model = match spec.model.as_deref() {
-        Some(selector) => {
-            let (extended, providers) =
-                crate::engine::model_roles::load_model_role_config(&ctx.config);
-            crate::engine::model_roles::resolve_selector(
+fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<SwarmChild> {
+    let worker_agent = match spec.worker {
+        SpawnWorkerKind::Bee => "bee",
+        SpawnWorkerKind::Scout => "scout",
+    };
+    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&ctx.config);
+    // `spawn.model` is a model-authored selector exactly like
+    // `task.payload.model`, so it takes the same custody-typed, forced
+    // redacted-untrusted route with subagent-invokable and capability checks.
+    // Naming a trusted-custody model here is a custody error, not an escalation.
+    let (model, custody) = match spec.model.as_deref() {
+        Some(selector) => match spec.model_origin {
+            // Host config named this target (e.g. `goalVerification.skepticModel`):
+            // it keeps its own configured custody class.
+            SpawnModelOrigin::HostConfig => {
+                crate::engine::model_roles::resolve_host_config_spawn_selector(
+                    selector,
+                    worker_agent,
+                    &extended,
+                    &providers,
+                    &ctx.agent.model,
+                )
+            }
+            // A model wrote this selector: forced redacted-untrusted custody.
+            SpawnModelOrigin::ModelDirected => crate::engine::model_roles::resolve_spawn_selector(
                 selector,
+                worker_agent,
                 &extended,
                 &providers,
                 &ctx.agent.model,
-            )
-            .map_err(|_| anyhow::anyhow!("invalid explicit spawn model selector `{selector}`"))?
+            ),
         }
-        None => ctx.agent.model.clone(),
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid explicit spawn model selector `{selector}`: {}",
+                match error {
+                    crate::engine::model_roles::SelectorResolution::Unset =>
+                        "selector unset".to_string(),
+                    crate::engine::model_roles::SelectorResolution::InvalidLiteral(message) =>
+                        message,
+                }
+            )
+        })?,
+        None => {
+            // No selector: the child inherits the parent's host-chosen model,
+            // so custody is that model's own configured class.
+            let custody = crate::engine::model_roles::inherited_custody_for_model(
+                &providers,
+                &ctx.agent.model,
+                &extended,
+            );
+            (ctx.agent.model.clone(), custody)
+        }
     };
     let args = SpawnArgs {
         model,
@@ -320,10 +383,36 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     // write-capable, parallel worker that may itself fan out deeper `bee`
     // workers via `spawn`. The interactive `Swarm` primary holds `spawn`; each
     // background child it fans out is a `bee`.
-    Ok(match spec.worker {
-        SpawnWorkerKind::Bee => crate::engine::builtin::load("bee", &args)?,
-        SpawnWorkerKind::Scout => crate::engine::builtin::load("scout", &args)?,
+    Ok(SwarmChild {
+        agent: match spec.worker {
+            SpawnWorkerKind::Bee => crate::engine::builtin::load("bee", &args)?,
+            SpawnWorkerKind::Scout => crate::engine::builtin::load("scout", &args)?,
+        },
+        custody,
     })
+}
+
+/// A built swarm child plus the custody decision its route was resolved under.
+/// The brief is rendered through `custody` before it reaches the child, so the
+/// typed payload is on the real dispatch path.
+struct SwarmChild {
+    agent: Agent,
+    custody: crate::engine::model_roles::DelegationCustody,
+}
+
+/// The brief the child actually receives.
+///
+/// Composed, then rendered for the resolved destination's custody class before
+/// it reaches the child or its history: an untrusted (cloud) child gets the
+/// session redaction-table rendering, a trusted (self-hosted / no-log) child
+/// gets it unchanged. This is the production use of the typed payload, and it
+/// is a named function so the test that pins it exercises the line
+/// [`run_swarm_loop`] runs rather than a copy of it.
+fn swarm_child_brief(
+    spec: &SpawnSpec,
+    custody: &crate::engine::model_roles::DelegationCustody,
+) -> String {
+    custody.render_brief(&compose_child_brief(spec))
 }
 
 /// Compose the child's brief: its slice question plus a standing instruction
@@ -390,9 +479,363 @@ mod tests {
             prompt: "find every firm in this state".into(),
             output_dir: "/tmp/state-ca".into(),
             model: None,
+            model_origin: Default::default(),
             depth,
             max_depth,
         }
+    }
+
+    /// The brief-rendering step of swarm dispatch, exercised through
+    /// [`swarm_child_brief`] — the exact call [`run_swarm_loop`] makes, not a
+    /// re-implementation of it. Deleting or weakening the render inside that
+    /// function fails this test.
+    ///
+    /// This test covers the rendering step only; it does not run the dispatch
+    /// loop. [`swarm_dispatch_never_sends_a_secret_to_an_untrusted_child`]
+    /// covers the loop end to end.
+    ///
+    /// A self-hosted (trusted) parent must not silently lose raw briefs — its
+    /// inherited-custody children carry the parent's own class, so the brief
+    /// arrives unchanged. An untrusted (cloud) child gets the session
+    /// redaction-table rendering.
+    #[test]
+    fn swarm_child_brief_is_rendered_for_the_childs_custody_class() {
+        use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
+
+        const SECRET: &str = "sk-live-swarm-secret";
+
+        let mut cfg = ProvidersConfig::default();
+        let entry = |trust: ModelTrust| ProviderEntry {
+            url: "http://localhost:1/v1".into(),
+            trust: Some(trust),
+            models: vec![ModelEntry {
+                id: "worker".into(),
+                subagent_invokable: Some(true),
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        };
+        cfg.providers
+            .insert("selfhosted".into(), entry(ModelTrust::Trusted));
+        cfg.providers
+            .insert("cloud".into(), entry(ModelTrust::Untrusted));
+
+        let table = Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "TEST".to_string())
+                .expect("forced literal"),
+        );
+        let extended = crate::config::extended::ExtendedConfig::default();
+
+        let mut spec = spec(1, 3);
+        spec.prompt = format!("use {SECRET} against the staging box");
+        let composed = compose_child_brief(&spec);
+        assert!(composed.contains(SECRET), "the composed brief carries it");
+
+        // Trusted (self-hosted / no-log) parent → raw brief reaches the child.
+        let trusted_parent = Arc::new(
+            crate::engine::model::Model::for_provider(&cfg, "selfhosted", "worker", table.clone())
+                .unwrap(),
+        );
+        let trusted_custody = crate::engine::model_roles::inherited_custody_for_model(
+            &cfg,
+            &trusted_parent,
+            &extended,
+        );
+        assert_eq!(
+            trusted_custody.custody(),
+            crate::config::providers::ModelCustody::Trusted
+        );
+        let rendered = swarm_child_brief(&spec, &trusted_custody);
+        assert_eq!(
+            rendered, composed,
+            "a self-hosted swarm must not silently lose raw briefs"
+        );
+
+        // Untrusted (cloud) child → session redaction-table rendering.
+        let untrusted_child = Arc::new(
+            crate::engine::model::Model::for_provider(&cfg, "cloud", "worker", table.clone())
+                .unwrap(),
+        );
+        let untrusted_custody = crate::engine::model_roles::inherited_custody_for_model(
+            &cfg,
+            &untrusted_child,
+            &extended,
+        );
+        assert_eq!(
+            untrusted_custody.custody(),
+            crate::config::providers::ModelCustody::Untrusted
+        );
+        let rendered = swarm_child_brief(&spec, &untrusted_custody);
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert_eq!(rendered, table.scrub(&composed));
+    }
+
+    /// Swarm dispatch, actually dispatched. This drives [`run_swarm_loop`]
+    /// itself — child build, brief render, and a real provider request — and
+    /// asserts on what came off the wire.
+    ///
+    /// The property under test is the one that matters for an untrusted
+    /// (cloud, may-retain-logs) child: a secret in the parent's brief must
+    /// never reach it. Two independent mechanisms stand behind that — the
+    /// custody rendering in [`swarm_child_brief`] and the model's own outbound
+    /// redaction guard — and this test fails if *either* is removed, because
+    /// the assertion is made on the bytes the provider received rather than on
+    /// an intermediate value.
+    ///
+    /// It also pins that dispatch happened at all: the captured body must
+    /// carry the brief's non-secret text and the child's output-dir
+    /// instruction, so the test cannot pass by never reaching the provider.
+    #[tokio::test]
+    async fn swarm_dispatch_never_sends_a_secret_to_an_untrusted_child() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        const SECRET: &str = "sk-live-swarm-dispatch-secret";
+
+        // A provider that captures the request body and answers with a
+        // one-token, finish_reason=stop completion so the loop ends after one
+        // turn.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, capture_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let mut tx = Some(tx);
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut tmp).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buf.len() >= body_start + content_len {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(
+                                String::from_utf8_lossy(&buf[body_start..body_start + content_len])
+                                    .into_owned(),
+                            );
+                        }
+                        break;
+                    }
+                }
+                let payload = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+                               data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":2}}\n\n\
+                               data: [DONE]\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        let base_url = format!("http://{addr}/v1");
+
+        // A cloud (untrusted) provider on that endpoint, written where the
+        // session config handle will read it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "cloud".into(),
+            crate::config::providers::ProviderEntry {
+                url: base_url.clone(),
+                trust: Some(crate::config::providers::ModelTrust::Untrusted),
+                timeout: crate::config::providers::TimeoutConfig {
+                    ttft_secs: 10,
+                    idle_secs: 10,
+                },
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "worker".into(),
+                    subagent_invokable: Some(true),
+                    can_delegate: Some(true),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+        doc.write(&providers).unwrap();
+
+        let table = Arc::new(
+            crate::redact::RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "[REDACTED]".to_string())
+                .expect("forced literal"),
+        );
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let (_extended, effective_providers) =
+            crate::engine::model_roles::load_model_role_config(&config);
+        let parent_model = Arc::new(
+            crate::engine::model::Model::for_provider(
+                &effective_providers,
+                "cloud",
+                "worker",
+                table.clone(),
+            )
+            .unwrap(),
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create(db, tmp.path().to_path_buf(), "Swarm").unwrap(),
+        );
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let parent = Agent {
+            name: "Swarm".to_string(),
+            system: "s".to_string(),
+            role_prompt: "s".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model: parent_model,
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: true,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Swarm".to_string(),
+            write_scope: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+        let ctx = ScheduleContext {
+            session,
+            locks,
+            redact: table.clone(),
+            cwd: tmp.path().to_path_buf(),
+            config,
+            agent: Arc::new(parent),
+        };
+
+        let mut spec = spec(1, 3);
+        spec.prompt = format!("use {SECRET} against the staging box");
+        let composed = compose_child_brief(&spec);
+        assert!(composed.contains(SECRET), "the composed brief carries it");
+
+        let (turn_tx, mut turn_rx) = mpsc::channel(256);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        tokio::spawn(async move { while turn_rx.recv().await.is_some() {} });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx),
+        )
+        .await
+        .expect("the swarm loop must finish against the local endpoint");
+        outcome.expect("the swarm child must complete");
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), capture_rx)
+            .await
+            .expect("the child must have reached the provider")
+            .expect("captured request body");
+
+        assert!(
+            !body.contains(SECRET),
+            "an untrusted swarm child must never receive the parent's secret: {body}"
+        );
+        assert!(
+            body.contains("against the staging box"),
+            "the brief must actually have been dispatched: {body}"
+        );
+        assert!(
+            body.contains("/tmp/state-ca"),
+            "the child's output-dir instruction must be on the wire: {body}"
+        );
+    }
+
+    /// A spawn spec defaults to model-directed provenance: anything that forgets
+    /// to say where its selector came from gets the conservative filter.
+    #[test]
+    fn spawn_spec_model_origin_defaults_to_model_directed() {
+        assert_eq!(spec(0, 3).model_origin, SpawnModelOrigin::ModelDirected);
+        assert_eq!(SpawnModelOrigin::default(), SpawnModelOrigin::ModelDirected);
+    }
+
+    /// Regression: host provenance must not launder through a nested spawn.
+    ///
+    /// A host-config goal-verification skeptic holding `spawn` used to hand its
+    /// `HostConfig` origin to a grandchild whose selector came from the **tool
+    /// argument** — letting the model name any trusted endpoint and obtain raw
+    /// custody plus a real grant. A tool-supplied selector is always
+    /// `ModelDirected`; only an unchanged inherited selector keeps `HostConfig`.
+    #[tokio::test]
+    async fn nested_spawn_cannot_launder_host_provenance() {
+        async fn child_origin(parent: &SpawnSpec, child_model: Option<&str>) -> SpawnModelOrigin {
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(8);
+            let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+            let handle = tokio::spawn(async move {
+                match cmd_rx.recv().await {
+                    Some(ScheduleCommand::Spawn { spec, result_tx }) => {
+                        if let Some(result_tx) = result_tx {
+                            let _ = result_tx.send("scheduled".to_string());
+                        }
+                        spec.model_origin
+                    }
+                    _ => panic!("expected a spawn command"),
+                }
+            });
+            let _ = route_child_spawn(
+                parent,
+                "deeper slice",
+                "/tmp/deeper",
+                child_model.map(str::to_string),
+                &cmd_tx,
+                &turn_tx,
+            )
+            .await;
+            handle.await.expect("spawn command observed")
+        }
+
+        let mut host_parent = spec(0, 3);
+        host_parent.model = Some("selfhosted:skeptic".into());
+        host_parent.model_origin = SpawnModelOrigin::HostConfig;
+
+        // The laundering attempt: a *different*, model-authored selector.
+        assert_eq!(
+            child_origin(&host_parent, Some("selfhosted:llama")).await,
+            SpawnModelOrigin::ModelDirected,
+            "a tool-supplied selector can never inherit host provenance"
+        );
+
+        // No selector at all: the child inherits the parent's model, so the
+        // parent's provenance is still the honest answer.
+        assert_eq!(
+            child_origin(&host_parent, None).await,
+            SpawnModelOrigin::HostConfig
+        );
+
+        // Repeating the host-config value verbatim is not an escalation.
+        assert_eq!(
+            child_origin(&host_parent, Some("selfhosted:skeptic")).await,
+            SpawnModelOrigin::HostConfig
+        );
+
+        // A model-directed parent can never produce host provenance.
+        let mut model_parent = spec(0, 3);
+        model_parent.model = Some("selfhosted:skeptic".into());
+        model_parent.model_origin = SpawnModelOrigin::ModelDirected;
+        assert_eq!(
+            child_origin(&model_parent, Some("selfhosted:skeptic")).await,
+            SpawnModelOrigin::ModelDirected
+        );
+        assert_eq!(
+            child_origin(&model_parent, None).await,
+            SpawnModelOrigin::ModelDirected
+        );
     }
 
     /// A child at the ceiling that calls `spawn` is refused — the

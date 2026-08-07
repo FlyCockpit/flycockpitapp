@@ -297,9 +297,60 @@ fn params_with_direct_computer(args: &SpawnArgs, model: &Model) -> ModelParams {
     params
 }
 
+/// Build and resolve the custody-typed route for one computer-use candidate.
+///
+/// Screenshots and desktop context are a potentially sensitive payload, so this
+/// path may not omit custody. The class is the candidate's own configured trust
+/// class — host-authorized, because enabling `computer_use` on a model is a
+/// host configuration decision and no model-authored selector reaches here.
+pub(crate) fn computer_use_custody_route(
+    providers: &crate::config::providers::ProvidersConfig,
+    provider_id: &str,
+    model_id: &str,
+    global_mode: crate::config::extended::LlmMode,
+) -> Result<crate::config::providers::ResolvedModelPolicy, crate::config::providers::ModelPolicyError>
+{
+    let custody = crate::engine::model_roles::custody_for_trust(
+        providers.resolve_trust(provider_id, model_id),
+    );
+    // Eligibility only — no payload is constructed, so this decision can never
+    // be used to render anything through an identity no-op table. The worker
+    // construction site builds the paired custody/payload request instead.
+    let selector = format!("{provider_id}:{model_id}");
+    providers.resolve_sensitive_model_policy_eligibility(
+        &computer_use_criteria(&selector, global_mode),
+        custody,
+    )
+}
+
+/// The shared selection criteria for a computer-use route, so the candidate
+/// scan and the worker construction site cannot drift apart.
+pub(crate) fn computer_use_criteria(
+    selector: &str,
+    global_mode: crate::config::extended::LlmMode,
+) -> crate::config::providers::ModelPolicyCriteria<'_> {
+    use crate::config::providers::{
+        AvailabilityScope, ModelOptimization, ModelPolicyCriteria, ModelPolicySelector,
+        RequiredModelCapability,
+    };
+    ModelPolicyCriteria {
+        selector: ModelPolicySelector::Exact(selector),
+        required_capabilities: vec![RequiredModelCapability::ImageInput],
+        min_context_tokens: None,
+        require_subagent_invokable: true,
+        optimize: ModelOptimization::Balanced,
+        role: Some("computer"),
+        agent: Some("computer"),
+        // The host enabled `computer_use` on this exact model.
+        availability: AvailabilityScope::HostNamedTarget,
+        global_mode,
+    }
+}
+
 fn computer_subagent_candidate(
     providers: &crate::config::providers::ProvidersConfig,
     cwd: &Path,
+    global_mode: crate::config::extended::LlmMode,
 ) -> Option<(String, String, crate::computer::NativeComputerToolConfig)> {
     let configured = crate::config::extended::resolve_computer_use_policy_for_cwd(cwd);
     for (provider_id, provider) in &providers.providers {
@@ -324,6 +375,14 @@ fn computer_subagent_candidate(
             else {
                 continue;
             };
+            // Computer use ships screenshots of the user's desktop — a
+            // potentially sensitive payload — so the route is custody-typed.
+            // The custody class is the configured computer-use model's own
+            // trust class: the host authorized this model for computer use, a
+            // model never picks it.
+            if computer_use_custody_route(providers, provider_id, &model.id, global_mode).is_err() {
+                continue;
+            }
             return Some((
                 provider_id.clone(),
                 model.id.clone(),
@@ -342,8 +401,8 @@ fn computer_subagent_reachable(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     cwd: &Path,
 ) -> bool {
-    let providers = config.providers();
-    computer_subagent_candidate(&providers, cwd).is_some()
+    let (extended, providers) = config.configs();
+    computer_subagent_candidate(&providers, cwd, extended.llm_mode).is_some()
 }
 
 /// Append the direct full codebase-intelligence tool set (GOALS §21) to `tb`.
@@ -2093,19 +2152,44 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
 /// vision-capable, subagent-invokable model with a native computer contract
 /// and refuses loudly when none exists.
 pub fn computer(args: &SpawnArgs) -> Result<Agent> {
-    let providers = args.config.providers();
+    let (extended, providers) = args.config.configs();
     let Some((provider_id, model_id, native_computer)) =
-        computer_subagent_candidate(&providers, &args.cwd)
+        computer_subagent_candidate(&providers, &args.cwd, extended.llm_mode)
     else {
         bail!(
             "computer-use subagent requires a configured vision-capable, subagent-invokable model with native computer_use enabled"
         );
     };
+    // The worker route is a *sensitive* route — computer use ships screenshots
+    // of the user's desktop — so it constructs the paired custody/payload type,
+    // not the payload-less eligibility check the candidate scan uses. The
+    // session redaction table is in hand here, so the payload carries a real
+    // rendering policy for the resolved class.
+    let session_redact = args.effective_model().session_redact_table();
+    let custody = crate::engine::model_roles::custody_for_trust(
+        providers.resolve_trust(&provider_id, &model_id),
+    );
+    let worker_selector = format!("{provider_id}:{model_id}");
+    let request = crate::config::providers::SensitiveModelPolicyRequest::new(
+        computer_use_criteria(&worker_selector, extended.llm_mode),
+        custody,
+        crate::engine::model_roles::custody_payload_for(custody, &session_redact),
+    )
+    .map_err(|error| anyhow::anyhow!("computer-use model custody: {error}"))?;
+    let resolved = providers
+        .resolve_sensitive_model_policy(&request)
+        .map_err(|error| anyhow::anyhow!("computer-use model custody: {error}"))?;
+    tracing::debug!(
+        custody = resolved.custody.as_str(),
+        granted = resolved.trusted_custody_grant().is_some(),
+        routing = %serde_json::to_string(&resolved.policy.routing_diagnostics()).unwrap_or_default(),
+        "computer-use subagent custody"
+    );
     let model = Arc::new(crate::engine::model::Model::for_provider(
         &providers,
         &provider_id,
         &model_id,
-        args.effective_model().session_redact_table(),
+        session_redact,
     )?);
     let caps = providers.resolve_effective_model_capabilities(
         model.provider_id(),
@@ -2404,6 +2488,112 @@ mod tests {
 
     use crate::config::extended::ExtendedConfig;
     use crate::engine::tool::Tool;
+
+    /// F3. Computer use ships desktop screenshots — a potentially sensitive
+    /// payload — so its route is custody-typed. Custody is the configured
+    /// computer-use model's own trust class (host-authorized: enabling
+    /// `computer_use` on a model is a host configuration decision), and a model
+    /// that cannot satisfy the typed request is not offered as a candidate.
+    #[test]
+    fn computer_use_route_is_custody_typed() {
+        use crate::config::extended::LlmMode;
+        use crate::config::providers::{
+            CapabilityStatus, ComputerUseCapability, ComputerUseContract, ModelCapabilities,
+            ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig,
+        };
+
+        let vision_model = |id: &str, trust: ModelTrust, invokable: bool| ModelEntry {
+            id: id.to_string(),
+            subagent_invokable: Some(invokable),
+            trust: Some(trust),
+            capabilities: ModelCapabilities {
+                image_input: CapabilityStatus::Supported,
+                computer_use: ComputerUseCapability {
+                    contract: Some(ComputerUseContract::Anthropic20251124),
+                    source: None,
+                },
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        };
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "selfhosted".into(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                models: vec![vision_model("vision", ModelTrust::Trusted, true)],
+                ..ProviderEntry::default()
+            },
+        );
+        cfg.providers.insert(
+            "cloud".into(),
+            ProviderEntry {
+                url: "http://localhost:2/v1".into(),
+                models: vec![vision_model("vision", ModelTrust::Untrusted, true)],
+                ..ProviderEntry::default()
+            },
+        );
+
+        // The trusted (self-hosted) model is eligible under trusted custody.
+        // The eligibility API mints no grant and takes no payload, so this
+        // decision can never release or render anything.
+        let trusted = computer_use_custody_route(&cfg, "selfhosted", "vision", LlmMode::Normal)
+            .expect("a trusted computer-use model routes");
+        assert_eq!(trusted.trust, ModelTrust::Trusted);
+        assert_eq!(
+            trusted.custody_filter,
+            Some(crate::config::providers::ModelCustody::Trusted)
+        );
+
+        // The session's actual harness posture is reported, not a hardcoded
+        // default: mode and custody stay independent.
+        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+            let route = computer_use_custody_route(&cfg, "selfhosted", "vision", mode)
+                .expect("mode never changes eligibility");
+            assert_eq!(route.routing_diagnostics().mode, mode.as_str());
+            assert_eq!(route.trust, ModelTrust::Trusted);
+        }
+
+        // The untrusted (cloud) model is eligible under untrusted custody.
+        let untrusted = computer_use_custody_route(&cfg, "cloud", "vision", LlmMode::Normal)
+            .expect("an untrusted computer-use model routes");
+        assert_eq!(untrusted.trust, ModelTrust::Untrusted);
+        assert_eq!(
+            untrusted.custody_filter,
+            Some(crate::config::providers::ModelCustody::Untrusted)
+        );
+
+        // A model that cannot satisfy the typed request is refused, so
+        // `computer_subagent_candidate` never offers it.
+        cfg.providers.insert(
+            "hidden".into(),
+            ProviderEntry {
+                url: "http://localhost:3/v1".into(),
+                models: vec![vision_model("vision", ModelTrust::Untrusted, false)],
+                ..ProviderEntry::default()
+            },
+        );
+        assert!(
+            computer_use_custody_route(&cfg, "hidden", "vision", LlmMode::Normal).is_err(),
+            "a non-subagent-invokable model must not be routable for computer use"
+        );
+
+        // A model with no vision capability is refused by the same request.
+        cfg.providers.insert(
+            "blind".into(),
+            ProviderEntry {
+                url: "http://localhost:4/v1".into(),
+                models: vec![ModelEntry {
+                    id: "text".into(),
+                    subagent_invokable: Some(true),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        assert!(computer_use_custody_route(&cfg, "blind", "text", LlmMode::Normal).is_err());
+    }
 
     /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
     /// factories. The model is never actually called — these tests only

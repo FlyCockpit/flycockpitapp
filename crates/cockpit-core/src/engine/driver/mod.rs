@@ -39,7 +39,9 @@ use queue::*;
 use reports::*;
 #[allow(unused_imports)]
 pub(crate) use reports::{
-    build_backup_model, build_failover_models, resolve_backup_model_for,
+    FailoverCustodyBlocked, FailoverCustodyRefusal, FailoverRefusalKind, build_backup_model,
+    build_backup_model_with_diagnostics, build_failover_models,
+    build_failover_models_with_diagnostics, failover_custody_block, resolve_backup_model_for,
     resolve_failover_models_for,
 };
 use skills_seed::SkillPair;
@@ -3653,6 +3655,9 @@ impl Driver {
                     prompt,
                     output_dir,
                     model: cfg.skeptic_model.clone(),
+                    // Host config (`goalVerification.skepticModel`): a
+                    // self-hosted skeptic keeps its trusted custody.
+                    model_origin: crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
                     depth: 0,
                     max_depth: self.swarm_max_depth,
                 });
@@ -7415,6 +7420,28 @@ impl Driver {
                         .await;
                     let brief =
                         self.expand_handoff_tags(&brief, &self.cwd, child_llm_mode, &child_agent);
+                    // Render the handoff brief for the interactive child's
+                    // resolved custody class before it is dispatched: an
+                    // untrusted (cloud) child gets the session redaction-table
+                    // rendering, a trusted (self-hosted / no-log) child gets it
+                    // unchanged.
+                    let brief = {
+                        let (extended, providers) =
+                            crate::engine::model_roles::load_model_role_config(&self.config);
+                        let child_model = self
+                            .stack
+                            .last()
+                            .expect("stack never empty")
+                            .agent
+                            .model
+                            .clone();
+                        crate::engine::model_roles::render_brief_for_model(
+                            &providers,
+                            &child_model,
+                            &extended,
+                            &brief,
+                        )
+                    };
                     next_prompt = Message::user(brief);
                     continue;
                 }
@@ -7687,6 +7714,9 @@ impl Driver {
                                     prompt,
                                     output_dir,
                                     model,
+                                    // The `spawn` tool argument is model-authored.
+                                    model_origin:
+                                        crate::engine::schedule::authority::SpawnModelOrigin::ModelDirected,
                                     depth: child_depth,
                                     max_depth: self.swarm_max_depth,
                                 },

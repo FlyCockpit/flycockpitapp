@@ -427,24 +427,27 @@ pub fn model_descriptor_with_selection(
             StepDescriptor {
                 id: "class",
                 prompt: "Model class",
-                help: "Writes a model-level class override only when it differs from the inherited answer.",
+                help: "Harness steering only: context rules, prompt/decomposition guidance, and defensive tool descriptions. It never changes data custody or redaction — set Provider trust separately. Writes a model-level class override only when it differs from the inherited answer.",
                 help_hook: None,
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
                             id: "defensive".into(),
                             label: "defensive".into(),
-                            description: "Small/defensive model class".into(),
+                            description: "Explicit steering for weaker models; no effect on trust"
+                                .into(),
                         },
                         SelectOption {
                             id: "normal".into(),
                             label: "normal".into(),
-                            description: "Default strong-model class".into(),
+                            description: "Terse steering for strong models; no effect on trust"
+                                .into(),
                         },
                         SelectOption {
                             id: "frontier".into(),
                             label: "frontier".into(),
-                            description: "Top-tier/frontier class".into(),
+                            description: "Lean steering for top-tier models; no effect on trust"
+                                .into(),
                         },
                     ],
                 },
@@ -456,21 +459,22 @@ pub fn model_descriptor_with_selection(
             },
             StepDescriptor {
                 id: "trust",
-                prompt: "Provider trust",
-                help: "provider default is shown by inheritance. untrusted: cockpit redacts known secrets from requests · trusted: requests are sent unredacted.",
+                prompt: "Provider trust (data custody)",
+                help: "Data custody only, independent of Model class and locality. untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values. Warning: marking an external provider trusted sends that provider raw secrets and environment values. Exports and client display stay redacted either way. Provider default is shown by inheritance.",
                 help_hook: Some(model_trust_help),
                 kind: StepKind::Select {
                     options: vec![
                         SelectOption {
                             id: "untrusted".into(),
                             label: "untrusted".into(),
-                            description: "Redact known secrets before requests".into(),
+                            description: "Redact inference requests (default)".into(),
                         },
                         SelectOption {
                             id: "trusted".into(),
                             label: "trusted".into(),
-                            description: "Self-hosted/trusted endpoint; send requests unredacted"
-                                .into(),
+                            description:
+                                "Send inference requests raw, including secrets and environment values; meant for self-hosted or no-log endpoints"
+                                    .into(),
                         },
                     ],
                 },
@@ -1638,7 +1642,7 @@ fn model_trust_help(run: &WizardRun) -> Option<String> {
     let provider = model_provider_answer(run)?;
     let trust = *model_context(run)?.provider_trust_defaults.get(&provider)?;
     Some(format!(
-        "provider default: {} · untrusted: cockpit redacts known secrets from requests · trusted: requests are sent unredacted.",
+        "provider default: {} · data custody only, independent of Model class and locality · untrusted: inference requests are redacted · trusted: inference requests may be sent raw, including secrets and environment values · exports and client display stay redacted either way.",
         model_trust_id(trust)
     ))
 }
@@ -1833,6 +1837,126 @@ mod tests {
         match answer {
             WizardAnswer::Select(value) if value == "fast" => Some("finish"),
             _ => Some("slow"),
+        }
+    }
+
+    /// AC6 (setup half). The model wizard must present data custody and
+    /// harness posture as two independent decisions, warn that a trusted
+    /// external provider receives raw secrets, and never suggest that a class
+    /// or locality implies trust.
+    #[test]
+    fn model_setup_separates_custody_from_harness_posture() {
+        let descriptor =
+            model_descriptor_for_config(&crate::config::providers::ProvidersConfig::default());
+        let step = |id: &str| {
+            descriptor
+                .steps
+                .iter()
+                .find(|step| step.id == id)
+                .unwrap_or_else(|| panic!("missing `{id}` step"))
+        };
+
+        let class = step("class");
+        assert!(
+            class.help.contains("Harness steering only"),
+            "class help: {}",
+            class.help
+        );
+        assert!(
+            class
+                .help
+                .contains("never changes data custody or redaction"),
+            "class help: {}",
+            class.help
+        );
+        let StepKind::Select { options } = &class.kind else {
+            panic!("class step must be a select");
+        };
+        for option in options {
+            assert!(
+                option.description.contains("no effect on trust"),
+                "class option `{}`: {}",
+                option.id,
+                option.description
+            );
+        }
+
+        let trust = step("trust");
+        assert!(
+            trust.prompt.contains("custody"),
+            "trust prompt: {}",
+            trust.prompt
+        );
+        assert!(
+            trust
+                .help
+                .contains("Data custody only, independent of Model class and locality"),
+            "trust help: {}",
+            trust.help
+        );
+        assert!(
+            trust
+                .help
+                .contains("may be sent raw, including secrets and environment values"),
+            "trust help: {}",
+            trust.help
+        );
+        assert!(
+            trust.help.contains(
+                "marking an external provider trusted sends that provider raw secrets and environment values"
+            ),
+            "trust help must carry the explicit warning: {}",
+            trust.help
+        );
+        assert!(
+            trust
+                .help
+                .contains("Exports and client display stay redacted either way"),
+            "trust help: {}",
+            trust.help
+        );
+        let StepKind::Select { options } = &trust.kind else {
+            panic!("trust step must be a select");
+        };
+        let ids: Vec<&str> = options.iter().map(|option| option.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            vec!["untrusted", "trusted"],
+            "untrusted is the conservative default and is listed first"
+        );
+        let trusted = options
+            .iter()
+            .find(|option| option.id == "trusted")
+            .expect("trusted option");
+        assert!(
+            trusted.description.contains("raw"),
+            "trusted option must state the custody effect: {}",
+            trusted.description
+        );
+        let untrusted = options
+            .iter()
+            .find(|option| option.id == "untrusted")
+            .expect("untrusted option");
+        assert!(
+            untrusted
+                .description
+                .to_ascii_lowercase()
+                .contains("redact"),
+            "untrusted option must state the redaction effect: {}",
+            untrusted.description
+        );
+        // Neither option may present a class/locality as *implying* a custody
+        // class — naming self-hosted endpoints as the intended use of trusted
+        // is fine, auto-deriving trust from locality is not.
+        for option in options {
+            let description = option.description.to_ascii_lowercase();
+            for forbidden in ["local models are trusted", "implies trust", "automatically"] {
+                assert!(
+                    !description.contains(forbidden),
+                    "trust option `{}` must not derive custody: {description}",
+                    option.id
+                );
+            }
         }
     }
 

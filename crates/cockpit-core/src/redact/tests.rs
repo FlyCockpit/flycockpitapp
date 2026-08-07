@@ -761,9 +761,14 @@ fn store_secrets_join_redaction_table() {
         },
     );
 
-    let untrusted =
-        Model::effective_redact_table_for(&providers, "untrusted", "model", table.clone());
-    let trusted = Model::effective_redact_table_for(&providers, "trusted", "model", table);
+    let untrusted = Model::effective_redact_table_for_configured(
+        &providers,
+        "untrusted",
+        "model",
+        table.clone(),
+    );
+    let trusted =
+        Model::effective_redact_table_for_configured(&providers, "trusted", "model", table);
     assert!(!untrusted.scrub(secret).contains(secret));
     assert_eq!(trusted.scrub(secret), secret);
 }

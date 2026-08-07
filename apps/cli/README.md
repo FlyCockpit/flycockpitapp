@@ -305,7 +305,8 @@ cockpit provider-catalog-status
 
 Provider and model entries can carry policy metadata used by routing, diagnostics, and export safety:
 
-- `trust`: model trust is the sole model trust posture and separate from workspace trust. `trusted` disables outbound redaction; `untrusted` keeps it enabled. Trusted models are intended for self-hosted providers, though trusting an external provider is permitted and is the user's decision.
+- `trust`: model trust is the sole model data-custody setting and is separate from workspace trust. Inference requests to a `trusted` model may be sent raw, including secrets and environment values; inference requests to an `untrusted` model are redacted. `trusted` is meant for an endpoint you are content to hold raw content — typically a self-hosted or contractually no-log provider — and raw content reaching one is the intended outcome. Missing trust resolves to the conservative `untrusted`. Marking an external provider trusted sends that provider raw secrets and environment values in inference requests — permitted, but it is your decision. Exports and client display stay redacted regardless of trust.
+- `mode`: `defensive`, `normal`, or `frontier` harness steering. Mode changes context rules, prompt and decomposition guidance, and defensive tool descriptions only; it never changes provider eligibility, data custody, or redaction. Trust and mode are independent, and every combination is valid — no mode, and no locality, implies trust.
 - `location`: `local`, `remote`, or `private_remote`. Locality is descriptive and never implies trust.
 - `quality_rank` and `cost_rank`: tie-breakers for policy selection. Higher quality is preferred for quality-optimized work; lower cost is preferred for cost-optimized work.
 - `subagent_invokable`: only models with this set, or inherited from their provider, are eligible for subagent routing.
@@ -314,7 +315,7 @@ Model instructions are exact to the configured `(provider, model)` and participa
 
 Provider/model context settings include a default-on `Compaction shadow brief` switch and `Shadow margin %` (10 percentage points by default). Near the automatic compaction threshold, Cockpit pre-drafts a utility brief only at an idle boundary; foreground user turns pre-empt unfinished drafts, and compaction delta-revises a fresh completed draft. Turn the switch off to restore synchronous full-brief drafting.
 
-Subagent model selection can target exact models, trust classes, or categories such as cheap-code and reasoning work. Hidden models (`subagent_invokable: false`) stay available for direct top-level use but are not advertised or selected for delegated agents. Recursive delegation is bounded by `delegation.defaultRecursionDepth` and `delegation.maxParallel`.
+Subagent model selection can target exact models or categories such as cheap-code and reasoning work. It cannot target a trust class: data custody is host policy, and model-directed delegation always routes to a redacted untrusted child. Hidden models (`subagent_invokable: false`) stay available for direct top-level use but are not advertised or selected for delegated agents. Recursive delegation is bounded by `delegation.defaultRecursionDepth` and `delegation.maxParallel`.
 
 `deepthink` is disabled by default. When enabled, it is a tool-free reasoning-only subagent; completed deepthink prompts are not retained in caller active context, only the response is retained.
 
@@ -417,7 +418,7 @@ current CLI behavior, not a future privacy policy.
 
 | Destination | What can leave | When | Default |
 | --- | --- | --- | --- |
-| Configured model provider | Prompts, conversation history, and tool results; redacted for the default untrusted models, but unsanitized for a model marked trusted | You send a message to a configured remote model | Opt-in: you configure and select the provider |
+| Configured model provider | Prompts, conversation history, and tool results; inference requests are redacted for the default untrusted models, and may be sent raw — including secrets and environment values — for a model marked trusted | You send a message to a configured remote model | Opt-in: you configure and select the provider |
 | [Firecrawl](https://firecrawl.dev/) (`api.firecrawl.dev`) | A model-authored web-search query or URL | The built-in `websearch` or `webfetch` tool runs | Default-on for the built-in web tools; the keyless tier is attributed to your IP |
 | [TinyFish](https://tinyfish.ai/) (`api.search.tinyfish.ai`, `api.fetch.tinyfish.ai`) | A web-search query or URL and its configured API credential | You select TinyFish and configure `TINYFISH_API_KEY` | Opt-in; without its key Cockpit falls back to Firecrawl keyless tier |
 | crates.io, npm, and PyPI | A package name | The docs/package workflow resolves a package official source repository | Default-on when that model-triggered workflow runs |
@@ -446,8 +447,11 @@ while `--include-sensitive` intentionally includes exact captured payloads.
 
 ### Limits of the protections
 
-Redaction is best-effort pattern matching, enabled by default for untrusted
-models; trusted models receive unsanitized outbound content. It has an
+Redaction is best-effort pattern matching. Inference requests to untrusted
+models are redacted by default; inference requests to trusted models may be
+sent raw, including secrets and environment values. That is a data-custody
+choice on the model, not something harness mode or locality implies. Exports
+and client display stay redacted regardless of trust. It has an
 allowlist and denylist. Automatic candidates default to an eight-character
 minimum; every redaction entry has a hard four-byte minimum. Treat it as a
 safeguard, not a guarantee that every secret is removed.

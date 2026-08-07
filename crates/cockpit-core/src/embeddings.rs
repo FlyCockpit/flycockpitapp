@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::config::providers::{ProviderEntry, ProvidersConfig, ResolvedEmbeddingModel};
-use crate::engine::model::OutboundGuard;
+use crate::engine::model::{Model, OutboundGuard};
 use crate::providers::models_fetch;
 use crate::redact::RedactionTable;
 
@@ -60,12 +60,18 @@ impl OpenAiCompatEmbedder {
         session_redact: Arc<RedactionTable>,
     ) -> Result<Self> {
         let request = models_fetch::resolve_provider_request_async(provider_id, entry).await?;
-        let trusted = providers.resolve_trust(provider_id, model).is_trusted();
-        let effective_redact = if trusted {
-            Arc::new(RedactionTable::empty())
-        } else {
-            session_redact
-        };
+        // AC4: the embedding send boundary is a potentially sensitive caller.
+        // Its custody class is host-owned (the *configured* embedding model
+        // fixes it, no caller may ask for `Trusted`), but it still may not
+        // decide raw-vs-redacted by reading a trust flag: it routes custody
+        // through the typed request API and takes the raw table only from the
+        // grant that route mints. An unroutable target falls closed.
+        let effective_redact = Model::effective_redact_table_for_configured(
+            providers,
+            provider_id,
+            model,
+            session_redact,
+        );
         let guard = OutboundGuard::new(effective_redact);
         Ok(Self::from_resolved_request(
             request,
@@ -339,6 +345,85 @@ mod tests {
             Some(3),
             guard,
         )
+    }
+
+    /// AC4, embeddings send boundary. The embedding path is a potentially
+    /// sensitive caller — it ships user text to a provider — so it may not
+    /// pick raw-vs-redacted by reading a trust flag. It routes custody through
+    /// the typed request API and takes the raw table only from the grant that
+    /// route mints.
+    ///
+    /// Custody here is host-owned: the *configured* embedding model fixes the
+    /// class and no caller may ask for `Trusted`. What this pins is the
+    /// outcome on the wire, built through the production constructor
+    /// [`OpenAiCompatEmbedder::for_provider_entry`]: an untrusted (cloud)
+    /// endpoint receives the placeholder, a trusted (self-hosted / no-log)
+    /// endpoint receives the value — and neither changes with harness posture.
+    #[tokio::test]
+    async fn embedding_send_boundary_routes_custody_before_the_wire() {
+        use crate::config::providers::{ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig};
+
+        for mode in [
+            crate::config::extended::LlmMode::Defensive,
+            crate::config::extended::LlmMode::Normal,
+            crate::config::extended::LlmMode::Frontier,
+        ] {
+            for (trust, raw_expected) in
+                [(ModelTrust::Trusted, true), (ModelTrust::Untrusted, false)]
+            {
+                let (base_url, capture_rx) = capture_embedding_server_with_response(
+                    r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#,
+                )
+                .await;
+                let entry = ProviderEntry {
+                    url: base_url,
+                    trust: Some(trust),
+                    mode: Some(mode),
+                    models: vec![ModelEntry {
+                        id: "text-embedding-3-small".into(),
+                        ..ModelEntry::default()
+                    }],
+                    ..ProviderEntry::default()
+                };
+                let mut providers = ProvidersConfig::default();
+                providers.providers.insert("p".into(), entry.clone());
+
+                let embedder = OpenAiCompatEmbedder::for_provider_entry(
+                    &providers,
+                    "p",
+                    &entry,
+                    "text-embedding-3-small",
+                    Some(3),
+                    secret_table(),
+                )
+                .await
+                .unwrap();
+                let _ = embedder
+                    .embed(&[&format!("index this {SECRET} please")])
+                    .await
+                    .unwrap();
+
+                let captured = capture_rx.await.unwrap();
+                if raw_expected {
+                    assert!(
+                        captured.body.contains(SECRET),
+                        "{mode:?}: a trusted embedding endpoint keeps raw custody: {}",
+                        captured.body
+                    );
+                } else {
+                    assert!(
+                        !captured.body.contains(SECRET),
+                        "{mode:?}: an untrusted embedding endpoint must never receive the secret: {}",
+                        captured.body
+                    );
+                    assert!(
+                        captured.body.contains(PLACEHOLDER),
+                        "{mode:?}: the redacted rendering must have reached the wire: {}",
+                        captured.body
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

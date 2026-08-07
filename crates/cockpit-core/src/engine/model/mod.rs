@@ -54,10 +54,34 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::extended::LlmMode;
+use crate::config::providers::{ModelPolicyError, RedactedRendering, ResolvedSensitiveModelPolicy};
 use crate::engine::agent::TurnEvent;
 use crate::engine::retry;
 
 pub(crate) type PreDrainFuture = Shared<BoxFuture<'static, std::result::Result<(), String>>>;
+
+/// Renders a model request through the session redaction table for one
+/// untrusted target. There is deliberately no raw variant: an untrusted
+/// custody class has no raw-byte conversion, so the only way a configured
+/// target ever sees raw bytes is a `Trusted` route's grant.
+pub(crate) struct SessionRedactionRendering(Arc<RedactionTable>);
+
+impl SessionRedactionRendering {
+    /// Wrap the session table for one untrusted target. The table is taken in
+    /// its *enforced* view: `redact.enabled = false` is an opt-out for trusted
+    /// routes only and must not reach an untrusted rendering. The field is
+    /// private so no caller can install a non-enforcing table.
+    pub(crate) fn new(session_table: &Arc<RedactionTable>) -> Self {
+        Self(RedactionTable::enforced_arc(session_table.clone()))
+    }
+}
+
+impl RedactedRendering for SessionRedactionRendering {
+    fn render_redacted(&self, _provider: &str, _model: &str, source: &str) -> String {
+        self.0.scrub(source)
+    }
+}
 
 mod build;
 mod dispatch;
@@ -550,16 +574,81 @@ impl Model {
         }
     }
 
+    /// Route a configured target's custody before building or re-tabling a
+    /// model for it.
+    ///
+    /// This is the one call that turns a `(provider, model)` pair into a
+    /// custody decision on the model-construction path. It goes through the
+    /// typed request API, so the decision arrives as a
+    /// [`ResolvedSensitiveModelPolicy`] — a value that either carries a
+    /// [`TrustedCustodyGrant`] or does not. There is no boolean to pass around
+    /// and no string-keyed trust lookup on this path to reach instead.
+    pub fn configured_custody_route(
+        cfg: &ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+        session_table: &Arc<RedactionTable>,
+    ) -> std::result::Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
+        cfg.route_configured_model_custody(
+            provider_id,
+            model_id,
+            // Custody never consults harness posture; the reported mode is
+            // diagnostic only and this path has no global posture to report.
+            LlmMode::default(),
+            Arc::new(SessionRedactionRendering::new(session_table)),
+        )
+    }
+
+    /// The redaction table a model built for `(provider_id, model_id)` must
+    /// carry, given the custody `route` already resolved for it.
+    ///
+    /// Raw custody — the empty table — is released **only** by a
+    /// [`TrustedCustodyGrant`] minted for this exact `(provider, model)`.
+    /// A route resolved under untrusted custody carries no grant, and a grant
+    /// minted for some other target does not authorize this one, so both fall
+    /// closed to the session table. Nothing here consults trust by name, so a
+    /// caller that never routed custody cannot obtain the raw table at all.
+    ///
+    /// The untrusted branch takes the session table's *enforced* view, so the
+    /// config-level opt-out `redact.enabled = false` cannot reach this sink.
+    /// That opt-out is honored for trusted routes only: model trust is the
+    /// single control over what leaves the machine raw, and a route without a
+    /// grant is always scrubbed against the real table.
     pub fn effective_redact_table_for(
+        route: &ResolvedSensitiveModelPolicy,
+        provider_id: &str,
+        model_id: &str,
+        session_table: Arc<RedactionTable>,
+    ) -> Arc<RedactionTable> {
+        let raw_released = route
+            .trusted_custody_grant()
+            .is_some_and(|grant| grant.provider() == provider_id && grant.model() == model_id);
+        if raw_released {
+            Arc::new(RedactionTable::empty())
+        } else {
+            RedactionTable::enforced_arc(session_table)
+        }
+    }
+
+    /// The redaction table for a configured target, falling closed when custody
+    /// cannot be routed for it (unknown provider, or a payload/custody
+    /// disagreement). An unroutable target never gets raw bytes.
+    pub fn effective_redact_table_for_configured(
         cfg: &ProvidersConfig,
         provider_id: &str,
         model_id: &str,
         session_table: Arc<RedactionTable>,
     ) -> Arc<RedactionTable> {
-        if cfg.resolve_trust(provider_id, model_id).is_trusted() {
-            Arc::new(RedactionTable::empty())
-        } else {
-            session_table
+        match Self::configured_custody_route(cfg, provider_id, model_id, &session_table) {
+            Ok(route) => {
+                Self::effective_redact_table_for(&route, provider_id, model_id, session_table)
+            }
+            // No custody route means no grant, so this target is treated as
+            // untrusted — which means the enforced table, not the session
+            // table as configured. Returning it unenforced would let
+            // `redact.enabled = false` send raw bytes to precisely the targets
+            // we could not classify.
+            Err(_) => RedactionTable::enforced_arc(session_table),
         }
     }
 
@@ -573,7 +662,7 @@ impl Model {
         providers: &ProvidersConfig,
         table: Arc<RedactionTable>,
     ) {
-        let effective = Self::effective_redact_table_for(
+        let effective = Self::effective_redact_table_for_configured(
             providers,
             self.provider_id(),
             self.model_id_ref(),

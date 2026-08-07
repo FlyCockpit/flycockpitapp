@@ -158,6 +158,17 @@ pub async fn turn_with_backup(
         }
     }
 
+    // A trusted primary whose only candidates were untrusted has no failover
+    // *because custody refused it*, not because none was configured. Compute it
+    // up front: when it applies we must suppress `turn`'s own failure UI and
+    // emit the augmented event ourselves, otherwise the reason never reaches
+    // the user on either channel.
+    let custody_block = if candidates.is_empty() {
+        crate::engine::driver::failover_custody_block(&config.providers(), &agent.model)
+    } else {
+        None
+    };
+
     let mut fallback_tried = Vec::new();
     let mut first_failure: Option<(String, crate::engine::model::InferenceErrorClass)> = None;
     let mut attempt_index = 0usize;
@@ -168,7 +179,11 @@ pub async fn turn_with_backup(
             candidates[attempt_index - 1].as_ref()
         };
         let has_later_candidate = attempt_index < candidates.len();
-        let emit_failure_ui = !has_later_candidate;
+        // Suppress `turn`'s own red inline error when a custody block exists so
+        // this function can emit the same event with the custody reason
+        // appended. Without this the two paths are mutually exclusive and the
+        // reason is dropped.
+        let emit_failure_ui = !has_later_candidate && custody_block.is_none();
         let attempt_result = turn(
             agent,
             current_model,
@@ -228,14 +243,27 @@ pub async fn turn_with_backup(
                 let can_advance = crate::engine::model::failure_engages_backup(&class)
                     && attempt_index < candidates.len();
                 if !can_advance {
+                    // The block only explains a failure that *would* have
+                    // engaged failover; an unrelated hard error keeps its own
+                    // message.
+                    let applied_block = custody_block
+                        .as_ref()
+                        .filter(|_| crate::engine::model::failure_engages_backup(&class));
                     if !emit_failure_ui {
+                        let detail = match applied_block {
+                            Some(block) if failure.detail.is_empty() => block.user_message(),
+                            Some(block) => {
+                                format!("{}\n{}", failure.detail, block.user_message())
+                            }
+                            None => failure.detail.clone(),
+                        };
                         let _ = tx
                             .send(TurnEvent::InferenceFailed {
                                 agent: agent.name.clone(),
                                 provider: failure.provider.clone(),
                                 model: failure.model.clone(),
                                 error_class: failure.class.clone(),
-                                detail: failure.detail.clone(),
+                                detail,
                                 auth_failure: crate::engine::model::auth_failure_kind(failure),
                             })
                             .await;
@@ -253,7 +281,14 @@ pub async fn turn_with_backup(
                             });
                         }
                     }
-                    return Err(err);
+                    return match applied_block {
+                        // Keep the original `InferenceFailure` in the chain (the
+                        // driver still downcasts to it) and add the typed
+                        // custody reason as context for log/report surfaces.
+                        // The user-visible channel is the event above.
+                        Some(block) => Err(err.context(block.user_message())),
+                        None => Err(err),
+                    };
                 }
 
                 let next_model = candidates[attempt_index].as_ref();
@@ -1506,6 +1541,11 @@ mod backup_fallback_tests {
             "reliable".into(),
             ProviderEntry {
                 url: "http://localhost:8/v1".into(),
+                models: vec![ModelEntry {
+                    id: "backup-model".into(),
+                    subagent_invokable: Some(true),
+                    ..ModelEntry::default()
+                }],
                 ..ProviderEntry::default()
             },
         );
@@ -1522,6 +1562,320 @@ mod backup_fallback_tests {
         // — independent of which agent is running `running`.
         assert_eq!(backup.provider_id(), "reliable");
         assert_eq!(backup.model_id_ref(), "backup-model");
+    }
+
+    /// Decision (B), untrusted primary: failover may upgrade onto a trusted
+    /// (self-hosted / no-log) endpoint, and may stay untrusted. Nothing is
+    /// refused, so no custody diagnostic is recorded.
+    #[test]
+    fn untrusted_primary_may_fail_over_to_trusted_or_untrusted() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "primary".into(),
+            provider_with_model("http://localhost:1/v1", "main"),
+        );
+        let mut trusted = provider_with_model("http://localhost:2/v1", "trusted-candidate");
+        trusted.trust = Some(ModelTrust::Trusted);
+        cfg.providers.insert("trusted".into(), trusted);
+        let mut untrusted = provider_with_model("http://localhost:3/v1", "untrusted-candidate");
+        untrusted.trust = Some(ModelTrust::Untrusted);
+        cfg.providers.insert("untrusted".into(), untrusted);
+
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+        let (fallbacks, refusals) =
+            crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &primary);
+        let ids: Vec<String> = fallbacks
+            .iter()
+            .map(|model| format!("{}:{}", model.provider_id(), model.model_id_ref()))
+            .collect();
+
+        assert!(
+            ids.iter().any(|id| id == "trusted:trusted-candidate"),
+            "an upgrade onto a trusted endpoint is permitted: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "untrusted:untrusted-candidate"),
+            "staying at the primary's own class is permitted: {ids:?}"
+        );
+        assert!(refusals.is_empty(), "nothing to refuse: {refusals:?}");
+    }
+
+    /// Decision (B), trusted primary: failover is upgrade-only, so an untrusted
+    /// candidate is refused with a typed error and recorded — never a silent
+    /// downgrade onto a cloud endpoint. A trusted primary with no trusted
+    /// candidate ends with an empty candidate list.
+    #[test]
+    fn trusted_primary_refuses_untrusted_failover_and_records_it() {
+        let mut cfg = ProvidersConfig::default();
+        let mut primary_entry = provider_with_model("http://localhost:1/v1", "main");
+        primary_entry.trust = Some(ModelTrust::Trusted);
+        primary_entry.backup = Some(BackupConfig {
+            provider: "cloud".into(),
+            model: "cloud-model".into(),
+        });
+        cfg.providers.insert("primary".into(), primary_entry);
+        let mut cloud = provider_with_model("http://localhost:2/v1", "cloud-model");
+        cloud.trust = Some(ModelTrust::Untrusted);
+        cfg.providers.insert("cloud".into(), cloud);
+
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+
+        // The configured backup is refused rather than substituted.
+        let (backup, backup_refusal) =
+            crate::engine::driver::build_backup_model_with_diagnostics(&cfg, &primary);
+        assert!(backup.is_none(), "a downgrade must not be substituted");
+        let backup_refusal = backup_refusal.expect("the refusal must be recorded");
+        assert_eq!(backup_refusal.provider, "cloud");
+        assert_eq!(backup_refusal.model, "cloud-model");
+        assert!(
+            backup_refusal.reason.contains("upgrade-only"),
+            "{}",
+            backup_refusal.reason
+        );
+
+        // Discovery finds no admissible candidate either: typed failure, empty list.
+        let (fallbacks, refusals) =
+            crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &primary);
+        assert!(fallbacks.is_empty(), "no trusted candidate exists");
+        assert!(
+            refusals
+                .iter()
+                .any(|refusal| refusal.provider == "cloud" && refusal.model == "cloud-model"),
+            "every refused candidate is recorded: {refusals:?}"
+        );
+
+        // Adding a trusted candidate restores failover — the upgrade path works.
+        let mut trusted = provider_with_model("http://localhost:3/v1", "trusted-candidate");
+        trusted.trust = Some(ModelTrust::Trusted);
+        cfg.providers.insert("trusted".into(), trusted);
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+        let (fallbacks, _) =
+            crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &primary);
+        assert!(
+            fallbacks.iter().any(|model| {
+                model.provider_id() == "trusted" && model.model_id_ref() == "trusted-candidate"
+            }),
+            "a trusted candidate is admissible for a trusted primary"
+        );
+    }
+
+    /// The typed custody refusal must reach the session boundary as a
+    /// user-visible reason. Without it the user sees only the primary's
+    /// original inference error and cannot tell that failover existed but was
+    /// refused on custody grounds.
+    #[test]
+    fn trusted_primary_custody_block_is_a_user_visible_reason() {
+        let mut cfg = ProvidersConfig::default();
+        let mut primary_entry = provider_with_model("http://localhost:1/v1", "main");
+        primary_entry.trust = Some(ModelTrust::Trusted);
+        primary_entry.backup = Some(BackupConfig {
+            provider: "cloud".into(),
+            model: "cloud-model".into(),
+        });
+        cfg.providers.insert("primary".into(), primary_entry);
+        let mut cloud = provider_with_model("http://localhost:2/v1", "cloud-model");
+        cloud.trust = Some(ModelTrust::Untrusted);
+        cfg.providers.insert("cloud".into(), cloud);
+
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+
+        let block = crate::engine::driver::failover_custody_block(&cfg, &primary)
+            .expect("a trusted primary with only untrusted candidates is custody-blocked");
+        assert_eq!(block.primary_provider, "primary");
+        assert_eq!(block.primary_model, "main");
+        assert!(
+            block
+                .refused
+                .iter()
+                .all(|refusal| refusal.kind.is_custody()),
+            "only custody refusals belong in the block: {:?}",
+            block.refused
+        );
+        let message = block.user_message();
+        assert!(message.contains("no failover target"), "{message}");
+        assert!(message.contains("upgrade-only"), "{message}");
+        assert!(message.contains("cloud:cloud-model"), "{message}");
+        assert!(message.contains("Configure a trusted backup"), "{message}");
+
+        // An untrusted primary is never custody-blocked — failover may upgrade.
+        let mut untrusted_cfg = cfg.clone();
+        untrusted_cfg.providers.get_mut("primary").unwrap().trust = Some(ModelTrust::Untrusted);
+        let untrusted_primary = Model::for_provider(
+            &untrusted_cfg,
+            "primary",
+            "main",
+            Arc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert!(
+            crate::engine::driver::failover_custody_block(&untrusted_cfg, &untrusted_primary)
+                .is_none()
+        );
+
+        // Nor is a trusted primary that has an admissible trusted candidate.
+        let mut ok_cfg = cfg.clone();
+        let mut trusted = provider_with_model("http://localhost:3/v1", "trusted-candidate");
+        trusted.trust = Some(ModelTrust::Trusted);
+        ok_cfg.providers.insert("trusted".into(), trusted);
+        let ok_primary = Model::for_provider(
+            &ok_cfg,
+            "primary",
+            "main",
+            Arc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert!(crate::engine::driver::failover_custody_block(&ok_cfg, &ok_primary).is_none());
+    }
+
+    /// Item 2 (round 4). The typed custody reason must actually reach the user
+    /// through `turn_with_backup`, not just format correctly.
+    ///
+    /// Previously `emit_failure_ui` and the custody-block branch were mutually
+    /// exclusive — an empty candidate list forced `emit_failure_ui = true`, so
+    /// `turn` emitted the plain error and the augmented event never ran. This
+    /// drives a real trusted primary against a failing endpoint and asserts the
+    /// `InferenceFailed` event the user sees carries the custody reason.
+    #[tokio::test]
+    async fn trusted_primary_custody_block_reaches_the_inference_failed_event() {
+        let failing_url = failing_server().await;
+        let mut cfg = ProvidersConfig::default();
+        let mut primary_entry = provider_with_model(&failing_url, "primary-model");
+        primary_entry.trust = Some(ModelTrust::Trusted);
+        primary_entry.backup = Some(BackupConfig {
+            provider: "cloud".into(),
+            model: "cloud-model".into(),
+        });
+        cfg.providers.insert("primary".into(), primary_entry);
+        let mut cloud = provider_with_model(&failing_url, "cloud-model");
+        cloud.trust = Some(ModelTrust::Untrusted);
+        cfg.providers.insert("cloud".into(), cloud);
+
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "primary",
+                "primary-model",
+                Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+
+        // The custody refusal means there is no candidate to hand in.
+        let (fallbacks, _) =
+            crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &agent.model);
+        assert!(fallbacks.is_empty(), "custody refused every candidate");
+
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                cfg.clone(),
+                crate::config::extended::ExtendedConfig::default(),
+            ),
+        );
+        let result = turn_with_backup(
+            &agent,
+            None,
+            &fallbacks,
+            &mut Vec::new(),
+            Message::user("hi"),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            config,
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the primary fails and has no failover");
+        // The error chain still carries the typed reason for log/report surfaces.
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("upgrade-only"),
+            "the custody reason must ride the error chain too"
+        );
+
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let detail = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::InferenceFailed { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("the user-visible red inline error is emitted exactly once");
+        assert!(detail.contains("no failover target"), "{detail}");
+        assert!(detail.contains("upgrade-only"), "{detail}");
+        assert!(detail.contains("cloud:cloud-model"), "{detail}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::InferenceFailed { .. }))
+                .count(),
+            1,
+            "exactly one red error — `turn`'s own emit must be suppressed"
+        );
+    }
+
+    /// Eligibility rejections are never recorded or logged as custody refusals.
+    #[test]
+    fn eligibility_rejections_are_not_labelled_as_custody() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "primary".into(),
+            provider_with_model("http://localhost:1/v1", "main"),
+        );
+        cfg.providers.insert(
+            "candidate".into(),
+            ProviderEntry {
+                url: "http://localhost:2/v1".into(),
+                models: vec![ModelEntry {
+                    id: "missing-context".into(),
+                    subagent_invokable: Some(true),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let primary =
+            Model::for_provider(&cfg, "primary", "main", Arc::new(RedactionTable::empty()))
+                .unwrap();
+
+        let (_, refusals) =
+            crate::engine::driver::build_failover_models_with_diagnostics(&cfg, &primary);
+        assert!(
+            refusals
+                .iter()
+                .all(|refusal| refusal.kind.as_str() != "custody_downgrade"),
+            "an untrusted primary can never produce a custody refusal: {refusals:?}"
+        );
     }
 
     #[test]

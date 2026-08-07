@@ -2145,6 +2145,57 @@ fn computer_use_resolve_matrix() {
     );
 }
 
+/// The literal a redacted rendering must never leak.
+const CUSTODY_TEST_SECRET: &str = "sk-live-policy-secret";
+
+/// Test rendering for the untrusted custody class. There is no raw variant:
+/// an untrusted payload exists only as a target-specific redacted rendering.
+struct TestRedaction;
+
+impl RedactedRendering for TestRedaction {
+    fn render_redacted(&self, provider: &str, model: &str, source: &str) -> String {
+        format!(
+            "[redacted for {provider}:{model}] {}",
+            source.replace(CUSTODY_TEST_SECRET, "<redacted>")
+        )
+    }
+}
+
+fn untrusted_payload() -> SensitivePayload {
+    SensitivePayload::redacted_for_untrusted_custody(std::sync::Arc::new(TestRedaction))
+}
+
+/// A criteria block with every custody-free dimension at its neutral value.
+fn policy_criteria(selector: ModelPolicySelector<'_>) -> ModelPolicyCriteria<'_> {
+    ModelPolicyCriteria {
+        selector,
+        required_capabilities: vec![],
+        min_context_tokens: None,
+        require_subagent_invokable: false,
+        optimize: ModelOptimization::Balanced,
+        role: None,
+        agent: None,
+        availability: AvailabilityScope::Discovery,
+        global_mode: LlmMode::default(),
+    }
+}
+
+/// Resolve under an explicit custody filter, pairing the class with the only
+/// payload rendering that class permits.
+fn resolve_sensitive(
+    cfg: &ProvidersConfig,
+    custody: ModelCustody,
+    criteria: ModelPolicyCriteria<'_>,
+) -> Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
+    let payload = match custody {
+        ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
+        ModelCustody::Untrusted => untrusted_payload(),
+    };
+    cfg.resolve_sensitive_model_policy(&SensitiveModelPolicyRequest::new(
+        criteria, custody, payload,
+    )?)
+}
+
 #[test]
 fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
     let mut cfg = ProvidersConfig::default();
@@ -2188,61 +2239,78 @@ fn policy_resolver_applies_defaults_filters_and_tie_breaks() {
     );
 
     let chosen = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Category("cheap_code"),
-            trust: None,
-            required_capabilities: vec![],
-            min_context_tokens: None,
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Cost,
-            role: Some("cheap_code"),
-            agent: Some("explore"),
-        })
+        .resolve_non_sensitive_model_policy(&NonSensitiveModelPolicyRequest::proven_non_sensitive(
+            ModelPolicyCriteria {
+                selector: ModelPolicySelector::Category("cheap_code"),
+                required_capabilities: vec![],
+                min_context_tokens: None,
+                require_subagent_invokable: true,
+                optimize: ModelOptimization::Cost,
+                role: Some("cheap_code"),
+                agent: Some("explore"),
+                availability: AvailabilityScope::Discovery,
+                global_mode: LlmMode::default(),
+            },
+        ))
         .unwrap();
     assert_eq!(chosen.selector(), "b:reasoning");
 
     let chosen = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Trust(ModelTrust::Untrusted),
-            trust: None,
-            required_capabilities: vec![RequiredModelCapability::ToolCalling],
-            min_context_tokens: Some(16_000),
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Quality,
-            role: None,
-            agent: None,
-        })
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    selector: ModelPolicySelector::Any,
+                    required_capabilities: vec![RequiredModelCapability::ToolCalling],
+                    min_context_tokens: Some(16_000),
+                    require_subagent_invokable: true,
+                    optimize: ModelOptimization::Quality,
+                    role: None,
+                    agent: None,
+                    availability: AvailabilityScope::Discovery,
+                    global_mode: LlmMode::default(),
+                },
+                ModelCustody::Untrusted,
+                untrusted_payload(),
+            )
+            .unwrap(),
+        )
         .unwrap();
-    assert_eq!(chosen.selector(), "a:cheap");
+    assert_eq!(chosen.policy.selector(), "a:cheap");
 
     let chosen = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Category("reasoning"),
-            trust: None,
-            required_capabilities: vec![
-                RequiredModelCapability::Reasoning,
-                RequiredModelCapability::ImageInput,
-            ],
-            min_context_tokens: Some(64_000),
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Balanced,
-            role: Some("reasoning"),
-            agent: Some("deepthink"),
-        })
+        .resolve_non_sensitive_model_policy(&NonSensitiveModelPolicyRequest::proven_non_sensitive(
+            ModelPolicyCriteria {
+                selector: ModelPolicySelector::Category("reasoning"),
+                required_capabilities: vec![
+                    RequiredModelCapability::Reasoning,
+                    RequiredModelCapability::ImageInput,
+                ],
+                min_context_tokens: Some(64_000),
+                require_subagent_invokable: true,
+                optimize: ModelOptimization::Balanced,
+                role: Some("reasoning"),
+                agent: Some("deepthink"),
+                availability: AvailabilityScope::Discovery,
+                global_mode: LlmMode::default(),
+            },
+        ))
         .unwrap();
     assert_eq!(chosen.selector(), "b:reasoning");
 
     let err = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Category("strict"),
-            trust: None,
-            required_capabilities: vec![RequiredModelCapability::StructuredOutputs],
-            min_context_tokens: None,
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Balanced,
-            role: Some("strict"),
-            agent: None,
-        })
+        .resolve_non_sensitive_model_policy(&NonSensitiveModelPolicyRequest::proven_non_sensitive(
+            ModelPolicyCriteria {
+                selector: ModelPolicySelector::Category("strict"),
+                required_capabilities: vec![RequiredModelCapability::StructuredOutputs],
+                min_context_tokens: None,
+                require_subagent_invokable: true,
+                optimize: ModelOptimization::Balanced,
+                role: Some("strict"),
+                agent: None,
+                availability: AvailabilityScope::Discovery,
+                global_mode: LlmMode::default(),
+            },
+        ))
         .unwrap_err();
     assert!(matches!(err, ModelPolicyError::NoEligibleModel(_)));
 }
@@ -2269,58 +2337,67 @@ fn mixed_harness_policy_loaded_from_files_covers_trust_and_hidden_models() {
     let cfg = ConfigDoc::providers_from_paths(&[config_path]);
 
     let top = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Exact("mixed:top-trusted"),
-            trust: Some(ModelTrust::Trusted),
-            required_capabilities: vec![],
-            min_context_tokens: None,
-            require_subagent_invokable: false,
-            optimize: ModelOptimization::Balanced,
-            role: Some("top_level"),
-            agent: Some("Build"),
-        })
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    role: Some("top_level"),
+                    agent: Some("Build"),
+                    ..policy_criteria(ModelPolicySelector::Exact("mixed:top-trusted"))
+                },
+                ModelCustody::Trusted,
+                SensitivePayload::raw_for_trusted_custody(),
+            )
+            .unwrap(),
+        )
         .unwrap();
-    assert_eq!(top.selector(), "mixed:top-trusted");
+    assert_eq!(top.policy.selector(), "mixed:top-trusted");
+    assert!(top.trusted_custody_grant().is_some());
 
     let child = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Trust(ModelTrust::Trusted),
-            trust: Some(ModelTrust::Trusted),
-            required_capabilities: vec![],
-            min_context_tokens: None,
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Quality,
-            role: Some("sensitive_child"),
-            agent: Some("builder"),
-        })
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    require_subagent_invokable: true,
+                    optimize: ModelOptimization::Quality,
+                    role: Some("sensitive_child"),
+                    agent: Some("builder"),
+                    ..policy_criteria(ModelPolicySelector::Any)
+                },
+                ModelCustody::Trusted,
+                SensitivePayload::raw_for_trusted_custody(),
+            )
+            .unwrap(),
+        )
         .unwrap();
-    assert_eq!(child.selector(), "mixed:child-trusted");
+    assert_eq!(child.policy.selector(), "mixed:child-trusted");
 
     let untrusted = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Exact("mixed:parent-untrusted"),
-            trust: None,
-            required_capabilities: vec![],
-            min_context_tokens: None,
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Balanced,
-            role: Some("utility"),
-            agent: Some("explore"),
-        })
+        .resolve_non_sensitive_model_policy(&NonSensitiveModelPolicyRequest::proven_non_sensitive(
+            ModelPolicyCriteria {
+                require_subagent_invokable: true,
+                role: Some("utility"),
+                agent: Some("explore"),
+                ..policy_criteria(ModelPolicySelector::Exact("mixed:parent-untrusted"))
+            },
+        ))
         .unwrap();
     assert_eq!(untrusted.selector(), "mixed:parent-untrusted");
 
     let hidden_refusal = cfg
-        .resolve_model_policy(&ModelPolicyRequest {
-            selector: ModelPolicySelector::Exact("mixed:hidden-trusted"),
-            trust: Some(ModelTrust::Trusted),
-            required_capabilities: vec![],
-            min_context_tokens: None,
-            require_subagent_invokable: true,
-            optimize: ModelOptimization::Quality,
-            role: Some("sensitive_child"),
-            agent: Some("builder"),
-        })
+        .resolve_sensitive_model_policy(
+            &SensitiveModelPolicyRequest::new(
+                ModelPolicyCriteria {
+                    require_subagent_invokable: true,
+                    optimize: ModelOptimization::Quality,
+                    role: Some("sensitive_child"),
+                    agent: Some("builder"),
+                    ..policy_criteria(ModelPolicySelector::Exact("mixed:hidden-trusted"))
+                },
+                ModelCustody::Trusted,
+                SensitivePayload::raw_for_trusted_custody(),
+            )
+            .unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(
         hidden_refusal,
@@ -2545,3 +2622,4 @@ fn resolve_text_embedded_recovery_three_tier_precedence() {
 /// `resolve_thinking_params` with no model/provider override configured.
 mod model_defaults_and_capabilities;
 mod multimodal_capability;
+mod trust_mode_orthogonality;

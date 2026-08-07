@@ -917,7 +917,7 @@ pub fn load_provider_raw_file(path: &Path) -> Result<Map<String, Value>> {
 fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>) -> Result<()> {
     if provider.contains_key("redact") {
         anyhow::bail!(
-            "provider `{provider_id}` uses legacy `redact`; use `trust: \"trusted\"` to disable outbound redaction or `trust: \"untrusted\"` to keep it enabled"
+            "provider `{provider_id}` uses legacy `redact`; use `trust: \"trusted\"` to send inference requests raw or `trust: \"untrusted\"` to keep them redacted (exports and client display stay redacted regardless of trust)"
         );
     }
     if let Some(models) = provider.get("models").and_then(Value::as_array) {
@@ -931,7 +931,7 @@ fn reject_legacy_redact_fields(provider_id: &str, provider: &Map<String, Value>)
                     .and_then(Value::as_str)
                     .unwrap_or("<unknown>");
                 anyhow::bail!(
-                    "model `{provider_id}:{model_id}` uses legacy `redact`; use `trust: \"trusted\"` to disable outbound redaction or `trust: \"untrusted\"` to keep it enabled"
+                    "model `{provider_id}:{model_id}` uses legacy `redact`; use `trust: \"trusted\"` to send inference requests raw or `trust: \"untrusted\"` to keep them redacted (exports and client display stay redacted regardless of trust)"
                 );
             }
         }

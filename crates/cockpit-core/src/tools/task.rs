@@ -90,7 +90,9 @@ impl TaskTool {
              conversation. An interactive subagent (e.g. the writer or the planning interviewer) \
              takes over the conversation with the user; the others run on their own and report \
              back. Only `builder` may write files, in either case. Use `intent=models` to discover \
-             allowed structured model selectors; prefer trusted models for sensitive delegated work. \
+             allowed structured model selectors. Model selectors choose capability, category, and \
+             cost only: data custody is host policy, so you cannot request a trusted (raw-custody) \
+             child, and delegated routing always applies the redacted untrusted filter. \
              Use exactly one task intent: \
              - delegate: {{ \"intent\": \"delegate\", \"payload\": {{ \"agent\": \"builder\", \"prompt\": \"...\" }} }} \
              - batch: {{ \"intent\": \"batch\", \"payload\": [{{ \"label\": \"x\", \"agent\": \"explore\", \"prompt\": \"...\" }}] }} \
@@ -111,10 +113,6 @@ impl TaskTool {
                 },
                 "category": {
                     "type": "string"
-                },
-                "trust": {
-                    "type": "string",
-                    "enum": ["trusted", "untrusted"]
                 },
                 "optimize": {
                     "type": "string",
@@ -301,6 +299,16 @@ impl TaskTool {
             ["description"] = defensive_min_context.clone();
         defensive_parameters["properties"]["payload"]["items"]["properties"]["model"]["properties"]
             ["min_context_tokens"]["description"] = defensive_min_context;
+        // Data custody is host policy, not a delegation choice. Say so
+        // explicitly in the Defensive schema so the model does not try to
+        // reintroduce a `trust` field for "sensitive" work.
+        let defensive_model_selector = serde_json::json!(
+            "Capability/category/cost selector only. Data custody is host policy: there is no `trust` field, delegated routing always applies the redacted untrusted filter, and a trusted (raw-custody) child cannot be requested here"
+        );
+        defensive_parameters["properties"]["payload"]["properties"]["model"]["description"] =
+            defensive_model_selector.clone();
+        defensive_parameters["properties"]["payload"]["items"]["properties"]["model"]["description"] =
+            defensive_model_selector;
         Self {
             description,
             defensive_description,
@@ -560,6 +568,41 @@ mod tests {
         }
     }
 
+    /// AC7 (schema half). The Defensive presentation used to advertise a
+    /// `trust` selector and tell the model to "prefer trusted models for
+    /// sensitive delegated work" — that let an untrusted parent request
+    /// raw-custody routing. Data custody is host policy, so the field is gone
+    /// from both schemas and both descriptions say so.
+    #[test]
+    fn task_schema_has_no_model_trust_selector() {
+        let tool = TaskTool::with_subagents(&["explore", "builder"]);
+        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+            assert_schema_key_absent(&schema, "trust");
+            assert_no_selectable_custody_value(&schema);
+        }
+
+        let defensive_description = tool.defensive_description().unwrap();
+        assert!(
+            !defensive_description.contains("prefer trusted models"),
+            "removed steering must not return: {defensive_description}"
+        );
+        assert!(defensive_description.contains("data custody is host policy"));
+        assert!(defensive_description.contains("redacted untrusted filter"));
+
+        let defensive = tool.defensive_parameters().unwrap();
+        for description in [
+            defensive["properties"]["payload"]["properties"]["model"]["description"]
+                .as_str()
+                .unwrap(),
+            defensive["properties"]["payload"]["items"]["properties"]["model"]["description"]
+                .as_str()
+                .unwrap(),
+        ] {
+            assert!(description.contains("Data custody is host policy"));
+            assert!(description.contains("no `trust` field"));
+        }
+    }
+
     #[test]
     fn task_schema_uses_write_scope_not_output_dir() {
         let tool = TaskTool::with_subagents(&["explore", "builder"]);
@@ -581,6 +624,32 @@ mod tests {
                 "batch write_scope stays schema-optional: {schema}"
             );
             assert_schema_key_absent(&schema, "output_dir");
+        }
+    }
+
+    /// No `enum` anywhere in the schema may offer a custody class as a
+    /// selectable value.
+    fn assert_no_selectable_custody_value(value: &Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::Array(values)) = map.get("enum") {
+                    for entry in values {
+                        assert!(
+                            entry != "trusted" && entry != "untrusted",
+                            "custody must not be selectable: {value}"
+                        );
+                    }
+                }
+                for child in map.values() {
+                    assert_no_selectable_custody_value(child);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    assert_no_selectable_custody_value(child);
+                }
+            }
+            _ => {}
         }
     }
 

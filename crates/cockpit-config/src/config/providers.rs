@@ -261,10 +261,14 @@ pub use crate::config::effective_default::{EffectiveDefaultCrashPoint, set_crash
 /// about the split on-disk layout.
 #[allow(unused_imports)]
 pub use crate::config::model_policy::{
-    EffectiveCapabilitySource, EffectiveModelCapabilities, EmbeddingModelResolutionError,
-    ModelOptimization, ModelPolicyError, ModelPolicyRequest, ModelPolicySelector,
-    RequiredModelCapability, RequiredModelCapabilityOutcome, ResolvedEmbeddingModel,
-    ResolvedInputCapability, ResolvedModelPolicy, required_model_capability_outcome,
+    AvailabilityScope, EffectiveCapabilitySource, EffectiveModelCapabilities,
+    EmbeddingModelResolutionError, FailoverCustody, HarnessCustodyTrust, ModelCustody,
+    ModelOptimization, ModelPolicyCriteria, ModelPolicyError, ModelPolicySelector,
+    NonSensitiveModelPolicyRequest, RedactedRendering, RequiredModelCapability,
+    RequiredModelCapabilityOutcome, ResolvedEmbeddingModel, ResolvedInputCapability,
+    ResolvedModelPolicy, ResolvedSensitiveModelPolicy, RoutingDiagnostics,
+    SensitiveModelPolicyRequest, SensitivePayload, TrustedCustodyGrant,
+    required_model_capability_outcome,
 };
 
 #[allow(unused_imports)]

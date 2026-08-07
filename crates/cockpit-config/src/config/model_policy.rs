@@ -1,5 +1,26 @@
 //! Model policy selection and capability resolution.
+//!
+//! Trust and mode are orthogonal policy dimensions here and stay that way:
+//!
+//! - [`ModelTrust`] is a provider/model **data-custody** classification.
+//!   `Trusted` marks a self-hosted / no-log endpoint that may hold raw
+//!   secret/environment values; raw content reaching it is the intended,
+//!   supported outcome. `Untrusted` marks a cloud endpoint that must receive a
+//!   redacted rendering. The enforced invariant is one-directional:
+//!   unredacted content must never reach an untrusted endpoint.
+//! - [`LlmMode`] is an independent **harness-steering posture**. It changes
+//!   context rules, prompt/decomposition guidance, and defensive tool
+//!   descriptions/schemas — never provider eligibility, custody, or redaction.
+//!
+//! Neither dimension may be inferred from the other, and neither may be
+//! inferred from locality. Ranking therefore uses only the documented
+//! intelligence/cost/capability criteria plus deterministic identity; custody
+//! filters candidates exclusively through
+//! [`SensitiveModelPolicyRequest::custody`].
 
+use std::sync::Arc;
+
+use crate::config::extended::LlmMode;
 use crate::config::providers::{
     CapabilityStatus, ComputerUseCapability, Inputs, ModelCapabilityOverrides, ModelEntry,
     ModelLocation, ModelTrust, ProvidersConfig,
@@ -94,40 +115,429 @@ impl ResolvedInputCapability {
     }
 }
 
+/// Candidate scope for a policy lookup. Deliberately carries **no** trust
+/// variant: custody is not a selector, it is the typed filter supplied by
+/// [`SensitiveModelPolicyRequest`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelPolicySelector<'a> {
     Exact(&'a str),
-    Trust(ModelTrust),
     Category(&'a str),
+    /// Every configured model, narrowed only by the request's capability,
+    /// context, availability, subagent-invokable, and custody requirements.
+    Any,
 }
 
+/// How `availability` allowlists apply to a request.
+///
+/// `availability` is a **discovery-scoping** mechanism: it says which
+/// categories/roles/agents a model may be *found* for. It was never meant to
+/// veto an explicit host reference to one provider/model.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AvailabilityScope {
+    /// Policy-driven discovery. The model was reached by scanning, so its
+    /// allowlists gate it on every axis.
+    #[default]
+    Discovery,
+    /// The host explicitly named this provider/model — agent-file frontmatter,
+    /// a configured role default, a configured backup or enumerated failover
+    /// candidate, or the session's own model. Allowlists do not gate an
+    /// explicit host reference; every other check (subagent-invokable,
+    /// capabilities, context, custody) still applies.
+    HostNamedTarget,
+}
+
+/// The documented, custody-free selection criteria. Every field here is an
+/// intelligence/cost/capability/availability concern; none of them may encode
+/// data custody or harness posture.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct ModelPolicyRequest<'a> {
+pub struct ModelPolicyCriteria<'a> {
     pub selector: ModelPolicySelector<'a>,
-    pub trust: Option<ModelTrust>,
     pub required_capabilities: Vec<RequiredModelCapability>,
     pub min_context_tokens: Option<u32>,
     pub require_subagent_invokable: bool,
     pub optimize: ModelOptimization,
     pub role: Option<&'a str>,
     pub agent: Option<&'a str>,
+    /// Whether `availability` allowlists gate this request. Host-named exact
+    /// targets are not discovery, so they are not gated.
+    pub availability: AvailabilityScope,
+    /// Global harness posture used only to report the resolved mode in routing
+    /// diagnostics. It never filters or ranks candidates.
+    pub global_mode: LlmMode,
 }
 
 #[allow(dead_code)]
-impl<'a> ModelPolicyRequest<'a> {
+impl<'a> ModelPolicyCriteria<'a> {
     pub fn subagent_category(category: &'a str) -> Self {
         Self {
             selector: ModelPolicySelector::Category(category),
-            trust: None,
             required_capabilities: Vec::new(),
             min_context_tokens: None,
             require_subagent_invokable: true,
             optimize: ModelOptimization::default(),
             role: Some(category),
             agent: None,
+            availability: AvailabilityScope::Discovery,
+            global_mode: LlmMode::default(),
         }
+    }
+}
+
+/// Data custody required of the provider/model that will receive a payload.
+///
+/// This is the *only* way trust may narrow routing. It is independent of
+/// [`LlmMode`]: no posture implies a custody class and no custody class
+/// implies a posture.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCustody {
+    /// The selected endpoint may receive raw secret/environment values.
+    Trusted,
+    /// The selected endpoint must receive a redacted rendering.
+    Untrusted,
+}
+
+#[allow(dead_code)]
+impl ModelCustody {
+    /// The provider/model trust class this custody requirement admits.
+    pub fn required_trust(self) -> ModelTrust {
+        match self {
+            Self::Trusted => ModelTrust::Trusted,
+            Self::Untrusted => ModelTrust::Untrusted,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// Custody posture of an **external OS harness**.
+///
+/// It carries the same meaning as [`ModelCustody`] — trusted may hold raw
+/// secrets, untrusted must be handed redacted material — but it is a separate
+/// type on purpose: an external harness is not a provider/model route, so this
+/// value must never reach model routing. There is deliberately no conversion
+/// into [`ModelCustody`] or [`ModelTrust`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessCustodyTrust {
+    Trusted,
+    Untrusted,
+}
+
+#[allow(dead_code)]
+impl HarnessCustodyTrust {
+    pub fn is_trusted(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// Renders potentially sensitive material for exactly one untrusted target.
+///
+/// Implementations own the redaction. There is no raw passthrough: the trait
+/// only ever returns an owned, target-specific rendering.
+pub trait RedactedRendering: Send + Sync {
+    fn render_redacted(&self, provider: &str, model: &str, source: &str) -> String;
+}
+
+#[derive(Clone)]
+enum PayloadRendering {
+    /// Raw provider bytes. Reachable only through
+    /// [`SensitivePayload::raw_for_trusted_custody`] and only unlockable with a
+    /// [`TrustedCustodyGrant`].
+    Raw,
+    /// Target-specific redacted rendering. Has no raw-byte conversion.
+    Redacted(Arc<dyn RedactedRendering>),
+}
+
+/// The rendering policy for a payload that may contain sensitive material.
+///
+/// The custody class is part of the value, so a caller cannot construct a
+/// sensitive request without first deciding custody. `Trusted` construction
+/// yields raw provider bytes only after routing hands back a
+/// [`TrustedCustodyGrant`]; `Untrusted` construction requires a
+/// target-specific redacted rendering and exposes no raw-byte conversion.
+#[derive(Clone)]
+pub struct SensitivePayload {
+    custody: ModelCustody,
+    rendering: PayloadRendering,
+}
+
+impl std::fmt::Debug for SensitivePayload {
+    /// Never prints payload material — diagnostics carry the class only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SensitivePayload")
+            .field("custody", &self.custody)
+            .field(
+                "rendering",
+                &match self.rendering {
+                    PayloadRendering::Raw => "raw",
+                    PayloadRendering::Redacted(_) => "redacted",
+                },
+            )
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl SensitivePayload {
+    /// Raw provider bytes may reach the selected endpoint. Fixes custody to
+    /// [`ModelCustody::Trusted`].
+    pub fn raw_for_trusted_custody() -> Self {
+        Self {
+            custody: ModelCustody::Trusted,
+            rendering: PayloadRendering::Raw,
+        }
+    }
+
+    /// The payload exists only as a target-specific redacted rendering. Fixes
+    /// custody to [`ModelCustody::Untrusted`].
+    pub fn redacted_for_untrusted_custody(rendering: Arc<dyn RedactedRendering>) -> Self {
+        Self {
+            custody: ModelCustody::Untrusted,
+            rendering: PayloadRendering::Redacted(rendering),
+        }
+    }
+
+    pub fn custody(&self) -> ModelCustody {
+        self.custody
+    }
+
+    /// Raw provider bytes, unlocked by the grant routing mints after a
+    /// `Trusted` selection.
+    ///
+    /// The grant is bound to the destination it was minted for: it unlocks raw
+    /// bytes only for that exact `(provider, model)`. A grant for one trusted
+    /// route can therefore never be replayed to send raw bytes to a different
+    /// route. Always `None` for an untrusted payload — a redacted rendering has
+    /// no raw-byte conversion.
+    pub fn raw_provider_bytes<'s>(
+        &self,
+        grant: &TrustedCustodyGrant,
+        route: &ResolvedModelPolicy,
+        source: &'s str,
+    ) -> Option<&'s str> {
+        if !grant.authorizes(route) {
+            return None;
+        }
+        match self.rendering {
+            PayloadRendering::Raw => Some(source),
+            PayloadRendering::Redacted(_) => None,
+        }
+    }
+
+    /// Target-specific redacted rendering for the resolved untrusted target.
+    /// Always `None` for a raw/trusted payload.
+    pub fn render_for_untrusted(
+        &self,
+        resolved: &ResolvedModelPolicy,
+        source: &str,
+    ) -> Option<String> {
+        match &self.rendering {
+            PayloadRendering::Raw => None,
+            PayloadRendering::Redacted(rendering) => {
+                Some(rendering.render_redacted(&resolved.provider, &resolved.model, source))
+            }
+        }
+    }
+}
+
+/// Proof that routing selected a provider/model under `Trusted` custody. Only
+/// [`ProvidersConfig::resolve_sensitive_model_policy`] mints one, so raw
+/// provider bytes cannot be produced without a completed trusted selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedCustodyGrant {
+    provider: String,
+    model: String,
+}
+
+#[allow(dead_code)]
+impl TrustedCustodyGrant {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Whether this grant was minted for `route`. Raw bytes are unlocked only
+    /// for the exact destination the trusted selection resolved to.
+    pub fn authorizes(&self, route: &ResolvedModelPolicy) -> bool {
+        self.provider == route.provider && self.model == route.model && route.trust.is_trusted()
+    }
+}
+
+/// The single place a [`TrustedCustodyGrant`] comes into existence.
+///
+/// Every custody-routing entry point funnels through here, so "raw provider
+/// bytes were released" and "a custody selection completed under
+/// [`ModelCustody::Trusted`]" are the same event by construction. An
+/// `Untrusted` selection never mints one, which is what makes a missing grant
+/// mean *redact*, not *unknown*.
+fn seal_custody_selection(
+    policy: ResolvedModelPolicy,
+    custody: ModelCustody,
+) -> ResolvedSensitiveModelPolicy {
+    let grant = matches!(custody, ModelCustody::Trusted).then(|| TrustedCustodyGrant {
+        provider: policy.provider.clone(),
+        model: policy.model.clone(),
+    });
+    ResolvedSensitiveModelPolicy {
+        policy,
+        custody,
+        grant,
+    }
+}
+
+/// Custody rule for backup/failover routing.
+///
+/// Failover is **upgrade-only**. An untrusted primary may fail over to an
+/// untrusted or a trusted candidate — moving work onto a self-hosted/no-log
+/// endpoint is never a regression. A trusted primary may fail over only to
+/// another trusted candidate; a downgrade would push content that was routed
+/// under raw custody onto a cloud endpoint, so it is a typed refusal rather
+/// than a silent substitution.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailoverCustody {
+    primary: ModelTrust,
+}
+
+#[allow(dead_code)]
+impl FailoverCustody {
+    pub fn for_primary(primary: ModelTrust) -> Self {
+        Self { primary }
+    }
+
+    pub fn primary(self) -> ModelTrust {
+        self.primary
+    }
+
+    /// Whether a candidate of this trust class is an admissible failover
+    /// target: the primary's own class, or an upgrade to trusted.
+    pub fn admits(self, candidate: ModelTrust) -> bool {
+        match self.primary {
+            ModelTrust::Trusted => candidate.is_trusted(),
+            ModelTrust::Untrusted => true,
+        }
+    }
+
+    /// The custody class this candidate must be routed under, or the typed
+    /// refusal when it would be a downgrade.
+    pub fn custody_for(
+        self,
+        provider: &str,
+        model: &str,
+        candidate: ModelTrust,
+    ) -> Result<ModelCustody, ModelPolicyError> {
+        if !self.admits(candidate) {
+            return Err(ModelPolicyError::CustodyDowngradeRefused {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                primary: self.primary,
+                candidate,
+            });
+        }
+        Ok(match candidate {
+            ModelTrust::Trusted => ModelCustody::Trusted,
+            ModelTrust::Untrusted => ModelCustody::Untrusted,
+        })
+    }
+}
+
+/// The request every potentially sensitive route must construct. Custody has
+/// no default and no `Option`, so it cannot be omitted.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SensitiveModelPolicyRequest<'a> {
+    criteria: ModelPolicyCriteria<'a>,
+    custody: ModelCustody,
+    payload: SensitivePayload,
+}
+
+#[allow(dead_code)]
+impl<'a> SensitiveModelPolicyRequest<'a> {
+    /// `custody` and `payload` must agree; a payload built for one class can
+    /// never be routed under the other.
+    pub fn new(
+        criteria: ModelPolicyCriteria<'a>,
+        custody: ModelCustody,
+        payload: SensitivePayload,
+    ) -> Result<Self, ModelPolicyError> {
+        if payload.custody() != custody {
+            return Err(ModelPolicyError::CustodyPayloadMismatch {
+                requested: custody,
+                payload: payload.custody(),
+            });
+        }
+        Ok(Self {
+            criteria,
+            custody,
+            payload,
+        })
+    }
+
+    pub fn criteria(&self) -> &ModelPolicyCriteria<'a> {
+        &self.criteria
+    }
+
+    pub fn custody(&self) -> ModelCustody {
+        self.custody
+    }
+
+    pub fn payload(&self) -> &SensitivePayload {
+        &self.payload
+    }
+}
+
+/// The sole request type allowed to omit custody. Constructing one asserts the
+/// caller proved the payload carries no sensitive material.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct NonSensitiveModelPolicyRequest<'a> {
+    criteria: ModelPolicyCriteria<'a>,
+}
+
+#[allow(dead_code)]
+impl<'a> NonSensitiveModelPolicyRequest<'a> {
+    pub fn proven_non_sensitive(criteria: ModelPolicyCriteria<'a>) -> Self {
+        Self { criteria }
+    }
+
+    pub fn criteria(&self) -> &ModelPolicyCriteria<'a> {
+        &self.criteria
+    }
+}
+
+/// A selection made under an explicit custody filter.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSensitiveModelPolicy {
+    pub policy: ResolvedModelPolicy,
+    pub custody: ModelCustody,
+    grant: Option<TrustedCustodyGrant>,
+}
+
+#[allow(dead_code)]
+impl ResolvedSensitiveModelPolicy {
+    /// `Some` only for a completed `Trusted` selection.
+    pub fn trusted_custody_grant(&self) -> Option<&TrustedCustodyGrant> {
+        self.grant.as_ref()
     }
 }
 
@@ -136,10 +546,16 @@ impl<'a> ModelPolicyRequest<'a> {
 pub struct ResolvedModelPolicy {
     pub provider: String,
     pub model: String,
+    /// Resolved data-custody class. Reported, never ranked on.
     pub trust: ModelTrust,
+    /// Resolved harness posture. Independent of `trust` in both directions.
+    pub mode: LlmMode,
     pub location: Option<ModelLocation>,
     pub quality_rank: i64,
     pub cost_rank: i64,
+    /// The explicit custody filter this selection passed. `None` when the
+    /// caller proved the payload non-sensitive.
+    pub custody_filter: Option<ModelCustody>,
 }
 
 #[allow(dead_code)]
@@ -147,6 +563,46 @@ impl ResolvedModelPolicy {
     pub fn selector(&self) -> String {
         format!("{}:{}", self.provider, self.model)
     }
+
+    /// Routing diagnostics. Trust and mode are separate fields, the explicit
+    /// trust filter carries its reason, and no payload material appears.
+    pub fn routing_diagnostics(&self) -> RoutingDiagnostics {
+        RoutingDiagnostics {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            trust: match self.trust {
+                ModelTrust::Trusted => "trusted",
+                ModelTrust::Untrusted => "untrusted",
+            },
+            mode: self.mode.as_str(),
+            custody_filter: self.custody_filter.map(ModelCustody::as_str),
+            custody_filter_reason: match self.custody_filter {
+                Some(ModelCustody::Trusted) => {
+                    "explicit trusted-custody filter: caller requested raw-custody routing"
+                }
+                Some(ModelCustody::Untrusted) => {
+                    "explicit untrusted-custody filter: caller requested redacted routing"
+                }
+                None => "no custody filter: caller proved the payload is non-sensitive",
+            },
+            quality_rank: self.quality_rank,
+            cost_rank: self.cost_rank,
+        }
+    }
+}
+
+/// Separate-field routing diagnostics. Never carries redacted literals or raw
+/// payload material.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoutingDiagnostics {
+    pub provider: String,
+    pub model: String,
+    pub trust: &'static str,
+    pub mode: &'static str,
+    pub custody_filter: Option<&'static str>,
+    pub custody_filter_reason: &'static str,
+    pub quality_rank: i64,
+    pub cost_rank: i64,
 }
 
 #[allow(dead_code)]
@@ -219,6 +675,27 @@ pub enum ModelPolicyError {
     RestrictedByAvailability {
         provider: String,
         model: String,
+    },
+    /// An exact selection whose resolved custody class is not the one the
+    /// caller required. Rejected before dispatch; never falls back.
+    CustodyMismatch {
+        provider: String,
+        model: String,
+        required: ModelCustody,
+        actual: ModelTrust,
+    },
+    /// A payload built for one custody class was paired with the other.
+    CustodyPayloadMismatch {
+        requested: ModelCustody,
+        payload: ModelCustody,
+    },
+    /// A trusted primary's backup/failover candidate is untrusted. Failover is
+    /// upgrade-only, so this refuses instead of silently downgrading custody.
+    CustodyDowngradeRefused {
+        provider: String,
+        model: String,
+        primary: ModelTrust,
+        candidate: ModelTrust,
     },
     NoEligibleModel(String),
 }
@@ -328,6 +805,43 @@ impl std::fmt::Display for ModelPolicyError {
                     "model `{provider}:{model}` is restricted by availability"
                 )
             }
+            Self::CustodyMismatch {
+                provider,
+                model,
+                required,
+                actual,
+            } => write!(
+                f,
+                "model `{provider}:{model}` is {} and cannot serve a request that requires {} custody",
+                match actual {
+                    ModelTrust::Trusted => "trusted",
+                    ModelTrust::Untrusted => "untrusted",
+                },
+                required.as_str()
+            ),
+            Self::CustodyPayloadMismatch { requested, payload } => write!(
+                f,
+                "requested {} custody but the payload was built for {} custody",
+                requested.as_str(),
+                payload.as_str()
+            ),
+            Self::CustodyDowngradeRefused {
+                provider,
+                model,
+                primary,
+                candidate,
+            } => write!(
+                f,
+                "failover candidate `{provider}:{model}` is {} but the primary runs under {} custody; failover is upgrade-only and never downgrades custody",
+                match candidate {
+                    ModelTrust::Trusted => "trusted",
+                    ModelTrust::Untrusted => "untrusted",
+                },
+                match primary {
+                    ModelTrust::Trusted => "trusted",
+                    ModelTrust::Untrusted => "untrusted",
+                }
+            ),
             Self::NoEligibleModel(selector) => write!(f, "no eligible model for `{selector}`"),
         }
     }
@@ -490,6 +1004,14 @@ fn legacy_input_listed(inputs: Option<&Inputs>, modality: fn(&Inputs) -> Option<
     inputs.and_then(modality) == Some(true)
 }
 
+/// Rank candidates by the documented intelligence/cost criteria, then by
+/// stable provider/model identity.
+///
+/// Trust is intentionally absent. A custody classification is not a quality
+/// signal, so letting it break ties obscured *why* a model was selected and
+/// made ordinary routing depend on an unrelated dimension. Custody narrows the
+/// candidate set earlier, through [`SensitiveModelPolicyRequest::custody`], and
+/// nothing else.
 #[allow(dead_code)]
 fn sort_policy_candidates(candidates: &mut [ResolvedModelPolicy], optimize: ModelOptimization) {
     candidates.sort_by(|a, b| {
@@ -503,18 +1025,17 @@ fn sort_policy_candidates(candidates: &mut [ResolvedModelPolicy], optimize: Mode
                 .cmp(&b.cost_rank)
                 .then_with(|| b.quality_rank.cmp(&a.quality_rank)),
         };
-        rank.then_with(|| b.trust.is_trusted().cmp(&a.trust.is_trusted()))
-            .then_with(|| a.provider.cmp(&b.provider))
+        rank.then_with(|| a.provider.cmp(&b.provider))
             .then_with(|| a.model.cmp(&b.model))
     });
 }
 
 #[allow(dead_code)]
-fn policy_selector_label(request: &ModelPolicyRequest<'_>) -> String {
-    match request.selector {
+fn policy_selector_label(criteria: &ModelPolicyCriteria<'_>) -> String {
+    match criteria.selector {
         ModelPolicySelector::Exact(selector) => selector.to_string(),
-        ModelPolicySelector::Trust(trust) => format!("{trust:?}"),
         ModelPolicySelector::Category(category) => category.to_string(),
+        ModelPolicySelector::Any => "any".to_string(),
     }
 }
 
@@ -655,27 +1176,133 @@ impl ProvidersConfig {
         }
     }
 
+    /// Route a payload the caller proved carries no sensitive material. This
+    /// is the only entry point that omits a custody filter.
     #[allow(dead_code)]
-    pub fn resolve_model_policy(
+    pub fn resolve_non_sensitive_model_policy(
         &self,
-        request: &ModelPolicyRequest<'_>,
+        request: &NonSensitiveModelPolicyRequest<'_>,
     ) -> Result<ResolvedModelPolicy, ModelPolicyError> {
-        match request.selector {
+        self.resolve_policy(request.criteria(), None)
+    }
+
+    /// Route a potentially sensitive payload under its required custody class.
+    /// A `Trusted` selection mints the [`TrustedCustodyGrant`] that unlocks raw
+    /// provider bytes; an `Untrusted` selection never does.
+    #[allow(dead_code)]
+    pub fn resolve_sensitive_model_policy(
+        &self,
+        request: &SensitiveModelPolicyRequest<'_>,
+    ) -> Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
+        let custody = request.custody();
+        let policy = self.resolve_policy(request.criteria(), Some(custody))?;
+        Ok(seal_custody_selection(policy, custody))
+    }
+
+    /// Route an already-configured target — the active model, a configured
+    /// utility model, the configured embedding model — under the custody class
+    /// the host's provider configuration assigns it.
+    ///
+    /// Custody for a configured target is a **host** decision: the caller does
+    /// not get to ask for `Trusted`. What the caller also does not get is a way
+    /// *around* this call. The only artifact that releases raw provider bytes
+    /// is the [`TrustedCustodyGrant`] on the returned route, nothing else mints
+    /// one, and a grant unlocks raw bytes only for the exact `(provider,
+    /// model)` it names. A caller that skips custody routing therefore has
+    /// nothing to unlock raw bytes with and falls closed to the redacted
+    /// rendering.
+    ///
+    /// Unlike discovery routing this does not require the model to appear in
+    /// the provider's model list: a configured target names a real endpoint
+    /// whether or not the model registry happens to enumerate it. Custody is
+    /// resolved for it either way, and an unknown provider is a hard error
+    /// rather than a silent custody guess.
+    ///
+    /// Mode is never consulted. `global_mode` only decides which posture the
+    /// returned route *reports* in its diagnostics.
+    #[allow(dead_code)]
+    pub fn route_configured_model_custody(
+        &self,
+        provider: &str,
+        model: &str,
+        global_mode: LlmMode,
+        redacted: Arc<dyn RedactedRendering>,
+    ) -> Result<ResolvedSensitiveModelPolicy, ModelPolicyError> {
+        if !self.providers.contains_key(provider) {
+            return Err(ModelPolicyError::UnknownProvider(provider.to_string()));
+        }
+        let custody = match self.resolve_trust(provider, model) {
+            ModelTrust::Trusted => ModelCustody::Trusted,
+            ModelTrust::Untrusted => ModelCustody::Untrusted,
+        };
+        let payload = match custody {
+            ModelCustody::Trusted => SensitivePayload::raw_for_trusted_custody(),
+            ModelCustody::Untrusted => SensitivePayload::redacted_for_untrusted_custody(redacted),
+        };
+        let selector = format!("{provider}:{model}");
+        let criteria = ModelPolicyCriteria {
+            selector: ModelPolicySelector::Exact(&selector),
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+            require_subagent_invokable: false,
+            optimize: ModelOptimization::Balanced,
+            role: None,
+            agent: None,
+            // The host named this exact provider/model; `availability` scopes
+            // discovery, not host-named targets.
+            availability: AvailabilityScope::HostNamedTarget,
+            global_mode,
+        };
+        // Constructing the request is the type-enforced step: custody has no
+        // default and no `Option`, and the payload must agree with it.
+        let request = SensitiveModelPolicyRequest::new(criteria, custody, payload)?;
+        let policy =
+            self.resolved_policy(provider, model, request.criteria(), Some(request.custody()));
+        Ok(seal_custody_selection(policy, request.custody()))
+    }
+
+    /// Custody **eligibility** only: does a route to this target exist under
+    /// `custody`?
+    ///
+    /// No payload is constructed and no grant is minted, so an eligibility
+    /// decision can never be used to render or release anything. Use this when
+    /// deciding *whether* a route exists (candidate scans, reachability
+    /// checks); use [`Self::resolve_sensitive_model_policy`] when you are about
+    /// to send on it.
+    #[allow(dead_code)]
+    pub fn resolve_sensitive_model_policy_eligibility(
+        &self,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: ModelCustody,
+    ) -> Result<ResolvedModelPolicy, ModelPolicyError> {
+        self.resolve_policy(criteria, Some(custody))
+    }
+
+    fn resolve_policy(
+        &self,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: Option<ModelCustody>,
+    ) -> Result<ResolvedModelPolicy, ModelPolicyError> {
+        match criteria.selector {
             ModelPolicySelector::Exact(selector) => {
                 let (provider, model) = parse_policy_selector(selector)?;
-                self.resolve_exact_policy(&provider, &model, request)
+                // Exact stays exact: a custody mismatch rejects here and never
+                // falls through to a different model.
+                self.resolve_exact_policy(&provider, &model, criteria, custody)
             }
-            ModelPolicySelector::Trust(trust) => {
-                self.resolve_best_policy_candidate(request, Some(trust), None)
-            }
+            ModelPolicySelector::Any => self.resolve_best_policy_candidate(criteria, custody, None),
             ModelPolicySelector::Category(category) => {
                 if let Some(default) = self.category_defaults.get(category)
-                    && let Ok(resolved) =
-                        self.resolve_exact_policy(&default.provider, &default.model, request)
+                    && let Ok(resolved) = self.resolve_exact_policy(
+                        &default.provider,
+                        &default.model,
+                        criteria,
+                        custody,
+                    )
                 {
                     return Ok(resolved);
                 }
-                self.resolve_best_policy_candidate(request, request.trust, Some(category))
+                self.resolve_best_policy_candidate(criteria, custody, Some(category))
             }
         }
     }
@@ -685,7 +1312,8 @@ impl ProvidersConfig {
         &self,
         provider: &str,
         model: &str,
-        request: &ModelPolicyRequest<'_>,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: Option<ModelCustody>,
     ) -> Result<ResolvedModelPolicy, ModelPolicyError> {
         let Some(entry) = self.providers.get(provider) else {
             return Err(ModelPolicyError::UnknownProvider(provider.to_string()));
@@ -696,53 +1324,63 @@ impl ProvidersConfig {
                 model: model.to_string(),
             });
         };
-        self.check_policy_candidate(provider, model_entry, request)?;
-        Ok(self.resolved_policy(provider, model))
+        self.check_policy_candidate(provider, model_entry, criteria, custody)?;
+        Ok(self.resolved_policy(provider, model, criteria, custody))
     }
 
     #[allow(dead_code)]
     fn resolve_best_policy_candidate(
         &self,
-        request: &ModelPolicyRequest<'_>,
-        trust_filter: Option<ModelTrust>,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: Option<ModelCustody>,
         category: Option<&str>,
     ) -> Result<ResolvedModelPolicy, ModelPolicyError> {
-        let mut candidates = Vec::new();
+        // Two tiers: models that explicitly allowlist the requested category
+        // are preferred over models with no category restriction at all (an
+        // unrestricted `availability` matches every category by default, but
+        // that openness is a fallback, not a declared fit). Without this
+        // split, a category query non-deterministically loses the
+        // purpose-scoped model to whichever unrestricted model sorts first.
+        let mut explicit = Vec::new();
+        let mut open = Vec::new();
         for (provider, entry) in &self.providers {
             for model in &entry.models {
-                let effective_trust_filter = trust_filter.or(request.trust);
-                if effective_trust_filter
-                    .is_some_and(|trust| self.resolve_trust(provider, &model.id) != trust)
-                {
-                    continue;
-                }
                 if category.is_some()
                     && !entry
                         .availability
-                        .permits(category, request.role, request.agent)
+                        .permits(category, criteria.role, criteria.agent)
                 {
                     continue;
                 }
                 if category.is_some()
                     && !model
                         .availability
-                        .permits(category, request.role, request.agent)
+                        .permits(category, criteria.role, criteria.agent)
                 {
                     continue;
                 }
                 if self
-                    .check_policy_candidate(provider, model, request)
+                    .check_policy_candidate(provider, model, criteria, custody)
                     .is_ok()
                 {
-                    candidates.push(self.resolved_policy(provider, &model.id));
+                    let resolved = self.resolved_policy(provider, &model.id, criteria, custody);
+                    let is_explicit = category
+                        .is_some_and(|c| model.availability.categories.iter().any(|cat| cat == c));
+                    if is_explicit {
+                        explicit.push(resolved);
+                    } else {
+                        open.push(resolved);
+                    }
                 }
             }
         }
-        sort_policy_candidates(&mut candidates, request.optimize);
-        candidates
+        sort_policy_candidates(&mut explicit, criteria.optimize);
+        sort_policy_candidates(&mut open, criteria.optimize);
+        explicit
             .into_iter()
+            .chain(open)
             .next()
-            .ok_or_else(|| ModelPolicyError::NoEligibleModel(policy_selector_label(request)))
+            .ok_or_else(|| ModelPolicyError::NoEligibleModel(policy_selector_label(criteria)))
     }
 
     #[allow(dead_code)]
@@ -750,9 +1388,10 @@ impl ProvidersConfig {
         &self,
         provider: &str,
         model: &ModelEntry,
-        request: &ModelPolicyRequest<'_>,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: Option<ModelCustody>,
     ) -> Result<(), ModelPolicyError> {
-        if request.require_subagent_invokable
+        if criteria.require_subagent_invokable
             && !self.resolve_subagent_invokable(provider, &model.id)
         {
             return Err(ModelPolicyError::NotSubagentInvokable {
@@ -760,42 +1399,49 @@ impl ProvidersConfig {
                 model: model.id.clone(),
             });
         }
-        if !self.providers.get(provider).is_some_and(|entry| {
-            entry.availability.permits(
-                match request.selector {
-                    ModelPolicySelector::Category(category) => Some(category),
-                    _ => None,
-                },
-                request.role,
-                request.agent,
-            )
-        }) || !model.availability.permits(
-            match request.selector {
+        // `availability` scopes *discovery*. An explicit host reference to one
+        // provider/model is not discovery, so allowlists do not veto it — that
+        // would make a category-scoped model unusable from agent-file
+        // frontmatter, a configured role default, or a configured backup.
+        if criteria.availability == AvailabilityScope::Discovery {
+            let category = match criteria.selector {
                 ModelPolicySelector::Category(category) => Some(category),
                 _ => None,
-            },
-            request.role,
-            request.agent,
-        ) {
-            return Err(ModelPolicyError::RestrictedByAvailability {
-                provider: provider.to_string(),
-                model: model.id.clone(),
-            });
+            };
+            let permitted =
+                self.providers.get(provider).is_some_and(|entry| {
+                    entry
+                        .availability
+                        .permits(category, criteria.role, criteria.agent)
+                }) && model
+                    .availability
+                    .permits(category, criteria.role, criteria.agent);
+            if !permitted {
+                return Err(ModelPolicyError::RestrictedByAvailability {
+                    provider: provider.to_string(),
+                    model: model.id.clone(),
+                });
+            }
+        } else if !self.providers.contains_key(provider) {
+            return Err(ModelPolicyError::UnknownProvider(provider.to_string()));
         }
-        if request
-            .trust
-            .is_some_and(|trust| self.resolve_trust(provider, &model.id) != trust)
-        {
-            return Err(ModelPolicyError::NoEligibleModel(policy_selector_label(
-                request,
-            )));
+        if let Some(custody) = custody {
+            let actual = self.resolve_trust(provider, &model.id);
+            if actual != custody.required_trust() {
+                return Err(ModelPolicyError::CustodyMismatch {
+                    provider: provider.to_string(),
+                    model: model.id.clone(),
+                    required: custody,
+                    actual,
+                });
+            }
         }
         let caps = self.resolve_effective_model_capabilities(
             provider,
             &model.id,
             self.resolution_generation,
         );
-        for capability in &request.required_capabilities {
+        for capability in &criteria.required_capabilities {
             let outcome = required_model_capability_outcome(&caps, *capability);
             if let Some(err) = ModelPolicyError::from_required_capability(
                 provider,
@@ -806,7 +1452,7 @@ impl ProvidersConfig {
                 return Err(err);
             }
         }
-        if let Some(min) = request.min_context_tokens {
+        if let Some(min) = criteria.min_context_tokens {
             let actual = caps.context_tokens;
             if actual.is_none_or(|actual| actual < min) {
                 return Err(ModelPolicyError::ContextTooSmall {
@@ -821,35 +1467,53 @@ impl ProvidersConfig {
     }
 
     #[allow(dead_code)]
-    fn resolved_policy(&self, provider: &str, model: &str) -> ResolvedModelPolicy {
+    fn resolved_policy(
+        &self,
+        provider: &str,
+        model: &str,
+        criteria: &ModelPolicyCriteria<'_>,
+        custody: Option<ModelCustody>,
+    ) -> ResolvedModelPolicy {
         ResolvedModelPolicy {
             provider: provider.to_string(),
             model: model.to_string(),
             trust: self.resolve_trust(provider, model),
+            mode: self.resolve_mode(provider, model, criteria.global_mode),
             location: self.resolve_location(provider, model),
             quality_rank: self.resolve_quality_rank(provider, model),
             cost_rank: self.resolve_cost_rank(provider, model),
+            custody_filter: custody,
         }
     }
 
+    /// Resolve the configured embedding model.
+    ///
+    /// Embedding routing is host-owned: the *configured* `embedding_model`
+    /// entry fixes the custody class rather than a caller choosing it, and the
+    /// send boundary (`cockpit-core/src/embeddings.rs`) renders the request for
+    /// the resolved class. It therefore resolves without a custody filter. This
+    /// is not a caller-supplied custody hole — no caller-facing request type
+    /// reaches this path.
     #[allow(dead_code)]
     pub fn resolve_embedding_model(
         &self,
         extended: &crate::config::extended::ExtendedConfig,
     ) -> Result<ResolvedEmbeddingModel, EmbeddingModelResolutionError> {
         if let Some(selector) = extended.embedding_model_ref() {
-            let request = ModelPolicyRequest {
+            let criteria = ModelPolicyCriteria {
                 selector: ModelPolicySelector::Exact(selector),
-                trust: None,
                 required_capabilities: vec![RequiredModelCapability::Embeddings],
                 min_context_tokens: None,
                 require_subagent_invokable: false,
                 optimize: ModelOptimization::Balanced,
                 role: Some("embedding_model"),
                 agent: None,
+                // The host configured this exact embedding model by name.
+                availability: AvailabilityScope::HostNamedTarget,
+                global_mode: extended.llm_mode,
             };
             let resolved = self
-                .resolve_model_policy(&request)
+                .resolve_policy(&criteria, None)
                 .map_err(EmbeddingModelResolutionError::Policy)?;
             let caps = self.resolve_effective_model_capabilities(
                 &resolved.provider,
@@ -876,9 +1540,11 @@ impl ProvidersConfig {
                         provider: provider.clone(),
                         model: model.id.clone(),
                         trust: self.resolve_trust(provider, &model.id),
+                        mode: self.resolve_mode(provider, &model.id, extended.llm_mode),
                         location: self.resolve_location(provider, &model.id),
                         quality_rank: self.resolve_quality_rank(provider, &model.id),
                         cost_rank: self.resolve_cost_rank(provider, &model.id),
+                        custody_filter: None,
                     });
                 }
             }

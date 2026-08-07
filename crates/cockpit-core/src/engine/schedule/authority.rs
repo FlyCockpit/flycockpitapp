@@ -191,6 +191,24 @@ pub enum SpawnWorkerKind {
 /// `spawn` (routed through main, the single authority). The
 /// authority owns the queue + the running-count, enforcing the global
 /// concurrency cap centrally.
+/// Provenance of a [`SpawnSpec::model`] selector.
+///
+/// Custody follows provenance, not the value: the same string means different
+/// things depending on who wrote it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpawnModelOrigin {
+    /// Written by a model — a `spawn` tool argument, or an agent-file
+    /// frontmatter field. Agent files are treated as model-directed on
+    /// purpose: they are project-writable, so they are the conservative case.
+    /// Routed under the forced redacted-untrusted custody filter.
+    #[default]
+    ModelDirected,
+    /// Written by the host in a config file (`goalVerification.skepticModel`
+    /// and friends). The host named the target, so it keeps its own configured
+    /// custody class — a self-hosted skeptic stays trusted.
+    HostConfig,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     /// Optional preassigned job id for callers that need to correlate queued
@@ -205,6 +223,10 @@ pub struct SpawnSpec {
     pub output_dir: String,
     /// Optional caller-supplied model selector for this worker.
     pub model: Option<String>,
+    /// Where `model` came from. Drives the custody decision: a selector a model
+    /// authored is forced onto redacted-untrusted custody, while one the host
+    /// wrote in a config file keeps the target's own configured class.
+    pub model_origin: SpawnModelOrigin,
     /// This child's recursive depth (root = 0; advanced by one per
     /// Swarm→Swarm edge). Already clamped ≤ ceiling by the caller.
     pub depth: u32,
@@ -1104,6 +1126,7 @@ mod tests {
             prompt: "slice".into(),
             output_dir: "/tmp/out".into(),
             model: None,
+            model_origin: Default::default(),
             depth,
             max_depth: 3,
         }

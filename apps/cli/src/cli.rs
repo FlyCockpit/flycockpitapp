@@ -1588,6 +1588,77 @@ mod tests {
         assert_no_internal_jargon("providers doc", include_str!("../docs/providers.md"));
     }
 
+    /// AC6. Checked docs search: every cited surface must say that trusted
+    /// inference may be raw, untrusted inference is redacted, exports and
+    /// client display stay redacted regardless of trust, and neither harness
+    /// mode nor locality implies trust.
+    #[test]
+    fn trust_and_mode_docs_are_orthogonal() {
+        const PROVIDERS_DOC: &str = include_str!("../docs/providers.md");
+        const SCRUB_SITES: &str = include_str!("../docs/redaction-scrub-sites.md");
+
+        for (label, text) in [("README", README), ("providers doc", PROVIDERS_DOC)] {
+            let lowered = text.to_ascii_lowercase();
+            assert!(
+                lowered.contains("inference requests to a trusted model may be sent raw")
+                    || lowered.contains("inference requests to a `trusted` model may be sent raw"),
+                "{label} must say trusted inference may be raw"
+            );
+            assert!(
+                lowered.contains("secrets and environment values"),
+                "{label} must name what a trusted provider receives"
+            );
+            assert!(
+                lowered.contains("stay redacted regardless of trust"),
+                "{label} must keep the export/display boundary explicit"
+            );
+            assert!(
+                lowered.contains("locality is descriptive and never implies trust"),
+                "{label} must state that locality never implies trust"
+            );
+            assert!(
+                lowered.contains("never changes provider eligibility, data custody"),
+                "{label} must deny mode-implies-custody"
+            );
+
+            // Negative half: no surface may claim the inverse implication.
+            // These are the concrete "X implies trust" shapes the copy must
+            // never contain, checked without a tautological `|| contains(..)`.
+            for forbidden in [
+                "local models are trusted",
+                "local providers are trusted",
+                "a local model is trusted",
+                "local endpoints are trusted",
+                "self-hosted models are trusted",
+                "frontier models are trusted",
+                "frontier implies trust",
+                "local implies trust",
+                "locality implies trust",
+                "mode implies trust",
+                "defensive models are untrusted",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "{label} must not claim `{forbidden}`"
+                );
+            }
+            // And trust must not be described as a blanket redaction switch:
+            // it governs inference custody, not the export/display boundary.
+            assert!(
+                !lowered.contains("trusted models disable outbound redaction"),
+                "{label} must not describe trust as a blanket redaction switch"
+            );
+        }
+
+        // The all-export boundary stays documented and unqualified by trust.
+        assert!(
+            SCRUB_SITES.contains(
+                "export payloads scrub session/config/MCP/file content regardless of model trust"
+            ),
+            "the all-export scrub boundary must stay documented"
+        );
+    }
+
     #[test]
     fn help_copy_readme_covers_top_level_commands() {
         let cells = common_command_cells();

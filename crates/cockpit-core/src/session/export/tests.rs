@@ -3980,3 +3980,139 @@ async fn config_entries_missing_config_writes_marker() {
     assert_eq!(entries[0].0, "config/NO-CONFIG-FOUND.txt");
     assert!(entries[0].1.contains("No cockpit config"));
 }
+
+/// AC5, the dependent portable-export matrix. All six trust/mode combinations
+/// must export **redacted** artifacts.
+///
+/// Trust decides raw-vs-redacted for *inference* only. Export is a different
+/// sink with a different rule: it is redacted unconditionally, regardless of
+/// which custody class the session's model runs under and regardless of the
+/// harness posture. That is the boundary `redaction-scrub-sites.md` calls the
+/// all-export boundary.
+///
+/// The failure this prevents is an export-path change that keys redaction on
+/// trust or mode — most plausibly "the model is trusted, so the operator is
+/// self-hosting and the bundle can keep raw values". Every combination is
+/// asserted independently so such a change cannot regress quietly under one
+/// pair while the others stay green. The positive control (a placeholder must
+/// appear somewhere) keeps the matrix from passing vacuously if the
+/// secret-bearing material stopped reaching the bundle at all.
+#[tokio::test]
+async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
+    use crate::config::extended::LlmMode;
+    use crate::config::providers::{
+        ActiveModelRef, ConfigDoc, ModelEntry, ModelTrust, ProviderEntry, ProvidersConfig,
+    };
+
+    const SECRET: &str = "SECRET_EXPORT_MATRIX_TOKEN_ABCDEF";
+
+    let combos = [
+        (ModelTrust::Trusted, LlmMode::Defensive),
+        (ModelTrust::Trusted, LlmMode::Normal),
+        (ModelTrust::Trusted, LlmMode::Frontier),
+        (ModelTrust::Untrusted, LlmMode::Defensive),
+        (ModelTrust::Untrusted, LlmMode::Normal),
+        (ModelTrust::Untrusted, LlmMode::Frontier),
+    ];
+    assert_eq!(combos.len(), 6, "the product must stay complete");
+
+    for (trust, mode) in combos {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"{{"llm_mode":"{}","redact":{{"scan_environment":false,"scan_dotenv":false,"denylist":["{SECRET}"]}}}}"#,
+                mode.as_str()
+            ),
+        )
+        .unwrap();
+
+        // The session's model carries this trust/mode pair explicitly, so a
+        // trust- or mode-keyed export change would have something to read.
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                url: "http://127.0.0.1:1/v1".into(),
+                trust: Some(trust),
+                mode: Some(mode),
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let selection = ActiveModelRef {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        providers.active_model = Some(selection.clone());
+        let mut doc = ConfigDoc::load(&config_path).unwrap();
+        doc.write(&providers).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let s = create_test_session(&db, "p", &root, "Build").await;
+        let sid = s.session_id;
+        set_test_session_active_model(&db, sid, &selection).await;
+
+        // Secret-bearing material on two different carriers, so the matrix is
+        // not resting on a single scrub site.
+        db.insert_session_event(
+            sid,
+            SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({ "text": format!("deploy with {SECRET} please") }),
+        )
+        .await
+        .unwrap();
+        db.insert_session_event(
+            sid,
+            SessionEventKind::ToolCall,
+            Some("Build"),
+            Some("tc-matrix"),
+            &json!({
+                "tool": "bash",
+                "original_input": { "command": format!("echo {SECRET}") },
+                "wire_input": { "command": format!("echo {SECRET}") },
+                "recovery_kind": "clean",
+                "recovery_stage": null,
+                "hard_fail": false,
+                "output": format!("{SECRET}\n"),
+                "truncated": false,
+                "duration_ms": 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let target = get_test_session(&db, sid).await;
+        let bundle = collect_bundle(&db, sid).await.unwrap();
+        let zip = trusted_build_zip(&db, &target, &bundle).await.unwrap();
+
+        let mut saw_placeholder = false;
+        for name in entry_names(&zip) {
+            let Some(body) = read_zip_entry(&zip, &name) else {
+                continue;
+            };
+            assert!(
+                !body.contains(SECRET),
+                "{trust:?}/{mode:?}: exported artifact `{name}` leaked the secret; \
+                 exports stay redacted regardless of trust and mode"
+            );
+            saw_placeholder |= body.contains("REDACTED");
+        }
+        assert!(
+            saw_placeholder,
+            "{trust:?}/{mode:?}: no redaction placeholder anywhere in the bundle — the \
+             secret-bearing material never reached the export, so the matrix proved nothing"
+        );
+    }
+}

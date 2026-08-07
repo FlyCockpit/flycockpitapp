@@ -29,9 +29,22 @@ impl Model {
             .providers
             .get(&active.provider)
             .with_context(|| format!("provider `{}` is not configured", active.provider))?;
-        let trusted = cfg
-            .resolve_trust(&active.provider, &active.model)
-            .is_trusted();
+        // AC4: the active-model path is a potentially sensitive caller, so it
+        // declares custody through the typed request API rather than reading a
+        // trust flag. The route it gets back either carries a
+        // `TrustedCustodyGrant` for this exact target or it does not, and only
+        // a grant releases raw provider bytes.
+        let custody_route =
+            Self::configured_custody_route(cfg, &active.provider, &active.model, &redact).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "cannot route custody for active model `{}:{}`: {error}",
+                        active.provider,
+                        active.model
+                    )
+                },
+            )?;
+        let trusted = custody_route.trusted_custody_grant().is_some();
         let cache = cfg.resolve_cache(&active.provider, &active.model);
         let timeout = cfg.resolve_timeout(&active.provider, &active.model);
         let hard_timeout_on_stall = true;
@@ -51,8 +64,12 @@ impl Model {
                 cfg.resolution_generation,
             )
             .computer_use;
-        let effective_redact =
-            Self::effective_redact_table_for(cfg, &active.provider, &active.model, redact.clone());
+        let effective_redact = Self::effective_redact_table_for(
+            &custody_route,
+            &active.provider,
+            &active.model,
+            redact.clone(),
+        );
         build_model_with_can_delegate(
             &active.provider,
             entry,
@@ -124,7 +141,15 @@ impl Model {
             .providers
             .get(provider_id)
             .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        let trusted = cfg.resolve_trust(provider_id, model_id).is_trusted();
+        // AC4, same boundary as [`Self::from_config_with_env`]: a utility /
+        // background target is still a potentially sensitive caller, so its
+        // custody is routed through the typed API instead of read off a trust
+        // flag.
+        let custody_route = Self::configured_custody_route(cfg, provider_id, model_id, &redact)
+            .map_err(|error| {
+                anyhow::anyhow!("cannot route custody for `{provider_id}:{model_id}`: {error}")
+            })?;
+        let trusted = custody_route.trusted_custody_grant().is_some();
         let cache = cfg.resolve_cache(provider_id, model_id);
         let timeout = cfg.resolve_timeout(provider_id, model_id);
         let hard_timeout_on_stall = true;
@@ -140,7 +165,7 @@ impl Model {
             .resolve_effective_model_capabilities(provider_id, model_id, cfg.resolution_generation)
             .computer_use;
         let effective_redact =
-            Self::effective_redact_table_for(cfg, provider_id, model_id, redact.clone());
+            Self::effective_redact_table_for(&custody_route, provider_id, model_id, redact.clone());
         build_model_with_can_delegate(
             provider_id,
             entry,

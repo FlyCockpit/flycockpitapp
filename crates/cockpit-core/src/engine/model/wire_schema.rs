@@ -398,7 +398,15 @@ mod tests {
                 canonical["properties"]["payload"]["items"]["properties"][field]
             );
         }
-        for field in ["min_context_tokens", "trust"] {
+        // `trust` is deliberately absent from the selector: data custody is
+        // host policy, never a model-authored delegation field.
+        assert!(
+            canonical["properties"]["payload"]["properties"]["model"]["properties"]
+                .get("trust")
+                .is_none(),
+            "the delegation selector must not offer a custody field"
+        );
+        for field in ["min_context_tokens", "optimize"] {
             assert!(
                 has_null_type(
                     &transformed["properties"]["payload"]["properties"]["model"]["properties"]

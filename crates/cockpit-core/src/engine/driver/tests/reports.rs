@@ -221,6 +221,7 @@ async fn set_swarm_config_threads_caps_to_authority() {
                     prompt: "s".into(),
                     output_dir: "/tmp/o".into(),
                     model: None,
+                    model_origin: Default::default(),
                     depth: 1,
                     max_depth: 5,
                 })

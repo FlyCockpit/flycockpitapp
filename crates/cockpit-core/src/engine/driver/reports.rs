@@ -63,6 +63,172 @@ pub(crate) fn resolve_failover_models_for(
     build_failover_models(&providers, model)
 }
 
+/// Why a failover candidate was rejected. The custody decision and ordinary
+/// eligibility are deliberately separate: an availability/invokability/
+/// capability rejection is routine candidate filtering and must never be
+/// recorded or logged as a custody refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailoverRefusalKind {
+    /// Upgrade-only custody: a trusted primary may not fail over to an
+    /// untrusted candidate.
+    CustodyDowngrade,
+    /// Ordinary eligibility: availability, subagent-invokability, capability,
+    /// or context. Not a custody decision.
+    Eligibility,
+}
+
+impl FailoverRefusalKind {
+    pub fn is_custody(self) -> bool {
+        matches!(self, Self::CustodyDowngrade)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CustodyDowngrade => "custody_downgrade",
+            Self::Eligibility => "eligibility",
+        }
+    }
+}
+
+/// One refused failover candidate, labelled by error kind so a custody
+/// downgrade is never silent and never conflated with routine filtering.
+/// Carries identity and reason only — no payload material.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FailoverCustodyRefusal {
+    pub provider: String,
+    pub model: String,
+    pub kind: FailoverRefusalKind,
+    pub reason: String,
+}
+
+/// A trusted primary left with no admissible failover target because every
+/// candidate would have been a custody downgrade.
+///
+/// This is a typed, user-visible failure reason: without it the user only sees
+/// the primary's original inference error and has no way to tell that failover
+/// was *available but refused* on custody grounds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FailoverCustodyBlocked {
+    pub primary_provider: String,
+    pub primary_model: String,
+    pub refused: Vec<FailoverCustodyRefusal>,
+}
+
+impl FailoverCustodyBlocked {
+    pub fn user_message(&self) -> String {
+        let names: Vec<String> = self
+            .refused
+            .iter()
+            .map(|refusal| format!("{}:{}", refusal.provider, refusal.model))
+            .collect();
+        format!(
+            "no failover target: `{}:{}` runs under trusted custody and failover is upgrade-only, \
+             so the untrusted candidate(s) {} were refused rather than silently downgraded. \
+             Configure a trusted backup, or change the primary's trust setting.",
+            self.primary_provider,
+            self.primary_model,
+            names.join(", ")
+        )
+    }
+}
+
+/// The typed custody block for `model`, when a trusted primary has no
+/// admissible candidate and at least one candidate was refused as a downgrade.
+/// `None` whenever failover is simply unconfigured or fails for ordinary
+/// eligibility reasons — those are not custody outcomes.
+pub(crate) fn failover_custody_block(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+) -> Option<FailoverCustodyBlocked> {
+    if !providers
+        .resolve_trust(model.provider_id(), model.model_id_ref())
+        .is_trusted()
+    {
+        return None;
+    }
+    let (admitted, refusals) = build_failover_models_with_diagnostics(providers, model);
+    let (backup, backup_refusal) = build_backup_model_with_diagnostics(providers, model);
+    if !admitted.is_empty() || backup.is_some() {
+        return None;
+    }
+    let mut refused: Vec<FailoverCustodyRefusal> = refusals
+        .into_iter()
+        .chain(backup_refusal)
+        .filter(|refusal| refusal.kind.is_custody())
+        .collect();
+    // Full dedup, not the adjacent-only `dedup_by`: the configured backup and
+    // a discovered entry for the same target arrive from two different scans.
+    let mut seen = std::collections::HashSet::new();
+    refused.retain(|refusal| seen.insert((refusal.provider.clone(), refusal.model.clone())));
+    if refused.is_empty() {
+        return None;
+    }
+    Some(FailoverCustodyBlocked {
+        primary_provider: model.provider_id().to_string(),
+        primary_model: model.model_id_ref().to_string(),
+        refused,
+    })
+}
+
+/// Decide the custody class a failover/backup candidate must be routed under,
+/// and build the custody-typed request that proves it.
+///
+/// Failover is **upgrade-only** (`FailoverCustody`): an untrusted primary may
+/// move to an untrusted or a trusted candidate; a trusted primary may only move
+/// to another trusted candidate. A downgrade is a typed refusal, never a silent
+/// substitution.
+pub(crate) fn failover_candidate_admitted(
+    providers: &crate::config::providers::ProvidersConfig,
+    primary: &crate::engine::model::Model,
+    provider: &str,
+    model_id: &str,
+    session_redact: &Arc<RedactionTable>,
+) -> Result<(), (FailoverRefusalKind, String)> {
+    use crate::config::providers::{
+        AvailabilityScope, FailoverCustody, ModelOptimization, ModelPolicyCriteria,
+        ModelPolicySelector, SensitiveModelPolicyRequest,
+    };
+
+    // Step 1 — the custody decision, alone. Only this step can produce a
+    // custody refusal.
+    let primary_trust = providers.resolve_trust(primary.provider_id(), primary.model_id_ref());
+    let candidate_trust = providers.resolve_trust(provider, model_id);
+    let policy = FailoverCustody::for_primary(primary_trust);
+    let custody = policy
+        .custody_for(provider, model_id, candidate_trust)
+        .map_err(|error| (FailoverRefusalKind::CustodyDowngrade, error.to_string()))?;
+
+    // Step 2 — ordinary eligibility. Anything failing here is routine candidate
+    // filtering (availability, invokability, capability, context) and is
+    // labelled `Eligibility`, never conflated with a custody outcome.
+    let selector = format!("{provider}:{model_id}");
+    let criteria = ModelPolicyCriteria {
+        selector: ModelPolicySelector::Exact(&selector),
+        required_capabilities: Vec::new(),
+        min_context_tokens: None,
+        require_subagent_invokable: false,
+        optimize: ModelOptimization::Balanced,
+        // Kept for genuinely role-scoped checks.
+        role: Some("failover"),
+        agent: None,
+        // The operator configured or enumerated this exact candidate; allowlists
+        // scope discovery, not an explicit backup/failover reference.
+        availability: AvailabilityScope::HostNamedTarget,
+        global_mode: crate::config::extended::LlmMode::default(),
+    };
+    let request = SensitiveModelPolicyRequest::new(
+        criteria,
+        custody,
+        crate::engine::model_roles::custody_payload_for(custody, session_redact),
+    )
+    .map_err(|error| (FailoverRefusalKind::Eligibility, error.to_string()))?;
+    providers
+        .resolve_sensitive_model_policy(&request)
+        .map(|_| ())
+        .map_err(|error| (FailoverRefusalKind::Eligibility, error.to_string()))
+}
+
 /// Resolve the per-`(provider, model)` backup against an already-loaded
 /// providers config and build it, inheriting `model`'s shutdown gate. Split
 /// from [`resolve_backup_model_for`] so the test-injected config path can reuse
@@ -71,16 +237,65 @@ pub(crate) fn build_backup_model(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
 ) -> Option<Arc<crate::engine::model::Model>> {
-    let backup = providers.resolve_backup(model.provider_id(), model.model_id_ref())?;
-    let built = crate::engine::model::Model::for_provider(
+    build_backup_model_with_diagnostics(providers, model).0
+}
+
+/// [`build_backup_model`] plus the custody refusal, when the configured backup
+/// would downgrade a trusted primary onto an untrusted endpoint.
+pub(crate) fn build_backup_model_with_diagnostics(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+) -> (
+    Option<Arc<crate::engine::model::Model>>,
+    Option<FailoverCustodyRefusal>,
+) {
+    let Some(backup) = providers.resolve_backup(model.provider_id(), model.model_id_ref()) else {
+        return (None, None);
+    };
+    let session_redact = model.session_redact_table();
+    if let Err((kind, reason)) = failover_candidate_admitted(
+        providers,
+        model,
+        &backup.provider,
+        &backup.model,
+        &session_redact,
+    ) {
+        let refusal = FailoverCustodyRefusal {
+            provider: backup.provider.clone(),
+            model: backup.model.clone(),
+            kind,
+            reason,
+        };
+        if kind.is_custody() {
+            tracing::warn!(
+                provider = %refusal.provider,
+                model = %refusal.model,
+                kind = refusal.kind.as_str(),
+                reason = %refusal.reason,
+                "backup model refused: custody downgrade"
+            );
+        } else {
+            tracing::debug!(
+                provider = %refusal.provider,
+                model = %refusal.model,
+                kind = refusal.kind.as_str(),
+                reason = %refusal.reason,
+                "backup model not eligible"
+            );
+        }
+        return (None, Some(refusal));
+    }
+    let Some(built) = crate::engine::model::Model::for_provider(
         providers,
         &backup.provider,
         &backup.model,
         // Start from the primary's session redaction table, then let the
         // backup target resolve its own trust policy.
-        model.session_redact_table(),
+        session_redact,
     )
-    .ok()?;
+    .ok() else {
+        return (None, None);
+    };
     let built = built.with_shutdown_gate(model.shutdown_gate());
     // Inherit the primary's wire-API self-heal target so the backup model also
     // pins a corrected endpoint (implementation note).
@@ -88,13 +303,32 @@ pub(crate) fn build_backup_model(
         Some(path) => built.with_config_path(path.to_path_buf()),
         None => built,
     };
-    Some(Arc::new(built))
+    (Some(Arc::new(built)), None)
 }
 
 pub(crate) fn build_failover_models(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
 ) -> Vec<Arc<crate::engine::model::Model>> {
+    build_failover_models_with_diagnostics(providers, model).0
+}
+
+/// [`build_failover_models`] plus every candidate refused on custody grounds.
+///
+/// Failover custody is upgrade-only: an untrusted primary may fail over to an
+/// untrusted or trusted candidate, a trusted primary only to another trusted
+/// candidate. A trusted primary with no trusted candidate ends with an empty
+/// candidate list and a recorded refusal for each rejected entry — a typed
+/// failure, never a silent downgrade onto a cloud endpoint.
+pub(crate) fn build_failover_models_with_diagnostics(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+) -> (
+    Vec<Arc<crate::engine::model::Model>>,
+    Vec<FailoverCustodyRefusal>,
+) {
+    let session_redact = model.session_redact_table();
+    let mut refusals = Vec::new();
     let configured_backup = providers.resolve_backup(model.provider_id(), model.model_id_ref());
     let mut refs = Vec::new();
     if let Some(backup) = configured_backup.as_ref() {
@@ -134,14 +368,53 @@ pub(crate) fn build_failover_models(
         refs.push((provider, model_id, false));
     }
 
-    refs.into_iter()
+    let admitted: Vec<(String, String)> = refs
+        .into_iter()
+        .filter(|(provider, model_id, _configured)| {
+            match failover_candidate_admitted(providers, model, provider, model_id, &session_redact)
+            {
+                Ok(()) => true,
+                Err((kind, reason)) => {
+                    let refusal = FailoverCustodyRefusal {
+                        provider: provider.clone(),
+                        model: model_id.clone(),
+                        kind,
+                        reason,
+                    };
+                    if kind.is_custody() {
+                        tracing::warn!(
+                            provider = %refusal.provider,
+                            model = %refusal.model,
+                            kind = refusal.kind.as_str(),
+                            reason = %refusal.reason,
+                            "failover candidate refused: custody downgrade"
+                        );
+                    } else {
+                        tracing::debug!(
+                            provider = %refusal.provider,
+                            model = %refusal.model,
+                            kind = refusal.kind.as_str(),
+                            reason = %refusal.reason,
+                            "failover candidate not eligible"
+                        );
+                    }
+                    refusals.push(refusal);
+                    false
+                }
+            }
+        })
+        .map(|(provider, model_id, _configured)| (provider, model_id))
         .take(crate::engine::agent::MAX_FAILOVER_CANDIDATES.saturating_sub(1))
-        .filter_map(|(provider, model_id, _configured)| {
+        .collect();
+
+    let built = admitted
+        .into_iter()
+        .filter_map(|(provider, model_id)| {
             let built = crate::engine::model::Model::for_provider(
                 providers,
                 &provider,
                 &model_id,
-                model.session_redact_table(),
+                session_redact.clone(),
             )
             .ok()?;
             let built = built.with_shutdown_gate(model.shutdown_gate());
@@ -151,7 +424,8 @@ pub(crate) fn build_failover_models(
             };
             Some(Arc::new(built))
         })
-        .collect()
+        .collect();
+    (built, refusals)
 }
 
 /// Assemble a finished delegated subagent's report. Every delegated subagent

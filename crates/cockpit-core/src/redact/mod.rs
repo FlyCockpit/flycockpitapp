@@ -532,18 +532,13 @@ impl RedactionTable {
         stored_secrets: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self> {
         let protected = ProtectedPaths::from_session(cwd, env);
-        if !cfg.enabled {
-            return Ok(Self {
-                matcher: None,
-                entries: Vec::new(),
-                origins: Vec::new(),
-                placeholder: cfg.placeholder.clone(),
-                disabled: true,
-                unsupported_files: Vec::new(),
-                protected,
-                protected_path_conflicts: Vec::new(),
-            });
-        }
+        // `cfg.enabled == false` is a *scrub-time* opt-out, never a reason to
+        // skip collection. The table is always built for real so that an
+        // untrusted route can enforce it (see [`Self::enforced`]); the
+        // `disabled` flag then suppresses substitution on every route that is
+        // allowed to honor the opt-out (trusted models, local sinks).
+        // Building an empty table here instead would leave the untrusted
+        // egress path with nothing to scrub against.
 
         // (1) Identify sources + (2) collect candidate values per source.
         // Denylist and private-key entries are forced inclusion. Env and
@@ -647,7 +642,7 @@ impl RedactionTable {
         Self::from_entries(
             entries,
             cfg.placeholder.clone(),
-            false,
+            !cfg.enabled,
             unsupported_files,
             protected,
         )
@@ -893,6 +888,13 @@ impl RedactionTable {
     /// no-table-or-disabled path returns a borrowed input, and a configured
     /// table with no match also avoids allocating.
     pub fn scrub_cow<'a>(&self, body: &'a str) -> Cow<'a, str> {
+        // The config-level opt-out (`redact.enabled = false`) suppresses
+        // substitution even though the entries are present. Only routes
+        // entitled to honor the opt-out ever hold a table in this state;
+        // untrusted egress holds the [`Self::enforced`] view instead.
+        if self.disabled {
+            return Cow::Borrowed(body);
+        }
         let Some(matcher) = self.matcher.as_ref() else {
             return Cow::Borrowed(body);
         };
@@ -912,25 +914,66 @@ impl RedactionTable {
     // Retained for `cockpit debug redact` introspection.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.matcher.is_none()
+        self.disabled || self.matcher.is_none()
+    }
+
+    /// This table with the config-level opt-out (`redact.enabled = false`)
+    /// ignored, so the collected entries actually substitute.
+    ///
+    /// This is the untrusted-egress view. `redact.enabled = false` is an
+    /// opt-out for routes that stay under the user's control — trusted models
+    /// and local sinks — and is never an opt-out for content leaving the
+    /// machine to a provider that may retain it. Model trust is the single
+    /// control over raw egress: a user who wants raw content to reach a cloud
+    /// model marks that model trusted, which releases
+    /// [`RedactionTable::empty`] through the custody grant instead.
+    ///
+    /// A table that is already enforcing is returned unchanged.
+    pub fn enforced(&self) -> Self {
+        Self {
+            matcher: self.matcher.clone(),
+            entries: self.entries.clone(),
+            origins: self.origins.clone(),
+            placeholder: self.placeholder.clone(),
+            disabled: false,
+            unsupported_files: self.unsupported_files.clone(),
+            protected: self.protected.clone(),
+            protected_path_conflicts: self.protected_path_conflicts.clone(),
+        }
+    }
+
+    /// [`Self::enforced`] over a shared table, reusing the existing allocation
+    /// when the table is already enforcing.
+    pub fn enforced_arc(table: std::sync::Arc<Self>) -> std::sync::Arc<Self> {
+        if table.disabled {
+            std::sync::Arc::new(table.enforced())
+        } else {
+            table
+        }
     }
 
     pub fn placeholder(&self) -> &str {
         &self.placeholder
     }
 
-    /// A no-op table that scrubs nothing — equivalent to a disabled
-    /// `RedactConfig`. Used as a fallback when a redaction chokepoint object
-    /// is needed but the table couldn't be built (the chokepoint still
-    /// *runs* — it just has an empty table), and by tests that need a
-    /// chokepoint without actual substitutions.
+    /// A no-op table that scrubs nothing, because it has no entries. Used as
+    /// the raw-custody token a trusted route receives, as a fallback when a
+    /// redaction chokepoint object is needed but the table couldn't be built
+    /// (the chokepoint still *runs* — it just has an empty table), and as the
+    /// accumulation base for sealed values and approved secret-file reads.
+    ///
+    /// `disabled` is **false** here: that flag means "the user set
+    /// `redact.enabled = false`" and nothing else. An empty table is a no-op
+    /// on its own merits, and marking it disabled would silence every entry
+    /// later accumulated onto it via [`Self::with_forced_literal`] /
+    /// [`Self::with_approved_secret_file`], which inherit the flag.
     pub fn empty() -> Self {
         Self {
             matcher: None,
             entries: Vec::new(),
             origins: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
-            disabled: true,
+            disabled: false,
             unsupported_files: Vec::new(),
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
@@ -1281,8 +1324,10 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/embeddings.rs",
         "crates/cockpit-core/src/engine/driver/reports.rs",
         "crates/cockpit-core/src/engine/model/dispatch.rs",
+        "crates/cockpit-core/src/engine/model/mod.rs",
         "crates/cockpit-core/src/engine/model/outbound_guard.rs",
         "crates/cockpit-core/src/engine/model/redact.rs",
+        "crates/cockpit-core/src/engine/model_roles.rs",
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",
         "crates/cockpit-core/src/mcp/builtin.rs",

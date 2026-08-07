@@ -1410,9 +1410,24 @@ impl Driver {
                         delivery_history.append(&mut prior_history);
                         prior_history = delivery_history;
                     }
+                    // Render the assembled brief for the child's resolved
+                    // custody class before dispatch, exactly as the batch path
+                    // does. Untrusted (cloud) children get the session
+                    // redaction-table rendering; trusted (self-hosted / no-log)
+                    // children get it unchanged.
+                    let dispatch_brief = {
+                        let (extended, providers) =
+                            crate::engine::model_roles::load_model_role_config(&self.config);
+                        crate::engine::model_roles::render_brief_for_model(
+                            &providers,
+                            &child.model,
+                            &extended,
+                            &composed_brief,
+                        )
+                    };
                     match run_noninteractive_resumable(
                         child,
-                        composed_brief.clone(),
+                        dispatch_brief,
                         prior_history,
                         child_session.clone(),
                         self.locks.clone(),
@@ -3178,6 +3193,20 @@ impl Driver {
                         child.llm_mode,
                         &entry.child_agent,
                     );
+                    // Render the assembled brief for the child's resolved
+                    // custody class before it leaves the parent: an untrusted
+                    // (cloud) child gets the session redaction-table rendering,
+                    // a trusted (self-hosted / no-log) child gets it unchanged.
+                    let brief = {
+                        let (extended, providers) =
+                            crate::engine::model_roles::load_model_role_config(&driver.config);
+                        crate::engine::model_roles::render_brief_for_model(
+                            &providers,
+                            &child.model,
+                            &extended,
+                            &brief,
+                        )
+                    };
                     match run_noninteractive_resumable(
                         child,
                         brief,

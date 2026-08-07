@@ -973,6 +973,129 @@ mod tests {
         assert_eq!(model.trust, None);
     }
 
+    /// AC3, setup surface. All six trust/mode pairs must go *through the setup
+    /// wizard* — every pair offered, accepted by both validators, written by
+    /// `apply_model_answers`, and resolving back as exactly the pair that was
+    /// submitted.
+    ///
+    /// The failure this prevents is a setup change that silently rejects,
+    /// rewrites, or hides a combination. `trusted + defensive` is the pair most
+    /// at risk: a "defensive posture implies a cloud model, so it cannot be
+    /// trusted" shortcut would reject it, and a "trusted implies self-hosted,
+    /// so promote it to frontier" shortcut would rewrite it. Custody and
+    /// posture are independent dimensions, so neither is permitted.
+    #[test]
+    fn trust_mode_cartesian_configuration_through_setup() {
+        use crate::config::extended::LlmMode;
+        use crate::config::providers::ModelTrust;
+
+        let combos = [
+            ("trusted", "defensive"),
+            ("trusted", "normal"),
+            ("trusted", "frontier"),
+            ("untrusted", "defensive"),
+            ("untrusted", "normal"),
+            ("untrusted", "frontier"),
+        ];
+        assert_eq!(combos.len(), 6, "the product must stay complete");
+
+        for (trust_id, class_id) in combos {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = CockpitConfigEnvGuard::set(&tmp.path().join("global-config.json"));
+            write_model_wizard_provider(tmp.path());
+            let descriptor =
+                descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
+            let mut run = WizardRun::new(descriptor).unwrap();
+
+            run.submit(WizardAnswer::Select("p".to_string())).unwrap();
+            run.submit(WizardAnswer::Select("p:m".to_string())).unwrap();
+
+            // Neither dimension may hide an option of the other.
+            assert_eq!(run.current_step_id(), Some("class"));
+            let class_options: Vec<String> = run
+                .select_options()
+                .into_iter()
+                .map(|o| o.id.to_string())
+                .collect();
+            for id in ["defensive", "normal", "frontier"] {
+                assert!(
+                    class_options.iter().any(|o| o == id),
+                    "{trust_id}/{class_id}: every posture must stay offered: {class_options:?}"
+                );
+            }
+            run.submit(WizardAnswer::Select(class_id.to_string()))
+                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: class rejected: {e}"));
+
+            assert_eq!(run.current_step_id(), Some("trust"));
+            let trust_options: Vec<String> = run
+                .select_options()
+                .into_iter()
+                .map(|o| o.id.to_string())
+                .collect();
+            for id in ["untrusted", "trusted"] {
+                assert!(
+                    trust_options.iter().any(|o| o == id),
+                    "{trust_id}/{class_id}: every custody class must stay offered: {trust_options:?}"
+                );
+            }
+            run.submit(WizardAnswer::Select(trust_id.to_string()))
+                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: trust rejected: {e}"));
+
+            // The answers the wizard is holding are already the submitted pair.
+            let expected_mode = match class_id {
+                "defensive" => LlmMode::Defensive,
+                "normal" => LlmMode::Normal,
+                _ => LlmMode::Frontier,
+            };
+            let expected_trust = match trust_id {
+                "trusted" => ModelTrust::Trusted,
+                _ => ModelTrust::Untrusted,
+            };
+            assert_eq!(
+                crate::wizard::model_class_answer(&run),
+                Some(expected_mode),
+                "{trust_id}/{class_id}: the custody answer must not rewrite the posture answer"
+            );
+            assert_eq!(
+                crate::wizard::model_trust_answer(&run),
+                Some(expected_trust),
+                "{trust_id}/{class_id}: the posture answer must not rewrite the custody answer"
+            );
+
+            run.submit(WizardAnswer::MultiToggle(Vec::new())).unwrap();
+            run.submit(WizardAnswer::Text(String::new())).unwrap();
+            run.submit(WizardAnswer::Text(String::new())).unwrap();
+            if run.current_step_id() == Some("thinking") {
+                run.submit(WizardAnswer::Select("inherit".to_string()))
+                    .unwrap();
+            }
+            run.submit(WizardAnswer::MultiToggle(Vec::new())).unwrap();
+            run.submit(WizardAnswer::Confirm(true)).unwrap();
+            run.submit(WizardAnswer::Select("skip".to_string()))
+                .unwrap();
+            assert_eq!(run.current_step_id(), Some("model-save"));
+
+            apply_model_answers(tmp.path(), &run)
+                .unwrap_or_else(|e| panic!("{trust_id}/{class_id}: save rejected: {e:#}"));
+
+            // Whether a dimension persisted as an explicit value or collapsed
+            // to inherit is an encoding detail; what must hold is that the
+            // effective config resolves back to the submitted pair.
+            let cfg = ConfigDoc::load_effective(tmp.path());
+            let global = crate::config::extended::load_for_cwd(tmp.path()).llm_mode;
+            assert_eq!(
+                cfg.resolve_trust("p", "m"),
+                expected_trust,
+                "{trust_id}/{class_id}: setup must not change trust because of the posture"
+            );
+            assert_eq!(
+                cfg.resolve_mode("p", "m", global),
+                expected_mode,
+                "{trust_id}/{class_id}: setup must not change the posture because of trust"
+            );
+        }
+    }
+
     #[test]
     fn model_wizard_saves_model_from_outer_layer() {
         let tmp = tempfile::tempdir().unwrap();

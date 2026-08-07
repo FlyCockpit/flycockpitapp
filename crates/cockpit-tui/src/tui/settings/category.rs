@@ -232,13 +232,19 @@ fn text_embedded_recovery_label(m: TextEmbeddedRecovery) -> &'static str {
     }
 }
 
+/// Harness-steering labels only. Mode is orthogonal to model trust: no label
+/// here implies data custody, and none of them changes redaction.
 fn llm_mode_label(m: LlmMode) -> &'static str {
     match m {
         LlmMode::Defensive => {
-            "defensive (default — explicit tool steering, more decomposition; weaker models)"
+            "defensive (default — explicit tool steering, more decomposition; weaker models; steering only)"
         }
-        LlmMode::Normal => "normal (terse tool descriptions, episode sequencing; strong models)",
-        LlmMode::Frontier => "frontier (lean steering, high-autonomy; top-tier models)",
+        LlmMode::Normal => {
+            "normal (terse tool descriptions, episode sequencing; strong models; steering only)"
+        }
+        LlmMode::Frontier => {
+            "frontier (lean steering, high-autonomy; top-tier models; steering only)"
+        }
     }
 }
 
@@ -740,7 +746,10 @@ impl SettingId {
                  high-autonomy prompts for top-tier models. This global default is \
                  not auto-detected — a provider or model Mode override wins over \
                  it (known frontier models on standard providers are pinned to \
-                 `frontier` at discovery)."
+                 `frontier` at discovery). Steering only: mode never changes \
+                 provider eligibility, data custody, or redaction. Model trust \
+                 alone decides whether inference requests are sent raw, and no \
+                 mode or locality implies trust."
             }
             SettingId::ApprovalMode => {
                 "When a command needs approval to leave the sandbox. `manual` \
@@ -841,8 +850,11 @@ impl SettingId {
             }
             SettingId::AgentChoosesSubagentModel => {
                 "When on, a delegating agent's `task.model` / `spawn.model` \
-                 policy selector (exact provider:model, trust, or category) is \
-                 honored; when off (default), role defaults apply."
+                 policy selector (exact provider:model, or category) is \
+                 honored; when off (default), role defaults apply. A selector \
+                 cannot choose data custody: that is host policy, so \
+                 model-directed delegation always routes to a redacted \
+                 untrusted child."
             }
             SettingId::DeepthinkEnabled => {
                 "When on, Build may delegate to `deepthink`, a tool-free \
@@ -3356,5 +3368,34 @@ mod descriptor_tests {
             SettingId::ApprovalMode.descriptor().help,
             "When a command needs approval to leave the sandbox. `manual` (default) asks you — you are the gate; `auto` lets the utility-model safety gate approve when possible and asks when unsafe or unavailable; `yolo` runs without approval prompts. Distinct from the `auto` *agent*."
         );
+    }
+
+    /// AC6 (picker/settings half). Mode copy must stay harness-steering only:
+    /// it may not claim, or let a reader infer, any custody or redaction
+    /// effect, and it must say model trust owns that decision.
+    #[test]
+    fn llm_mode_copy_never_implies_trust() {
+        let help = SettingId::LlmMode.descriptor().help;
+        assert!(
+            help.contains("mode never changes provider eligibility, data custody, or redaction"),
+            "llm mode help: {help}"
+        );
+        assert!(
+            help.contains("no mode or locality implies trust"),
+            "llm mode help: {help}"
+        );
+
+        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+            let label = llm_mode_label(mode);
+            assert!(
+                label.contains("steering only"),
+                "{mode:?} label must stay steering-only: {label}"
+            );
+            let lowered = label.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("trust") && !lowered.contains("redact"),
+                "{mode:?} label must not mention custody: {label}"
+            );
+        }
     }
 }

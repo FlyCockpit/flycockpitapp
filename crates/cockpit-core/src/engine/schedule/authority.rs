@@ -176,6 +176,19 @@ pub struct ScheduleContext {
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
+    /// Durable write-scope authority, as the registry's late-install cell
+    /// rather than a resolved value: the coordinator is installed after the
+    /// driver is built, so a snapshot taken here would always be `None`.
+    pub write_scope: Option<crate::write_scope::WriteScopeSource>,
+}
+
+impl ScheduleContext {
+    /// Resolve the coordinator, if one has been installed.
+    pub fn write_scope(&self) -> Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>> {
+        self.write_scope
+            .as_ref()
+            .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
+    }
 }
 
 /// The worker kind scheduled through the recursive `Swarm` authority.
@@ -183,6 +196,26 @@ pub struct ScheduleContext {
 pub enum SpawnWorkerKind {
     Bee,
     Scout,
+}
+
+impl SpawnWorkerKind {
+    /// Whether this worker holds Cockpit write **tools** (`write`/`edit`), and
+    /// therefore whether delegating to it is a strict writable delegation whose
+    /// scope must be transferred away from the parent.
+    ///
+    /// This reflects Cockpit write-tool capability, **not** shell write
+    /// capability. `Scout` returns `false` because it holds no `write`/`edit`
+    /// tools, but it does hold `bash`, and a spawned child's `ToolCtx` has
+    /// `write_scope: None`, so the shell sandbox permits writes anywhere under
+    /// the session cwd (`tools::shell_sandbox::sandbox_policy`). A `Scout` is
+    /// therefore read-only by prompt instruction, not by enforcement, and can
+    /// write via the shell.
+    ///
+    /// Closing that gap needs a mechanically read-only shell surface and is
+    /// tracked as follow-up work; it predates this write-scope subsystem.
+    pub fn is_write_capable(self) -> bool {
+        matches!(self, Self::Bee)
+    }
 }
 
 /// A scheduled-or-queued recursive `Swarm` subagent (GOALS §24). Built by
@@ -215,12 +248,14 @@ pub struct SpawnSpec {
     /// work before a concurrency slot is available.
     pub job_id: Option<String>,
     /// Which worker factory to use. Both route through this same authority:
-    /// write-capable `bee` for Swarm, read-only `scout` for Multireview.
+    /// write-capable `bee` for Swarm, `scout` for Multireview. `scout` holds no
+    /// Cockpit write tools but can still write via `bash`; see
+    /// [`SpawnWorkerKind::is_write_capable`].
     pub worker: SpawnWorkerKind,
     /// The child's self-contained brief.
     pub prompt: String,
-    /// The dedicated output folder/DB the child writes results into.
-    pub output_dir: String,
+    /// The dedicated write scope/DB the child writes results into.
+    pub write_scope: String,
     /// Optional caller-supplied model selector for this worker.
     pub model: Option<String>,
     /// Where `model` came from. Drives the custody decision: a selector a model
@@ -268,6 +303,12 @@ pub struct ScheduleAuthority {
 }
 
 impl ScheduleAuthority {
+    /// Install the durable write-scope cell into the context this authority
+    /// hands to every spawned job.
+    pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
+        self.ctx.write_scope = Some(write_scope);
+    }
+
     /// Build an authority. `event_tx` is drained by the driver at the turn
     /// boundary; `cmd_tx` lets in-task timers re-arm; `turn_tx` is the
     /// engine event channel for UI-only signals.
@@ -806,7 +847,7 @@ fn loop_label(args: &LoopStartArgs) -> String {
     }
 }
 
-/// One-line label for a recursive `Swarm` subagent (its output dir +
+/// One-line label for a recursive `Swarm` subagent (its write scope +
 /// the first line of the brief), shown in the strip + completion marker.
 fn swarm_label(spec: &SpawnSpec) -> String {
     let first = spec.prompt.lines().next().unwrap_or("").trim();
@@ -912,6 +953,7 @@ mod tests {
             locks,
             redact,
             cwd: root,
+            write_scope: None,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             agent,
         };
@@ -1124,7 +1166,7 @@ mod tests {
             job_id: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "slice".into(),
-            output_dir: "/tmp/out".into(),
+            write_scope: "/tmp/out".into(),
             model: None,
             model_origin: Default::default(),
             depth,

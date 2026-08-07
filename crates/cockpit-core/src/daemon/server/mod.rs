@@ -1717,6 +1717,11 @@ pub struct DaemonContext {
     /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
     pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     _process_containment_actor: Option<crate::process_containment::ProcessContainmentActor>,
+    /// Durable hierarchical write-scope authority (`spawn-scoped-writes`).
+    /// `None` under unit tests, which opt in explicitly. Every consumer must
+    /// treat `None` as "no durable write-scope lifecycle is available", which is
+    /// safe because the spawn gate independently refuses writable delegation.
+    pub write_scope: Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>>,
 }
 
 impl DaemonContext {
@@ -1822,6 +1827,7 @@ impl DaemonContext {
             external_journal: None,
             process_containment: None,
             _process_containment_actor: None,
+            write_scope: None,
         }
     }
 
@@ -2099,6 +2105,38 @@ pub(crate) async fn boot_with_db(
             }
         }
         timer.phase("process_containment_actor");
+
+        // Durable write-scope authority. One coordinator per daemon: `recover`
+        // and the shutdown drain are daemon-global, so this cannot be per-child.
+        //
+        // The production filesystem backend is the direct workspace, which is
+        // always Unsupported — so every strict writable delegation fails closed
+        // here rather than in an ad-hoc gate. The lifecycle is nonetheless live:
+        // recovery, session deletion, and shutdown all reconcile real rows.
+        let coordinator = std::sync::Arc::new(crate::write_scope::WriteScopeCoordinator::new(
+            db.clone(),
+            std::sync::Arc::new(crate::write_scope::DirectWorkspaceBackend),
+            std::sync::Arc::new(crate::write_scope::ProcessContainmentBarrier::new(
+                handle.clone(),
+            )),
+            std::sync::Arc::new(crate::write_scope::NullEventSink),
+            crate::write_scope::system_clock(),
+        ));
+        // Must run after containment recovery: reconciling a transfer consults
+        // the containment oracle for ProvenEmpty.
+        match coordinator.recover(None).await {
+            Ok(outcomes) => {
+                tracing::info!(recovered = outcomes.len(), "write scope recovery finished");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "write scope recovery failed");
+            }
+        }
+        // Publish to the registry so every session worker installs the same
+        // coordinator into its driver.
+        ctx.registry.set_write_scope(coordinator.clone());
+        ctx.write_scope = Some(coordinator);
+        timer.phase("write_scope_coordinator");
     }
     #[cfg(test)]
     {

@@ -83,6 +83,7 @@ pub mod tool_calls;
 pub mod usage_events;
 pub mod wire;
 pub mod workspace_trust;
+pub mod write_scope_leases;
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};

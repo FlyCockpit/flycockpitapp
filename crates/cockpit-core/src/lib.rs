@@ -69,5 +69,6 @@ pub mod tools;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;
+pub mod write_scope;
 
 pub use cockpit_proto as proto_crate;

@@ -1,20 +1,27 @@
 use super::*;
 
-/// Gate a `spawn` request (GOALS §24): enforce the dedicated-output
-/// requirement and the hard depth ceiling (clamp, don't crash). Returns
+/// Gate a `spawn` request (GOALS §24): enforce the required `write_scope`
+/// and the hard depth ceiling (clamp, don't crash). Returns
 /// `Ok(child_depth)` (= `parent_depth + 1`) when the spawn is admissible, or
 /// `Err(refusal_text)` — the tool result telling the model to do the slice's
-/// work itself as a leaf — when `output_dir` is missing or the child would
+/// work itself as a leaf — when `write_scope` is missing or the child would
 /// exceed the ceiling. Pure so the gate is unit-testable without a driver.
+///
+/// This is only the syntactic gate. Durable authority containment (strict
+/// sub-scope of the parent's *effective* authority, backend capability,
+/// execution-wide permit, containment) is decided by
+/// [`crate::write_scope`]'s coordinator before any child record, token, or
+/// event exists.
 pub(super) fn spawn_gate(
     parent_depth: u32,
     max_depth: u32,
-    output_dir: &str,
+    write_scope: &str,
 ) -> std::result::Result<u32, String> {
-    if output_dir.trim().is_empty() {
+    if write_scope.trim().is_empty() {
         return Err(
-            "refused: `output_dir` is required so concurrent branches don't collide on a file \
-             — give this child a dedicated folder/DB path and retry."
+            "refused: `write_scope` is required — delegating transfers a strict subtree of your \
+             own write authority to the child. Give this child a dedicated workspace-relative \
+             directory subtree and retry."
                 .to_string(),
         );
     }
@@ -26,6 +33,72 @@ pub(super) fn spawn_gate(
         ));
     }
     Ok(child_depth)
+}
+
+/// Fail closed on strict *writable* delegation.
+///
+/// Handing a child its own write scope is an authority transfer: the parent is
+/// excluded from that subtree while the child runs. That exclusivity can only
+/// be honored by a filesystem backend able to isolate arbitrary child syscalls,
+/// and the direct workspace cannot — a child can hard-link its way to another
+/// owner's inode without passing through any Cockpit check
+/// (see [`crate::write_scope::backend`]).
+///
+/// So a write-capable worker is refused here, before any child record, token,
+/// or event exists. Workers holding no Cockpit write tools
+/// ([`crate::engine::schedule::authority::SpawnWorkerKind::Scout`]) are
+/// unaffected: they receive no transferred authority. That is not the same as
+/// being unable to write — see
+/// [`crate::engine::schedule::authority::SpawnWorkerKind::is_write_capable`].
+///
+/// Returns `Some(refusal_text)` when the spawn must be refused.
+pub(crate) fn scoped_write_refusal(
+    worker: crate::engine::schedule::authority::SpawnWorkerKind,
+    workspace_root: &std::path::Path,
+    write_scope: &str,
+    backend: &dyn crate::write_scope::backend::ScopedWriteBackend,
+) -> Option<String> {
+    use crate::write_scope::backend::ExecutionMode;
+    use crate::write_scope::scope::CanonicalScope;
+
+    // Scope containment is validated for EVERY worker, including those with no
+    // Cockpit write tools. Such a child receives no transferred authority, but
+    // `write_scope` still names a real subtree of this workspace, and a
+    // `../outside` or symlink escape must never reach scheduling unvalidated.
+    let scope = match CanonicalScope::resolve_under(workspace_root, write_scope) {
+        Ok(scope) => scope,
+        Err(err) => {
+            return Some(format!(
+                "refused: `write_scope` is not a usable subtree of this workspace — {err}. Give \
+                 the child a workspace-relative directory inside your own write authority."
+            ));
+        }
+    };
+
+    // Only a write-capable child needs the isolation capability: it is the one
+    // receiving exclusive authority.
+    if !worker.is_write_capable() {
+        return None;
+    }
+
+    // Probe the caller's backend rather than hard-coding the answer. The driver
+    // passes the coordinator's own backend, so this fast gate and the durable
+    // transfer in `run_swarm` always agree; a future Proven backend lights both
+    // up together.
+    let capability = backend.capability_for(&scope, ExecutionMode::Native);
+    if capability.is_proven() {
+        return None;
+    }
+
+    Some(
+        "refused: scoped writes are unsupported on this workspace, so a write-capable child \
+         cannot be given exclusive authority over a subtree. Cockpit cannot prove that another \
+         process will not reach inside the delegated scope through a hard link or an ancestor \
+         rename, so it fails closed rather than pretending the scope is exclusive. Do this \
+         slice's work yourself, or delegate a reviewer that needs no write tools (note that \
+         such a child can still write via `bash` within the session cwd)."
+            .to_string(),
+    )
 }
 
 /// True when `msg` is one half of a tracked skill pair — an assistant
@@ -437,6 +510,193 @@ mod tests {
         assert_eq!(
             delegation_payload_call_id("Build", "abcdef1234567890"),
             "fc-delegation-payload-Build-abcdef123456"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scoped_write_gate_tests {
+    use super::*;
+    use crate::engine::schedule::authority::SpawnWorkerKind;
+    use crate::write_scope::backend::DirectWorkspaceBackend;
+
+    fn workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("out")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn a_write_capable_child_is_refused_on_the_direct_workspace() {
+        let ws = workspace();
+        let refusal = scoped_write_refusal(
+            SpawnWorkerKind::Bee,
+            ws.path(),
+            "out",
+            &DirectWorkspaceBackend,
+        )
+        .expect("a write-capable child must be refused");
+        assert!(refusal.starts_with("refused:"), "{refusal}");
+        assert!(
+            refusal.contains("hard link"),
+            "the refusal should explain why: {refusal}"
+        );
+        // It offers the two available alternatives rather than dead-ending,
+        // and does not claim the alternative is mechanically read-only.
+        assert!(refusal.contains("no write tools"), "{refusal}");
+        assert!(
+            !refusal.contains("read-only"),
+            "the refusal must not call a shell-capable worker read-only: {refusal}"
+        );
+    }
+
+    /// A worker holding no Cockpit write tools receives no transferred
+    /// authority, so it is not gated. It is not thereby prevented from writing
+    /// via `bash` — see `SpawnWorkerKind::is_write_capable`.
+    #[test]
+    fn a_worker_without_write_tools_is_unaffected() {
+        let ws = workspace();
+        assert!(
+            scoped_write_refusal(
+                SpawnWorkerKind::Scout,
+                ws.path(),
+                "out",
+                &DirectWorkspaceBackend
+            )
+            .is_none(),
+            "a worker with no transferred authority must still dispatch"
+        );
+    }
+
+    /// A child with no Cockpit write tools receives no transferred authority,
+    /// but its `write_scope` still names a real subtree of this workspace. An
+    /// escaping scope must never reach scheduling unvalidated just because the
+    /// worker holds no write tools.
+    #[test]
+    fn a_worker_without_write_tools_still_has_its_scope_validated() {
+        let ws = workspace();
+        for escape in ["../outside", "/etc", ""] {
+            let refusal = scoped_write_refusal(
+                SpawnWorkerKind::Scout,
+                ws.path(),
+                escape,
+                &DirectWorkspaceBackend,
+            )
+            .unwrap_or_else(|| {
+                panic!("a worker without write tools must still reject scope `{escape}`")
+            });
+            assert!(
+                refusal.contains("not a usable subtree"),
+                "`{escape}`: {refusal}"
+            );
+        }
+
+        // A symlink pointing out of the workspace is resolved, not trusted.
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), ws.path().join("escape")).unwrap();
+            let refusal = scoped_write_refusal(
+                SpawnWorkerKind::Scout,
+                ws.path(),
+                "escape",
+                &DirectWorkspaceBackend,
+            )
+            .expect("a symlink escape must be refused for workers without write tools too");
+            assert!(refusal.contains("not a usable subtree"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn an_escaping_scope_is_reported_as_an_escape_not_a_capability_problem() {
+        let ws = workspace();
+        for escape in ["../outside", "/etc", ""] {
+            let refusal = scoped_write_refusal(
+                SpawnWorkerKind::Bee,
+                ws.path(),
+                escape,
+                &DirectWorkspaceBackend,
+            )
+            .unwrap_or_else(|| panic!("`{escape}` must be refused"));
+            assert!(refusal.starts_with("refused:"), "{escape}: {refusal}");
+        }
+        // The escape message names the scope problem, not the backend.
+        let refusal = scoped_write_refusal(
+            SpawnWorkerKind::Bee,
+            ws.path(),
+            "../outside",
+            &DirectWorkspaceBackend,
+        )
+        .unwrap();
+        assert!(
+            refusal.contains("not a usable subtree"),
+            "an escape should be reported as an escape: {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_syntactic_gate_still_requires_a_write_scope() {
+        assert!(spawn_gate(0, 4, "").is_err());
+        assert!(spawn_gate(0, 4, "   ").is_err());
+        let err = spawn_gate(0, 4, "").unwrap_err();
+        assert!(err.contains("write_scope"), "{err}");
+        // The legacy field name is built at runtime rather than written as a
+        // literal: this file is a named spawn anchor, and the rename inventory
+        // rejects that literal appearing anywhere inside one.
+        let legacy = format!("output{}dir", '_');
+        assert!(!err.contains(&legacy), "{err}");
+        // Depth ceiling still clamps rather than crashing.
+        assert!(spawn_gate(4, 4, "out").is_err());
+        assert_eq!(spawn_gate(0, 4, "out").unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scoped_write_gate_backend_tests {
+    use super::*;
+    use crate::engine::schedule::authority::SpawnWorkerKind;
+    use crate::write_scope::backend::DirectWorkspaceBackend;
+    use crate::write_scope::fake::FakeMediatedCowBackend;
+
+    fn workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("out")).unwrap();
+        tmp
+    }
+
+    /// The gate must probe the backend it is handed, not a hard-coded one.
+    ///
+    /// This is what keeps the dispatch-time refusal and the durable transfer in
+    /// `run_swarm` in agreement: the driver passes the coordinator's own
+    /// backend, so a future Proven backend lights up both at once. If the gate
+    /// hard-coded `DirectWorkspaceBackend` again, this test would fail.
+    #[test]
+    fn the_gate_probes_the_backend_it_is_given() {
+        let ws = workspace();
+
+        // Production backend: refused.
+        assert!(
+            scoped_write_refusal(
+                SpawnWorkerKind::Bee,
+                ws.path(),
+                "out",
+                &DirectWorkspaceBackend
+            )
+            .is_some(),
+            "the direct workspace must refuse a write-capable child"
+        );
+
+        // A Proven backend: admitted.
+        let proven = FakeMediatedCowBackend::new();
+        assert!(
+            scoped_write_refusal(SpawnWorkerKind::Bee, ws.path(), "out", &proven).is_none(),
+            "a Proven backend must admit the same request"
+        );
+
+        // Scope validation still applies regardless of backend.
+        assert!(
+            scoped_write_refusal(SpawnWorkerKind::Bee, ws.path(), "../outside", &proven).is_some(),
+            "an escaping scope is refused even on a Proven backend"
         );
     }
 }

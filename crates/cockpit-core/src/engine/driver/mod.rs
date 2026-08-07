@@ -24,6 +24,7 @@ mod swap;
 #[cfg(test)]
 use context_reduction::*;
 use context_reduction::{PruneEffectiveness, wire_token_total};
+pub(crate) use delegation_helpers::scoped_write_refusal;
 use delegation_helpers::*;
 use inbound::injection_check_prompt_target;
 #[cfg(test)]
@@ -771,6 +772,9 @@ pub struct Driver {
     /// cell rather than a snapshot so late `set_scheduler` calls are visible.
     daemon_scheduler:
         Option<Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>>,
+    /// Durable write-scope authority cell, installed by the worker. Held as the
+    /// registry's cell so a late `set_write_scope` is visible.
+    write_scope: Option<crate::write_scope::WriteScopeSource>,
     /// Compact-after-delegation trackers for **interactive** subagent
     /// delegations (`SpawnSubagent`), keyed by the paused parent frame's
     /// stack depth (its index in `self.stack`). The lazy shrink for the
@@ -1289,6 +1293,7 @@ impl Driver {
             cwd: self.cwd.clone(),
             config: self.config.clone(),
             agent: self.stack[0].agent.clone(),
+            write_scope: self.write_scope.clone(),
         };
         let schedule = ScheduleAuthority::new(
             job_event_tx,
@@ -1370,6 +1375,7 @@ impl Driver {
             lsp: self.lsp.clone(),
             resource_scheduler: self.resource_scheduler.clone(),
             daemon_scheduler: self.daemon_scheduler.clone(),
+            write_scope: self.write_scope.clone(),
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: self.model_override.clone(),
             swarm_max_depth: self.swarm_max_depth,
@@ -1588,6 +1594,9 @@ impl Driver {
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
             agent: root.clone(),
+            // Installed later by `set_write_scope_source`; the authority's copy
+            // is updated through the same setter.
+            write_scope: None,
         };
         // The authority needs the engine UI-event channel (`tx`) to emit
         // started/progress/note signals, but `tx` isn't known until
@@ -1674,6 +1683,7 @@ impl Driver {
             lsp: None,
             resource_scheduler: None,
             daemon_scheduler: None,
+            write_scope: None,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
             swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
@@ -2042,6 +2052,20 @@ impl Driver {
         scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     ) {
         self.daemon_scheduler = Some(scheduler);
+    }
+
+    pub fn set_write_scope_source(&mut self, write_scope: crate::write_scope::WriteScopeSource) {
+        self.write_scope = Some(write_scope.clone());
+        self.schedule.set_write_scope_source(write_scope);
+    }
+
+    /// Resolve the installed coordinator, if any.
+    pub fn write_scope_coordinator(
+        &self,
+    ) -> Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>> {
+        self.write_scope
+            .as_ref()
+            .and_then(|cell| crate::sync::lock_or_recover(cell).clone())
     }
 
     pub fn daemon_scheduler_handle(
@@ -3640,7 +3664,7 @@ impl Driver {
             let prompt = self
                 .goal_verification_prompt(goal, idx, total, framing)
                 .await?;
-            let output_dir = std::env::temp_dir()
+            let write_scope = std::env::temp_dir()
                 .join("cockpit-goal-verification")
                 .join(goal.id.to_string())
                 .join(format!("round-{}", goal.verification_rounds))
@@ -3652,7 +3676,7 @@ impl Driver {
                     job_id: Some(job_id.clone()),
                     worker: crate::engine::schedule::authority::SpawnWorkerKind::Scout,
                     prompt,
-                    output_dir,
+                    write_scope,
                     model: cfg.skeptic_model.clone(),
                     // Host config (`goalVerification.skepticModel`): a
                     // self-hosted skeptic keeps its trusted custody.
@@ -7654,7 +7678,7 @@ impl Driver {
                 }
                 TurnOutcome::Spawn {
                     prompt,
-                    output_dir,
+                    write_scope,
                     model,
                     task_call_id,
                     task_function_call_id,
@@ -7667,7 +7691,7 @@ impl Driver {
                     // cap and schedules the parallel background child. The
                     // pointer (scheduled / queued / refused) comes back as this
                     // `spawn` call's tool result. The dedicated
-                    // `output_dir` is the contention-avoidance mechanism: each
+                    // `write_scope` is the contention-avoidance mechanism: each
                     // child writes only there, so disjoint scopes coexist and
                     // the lock manager still serializes any same-path write.
                     let agent_name = self.stack.last().unwrap().agent.name.clone();
@@ -7676,33 +7700,55 @@ impl Driver {
                             agent: agent_name.clone(),
                             call_id: task_call_id.clone(),
                             tool: "spawn".to_string(),
-                            args: serde_json::json!({ "output_dir": output_dir }),
+                            args: serde_json::json!({ "write_scope": write_scope }),
                         })
                         .await;
                     let parent_depth = self.foreground_swarm_depth();
-                    let output = match spawn_gate(parent_depth, self.swarm_max_depth, &output_dir) {
+                    let worker = match agent_name.as_str() {
+                        "Multireview" | "scout" => {
+                            crate::engine::schedule::authority::SpawnWorkerKind::Scout
+                        }
+                        _ => crate::engine::schedule::authority::SpawnWorkerKind::Bee,
+                    };
+                    let output = match spawn_gate(parent_depth, self.swarm_max_depth, &write_scope)
+                    {
                         Err(refusal) => refusal,
                         Ok(child_depth) => {
-                            let worker = match agent_name.as_str() {
-                                "Multireview" | "scout" => {
-                                    crate::engine::schedule::authority::SpawnWorkerKind::Scout
-                                }
-                                _ => crate::engine::schedule::authority::SpawnWorkerKind::Bee,
-                            };
-                            self.schedule.spawn_swarm(
-                                crate::engine::schedule::authority::SpawnSpec {
-                                    job_id: None,
-                                    worker,
-                                    prompt,
-                                    output_dir,
-                                    model,
-                                    // The `spawn` tool argument is model-authored.
-                                    model_origin:
-                                        crate::engine::schedule::authority::SpawnModelOrigin::ModelDirected,
-                                    depth: child_depth,
-                                    max_depth: self.swarm_max_depth,
-                                },
-                            )
+                            // Strict writable delegation needs a backend that
+                            // can isolate arbitrary child syscalls. Refuse
+                            // before any child record, token, or event exists.
+                            // Probe the SAME backend the coordinator enforces
+                            // against, so the fast gate and the durable transfer
+                            // can never disagree.
+                            //
+                            // `worker` is resolved once above and reused here.
+                            let coordinator = self.write_scope_coordinator();
+                            let backend: &dyn crate::write_scope::ScopedWriteBackend =
+                                match coordinator.as_ref() {
+                                    Some(c) => c.backend().as_ref(),
+                                    None => &crate::write_scope::DirectWorkspaceBackend,
+                                };
+                            match scoped_write_refusal(worker, &self.cwd, &write_scope, backend) {
+                                Some(refusal) => refusal,
+                                None => self.schedule.spawn_swarm(
+                                    crate::engine::schedule::authority::SpawnSpec {
+                                        job_id: None,
+                                        worker,
+                                        prompt,
+                                        write_scope,
+                                        model,
+                                        // The `spawn` tool argument is
+                                        // model-authored, so the selector is
+                                        // forced onto redacted-untrusted
+                                        // custody and cannot claim
+                                        // host-named-target privileges.
+                                        model_origin:
+                                            crate::engine::schedule::authority::SpawnModelOrigin::ModelDirected,
+                                        depth: child_depth,
+                                        max_depth: self.swarm_max_depth,
+                                    },
+                                ),
+                            }
                         }
                     };
                     let _ = tx

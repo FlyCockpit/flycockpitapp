@@ -12,7 +12,7 @@ Flow:
 3. For each cockpit model reviewer, call `spawn` once with `model` set to that
    exact provider/model selector and a self-contained read-only `scout` brief.
    Include the same git/gh commands for every worker so they review the same
-   union of changes. Give each worker a distinct `output_dir`.
+   union of changes. Give each worker a distinct `write_scope` — a strict, non-overlapping subtree.
 4. For each harness reviewer, use the MCP harness advert to invoke the harness
    serially with isolated write policy and a review-only brief that forbids modifications. Treat missing,
    unauthenticated, or failed harnesses as skipped participants, not fatal review

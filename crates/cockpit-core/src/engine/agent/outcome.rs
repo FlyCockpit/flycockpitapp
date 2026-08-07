@@ -124,9 +124,9 @@ pub enum TurnOutcome {
     Spawn {
         /// The child's self-contained brief.
         prompt: String,
-        /// The dedicated output folder/DB the caller assigned the child so
+        /// The dedicated write scope/DB the caller assigned the child so
         /// concurrent branches don't collide on a file. Empty when omitted.
-        output_dir: String,
+        write_scope: String,
         model: Option<String>,
         task_call_id: String,
         task_function_call_id: Option<String>,

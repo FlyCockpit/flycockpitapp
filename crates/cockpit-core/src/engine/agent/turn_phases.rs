@@ -633,8 +633,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let output_dir = args
-            .get("output_dir")
+        let write_scope = args
+            .get("write_scope")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
@@ -646,7 +646,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
             .map(str::to_string);
         return_structural!(TurnOutcome::Spawn {
             prompt,
-            output_dir,
+            write_scope,
             model,
             task_call_id: tc.id.clone(),
             task_function_call_id: tc.call_id.clone(),

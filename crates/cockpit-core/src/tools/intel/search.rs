@@ -168,9 +168,6 @@ impl Tool for SearchTool {
         // the body is emitted verbatim in rg/grep file order.
         let ranked_body = if crate::config::extended::resolve_centrality_ranking(&ctx.cwd) {
             let index = index_of(ctx);
-            index
-                .ensure_fresh_scoped(freshen_options(ctx, None))
-                .await?;
             let scores = index.centrality_scores().await?;
             rank_search_body(&body, &scores, path)
         } else {

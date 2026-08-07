@@ -1914,6 +1914,8 @@ async fn search_ranks_central_file_first_and_is_additive() {
     // ON: central zcore.rs's match emitted before acold.rs's.
     set_centrality(tmp.path(), true);
     let ctx = test_ctx(tmp.path());
+    let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
+    index.ensure_fresh().await.unwrap();
     let on = SearchTool
         .call(serde_json::json!({ "pattern": "gadget" }), &ctx)
         .await

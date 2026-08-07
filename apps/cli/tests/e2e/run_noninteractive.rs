@@ -56,11 +56,21 @@ fn inference_failure_turn() -> Turn {
     }
 }
 
-fn captured_contains(provider: &ScriptedProvider, needle: &str) -> bool {
-    provider
-        .captured()
-        .iter()
-        .any(|request| request.body.to_string().contains(needle))
+async fn captured_contains(provider: &ScriptedProvider, needle: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if provider
+            .captured()
+            .iter()
+            .any(|request| request.body.to_string().contains(needle))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
@@ -422,7 +432,8 @@ async fn run_approval_auto_denied() {
         captured_contains(
             &provider,
             "noninteractive run: approval auto-denied; re-run with --approve <class> or use the TUI"
-        ),
+        )
+        .await,
         "model did not receive the structured noninteractive denial"
     );
 
@@ -454,9 +465,9 @@ async fn run_approval_auto_denied() {
         output_text(&question_output)
     );
     assert!(
-        captured_contains(&provider, "No interactive client is attached")
-            && captured_contains(&provider, "Proceed on your best judgment")
-            && captured_contains(&provider, "state the assumption"),
+        captured_contains(&provider, "No interactive client is attached").await
+            && captured_contains(&provider, "Proceed on your best judgment").await
+            && captured_contains(&provider, "state the assumption").await,
         "headless question guidance did not reach the model"
     );
 }

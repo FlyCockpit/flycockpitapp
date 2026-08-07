@@ -6027,7 +6027,7 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(root), false);
         app.daemon_prompt = None;
         app.dialog = crate::tui::settings::Dialog::None;
-        app.overlay = Overlay::None;
+        app.overlay = super::Overlay::None;
         app.launch.banner_enabled = true;
         app.vim_setting = VimModeSetting::Disabled;
         app.composer.set_vim_enabled(false);

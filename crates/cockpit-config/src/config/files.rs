@@ -793,6 +793,7 @@ impl Drop for PreparedAtomicWrite {
 /// parent directory descriptor; Windows opens every path component relative to
 /// its retained parent and retains the final file handle. A path-component swap
 /// therefore cannot redirect commit into an attacker-controlled directory.
+#[derive(Debug)]
 pub(crate) struct PreparedFileRemoval {
     path: PathBuf,
     #[cfg(unix)]

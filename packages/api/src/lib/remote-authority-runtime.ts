@@ -204,7 +204,7 @@ export class RemoteAuthorityRuntime {
     } catch {
       return this.#fail("observation_unavailable");
     }
-    if (!this.#decision.ready) return this.#decision;
+    if (!this.#decision.ready) return this.#fail(this.#decision.reason);
     let status = await this.options.store
       .loadHighestFinalizedStatus({
         deploymentId: this.config.deploymentId,
@@ -343,8 +343,7 @@ export class RemoteAuthorityRuntime {
     return jws;
   }
   #fail(reason: string) {
-    if (this.#decision.ready && this.#status)
-      this.#recoveryMinimumGeneration = this.#status.status.statusGeneration;
+    if (this.#status) this.#recoveryMinimumGeneration = this.#status.status.statusGeneration;
     this.#decision = {
       ready: false,
       mayMint: false,

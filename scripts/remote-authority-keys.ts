@@ -8,6 +8,8 @@ import {
   authorityRingDigest,
   parseAuthorityConfig,
   parseAuthorityRingFile,
+  publicAuthorityRing,
+  validateThreeDigestPlan,
 } from "../packages/api/src/lib/remote-authority";
 
 const [command, ...argv] = process.argv.slice(2);
@@ -113,6 +115,26 @@ async function main() {
           Buffer.compare(Buffer.from(a.kid), Buffer.from(b.kid)),
         ),
       };
+      const promoted = parseAuthorityRingFile({
+        ...ring,
+        revision: increment(ring.revision),
+        authorityEpoch: increment(ring.authorityEpoch),
+        currentKid: key.kid,
+        keys: ring.keys.map((item) => ({
+          ...item,
+          state:
+            item.kid === key.kid
+              ? "current"
+              : item.kid === prior.currentKid
+                ? "verification_only"
+                : item.state,
+        })),
+      });
+      validateThreeDigestPlan(
+        publicAuthorityRing(prior, cfg),
+        publicAuthorityRing(parseAuthorityRingFile(ring), cfg),
+        publicAuthorityRing(promoted, cfg),
+      );
     } else if (command === "promote") {
       const kid = required("kid");
       ring = {
@@ -126,10 +148,19 @@ async function main() {
             k.kid === kid ? "current" : k.kid === prior.currentKid ? "verification_only" : k.state,
         })),
       };
+      const base = await load(required("base"));
+      validateThreeDigestPlan(
+        publicAuthorityRing(base, cfg),
+        publicAuthorityRing(prior, cfg),
+        publicAuthorityRing(parseAuthorityRingFile(ring), cfg),
+      );
     } else if (command === "retire") {
       const kid = required("kid"),
+        target = prior.keys.find((key) => key.kid === kid),
         cutoff = BigInt(required("signing-cutoff")),
         now = BigInt(required("effective-at"));
+      if (target?.state !== "verification_only" || target.retireAt !== null)
+        throw new Error("only an unretired verification-only key may retire");
       if (now < cutoff + 2_592_060n) throw new Error("retirement floor not reached");
       ring = {
         ...prior,

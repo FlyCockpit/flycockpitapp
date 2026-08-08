@@ -9,6 +9,7 @@ import {
   type AuthorityPrivateKey,
   AuthorityPublicSnapshot,
   type AuthorityRingFile,
+  authorityRetirementFloor,
   authorityRingDigest,
   canonicalAuthorityRing,
   createRemoteAuthorityStatusJws,
@@ -22,8 +23,11 @@ import {
   publicAuthorityRingDigest,
   REMOTE_AUTHORITY,
   RingAuthorityVerifier,
+  reconcileAuthorityFence,
   reduceAuthorityRollout,
+  reserveAuthorityMint,
   validateThreeDigestPlan,
+  verifyRemoteAuthorityStatusJws,
 } from "./remote-authority";
 import { readAuthorityRingFile } from "./remote-authority-file";
 
@@ -204,6 +208,19 @@ describe("remote_authority_jwks_and_status_public_only", () => {
         signer,
       );
     expect(status.split(".")).toHaveLength(3);
+    const verified = await verifyRemoteAuthorityStatusJws(
+      status,
+      new RingAuthorityVerifier(value, "100"),
+      {
+        issuer: cfg.issuer,
+        deploymentId: cfg.deploymentId,
+        ringDigest: digest,
+        authorityEpoch: "1",
+        minimumGeneration: "1",
+        now: "100",
+      },
+    );
+    expect(verified.header.kid).toBe("k0");
     const jwks = publicAuthorityJwks(value, "100");
     expect(JSON.stringify(jwks)).not.toContain('"d"');
     const snapshot = new AuthorityPublicSnapshot();
@@ -211,5 +228,88 @@ describe("remote_authority_jwks_and_status_public_only", () => {
     expect(snapshot.read("jwks", "160")).toBeDefined();
     expect(snapshot.read("jwks", "161")).toBeUndefined();
     expect(REMOTE_AUTHORITY.statusLifetime).toBe(60n);
+  });
+});
+
+describe("remote_authority_replica_lease_races", () => {
+  it("fails closed for empty, expired, replaced, or regressed membership observations", () => {
+    const value = publicAuthorityRing(ring([makeKey("k0", "current")]), cfg),
+      digest = publicAuthorityRingDigest(value),
+      base = {
+        now: "10",
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        plan: [digest] as [string],
+        rings: new Map([[digest, value]]),
+        localDigest: digest,
+      };
+    expect(
+      reduceAuthorityRollout({
+        ...base,
+        snapshot: { membershipGeneration: "1", members: [] },
+        leases: [],
+      }).ready,
+    ).toBe(false);
+    const snapshot = {
+        membershipGeneration: "2",
+        members: [{ replicaId: "a", replicaGeneration: "2", state: "required" as const }],
+      },
+      lease: ObservationLease = {
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        membershipGeneration: "2",
+        replicaId: "a",
+        replicaGeneration: "1",
+        leaseGeneration: "1",
+        revision: "1",
+        digest,
+        currentKid: "k0",
+        publicKids: ["k0"],
+        authorityEpoch: "1",
+        observedRedisTime: "1",
+        expiresAt: "10",
+      };
+    expect(reduceAuthorityRollout({ ...base, snapshot, leases: [lease] }).ready).toBe(false);
+    expect(
+      reduceAuthorityRollout({
+        ...base,
+        previousRedisTime: "11",
+        snapshot,
+        leases: [{ ...lease, replicaGeneration: "2", expiresAt: "40" }],
+      }).reason,
+    ).toBe("redis_time_regression");
+  });
+});
+
+describe("remote_authority_retirement_floor", () => {
+  it("closes reservations, reconciles provider outcomes, and computes the exact floor", () => {
+    const fence = { kid: "k0", signingGeneration: "7", state: "open" as const },
+      reserved = reserveAuthorityMint(fence, {
+        mintId: "m1",
+        deploymentId: cfg.deploymentId,
+        signingGeneration: "7",
+        kid: "k0",
+        claimsHash: "a".repeat(64),
+      });
+    const { state: _state, ...entry } = reserved;
+    expect(() => reserveAuthorityMint({ ...fence, state: "closing" }, entry)).toThrow();
+    const result = reconcileAuthorityFence({
+      fence: { ...fence, state: "closing", cutoff: "100" },
+      rows: [reserved],
+      provider: new Map([["m1", "confirmed_not_started" as const]]),
+      postgresNow: "100",
+    });
+    expect(result.rows[0]?.state).toBe("aborted");
+    expect(result.fence.state).toBe("frozen");
+    expect(authorityRetirementFloor("100")).toBe("2592160");
+  });
+});
+
+describe("remote_authority_outage_matrix", () => {
+  it("serves the paired public snapshot only through the earlier 60-second bound", () => {
+    const snapshot = new AuthorityPublicSnapshot();
+    snapshot.publish({ keys: [] }, "status", "200", "100");
+    expect(snapshot.read("status", "160")?.body).toBe("status");
+    expect(snapshot.read("status", "161")).toBeUndefined();
   });
 });

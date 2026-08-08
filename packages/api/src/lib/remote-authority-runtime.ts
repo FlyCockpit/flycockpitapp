@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { canonicalizeRfc8785 } from "@flycockpit/cockpit-protocol";
 import {
   type AuthorityConfig,
   AuthorityPublicSnapshot,
@@ -74,7 +75,7 @@ export interface AuthorityRuntimeStore {
     statusGeneration: string;
     statusBodyDigest: string;
     signerKid: string;
-  }): Promise<boolean>;
+  }): Promise<boolean | string>;
   markTransitionStatusSigned(transitionId: string, compactJws: string): Promise<boolean>;
   commitLifecycleTransition(args: {
     transitionId: string;
@@ -257,7 +258,7 @@ export class RemoteAuthorityRuntime {
           revokedKids = publicRing.keys
             .filter((key) => key.state === "revoked")
             .map((key) => key.kid),
-          body: RemoteAuthorityStatusV1 = {
+          candidateBody: RemoteAuthorityStatusV1 = {
             schemaVersion: 1,
             iss: this.config.issuer,
             aud: "flycockpit-remote-authority-status-v1",
@@ -274,9 +275,10 @@ export class RemoteAuthorityRuntime {
           transitionId = createHash("sha256")
             .update(`${this.config.deploymentId}\0${lifecycle.ringDigest}\0${digest}`)
             .digest("hex"),
-          bodyDigest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
-        if (
-          !(await this.options.store.prepareLifecycleTransition({
+          bodyDigest = createHash("sha256")
+            .update(canonicalizeRfc8785(candidateBody))
+            .digest("hex"),
+          prepared = await this.options.store.prepareLifecycleTransition({
             transitionId,
             deploymentId: this.config.deploymentId,
             from: lifecycle,
@@ -285,12 +287,27 @@ export class RemoteAuthorityRuntime {
             statusGeneration: generation,
             statusBodyDigest: bodyDigest,
             signerKid: signer.kid,
-          }))
-        )
-          return this.#fail("lifecycle_transition_conflict");
-        const compactJws = await createRemoteAuthorityStatusJws(body, signer);
+          });
+        if (!prepared) return this.#fail("lifecycle_transition_conflict");
+        let body = candidateBody,
+          compactJws: string;
+        if (typeof prepared === "string") {
+          compactJws = prepared;
+          const payload = compactJws.split(".")[1];
+          if (!payload) return this.#fail("stored_transition_status_invalid");
+          body = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+          await verifyRemoteAuthorityStatusJws(compactJws, new RingAuthorityVerifier(ring, now), {
+            issuer: this.config.issuer,
+            deploymentId: this.config.deploymentId,
+            ringDigest: digest,
+            authorityEpoch: ring.authorityEpoch,
+            minimumGeneration: generation,
+            now,
+          });
+        } else compactJws = await createRemoteAuthorityStatusJws(body, signer);
         if (
-          !(await this.options.store.markTransitionStatusSigned(transitionId, compactJws)) ||
+          (typeof prepared !== "string" &&
+            !(await this.options.store.markTransitionStatusSigned(transitionId, compactJws))) ||
           !(await this.options.store.commitLifecycleTransition({
             transitionId,
             deploymentId: this.config.deploymentId,

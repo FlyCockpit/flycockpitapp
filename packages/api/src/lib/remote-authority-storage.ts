@@ -266,7 +266,13 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
           args.statusBodyDigest,
           args.signerKid,
         );
-        return true;
+        const transition = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "statusCompactJws" FROM remote_authority_lifecycle_transitions WHERE "transitionId"=$1`,
+          args.transitionId,
+        );
+        return typeof transition[0]?.statusCompactJws === "string"
+          ? transition[0].statusCompactJws
+          : true;
       },
       { isolationLevel: "Serializable" },
     );

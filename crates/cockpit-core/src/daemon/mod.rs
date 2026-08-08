@@ -772,9 +772,12 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
                 );
             }
             if !canonical.socket.exists() && canonical.pid_file.exists() {
+                #[cfg(unix)]
                 let status = status_for_unreachable_pid_with_cleanup(&canonical, || {
                     let _ = std::fs::remove_file(&endpoint);
                 });
+                #[cfg(not(unix))]
+                let status = status_for_unreachable_pid(&canonical);
                 return DaemonProbe::new(status, recorded);
             }
         }
@@ -1817,7 +1820,9 @@ mod tests {
         let err = cleanup_manifest(&manifest_path).expect_err("must refuse current process");
 
         assert!(
-            err.to_string().contains(TEST_OWNER_ENV) || err.to_string().contains("not a cockpit"),
+            err.to_string().contains(TEST_OWNER_ENV)
+                || err.to_string().contains("not a cockpit")
+                || err.to_string().contains("unsupported on this platform"),
             "error should name the failed identity check: {err:#}"
         );
         assert!(socket.exists());

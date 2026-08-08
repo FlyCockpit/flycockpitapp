@@ -100,9 +100,15 @@ fn cancellation_before_publication_removes_only_the_temp_and_preserves_absence()
     let target = tmp.path().join("out.md");
     let result = publish_no_clobber(&target, b"payload", &|| true);
     assert_eq!(result, Err(PublishError::Cancelled));
-    assert!(!target.exists(), "cancellation must never publish the target");
+    assert!(
+        !target.exists(),
+        "cancellation must never publish the target"
+    );
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
-    assert!(leftovers.is_empty(), "the verified temp file must be removed");
+    assert!(
+        leftovers.is_empty(),
+        "the verified temp file must be removed"
+    );
 }
 
 #[test]
@@ -169,7 +175,8 @@ fn every_publish_error_display_is_sentinel_free() {
     // payload — proving the *size* is reported, never the bytes).
     let mut oversized = vec![b'x'; MAX_PAYLOAD_BYTES + 1 - SENTINEL.len()];
     oversized.extend_from_slice(payload);
-    let err = publish_no_clobber(&tmp.path().join("big.md"), &oversized, &never_cancelled).unwrap_err();
+    let err =
+        publish_no_clobber(&tmp.path().join("big.md"), &oversized, &never_cancelled).unwrap_err();
     assert!(!err.to_string().contains(SENTINEL), "{err}");
 
     // Cancelled.
@@ -253,7 +260,14 @@ mod linux_platform_contract {
             script: vec![Ok(())],
             ..Default::default()
         };
-        let published = publish_with(&mut backend, &mut real_io(), &target, b"payload", &never_cancelled).unwrap();
+        let published = publish_with(
+            &mut backend,
+            &mut real_io(),
+            &target,
+            b"payload",
+            &never_cancelled,
+        )
+        .unwrap();
         assert_eq!(published.bytes_written, 7);
         assert_eq!(backend.calls.len(), 1, "exactly one rename attempt");
     }
@@ -266,7 +280,13 @@ mod linux_platform_contract {
             script: vec![Err(BackendError::TargetExists)],
             ..Default::default()
         };
-        let result = publish_with(&mut backend, &mut real_io(), &target, b"payload", &never_cancelled);
+        let result = publish_with(
+            &mut backend,
+            &mut real_io(),
+            &target,
+            b"payload",
+            &never_cancelled,
+        );
         assert_eq!(result, Err(PublishError::TargetExists));
         assert_eq!(
             backend.calls.len(),
@@ -283,7 +303,13 @@ mod linux_platform_contract {
             script: vec![Err(BackendError::Unsupported)],
             ..Default::default()
         };
-        let result = publish_with(&mut backend, &mut real_io(), &target, b"payload", &never_cancelled);
+        let result = publish_with(
+            &mut backend,
+            &mut real_io(),
+            &target,
+            b"payload",
+            &never_cancelled,
+        );
         assert_eq!(result, Err(PublishError::UnsupportedAtomicNoClobber));
         assert!(!target.exists());
     }
@@ -322,7 +348,10 @@ mod linux_platform_contract {
                 libc::close(fd);
                 let renamed =
                     libc::renameat(parent_fd, attacker_name.as_ptr(), parent_fd, to.as_ptr());
-                assert_eq!(renamed, 0, "test setup: substituting the published entry failed");
+                assert_eq!(
+                    renamed, 0,
+                    "test setup: substituting the published entry failed"
+                );
             }
             Ok(())
         }
@@ -333,7 +362,13 @@ mod linux_platform_contract {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("out.md");
         let mut backend = SwappedContentBackend;
-        let result = publish_with(&mut backend, &mut real_io(), &target, b"real payload", &never_cancelled);
+        let result = publish_with(
+            &mut backend,
+            &mut real_io(),
+            &target,
+            b"real payload",
+            &never_cancelled,
+        );
         assert!(
             result.is_err(),
             "a name swapped out from under the publish must not be reported as success"
@@ -428,7 +463,13 @@ mod linux_platform_contract {
             fail_write: true,
             ..Default::default()
         };
-        let result = publish_with(&mut backend, &mut io_ops, &target, b"payload", &never_cancelled);
+        let result = publish_with(
+            &mut backend,
+            &mut io_ops,
+            &target,
+            b"payload",
+            &never_cancelled,
+        );
         assert!(matches!(result, Err(PublishError::Io(_))));
         assert!(!target.exists());
         assert!(
@@ -446,7 +487,13 @@ mod linux_platform_contract {
             fail_sync_temp: true,
             ..Default::default()
         };
-        let result = publish_with(&mut backend, &mut io_ops, &target, b"payload", &never_cancelled);
+        let result = publish_with(
+            &mut backend,
+            &mut io_ops,
+            &target,
+            b"payload",
+            &never_cancelled,
+        );
         assert!(matches!(result, Err(PublishError::Io(_))));
         assert!(!target.exists());
         assert!(
@@ -468,9 +515,14 @@ mod linux_platform_contract {
             fail_sync_parent: true,
             ..Default::default()
         };
-        let published =
-            publish_with(&mut backend, &mut io_ops, &target, b"payload", &never_cancelled)
-                .expect("a parent-fsync failure must not be reported as a publish failure");
+        let published = publish_with(
+            &mut backend,
+            &mut io_ops,
+            &target,
+            b"payload",
+            &never_cancelled,
+        )
+        .expect("a parent-fsync failure must not be reported as a publish failure");
         assert!(
             !published.durability_confirmed,
             "the caller must be able to tell durability is unconfirmed"

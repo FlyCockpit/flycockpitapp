@@ -1494,15 +1494,14 @@ fn tool_provider_identity_json(tool_call: &ToolCallEvent) -> Result<Value> {
             );
         }
         match tool_call.wire_api.as_deref() {
-            Some("completions") | Some("responses") => {
-                if tool_call.provider_call_id.is_none() {
-                    anyhow::bail!(
-                        "invalid provider identity for tool_call row {}: {} wire requires provider_call_id",
-                        tool_call.call_id,
-                        tool_call.wire_api.as_deref().unwrap_or("unknown")
-                    );
-                }
+            Some("completions") | Some("responses") if tool_call.provider_call_id.is_none() => {
+                anyhow::bail!(
+                    "invalid provider identity for tool_call row {}: {} wire requires provider_call_id",
+                    tool_call.call_id,
+                    tool_call.wire_api.as_deref().unwrap_or("unknown")
+                );
             }
+            Some("completions") | Some("responses") => {}
             Some(other) => {
                 anyhow::bail!(
                     "invalid provider identity for tool_call row {}: unsupported wire_api `{}`",

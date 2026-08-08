@@ -311,7 +311,7 @@ fn lexical_absolute(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     };
-    lexical_normalize(&abs)
+    super::files::normalize_macos_system_path(&lexical_normalize(&abs))
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {

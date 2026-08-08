@@ -1010,7 +1010,6 @@ impl SessionWorkerHandle {
         Ok(deleted)
     }
 
-
     pub fn session(&self) -> Arc<Session> {
         self.session.clone()
     }

@@ -1955,7 +1955,10 @@ async fn sealed_value_survives_compaction_and_resume() {
         .unwrap()
         .expect("session must resume after compaction");
     assert!(
-        resumed.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "resume_keep").await.unwrap(),
+        resumed
+            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "resume_keep")
+            .await
+            .unwrap(),
         "resumed session must inject the pre-compaction sealed value"
     );
     let scrubbed = resumed
@@ -1979,7 +1982,9 @@ async fn failed_compaction_does_not_change_sealed_state() {
     let literal = "failed-compact-sealed-value-2d9f";
     driver
         .session
-        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &crate::redact::RedactionTable::empty(),
+        .set_sealed_value(
+            crate::sealed::OwnerAuthority::for_test(),
+            &crate::redact::RedactionTable::empty(),
             "fail_keep",
             literal,
             "failed compaction",
@@ -1987,7 +1992,11 @@ async fn failed_compaction_does_not_change_sealed_state() {
         )
         .await
         .unwrap();
-    let before_meta = driver.session.list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test()).await.unwrap();
+    let before_meta = driver
+        .session
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .await
+        .unwrap();
     let before_table_json = driver
         .session
         .persisted_redaction_table()
@@ -2030,7 +2039,11 @@ async fn failed_compaction_does_not_change_sealed_state() {
             .unwrap(),
         "failed compaction must keep the pre-attempt sealed value injectable"
     );
-    let after_meta = driver.session.list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test()).await.unwrap();
+    let after_meta = driver
+        .session
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .await
+        .unwrap();
     assert_eq!(
         after_meta.len(),
         before_meta.len(),

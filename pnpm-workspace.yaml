@@ -13,6 +13,10 @@ minimumReleaseAgeExclude:
   # GHSA-p6gq-j5cr-w38f: nodemailer 9.0.1 (released 2026-06-17) is the first
   # fixed version and is <7 days old. Remove once it ages past 2026-06-24.
   - nodemailer
+  # GHSA-28wg-ghj8-5hjv / GHSA-2v37-7h3g-55p8: nanoid 3.3.17 is the first
+  # patched compatible release and was published 2026-08-03. Remove after
+  # 2026-08-10 once it meets the 7-day minimum-age policy.
+  - nanoid
 # Each selector lifts a transitive out of its vulnerable range. All target
 # versions pass the 7-day minimumReleaseAge gate; selectors are scoped tight so
 # unrelated majors are untouched. The picomatch@<2.3.2 and devalue@>=5.6.3
@@ -22,13 +26,23 @@ overrides:
   hono@<4.12.25: ">=4.12.25" # CVE-2026-54290 (CORS credential origin reflection)
   picomatch@>=4 <4.0.4: ">=4.0.4" # CVE-2026-33671 (ReDoS via extglob)
   defu@<6.1.5: ">=6.1.5" # CVE-2026-35209 (prototype pollution)
-  fast-uri@<3.1.2: ">=3.1.2" # CVE-2026-6321 / CVE-2026-6322 (path traversal)
+  brace-expansion@>=2 <2.1.2: ">=2.1.2 <3" # CVE-2026-13149 (ReDoS), stay on the 2.x API
+  brace-expansion@>=3 <5.0.9: ">=5.0.9" # CVE-2026-14257 / CVE-2026-14258 / CVE-2026-14259 (DoS)
+  fast-uri@<3.1.3: ">=3.1.3" # CVE-2026-13676 / CVE-2026-16221 / CVE-2026-18446
+  ip-address@<10.3.1: ">=10.3.1" # CVE-2026-69192 (SSRF)
+  js-yaml@<4.3.1: 4.3.1 # CVE-2026-59869 / CVE-2026-59870 / GHSA-5p4m-2wfm-xmqj
+  postcss@<8.5.18: ">=8.5.18" # GHSA-r28c-9q8g-f849 (source-map traversal)
+  sharp@<0.35.0: ">=0.35.0" # GHSA-f88m-g3jw-g9cj (libvips CVEs)
+  shell-quote@<=1.8.4: ">=1.8.5" # GHSA-g4rg-993f-4qgw (quadratic DoS)
+  svgo@>=4 <4.0.2: ">=4.0.2" # GHSA-6j7m-49gr-22hq (incomplete script removal)
+  nanoid@<3.3.17: 3.3.17 # GHSA-28wg-ghj8-5hjv / GHSA-2v37-7h3g-55p8 (generator DoS)
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe @better-auth/core: better-auth 1.6.11 peers
   # `kysely ^0.28.17` (excludes the otherwise-hoisted 0.29.0), and two copies of
   # @better-auth/core split its types so the api-key plugin stops being assignable
   # to BetterAuthPlugin. kysely is only used transitively via better-auth here.
   kysely: 0.28.17
+  "@better-auth/core": 1.6.22 # keep auth plugins on one compatible core type graph
   path-to-regexp@>=8 <8.4.0: ">=8.4.0" # CVE-2026-4926 (ReDoS)
   # Peer-range alignment after 2026-06 dependency refresh. These are scoped to
   # the packages that declare the peers and all target releases are older than
@@ -70,7 +84,7 @@ catalog:
   "@orpc/server": ^1.14.6
   "@orpc/openapi": ^1.14.6
   "@orpc/zod": ^1.14.6
-  better-auth: ^1.6.19
+  better-auth: 1.6.22
   lucide-react: ^1.20.0
   next-themes: ^0.4.6
   react: ^19.2.7
@@ -85,7 +99,7 @@ catalog:
   typescript: ^6.0.3
   vite: ^8.0.16
   "@vitejs/plugin-react": ^6.0.2
-  postcss: ^8.5.15
+  postcss: ^8.5.18
   "@tanstack/react-form": ^1.33.0
   "@tanstack/react-query": ^5.101.0
   "@tanstack/react-query-devtools": ^5.101.0
@@ -102,14 +116,14 @@ catalog:
   bullmq: ^5.78.1
   ioredis: ^5.11.1
   tsdown: ^0.22.2
-  sharp: ^0.35.1
+  sharp: ^0.35.0
   blurhash: ^2.0.5
   "@aws-sdk/client-s3": ^3.1069.0
   "@aws-sdk/s3-request-presigner": ^3.1069.0
   react-markdown: ^10.1.0
   "@hono/mcp": ^0.3.0
   "@modelcontextprotocol/sdk": ^1.29.0
-  "@better-auth/api-key": ^1.6.19
+  "@better-auth/api-key": 1.6.22
   i18next: ^26.3.1
   react-i18next: ^17.0.8
   i18next-browser-languagedetector: ^8.2.1
@@ -123,7 +137,7 @@ catalog:
   "@xterm/addon-webgl": ^0.19.0
   "@xterm/addon-clipboard": ^0.2.0
   "@fontsource-variable/roboto": ^5.2.10
-  "@better-auth/expo": ^1.6.19
+  "@better-auth/expo": 1.6.22
   "@expo/metro-runtime": ~56.0.11
   "@expo/vector-icons": ^15.1.1
   "@gorhom/bottom-sheet": ^5.2.14

@@ -2111,83 +2111,79 @@ impl SettingsCx {
                     }
                     return Nav::Stay;
                 }
-                KeyCode::Char('D') => {
-                    if editor.multimodal_action("Discard", &parent.entry) {
+                KeyCode::Char('D') if editor.multimodal_action("Discard", &parent.entry) => {
+                    return Nav::Stay;
+                }
+                KeyCode::Char('R') if editor.multimodal_action("Retry", &parent.entry) => {
+                    // Refresh Retry re-enters Refreshing; complete local re-resolve.
+                    if let Some(mm) = editor.multimodal()
+                        && let crate::tui::settings::multimodal_capability_editor::RefreshPhase::Refreshing {
+                            refresh_id: rid,
+                            ..
+                        } = mm.refresh
+                    {
+                        let mut live = parent.entry.clone();
+                        live.models = models.rows.clone();
+                        editor.complete_multimodal_refresh_success(rid, &live);
                         return Nav::Stay;
                     }
-                }
-                KeyCode::Char('R') => {
-                    if editor.multimodal_action("Retry", &parent.entry) {
-                        // Refresh Retry re-enters Refreshing; complete local re-resolve.
-                        if let Some(mm) = editor.multimodal()
-                            && let crate::tui::settings::multimodal_capability_editor::RefreshPhase::Refreshing {
-                                refresh_id: rid,
-                                ..
-                            } = mm.refresh
-                        {
-                            let mut live = parent.entry.clone();
-                            live.models = models.rows.clone();
-                            editor.complete_multimodal_refresh_success(rid, &live);
+                    // Save Retry re-enters Saving; complete the disk write now.
+                    if let Some((
+                        save_id,
+                        provider_id,
+                        model_id,
+                        selection_generation,
+                        base_config_generation,
+                    )) = editor.pending_multimodal_save()
+                    {
+                        let live_gen = self.config.resolution_generation.max(1);
+                        if live_gen != base_config_generation {
+                            editor.complete_multimodal_save_conflict(
+                                save_id,
+                                &provider_id,
+                                &model_id,
+                                selection_generation,
+                                base_config_generation,
+                                live_gen,
+                                &parent.entry,
+                            );
                             return Nav::Stay;
                         }
-                        // Save Retry re-enters Saving; complete the disk write now.
-                        if let Some((
-                            save_id,
-                            provider_id,
-                            model_id,
-                            selection_generation,
-                            base_config_generation,
-                        )) = editor.pending_multimodal_save()
-                        {
-                            let live_gen = self.config.resolution_generation.max(1);
-                            if live_gen != base_config_generation {
-                                editor.complete_multimodal_save_conflict(
+                        let prior_parent_entry = parent.entry.clone();
+                        let mut tmp = parent.entry.clone();
+                        tmp.models = models.rows.clone();
+                        editor.write_into(&mut tmp);
+                        parent.entry.models = tmp.models.clone();
+                        self.apply_active_prompt_cache_retention_from_editor(editor);
+                        parent.status = self.commit_edit_entry(parent);
+                        match &parent.status {
+                            Some(msg) if msg.to_ascii_lowercase().contains("fail") => {
+                                parent.entry = prior_parent_entry;
+                                models.rows = parent.entry.models.clone();
+                                editor.complete_multimodal_save_failure(
                                     save_id,
                                     &provider_id,
                                     &model_id,
                                     selection_generation,
                                     base_config_generation,
-                                    live_gen,
+                                    msg.clone(),
+                                );
+                            }
+                            _ => {
+                                let saved_generation = self.config.resolution_generation.max(1);
+                                editor.complete_multimodal_save_success(
+                                    save_id,
+                                    &provider_id,
+                                    &model_id,
+                                    selection_generation,
+                                    base_config_generation,
+                                    saved_generation,
                                     &parent.entry,
                                 );
-                                return Nav::Stay;
-                            }
-                            let prior_parent_entry = parent.entry.clone();
-                            let mut tmp = parent.entry.clone();
-                            tmp.models = models.rows.clone();
-                            editor.write_into(&mut tmp);
-                            parent.entry.models = tmp.models.clone();
-                            self.apply_active_prompt_cache_retention_from_editor(editor);
-                            parent.status = self.commit_edit_entry(parent);
-                            match &parent.status {
-                                Some(msg) if msg.to_ascii_lowercase().contains("fail") => {
-                                    parent.entry = prior_parent_entry;
-                                    models.rows = parent.entry.models.clone();
-                                    editor.complete_multimodal_save_failure(
-                                        save_id,
-                                        &provider_id,
-                                        &model_id,
-                                        selection_generation,
-                                        base_config_generation,
-                                        msg.clone(),
-                                    );
-                                }
-                                _ => {
-                                    let saved_generation = self.config.resolution_generation.max(1);
-                                    editor.complete_multimodal_save_success(
-                                        save_id,
-                                        &provider_id,
-                                        &model_id,
-                                        selection_generation,
-                                        base_config_generation,
-                                        saved_generation,
-                                        &parent.entry,
-                                    );
-                                }
                             }
                         }
-                        return Nav::Stay;
                     }
+                    return Nav::Stay;
                 }
                 KeyCode::Char('L') if editor.multimodal_action("Reload", &parent.entry) => {
                     return Nav::Stay;

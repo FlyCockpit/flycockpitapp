@@ -78,6 +78,13 @@ jobs:
           shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
           workspaces: . -> target
 
+      # macOS exposes `/var` as an alias for `/private/var`. Use the short,
+      # physical system temp root: it keeps lexical and canonical paths equal
+      # without exceeding the Unix-domain socket path limit in daemon tests.
+      - name: Normalize macOS temporary directory
+        if: contains(matrix.os, 'macos')
+        run: echo "TMPDIR=/private/tmp" >> "$GITHUB_ENV"
+
       - name: Build
         if: contains(matrix.os, 'windows') == false
         run: cargo build --locked --workspace
@@ -88,6 +95,15 @@ jobs:
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      # The dependency-inventory test intentionally resolves every supported
+      # target with `--offline`; a host build fetches only its own target's
+      # optional crates. Populate the registry cache on every test runner.
+      - name: Fetch cross-platform metadata dependencies
+        run: |
+          cargo fetch --locked --target aarch64-apple-darwin
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
 
       - name: Test
         run: cargo nextest run --locked --workspace

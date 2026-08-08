@@ -2124,7 +2124,7 @@ fn oauth_grok_manual_paste_option_focuses_without_rebeginning_state() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_oauth_effects(false);
     let effects = fake_oauth_effects();
-    let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     state.set_browser_session_for_test("https://example.test/oauth");
     state.pending = false;
     state.cursor = 1;

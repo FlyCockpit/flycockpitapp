@@ -898,15 +898,11 @@ impl SessionsPane {
             KeyCode::PageDown if self.focus == Focus::Preview => {
                 self.page_preview_down();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.move_cursor(-1) && self.preview_enabled {
-                    return self.ensure_preview_for_selection();
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.move_cursor(-1) && self.preview_enabled => {
+                return self.ensure_preview_for_selection();
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.move_cursor(1) && self.preview_enabled {
-                    return self.ensure_preview_for_selection();
-                }
+            KeyCode::Down | KeyCode::Char('j') if self.move_cursor(1) && self.preview_enabled => {
+                return self.ensure_preview_for_selection();
             }
             KeyCode::Enter => {
                 // Resume needs the daemon (agent loop + locks + single
@@ -929,13 +925,11 @@ impl SessionsPane {
                 }
             }
             // Go back up one fork level (no-op at the root).
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.drill_out() {
-                    self.preview = None;
-                    if self.daemon_connected {
-                        self.mark_current_level_loading();
-                        return Some(SessionsOutcome::LoadList);
-                    }
+            KeyCode::Left | KeyCode::Char('h') if self.drill_out() => {
+                self.preview = None;
+                if self.daemon_connected {
+                    self.mark_current_level_loading();
+                    return Some(SessionsOutcome::LoadList);
                 }
             }
             // Scope toggle — only meaningful with a current project.

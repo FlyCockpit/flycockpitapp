@@ -184,13 +184,12 @@ pub(crate) async fn removed_primary_notice(
             row.active_agent,
             crate::agents::FALLBACK_PRIMARY
         )
-    } else if let Some(default_primary) = cfg.removed_default_primary_agent() {
+    } else {
+        let default_primary = cfg.removed_default_primary_agent()?;
         format!(
             "Default primary agent `{default_primary}` was removed; continuing with `{}`.",
             crate::agents::FALLBACK_PRIMARY
         )
-    } else {
-        return None;
     };
     let already_recorded = db
         .list_session_events(session_id)

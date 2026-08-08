@@ -368,14 +368,16 @@ fn pressing_left_from_providers_list_returns_to_root() {
 fn oauth_add_step_help_collapses_after_login() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    let mut codex = providers::OAuthFlowState::new(OAuthProvider::Codex);
+    let mut codex =
+        providers::OAuthFlowState::new_with_acknowledgement_for_test(OAuthProvider::Codex);
     codex.logged_in = true;
     let mut add = providers::AddState::new();
     add.enter_oauth_for_test(codex);
     d.set_test_page(Page::Providers(ProvidersPage::Add(add)));
     assert_eq!(d.help_text(), "enter: acknowledge  esc: back");
 
-    let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.logged_in = false;
     let mut add = providers::AddState::new();
     add.enter_oauth_for_test(grok);
@@ -390,7 +392,8 @@ fn oauth_add_step_help_collapses_after_login() {
 fn paste_routes_to_add_grok_oauth_manual_input() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.paste_focused = true;
     grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
     let mut add = providers::AddState::new();
@@ -413,7 +416,8 @@ fn paste_routes_to_add_grok_oauth_manual_input() {
 fn paste_routes_to_standalone_grok_oauth_manual_input() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.paste_focused = true;
     grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
     d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
@@ -437,7 +441,8 @@ fn grok_and_codex_oauth_render_register_link_regions() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
 
-    let mut grok = providers::OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
     d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
         state: Box::new(grok),
@@ -454,7 +459,8 @@ fn grok_and_codex_oauth_render_register_link_regions() {
     );
     assert_eq!(links.regions()[0].rect.height, 1);
     assert_eq!(links.regions()[0].label, "open xai.com authorization page");
-    let mut grok_confirming = providers::OAuthFlowState::new(OAuthProvider::Grok);
+    let mut grok_confirming =
+        providers::OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     grok_confirming.set_browser_session_for_test("https://x.ai/oauth/authorize?state=abc");
     grok_confirming.apply_complete(Ok(true));
     d.set_test_page(Page::Providers(ProvidersPage::OAuthSetup {
@@ -2037,7 +2043,6 @@ fn security_setup_wizard_tui_edits_redaction_number() {
 
     d.handle_key(press(KeyCode::Enter)); // sandbox default
     d.handle_key(press(KeyCode::Enter)); // approval default
-    d.handle_key(press(KeyCode::Enter)); // redaction default
     for _ in 0..8 {
         d.handle_key(press(KeyCode::Backspace));
     }

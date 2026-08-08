@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::{Published, PublishError};
+use super::{PublishError, Published};
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -125,8 +125,10 @@ fn open_relative(
     };
     let mut handle: HANDLE = std::ptr::null_mut();
     let mut io_status = IO_STATUS_BLOCK::default();
-    let open_options =
-        FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE;
+    let open_options = FILE_OPEN_REPARSE_POINT
+        | FILE_OPEN_FOR_BACKUP_INTENT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | FILE_NON_DIRECTORY_FILE;
     // SAFETY: `parent` is a live, retained directory handle; the name
     // buffer, object attributes, and status block remain live for the
     // call. Resolution is relative to `RootDirectory` only — never a path.
@@ -186,18 +188,24 @@ fn write_all_and_flush(file: &std::fs::File, bytes: &[u8]) -> io::Result<()> {
 
 /// Publish the open temp handle under `dest_name`, resolved relative to
 /// the held parent handle, with no replace-if-exists bit set.
-fn publish_no_replace(temp: &std::fs::File, parent: HANDLE, dest_name: &std::ffi::OsStr) -> io::Result<()> {
+fn publish_no_replace(
+    temp: &std::fs::File,
+    parent: HANDLE,
+    dest_name: &std::ffi::OsStr,
+) -> io::Result<()> {
     let dest_wide = wide(dest_name);
     let name_bytes = ((dest_wide.len() - 1) * std::mem::size_of::<u16>()) as u32;
     let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let total_bytes = header_bytes + name_bytes as usize;
+    // `FileNameLength` excludes the terminator, but Windows requires the
+    // variable-length buffer passed to FileRenameInfoEx to include one.
+    let total_bytes = header_bytes + name_bytes as usize + std::mem::size_of::<u16>();
     let word_bytes = std::mem::size_of::<usize>();
     let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and large enough for the fixed
-    // header plus the exact UTF-16 destination bytes (no trailing NUL —
-    // `FileNameLength` is exact). `parent` is the live, retained directory
-    // handle; `temp` was opened with `DELETE` access.
+    // header plus the UTF-16 destination bytes and terminator. `parent` is
+    // the live, retained directory handle; `temp` was opened with `DELETE`
+    // access.
     unsafe {
         (*info).Anonymous.Flags = 0; // No `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`.
         (*info).RootDirectory = parent;
@@ -205,7 +213,7 @@ fn publish_no_replace(temp: &std::fs::File, parent: HANDLE, dest_name: &std::ffi
         std::ptr::copy_nonoverlapping(
             dest_wide.as_ptr(),
             std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            dest_wide.len() - 1,
+            dest_wide.len(),
         );
     }
     // SAFETY: `info` points to a live, correctly sized rename-info buffer.
@@ -244,7 +252,12 @@ pub(super) fn publish(
     let temp = open_relative(
         parent_handle,
         &temp_name_os,
-        DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | GENERIC_READ | SYNCHRONIZE,
+        DELETE
+            | FILE_WRITE_DATA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_READ_ATTRIBUTES
+            | GENERIC_READ
+            | SYNCHRONIZE,
         FILE_CREATE,
     )
     .map_err(|e| PublishError::Io(format!("creating temp file: {e}")))?;
@@ -283,7 +296,9 @@ pub(super) fn publish(
 
 fn remove_open_file(file: &std::fs::File) {
     use windows_sys::Win32::Storage::FileSystem::{FILE_DISPOSITION_INFO, FileDispositionInfo};
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true as _ };
+    let disposition = FILE_DISPOSITION_INFO {
+        DeleteFile: true as _,
+    };
     // SAFETY: `file` was opened with `DELETE` access; `disposition` matches
     // the exact layout `FileDispositionInfo` requires. Cleanup of our own
     // not-yet-published temp file only — never the caller's target.

@@ -436,8 +436,19 @@ fn ensure_no_skill_symlink(target: &SkillPackageTarget) -> Result<()> {
 }
 
 fn lexical_absolute_against(path: &Path, cwd: &Path) -> PathBuf {
+    let lexical_cwd = lexical_normalize(cwd);
+    // Canonicalize only the workspace root, then append the requested path
+    // lexically. On macOS, `/var` is an alias for `/private/var`; resolving
+    // the root keeps a tempdir-based workspace and the manifest discovered
+    // beneath it in the same namespace. Do not canonicalize the requested
+    // path itself: that could follow a package-file symlink before the
+    // managed-skill symlink guard has a chance to reject it.
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| lexical_cwd.clone());
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        let path = lexical_normalize(path);
+        path.strip_prefix(&lexical_cwd)
+            .map(|relative| cwd.join(relative))
+            .unwrap_or(path)
     } else {
         cwd.join(path)
     };
@@ -505,22 +516,7 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
     if let Some(entry) = cache.lock().unwrap().get(&dirs) {
         return Ok(entry.skills.clone());
     }
-    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
-    let mut skills: Vec<Skill> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for manifest in manifests {
-        match parse_skill(&manifest) {
-            Ok(skill) => {
-                if seen.insert(skill.frontmatter.name.clone()) {
-                    skills.push(skill);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %manifest.display(), error = %e, "skipping malformed SKILL.md");
-            }
-        }
-    }
+    let skills = discover_uncached(&dirs);
 
     cache.lock().unwrap().insert(
         dirs,
@@ -529,6 +525,23 @@ pub fn discover(cwd: &Path, cfg: &SkillsConfig) -> Result<Vec<Skill>> {
         },
     );
     Ok(skills)
+}
+
+fn discover_uncached(dirs: &[PathBuf]) -> Vec<Skill> {
+    let manifests: Vec<PathBuf> = dirs.iter().flat_map(|dir| manifests_under(dir)).collect();
+    let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for manifest in manifests {
+        match parse_skill(&manifest) {
+            Ok(skill) if seen.insert(skill.frontmatter.name.clone()) => skills.push(skill),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(path = %manifest.display(), %error, "skipping malformed SKILL.md");
+            }
+        }
+    }
+    skills
 }
 
 /// Return every package manifest beneath one configured root in deterministic
@@ -838,16 +851,14 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     // Advance past the opening `---` line.
-    let after_open = match rest.find('\n') {
-        Some(nl) => {
-            // Ensure the opening line is *only* `---` (allow trailing CR).
-            let first_line = rest[..nl].trim_end_matches('\r');
-            if first_line != "---" {
-                return None;
-            }
-            &rest[nl + 1..]
+    let after_open = {
+        let nl = rest.find('\n')?;
+        // Ensure the opening line is *only* `---` (allow trailing CR).
+        let first_line = rest[..nl].trim_end_matches('\r');
+        if first_line != "---" {
+            return None;
         }
-        None => return None,
+        &rest[nl + 1..]
     };
 
     // Find the closing fence: a line consisting solely of `---`.
@@ -874,6 +885,13 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
 /// Returned paths are absolute and may not exist — [`discover`] tolerates
 /// missing dirs.
 pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
+    resolve_configured_scan_dirs(cwd, cfg)
+        .into_iter()
+        .filter(|dir| skill_scan_dir_allowed_by_trust(dir))
+        .collect()
+}
+
+fn resolve_configured_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in &cfg.scan_dirs {
         resolve_dir_entry(entry, cwd, cfg.ancestor_walk, &mut out);
@@ -881,9 +899,7 @@ pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
     for entry in &cfg.external_dirs {
         resolve_dir_entry(entry, cwd, false, &mut out);
     }
-    out.into_iter()
-        .filter(|dir| skill_scan_dir_allowed_by_trust(dir))
-        .collect()
+    out
 }
 
 fn skill_scan_dir_allowed_by_trust(dir: &Path) -> bool {
@@ -1596,6 +1612,32 @@ mod tests {
     }
 
     #[test]
+    fn ignored_workspace_skill_is_not_treated_as_a_managed_write_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "local",
+            "---\nname: local\ndescription: d\n---\n",
+            "B",
+        );
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
+
+        let target = crate::config::trust::with_workspace_trust_policy(policy, || {
+            package_target_for_path(&scan.join("local/SKILL.md"), tmp.path(), &cfg)
+        });
+
+        assert!(
+            target.is_none(),
+            "untrusted skill directories remain plain paths"
+        );
+    }
+
+    #[test]
     fn trust_mode_keeps_repo_local_skills() {
         let tmp = tempfile::tempdir().unwrap();
         let scan = tmp.path().join(".agents").join("skills");
@@ -1879,6 +1921,34 @@ mod tests {
         let cfg = skills_cfg(vec!["skills"], false);
 
         assert!(package_target_for_path(&lookalike.join("SKILL.md"), tmp.path(), &cfg).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_target_for_path_handles_canonical_workspace_alias() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let scan = workspace.join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "target",
+            "---\nname: target\ndescription: d\n---\n",
+            "Body",
+        );
+        let alias = tmp.path().join("workspace-alias");
+        symlink(&workspace, &alias).unwrap();
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+
+        let target =
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(&alias), || {
+                package_target_for_path(&alias.join(".agents/skills/target/SKILL.md"), &alias, &cfg)
+            })
+            .expect("workspace aliases should still identify managed skill packages");
+
+        assert_eq!(target.name, "target");
     }
 
     #[test]

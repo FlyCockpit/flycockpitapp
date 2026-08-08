@@ -2486,7 +2486,10 @@ mod tests {
                     .unwrap();
 
             let request = request_handle.await.unwrap();
-            assert!(request.starts_with("GET /v1/models?client_version=0.0.0 "));
+            assert!(
+                request.starts_with("GET /v1/models?client_version=0.0.0 "),
+                "unexpected Codex model-list request: {request}"
+            );
             assert_eq!(
                 request_header_value(&request, "authorization"),
                 Some("Bearer codex-access-1")

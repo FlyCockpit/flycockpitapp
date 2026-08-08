@@ -597,6 +597,7 @@ mod tests {
     use crate::session::Session;
     use std::collections::BTreeMap;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1723,9 +1724,12 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
         writeln!(file, "{script_src}").unwrap();
-        let mut perms = file.metadata().unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = file.metadata().unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
         tmp
     }
 

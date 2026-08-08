@@ -2011,7 +2011,10 @@ fn clipboard_recovery_config_defaults_off_when_omitted() {
 
 #[test]
 fn clipboard_recovery_config_struct_default_is_off() {
-    assert_eq!(TuiConfig::default().clipboard_recovery, ClipboardRecovery::Off);
+    assert_eq!(
+        TuiConfig::default().clipboard_recovery,
+        ClipboardRecovery::Off
+    );
     assert_eq!(
         ExtendedConfig::default().tui.clipboard_recovery,
         ClipboardRecovery::Off
@@ -2052,7 +2055,10 @@ fn clipboard_recovery_config_round_trips() {
     doc.write(&cfg).unwrap();
 
     let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
-    assert_eq!(reloaded.tui.clipboard_recovery, ClipboardRecovery::PrivateFile);
+    assert_eq!(
+        reloaded.tui.clipboard_recovery,
+        ClipboardRecovery::PrivateFile
+    );
 
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -2067,7 +2073,11 @@ fn clipboard_recovery_config_round_trips() {
     cfg2.tui.clipboard_recovery = ClipboardRecovery::Off;
     doc2.write(&cfg2).unwrap();
     assert_eq!(
-        ExtendedConfigDoc::load(&path).unwrap().config().tui.clipboard_recovery,
+        ExtendedConfigDoc::load(&path)
+            .unwrap()
+            .config()
+            .tui
+            .clipboard_recovery,
         ClipboardRecovery::Off
     );
 

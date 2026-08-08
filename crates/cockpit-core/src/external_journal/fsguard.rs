@@ -601,11 +601,26 @@ mod imp {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt as _;
-            if metadata.number_of_links() > 1 {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            // `std::os::windows::fs::MetadataExt::number_of_links` is still
+            // unstable. Query the same value from the already-open handle so
+            // the containment check remains effective on stable Rust.
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+                .map_err(|error| {
+                ExternalJournalError::Containment(format!(
+                    "could not inspect capsule {name} link count: {error}"
+                ))
+            })?;
+            if information.nNumberOfLinks > 1 {
                 return Err(ExternalJournalError::Containment(format!(
                     "capsule {name} has {} links",
-                    metadata.number_of_links()
+                    information.nNumberOfLinks
                 )));
             }
         }

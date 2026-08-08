@@ -72,6 +72,7 @@ impl Session {
     /// [`OwnerAuthority`] token cannot be forged by agent-reachable code, and
     /// these are `pub(crate)` so no new transport can grow onto them without
     /// passing through the daemon's `owner_only` command table.
+    #[allow(dead_code)]
     pub(crate) async fn set_sealed_value(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -91,6 +92,7 @@ impl Session {
     }
 
     /// Owner-only inventory. See [`Session::set_sealed_value`].
+    #[allow(dead_code)]
     pub(crate) async fn list_sealed_value_metadata(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -122,6 +124,7 @@ impl Session {
     /// Owner-only existence check. Sealed literals are never returned for
     /// injection or generic child handoff, and existence itself is an oracle,
     /// so this is gated like the rest. See [`Session::set_sealed_value`].
+    #[allow(dead_code)]
     pub(crate) async fn sealed_value_exists(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -164,7 +167,9 @@ mod tests {
         let session = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
         let initial = crate::redact::RedactionTable::empty();
         session
-            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &initial,
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test(),
+                &initial,
                 "prod_token",
                 "first-high-entropy-token",
                 "deploy",
@@ -179,7 +184,9 @@ mod tests {
                 .contains("first-high-entropy-token")
         );
         session
-            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &first_table,
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test(),
+                &first_table,
                 "prod_token",
                 "second-high-entropy-token",
                 "deploy",
@@ -193,9 +200,22 @@ mod tests {
                 .scrub("first-high-entropy-token")
                 .contains("first-high-entropy-token")
         );
-        assert!(session.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap());
-        session.delete_sealed_value(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap();
-        assert!(!session.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap());
+        assert!(
+            session
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+                .await
+                .unwrap()
+        );
+        session
+            .delete_sealed_value(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+            .await
+            .unwrap();
+        assert!(
+            !session
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+                .await
+                .unwrap()
+        );
         let resumed = Session::resume(db, session.id).unwrap().unwrap();
         assert!(
             !resumed
@@ -213,7 +233,9 @@ mod tests {
         let parent = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
         let table = crate::redact::RedactionTable::empty();
         parent
-            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &table,
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test(),
+                &table,
                 "before",
                 "before-high-entropy-token",
                 "test",
@@ -222,10 +244,17 @@ mod tests {
             .await
             .unwrap();
         let child = Session::create_fork(db, parent.id, None).unwrap();
-        assert!(child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "before").await.unwrap());
+        assert!(
+            child
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "before")
+                .await
+                .unwrap()
+        );
         let parent_table = parent.persisted_redaction_table().unwrap().unwrap();
         parent
-            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &parent_table,
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test(),
+                &parent_table,
                 "after",
                 "after-high-entropy-token",
                 "test",
@@ -233,7 +262,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "after").await.unwrap());
+        assert!(
+            !child
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "after")
+                .await
+                .unwrap()
+        );
     }
 
     /// Source inspection: no injection resolver or literal-return API remains.
@@ -241,7 +275,7 @@ mod tests {
     fn sealed_value_surface_has_no_public_literal_read_or_migration() {
         let source = include_str!("sealed_values.rs");
         let production = source
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production module precedes test module");
         assert!(

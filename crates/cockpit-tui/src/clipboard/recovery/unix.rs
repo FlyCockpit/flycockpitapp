@@ -117,8 +117,9 @@ impl DirHandle {
             ));
         }
         let stat = file_stat(&file)?;
-        policy::verify_unix_file(stat, current_uid())
-            .map_err(|v| io::Error::other(format!("new recovery artifact failed containment: {v:?}")))?;
+        policy::verify_unix_file(stat, current_uid()).map_err(|v| {
+            io::Error::other(format!("new recovery artifact failed containment: {v:?}"))
+        })?;
         Ok(file)
     }
 
@@ -216,7 +217,11 @@ impl DirHandle {
     /// already being gone both leave the entry exactly as found — neither
     /// is an error.
     pub fn remove_verified(&self, name: &str, verified: File) -> io::Result<bool> {
-        let expected = file_identity(&verified.metadata().map_err(|e| io_err("stat verified handle", e))?);
+        let expected = file_identity(
+            &verified
+                .metadata()
+                .map_err(|e| io_err("stat verified handle", e))?,
+        );
         let cname = cstring(name)?;
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: dirfd and name are live for the call; `stat` is a valid,
@@ -285,8 +290,13 @@ fn open_dir_at(parent: &File, name: &CString) -> io::Result<(File, bool)> {
         let error = io::Error::last_os_error();
         if attempt == 0 && error.kind() == io::ErrorKind::NotFound {
             // SAFETY: same liveness argument; `mkdirat` creates one component.
-            let made =
-                unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), EXPECTED_DIR_MODE as libc::mode_t) };
+            let made = unsafe {
+                libc::mkdirat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    EXPECTED_DIR_MODE as libc::mode_t,
+                )
+            };
             if made != 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::AlreadyExists {

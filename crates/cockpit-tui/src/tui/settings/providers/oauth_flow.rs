@@ -375,6 +375,13 @@ impl OAuthFlowState {
         state
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_acknowledgement_for_test(provider: OAuthProvider) -> Self {
+        let mut state = Self::new(provider);
+        state.acknowledgement_required = true;
+        state
+    }
+
     pub(crate) fn new(provider: OAuthProvider) -> Self {
         Self::new_with_effects(provider, OAuthEffects::production())
     }

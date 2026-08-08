@@ -1,4 +1,4 @@
-use super::{App, ToastKind};
+use super::{App, Overlay, ToastKind};
 use cockpit_core::daemon::proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
 };
@@ -9,7 +9,12 @@ use uuid::Uuid;
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();
-    App::new(Some(tmp.path()), false)
+    let mut app = App::new(Some(tmp.path()), false);
+    // These tests exercise composer input, not first-run onboarding.
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.overlay = Overlay::None;
+    app
 }
 
 fn question_set(permission: bool) -> InterruptQuestionSet {

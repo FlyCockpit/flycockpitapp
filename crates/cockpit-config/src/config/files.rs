@@ -100,6 +100,7 @@ fn open_directory_nofollow(
 ) -> Result<std::fs::File> {
     use std::path::Component;
 
+    let path = normalize_macos_system_path(path);
     let mut directory = open_start_directory(path.is_absolute())?;
     let components = path
         .components()
@@ -156,6 +157,21 @@ fn open_directory_nofollow(
         directory = next;
     }
     Ok(directory)
+}
+
+// macOS exposes `/var` and `/tmp` as root-owned symlinks into `/private`.
+// Keep component traversal no-follow for caller-controlled paths while using
+// their physical spelling for these two immutable system aliases.
+pub(crate) fn normalize_macos_system_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            if let Ok(remainder) = path.strip_prefix(alias) {
+                return Path::new(physical).join(remainder);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(unix)]
@@ -774,6 +790,7 @@ impl Drop for PreparedAtomicWrite {
 /// parent directory descriptor; Windows opens every path component relative to
 /// its retained parent and retains the final file handle. A path-component swap
 /// therefore cannot redirect commit into an attacker-controlled directory.
+#[derive(Debug)]
 pub(crate) struct PreparedFileRemoval {
     path: PathBuf,
     #[cfg(unix)]
@@ -911,6 +928,23 @@ fn windows_absolute_path_parts(path: &Path) -> Result<(PathBuf, Vec<std::ffi::Os
 
 #[cfg(windows)]
 fn open_windows_directory_nofollow(path: &Path, create_missing: bool) -> Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+
+    open_windows_directory_nofollow_with_final_access(
+        path,
+        create_missing,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    )
+}
+
+#[cfg(windows)]
+fn open_windows_directory_nofollow_with_final_access(
+    path: &Path,
+    create_missing: bool,
+    final_desired_access: u32,
+) -> Result<std::fs::File> {
     use windows_sys::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_OPEN};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
@@ -921,9 +955,14 @@ fn open_windows_directory_nofollow(path: &Path, create_missing: bool) -> Result<
         .with_context(|| format!("opening Windows path anchor {}", anchor.display()))?;
     reject_windows_reparse_handle(&directory, &anchor)?;
     let mut traversed = anchor;
-    for name in names {
+    let final_index = names.len().saturating_sub(1);
+    for (index, name) in names.into_iter().enumerate() {
         traversed.push(&name);
-        let desired_access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        let desired_access = if index == final_index {
+            final_desired_access
+        } else {
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        };
         directory = match open_windows_relative_nofollow(
             &directory,
             &name,
@@ -988,6 +1027,29 @@ fn open_windows_parent_directory_nofollow(
         .ok_or_else(|| anyhow::anyhow!("Windows path has no file name: {}", path.display()))?;
     Ok((
         open_windows_directory_nofollow(parent, create_missing)?,
+        name.to_os_string(),
+    ))
+}
+
+#[cfg(windows)]
+fn open_windows_parent_directory_for_rename_nofollow(
+    path: &Path,
+    create_missing: bool,
+) -> Result<(std::fs::File, std::ffi::OsString)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Windows path has no file name: {}", path.display()))?;
+    Ok((
+        open_windows_directory_nofollow_with_final_access(
+            parent,
+            create_missing,
+            FILE_ADD_FILE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?,
         name.to_os_string(),
     ))
 }
@@ -1166,7 +1228,7 @@ fn rename_open_file_on_windows(
         FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
     };
 
-    let destination_wide = destination.encode_wide().collect::<Vec<_>>();
+    let mut destination_wide = destination.encode_wide().collect::<Vec<_>>();
     if destination_wide.contains(&0) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1183,9 +1245,17 @@ fn rename_open_file_on_windows(
                 "Windows destination name is too long",
             )
         })?;
-    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let total_bytes = header_bytes
+    // `FileNameLength` excludes the terminator, but the kernel's
+    // FileRenameInformation parser requires one to be present in the buffer.
+    // Supplying only the counted UTF-16 units is rejected by Windows with
+    // ERROR_INVALID_PARAMETER.
+    destination_wide.push(0);
+    // `FILE_RENAME_INFO` is variable-length. Its Rust `size_of` includes
+    // trailing alignment padding, which is not part of the record passed to
+    // Windows; supply the fixed header, the counted name, and its NUL.
+    let total_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes as usize)
+        .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1196,8 +1266,8 @@ fn rename_open_file_on_windows(
     let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and large enough for the fixed
-    // header plus the exact UTF-16 destination bytes. The parent and source
-    // handles remain live for the subsequent rename call.
+    // header plus the UTF-16 destination bytes and terminator. The parent and
+    // source handles remain live for the subsequent rename call.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = parent.as_raw_handle();
@@ -1282,7 +1352,8 @@ fn prepare_atomic_write_in_existing_parent(
     #[cfg(unix)]
     let (parent_dir, destination_name) = open_parent_directory_nofollow(path)?;
     #[cfg(windows)]
-    let (parent_dir, destination_name) = open_windows_parent_directory_nofollow(path, false)?;
+    let (parent_dir, destination_name) =
+        open_windows_parent_directory_for_rename_nofollow(path, false)?;
     #[cfg(any(unix, windows))]
     let tmp_name =
         std::ffi::OsString::from(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));

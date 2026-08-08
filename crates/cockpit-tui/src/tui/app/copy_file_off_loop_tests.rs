@@ -5,7 +5,9 @@
 //! view.
 
 use super::{App, CopyFormat};
-use crate::tui::async_action::{AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult};
+use crate::tui::async_action::{
+    AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
+};
 
 async fn drain_until_idle(app: &mut App) {
     for _ in 0..200 {

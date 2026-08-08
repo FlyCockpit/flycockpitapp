@@ -81,7 +81,11 @@ pub fn recovery_dir_path() -> io::Result<PathBuf> {
 /// plain text that was attempted; it is either written verbatim to the
 /// bounded private artifact or never touches storage at all — it is never
 /// logged, returned, or included in any error produced here.
-pub fn observe_delivery(mode: ClipboardRecovery, confidence: Confidence, content: &str) -> RecoveryOutcome {
+pub fn observe_delivery(
+    mode: ClipboardRecovery,
+    confidence: Confidence,
+    content: &str,
+) -> RecoveryOutcome {
     if let Some(reason) = skip_reason(mode, confidence, content) {
         return RecoveryOutcome::Skipped(reason);
     }
@@ -97,7 +101,11 @@ pub fn observe_delivery(mode: ClipboardRecovery, confidence: Confidence, content
 /// and so a directory-injecting test exercises this exact function, not a
 /// hand-copied reimplementation of it that could silently drift from the
 /// real dispatch.
-fn skip_reason(mode: ClipboardRecovery, confidence: Confidence, content: &str) -> Option<SkipReason> {
+fn skip_reason(
+    mode: ClipboardRecovery,
+    confidence: Confidence,
+    content: &str,
+) -> Option<SkipReason> {
     if mode == ClipboardRecovery::Off {
         return Some(SkipReason::RecoveryOff);
     }
@@ -365,7 +373,7 @@ fn inspect(dir: &DirHandle) -> io::Result<Inspection> {
             }
         }
     }
-    verified.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    verified.sort_by_key(|entry| std::cmp::Reverse(entry.mtime));
     Ok(Inspection {
         verified_newest_first: verified,
         unsafe_entries_reported: unsafe_count,

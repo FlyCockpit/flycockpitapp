@@ -529,7 +529,7 @@ pub fn image_tag(dockerfile_bytes: &[u8], build_args: &[(&str, &str)]) -> String
     for (key, value) in build_args {
         hasher.update([0]);
         hasher.update(key.as_bytes());
-        hasher.update([b'=']);
+        hasher.update(b"=");
         hasher.update(value.as_bytes());
     }
     let hex = crate::intel::hex_lower(&hasher.finalize());

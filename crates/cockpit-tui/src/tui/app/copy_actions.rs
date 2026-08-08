@@ -113,10 +113,14 @@ impl App {
                     Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
                 }
             }
-            ContextMenuAction::CopyAsMarkdown => match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
-                Ok(result) => describe_delivered(&result, format!("Copied {title} as markdown.")),
-                Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
-            },
+            ContextMenuAction::CopyAsMarkdown => {
+                match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
+                    Ok(result) => {
+                        describe_delivered(&result, format!("Copied {title} as markdown."))
+                    }
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
             ContextMenuAction::CopyAsPlainText => {
                 let plain = match shape {
                     pins::CopyShape::Message => crate::clipboard::markdown_to_plain(&text),
@@ -171,7 +175,9 @@ impl App {
 
     pub(super) fn copy_selection_plaintext(&mut self) {
         let recovery = self.clipboard_recovery;
-        self.copy_selection_plaintext_with(move |text| crate::clipboard::copy_plain(text, recovery));
+        self.copy_selection_plaintext_with(move |text| {
+            crate::clipboard::copy_plain(text, recovery)
+        });
     }
 
     pub(super) fn copy_selection_plaintext_with(
@@ -224,7 +230,10 @@ impl App {
             Ok(result) => {
                 let (msg, kind) = describe_delivered(
                     &result,
-                    format!("Copied {} chars to clipboard.", text_to_copy.chars().count()),
+                    format!(
+                        "Copied {} chars to clipboard.",
+                        text_to_copy.chars().count()
+                    ),
                 );
                 if matches!(kind, ToastKind::Success) {
                     self.show_copy_ok_or_tmux_hint(msg);

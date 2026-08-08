@@ -201,10 +201,7 @@ mod tests {
             is_regular_file: false,
             ..ok_unix_file()
         };
-        assert_eq!(
-            verify_unix_file(stat, 1000),
-            Err(Violation::NotRegularFile)
-        );
+        assert_eq!(verify_unix_file(stat, 1000), Err(Violation::NotRegularFile));
     }
 
     #[test]

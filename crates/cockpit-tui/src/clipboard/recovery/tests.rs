@@ -14,21 +14,30 @@ fn scratch() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn off_mode_performs_zero_filesystem_operations_for_every_outcome() {
     let (tmp, dir) = scratch();
-    for confidence in [Confidence::Failed, Confidence::Unverified, Confidence::Confirmed] {
+    for confidence in [
+        Confidence::Failed,
+        Confidence::Unverified,
+        Confidence::Confirmed,
+    ] {
         let outcome = observe_delivery_at(ClipboardRecovery::Off, confidence, "secret text", &dir);
-        assert_eq!(
-            outcome,
-            RecoveryOutcome::Skipped(SkipReason::RecoveryOff)
-        );
+        assert_eq!(outcome, RecoveryOutcome::Skipped(SkipReason::RecoveryOff));
     }
-    assert!(!dir.exists(), "Off must never create the recovery directory");
+    assert!(
+        !dir.exists(),
+        "Off must never create the recovery directory"
+    );
     drop(tmp);
 }
 
 #[test]
 fn confirmed_copy_writes_nothing_even_when_recovery_is_on() {
     let (_tmp, dir) = scratch();
-    let outcome = observe_delivery_at(ClipboardRecovery::PrivateFile, Confidence::Confirmed, "secret", &dir);
+    let outcome = observe_delivery_at(
+        ClipboardRecovery::PrivateFile,
+        Confidence::Confirmed,
+        "secret",
+        &dir,
+    );
     assert_eq!(
         outcome,
         RecoveryOutcome::Skipped(SkipReason::ContentConfirmedDelivered)
@@ -87,7 +96,11 @@ mod unix_private_file {
             .collect();
         assert_eq!(names.len(), 1, "exactly one live artifact");
         let artifact_path = dir.join(&names[0]);
-        let file_mode = std::fs::metadata(&artifact_path).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&artifact_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(file_mode, 0o600);
         assert_eq!(
             std::fs::read(&artifact_path).unwrap(),
@@ -105,15 +118,26 @@ mod unix_private_file {
             &String::from_utf8(oversized).unwrap(),
             &dir,
         );
-        assert_eq!(outcome, RecoveryOutcome::Skipped(SkipReason::ContentTooLarge));
-        assert!(!dir.exists(), "over-cap content must never touch the filesystem");
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Skipped(SkipReason::ContentTooLarge)
+        );
+        assert!(
+            !dir.exists(),
+            "over-cap content must never touch the filesystem"
+        );
     }
 
     #[test]
     fn exactly_at_cap_is_accepted() {
         let (_tmp, dir) = scratch();
         let exact = "a".repeat(MAX_ARTIFACT_BYTES);
-        let outcome = observe_delivery_at(ClipboardRecovery::PrivateFile, Confidence::Failed, &exact, &dir);
+        let outcome = observe_delivery_at(
+            ClipboardRecovery::PrivateFile,
+            Confidence::Failed,
+            &exact,
+            &dir,
+        );
         assert!(matches!(outcome, RecoveryOutcome::Written { .. }));
     }
 
@@ -129,7 +153,11 @@ mod unix_private_file {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names.len(), 1, "replacement must retire the previous artifact");
+        assert_eq!(
+            names.len(),
+            1,
+            "replacement must retire the previous artifact"
+        );
         let contents = std::fs::read(dir.join(&names[0])).unwrap();
         assert_eq!(contents, b"second");
     }
@@ -145,13 +173,19 @@ mod unix_private_file {
         let artifact = dir.join(&names[0]);
         // Backdate mtime past the expiry window.
         let stale_time = std::time::SystemTime::now() - ARTIFACT_EXPIRY - Duration::from_secs(60);
-        let file = std::fs::OpenOptions::new().write(true).open(&artifact).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact)
+            .unwrap();
         file.set_times(std::fs::FileTimes::new().set_modified(stale_time))
             .unwrap();
         drop(file);
 
         let status = artifact_status(&dir).unwrap();
-        assert!(status.present, "artifact_status still reports the stale entry");
+        assert!(
+            status.present,
+            "artifact_status still reports the stale entry"
+        );
         assert!(status.expired);
 
         let report = reconcile_startup(&dir).unwrap();
@@ -193,7 +227,11 @@ mod crash_reconcile {
         assert!(report.kept);
         assert_eq!(report.removed, 1);
         let remaining: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(remaining.len(), 1, "exactly one artifact survives reconcile");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly one artifact survives reconcile"
+        );
     }
 
     #[test]
@@ -284,7 +322,9 @@ mod unsafe_entries {
     fn wrong_mode_entry_is_reported_and_never_opened_or_deleted() {
         let (_tmp, dir) = scratch();
         let handle = DirHandle::open_or_create(&dir).unwrap();
-        let file = handle.create_file_exclusive("cccccccccccccccccccccccccccccccc").unwrap();
+        let file = handle
+            .create_file_exclusive("cccccccccccccccccccccccccccccccc")
+            .unwrap();
         drop(file);
         std::fs::set_permissions(
             dir.join("cccccccccccccccccccccccccccccccc"),
@@ -436,7 +476,10 @@ fn doctor_output_never_contains_recovered_content() {
     let (lines, has_failures) = doctor::doctor_lines(ClipboardRecovery::PrivateFile, &dir);
     assert!(!has_failures);
     let joined = lines.join("\n");
-    assert!(!joined.contains(SENTINEL), "doctor output leaked content: {joined}");
+    assert!(
+        !joined.contains(SENTINEL),
+        "doctor output leaked content: {joined}"
+    );
     assert!(joined.contains("present"));
 }
 
@@ -486,5 +529,9 @@ fn doctor_reports_unsafe_entry_count_without_opening_it() {
     )
     .unwrap();
     let (lines, _) = doctor::doctor_lines(ClipboardRecovery::PrivateFile, &dir);
-    assert!(lines.iter().any(|l| l.contains("unsafe entries ignored: 1")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("unsafe entries ignored: 1"))
+    );
 }

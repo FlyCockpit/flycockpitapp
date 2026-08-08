@@ -1452,7 +1452,7 @@ async fn search_in_process_preserves_columns_context_glob_and_case_insensitive()
 }
 
 #[tokio::test]
-async fn search_ranking_is_noop_without_existing_index_scores() {
+async fn search_refreshes_index_when_centrality_scores_tie() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "zcore.rs", "// gadget\n");
     write(tmp.path(), "acold.rs", "// gadget\n");
@@ -1474,9 +1474,44 @@ async fn search_ranking_is_noop_without_existing_index_scores() {
     assert_eq!(ranked.content, unranked.content);
     let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
     assert!(
-        index.tree_rows().await.unwrap().is_empty(),
-        "search ranking must not build the index just to rank results"
+        !index.tree_rows().await.unwrap().is_empty(),
+        "search must refresh its Intel index before reading centrality scores"
     );
+}
+
+#[tokio::test]
+async fn search_with_centrality_disabled_does_not_refresh_the_index() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        write(tmp.path(), "src/lib.rs", "// gadget\n");
+        set_centrality(tmp.path(), false);
+        let ctx = test_ctx(tmp.path());
+        let recomputes = Arc::new(AtomicUsize::new(0));
+        set_test_recompute_counter(
+            Some(ctx.session.project_root.to_string_lossy().into_owned()),
+            Some(recomputes.clone()),
+        );
+
+        let out = SearchTool
+            .call(serde_json::json!({ "pattern": "gadget" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("src/lib.rs"), "{}", out.content);
+        assert_eq!(
+            recomputes.load(Ordering::SeqCst),
+            0,
+            "disabled centrality must not build an index for plain text search"
+        );
+        set_test_recompute_counter(None, None);
+        clear_freshness_cache();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1900,8 +1935,10 @@ async fn symbol_find_ranking_flips_order_vs_disabled() {
 #[tokio::test]
 async fn search_ranks_central_file_first_and_is_additive() {
     let tmp = tempfile::tempdir().unwrap();
-    // Both files contain the search term `gadget`; `zcore.rs` is
-    // central (sorts last alphabetically), `acold.rs` is not.
+    // Both files contain the search term `gadget`; `zcore.rs` is central
+    // because ten callers invoke its `beacon` symbol, whereas `acold.rs` is
+    // isolated. Deliberately do not pre-freshen the index: SearchTool must do
+    // that itself before using centrality scores.
     write(tmp.path(), "zcore.rs", "// gadget\npub fn beacon() {}\n");
     write(tmp.path(), "acold.rs", "// gadget\n");
     let mut body = String::from("pub fn run() {\n");
@@ -1923,14 +1960,23 @@ async fn search_ranks_central_file_first_and_is_additive() {
         .lines()
         .filter(|l| l.contains("gadget"))
         .collect();
+    let zcore_position = on_lines
+        .iter()
+        .position(|l| l.contains("zcore.rs"))
+        .expect("search must emit zcore.rs");
+    let acold_position = on_lines
+        .iter()
+        .position(|l| l.contains("acold.rs"))
+        .expect("search must emit acold.rs");
     assert!(
-        on_lines.iter().position(|l| l.contains("zcore.rs"))
-            < on_lines.iter().position(|l| l.contains("acold.rs")),
+        zcore_position < acold_position,
         "central zcore.rs match must come first; got:\n{}",
         on.content
     );
 
-    // OFF: file order (alphabetical from rg) → acold.rs first.
+    // OFF: ranking changes only order, never the matched-file set. Native
+    // walker order is intentionally not asserted because it is filesystem-
+    // dependent rather than alphabetical or a ranking result.
     set_centrality(tmp.path(), false);
     let ctx2 = test_ctx(tmp.path());
     let off = SearchTool

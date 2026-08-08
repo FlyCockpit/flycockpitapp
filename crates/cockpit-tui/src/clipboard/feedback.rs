@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn unverified_with_rich_to_plain_downgrade() {
-        let outcome = classify(&result(Confidence::Unverified, Some(Downgrade::RichToPlain)));
+        let outcome = classify(&result(
+            Confidence::Unverified,
+            Some(Downgrade::RichToPlain),
+        ));
         assert!(outcome.is_unverified());
         assert!(outcome.downgraded);
     }

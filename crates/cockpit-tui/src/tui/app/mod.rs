@@ -63,7 +63,7 @@ use events::{
     tool_invocation,
 };
 use input::accepts_key;
-use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};
+use render::{extract_selection_plaintext, extract_selection_semantic, is_edit_tool};
 #[cfg(test)]
 use slash::{
     AgentCommandOutcome, CopyCommand, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,

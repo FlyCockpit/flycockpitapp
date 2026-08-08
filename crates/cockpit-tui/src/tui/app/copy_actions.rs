@@ -213,16 +213,10 @@ impl App {
         {
             return;
         }
-        let text_to_copy =
-            extract_selection_markdown_source(&self.history, &self.chat_row_meta, area, sel)
-                .unwrap_or_else(|| {
-                    extract_selection_plaintext(
-                        &self.chat_text_grid,
-                        &self.chat_row_meta,
-                        area,
-                        sel,
-                    )
-                });
+        let text_to_copy = extract_selection_semantic(&self.chat_row_meta, area, sel)
+            .unwrap_or_else(|| {
+                extract_selection_plaintext(&self.chat_text_grid, &self.chat_row_meta, area, sel)
+            });
         if text_to_copy.is_empty() {
             return;
         }

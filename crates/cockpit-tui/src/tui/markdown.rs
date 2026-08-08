@@ -18,6 +18,161 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Copy provenance emitted from the Markdown event stream.  `text` is exactly
+/// what the renderer makes semantic (never a delimiter); source offsets are
+/// diagnostic only and are never used to reconstruct clipboard text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyFragment {
+    pub(crate) id: usize,
+    pub(crate) text: String,
+    pub(crate) source: Option<std::ops::Range<usize>>,
+    pub(crate) logical_line: usize,
+    pub(crate) table_cell: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CopyAtom {
+    Fragment(CopyFragment),
+    Newline,
+}
+
+/// Parse Markdown into semantic clipboard atoms.  This deliberately shares
+/// pulldown-cmark's event stream with rendering: formatting/link/code fences
+/// are tags and therefore never become copy fragments, while escapes and
+/// entities arrive already decoded as visible text.
+pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_MATH);
+    opts.insert(Options::ENABLE_TABLES);
+    let mut atoms = Vec::new();
+    let mut id = 0usize;
+    let mut logical_line = 0usize;
+    let mut table_row = None;
+    let mut table_col = 0usize;
+    let mut pending_block_break = 0usize;
+    let normalized = normalize_backslash_math(src);
+    for (event, range) in Parser::new_ext(&normalized, opts).into_offset_iter() {
+        match event {
+            Event::Text(text) | Event::Code(text) | Event::InlineMath(text) => {
+                if pending_block_break > 0 && !atoms.is_empty() {
+                    for _ in 0..pending_block_break {
+                        atoms.push(CopyAtom::Newline);
+                        logical_line += 1;
+                    }
+                }
+                pending_block_break = 0;
+                for grapheme in semantic_graphemes(&text) {
+                    atoms.push(CopyAtom::Fragment(CopyFragment {
+                        id,
+                        text: grapheme,
+                        source: (normalized == src).then_some(range.clone()),
+                        logical_line,
+                        table_cell: table_row.map(|row| (row, table_col)),
+                    }));
+                    id += 1;
+                }
+            }
+            Event::SoftBreak => {
+                // The renderer shows a space, but wrapping this space must not
+                // manufacture a newline.
+                atoms.push(CopyAtom::Fragment(CopyFragment {
+                    id,
+                    text: " ".into(),
+                    source: (normalized == src).then_some(range),
+                    logical_line,
+                    table_cell: table_row.map(|row| (row, table_col)),
+                }));
+                id += 1;
+            }
+            Event::HardBreak => {
+                atoms.push(CopyAtom::Newline);
+                logical_line += 1;
+                pending_block_break = 0;
+            }
+            Event::Start(Tag::TableHead) => table_row = Some(0),
+            Event::Start(Tag::TableRow) => {
+                table_row = Some(table_row.map_or(0, |row| row + 1));
+                table_col = 0;
+            }
+            Event::End(TagEnd::TableCell) => table_col += 1,
+            Event::End(TagEnd::TableRow) => {
+                atoms.push(CopyAtom::Newline);
+                logical_line += 1;
+            }
+            Event::End(TagEnd::TableHead) => {
+                atoms.push(CopyAtom::Newline);
+                logical_line += 1;
+            }
+            Event::End(TagEnd::Table) => {
+                table_row = None;
+                pending_block_break = 2;
+            }
+            Event::End(TagEnd::Paragraph)
+            | Event::End(TagEnd::Heading(_))
+            | Event::End(TagEnd::CodeBlock)
+            | Event::End(TagEnd::BlockQuote(_))
+            | Event::End(TagEnd::List(_)) => pending_block_break = 2,
+            Event::DisplayMath(text) => {
+                if pending_block_break > 0 && !atoms.is_empty() {
+                    for _ in 0..pending_block_break {
+                        atoms.push(CopyAtom::Newline);
+                        logical_line += 1;
+                    }
+                }
+                pending_block_break = 0;
+                for grapheme in semantic_graphemes(&text) {
+                    atoms.push(CopyAtom::Fragment(CopyFragment {
+                        id,
+                        text: grapheme,
+                        source: (normalized == src).then_some(range.clone()),
+                        logical_line,
+                        table_cell: None,
+                    }));
+                    id += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    while matches!(atoms.last(), Some(CopyAtom::Newline)) {
+        atoms.pop();
+    }
+    atoms
+}
+
+/// Small, dependency-free extended-grapheme approximation tailored to cell
+/// identity: combining/variation/modifier characters and every ZWJ-linked
+/// component stay with their base, as do regional-indicator pairs.
+pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut join_next = false;
+    let mut regional_in_last = false;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        let combining = ch.width().unwrap_or(0) == 0
+            || (0xFE00..=0xFE0F).contains(&cp)
+            || (0x1F3FB..=0x1F3FF).contains(&cp)
+            || (0xE0100..=0xE01EF).contains(&cp);
+        let regional = (0x1F1E6..=0x1F1FF).contains(&cp);
+        if combining || join_next || (regional && regional_in_last) {
+            if let Some(last) = out.last_mut() {
+                last.push(ch);
+            } else {
+                out.push(ch.to_string());
+            }
+        } else {
+            out.push(ch.to_string());
+        }
+        join_next = ch == '\u{200d}';
+        regional_in_last = regional && !regional_in_last;
+        if !regional {
+            regional_in_last = false;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 thread_local! {
     static RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1091,5 +1246,115 @@ mod tests {
         let s = render_to_strings("`\\(x\\)` is code");
         let joined = s.join("\n");
         assert!(joined.contains("\\(x\\)"), "code stays literal: {s:?}");
+    }
+
+    fn copied(src: &str) -> String {
+        semantic_copy_atoms(src)
+            .into_iter()
+            .map(|atom| match atom {
+                CopyAtom::Fragment(fragment) => fragment.text,
+                CopyAtom::Newline => "\n".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selection_source_map_survives_wrap_and_viewport_slice() {
+        let atoms = semantic_copy_atoms("alpha **wide界** omega");
+        let ids = atoms
+            .iter()
+            .filter_map(|atom| match atom {
+                CopyAtom::Fragment(fragment) => Some(fragment.id),
+                CopyAtom::Newline => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (0..ids.len()).collect::<Vec<_>>());
+        assert_eq!(copied("alpha **wide界** omega"), "alpha wide界 omega");
+    }
+
+    #[test]
+    fn selection_copies_rendered_semantics_not_raw_markdown() {
+        assert_eq!(
+            copied("**outer _inner_ outer** / **outer**"),
+            "outer inner outer / outer"
+        );
+    }
+
+    #[test]
+    fn selection_decodes_escapes_and_entities() {
+        assert_eq!(copied(r"\*literal\* &amp; &#x1F642; �"), "*literal* & 🙂 �");
+    }
+
+    #[test]
+    fn selection_links_copy_visible_label_only() {
+        assert_eq!(
+            copied("[label](https://secret.example) https://visible.example"),
+            "label https://visible.example"
+        );
+    }
+
+    #[test]
+    fn selection_code_copies_content_without_delimiters() {
+        assert_eq!(
+            copied("`a * b`\n\n```rs\nlet x = 1;\n```"),
+            "a * b\n\nlet x = 1;"
+        );
+    }
+
+    #[test]
+    fn selection_wrap_and_block_newlines_match_visible_layout() {
+        assert_eq!(
+            copied("soft\nwrap  \nhard\n\nblock"),
+            "soft wrap\nhard\n\nblock"
+        );
+    }
+
+    #[test]
+    fn selection_grapheme_identity_is_width_safe() {
+        let values = semantic_graphemes("界 e\u{301} 👩\u{200d}💻 🇺🇸");
+        assert_eq!(
+            values,
+            vec!["界", " ", "e\u{301}", " ", "👩\u{200d}💻", " ", "🇺🇸"]
+        );
+    }
+
+    #[test]
+    fn selection_tab_cells_copy_one_tab() {
+        assert_eq!(copied("`a\tb`"), "a\tb");
+    }
+
+    #[test]
+    fn selection_scrolled_mid_message_preserves_semantic_identity() {
+        let atoms = semantic_copy_atoms("first\nsecond\nthird");
+        let second = atoms
+            .iter()
+            .find_map(|atom| match atom {
+                CopyAtom::Fragment(fragment) if fragment.text == "s" => Some(fragment),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(second.logical_line, 0); // soft breaks remain one semantic line
+        assert!(second.id > 0);
+    }
+
+    #[test]
+    fn selection_table_fragments_exclude_borders_and_padding() {
+        let atoms = semantic_copy_atoms("| A | B |\n|---|---|\n| x | y |");
+        let cells = atoms
+            .iter()
+            .filter_map(|atom| match atom {
+                CopyAtom::Fragment(fragment) => fragment.table_cell,
+                CopyAtom::Newline => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(cells.contains(&(0, 0)) && cells.iter().any(|cell| cell.0 >= 1));
+        assert_eq!(copied("| A | B |\n|---|---|\n| x | y |"), "AB\nxy");
+    }
+
+    #[test]
+    fn selection_unmapped_chrome_never_guesses_source() {
+        let text = copied("# **title**\n\n`code`");
+        assert_eq!(text, "title\n\ncode");
+        assert!(!text.contains('#') && !text.contains('`') && !text.contains('*'));
     }
 }

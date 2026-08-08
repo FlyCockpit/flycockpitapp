@@ -27,6 +27,8 @@ fn message_meta(history_index: usize) -> ChatRowMeta {
         fork_hit: None,
         continuation: false,
         selectable: true,
+        copy_cells: Vec::new(),
+        copy_newlines_before: 0,
     }
 }
 
@@ -66,6 +68,8 @@ fn app_with_selection() -> App {
         fork_hit: None,
         continuation: false,
         selectable: true,
+        copy_cells: Vec::new(),
+        copy_newlines_before: 0,
     }];
     app.selection = Some(Selection {
         anchor: (0, 0),
@@ -208,6 +212,8 @@ fn copy_selection_unmapped_row_falls_back_to_plaintext() {
         fork_hit: None,
         continuation: false,
         selectable: true,
+        copy_cells: Vec::new(),
+        copy_newlines_before: 0,
     });
     app.selection = Some(Selection {
         anchor: (0, 0),

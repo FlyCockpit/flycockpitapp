@@ -726,6 +726,12 @@ pub(crate) struct ChatRowMeta {
     pub fork_hit: Option<PinHit>,
     pub continuation: bool,
     pub selectable: bool,
+    /// Semantic copy provenance for each occupied terminal column. Wide
+    /// graphemes repeat the same fragment identity in every occupied cell.
+    pub copy_cells: Vec<Option<crate::tui::markdown::CopyFragment>>,
+    /// A rendered hard/block boundary precedes this row. Soft wrapping leaves
+    /// this false, so viewport materialization never invents line breaks.
+    pub copy_newlines_before: usize,
 }
 
 impl ChatRowMeta {
@@ -746,6 +752,8 @@ impl ChatRowMeta {
             fork_hit: None,
             continuation: false,
             selectable: false,
+            copy_cells: Vec::new(),
+            copy_newlines_before: 0,
         }
     }
 
@@ -2344,6 +2352,7 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
+        let (copy_rows, copy_breaks) = semantic_copy_rows(entry, lines);
 
         for i in 0..lines.len() {
             let chip_target = if Some(i) == *chip_row {
@@ -2418,6 +2427,8 @@ impl App {
                 fork_hit,
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
+                copy_cells: copy_rows.get(i).cloned().unwrap_or_default(),
+                copy_newlines_before: copy_breaks.get(i).copied().unwrap_or(0),
             });
         }
 
@@ -4260,6 +4271,14 @@ where
                 .cloned()
                 .unwrap_or_else(ChatRowMeta::padding);
             meta.continuation = meta.continuation || part_idx > 0;
+            if part_idx > 0 {
+                meta.copy_newlines_before = 0;
+            }
+            meta.copy_cells = meta
+                .copy_cells
+                .get(start_col..end_col.min(meta.copy_cells.len()))
+                .unwrap_or_default()
+                .to_vec();
             meta.pin_hit = meta
                 .pin_hit
                 .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
@@ -4457,6 +4476,71 @@ fn rendered_line_text(line: &Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+/// Attach parser-emitted semantic fragments to the exact cells occupied by
+/// the corresponding rendered grapheme. Matching is a single forward walk of
+/// the render output and parser event stream; it never searches source text.
+fn semantic_copy_rows(
+    entry: &HistoryEntry,
+    lines: &[Line<'static>],
+) -> (
+    Vec<Vec<Option<crate::tui::markdown::CopyFragment>>>,
+    Vec<usize>,
+) {
+    use crate::tui::markdown::{CopyAtom, semantic_copy_atoms, semantic_graphemes};
+    let source = match entry {
+        HistoryEntry::User {
+            text,
+            cleaned,
+            expanded,
+            preflight_pending,
+            ..
+        } => {
+            if *preflight_pending || cleaned.is_none() || *expanded {
+                text.as_str()
+            } else {
+                cleaned.as_deref().unwrap_or(text)
+            }
+        }
+        HistoryEntry::Agent { text, .. } => text.as_str(),
+        _ => return (vec![Vec::new(); lines.len()], vec![false; lines.len()]),
+    };
+    let atoms = semantic_copy_atoms(source);
+    let mut atom = 0usize;
+    let mut rows = Vec::with_capacity(lines.len());
+    let mut breaks = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let mut hard_breaks = 0usize;
+        let text = rendered_line_text(line);
+        let mut cells = vec![None; text.width()];
+        let mut col = 0usize;
+        for visible in semantic_graphemes(&text) {
+            let width = visible.width().max(1);
+            let mut next_atom = atom;
+            while matches!(atoms.get(next_atom), Some(CopyAtom::Newline)) {
+                next_atom += 1;
+            }
+            let next = atoms.get(next_atom).and_then(|candidate| match candidate {
+                CopyAtom::Fragment(fragment) => Some(fragment),
+                CopyAtom::Newline => None,
+            });
+            if let Some(fragment) = next
+                && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
+            {
+                for cell in col..col.saturating_add(width).min(cells.len()) {
+                    cells[cell] = Some(fragment.clone());
+                }
+                hard_breaks = hard_breaks.max(next_atom - atom);
+                atom = next_atom + 1;
+            }
+            col = col.saturating_add(width);
+        }
+        breaks.push(hard_breaks);
+        rows.push(cells);
+    }
+    (rows, breaks)
 }
 
 fn render_transcript_find_bar(
@@ -4702,78 +4786,6 @@ fn content_bounds(row: &[String]) -> Option<(usize, usize)> {
 ///    with a space instead of a newline so a wrapped paragraph pastes as
 ///    one paragraph, not a stack of short visual lines. Hard line breaks
 ///    (paragraph boundaries) still produce newlines.
-pub(super) fn extract_selection_markdown_source(
-    history: &[HistoryEntry],
-    row_meta: &[ChatRowMeta],
-    area: Rect,
-    sel: Selection,
-) -> Option<String> {
-    let (start, end) = sel.ordered();
-    let mut target: Option<ChatCopyTarget> = None;
-    let mut selected_lines: Vec<usize> = Vec::new();
-    let mut active_target: Option<ChatCopyTarget> = None;
-    let mut source_line: Option<usize> = None;
-
-    for (row_idx, meta) in row_meta.iter().enumerate() {
-        if meta.copy_target != active_target {
-            active_target = meta.copy_target;
-            source_line = if meta.copy_target.is_some() && meta.selectable && !meta.continuation {
-                Some(0)
-            } else {
-                None
-            };
-        } else if meta.copy_target.is_some()
-            && meta.selectable
-            && !meta.continuation
-            && let Some(line) = source_line.as_mut()
-        {
-            *line += 1;
-        }
-
-        let abs_row = area.y.saturating_add(row_idx as u16);
-        if abs_row < start.1 || abs_row > end.1 {
-            continue;
-        }
-        if !meta.selectable {
-            return None;
-        }
-        let copy_target = meta.copy_target?;
-        if target.is_some_and(|existing| existing != copy_target) {
-            return None;
-        }
-        target = Some(copy_target);
-        selected_lines.push(source_line?);
-    }
-
-    let ChatCopyTarget::Message { history_index } = target?;
-    let source = match history.get(history_index)? {
-        HistoryEntry::User { text, .. } | HistoryEntry::Agent { text, .. } => text.as_str(),
-        _ => return None,
-    };
-    let ranges = source_line_ranges(source);
-    let first_line = *selected_lines.iter().min()?;
-    let last_line = *selected_lines.iter().max()?;
-    let start_byte = ranges.get(first_line)?.0;
-    let end_byte = ranges.get(last_line)?.1;
-    let selected = &source[start_byte..end_byte];
-    let selected = selected.strip_suffix('\n').unwrap_or(selected);
-    (!selected.is_empty()).then(|| selected.to_string())
-}
-
-fn source_line_ranges(source: &str) -> Vec<(usize, usize)> {
-    if source.is_empty() {
-        return vec![(0, 0)];
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    for line in source.split_inclusive('\n') {
-        let end = start + line.len();
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
 pub(super) fn extract_selection_plaintext(
     grid: &[Vec<String>],
     row_meta: &[ChatRowMeta],
@@ -4830,6 +4842,65 @@ pub(super) fn extract_selection_plaintext(
         out.push_str(&stripped);
     }
     out
+}
+
+/// Extract parser-owned semantic fragments under a cell selection. Fragment
+/// identity de-duplicates wide/combining graphemes even when the selection
+/// begins on a continuation cell. Rows without provenance (chrome) contribute
+/// nothing; callers may use visible plaintext only when the entire selection
+/// is outside a semantic Markdown message.
+pub(super) fn extract_selection_semantic(
+    row_meta: &[ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+) -> Option<String> {
+    let (start, end) = sel.ordered();
+    let mut out = String::new();
+    let mut last_identity: Option<(Option<usize>, usize)> = None;
+    let mut emitted_row = false;
+    let mut saw_semantic_row = false;
+    for abs_row in start.1..=end.1 {
+        let row_index = abs_row.saturating_sub(area.y) as usize;
+        let Some(meta) = row_meta.get(row_index) else {
+            continue;
+        };
+        if meta.copy_target.is_some() {
+            saw_semantic_row = true;
+        }
+        let first_col = if abs_row == start.1 {
+            start.0.saturating_sub(area.x) as usize
+        } else {
+            0
+        };
+        let last_col = if abs_row == end.1 {
+            end.0.saturating_sub(area.x) as usize
+        } else {
+            meta.copy_cells.len().saturating_sub(1)
+        };
+        let mut row_emitted = false;
+        for fragment in meta
+            .copy_cells
+            .get(first_col..=last_col.min(meta.copy_cells.len().saturating_sub(1)))
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+        {
+            let identity = (meta.history_index, fragment.id);
+            if last_identity == Some(identity) {
+                continue;
+            }
+            if !row_emitted && emitted_row {
+                for _ in 0..meta.copy_newlines_before {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&fragment.text);
+            last_identity = Some(identity);
+            row_emitted = true;
+            emitted_row = true;
+        }
+    }
+    (saw_semantic_row && !out.is_empty()).then_some(out)
 }
 
 /// Rough row count for a history entry. Mirrors the breakdown in

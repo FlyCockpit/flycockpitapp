@@ -1164,6 +1164,8 @@ mod affordance_hover_tests {
             fork_hit: None,
             continuation: false,
             selectable: false,
+            copy_cells: Vec::new(),
+            copy_newlines_before: 0,
         }
     }
 

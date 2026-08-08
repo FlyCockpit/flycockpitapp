@@ -19,6 +19,7 @@ import {
   type RolloutDecision,
   reduceAuthorityRollout,
   type SigningJournalEntry,
+  validateLifecycleTransition,
   verifyRemoteAuthorityStatusJws,
 } from "./remote-authority";
 import { readAuthorityRingFile } from "./remote-authority-file";
@@ -298,6 +299,24 @@ export class RemoteAuthorityRuntime {
           bodyDigest = createHash("sha256")
             .update(canonicalizeRfc8785(candidateBody))
             .digest("hex"),
+          _validatedTransition = validateLifecycleTransition(
+            {
+              transitionId,
+              state: "reserved",
+              fromRevision: lifecycle.revision,
+              toRevision: ring.revision,
+              fromDigest: lifecycle.ringDigest,
+              toDigest: digest,
+              fromAuthorityEpoch: lifecycle.authorityEpoch,
+              toAuthorityEpoch: ring.authorityEpoch,
+              fromCurrentKid: lifecycle.currentKid,
+              toCurrentKid: ring.currentKid,
+              statusGeneration: generation,
+              statusBodyDigest: bodyDigest,
+              signingGeneration: ring.authorityEpoch,
+            },
+            signer.kid,
+          ),
           prepared = await this.options.store.prepareLifecycleTransition({
             transitionId,
             deploymentId: this.config.deploymentId,
@@ -308,6 +327,7 @@ export class RemoteAuthorityRuntime {
             statusBodyDigest: bodyDigest,
             signerKid: signer.kid,
           });
+        void _validatedTransition;
         if (!prepared) return this.#fail("lifecycle_transition_conflict");
         let body = candidateBody,
           compactJws: string;

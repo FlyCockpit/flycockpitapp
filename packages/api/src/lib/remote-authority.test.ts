@@ -1,5 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
-import { chmod, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalizeRfc8785 } from "@flycockpit/cockpit-protocol";
@@ -73,6 +73,30 @@ describe("remote_authority_file_provider_rejects_unsafe_ring", () => {
     expect(() =>
       parseAuthorityRingFile({ ...value, keys: [value.keys[0], value.keys[0]] }),
     ).toThrow();
+    await expect(readAuthorityRingFile("relative.json")).rejects.toThrow("absolute");
+    await chmod(path, 0o600);
+    await expect(readAuthorityRingFile(path, "2", value)).rejects.toThrow("nonmonotonic");
+    const other = makeKey("other", "current");
+    expect(() =>
+      parseAuthorityRingFile({
+        ...value,
+        keys: [{ ...value.keys[0]!, x: other.x, y: other.y }],
+      }),
+    ).toThrow("private/public mismatch");
+    const { d: _private, ...publicOnly } = value.keys[0]!;
+    expect(() => parseAuthorityRingFile({ ...value, keys: [publicOnly] })).toThrow();
+    expect(() =>
+      parseAuthorityRingFile({
+        ...value,
+        keys: [{ ...value.keys[0]!, x: "A".repeat(43), y: "A".repeat(43) }],
+      }),
+    ).toThrow();
+    const unsafe = join(dir, "unsafe");
+    await mkdir(unsafe, { mode: 0o777 });
+    await chmod(unsafe, 0o777);
+    const unsafePath = join(unsafe, "ring.json");
+    await writeFile(unsafePath, JSON.stringify(value), { mode: 0o600 });
+    await expect(readAuthorityRingFile(unsafePath)).rejects.toThrow("parent is unsafe");
   });
 });
 describe("remote_authority_canonical_digest_vectors", () => {

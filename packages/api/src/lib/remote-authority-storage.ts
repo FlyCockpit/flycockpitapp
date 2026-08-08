@@ -488,18 +488,16 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
   }
   async loadFrozenSigningJournalProof(deploymentId: string, kid: string) {
     const fences = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-        `SELECT "signingGeneration","state","cutoff","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2`,
+        `SELECT "signingGeneration","state","cutoff","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='frozen' ORDER BY "signingGeneration" DESC LIMIT 1`,
         deploymentId,
         kid,
       ),
       fence = fences[0];
-    if (!fence || fence.state !== "frozen" || !fence.cutoff)
-      throw new Error("signing fence is not frozen");
+    if (fence?.state !== "frozen" || !fence.cutoff) throw new Error("signing fence is not frozen");
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric ORDER BY "mintId"`,
+      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 ORDER BY "mintId"`,
       deploymentId,
       kid,
-      text(fence.signingGeneration),
     );
     const seconds = (value: unknown) =>
       Math.floor(new Date(value as string).getTime() / 1000).toString();

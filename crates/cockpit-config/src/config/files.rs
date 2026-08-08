@@ -1248,17 +1248,12 @@ fn rename_open_file_on_windows(
                 "Windows destination name is too long",
             )
         })?;
-    // `FileNameLength` excludes the terminator, but the kernel's
-    // FileRenameInformation parser requires one to be present in the buffer.
-    // Supplying only the counted UTF-16 units is rejected by Windows with
-    // ERROR_INVALID_PARAMETER.
-    destination_wide.push(0);
     // `FILE_RENAME_INFO` is variable-length. Its Rust `size_of` includes
     // trailing alignment padding, which is not part of the record passed to
-    // Windows; supply the fixed header, the counted name, and its NUL.
+    // Windows. `FileName` is counted, not NUL-terminated, so pass exactly
+    // the fixed header followed by its UTF-16 name bytes.
     let total_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes as usize)
-        .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1269,7 +1264,7 @@ fn rename_open_file_on_windows(
     let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and large enough for the fixed
-    // header plus the UTF-16 destination bytes and terminator. The parent and
+    // header plus the UTF-16 destination bytes. The parent and
     // source handles remain live for the subsequent rename call.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = true;

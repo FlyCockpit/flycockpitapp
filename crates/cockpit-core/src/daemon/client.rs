@@ -1051,7 +1051,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn negotiation_falls_back_to_current_version_when_hello_is_absent() {
         let (_dir, socket, listener) = bind_test_socket();
         let server = tokio::spawn(async move {
@@ -1186,7 +1186,7 @@ mod tests {
         daemon_task.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn dropped_events_emit_exactly_one_lag_marker() {
         let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));

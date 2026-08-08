@@ -1149,7 +1149,7 @@ async fn turn_loop_retry_then_success_lands_exactly_one_assistant_message() {
     assert_eq!(assistant_messages[0].data["text"], "retry recovered");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn turn_loop_cancellation_mid_stream_does_not_persist_partial_output() {
     let mut provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)

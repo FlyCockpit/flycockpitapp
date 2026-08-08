@@ -20,6 +20,14 @@ async fn typed_client_sends_request_and_receives_event() {
     let daemon = SpawnedDaemon::start().await;
     let client = daemon.client().await;
 
+    // Connecting receives the daemon's initial global-state snapshot before
+    // any request-triggered broadcasts. Consume that snapshot so the next
+    // caffeinate event is the transition initiated below.
+    let _initial = client
+        .next_caffeinate_state(Duration::from_secs(5))
+        .await
+        .expect("initial caffeinate state");
+
     let status = client.status().await.expect("daemon status response");
     assert_eq!(
         status.socket_path,

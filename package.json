@@ -63,11 +63,11 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.0",
+    "@biomejs/biome": "^2.5.6",
     "@flycockpit/config": "workspace:*",
     "@types/node": "catalog:",
     "knip": "^6.17.1",
-    "lefthook": "^2.1.9",
+    "lefthook": "^2.1.10",
     "react-doctor": "^0.5.6",
     "tsx": "catalog:",
     "turbo": "^2.9.18",

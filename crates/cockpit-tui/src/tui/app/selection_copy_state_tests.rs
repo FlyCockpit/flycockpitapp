@@ -28,7 +28,9 @@ fn message_meta(history_index: usize) -> ChatRowMeta {
         continuation: false,
         selectable: true,
         copy_cells: Vec::new(),
+        copy_fragments: std::rc::Rc::new(Vec::new()),
         copy_newlines_before: 0,
+        copy_fallback_if_unmapped: false,
     }
 }
 
@@ -69,7 +71,9 @@ fn app_with_selection() -> App {
         continuation: false,
         selectable: true,
         copy_cells: Vec::new(),
+        copy_fragments: std::rc::Rc::new(Vec::new()),
         copy_newlines_before: 0,
+        copy_fallback_if_unmapped: false,
     }];
     app.selection = Some(Selection {
         anchor: (0, 0),
@@ -213,7 +217,9 @@ fn copy_selection_unmapped_row_falls_back_to_plaintext() {
         continuation: false,
         selectable: true,
         copy_cells: Vec::new(),
+        copy_fragments: std::rc::Rc::new(Vec::new()),
         copy_newlines_before: 0,
+        copy_fallback_if_unmapped: false,
     });
     app.selection = Some(Selection {
         anchor: (0, 0),

@@ -28,8 +28,9 @@ use crate::tui::composer::{
 };
 use crate::tui::geometry::{INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneGeometry};
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, ToolCallState, agent_display_label,
-    format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
+    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, TIMESTAMP_RIGHT_MARGIN, TIMESTAMP_WIDTH,
+    ToolCallState, agent_display_label, format_status_elapsed, render_entry,
+    render_pending_incremental, thinking_dots_padded,
 };
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,
@@ -728,10 +729,16 @@ pub(crate) struct ChatRowMeta {
     pub selectable: bool,
     /// Semantic copy provenance for each occupied terminal column. Wide
     /// graphemes repeat the same fragment identity in every occupied cell.
-    pub copy_cells: Vec<Option<Rc<crate::tui::markdown::CopyFragment>>>,
+    pub copy_cells: Vec<Option<u32>>,
+    /// One shared fragment table per rendered message; cells retain compact
+    /// ids rather than cloning fragment payloads throughout the row cache.
+    pub copy_fragments: Rc<Vec<crate::tui::markdown::CopyFragment>>,
     /// A rendered hard/block boundary precedes this row. Soft wrapping leaves
     /// this false, so viewport materialization never invents line breaks.
     pub copy_newlines_before: usize,
+    /// This selectable message row is visible plaintext outside the mapped
+    /// Markdown body (for example Markdown-disabled text or reasoning).
+    pub copy_fallback_if_unmapped: bool,
 }
 
 impl ChatRowMeta {
@@ -753,7 +760,9 @@ impl ChatRowMeta {
             continuation: false,
             selectable: false,
             copy_cells: Vec::new(),
+            copy_fragments: Rc::new(Vec::new()),
             copy_newlines_before: 0,
+            copy_fallback_if_unmapped: false,
         }
     }
 
@@ -2334,6 +2343,7 @@ impl App {
         entry: &HistoryEntry,
         idx: usize,
         rendered: &Rendered,
+        render_width: usize,
     ) -> Vec<ChatRowMeta> {
         let Rendered {
             lines,
@@ -2353,7 +2363,14 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
-        let (copy_rows, copy_breaks) = semantic_copy_rows(entry, lines, *copy_body_start);
+        let (copy_rows, copy_breaks, copy_fragments) = semantic_copy_rows(
+            entry,
+            lines,
+            continuations,
+            *copy_body_start,
+            render_width,
+            pin_region.as_ref(),
+        );
 
         for i in 0..lines.len() {
             let chip_target = if Some(i) == *chip_row {
@@ -2429,7 +2446,10 @@ impl App {
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
                 copy_cells: copy_rows.get(i).cloned().unwrap_or_default(),
+                copy_fragments: Rc::clone(&copy_fragments),
                 copy_newlines_before: copy_breaks.get(i).copied().unwrap_or(0),
+                copy_fallback_if_unmapped: base_copy.is_some()
+                    && copy_body_start.is_none_or(|start| i < start),
             });
         }
 
@@ -2519,8 +2539,12 @@ impl App {
                             preflight_dots_ms,
                             pin,
                         ));
-                        let entry_row_meta =
-                            Self::row_meta_for_rendered_entry(entry, idx, &rendered);
+                        let entry_row_meta = Self::row_meta_for_rendered_entry(
+                            entry,
+                            idx,
+                            &rendered,
+                            area.width as usize,
+                        );
                         let prewrapped = Rc::new(prewrap_entry_rows(
                             &rendered.lines,
                             &entry_row_meta,
@@ -4485,16 +4509,24 @@ fn rendered_line_text(line: &Line<'_>) -> String {
 fn semantic_copy_rows(
     entry: &HistoryEntry,
     lines: &[Line<'static>],
+    continuations: &[bool],
     body_start: Option<usize>,
+    render_width: usize,
+    pin_region: Option<&crate::tui::history::PinRegion>,
 ) -> (
-    Vec<Vec<Option<Rc<crate::tui::markdown::CopyFragment>>>>,
+    Vec<Vec<Option<u32>>>,
     Vec<usize>,
+    Rc<Vec<crate::tui::markdown::CopyFragment>>,
 ) {
     use crate::tui::markdown::{CopyAtom, semantic_copy_atoms, semantic_graphemes};
     let Some(body_start) = body_start else {
-        return (vec![Vec::new(); lines.len()], vec![0; lines.len()]);
+        return (
+            vec![Vec::new(); lines.len()],
+            vec![0; lines.len()],
+            Rc::new(Vec::new()),
+        );
     };
-    let source = match entry {
+    let (source, semantic_width, external_prefix, body_has_timestamp) = match entry {
         HistoryEntry::User {
             text,
             cleaned,
@@ -4503,25 +4535,64 @@ fn semantic_copy_rows(
             ..
         } => {
             if *preflight_pending || cleaned.is_none() || *expanded {
-                text.as_str()
+                (
+                    text.as_str(),
+                    render_width.saturating_sub(4).max(1),
+                    2,
+                    true,
+                )
             } else {
-                cleaned.as_deref().unwrap_or(text)
+                (
+                    cleaned.as_deref().unwrap_or(text),
+                    render_width.saturating_sub(4).max(1),
+                    2,
+                    true,
+                )
             }
         }
-        HistoryEntry::Agent { text, .. } => text.as_str(),
-        _ => return (vec![Vec::new(); lines.len()], vec![0; lines.len()]),
+        HistoryEntry::Agent { text, .. } => (
+            text.as_str(),
+            render_width.saturating_sub(2 * AGENT_INDENT).max(1),
+            AGENT_INDENT,
+            body_start == 0,
+        ),
+        _ => {
+            return (
+                vec![Vec::new(); lines.len()],
+                vec![0; lines.len()],
+                Rc::new(Vec::new()),
+            );
+        }
     };
-    let semantic_width = lines
-        .iter()
-        .map(|line| rendered_line_text(line).width())
-        .max()
-        .unwrap_or(1)
-        .max(1);
     let atoms = semantic_copy_atoms(source, semantic_width);
+    let fragments = Rc::new(
+        atoms
+            .iter()
+            .filter_map(|atom| match atom {
+                CopyAtom::Fragment(fragment) => Some(fragment.clone()),
+                CopyAtom::Newline => None,
+            })
+            .collect::<Vec<_>>(),
+    );
     let mut atom = 0usize;
     let mut used = std::collections::HashSet::new();
     let mut rows = Vec::with_capacity(lines.len());
     let mut breaks = Vec::with_capacity(lines.len());
+    let mut previous_mapped_row = None;
+    let first_body_end = pin_region
+        .into_iter()
+        .filter(|region| region.row == body_start)
+        .flat_map(|region| [Some(region.col_start), region.fork_col_start])
+        .flatten()
+        .map(usize::from)
+        .min()
+        .unwrap_or_else(|| {
+            if body_has_timestamp {
+                render_width.saturating_sub(TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN)
+            } else {
+                render_width
+            }
+        });
 
     for (row_index, line) in lines.iter().enumerate() {
         let mut hard_breaks = 0usize;
@@ -4533,7 +4604,11 @@ fn semantic_copy_rows(
             continue;
         }
         let mut col = 0usize;
+        let mut row_emitted = false;
         for visible in semantic_graphemes(&text) {
+            if row_index == body_start && col >= first_body_end {
+                break;
+            }
             let width = visible.width().max(1);
             while atoms.get(atom).is_some_and(|candidate| match candidate {
                 CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
@@ -4542,7 +4617,7 @@ fn semantic_copy_rows(
                 atom += 1;
             }
             let mut next_atom = atom;
-            while matches!(atoms.get(next_atom), Some(CopyAtom::Newline)) {
+            while !row_emitted && matches!(atoms.get(next_atom), Some(CopyAtom::Newline)) {
                 next_atom += 1;
             }
             let mut next = atoms.get(next_atom).and_then(|candidate| match candidate {
@@ -4551,7 +4626,8 @@ fn semantic_copy_rows(
                 CopyAtom::Fragment(_) => None,
             });
             let mut matched_atom = next_atom;
-            if next.is_some_and(|fragment| fragment.text != visible)
+            if visible != " "
+                && next.is_some_and(|fragment| fragment.text != visible)
                 && next.is_some_and(|fragment| fragment.table_cell.is_some())
                 && let Some((index, fragment)) =
                     atoms
@@ -4574,9 +4650,9 @@ fn semantic_copy_rows(
             if let Some(fragment) = next
                 && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
             {
-                let shared = Rc::new(fragment.clone());
                 let fragment_width = if fragment.text == "\t" {
-                    4 - col % 4
+                    crate::tui::markdown::TAB_STOP
+                        - col.saturating_sub(external_prefix) % crate::tui::markdown::TAB_STOP
                 } else {
                     width
                 };
@@ -4585,9 +4661,10 @@ fn semantic_copy_rows(
                     .take(col.saturating_add(fragment_width))
                     .skip(col)
                 {
-                    *cell = Some(Rc::clone(&shared));
+                    *cell = u32::try_from(fragment.id).ok();
                 }
                 used.insert(fragment.id);
+                row_emitted = true;
                 if matched_atom == next_atom {
                     hard_breaks = hard_breaks.max(next_atom - atom);
                     atom = next_atom + 1;
@@ -4595,10 +4672,22 @@ fn semantic_copy_rows(
             }
             col = col.saturating_add(width);
         }
+        if row_emitted {
+            if let Some(previous) = previous_mapped_row {
+                hard_breaks = if continuations.get(row_index).copied().unwrap_or(false) {
+                    0
+                } else {
+                    row_index.saturating_sub(previous)
+                };
+            } else {
+                hard_breaks = 0;
+            }
+            previous_mapped_row = Some(row_index);
+        }
         breaks.push(hard_breaks);
         rows.push(cells);
     }
-    (rows, breaks)
+    (rows, breaks, fragments)
 }
 
 fn render_transcript_find_bar(
@@ -4942,13 +5031,14 @@ pub(super) fn extract_selection_semantic(
         };
         let mut row_emitted = false;
         let mut row_table_cell = None;
-        for fragment in meta
+        for fragment_id in meta
             .copy_cells
             .get(first_col..=last_col.min(meta.copy_cells.len().saturating_sub(1)))
             .unwrap_or_default()
             .iter()
             .flatten()
         {
+            let fragment = meta.copy_fragments.get(*fragment_id as usize)?;
             let identity = (meta.history_index, fragment.id);
             if last_identity == Some(identity) {
                 continue;
@@ -4971,6 +5061,9 @@ pub(super) fn extract_selection_semantic(
             emitted_row = true;
             last_message = meta.history_index;
             row_table_cell = fragment.table_cell.or(row_table_cell);
+        }
+        if !row_emitted && meta.copy_fallback_if_unmapped {
+            return None;
         }
     }
     (saw_semantic_row && !out.is_empty()).then_some(out)
@@ -6528,7 +6621,12 @@ mod render_history_spacing_tests {
                 preflight_dots_ms,
                 pin,
             );
-            row_meta.extend(App::row_meta_for_rendered_entry(entry, idx, &rendered));
+            row_meta.extend(App::row_meta_for_rendered_entry(
+                entry,
+                idx,
+                &rendered,
+                width as usize,
+            ));
             all.extend(rendered.lines);
             if gap_after_entry(&app.history, idx, entry) {
                 all.push(Line::default());

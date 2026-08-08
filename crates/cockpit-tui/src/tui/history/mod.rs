@@ -573,7 +573,7 @@ const AGENT_BULLET: &str = "";
 pub const AGENT_INDENT: usize = 2;
 /// Right-side margin that transcript timestamps keep clear, matching the
 /// transcript hover inset.
-const TIMESTAMP_RIGHT_MARGIN: usize = AGENT_INDENT;
+pub(crate) const TIMESTAMP_RIGHT_MARGIN: usize = AGENT_INDENT;
 
 /// One rendered history entry. The chrome assembles a flat list of
 /// `Rendered` for the chat pane, then uses each entry's `chip_row` to

@@ -258,7 +258,7 @@ const HEADING_FG: Color = Color::Indexed(81); // light cyan
 const QUOTE_FG: Color = Color::Indexed(244); // mid grey
 const LINK_FG: Color = Color::Indexed(75); // sky blue
 const MATH_FG: Color = Color::Indexed(151); // soft green
-const TAB_STOP: usize = 4;
+pub(crate) const TAB_STOP: usize = 4;
 
 fn expand_tabs(text: &str, start_col: usize) -> String {
     let mut out = String::with_capacity(text.len());
@@ -773,7 +773,11 @@ impl Emitter {
                     ));
                 }
                 if trimmed_nl.is_some() {
-                    self.flush_line();
+                    if self.current.is_empty() {
+                        self.lines.push(Line::default());
+                    } else {
+                        self.flush_line();
+                    }
                 }
             }
             return;

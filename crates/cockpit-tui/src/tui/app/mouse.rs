@@ -1165,7 +1165,9 @@ mod affordance_hover_tests {
             continuation: false,
             selectable: false,
             copy_cells: Vec::new(),
+            copy_fragments: std::rc::Rc::new(Vec::new()),
             copy_newlines_before: 0,
+            copy_fallback_if_unmapped: false,
         }
     }
 

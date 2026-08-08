@@ -850,6 +850,74 @@ export function authorityRetirementFloor(cutoff: string) {
   ).toString();
 }
 
+export interface FrozenSigningJournalProof {
+  schemaVersion: 1;
+  deploymentId: string;
+  kid: string;
+  signingGeneration: string;
+  state: "frozen";
+  cutoff: string;
+  frozenAt: string;
+  rows: Array<{
+    mintId: string;
+    state: "finalized" | "aborted";
+    signedAt: string | null;
+  }>;
+}
+export function validateFrozenSigningJournalProof(
+  input: unknown,
+  expected: { deploymentId: string; kid: string },
+): FrozenSigningJournalProof {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new Error("invalid signing journal proof");
+  exact(
+    input,
+    [
+      "schemaVersion",
+      "deploymentId",
+      "kid",
+      "signingGeneration",
+      "state",
+      "cutoff",
+      "frozenAt",
+      "rows",
+    ],
+    "signing journal proof",
+  );
+  const proof = input as FrozenSigningJournalProof;
+  if (
+    proof.schemaVersion !== 1 ||
+    proof.state !== "frozen" ||
+    proof.deploymentId !== expected.deploymentId ||
+    proof.kid !== expected.kid ||
+    !Array.isArray(proof.rows)
+  )
+    throw new Error("signing journal proof scope mismatch");
+  u64(proof.signingGeneration, "signing generation");
+  u64(proof.cutoff, "signing cutoff");
+  u64(proof.frozenAt, "frozen time");
+  const finalized: bigint[] = [];
+  for (const row of proof.rows) {
+    exact(row, ["mintId", "state", "signedAt"], "signing journal row");
+    if (
+      typeof row.mintId !== "string" ||
+      !row.mintId ||
+      (row.state !== "finalized" && row.state !== "aborted")
+    )
+      throw new Error("invalid signing journal row");
+    if (row.state === "finalized") {
+      if (row.signedAt === null) throw new Error("finalized signature lacks Postgres time");
+      u64(row.signedAt, "signature time");
+      finalized.push(BigInt(row.signedAt));
+    } else if (row.signedAt !== null) throw new Error("aborted signature has a signing time");
+  }
+  const proven = finalized.length
+    ? finalized.reduce((left, right) => (left > right ? left : right)).toString()
+    : proof.frozenAt;
+  if (proof.cutoff !== proven) throw new Error("signing cutoff is not journal-proven");
+  return proof;
+}
+
 export interface LifecycleTransition {
   transitionId: string;
   state: "reserved" | "status_signed" | "committed" | "aborted";

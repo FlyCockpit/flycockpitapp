@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { generateKeyPairSync } from "node:crypto";
-import { open, rename, unlink } from "node:fs/promises";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   type AuthorityPrivateKey,
@@ -10,6 +10,7 @@ import {
   parseAuthorityConfig,
   parseAuthorityRingFile,
   publicAuthorityRing,
+  validateFrozenSigningJournalProof,
   validateThreeDigestPlan,
 } from "../packages/api/src/lib/remote-authority";
 import { readAuthorityRingFile } from "../packages/api/src/lib/remote-authority-file";
@@ -37,6 +38,13 @@ const config = () =>
 async function load(path: string) {
   if (!isAbsolute(path)) throw new Error("input path must be absolute");
   return readAuthorityRingFile(path);
+}
+async function loadPrivateJson(path: string) {
+  if (!isAbsolute(path)) throw new Error("proof path must be absolute");
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o077) !== 0)
+    throw new Error("proof must be an owner-private regular file");
+  return JSON.parse(await readFile(path, "utf8")) as unknown;
 }
 async function write(path: string, ring: AuthorityRingFile) {
   if (!isAbsolute(path) || resolve(path) === resolve(flags.get("input") ?? "."))
@@ -158,7 +166,11 @@ async function main() {
     } else if (command === "retire") {
       const kid = required("kid"),
         target = prior.keys.find((key) => key.kid === kid),
-        cutoff = BigInt(required("signing-cutoff")),
+        proof = validateFrozenSigningJournalProof(
+          await loadPrivateJson(required("signing-journal-proof")),
+          { deploymentId: cfg.deploymentId, kid },
+        ),
+        cutoff = BigInt(proof.cutoff),
         now = BigInt(required("effective-at"));
       if (target?.state !== "verification_only" || target.retireAt !== null)
         throw new Error("only an unretired verification-only key may retire");

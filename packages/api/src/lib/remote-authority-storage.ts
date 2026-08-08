@@ -6,6 +6,7 @@ import {
   publicAuthorityRingDigest,
   type RemoteAuthorityStatusV1,
   type SigningJournalEntry,
+  validateFrozenSigningJournalProof,
 } from "./remote-authority";
 import type {
   AuthorityLifecycleRecord,
@@ -449,6 +450,41 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       { isolationLevel: "Serializable" },
     );
   }
+  async loadFrozenSigningJournalProof(deploymentId: string, kid: string) {
+    const fences = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
+        `SELECT "signingGeneration","state","cutoff","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2`,
+        deploymentId,
+        kid,
+      ),
+      fence = fences[0];
+    if (!fence || fence.state !== "frozen" || !fence.cutoff)
+      throw new Error("signing fence is not frozen");
+    const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
+      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric ORDER BY "mintId"`,
+      deploymentId,
+      kid,
+      text(fence.signingGeneration),
+    );
+    const seconds = (value: unknown) =>
+      Math.floor(new Date(value as string).getTime() / 1000).toString();
+    return validateFrozenSigningJournalProof(
+      {
+        schemaVersion: 1,
+        deploymentId,
+        kid,
+        signingGeneration: text(fence.signingGeneration),
+        state: "frozen",
+        cutoff: seconds(fence.cutoff),
+        frozenAt: seconds(fence.updatedAt),
+        rows: rows.map((row) => ({
+          mintId: text(row.mintId),
+          state: text(row.state),
+          signedAt: row.signedAt ? seconds(row.signedAt) : null,
+        })),
+      },
+      { deploymentId, kid },
+    );
+  }
   async finalizeMint(args: {
     mintId: string;
     signingGeneration: string;
@@ -456,13 +492,24 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     signatureP1363: string;
     compactJws: string;
   }) {
-    await this.db.$executeRawUnsafe(
-      `UPDATE remote_authority_signing_journal SET "state"='finalized',"signatureP1363"=$4,"compactJws"=$5,"signedAt"=NOW(),"updatedAt"=NOW() WHERE "mintId"=$1 AND "signingGeneration"=$2::numeric AND "claimsHash"=$3 AND "state"='reserved'`,
-      args.mintId,
-      args.signingGeneration,
-      args.claimsHash,
-      args.signatureP1363,
-      args.compactJws,
+    await this.db.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_journal SET "state"='signed',"signatureP1363"=$4,"compactJws"=$5,"updatedAt"=NOW() WHERE "mintId"=$1 AND "signingGeneration"=$2::numeric AND "claimsHash"=$3 AND "state"='reserved'`,
+          args.mintId,
+          args.signingGeneration,
+          args.claimsHash,
+          args.signatureP1363,
+          args.compactJws,
+        );
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_journal j SET "state"='finalized',"signedAt"=NOW(),"updatedAt"=NOW() FROM remote_authority_signing_fences f WHERE j."mintId"=$1 AND j."signingGeneration"=$2::numeric AND j."claimsHash"=$3 AND j."state"='signed' AND f."deploymentId"=j."deploymentId" AND f."kid"=j."kid" AND f."signingGeneration"=j."signingGeneration" AND (f."state"='open' OR f."state"='closing')`,
+          args.mintId,
+          args.signingGeneration,
+          args.claimsHash,
+        );
+      },
+      { isolationLevel: "Serializable" },
     );
     return this.getMint(args.mintId);
   }

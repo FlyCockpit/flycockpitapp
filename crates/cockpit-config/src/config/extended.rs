@@ -23,6 +23,7 @@ mod data_syntax;
 mod delegation;
 mod guards;
 mod harness;
+pub mod hooks;
 mod lsp;
 mod resource_scheduler;
 pub mod tui;
@@ -48,6 +49,11 @@ pub use guards::{
 pub use harness::{
     ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, PromptInputMode,
     SystemPromptConfig, builtin_harness_presets, resolve_harnesses,
+};
+pub use hooks::{
+    HookApplicability, HookConfigSource, HookEvent, HookEventPolicy, HookGate, HookMatcherPolicy,
+    HookOrigin, HookRegistry, HookSourceKind, HookWarning, ResolvedHook, resolve_hooks_for_cwd,
+    resolve_hooks_from_sources,
 };
 #[allow(unused_imports)]
 pub use lsp::{

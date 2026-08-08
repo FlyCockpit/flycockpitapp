@@ -1051,7 +1051,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn negotiation_falls_back_to_current_version_when_hello_is_absent() {
         let (_dir, socket, listener) = bind_test_socket();
         let server = tokio::spawn(async move {
@@ -1157,7 +1157,7 @@ mod tests {
         assert!(remove_pending_request(&mut pending, id).is_none());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn full_event_queue_does_not_block_pending_requests() {
         let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));

@@ -196,14 +196,16 @@ fn publish_no_replace(
     let dest_wide = wide(dest_name);
     let name_bytes = ((dest_wide.len() - 1) * std::mem::size_of::<u16>()) as u32;
     let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let total_bytes = header_bytes + name_bytes as usize;
+    // `FileNameLength` excludes the terminator, but Windows requires the
+    // variable-length buffer passed to FileRenameInfoEx to include one.
+    let total_bytes = header_bytes + name_bytes as usize + std::mem::size_of::<u16>();
     let word_bytes = std::mem::size_of::<usize>();
     let mut storage = vec![0usize; total_bytes.div_ceil(word_bytes)];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and large enough for the fixed
-    // header plus the exact UTF-16 destination bytes (no trailing NUL —
-    // `FileNameLength` is exact). `parent` is the live, retained directory
-    // handle; `temp` was opened with `DELETE` access.
+    // header plus the UTF-16 destination bytes and terminator. `parent` is
+    // the live, retained directory handle; `temp` was opened with `DELETE`
+    // access.
     unsafe {
         (*info).Anonymous.Flags = 0; // No `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`.
         (*info).RootDirectory = parent;
@@ -211,7 +213,7 @@ fn publish_no_replace(
         std::ptr::copy_nonoverlapping(
             dest_wide.as_ptr(),
             std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            dest_wide.len() - 1,
+            dest_wide.len(),
         );
     }
     // SAFETY: `info` points to a live, correctly sized rename-info buffer.

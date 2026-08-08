@@ -1480,6 +1480,41 @@ async fn search_refreshes_index_when_centrality_scores_tie() {
 }
 
 #[tokio::test]
+async fn search_with_centrality_disabled_does_not_refresh_the_index() {
+    let _guard = test_recompute_counter_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::scope_workspace_trust_policy(policy, async {
+        write(tmp.path(), "src/lib.rs", "// gadget\n");
+        set_centrality(tmp.path(), false);
+        let ctx = test_ctx(tmp.path());
+        let recomputes = Arc::new(AtomicUsize::new(0));
+        set_test_recompute_counter(
+            Some(ctx.session.project_root.to_string_lossy().into_owned()),
+            Some(recomputes.clone()),
+        );
+
+        let out = SearchTool
+            .call(serde_json::json!({ "pattern": "gadget" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("src/lib.rs"), "{}", out.content);
+        assert_eq!(
+            recomputes.load(Ordering::SeqCst),
+            0,
+            "disabled centrality must not build an index for plain text search"
+        );
+        set_test_recompute_counter(None, None);
+        clear_freshness_cache();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn search_thins_large_line_results_before_budgeting() {
     let tmp = tempfile::tempdir().unwrap();
     let mut body = String::new();

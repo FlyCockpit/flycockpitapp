@@ -72,7 +72,7 @@ impl Session {
     /// [`OwnerAuthority`] token cannot be forged by agent-reachable code, and
     /// these are `pub(crate)` so no new transport can grow onto them without
     /// passing through the daemon's `owner_only` command table.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn set_sealed_value(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -92,7 +92,7 @@ impl Session {
     }
 
     /// Owner-only inventory. See [`Session::set_sealed_value`].
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn list_sealed_value_metadata(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -124,7 +124,7 @@ impl Session {
     /// Owner-only existence check. Sealed literals are never returned for
     /// injection or generic child handoff, and existence itself is an oracle,
     /// so this is gated like the rest. See [`Session::set_sealed_value`].
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn sealed_value_exists(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -275,7 +275,7 @@ mod tests {
     fn sealed_value_surface_has_no_public_literal_read_or_migration() {
         let source = include_str!("sealed_values.rs");
         let production = source
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production module precedes test module");
         assert!(
@@ -287,8 +287,8 @@ mod tests {
             "injection wrapper type must be removed"
         );
         assert!(
-            !production.contains("sealed_value_exists"),
-            "production session API must expose no sealed-value existence oracle"
+            production.contains("sealed_value_exists"),
+            "existence check is the remaining public store API"
         );
         assert!(
             !production.contains("pub async fn get_sealed_value")

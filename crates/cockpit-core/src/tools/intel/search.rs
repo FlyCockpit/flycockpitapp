@@ -121,16 +121,6 @@ impl Tool for SearchTool {
             return Ok(refusal);
         }
 
-        // Keep the call graph current before reading centrality scores below.
-        // Unlike the structural intel tools, `search` reads file contents
-        // directly; without this refresh, a new session has an empty
-        // `intel_callsites` table and centrality ranking silently degenerates
-        // into filesystem enumeration order.
-        let index = index_of(ctx);
-        index
-            .ensure_fresh_scoped(freshen_options(ctx, path.map(|p| rel_path(p, ctx))))
-            .await?;
-
         let options = SearchOptions {
             pattern: pattern.to_string(),
             case_insensitive,
@@ -178,8 +168,25 @@ impl Tool for SearchTool {
         // ranking on vs off (verified by the additive test). When disabled
         // the body is emitted verbatim in rg/grep file order.
         let ranked_body = if crate::config::extended::resolve_centrality_ranking(&ctx.cwd) {
-            let scores = index.centrality_scores().await?;
-            rank_search_body(&body, &scores, path)
+            // Ranking is an optional presentation enhancement. Search remains
+            // available when its best-effort index refresh cannot run.
+            let index = index_of(ctx);
+            match index
+                .ensure_fresh_scoped(freshen_options(ctx, path.map(|p| rel_path(p, ctx))))
+                .await
+            {
+                Ok(_) => match index.centrality_scores().await {
+                    Ok(scores) => rank_search_body(&body, &scores, path),
+                    Err(error) => {
+                        tracing::debug!(%error, "skipping search centrality ranking");
+                        body
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(%error, "skipping search centrality refresh");
+                    body
+                }
+            }
         } else {
             body
         };

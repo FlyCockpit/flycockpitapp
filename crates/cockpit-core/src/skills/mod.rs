@@ -370,11 +370,7 @@ fn package_target_for_path_with_skill(
     cfg: &SkillsConfig,
 ) -> Option<(SkillPackageTarget, Skill)> {
     let path = lexical_absolute_against(path, cwd);
-    // Write validation must inspect every configured package, even when the
-    // current workspace is untrusted and normal skill discovery suppresses
-    // its contents. Otherwise an untrusted-policy gap would let a write
-    // bypass package integrity and read-only provenance checks.
-    let scan_dirs = resolve_configured_scan_dirs(cwd, cfg);
+    let scan_dirs = resolve_scan_dirs(cwd, cfg);
     if !scan_dirs
         .iter()
         .map(|dir| lexical_absolute_against(dir, cwd))
@@ -382,7 +378,7 @@ fn package_target_for_path_with_skill(
     {
         return None;
     }
-    let skills = discover_uncached(&scan_dirs);
+    let skills = discover(cwd, cfg).ok()?;
     for skill in skills {
         let package_root = lexical_absolute_against(package_root(&skill), cwd);
         if !path.starts_with(&package_root) || path == package_root {
@@ -1613,6 +1609,32 @@ mod tests {
         .unwrap();
 
         assert!(found.is_empty(), "repo-local skill must be invisible");
+    }
+
+    #[test]
+    fn ignored_workspace_skill_is_not_treated_as_a_managed_write_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join(".agents").join("skills");
+        write_skill(
+            &scan,
+            "local",
+            "---\nname: local\ndescription: d\n---\n",
+            "B",
+        );
+        let cfg = skills_cfg(vec![".agents/skills"], false);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
+
+        let target = crate::config::trust::with_workspace_trust_policy(policy, || {
+            package_target_for_path(&scan.join("local/SKILL.md"), tmp.path(), &cfg)
+        });
+
+        assert!(
+            target.is_none(),
+            "untrusted skill directories remain plain paths"
+        );
     }
 
     #[test]

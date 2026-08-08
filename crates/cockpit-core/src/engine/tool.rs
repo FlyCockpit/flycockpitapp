@@ -282,7 +282,8 @@ impl ReviewCage {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .viewed_package_roots
-            .contains(&package_root)
+            .iter()
+            .any(|viewed| paths_refer_to_same_directory(viewed, &package_root))
     }
 
     pub fn preauthorizes_package_path(&self, path: &Path) -> bool {
@@ -309,6 +310,14 @@ impl ReviewCage {
             .unwrap_or_else(|err| err.into_inner())
             .max_dispatches
     }
+}
+
+fn paths_refer_to_same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
 }
 
 fn sorted_csv(values: &HashSet<String>) -> String {
@@ -398,6 +407,22 @@ mod typed_args_tests {
         cage.record_skill_package_view("new-skill", &root);
         assert!(cage.skill_package_was_viewed(&root));
         assert!(cage.preauthorizes_package_path(&root.join("SKILL.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_cage_matches_a_viewed_skill_through_workspace_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let physical = tmp.path().join("workspace");
+        let package = physical.join(".agents/skills/example");
+        std::fs::create_dir_all(&package).unwrap();
+        let alias = tmp.path().join("workspace-alias");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let cage = ReviewCage::skills_review();
+
+        cage.record_skill_package_view("example", &alias.join(".agents/skills/example"));
+
+        assert!(cage.skill_package_was_viewed(&package));
     }
 
     #[test]

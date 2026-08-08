@@ -162,18 +162,15 @@ fn open_directory_nofollow(
 // macOS exposes `/var` and `/tmp` as root-owned symlinks into `/private`.
 // Keep component traversal no-follow for caller-controlled paths while using
 // their physical spelling for these two immutable system aliases.
-#[cfg(all(unix, target_os = "macos"))]
-fn normalize_macos_system_path(path: &Path) -> PathBuf {
-    for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
-        if let Ok(remainder) = path.strip_prefix(alias) {
-            return Path::new(physical).join(remainder);
+pub(crate) fn normalize_macos_system_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            if let Ok(remainder) = path.strip_prefix(alias) {
+                return Path::new(physical).join(remainder);
+            }
         }
     }
-    path.to_path_buf()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn normalize_macos_system_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 

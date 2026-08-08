@@ -582,6 +582,9 @@ const TIMESTAMP_RIGHT_MARGIN: usize = AGENT_INDENT;
 #[derive(Clone)]
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
+    /// First row occupied by parser-rendered Markdown message content. `None`
+    /// for non-message entries and when Markdown rendering is disabled.
+    pub copy_body_start: Option<usize>,
     /// Index of the row within `lines` that is the clickable "thinking"
     /// chip. `None` for entries without one (everything except a
     /// `HistoryEntry::Agent` with non-empty reasoning).
@@ -765,6 +768,7 @@ pub fn render_entry(
             let chip_row = toggleable.then_some(0);
             Rendered {
                 lines,
+                copy_body_start: md.user.then_some(chip.is_some() as usize),
                 chip_row,
                 continuations,
                 tool_call_rows: Vec::new(),
@@ -783,6 +787,7 @@ pub fn render_entry(
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
+            copy_body_start: None,
             pin_region: None,
         },
         HistoryEntry::CommandError { line } => Rendered {
@@ -795,6 +800,7 @@ pub fn render_entry(
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
+            copy_body_start: None,
             pin_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
@@ -807,6 +813,7 @@ pub fn render_entry(
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
+            copy_body_start: None,
             pin_region: None,
         },
         HistoryEntry::InterruptDecision { decision } => {
@@ -819,6 +826,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -834,6 +842,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -846,6 +855,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -887,6 +897,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -903,6 +914,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -922,6 +934,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -953,6 +966,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -983,6 +997,7 @@ pub fn render_entry(
                 tool_call_rows: Vec::new(),
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
+                copy_body_start: None,
                 pin_region: None,
             }
         }
@@ -1825,6 +1840,7 @@ fn render_agent(
     // control (mouse mode on and it fit). The `▶` pick-arrow alone is not
     // clickable, so it leaves this `None`.
     let mut pin_region: Option<PinRegion> = None;
+    let mut copy_body_start = None;
 
     let mut out: Vec<Line<'static>> = Vec::new();
     // Parallel to `out`: `conts[i]` is `true` when row `i` is a
@@ -1983,6 +1999,7 @@ fn render_agent(
                     max_offset: window.max_offset,
                 });
             }
+            copy_body_start = Some(out.len());
             out.extend(body_lines);
             conts.extend(body_conts);
         } else if markdown {
@@ -1994,6 +2011,7 @@ fn render_agent(
             pin_region = region;
             out.push(line);
             conts.push(false);
+            copy_body_start = Some(out.len());
             out.extend(body_lines);
             conts.extend(body_conts);
         } else {
@@ -2022,6 +2040,7 @@ fn render_agent(
             }
         }
     } else if markdown {
+        copy_body_start = Some(0);
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every
         // line carries AGENT_INDENT on the left AND a matching right
@@ -2115,6 +2134,7 @@ fn render_agent(
 
     Rendered {
         lines: out,
+        copy_body_start,
         chip_row,
         continuations: conts,
         tool_call_rows: Vec::new(),
@@ -2230,6 +2250,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
+            copy_body_start: None,
             pin_region: None,
         };
     };
@@ -2282,6 +2303,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             tool_call_rows: Vec::new(),
             tool_result_scroll_regions: Vec::new(),
             reasoning_scroll_region: None,
+            copy_body_start: None,
             pin_region: None,
         };
     }
@@ -2355,6 +2377,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         tool_call_rows: Vec::new(),
         tool_result_scroll_regions: Vec::new(),
         reasoning_scroll_region: None,
+        copy_body_start: None,
         pin_region: None,
     }
 }
@@ -3067,6 +3090,7 @@ fn render_toolbox(
         tool_call_rows,
         tool_result_scroll_regions: result_regions,
         reasoning_scroll_region: None,
+        copy_body_start: None,
         pin_region: None,
     }
 }

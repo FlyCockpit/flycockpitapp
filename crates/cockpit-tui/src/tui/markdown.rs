@@ -25,7 +25,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub(crate) struct CopyFragment {
     pub(crate) id: usize,
     pub(crate) text: String,
+    #[allow(dead_code)] // retained for render diagnostics, never extraction
     pub(crate) source: Option<std::ops::Range<usize>>,
+    #[allow(dead_code)] // stable semantic identity across viewport slices
     pub(crate) logical_line: usize,
     pub(crate) table_cell: Option<(usize, usize)>,
 }
@@ -40,7 +42,7 @@ pub(crate) enum CopyAtom {
 /// pulldown-cmark's event stream with rendering: formatting/link/code fences
 /// are tags and therefore never become copy fragments, while escapes and
 /// entities arrive already decoded as visible text.
-pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
+pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_MATH);
@@ -52,9 +54,10 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
     let mut table_col = 0usize;
     let mut pending_block_break = 0usize;
     let normalized = normalize_backslash_math(src);
+    let source_unchanged = normalized == src;
     for (event, range) in Parser::new_ext(&normalized, opts).into_offset_iter() {
         match event {
-            Event::Text(text) | Event::Code(text) | Event::InlineMath(text) => {
+            Event::Text(text) | Event::Code(text) => {
                 if pending_block_break > 0 && !atoms.is_empty() {
                     for _ in 0..pending_block_break {
                         atoms.push(CopyAtom::Newline);
@@ -62,16 +65,14 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
                     }
                 }
                 pending_block_break = 0;
-                for grapheme in semantic_graphemes(&text) {
-                    atoms.push(CopyAtom::Fragment(CopyFragment {
-                        id,
-                        text: grapheme,
-                        source: (normalized == src).then_some(range.clone()),
-                        logical_line,
-                        table_cell: table_row.map(|row| (row, table_col)),
-                    }));
-                    id += 1;
-                }
+                push_copy_text(
+                    &mut atoms,
+                    &mut id,
+                    &mut logical_line,
+                    &text,
+                    source_unchanged.then_some(range),
+                    table_row.map(|row| (row, table_col)),
+                );
             }
             Event::SoftBreak => {
                 // The renderer shows a space, but wrapping this space must not
@@ -79,7 +80,7 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
                 atoms.push(CopyAtom::Fragment(CopyFragment {
                     id,
                     text: " ".into(),
-                    source: (normalized == src).then_some(range),
+                    source: source_unchanged.then_some(range),
                     logical_line,
                     table_cell: table_row.map(|row| (row, table_col)),
                 }));
@@ -96,6 +97,10 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
                 table_col = 0;
             }
             Event::End(TagEnd::TableCell) => table_col += 1,
+            Event::End(TagEnd::Item) => {
+                atoms.push(CopyAtom::Newline);
+                logical_line += 1;
+            }
             Event::End(TagEnd::TableRow) => {
                 atoms.push(CopyAtom::Newline);
                 logical_line += 1;
@@ -111,8 +116,33 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
             Event::End(TagEnd::Paragraph)
             | Event::End(TagEnd::Heading(_))
             | Event::End(TagEnd::CodeBlock)
-            | Event::End(TagEnd::BlockQuote(_))
-            | Event::End(TagEnd::List(_)) => pending_block_break = 2,
+            | Event::End(TagEnd::BlockQuote(_)) => pending_block_break = 2,
+            Event::End(TagEnd::List(_)) => {
+                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
+                    atoms.pop();
+                    logical_line = logical_line.saturating_sub(1);
+                }
+                pending_block_break = 2;
+            }
+            Event::InlineMath(text) => {
+                if pending_block_break > 0 && !atoms.is_empty() {
+                    for _ in 0..pending_block_break {
+                        atoms.push(CopyAtom::Newline);
+                        logical_line += 1;
+                    }
+                }
+                pending_block_break = 0;
+                let visible =
+                    math_render::render_inline(&text).unwrap_or_else(|| format!("${text}$"));
+                push_copy_text(
+                    &mut atoms,
+                    &mut id,
+                    &mut logical_line,
+                    &visible,
+                    source_unchanged.then_some(range),
+                    None,
+                );
+            }
             Event::DisplayMath(text) => {
                 if pending_block_break > 0 && !atoms.is_empty() {
                     for _ in 0..pending_block_break {
@@ -121,16 +151,17 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
                     }
                 }
                 pending_block_break = 0;
-                for grapheme in semantic_graphemes(&text) {
-                    atoms.push(CopyAtom::Fragment(CopyFragment {
-                        id,
-                        text: grapheme,
-                        source: (normalized == src).then_some(range.clone()),
-                        logical_line,
-                        table_cell: None,
-                    }));
-                    id += 1;
-                }
+                let visible = math_render::render_display(&text, width)
+                    .map(|rows| rows.join("\n"))
+                    .unwrap_or_else(|| format!("$$\n{text}\n$$"));
+                push_copy_text(
+                    &mut atoms,
+                    &mut id,
+                    &mut logical_line,
+                    &visible,
+                    source_unchanged.then_some(range),
+                    None,
+                );
             }
             _ => {}
         }
@@ -139,6 +170,32 @@ pub(crate) fn semantic_copy_atoms(src: &str) -> Vec<CopyAtom> {
         atoms.pop();
     }
     atoms
+}
+
+fn push_copy_text(
+    atoms: &mut Vec<CopyAtom>,
+    id: &mut usize,
+    logical_line: &mut usize,
+    text: &str,
+    source: Option<std::ops::Range<usize>>,
+    table_cell: Option<(usize, usize)>,
+) {
+    for (piece_index, piece) in text.split('\n').enumerate() {
+        if piece_index > 0 {
+            atoms.push(CopyAtom::Newline);
+            *logical_line += 1;
+        }
+        for grapheme in semantic_graphemes(piece) {
+            atoms.push(CopyAtom::Fragment(CopyFragment {
+                id: *id,
+                text: grapheme,
+                source: source.clone(),
+                logical_line: *logical_line,
+                table_cell,
+            }));
+            *id += 1;
+        }
+    }
 }
 
 /// Small, dependency-free extended-grapheme approximation tailored to cell
@@ -150,7 +207,7 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
     let mut regional_in_last = false;
     for ch in text.chars() {
         let cp = ch as u32;
-        let combining = ch.width().unwrap_or(0) == 0
+        let combining = !ch.is_control() && ch.width().unwrap_or(0) == 0
             || (0xFE00..=0xFE0F).contains(&cp)
             || (0x1F3FB..=0x1F3FF).contains(&cp)
             || (0xE0100..=0xE01EF).contains(&cp);
@@ -201,6 +258,23 @@ const HEADING_FG: Color = Color::Indexed(81); // light cyan
 const QUOTE_FG: Color = Color::Indexed(244); // mid grey
 const LINK_FG: Color = Color::Indexed(75); // sky blue
 const MATH_FG: Color = Color::Indexed(151); // soft green
+const TAB_STOP: usize = 4;
+
+fn expand_tabs(text: &str, start_col: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut col = start_col;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let spaces = TAB_STOP - col % TAB_STOP;
+            out.push_str(&" ".repeat(spaces));
+            col += spaces;
+        } else {
+            out.push(ch);
+            col += ch.width().unwrap_or(0);
+        }
+    }
+    out
+}
 
 /// Parse `src` as Markdown and return one ratatui line per logical
 /// rendered row. Empty input renders as a single empty line so the
@@ -692,8 +766,9 @@ impl Emitter {
                 let trimmed_nl = raw.strip_suffix('\n');
                 let chunk = trimmed_nl.unwrap_or(raw).to_string();
                 if !chunk.is_empty() {
+                    let start = self.current.iter().map(|span| span.content.width()).sum();
                     self.current.push(Span::styled(
-                        chunk,
+                        expand_tabs(&chunk, start),
                         Style::default().fg(CODE_FG).bg(CODE_BG),
                     ));
                 }
@@ -713,7 +788,9 @@ impl Emitter {
                 self.flush_line();
             }
             if !piece.is_empty() {
-                self.current.push(Span::styled(piece.to_string(), style));
+                let start = self.current.iter().map(|span| span.content.width()).sum();
+                self.current
+                    .push(Span::styled(expand_tabs(piece, start), style));
             }
             first = false;
         }
@@ -721,12 +798,18 @@ impl Emitter {
 
     fn inline_code(&mut self, s: String) {
         if let Some(cell) = self.current_table_cell_mut() {
-            cell.spans
-                .push(Span::styled(s, Style::default().fg(CODE_FG).bg(CODE_BG)));
+            let start = cell.spans.iter().map(|span| span.content.width()).sum();
+            cell.spans.push(Span::styled(
+                expand_tabs(&s, start),
+                Style::default().fg(CODE_FG).bg(CODE_BG),
+            ));
             return;
         }
-        self.current
-            .push(Span::styled(s, Style::default().fg(CODE_FG).bg(CODE_BG)));
+        let start = self.current.iter().map(|span| span.content.width()).sum();
+        self.current.push(Span::styled(
+            expand_tabs(&s, start),
+            Style::default().fg(CODE_FG).bg(CODE_BG),
+        ));
     }
 
     fn horizontal_rule(&mut self) {
@@ -758,7 +841,8 @@ impl Emitter {
     fn table_text(&mut self, s: String) {
         let style = self.current_style();
         if let Some(cell) = self.current_table_cell_mut() {
-            let text = s.replace('\n', " ");
+            let start = cell.spans.iter().map(|span| span.content.width()).sum();
+            let text = expand_tabs(&s.replace('\n', " "), start);
             if !text.is_empty() {
                 cell.spans.push(Span::styled(text, style));
             }
@@ -1249,7 +1333,7 @@ mod tests {
     }
 
     fn copied(src: &str) -> String {
-        semantic_copy_atoms(src)
+        semantic_copy_atoms(src, 80)
             .into_iter()
             .map(|atom| match atom {
                 CopyAtom::Fragment(fragment) => fragment.text,
@@ -1260,7 +1344,7 @@ mod tests {
 
     #[test]
     fn selection_source_map_survives_wrap_and_viewport_slice() {
-        let atoms = semantic_copy_atoms("alpha **wide界** omega");
+        let atoms = semantic_copy_atoms("alpha **wide界** omega", 80);
         let ids = atoms
             .iter()
             .filter_map(|atom| match atom {
@@ -1325,7 +1409,7 @@ mod tests {
 
     #[test]
     fn selection_scrolled_mid_message_preserves_semantic_identity() {
-        let atoms = semantic_copy_atoms("first\nsecond\nthird");
+        let atoms = semantic_copy_atoms("first\nsecond\nthird", 80);
         let second = atoms
             .iter()
             .find_map(|atom| match atom {
@@ -1339,7 +1423,7 @@ mod tests {
 
     #[test]
     fn selection_table_fragments_exclude_borders_and_padding() {
-        let atoms = semantic_copy_atoms("| A | B |\n|---|---|\n| x | y |");
+        let atoms = semantic_copy_atoms("| A | B |\n|---|---|\n| x | y |", 80);
         let cells = atoms
             .iter()
             .filter_map(|atom| match atom {

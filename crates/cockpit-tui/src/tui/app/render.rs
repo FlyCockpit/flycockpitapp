@@ -728,7 +728,7 @@ pub(crate) struct ChatRowMeta {
     pub selectable: bool,
     /// Semantic copy provenance for each occupied terminal column. Wide
     /// graphemes repeat the same fragment identity in every occupied cell.
-    pub copy_cells: Vec<Option<crate::tui::markdown::CopyFragment>>,
+    pub copy_cells: Vec<Option<Rc<crate::tui::markdown::CopyFragment>>>,
     /// A rendered hard/block boundary precedes this row. Soft wrapping leaves
     /// this false, so viewport materialization never invents line breaks.
     pub copy_newlines_before: usize,
@@ -2337,6 +2337,7 @@ impl App {
     ) -> Vec<ChatRowMeta> {
         let Rendered {
             lines,
+            copy_body_start,
             chip_row,
             continuations,
             tool_call_rows,
@@ -2352,7 +2353,7 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
-        let (copy_rows, copy_breaks) = semantic_copy_rows(entry, lines);
+        let (copy_rows, copy_breaks) = semantic_copy_rows(entry, lines, *copy_body_start);
 
         for i in 0..lines.len() {
             let chip_target = if Some(i) == *chip_row {
@@ -4484,11 +4485,15 @@ fn rendered_line_text(line: &Line<'_>) -> String {
 fn semantic_copy_rows(
     entry: &HistoryEntry,
     lines: &[Line<'static>],
+    body_start: Option<usize>,
 ) -> (
-    Vec<Vec<Option<crate::tui::markdown::CopyFragment>>>,
+    Vec<Vec<Option<Rc<crate::tui::markdown::CopyFragment>>>>,
     Vec<usize>,
 ) {
     use crate::tui::markdown::{CopyAtom, semantic_copy_atoms, semantic_graphemes};
+    let Some(body_start) = body_start else {
+        return (vec![Vec::new(); lines.len()], vec![0; lines.len()]);
+    };
     let source = match entry {
         HistoryEntry::User {
             text,
@@ -4504,36 +4509,89 @@ fn semantic_copy_rows(
             }
         }
         HistoryEntry::Agent { text, .. } => text.as_str(),
-        _ => return (vec![Vec::new(); lines.len()], vec![false; lines.len()]),
+        _ => return (vec![Vec::new(); lines.len()], vec![0; lines.len()]),
     };
-    let atoms = semantic_copy_atoms(source);
+    let semantic_width = lines
+        .iter()
+        .map(|line| rendered_line_text(line).width())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let atoms = semantic_copy_atoms(source, semantic_width);
     let mut atom = 0usize;
+    let mut used = std::collections::HashSet::new();
     let mut rows = Vec::with_capacity(lines.len());
     let mut breaks = Vec::with_capacity(lines.len());
 
-    for line in lines {
+    for (row_index, line) in lines.iter().enumerate() {
         let mut hard_breaks = 0usize;
         let text = rendered_line_text(line);
         let mut cells = vec![None; text.width()];
+        if row_index < body_start {
+            breaks.push(0);
+            rows.push(cells);
+            continue;
+        }
         let mut col = 0usize;
         for visible in semantic_graphemes(&text) {
             let width = visible.width().max(1);
+            while atoms.get(atom).is_some_and(|candidate| match candidate {
+                CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
+                CopyAtom::Newline => false,
+            }) {
+                atom += 1;
+            }
             let mut next_atom = atom;
             while matches!(atoms.get(next_atom), Some(CopyAtom::Newline)) {
                 next_atom += 1;
             }
-            let next = atoms.get(next_atom).and_then(|candidate| match candidate {
-                CopyAtom::Fragment(fragment) => Some(fragment),
+            let mut next = atoms.get(next_atom).and_then(|candidate| match candidate {
+                CopyAtom::Fragment(fragment) if !used.contains(&fragment.id) => Some(fragment),
                 CopyAtom::Newline => None,
+                CopyAtom::Fragment(_) => None,
             });
+            let mut matched_atom = next_atom;
+            if next.is_some_and(|fragment| fragment.text != visible)
+                && next.is_some_and(|fragment| fragment.table_cell.is_some())
+                && let Some((index, fragment)) =
+                    atoms
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, candidate)| match candidate {
+                            CopyAtom::Fragment(fragment)
+                                if fragment.text == visible
+                                    && fragment.table_cell.is_some()
+                                    && !used.contains(&fragment.id) =>
+                            {
+                                Some((index, fragment))
+                            }
+                            _ => None,
+                        })
+            {
+                matched_atom = index;
+                next = Some(fragment);
+            }
             if let Some(fragment) = next
                 && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
             {
-                for cell in col..col.saturating_add(width).min(cells.len()) {
-                    cells[cell] = Some(fragment.clone());
+                let shared = Rc::new(fragment.clone());
+                let fragment_width = if fragment.text == "\t" {
+                    4 - col % 4
+                } else {
+                    width
+                };
+                for cell in cells
+                    .iter_mut()
+                    .take(col.saturating_add(fragment_width))
+                    .skip(col)
+                {
+                    *cell = Some(Rc::clone(&shared));
                 }
-                hard_breaks = hard_breaks.max(next_atom - atom);
-                atom = next_atom + 1;
+                used.insert(fragment.id);
+                if matched_atom == next_atom {
+                    hard_breaks = hard_breaks.max(next_atom - atom);
+                    atom = next_atom + 1;
+                }
             }
             col = col.saturating_add(width);
         }
@@ -4857,6 +4915,7 @@ pub(super) fn extract_selection_semantic(
     let (start, end) = sel.ordered();
     let mut out = String::new();
     let mut last_identity: Option<(Option<usize>, usize)> = None;
+    let mut last_message = None;
     let mut emitted_row = false;
     let mut saw_semantic_row = false;
     for abs_row in start.1..=end.1 {
@@ -4866,6 +4925,10 @@ pub(super) fn extract_selection_semantic(
         };
         if meta.copy_target.is_some() {
             saw_semantic_row = true;
+        } else if meta.selectable {
+            // A mixed selection must fall back as a whole; silently omitting
+            // tool/diff/plain rows would lose visible user-selected text.
+            return None;
         }
         let first_col = if abs_row == start.1 {
             start.0.saturating_sub(area.x) as usize
@@ -4878,6 +4941,7 @@ pub(super) fn extract_selection_semantic(
             meta.copy_cells.len().saturating_sub(1)
         };
         let mut row_emitted = false;
+        let mut row_table_cell = None;
         for fragment in meta
             .copy_cells
             .get(first_col..=last_col.min(meta.copy_cells.len().saturating_sub(1)))
@@ -4890,14 +4954,23 @@ pub(super) fn extract_selection_semantic(
                 continue;
             }
             if !row_emitted && emitted_row {
-                for _ in 0..meta.copy_newlines_before {
+                let cross_message = usize::from(last_message != meta.history_index);
+                for _ in 0..meta.copy_newlines_before.max(cross_message) {
                     out.push('\n');
                 }
+            }
+            if row_emitted
+                && let (Some(previous), Some(current)) = (row_table_cell, fragment.table_cell)
+                && previous != current
+            {
+                out.push('\t');
             }
             out.push_str(&fragment.text);
             last_identity = Some(identity);
             row_emitted = true;
             emitted_row = true;
+            last_message = meta.history_index;
+            row_table_cell = fragment.table_cell.or(row_table_cell);
         }
     }
     (saw_semantic_row && !out.is_empty()).then_some(out)

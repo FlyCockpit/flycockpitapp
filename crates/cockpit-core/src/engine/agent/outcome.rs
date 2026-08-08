@@ -89,7 +89,6 @@ pub enum TurnOutcome {
         /// only. Empty when the parent granted nothing.
         granted_tools: Vec<String>,
         todo_ids: Vec<uuid::Uuid>,
-        sealed_fetch_value_id: Option<String>,
         repair_notes: Vec<String>,
         task_call_id: String,
         task_function_call_id: Option<String>,

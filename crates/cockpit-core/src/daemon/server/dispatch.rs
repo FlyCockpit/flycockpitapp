@@ -589,6 +589,10 @@ pub(super) async fn handle_serialized_request(
             session_id,
             value_id,
         } => {
+            // Both arms must go through the scoped delete: a session-scope
+            // scoped value is dual-written, so removing only the legacy
+            // `sealed_values` row would ack a delete that left the record
+            // resolvable with no literal behind it.
             let deleted = if let Some(handle) = ctx.registry.live_handle(session_id) {
                 handle
                     .delete_sealed_value(&value_id)
@@ -596,7 +600,11 @@ pub(super) async fn handle_serialized_request(
                     .map_err(internal)?
             } else {
                 ctx.db
-                    .delete_sealed_value(session_id, &value_id)
+                    .delete_sealed_value_for_session(
+                        session_id.to_string(),
+                        value_id.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
                     .await
                     .map_err(internal)?
             };

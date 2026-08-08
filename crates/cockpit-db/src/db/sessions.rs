@@ -6,6 +6,7 @@
 //! `cockpit -c` or `cockpit --session ID` re-attaches.
 
 use anyhow::{Context, Result, anyhow};
+
 use chrono::Utc;
 use rusqlite::{
     Connection, ErrorCode, OptionalExtension, params, params_from_iter, types::Value as SqlValue,
@@ -13,6 +14,78 @@ use rusqlite::{
 use uuid::Uuid;
 
 use crate::db::Db;
+
+/// A fork was refused because the parent session owns scoped sealed values.
+///
+/// Typed and downcastable so a caller can render this specific reason rather
+/// than a generic failure: `error.downcast_ref::<SessionForkRefusedSealed>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionForkRefusedSealed {
+    pub parent_session_id: Uuid,
+    pub scoped_value_count: i64,
+}
+
+impl std::fmt::Display for SessionForkRefusedSealed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session {} cannot be forked: it owns {} scoped sealed value(s), \
+             and forking them has no defined semantics yet",
+            self.parent_session_id, self.scoped_value_count
+        )
+    }
+}
+
+impl std::error::Error for SessionForkRefusedSealed {}
+
+/// Count the scoped sealed value records a session owns.
+///
+/// Session scope keys its records by the session id. Project- and
+/// global-scope values are not owned by any session and so never block a
+/// fork. Soft-deleted rows are deliberately **not** excluded: a record mid
+/// delete is precisely the ambiguous state a fork must not have to reason
+/// about, so it fails closed too.
+fn scoped_sealed_value_count(conn: &Connection, session_id: Uuid) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sealed_value_records
+          WHERE scope = 'session' AND scope_key = ?1",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )
+    .context("checking parent session for scoped sealed values")
+}
+
+/// Refuse to copy sealed values into a fork when the parent owns scoped ones.
+///
+/// The invariant being protected is about **inheritance, not coexistence**: a
+/// child session must never come to hold sealed state it cannot correctly
+/// represent. A parent may perfectly well own scoped values while some
+/// earlier fork of it exists — that fork inherited nothing scoped, so nothing
+/// is undefined about it. What must never happen is a *copy* handing a child
+/// a scoped value's literal without its record, grants, or tombstone.
+///
+/// So this is called immediately before the copy, not at the fork entry
+/// points. Any future path reaching that copy is guarded by construction.
+///
+/// Copying the legacy `sealed_values` rows is fine and unchanged: they predate
+/// the scoped subsystem and are self-contained, so a session holding only
+/// legacy rows still forks normally. A *scoped* value has no defined fork
+/// semantics — whether the child inherits the parent's action grants, what to
+/// do with an in-flight lifecycle saga, and whether a rotated value yields
+/// pre- or post-rotation state are all open questions. Guessing at exactly
+/// this kind of saga interaction is what produced the delete-versus-rotation
+/// defect in this subsystem, so this fails closed with a typed error until a
+/// fork semantics is designed deliberately.
+fn refuse_fork_with_scoped_sealed_values(conn: &Connection, parent_session_id: Uuid) -> Result<()> {
+    let scoped_value_count = scoped_sealed_value_count(conn, parent_session_id)?;
+    if scoped_value_count > 0 {
+        return Err(anyhow::Error::new(SessionForkRefusedSealed {
+            parent_session_id,
+            scoped_value_count,
+        }));
+    }
+    Ok(())
+}
 
 /// Crockford base32 alphabet, lowercased. Excludes I/L/O/U for visual
 /// disambiguation. Used for 6-char session display ids (GOALS §17b).
@@ -957,6 +1030,13 @@ impl Db {
                     created: false,
                 });
             }
+            // No sealed-value guard here, deliberately: `/btw` forks copy the
+            // transcript and nothing else. There is no `INSERT INTO
+            // sealed_values` on this path, so a `/btw` fork never inherits a
+            // sealed value by any ordering, and refusing one would restrict a
+            // fork that cannot reach the bad state. The property this relies
+            // on is pinned by
+            // `btw_fork_never_inherits_sealed_values_of_either_kind`.
             let parent = get_session_inner(&tx, parent_session_id)?
                 .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
             let short_id = generate_unique_short_id(&tx, &parent.project_id)
@@ -1121,6 +1201,14 @@ impl Db {
         .context("copying fork transcript")?;
         // Sealed values are fork-point state, not a live parent lookup: a
         // value created in the parent after this fork must stay parent-only.
+        //
+        // The refusal is welded to the copy rather than to the fork entry
+        // points. Copying is the dangerous operation — it is what would give
+        // a child session a scoped value's literal without its record — so
+        // guarding here means any future path that reaches this copy is
+        // guarded by construction, instead of relying on having enumerated
+        // the callers correctly.
+        refuse_fork_with_scoped_sealed_values(&tx, parent_session_id)?;
         tx.execute(
             "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
              SELECT ?1, value_id, value, reason, origin, created_at
@@ -1134,6 +1222,15 @@ impl Db {
 
     pub async fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
         self.read(move |conn| Self::get_session_conn(conn, session_id))
+            .await
+    }
+
+    /// Does this session own any scoped sealed value records?
+    ///
+    /// Exposed so callers can explain the refusal before attempting a fork,
+    /// rather than surfacing it only as an error.
+    pub async fn session_owns_scoped_sealed_values(&self, session_id: Uuid) -> Result<bool> {
+        self.read(move |conn| Ok(scoped_sealed_value_count(conn, session_id)? > 0))
             .await
     }
 
@@ -4249,5 +4346,164 @@ mod tests {
         let loaded = db.get_session(row.session_id).await.unwrap().unwrap();
         assert_eq!(loaded.active_model_revision, 1);
         assert_eq!(loaded.provider.as_deref(), Some("p"));
+    }
+
+    /// A session holding a *scoped* sealed value cannot be forked at all.
+    ///
+    /// Fail closed by decision: forking a scoped value has no defined
+    /// semantics (grants, in-flight sagas, pre- versus post-rotation state),
+    /// and the refusal is typed so a caller can say why.
+    #[tokio::test]
+    async fn fork_is_refused_when_the_session_owns_scoped_sealed_values() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.create_session_sealed_value(
+            crate::db::sealed_scope::NewSealedValueRecord {
+                record_id: Uuid::new_v4().to_string(),
+                scope: crate::db::sealed_scope::SealedScopeKind::Session,
+                scope_key: parent.session_id.to_string(),
+                name: "prod_token".to_string(),
+                description: "deployment credential".to_string(),
+                owner_principal: "owner".to_string(),
+                created_at_ms: 1_000,
+            },
+            "very-high-entropy-token".to_string(),
+            "deploy".to_string(),
+            "user".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.session_owns_scoped_sealed_values(parent.session_id)
+                .await
+                .unwrap()
+        );
+
+        let error = db.create_fork(parent.session_id, None).await.unwrap_err();
+        let typed = error
+            .downcast_ref::<SessionForkRefusedSealed>()
+            .expect("the refusal is typed and downcastable");
+        assert_eq!(typed.parent_session_id, parent.session_id);
+        assert_eq!(typed.scoped_value_count, 1);
+        assert!(
+            format!("{error:#}").contains("no defined semantics"),
+            "the error names the reason: {error:#}"
+        );
+
+        // The ephemeral fork shares the copy path, so it refuses identically.
+        assert!(
+            db.create_ephemeral_fork(parent.session_id, None)
+                .await
+                .unwrap_err()
+                .downcast_ref::<SessionForkRefusedSealed>()
+                .is_some()
+        );
+        // A `/btw` fork is *allowed*: it copies no sealed values at all, so it
+        // cannot inherit the scoped one and is not the state being prevented.
+        db.create_btw_fork(parent.session_id, false)
+            .await
+            .expect("a /btw fork inherits no sealed values and so is permitted");
+
+        // Nothing is written: the refusal returns before `tx.commit()`, so
+        // the fork transaction is dropped and rolled back.
+        assert!(
+            db.get_session(parent.session_id).await.unwrap().is_some(),
+            "the parent session is untouched by a refused fork"
+        );
+    }
+
+    /// A session holding only *legacy* pre-scoped rows still forks normally:
+    /// that copy path is self-contained and unchanged.
+    #[tokio::test]
+    async fn fork_still_works_with_only_legacy_sealed_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.upsert_sealed_value(
+            parent.session_id,
+            "legacy_token",
+            "old-secret",
+            "deploy",
+            "user",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !db.session_owns_scoped_sealed_values(parent.session_id)
+                .await
+                .unwrap(),
+            "a legacy row is not a scoped record"
+        );
+
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
+        assert_ne!(fork.session_id, parent.session_id);
+        assert!(
+            db.sealed_value_exists(fork.session_id, "legacy_token")
+                .await
+                .unwrap(),
+            "the unchanged legacy copy path still populates the fork"
+        );
+    }
+
+    /// Pins the property the `/btw` guard decision rests on: a `/btw` fork
+    /// copies the transcript and nothing else, so it inherits neither legacy
+    /// nor scoped sealed values, in either creation order.
+    ///
+    /// If someone later adds sealed-value copying to `create_btw_fork`, this
+    /// fails — which is the point, because the reasoning for leaving that path
+    /// unguarded depends entirely on it copying nothing.
+    #[tokio::test]
+    async fn btw_fork_never_inherits_sealed_values_of_either_kind() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.upsert_sealed_value(
+            parent.session_id,
+            "legacy_token",
+            "old-secret",
+            "deploy",
+            "user",
+        )
+        .await
+        .unwrap();
+
+        // Ordering the review raised: fork first, then create a scoped value.
+        let first = db.create_btw_fork(parent.session_id, false).await.unwrap();
+        assert!(first.created);
+        db.create_session_sealed_value(
+            crate::db::sealed_scope::NewSealedValueRecord {
+                record_id: Uuid::new_v4().to_string(),
+                scope: crate::db::sealed_scope::SealedScopeKind::Session,
+                scope_key: parent.session_id.to_string(),
+                name: "prod_token".to_string(),
+                description: "deployment credential".to_string(),
+                owner_principal: "owner".to_string(),
+                created_at_ms: 1_000,
+            },
+            "very-high-entropy-token".to_string(),
+            "deploy".to_string(),
+            "user".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // The live fork is still returned, and still holds nothing sealed.
+        let again = db.create_btw_fork(parent.session_id, false).await.unwrap();
+        assert!(!again.created, "the existing /btw fork is returned");
+        let fork_id = again.info.session_id;
+        for name in ["legacy_token", "prod_token"] {
+            assert!(
+                !db.sealed_value_exists(fork_id, name).await.unwrap(),
+                "a /btw fork must not inherit `{name}`"
+            );
+        }
+        assert!(
+            !db.session_owns_scoped_sealed_values(fork_id).await.unwrap(),
+            "a /btw fork owns no scoped records of its own"
+        );
+        // The parent is untouched.
+        assert!(
+            db.sealed_value_exists(parent.session_id, "prod_token")
+                .await
+                .unwrap()
+        );
     }
 }

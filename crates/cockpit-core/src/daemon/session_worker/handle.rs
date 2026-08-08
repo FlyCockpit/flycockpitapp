@@ -16,7 +16,6 @@ pub struct SessionWorkerHandle {
     turn_completions: Arc<Mutex<TurnCompletions>>,
     redaction: SharedRedactionTable,
     /// Injection-only session values. Never exposed over proto or Debug.
-    sealed_values: Arc<Mutex<HashMap<String, String>>>,
     /// Live job/turn status for the `/sessions` browser (GOALS §17f).
     live: Arc<LiveState>,
     /// Count of attached *interactive* clients — ones that can answer an
@@ -694,7 +693,6 @@ impl SessionWorkerHandle {
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
             redaction,
-            sealed_values: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(LiveState::default()),
             interactive_clients: Arc::new(AtomicUsize::new(0)),
             session: session.clone(),
@@ -997,54 +995,21 @@ impl SessionWorkerHandle {
         current_redaction(&self.redaction)
     }
 
-    /// Existence only — sealed child-environment injection is retired.
-    pub async fn sealed_value_exists(&self, value_id: &str) -> anyhow::Result<bool> {
-        if self.sealed_values.lock().unwrap().contains_key(value_id) {
-            return Ok(true);
-        }
-        self.session.sealed_value_exists(value_id).await
-    }
-
-    /// Create or overwrite a sealed value. Install its literal into the live
-    /// redaction table before the database operation can yield, so no
-    /// concurrent worker egress can expose it.
-    pub async fn set_sealed_value(
-        &self,
-        value_id: &str,
-        value: &str,
-        reason: &str,
-        origin: &str,
-    ) -> anyhow::Result<crate::db::sealed_values::SealedValueMetadata> {
-        crate::session::sealed_values::validate_sealed_value(value_id, value)?;
-        self.seal_redaction_literal(value.to_owned(), value_id)?;
-        let metadata = self
-            .session
-            .set_sealed_value(&self.redaction_table(), value_id, value, reason, origin)
-            .await?;
-        self.sealed_values
-            .lock()
-            .unwrap()
-            .insert(value_id.to_owned(), value.to_owned());
-        Ok(metadata)
-    }
-
+    /// Delete a sealed value. Reached only from the daemon's `owner_only`
+    /// `DeleteSealedValue` request.
+    ///
+    /// The create and existence-probe siblings are gone: their only callers
+    /// were the retired agent-facing Monty builtins and the retired
+    /// `sealed_fetch` delegation mode, and leaving them would have kept an
+    /// agent-reachable write and existence oracle alive.
     pub async fn delete_sealed_value(&self, value_id: &str) -> anyhow::Result<bool> {
-        let deleted = self.session.delete_sealed_value(value_id).await?;
-        self.sealed_values.lock().unwrap().remove(value_id);
+        let deleted = self
+            .session
+            .delete_sealed_value(crate::sealed::OwnerAuthority::for_owner_request(), value_id)
+            .await?;
         Ok(deleted)
     }
 
-    /// Union a sealed literal into the live egress table and make the union
-    /// durable before the caller proceeds to persist/inject the value.
-    pub fn seal_redaction_literal(&self, value: String, value_id: &str) -> anyhow::Result<()> {
-        let table = self
-            .redaction_table()
-            .with_forced_literal(value, format!("sealed:{value_id}"))?;
-        let table = Arc::new(table);
-        self.session.persist_redaction_table(&table)?;
-        set_current_redaction(&self.redaction, table);
-        Ok(())
-    }
 
     pub fn session(&self) -> Arc<Session> {
         self.session.clone()
@@ -1654,7 +1619,6 @@ pub fn spawn(
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
         redaction: redaction.clone(),
-        sealed_values: Arc::new(Mutex::new(HashMap::new())),
         live: live.clone(),
         interactive_clients: interactive_clients.clone(),
         session: session.clone(),

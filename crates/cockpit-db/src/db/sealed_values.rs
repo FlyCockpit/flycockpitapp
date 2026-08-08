@@ -18,6 +18,24 @@ pub struct SealedValueMetadata {
 }
 
 impl Db {
+    /// Write a **legacy, pre-scoped** sealed value row.
+    ///
+    /// Refuses when a scoped record owns the name, for a sharper reason than
+    /// the delete sibling. Overwriting a scoped value's literal here would
+    /// leave `sealed_value_records.active_version` untouched and every
+    /// outstanding grant unfenced — so a grant authorized against version 1
+    /// would go on resolving, and hand its holder a *different secret* than
+    /// the one it was granted over. Version pinning
+    /// (`authorize_sealed_use`'s `grant.value_version != record.active_version`
+    /// check) is precisely what stops a rotation from silently upgrading a
+    /// grant to a new secret, and a legacy overwrite would walk straight
+    /// around it. Rotation belongs to `Db::rotate_session_sealed_value`.
+    ///
+    /// This stays `pub` rather than `pub(crate)`: callers outside this crate
+    /// legitimately seed *legacy* rows (that path is unchanged and supported),
+    /// and the refusal below removes the hazard itself rather than merely
+    /// reducing who can reach it. The scoped create writes its own legacy row
+    /// by raw SQL inside one transaction, so it does not come through here.
     pub async fn upsert_sealed_value(
         &self,
         session_id: Uuid,
@@ -31,7 +49,22 @@ impl Db {
         let value = value.to_owned();
         let reason = reason.to_owned();
         let origin = origin.to_owned();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
+            let scoped: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sealed_value_records
+                      WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
+                    params![session_id.to_string(), value_id],
+                    |row| row.get(0),
+                )
+                .context("checking for a scoped record before a legacy upsert")?;
+            if scoped > 0 {
+                anyhow::bail!(
+                    "sealed value `{value_id}` is a scoped value; rotate it through \
+                     the scoped path so its version is bumped and grants fenced, \
+                     rather than overwriting the literal underneath them"
+                );
+            }
             conn.execute(
                 "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -52,13 +85,51 @@ impl Db {
         .await
     }
 
-    pub async fn delete_sealed_value(&self, session_id: Uuid, value_id: &str) -> Result<bool> {
+    /// Delete a **legacy, pre-scoped** sealed value row.
+    ///
+    /// Narrowed to the crate and self-defending, because on its own this is
+    /// the exact shape of a bug already fixed once: a session-scope *scoped*
+    /// value is dual-written (record in `sealed_value_records`, literal here),
+    /// so removing only this row leaves the record resolvable with no literal
+    /// under it, its name un-tombstoned and its grants unfenced.
+    ///
+    /// Two things stop that rather than one, so it is impossible rather than
+    /// merely unused:
+    ///
+    /// 1. `pub(crate)` — no caller outside `cockpit-db` can reach it at all.
+    ///    The scoped entry point [`Db::delete_sealed_value_for_session`] is
+    ///    the only way in from `cockpit-core`.
+    /// 2. It refuses outright when a scoped record owns the name, checked in
+    ///    the same transaction as the delete so a concurrent create cannot
+    ///    slip between. A caller who reaches for the legacy path on a scoped
+    ///    value gets an error, not a half-delete.
+    pub(crate) async fn delete_sealed_value(
+        &self,
+        session_id: Uuid,
+        value_id: &str,
+    ) -> Result<bool> {
         let value_id = value_id.to_owned();
-        self.write(move |conn| {
+        self.transaction(move |conn| {
+            let session_key = session_id.to_string();
+            let scoped: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sealed_value_records
+                      WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
+                    params![session_key, value_id],
+                    |row| row.get(0),
+                )
+                .context("checking for a scoped record before a legacy delete")?;
+            if scoped > 0 {
+                anyhow::bail!(
+                    "sealed value `{value_id}` is a scoped value; delete it through \
+                     the scoped path (`delete_sealed_value_for_session`) so its \
+                     record, name tombstone and grants are handled too"
+                );
+            }
             Ok(conn
                 .execute(
                     "DELETE FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
-                    params![session_id.to_string(), value_id],
+                    params![session_key, value_id],
                 )
                 .context("deleting sealed value")?
                 > 0)

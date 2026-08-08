@@ -71,6 +71,11 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("todo"),
     ToolTimeoutSafety::abandon_safe("tool_result_retrieve"),
     ToolTimeoutSafety::abandon_safe("unlock"),
+    // `use_sealed_value` dispatches an Owner-compiled adapter outbound to a
+    // fixed destination. Abandoning it mid-flight cannot be assumed safe: the
+    // external effect may already have landed, and the caller is never told
+    // either way (the completion is a fixed constant).
+    ToolTimeoutSafety::nested_dispatch_or_owned_transport("use_sealed_value"),
     ToolTimeoutSafety::web_backend_dependent("webfetch"),
     ToolTimeoutSafety::web_backend_dependent("websearch"),
     ToolTimeoutSafety::abandon_safe("write"),

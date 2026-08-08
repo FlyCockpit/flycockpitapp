@@ -147,7 +147,17 @@ impl CredentialStore {
             .push(SecretMutation::Remove(name.to_string()));
     }
 
-    pub fn list_named_secrets(&self) -> Vec<String> {
+    /// Named-secret keys.
+    ///
+    /// Deliberately **not** `pub`. Enumerating this namespace is an inventory
+    /// oracle, and sealed values must never be inventoriable through a generic
+    /// credential surface. Persistent sealed literals live in their own
+    /// compartment — a separate file with a separate API that has no listing
+    /// surface at all — so this method cannot reach them either way. It stays
+    /// crate-private so no public, re-exported, status, debug, doctor, or
+    /// export path can grow onto it.
+    #[cfg(test)]
+    pub(crate) fn list_named_secrets(&self) -> Vec<String> {
         self.secrets.keys().cloned().collect()
     }
 

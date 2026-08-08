@@ -313,8 +313,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
     let literal = "parent-pre-fork-sealed-value-9f3a";
     driver
         .session
-        .set_sealed_value(
-            &crate::redact::RedactionTable::empty(),
+        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &crate::redact::RedactionTable::empty(),
             "parent_pre",
             literal,
             "delegation inheritance",
@@ -342,7 +341,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
     );
 
     assert!(
-        child.sealed_value_exists("parent_pre").await.unwrap(),
+        child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "parent_pre").await.unwrap(),
         "subagent must inherit parent value sealed before fork point"
     );
     // Availability only — do not read the literal-bearing wrapper via as_str.
@@ -357,7 +356,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
         "parent redaction table must scrub the sealed literal"
     );
 
-    let child_meta = child.list_sealed_value_metadata().await.unwrap();
+    let child_meta = child.list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test()).await.unwrap();
     assert!(
         child_meta.iter().any(|row| row.value_id == "parent_pre"),
         "child metadata must list the inherited id"
@@ -374,7 +373,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
             "subagent event payload must not carry the sealed literal"
         );
     }
-    let parent_meta = driver.session.list_sealed_value_metadata().await.unwrap();
+    let parent_meta = driver.session.list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test()).await.unwrap();
     for row in &parent_meta {
         assert!(!row.value_id.contains(literal));
         assert!(!row.reason.contains(literal));
@@ -403,8 +402,7 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     let late = "parent-late-sealed-value-4e1d";
     driver
         .session
-        .set_sealed_value(
-            &crate::redact::RedactionTable::empty(),
+        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &crate::redact::RedactionTable::empty(),
             "early_token",
             early,
             "before fork",
@@ -425,30 +423,30 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
 
     let (child, _history) = driver.prepare_fork_task_context().await.unwrap();
     assert!(
-        child.sealed_value_exists("early_token").await.unwrap(),
+        child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "early_token").await.unwrap(),
         "value sealed before fork remains injectable on the child"
     );
 
     let parent_table = driver.session.persisted_redaction_table().unwrap().unwrap();
     driver
         .session
-        .set_sealed_value(&parent_table, "late_token", late, "after fork", "user")
+        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &parent_table, "late_token", late, "after fork", "user")
         .await
         .unwrap();
 
     assert!(
         driver
             .session
-            .sealed_value_exists("late_token")
+            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "late_token")
             .await
             .unwrap(),
         "parent must resolve its own late value"
     );
     assert!(
-        !child.sealed_value_exists("late_token").await.unwrap(),
+        !child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "late_token").await.unwrap(),
         "subagent must not see parent values written after the fork point"
     );
-    let child_meta = child.list_sealed_value_metadata().await.unwrap();
+    let child_meta = child.list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test()).await.unwrap();
     assert!(
         child_meta.iter().all(|row| row.value_id != "late_token"),
         "late parent id must not appear on the child metadata list"
@@ -650,7 +648,6 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         write_scope: None,
         granted_tools: Vec::new(),
         todo_ids: Vec::new(),
-        sealed_fetch: None,
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
         task_call_id: "task-resolved-cwd".to_string(),

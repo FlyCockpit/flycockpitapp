@@ -71,7 +71,7 @@ impl TaskTool {
             })
             .unwrap_or_default();
         let description = format!(
-            "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls. `sealed_fetch` needs `value_id`; hides text, returns status.{recursion_note}"
+            "Delegate {list}: `intent` plus optional `payload`. @file/@file:XX-YY/@dir/ or /skill. Backgrounded JSON: task_call_id controls.{recursion_note}"
         );
         // Defensive (`LlmMode::Defensive`) steering: decompose harder and
         // route narrow pieces through subagents so each does one focused job
@@ -147,7 +147,7 @@ impl TaskTool {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["subagent", "subagent_interactive", "sealed_fetch"]
+                    "enum": ["subagent", "subagent_interactive"]
                 },
                 "model": model_selector_schema.clone(),
                 "context": {
@@ -172,10 +172,6 @@ impl TaskTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Extra tools"
-                },
-                "value_id": {
-                    "type": "string",
-                    "description": "Required with mode=sealed_fetch; sealed value id the child must write"
                 },
                 "todo_ids": {
                     "type": "array",
@@ -262,7 +258,6 @@ impl TaskTool {
                 "cwd": delegate_payload["properties"]["cwd"].clone(),
                 "write_scope": delegate_payload["properties"]["write_scope"].clone(),
                 "grant_tools": delegate_payload["properties"]["grant_tools"].clone(),
-                "value_id": delegate_payload["properties"]["value_id"].clone(),
                 "todo_ids": delegate_payload["properties"]["todo_ids"].clone(),
                 "remaining_depth": delegate_payload["properties"]["remaining_depth"].clone(),
                 "task_call_id": control_payload["properties"]["task_call_id"].clone(),
@@ -422,13 +417,12 @@ mod tests {
             assert!(payload_props.contains_key("why"), "missing `why`: {schema}");
             assert_eq!(
                 payload_props["mode"]["enum"],
-                serde_json::json!(["subagent", "subagent_interactive", "sealed_fetch"]),
-                "sealed-fetch mode must be advertised: {schema}"
+                serde_json::json!(["subagent", "subagent_interactive"]),
+                "delegation advertises exactly the two live modes: {schema}"
             );
-            assert_eq!(
-                payload_props["value_id"]["description"],
-                "Required with mode=sealed_fetch; sealed value id the child must write",
-                "sealed-fetch target id must be advertised: {schema}"
+            assert!(
+                !payload_props.contains_key("value_id"),
+                "the retired sealed-fetch target id must not be advertised: {schema}"
             );
             let context = payload_props.get("context").expect("missing context");
             assert_eq!(context["type"], "string");

@@ -2053,3 +2053,170 @@ WHEN OLD.state IN (
 BEGIN
     SELECT RAISE(ABORT, 'external journal terminal state is final');
 END;
+
+-- ---- scoped sealed values --------------------------------------------------
+-- Owner-managed sealed values across Session, Project, and Global scope.
+--
+-- Only Session literals live in SQLite (the pre-existing `sealed_values`
+-- table above). Project and Global literals live in a dedicated sealed-value
+-- compartment outside this database, addressed by a random opaque 32-byte
+-- exact key held in `compartment_key`. That key is a *locator*, never key
+-- material and never secret-derived: it is drawn from the OS CSPRNG with no
+-- relation to the literal, so possessing this table yields no oracle over any
+-- literal's content, length, or encoding.
+--
+-- `active_version` is 0 while a create saga is still prepared. A record is
+-- resolvable only at `active_version >= 1` with `deleted_at_ms IS NULL`, which
+-- is what makes an interrupted cross-store saga non-resolvable rather than
+-- half-live.
+CREATE TABLE sealed_value_records (
+    record_id       TEXT    PRIMARY KEY,
+    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    -- session_id for session scope, canonical project key for project scope,
+    -- and the empty string for global scope (global names are unique globally).
+    scope_key       TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    description     TEXT    NOT NULL,
+    owner_principal TEXT    NOT NULL,
+    active_version  INTEGER NOT NULL DEFAULT 0 CHECK (active_version >= 0),
+    compartment_key TEXT,
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    deleted_at_ms   INTEGER,
+    -- Session literals never leave SQLite, so a session record never carries a
+    -- compartment locator.
+    CHECK (scope <> 'session' OR compartment_key IS NULL),
+    -- Global records are unique globally; their scope key is always empty.
+    CHECK ((scope = 'global') = (scope_key = '')),
+    UNIQUE (scope, scope_key, name)
+);
+
+
+-- Session-scope records follow their session out of existence. There is no
+-- foreign key because `scope_key` is polymorphic across the three scopes.
+CREATE TRIGGER sealed_value_records_session_cascade
+AFTER DELETE ON sessions
+BEGIN
+    DELETE FROM sealed_value_records
+     WHERE scope = 'session' AND scope_key = OLD.session_id;
+END;
+
+-- Deleted names are never reused. The tombstone outlives the record row so a
+-- later create of the same canonical name in the same scope is refused.
+CREATE TABLE sealed_value_name_tombstones (
+    scope         TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope_key     TEXT    NOT NULL,
+    name          TEXT    NOT NULL,
+    retired_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (scope, scope_key, name)
+);
+
+-- Crash-resumable prepared/committed saga ledger for the cross-store
+-- (SQLite + compartment) lifecycle. `prepared` create/rotate roll back;
+-- `prepared` delete and every `committed` phase roll forward. The row is
+-- removed once cleanup has run, so a resumable saga is exactly a live row.
+CREATE TABLE sealed_value_sagas (
+    op_id                      TEXT    PRIMARY KEY,
+    record_id                  TEXT    NOT NULL,
+    kind                       TEXT    NOT NULL CHECK (kind IN ('create', 'rotate', 'delete')),
+    phase                      TEXT    NOT NULL CHECK (phase IN ('prepared', 'committed')),
+    target_version             INTEGER NOT NULL CHECK (target_version >= 0),
+    prepared_compartment_key   TEXT,
+    superseded_compartment_key TEXT,
+    created_at_ms              INTEGER NOT NULL,
+    updated_at_ms              INTEGER NOT NULL,
+    -- A create or rotate saga always stages a new locator. A delete normally
+    -- stages none, but a delete that *converted* an in-flight rotate inherits
+    -- that rotation's staged locator so cleanup can still reclaim it; without
+    -- that, the staged plaintext of a deleted value would be referenced by
+    -- nothing and survive on disk forever.
+    CHECK (kind = 'delete' OR prepared_compartment_key IS NOT NULL)
+);
+
+-- At most one in-flight lifecycle saga per record: concurrent create/rotate/
+-- delete on one record is a deterministic first-writer-wins race. This unique
+-- index is also the record lookup path, so no separate index is needed.
+CREATE UNIQUE INDEX uq_sealed_value_sagas_record ON sealed_value_sagas (record_id);
+
+-- Explicit Owner grant of a Global sealed value to one canonical project.
+-- Global scope carries no implicit project reach.
+CREATE TABLE sealed_global_project_grants (
+    record_id     TEXT    NOT NULL,
+    project_key   TEXT    NOT NULL,
+    granted_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (record_id, project_key),
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE
+);
+
+-- The exact grant tuple for one immutable action instance. Every targeting
+-- column is exact and NOT NULL: there is no wildcard target, environment name,
+-- child id, or caller dispatch identity anywhere in this table.
+--
+-- `use_epoch` is the deterministic compare-and-swap ownership token. A use
+-- claims the grant by bumping it; the loser of a race changes zero rows and
+-- performs no literal lookup and no outbound action.
+CREATE TABLE sealed_action_grants (
+    grant_id           TEXT    PRIMARY KEY,
+    record_id          TEXT    NOT NULL,
+    value_version      INTEGER NOT NULL CHECK (value_version >= 1),
+    project_key        TEXT    NOT NULL,
+    session_id         TEXT    NOT NULL,
+    session_generation INTEGER NOT NULL CHECK (session_generation >= 0),
+    action_id          TEXT    NOT NULL,
+    action_revision    INTEGER NOT NULL CHECK (action_revision >= 1),
+    use_epoch          INTEGER NOT NULL DEFAULT 0 CHECK (use_epoch >= 0),
+    issued_at_ms       INTEGER NOT NULL,
+    expires_at_ms      INTEGER,
+    revoked_at_ms      INTEGER,
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE,
+    -- A grant names an exact session. When that session is deleted the grant
+    -- must go with it: an outstanding grant naming a dead session would be a
+    -- capability nobody can see and nobody can revoke.
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_sealed_action_grants_lookup
+    ON sealed_action_grants (record_id, action_id, project_key, session_id);
+
+-- Session deletion cascades through this table, so the cascade needs an index
+-- it can seek on. Both indexes above lead with `record_id`, which SQLite
+-- cannot use for a `session_id` lookup, so deleting a session would scan every
+-- grant. Leads with `session_id` for that reason.
+CREATE INDEX idx_sealed_action_grants_session ON sealed_action_grants (session_id);
+
+-- One live grant per exact (record, action, project, session, generation)
+-- tuple, so authorization resolves a single row without ranking.
+CREATE UNIQUE INDEX uq_sealed_action_grants_tuple
+    ON sealed_action_grants (record_id, action_id, project_key, session_id, session_generation);
+
+-- A grant's targeting columns are immutable once issued. Only the revocation
+-- stamp and the use-ownership epoch may move.
+CREATE TRIGGER sealed_action_grants_targeting_immutable
+BEFORE UPDATE ON sealed_action_grants
+WHEN NEW.record_id          IS NOT OLD.record_id
+  OR NEW.value_version      IS NOT OLD.value_version
+  OR NEW.project_key        IS NOT OLD.project_key
+  OR NEW.session_id         IS NOT OLD.session_id
+  OR NEW.session_generation IS NOT OLD.session_generation
+  OR NEW.action_id          IS NOT OLD.action_id
+  OR NEW.action_revision    IS NOT OLD.action_revision
+  OR NEW.issued_at_ms       IS NOT OLD.issued_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'sealed action grant targeting is immutable');
+END;
+
+-- Revocation is one-way; a revoked grant is never un-revoked.
+CREATE TRIGGER sealed_action_grants_revocation_final
+BEFORE UPDATE ON sealed_action_grants
+WHEN OLD.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'sealed action grant revocation is final');
+END;
+
+-- The use-ownership epoch only advances.
+CREATE TRIGGER sealed_action_grants_epoch_monotonic
+BEFORE UPDATE ON sealed_action_grants
+WHEN NEW.use_epoch < OLD.use_epoch
+BEGIN
+    SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
+END;

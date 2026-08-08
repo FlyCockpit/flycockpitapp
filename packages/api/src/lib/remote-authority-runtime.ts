@@ -44,6 +44,7 @@ export interface AuthorityRuntimeStore {
   }): Promise<void>;
   loadLifecycle(deploymentId: string): Promise<AuthorityLifecycleRecord | null>;
   loadMembership(deploymentId: string): Promise<MembershipSnapshot>;
+  promoteJoiningReplica(deploymentId: string, replicaId: string): Promise<boolean>;
   loadPublicRings(
     deploymentId: string,
     digests: readonly string[],
@@ -222,6 +223,13 @@ export class RemoteAuthorityRuntime {
     try {
       await this.options.store.observePublicRing(this.config.deploymentId, digest, publicRing);
       await this.options.observations.publishLease(lease, 30);
+      if (localMember.state === "joining") {
+        await this.options.store.promoteJoiningReplica(
+          this.config.deploymentId,
+          this.options.replicaId,
+        );
+        return this.#fail("membership_snapshot_changed");
+      }
       const [leases, rings] = await Promise.all([
         this.options.observations.listLeases(
           this.config.deploymentId,

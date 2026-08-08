@@ -117,6 +117,27 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       })),
     } satisfies MembershipSnapshot;
   }
+  async promoteJoiningReplica(deploymentId: string, replicaId: string) {
+    return this.db.$transaction(
+      async (tx) => {
+        const rows = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "membershipGeneration","state" FROM remote_authority_replica_memberships WHERE "deploymentId"=$1 AND "replicaId"=$2 FOR UPDATE`,
+          deploymentId,
+          replicaId,
+        );
+        if (rows[0]?.state !== "joining") return false;
+        const next = (BigInt(text(rows[0]?.membershipGeneration)) + 1n).toString();
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_replica_memberships SET "membershipGeneration"=$2::numeric,"state"=CASE WHEN "replicaId"=$3 THEN 'required'::"RemoteAuthorityReplicaState" ELSE "state" END,"updatedAt"=NOW() WHERE "deploymentId"=$1`,
+          deploymentId,
+          next,
+          replicaId,
+        );
+        return true;
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }
   async loadPublicRings(deploymentId: string, digests: readonly string[]) {
     if (digests.length === 0) return new Map();
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
@@ -397,6 +418,18 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       async (tx) => {
         await tx.$executeRawUnsafe(
           `UPDATE remote_authority_signing_fences SET "state"='closing',"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='open'`,
+          deploymentId,
+          kid,
+        );
+        // The in-process file provider cannot complete work after its process dies: a
+        // durable reservation with no recorded signature is therefore confirmed-not-started.
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_journal SET "state"='aborted',"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='reserved'`,
+          deploymentId,
+          kid,
+        );
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_journal SET "state"='finalized',"signedAt"=NOW(),"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='signed'`,
           deploymentId,
           kid,
         );

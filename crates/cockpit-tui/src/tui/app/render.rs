@@ -4782,12 +4782,17 @@ fn markdown_chrome_prefix_width(
         spans = line.spans.iter();
     }
     if let Some(marker) = spans.next() {
-        let marker = marker.content.as_ref();
-        if marker == "│ "
-            || heading_marker_width(marker).is_some_and(|width| width == marker.width())
-            || list_marker_width(marker).is_some_and(|width| width == marker.width())
+        let text = marker.content.as_ref();
+        if text.starts_with("│ ") {
+            return external_prefix + 2;
+        }
+        if marker.style.add_modifier.contains(Modifier::BOLD)
+            && let Some(width) = heading_marker_width(text)
         {
-            return external_prefix + marker.width();
+            return external_prefix + width;
+        }
+        if let Some(width) = list_marker_width(text) {
+            return external_prefix + width;
         }
     }
     external_prefix
@@ -9765,6 +9770,16 @@ mod render_history_spacing_tests {
         )
         .unwrap();
         assert_eq!(item, "1999 follows");
+
+        app.history = vec![agent(
+            "1. a deliberately long ordered item that wraps across several rows",
+        )]
+        .into();
+        render_history(&mut app, 22, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 22, 8),
+            "a deliberately long ordered item that wraps across several rows"
+        );
     }
 
     #[test]

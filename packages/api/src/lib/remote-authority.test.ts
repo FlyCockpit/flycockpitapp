@@ -26,6 +26,7 @@ import {
   reconcileAuthorityFence,
   reduceAuthorityRollout,
   reserveAuthorityMint,
+  validateLifecycleTransition,
   validateThreeDigestPlan,
   verifyRemoteAuthorityStatusJws,
 } from "./remote-authority";
@@ -306,10 +307,198 @@ describe("remote_authority_retirement_floor", () => {
 });
 
 describe("remote_authority_outage_matrix", () => {
-  it("serves the paired public snapshot only through the earlier 60-second bound", () => {
+  it.each([
+    { publishedAt: "100", statusExpiry: "200", lastServed: "160" },
+    { publishedAt: "100", statusExpiry: "130", lastServed: "130" },
+  ])("serves the paired public snapshot only through the earlier bound %#", ({
+    publishedAt,
+    statusExpiry,
+    lastServed,
+  }) => {
     const snapshot = new AuthorityPublicSnapshot();
-    snapshot.publish({ keys: [] }, "status", "200", "100");
-    expect(snapshot.read("status", "160")?.body).toBe("status");
-    expect(snapshot.read("status", "161")).toBeUndefined();
+    snapshot.publish({ keys: [] }, "status", statusExpiry, publishedAt);
+    expect(snapshot.read("jwks", publishedAt)).toBeDefined();
+    expect(snapshot.read("status", lastServed)?.body).toBe("status");
+    expect(snapshot.read("jwks", (BigInt(lastServed) + 1n).toString())).toBeUndefined();
+    expect(snapshot.read("status", (BigInt(lastServed) + 1n).toString())).toBeUndefined();
+  });
+
+  it("encodes the exact lease renewal, expiry, refresh, and recovery timing constants", () => {
+    expect(REMOTE_AUTHORITY.leaseRenew).toBe(10n);
+    expect(REMOTE_AUTHORITY.leaseTtl).toBe(30n);
+    expect(REMOTE_AUTHORITY.statusRefresh).toBe(20n);
+    expect(REMOTE_AUTHORITY.statusLifetime).toBe(60n);
+
+    const value = publicAuthorityRing(ring([makeKey("k0", "current")]), cfg),
+      digest = publicAuthorityRingDigest(value),
+      snapshot = {
+        membershipGeneration: "1",
+        members: [{ replicaId: "a", replicaGeneration: "1", state: "required" as const }],
+      },
+      lease: ObservationLease = {
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        membershipGeneration: "1",
+        replicaId: "a",
+        replicaGeneration: "1",
+        leaseGeneration: "1",
+        revision: "1",
+        digest,
+        currentKid: "k0",
+        publicKids: ["k0"],
+        authorityEpoch: "1",
+        observedRedisTime: "100",
+        expiresAt: "130",
+      },
+      input = {
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        snapshot,
+        leases: [lease],
+        plan: [digest] as [string],
+        rings: new Map([[digest, value]]),
+        localDigest: digest,
+      };
+    expect(reduceAuthorityRollout({ ...input, now: "129" }).ready).toBe(true);
+    expect(reduceAuthorityRollout({ ...input, now: "130" }).ready).toBe(false);
+    expect(reduceAuthorityRollout({ ...input, now: "99", previousRedisTime: "100" }).ready).toBe(
+      false,
+    );
+  });
+});
+
+describe("remote_authority_revocation_epoch_bound", () => {
+  it("binds continuous generations to epochs and rejects stale authority after validity plus skew", async () => {
+    const k0 = makeKey("k0", "current"),
+      k1 = makeKey("k1", "verification_only"),
+      before = ring([k0, k1], "8", "12"),
+      after = ring(
+        [
+          { ...k0, state: "revoked" },
+          { ...k1, state: "current" },
+        ],
+        "9",
+        "13",
+      ),
+      beforeDigest = authorityRingDigest(before, cfg),
+      afterDigest = authorityRingDigest(after, cfg),
+      oldStatus = await createRemoteAuthorityStatusJws(
+        {
+          schemaVersion: 1,
+          iss: cfg.issuer,
+          aud: "flycockpit-remote-authority-status-v1",
+          deploymentId: cfg.deploymentId,
+          revision: "8",
+          ringDigest: beforeDigest,
+          authorityEpoch: "12",
+          statusGeneration: "40",
+          revokedKids: [],
+          iat: "100",
+          validUntil: "160",
+        },
+        new FileAuthoritySigner(k0),
+      ),
+      refreshedStatus = await createRemoteAuthorityStatusJws(
+        {
+          schemaVersion: 1,
+          iss: cfg.issuer,
+          aud: "flycockpit-remote-authority-status-v1",
+          deploymentId: cfg.deploymentId,
+          revision: "8",
+          ringDigest: beforeDigest,
+          authorityEpoch: "12",
+          statusGeneration: "41",
+          revokedKids: [],
+          iat: "120",
+          validUntil: "180",
+        },
+        new FileAuthoritySigner(k0),
+      ),
+      revokedStatus = await createRemoteAuthorityStatusJws(
+        {
+          schemaVersion: 1,
+          iss: cfg.issuer,
+          aud: "flycockpit-remote-authority-status-v1",
+          deploymentId: cfg.deploymentId,
+          revision: "9",
+          ringDigest: afterDigest,
+          authorityEpoch: "13",
+          statusGeneration: "42",
+          revokedKids: ["k0"],
+          iat: "140",
+          validUntil: "200",
+        },
+        new FileAuthoritySigner({ ...k1, state: "current" }),
+      );
+
+    expect(
+      (
+        await verifyRemoteAuthorityStatusJws(
+          refreshedStatus,
+          new RingAuthorityVerifier(before, "120"),
+          {
+            issuer: cfg.issuer,
+            deploymentId: cfg.deploymentId,
+            ringDigest: beforeDigest,
+            authorityEpoch: "12",
+            minimumGeneration: "41",
+            now: "120",
+          },
+        )
+      ).payload.statusGeneration,
+    ).toBe("41");
+    await expect(
+      verifyRemoteAuthorityStatusJws(oldStatus, new RingAuthorityVerifier(before, "221"), {
+        issuer: cfg.issuer,
+        deploymentId: cfg.deploymentId,
+        ringDigest: beforeDigest,
+        authorityEpoch: "12",
+        minimumGeneration: "40",
+        now: "221",
+      }),
+    ).rejects.toThrow("status scope, generation, or time mismatch");
+    const committed = await verifyRemoteAuthorityStatusJws(
+      revokedStatus,
+      new RingAuthorityVerifier(after, "140"),
+      {
+        issuer: cfg.issuer,
+        deploymentId: cfg.deploymentId,
+        ringDigest: afterDigest,
+        authorityEpoch: "13",
+        minimumGeneration: "42",
+        now: "140",
+      },
+    );
+    expect(committed.payload.revokedKids).toEqual(["k0"]);
+    expect(publicAuthorityJwks(after, "140").keys.map((key) => key.kid)).toEqual(["k1"]);
+  });
+
+  it("requires one counter increment, a replacement signer, and stable transition identity", () => {
+    const transition = {
+      transitionId: "revocation-1",
+      state: "status_signed" as const,
+      fromRevision: "8",
+      toRevision: "9",
+      fromDigest: "a".repeat(64),
+      toDigest: "b".repeat(64),
+      fromAuthorityEpoch: "12",
+      toAuthorityEpoch: "13",
+      fromCurrentKid: "k0",
+      toCurrentKid: "k1",
+      statusGeneration: "42",
+      statusBodyDigest: "c".repeat(64),
+      signingGeneration: "13",
+    };
+    expect(validateLifecycleTransition(transition, "k1")).toBe(transition);
+    expect(validateLifecycleTransition({ ...transition, state: "committed" }, "k1")).toEqual({
+      ...transition,
+      state: "committed",
+    });
+    expect(() => validateLifecycleTransition(transition, "")).toThrow(
+      "authorized non-revoked signer",
+    );
+    expect(() =>
+      validateLifecycleTransition({ ...transition, toAuthorityEpoch: "12" }, "k1"),
+    ).toThrow("lifecycle counters must increment");
   });
 });

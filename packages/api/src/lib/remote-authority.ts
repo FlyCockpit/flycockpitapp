@@ -89,7 +89,7 @@ export function normalizeAuthorityIssuer(value: string) {
   )
     throw new Error("issuer must be an HTTPS origin");
   const normalized = `https://${url.hostname.toLowerCase()}${url.port && url.port !== "443" ? `:${url.port}` : ""}`;
-  if (normalized !== value || normalized.length > 255 || !/^[\x20-\x7e]+$/.test(normalized))
+  if (normalized.length > 255 || !/^[\x20-\x7e]+$/.test(normalized))
     throw new Error("issuer must be a canonical ASCII HTTPS origin");
   return normalized;
 }
@@ -624,6 +624,7 @@ export async function verifyRemoteAuthorityStatusJws(
     authorityEpoch: string;
     minimumGeneration: string;
     now: string;
+    authorizedSignerKid: string;
   },
 ) {
   if (Buffer.byteLength(compact) > 16_384) throw new Error("status JWS exceeds limit");
@@ -697,6 +698,8 @@ export async function verifyRemoteAuthorityStatusJws(
     p.deploymentId !== expected.deploymentId ||
     p.ringDigest !== expected.ringDigest ||
     p.authorityEpoch !== expected.authorityEpoch ||
+    h.kid !== expected.authorizedSignerKid ||
+    p.revokedKids.includes(h.kid) ||
     BigInt(p.statusGeneration) < BigInt(expected.minimumGeneration) ||
     BigInt(expected.now) > BigInt(p.validUntil) + REMOTE_AUTHORITY.verificationSkew
   )
@@ -721,7 +724,10 @@ export interface AuthorityPublicJwks {
     y: string;
   }>;
 }
-export function publicAuthorityJwks(ring: AuthorityRingFile, now: string): AuthorityPublicJwks {
+export function publicAuthorityJwks(
+  ring: AuthorityRingFile | PublicAuthorityRing,
+  now: string,
+): AuthorityPublicJwks {
   u64(now, "JWKS time");
   const time = BigInt(now);
   return {
@@ -963,7 +969,7 @@ export function validateLifecycleTransition(
 }
 export class RingAuthorityVerifier implements RemoteAuthorityVerifier {
   #keys = new Map<string, ReturnType<typeof createPublicKey>>();
-  constructor(ring: AuthorityRingFile, now: string) {
+  constructor(ring: AuthorityRingFile | PublicAuthorityRing, now: string) {
     u64(now, "verifier time");
     const time = BigInt(now);
     for (const key of ring.keys)
@@ -975,7 +981,7 @@ export class RingAuthorityVerifier implements RemoteAuthorityVerifier {
         this.#keys.set(
           key.kid,
           createPublicKey({
-            key: { kty: key.kty, crv: key.crv, x: key.x, y: key.y },
+            key: { kty: "EC", crv: key.crv, x: key.x, y: key.y },
             format: "jwk",
           }),
         );
@@ -998,6 +1004,7 @@ export class CachedAuthorityVerifier implements RemoteAuthorityVerifier {
   #verifier: RingAuthorityVerifier;
   #refresh: Promise<void> | undefined;
   #lastUnknownRefresh = Number.NEGATIVE_INFINITY;
+  #loadedAt: number;
   constructor(
     readonly issuer: string,
     initialRing: AuthorityRingFile,
@@ -1005,23 +1012,29 @@ export class CachedAuthorityVerifier implements RemoteAuthorityVerifier {
     private readonly loadRing: () => Promise<AuthorityRingFile>,
   ) {
     normalizeAuthorityIssuer(issuer);
-    this.#verifier = new RingAuthorityVerifier(initialRing, String(Math.floor(nowSeconds())));
+    this.#loadedAt = nowSeconds();
+    this.#verifier = new RingAuthorityVerifier(initialRing, String(Math.floor(this.#loadedAt)));
   }
   async verifyP1363(input: Uint8Array, signature: Uint8Array, kid: string) {
-    if (this.#verifier.hasKid(kid)) return this.#verifier.verifyP1363(input, signature, kid);
     const now = this.nowSeconds();
+    if (now - this.#loadedAt >= Number(REMOTE_AUTHORITY.jwksCacheAge)) await this.#refreshRing();
+    if (this.#verifier.hasKid(kid)) return this.#verifier.verifyP1363(input, signature, kid);
     if (this.#refresh) await this.#refresh;
     else if (now - this.#lastUnknownRefresh >= Number(REMOTE_AUTHORITY.jwksCacheAge)) {
       this.#lastUnknownRefresh = now;
-      this.#refresh = this.loadRing()
-        .then((ring) => {
-          this.#verifier = new RingAuthorityVerifier(ring, String(Math.floor(this.nowSeconds())));
-        })
-        .finally(() => {
-          this.#refresh = undefined;
-        });
-      await this.#refresh;
+      await this.#refreshRing();
     }
     return this.#verifier.verifyP1363(input, signature, kid);
+  }
+  async #refreshRing() {
+    this.#refresh ??= this.loadRing()
+      .then((ring) => {
+        this.#loadedAt = this.nowSeconds();
+        this.#verifier = new RingAuthorityVerifier(ring, String(Math.floor(this.#loadedAt)));
+      })
+      .finally(() => {
+        this.#refresh = undefined;
+      });
+    await this.#refresh;
   }
 }

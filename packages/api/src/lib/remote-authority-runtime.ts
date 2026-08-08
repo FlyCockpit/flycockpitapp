@@ -45,6 +45,7 @@ export interface AuthorityRuntimeStore {
   loadLifecycle(deploymentId: string): Promise<AuthorityLifecycleRecord | null>;
   loadMembership(deploymentId: string): Promise<MembershipSnapshot>;
   promoteJoiningReplica(deploymentId: string, replicaId: string): Promise<boolean>;
+  drainReplica(deploymentId: string, replicaId: string): Promise<boolean>;
   loadPublicRings(
     deploymentId: string,
     digests: readonly string[],
@@ -149,7 +150,18 @@ export class RemoteAuthorityRuntime {
   get decision() {
     return this.#decision;
   }
+  async drain() {
+    this.#fail("replica_draining");
+    return this.options.store.drainReplica(this.config.deploymentId, this.options.replicaId);
+  }
   async tick() {
+    try {
+      return await this.#tick();
+    } catch {
+      return this.#fail("runtime_dependency_failure");
+    }
+  }
+  async #tick() {
     let now: string;
     let convergenceLeases: ObservationLease[] = [];
     try {
@@ -311,6 +323,7 @@ export class RemoteAuthorityRuntime {
             authorityEpoch: ring.authorityEpoch,
             minimumGeneration: generation,
             now,
+            authorizedSignerKid: ring.currentKid,
           });
         } else compactJws = await createRemoteAuthorityStatusJws(body, signer);
         if (
@@ -355,32 +368,38 @@ export class RemoteAuthorityRuntime {
       )
         return this.#fail("prior_signing_fence_not_frozen");
     }
+    const servingPublicRing =
+      lifecycle.ringDigest === digest
+        ? publicRing
+        : (
+            await this.options.store
+              .loadPublicRings(this.config.deploymentId, [lifecycle.ringDigest])
+              .catch(() => new Map<string, PublicAuthorityRing>())
+          ).get(lifecycle.ringDigest);
+    if (!servingPublicRing) return this.#fail("committed_public_ring_missing");
     let status = await this.options.store
       .loadHighestFinalizedStatus({
         deploymentId: this.config.deploymentId,
-        ringDigest: digest,
-        authorityEpoch: ring.authorityEpoch,
+        ringDigest: lifecycle.ringDigest,
+        authorityEpoch: lifecycle.authorityEpoch,
       })
       .catch(() => null);
     if (status) {
       try {
         const verified = await verifyRemoteAuthorityStatusJws(
           status.compactJws,
-          new RingAuthorityVerifier(ring, now),
+          new RingAuthorityVerifier(servingPublicRing, now),
           {
             issuer: this.config.issuer,
             deploymentId: this.config.deploymentId,
-            ringDigest: digest,
-            authorityEpoch: ring.authorityEpoch,
+            ringDigest: lifecycle.ringDigest,
+            authorityEpoch: lifecycle.authorityEpoch,
             minimumGeneration: "0",
             now,
+            authorizedSignerKid: lifecycle.currentKid,
           },
         );
-        if (
-          verified.header.kid !== ring.currentKid ||
-          verified.payload.statusGeneration !== status.status.statusGeneration
-        )
-          status = null;
+        if (verified.payload.statusGeneration !== status.status.statusGeneration) status = null;
         else status = { compactJws: status.compactJws, status: verified.payload };
       } catch {
         status = null;
@@ -390,7 +409,11 @@ export class RemoteAuthorityRuntime {
       this.#recoveryMinimumGeneration !== undefined &&
       (!status ||
         BigInt(status.status.statusGeneration) <= BigInt(this.#recoveryMinimumGeneration));
-    if (!status || mustRecover || BigInt(status.status.validUntil) <= BigInt(now) + 40n) {
+    const localMayIssueStatus = this.#decision.signingKid === lifecycle.currentKid;
+    if (
+      (!status || mustRecover || BigInt(status.status.validUntil) <= BigInt(now) + 40n) &&
+      localMayIssueStatus
+    ) {
       try {
         const elected = await this.options.store.acquireStatusLease({
           deploymentId: this.config.deploymentId,
@@ -400,8 +423,8 @@ export class RemoteAuthorityRuntime {
         if (!elected) {
           const winner = await this.options.store.loadHighestFinalizedStatus({
             deploymentId: this.config.deploymentId,
-            ringDigest: digest,
-            authorityEpoch: ring.authorityEpoch,
+            ringDigest: lifecycle.ringDigest,
+            authorityEpoch: lifecycle.authorityEpoch,
           });
           if (winner && BigInt(winner.status.validUntil) > BigInt(now)) status = winner;
           else return this.#fail("status_election_wait");
@@ -415,9 +438,9 @@ export class RemoteAuthorityRuntime {
               iss: this.config.issuer,
               aud: "flycockpit-remote-authority-status-v1",
               deploymentId: this.config.deploymentId,
-              revision: ring.revision,
-              ringDigest: digest,
-              authorityEpoch: ring.authorityEpoch,
+              revision: lifecycle.revision,
+              ringDigest: lifecycle.ringDigest,
+              authorityEpoch: lifecycle.authorityEpoch,
               statusGeneration: generation,
               revokedKids: [...new Set(lifecycle.revokedKids)].sort((a, b) =>
                 Buffer.compare(Buffer.from(a), Buffer.from(b)),
@@ -436,8 +459,8 @@ export class RemoteAuthorityRuntime {
           if (!committed) {
             status = await this.options.store.loadHighestFinalizedStatus({
               deploymentId: this.config.deploymentId,
-              ringDigest: digest,
-              authorityEpoch: ring.authorityEpoch,
+              ringDigest: lifecycle.ringDigest,
+              authorityEpoch: lifecycle.authorityEpoch,
             });
             if (!status) return this.#fail("status_generation_conflict");
           } else status = { status: body, compactJws };
@@ -446,6 +469,7 @@ export class RemoteAuthorityRuntime {
         return this.#fail("status_refresh_failed");
       }
     }
+    if (!status) return this.#fail("current_status_unavailable");
     if (
       this.#recoveryMinimumGeneration !== undefined &&
       BigInt(status.status.statusGeneration) <= BigInt(this.#recoveryMinimumGeneration)
@@ -470,7 +494,7 @@ export class RemoteAuthorityRuntime {
     this.#recoveryMinimumGeneration = undefined;
     this.#lastSuccessfulTickAt = Date.now();
     this.options.snapshot.publish(
-      publicAuthorityJwks(ring, now),
+      publicAuthorityJwks(servingPublicRing, now),
       status.compactJws,
       status.status.validUntil,
       now,

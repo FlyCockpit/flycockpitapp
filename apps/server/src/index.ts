@@ -564,6 +564,7 @@ async function shutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
+  await remoteAuthority.runtime?.drain().catch(() => false);
 
   // 1. Stop accepting new connections and drain in-flight requests.
   await new Promise<void>((resolve) => {

@@ -17,9 +17,12 @@ describe("remote_authority_static_ownership", () => {
   it("keeps authority code independent of legacy secrets and enterprise providers", async () => {
     const apiRoot = new URL("..", import.meta.url).pathname,
       serverRoot = new URL("../../../../apps/server/src", import.meta.url).pathname,
-      files = [...(await sourceFiles(apiRoot)), ...(await sourceFiles(serverRoot))].filter((path) =>
-        path.includes("remote-authority"),
-      );
+      keyScript = new URL("../../../../scripts/remote-authority-keys.ts", import.meta.url).pathname,
+      files = [
+        ...(await sourceFiles(apiRoot)),
+        ...(await sourceFiles(serverRoot)),
+        keyScript,
+      ].filter((path) => path.includes("remote-authority"));
     expect(files.length).toBeGreaterThan(0);
     for (const path of files) {
       const source = await readFile(path, "utf8");

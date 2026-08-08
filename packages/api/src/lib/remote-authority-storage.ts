@@ -57,10 +57,11 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
           args.ring.currentKid,
         );
         const members = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
-          `SELECT "membershipGeneration","replicaId" FROM remote_authority_replica_memberships WHERE "deploymentId"=$1 FOR UPDATE`,
+          `SELECT "membershipGeneration","replicaId","replicaGeneration","state" FROM remote_authority_replica_memberships WHERE "deploymentId"=$1 FOR UPDATE`,
           args.deploymentId,
         );
-        if (!members.some((member) => member.replicaId === args.replicaId)) {
+        const existingMember = members.find((member) => member.replicaId === args.replicaId);
+        if (!existingMember) {
           const generation = members.length === 0 ? "1" : text(members[0]?.membershipGeneration);
           await tx.$executeRawUnsafe(
             `INSERT INTO remote_authority_replica_memberships ("deploymentId","membershipGeneration","replicaId","replicaGeneration","state","updatedAt") VALUES ($1,$2::numeric,$3,1,$4,NOW())`,
@@ -69,10 +70,22 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
             args.replicaId,
             members.length === 0 ? "required" : "joining",
           );
+        } else if (existingMember.state === "draining") {
+          const nextMembership = (
+              BigInt(text(existingMember.membershipGeneration)) + 1n
+            ).toString(),
+            nextReplica = (BigInt(text(existingMember.replicaGeneration)) + 1n).toString();
+          await tx.$executeRawUnsafe(
+            `UPDATE remote_authority_replica_memberships SET "membershipGeneration"=$2::numeric,"replicaGeneration"=CASE WHEN "replicaId"=$3 THEN $4::numeric ELSE "replicaGeneration" END,"state"=CASE WHEN "replicaId"=$3 THEN 'joining'::"RemoteAuthorityReplicaState" ELSE "state" END,"updatedAt"=NOW() WHERE "deploymentId"=$1`,
+            args.deploymentId,
+            nextMembership,
+            args.replicaId,
+            nextReplica,
+          );
         }
         if (inserted === 1)
           await tx.$executeRawUnsafe(
-            `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT DO NOTHING`,
+            `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT ("deploymentId","kid","signingGeneration") DO NOTHING`,
             args.deploymentId,
             args.ring.currentKid,
             args.ring.authorityEpoch,
@@ -130,6 +143,27 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         const next = (BigInt(text(rows[0]?.membershipGeneration)) + 1n).toString();
         await tx.$executeRawUnsafe(
           `UPDATE remote_authority_replica_memberships SET "membershipGeneration"=$2::numeric,"state"=CASE WHEN "replicaId"=$3 THEN 'required'::"RemoteAuthorityReplicaState" ELSE "state" END,"updatedAt"=NOW() WHERE "deploymentId"=$1`,
+          deploymentId,
+          next,
+          replicaId,
+        );
+        return true;
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }
+  async drainReplica(deploymentId: string, replicaId: string) {
+    return this.db.$transaction(
+      async (tx) => {
+        const rows = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "membershipGeneration","state" FROM remote_authority_replica_memberships WHERE "deploymentId"=$1 AND "replicaId"=$2 FOR UPDATE`,
+          deploymentId,
+          replicaId,
+        );
+        if (rows[0]?.state !== "required") return false;
+        const next = (BigInt(text(rows[0]?.membershipGeneration)) + 1n).toString();
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_replica_memberships SET "membershipGeneration"=$2::numeric,"state"=CASE WHEN "replicaId"=$3 THEN 'draining'::"RemoteAuthorityReplicaState" ELSE "state" END,"updatedAt"=NOW() WHERE "deploymentId"=$1`,
           deploymentId,
           next,
           replicaId,
@@ -378,9 +412,10 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     return this.db.$transaction(
       async (tx) => {
         const existing = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
-          `SELECT "state","signingGeneration" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 FOR UPDATE`,
+          `SELECT "state","signingGeneration" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric FOR UPDATE`,
           args.deploymentId,
           args.kid,
+          args.signingGeneration,
         );
         if (
           existing[0]?.state === "open" &&
@@ -397,15 +432,16 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         )
           return false;
         await tx.$executeRawUnsafe(
-          `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT ("deploymentId","kid") DO UPDATE SET "signingGeneration"=EXCLUDED."signingGeneration","updatedAt"=NOW() WHERE remote_authority_signing_fences."state"='open'`,
+          `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT ("deploymentId","kid","signingGeneration") DO NOTHING`,
           args.deploymentId,
           args.kid,
           args.signingGeneration,
         );
         const fence = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
-          `SELECT "state","signingGeneration" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2`,
+          `SELECT "state","signingGeneration" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric`,
           args.deploymentId,
           args.kid,
+          args.signingGeneration,
         );
         return (
           fence[0]?.state === "open" && text(fence[0]?.signingGeneration) === args.signingGeneration

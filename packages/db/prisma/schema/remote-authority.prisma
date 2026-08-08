@@ -64,7 +64,7 @@ model RemoteAuthoritySigningFence {
   cutoff            DateTime?
   updatedAt         DateTime                  @updatedAt
 
-  @@id([deploymentId, kid])
+  @@id([deploymentId, kid, signingGeneration])
   @@map("remote_authority_signing_fences")
 }
 

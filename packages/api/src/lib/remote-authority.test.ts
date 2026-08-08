@@ -219,6 +219,7 @@ describe("remote_authority_jwks_and_status_public_only", () => {
         authorityEpoch: "1",
         minimumGeneration: "1",
         now: "100",
+        authorizedSignerKid: "k0",
       },
     );
     expect(verified.header.kid).toBe("k0");
@@ -443,6 +444,7 @@ describe("remote_authority_revocation_epoch_bound", () => {
             authorityEpoch: "12",
             minimumGeneration: "41",
             now: "120",
+            authorizedSignerKid: "k0",
           },
         )
       ).payload.statusGeneration,
@@ -455,6 +457,7 @@ describe("remote_authority_revocation_epoch_bound", () => {
         authorityEpoch: "12",
         minimumGeneration: "40",
         now: "221",
+        authorizedSignerKid: "k0",
       }),
     ).rejects.toThrow("status scope, generation, or time mismatch");
     const committed = await verifyRemoteAuthorityStatusJws(
@@ -467,6 +470,7 @@ describe("remote_authority_revocation_epoch_bound", () => {
         authorityEpoch: "13",
         minimumGeneration: "42",
         now: "140",
+        authorizedSignerKid: "k1",
       },
     );
     expect(committed.payload.revokedKids).toEqual(["k0"]);

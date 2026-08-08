@@ -843,7 +843,7 @@ pub struct ParsedCertificateJws {
     pub signature_p1363: [u8; 64],
     pub signing_input: Vec<u8>,
 }
-fn canonical_json(value: &serde_json::Value) -> Result<String> {
+pub fn canonical_json(value: &serde_json::Value) -> Result<String> {
     match value {
         serde_json::Value::Null => Ok("null".into()),
         serde_json::Value::Bool(_)

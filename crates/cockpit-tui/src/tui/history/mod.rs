@@ -2006,7 +2006,7 @@ fn render_agent(
                     max_offset: window.max_offset,
                 });
             }
-            copy_body_start = Some(out.len());
+            copy_body_start = markdown.then_some(out.len());
             out.extend(body_lines);
             conts.extend(body_conts);
         } else if markdown {

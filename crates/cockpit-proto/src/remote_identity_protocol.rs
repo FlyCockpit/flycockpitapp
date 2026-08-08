@@ -1,4 +1,5 @@
 //! Canonical transport-neutral remote identity codecs. This module validates syntax only.
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 pub const FCIP: [u8; 4] = *b"FCIP";
@@ -199,6 +200,37 @@ fn id(x: &[u8; 16]) -> Result<()> {
         Ok(())
     }
 }
+const P256_N: [u8; 32] = [
+    255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 188, 230, 250, 173,
+    167, 23, 158, 132, 243, 185, 202, 194, 252, 99, 37, 81,
+];
+const P256_HALF_N: [u8; 32] = [
+    127, 255, 255, 255, 128, 0, 0, 0, 127, 255, 255, 255, 255, 255, 255, 255, 222, 115, 125, 86,
+    211, 139, 207, 66, 121, 220, 229, 97, 126, 49, 146, 168,
+];
+fn validate_low_s(signature: &[u8; 64]) -> Result<()> {
+    let r: [u8; 32] = signature[..32]
+        .try_into()
+        .map_err(|_| Error("signature".into()))?;
+    let s: [u8; 32] = signature[32..]
+        .try_into()
+        .map_err(|_| Error("signature".into()))?;
+    if r.iter().all(|b| *b == 0) || s.iter().all(|b| *b == 0) || r >= P256_N || s > P256_HALF_N {
+        return err("invalid or high-S P1363 signature");
+    };
+    Ok(())
+}
+fn validate_thumbprint(x: &[u8; 32], y: &[u8; 32], thumbprint: &[u8; 32]) -> Result<()> {
+    let json = format!(
+        "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+        URL_SAFE_NO_PAD.encode(x),
+        URL_SAFE_NO_PAD.encode(y)
+    );
+    if sha256(json.as_bytes()) != *thumbprint {
+        return err("thumbprint mismatch");
+    };
+    Ok(())
+}
 fn put_account(w: &mut Writer, k: SubjectKind, a: &Option<[u8; 16]>) -> Result<()> {
     match (k, a) {
         (SubjectKind::Client, Some(x)) => {
@@ -254,6 +286,7 @@ impl Proposal {
         ] {
             id(x)?
         }
+        validate_thumbprint(&self.p256_x, &self.p256_y, &self.thumbprint)?;
         let o = normalized_origin(&self.issuer)?;
         let mut w = Writer::new(FCIP);
         w.u8(self.subject_kind as u8);
@@ -335,7 +368,11 @@ fn normalized_origin(s: &str) -> Result<&[u8]> {
         return err("origin must be a normalized HTTPS origin");
     }
     let host = authority.split_once(':').map_or(authority, |(host, port)| {
-        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        if port.is_empty()
+            || port.starts_with('0')
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
             ""
         } else {
             host
@@ -400,6 +437,7 @@ impl EnrollmentTranscript {
         if !valid_roles(self.initiator_role, self.confirmer_role) {
             return err("invalid enrollment role pair");
         }
+        validate_thumbprint(&self.p256_x, &self.p256_y, &self.thumbprint)?;
         if !matches!(self.expires_at.checked_sub(self.created_at), Some(1..=300)) {
             return err("invalid transcript lifetime");
         }
@@ -559,6 +597,7 @@ pub fn enrollment_confirmation_domain(role: EnrollmentRole) -> Vec<u8> {
 impl EnrollmentConfirmation {
     pub fn encode(&self) -> Result<Vec<u8>> {
         id(&self.enrollment_id)?;
+        validate_low_s(&self.signature_p1363)?;
         if !(1..=2).contains(&self.decision)
             || !matches!(self.expires_at.checked_sub(self.issued_at), Some(1..=60))
         {
@@ -730,6 +769,7 @@ impl PossessionProof {
         id(&self.subject_id)?;
         id(&self.certificate_id)?;
         id(&self.request_id)?;
+        validate_low_s(&self.signature_p1363)?;
         if self.expires_at.checked_sub(self.issued_at) != Some(60) {
             return err("proof lifetime");
         };
@@ -791,6 +831,105 @@ impl PossessionProof {
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCertificateJws {
+    pub protected_header: serde_json::Value,
+    pub payload: serde_json::Value,
+    pub signature_p1363: [u8; 64],
+    pub signing_input: Vec<u8>,
+}
+fn decode_canonical_b64url(text: &str) -> Result<Vec<u8>> {
+    if text.is_empty() || text.contains('=') {
+        return err("noncanonical base64url");
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|_| Error("invalid base64url".into()))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != text {
+        return err("noncanonical base64url");
+    };
+    Ok(bytes)
+}
+pub fn parse_remote_identity_certificate_jws(compact: &str) -> Result<ParsedCertificateJws> {
+    if compact.len() > 4096 {
+        return err("certificate exceeds limit");
+    };
+    let parts: Vec<_> = compact.split('.').collect();
+    if parts.len() != 3 {
+        return err("invalid compact JWS");
+    };
+    let header_bytes = decode_canonical_b64url(parts[0])?;
+    let payload_bytes = decode_canonical_b64url(parts[1])?;
+    let signature: [u8; 64] = decode_canonical_b64url(parts[2])?
+        .try_into()
+        .map_err(|_| Error("signature length".into()))?;
+    validate_low_s(&signature)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| Error("invalid header JSON".into()))?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|_| Error("invalid payload JSON".into()))?;
+    if serde_json::to_vec(&header).map_err(|_| Error("header JSON".into()))? != header_bytes
+        || serde_json::to_vec(&payload).map_err(|_| Error("payload JSON".into()))? != payload_bytes
+    {
+        return err("noncanonical JSON");
+    };
+    let h = header
+        .as_object()
+        .ok_or_else(|| Error("header object".into()))?;
+    if h.len() != 3
+        || h.get("alg").and_then(|v| v.as_str()) != Some("ES256")
+        || h.get("typ").and_then(|v| v.as_str())
+            != Some("flycockpit-remote-identity-certificate+jws")
+        || h.get("kid").and_then(|v| v.as_str()).is_none()
+    {
+        return err("invalid protected header");
+    };
+    let p = payload
+        .as_object()
+        .ok_or_else(|| Error("payload object".into()))?;
+    const KEYS: [&str; 17] = [
+        "schemaVersion",
+        "iss",
+        "aud",
+        "sub",
+        "tenantId",
+        "accountId",
+        "instanceId",
+        "subjectKind",
+        "certificateId",
+        "generation",
+        "publicKey",
+        "thumbprint",
+        "custody",
+        "presenceMode",
+        "authorityEpoch",
+        "iat",
+        "exp",
+    ];
+    if p.len() != KEYS.len()
+        || KEYS.iter().any(|k| !p.contains_key(*k))
+        || p.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1)
+        || p.get("aud").and_then(|v| v.as_str()) != Some("flycockpit-remote-peer-v1")
+    {
+        return err("invalid certificate payload");
+    };
+    for key in ["sub", "tenantId", "instanceId", "certificateId"] {
+        let value = p
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error(format!("invalid {key}")))?;
+        crate::remote_protocol_id::decode_protocol_id_base64url(value)
+            .map_err(|e| Error(e.to_string()))?;
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]).into_bytes();
+    Ok(ParsedCertificateJws {
+        protected_header: header,
+        payload,
+        signature_p1363: signature,
+        signing_input,
+    })
 }
 
 pub fn possession_proof_signing_digest(

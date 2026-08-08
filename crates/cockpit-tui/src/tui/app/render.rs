@@ -4675,6 +4675,7 @@ fn semantic_copy_rows(
             if let Some(fragment) = next
                 && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
             {
+                let first_fragment_on_row = !row_emitted;
                 let fragment_width = if fragment.text == "\t" {
                     crate::tui::markdown::TAB_STOP
                         - col.saturating_sub(external_prefix) % crate::tui::markdown::TAB_STOP
@@ -4691,7 +4692,9 @@ fn semantic_copy_rows(
                 used.insert(fragment.id);
                 row_emitted = true;
                 if matched_atom == next_atom {
-                    hard_breaks = next_atom.saturating_sub(atom);
+                    if first_fragment_on_row {
+                        hard_breaks = next_atom.saturating_sub(atom);
+                    }
                     atom = next_atom + 1;
                 }
             }
@@ -9636,8 +9639,7 @@ mod render_history_spacing_tests {
 
         render_history(&mut app, 40, 12);
         let copied = extract_full_semantic_selection(&app, 40, 12);
-        assert!(copied.contains("title"));
-        assert!(copied.contains("let x = 1;"));
+        assert_eq!(copied, "title\n\nlet x = 1;");
         assert!(!copied.contains('#') && !copied.contains('`') && !copied.contains('*'));
     }
 

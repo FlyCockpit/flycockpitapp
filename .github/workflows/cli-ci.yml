@@ -78,6 +78,16 @@ jobs:
           shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
           workspaces: . -> target
 
+      # macOS exposes `/var` as an alias for `/private/var`. Keep tempfile's
+      # root in its physical spelling so lexical and canonical test paths
+      # agree. Do not prefix an already physical TMPDIR.
+      - name: Normalize macOS temporary directory
+        if: contains(matrix.os, 'macos')
+        run: |
+          if [[ "$TMPDIR" == /var/* ]]; then
+            echo "TMPDIR=/private${TMPDIR}" >> "$GITHUB_ENV"
+          fi
+
       - name: Build
         if: contains(matrix.os, 'windows') == false
         run: cargo build --locked --workspace

@@ -235,6 +235,43 @@ pub enum AssistantCommand {
     },
     /// Turn local paths, URLs, text, or a recent workflow into a reusable skill.
     Learn(LearnArgs),
+    /// Inspect or repair durable media accounting.
+    Media {
+        #[command(subcommand)]
+        command: AssistantMediaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssistantMediaCommand {
+    Accounting {
+        #[command(subcommand)]
+        command: MediaAccountingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MediaAccountingCommand {
+    Diagnose {
+        #[arg(long, value_parser=["global","project","session"])]
+        scope: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    Repair {
+        #[arg(long, value_parser=["global","project","session"])]
+        scope: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        expected_block_generation: u64,
+        #[arg(long)]
+        repair_plan_digest: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 #[derive(Debug, clap::Args)]

@@ -98,6 +98,168 @@ fn keys_v1() -> SpoolKeyRing {
     SpoolKeyRing::for_test(&[(1, [0x11u8; 32])], 1).expect("key ring")
 }
 
+fn inference_projection() -> SanitizedProjection {
+    SanitizedProjection::new(OperationBody::InferenceRecovery {
+        request_digest: Digest::of(b"redacted-request"),
+        provider_digest: Digest::of(b"provider:model"),
+    })
+}
+
+#[tokio::test]
+async fn inference_journal_precedes_provider_construction() {
+    let env = Env::new();
+    let journal = env.journal();
+    let provider = FakeProvider::default();
+    let projection = inference_projection();
+    let record = journal
+        .prepare(&owner(), &key("inference-1"), &projection, T0)
+        .await
+        .unwrap();
+    assert_eq!(provider.count(), 0);
+    let ticket = journal
+        .begin_dispatch(record.operation_id, &projection, T0 + 1)
+        .await
+        .unwrap();
+    assert_eq!(provider.count(), 0);
+    provider.call(&ticket);
+    assert_eq!(provider.count(), 1);
+}
+
+#[tokio::test]
+async fn inference_journal_durability_failure_sends_nothing() {
+    let env = Env::new();
+    let journal = env.journal();
+    let provider = FakeProvider::default();
+    let projection = inference_projection();
+    journal.set_db_faults(DbFaults {
+        fail_prepared_commit: true,
+        ..DbFaults::default()
+    });
+    assert!(
+        journal
+            .prepare(&owner(), &key("inference-prepare"), &projection, T0)
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.count(), 0);
+
+    let journal = env.journal();
+    let record = journal
+        .prepare(&owner(), &key("inference-dispatch"), &projection, T0)
+        .await
+        .unwrap();
+    journal.set_db_faults(DbFaults {
+        fail_dispatching_commit: true,
+        ..DbFaults::default()
+    });
+    assert!(
+        journal
+            .begin_dispatch(record.operation_id, &projection, T0 + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.count(), 0);
+}
+
+async fn inference_primary_failure_journal_success_case() {
+    let env = Env::new();
+    let journal = env.journal();
+    let provider = FakeProvider::default();
+    let projection = inference_projection();
+    let record = journal
+        .prepare(&owner(), &key("incident-85acj7"), &projection, T0)
+        .await
+        .unwrap();
+    let ticket = journal
+        .begin_dispatch(record.operation_id, &projection, T0 + 1)
+        .await
+        .unwrap();
+    let missing_session = Uuid::new_v4();
+    assert!(
+        env.db()
+            .insert_inference_request(
+                "incident-85acj7",
+                missing_session,
+                &serde_json::json!({"redacted": true}),
+                cockpit_db::db::session_log::InferenceRequestStatus::Pending,
+            )
+            .await
+            .is_err()
+    );
+    provider.call(&ticket);
+    assert_eq!(provider.count(), 1);
+}
+
+#[tokio::test]
+async fn inference_primary_failure_journal_success() {
+    inference_primary_failure_journal_success_case().await;
+}
+
+#[tokio::test]
+async fn inference_submission_unknown_is_not_retried() {
+    let env = Env::new();
+    let journal = env.journal();
+    let mut ticket = dispatch(&journal, "inference-unknown").await;
+    journal
+        .record_outcome(&mut ticket, ExternalJournalState::SubmissionUnknown, T0 + 1)
+        .await
+        .unwrap();
+    let record = env
+        .db()
+        .external_operation(ticket.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, ExternalJournalState::SubmissionUnknown);
+    assert!(!record.retry_permitted());
+}
+
+#[tokio::test]
+async fn inference_session_tombstone_prevents_resurrection() {
+    let env = Env::new();
+    let journal = env.journal();
+    let mut ticket = dispatch(&journal, "inference-tombstone").await;
+    env.db()
+        .tombstone_external_journal_session(&owner(), T0 + 1)
+        .await
+        .unwrap();
+    journal
+        .record_outcome(&mut ticket, ExternalJournalState::SubmissionUnknown, T0 + 2)
+        .await
+        .unwrap();
+    assert!(
+        env.db()
+            .external_journal_session_tombstoned(&owner())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn inference_85acj7_regression() {
+    inference_primary_failure_journal_success_case().await;
+}
+
+#[test]
+fn inference_audit_sentinels_are_digest_only() {
+    let sentinels = [
+        "raw prompt",
+        "Bearer credential",
+        "x-secret-header",
+        "DATABASE disk image is malformed",
+        "SQL INSERT INTO inference_requests",
+        "/home/user/private",
+    ];
+    let projection = SanitizedProjection::new(OperationBody::InferenceRecovery {
+        request_digest: Digest::of(sentinels.join("|").as_bytes()),
+        provider_digest: Digest::of(b"provider:model"),
+    });
+    let encoded = String::from_utf8(projection.encode().unwrap()).unwrap();
+    for sentinel in sentinels {
+        assert!(!encoded.contains(sentinel));
+    }
+}
+
 fn projection() -> SanitizedProjection {
     SanitizedProjection::new(OperationBody::ComputerInput {
         target_digest: Digest::of(b"display-0"),

@@ -2,6 +2,177 @@ use std::ops::ControlFlow;
 
 use super::*;
 
+struct InferenceJournalAttempt {
+    journal: Arc<crate::external_journal::ExternalJournal>,
+    ticket: crate::external_journal::DispatchTicket,
+}
+
+async fn prepare_inference_journal(
+    session: &Arc<Session>,
+    model: &Model,
+    payload: &Value,
+    call_id: Uuid,
+) -> Result<Option<InferenceJournalAttempt>> {
+    let Some(journal) = session.external_journal() else {
+        if session.unjournaled_inference_allowed() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        return Ok(None);
+        #[cfg(not(test))]
+        anyhow::bail!("inference audit journal is unavailable; provider handoff refused");
+    };
+    let encoded = serde_json::to_vec(payload).context("encoding redacted inference audit")?;
+    let provider_identity = format!("{}:{}", model.provider_id(), model.model_id_ref());
+    let projection = crate::external_journal::projection::SanitizedProjection::new(
+        crate::external_journal::projection::OperationBody::InferenceRecovery {
+            request_digest: crate::external_journal::projection::Digest::of(&encoded),
+            provider_digest: crate::external_journal::projection::Digest::of(
+                provider_identity.as_bytes(),
+            ),
+        },
+    );
+    let owner = crate::external_journal::projection::SafeToken::for_session(session.id);
+    let idempotency =
+        crate::external_journal::projection::SafeToken::parse(&call_id.hyphenated().to_string())
+            .context("building inference journal idempotency key")?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let prepared = journal
+        .prepare(&owner, &idempotency, &projection, now)
+        .await
+        .map_err(|_| anyhow::anyhow!("inference audit prepared commit failed"))?;
+    let ticket = journal
+        .begin_dispatch(prepared.operation_id, &projection, now)
+        .await
+        .map_err(|_| anyhow::anyhow!("inference audit dispatching commit failed"))?;
+    Ok(Some(InferenceJournalAttempt { journal, ticket }))
+}
+
+async fn settle_inference_journal_success(attempt: &mut Option<InferenceJournalAttempt>) -> bool {
+    let Some(attempt) = attempt else { return true };
+    let now = chrono::Utc::now().timestamp_millis();
+    if attempt
+        .journal
+        .record_outcome(
+            &mut attempt.ticket,
+            crate::db::external_journal::ExternalJournalState::Accepted,
+            now,
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    attempt
+        .journal
+        .record_outcome(
+            &mut attempt.ticket,
+            crate::db::external_journal::ExternalJournalState::Succeeded,
+            now,
+        )
+        .await
+        .is_ok()
+}
+
+async fn settle_inference_journal_error(
+    attempt: &mut Option<InferenceJournalAttempt>,
+    error: &anyhow::Error,
+) -> bool {
+    let Some(attempt) = attempt else { return true };
+    let now = chrono::Utc::now().timestamp_millis();
+    if crate::engine::model::is_cancelled(error) {
+        if attempt
+            .journal
+            .request_cancellation(attempt.ticket.operation_id, now)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let state = match crate::engine::model::cancellation_phase(error) {
+            Some(crate::engine::model::InferencePhase::Prep) => {
+                crate::db::external_journal::ExternalJournalState::Cancelled
+            }
+            Some(crate::engine::model::InferencePhase::Dispatched) | None => {
+                crate::db::external_journal::ExternalJournalState::SubmissionUnknown
+            }
+            Some(
+                crate::engine::model::InferencePhase::FirstToken
+                | crate::engine::model::InferencePhase::Streaming,
+            ) => crate::db::external_journal::ExternalJournalState::CompletedAfterCancel,
+        };
+        return attempt
+            .journal
+            .record_outcome(&mut attempt.ticket, state, now)
+            .await
+            .is_ok();
+    }
+    let failure = crate::engine::model::as_inference_failure(error);
+    let provably_unsent = crate::engine::model::is_gated(error)
+        || failure.is_some_and(|failure| failure.phase == "prep");
+    if provably_unsent {
+        return attempt
+            .journal
+            .record_outcome(
+                &mut attempt.ticket,
+                crate::db::external_journal::ExternalJournalState::Rejected,
+                now,
+            )
+            .await
+            .is_ok();
+    }
+    let provider_replied = failure.is_some_and(|failure| {
+        matches!(
+            failure.class,
+            crate::engine::model::InferenceErrorClass::Http(_)
+        ) || failure.phase == crate::engine::model::InferencePhase::FirstToken.as_str()
+            || failure.phase == crate::engine::model::InferencePhase::Streaming.as_str()
+    });
+    if provider_replied {
+        if attempt
+            .journal
+            .record_outcome(
+                &mut attempt.ticket,
+                crate::db::external_journal::ExternalJournalState::Accepted,
+                now,
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        attempt
+            .journal
+            .record_outcome(
+                &mut attempt.ticket,
+                crate::db::external_journal::ExternalJournalState::Failed,
+                now,
+            )
+            .await
+            .is_ok()
+    } else {
+        attempt
+            .journal
+            .record_outcome(
+                &mut attempt.ticket,
+                crate::db::external_journal::ExternalJournalState::SubmissionUnknown,
+                now,
+            )
+            .await
+            .is_ok()
+    }
+}
+
+fn provider_error_remains_primary(error: anyhow::Error, audit_settled: bool) -> anyhow::Error {
+    if !audit_settled {
+        // Deliberately do not attach, format, or log the audit error here. The
+        // provider error is the actionable turn failure and the secondary
+        // diagnostic must be both bounded and safe for logs.
+        tracing::warn!("secondary inference audit reconciliation failed");
+    }
+    error
+}
+
 pub(crate) struct TurnCtx<'a> {
     pub(crate) agent: &'a Agent,
     pub(crate) model: &'a Model,
@@ -884,7 +1055,7 @@ pub(crate) async fn run_turn(
     // export's file-per-call pass picks up the record either way without
     // double-counting. Best-effort: auditing must never break a live turn (same
     // posture as the existing post-success write).
-    let prepared_request = model.prepare_completion_request(
+    let mut prepared_request = model.prepare_completion_request(
         &agent.system,
         history,
         &prompt,
@@ -896,28 +1067,24 @@ pub(crate) async fn run_turn(
         prepared_request.captured.clone(),
         &serde_json::json!({ "dispatched_ms": 0 }),
     );
-    let pending_record = {
-        let session = session.clone();
-        let payload = dispatch_payload.clone();
-        let handle = tokio::spawn(async move {
-            record_inference_request_async(
-                session,
-                call_id,
-                payload,
-                crate::db::session_log::InferenceRequestStatus::Pending,
-                goal_provenance,
-            )
-            .await
-            .map_err(|e| e.to_string())
-        });
-        async move {
-            handle
-                .await
-                .map_err(|e| format!("record_inference_request task join failed: {e}"))?
-        }
-        .boxed()
-        .shared()
-    };
+    let mut journal_attempt =
+        prepare_inference_journal(&session, model, &dispatch_payload, call_id).await?;
+    let pending_write_failed = record_inference_request_async(
+        session.clone(),
+        call_id,
+        dispatch_payload.clone(),
+        crate::db::session_log::InferenceRequestStatus::Pending,
+        goal_provenance,
+    )
+    .await
+    .is_err();
+    if pending_write_failed {
+        tracing::warn!("primary inference audit write failed; durable journal recovery is active");
+    }
+    // Normal provider retry/recovery policy remains unchanged. Only the
+    // journal-backed degraded path is limited to the single handoff that the
+    // durable attempt authorizes.
+    prepared_request.single_handoff = pending_write_failed;
 
     // Model-comparison tandem (shadow) dispatch (`model-comparison-
     // tandem-inference.md`). Fired HERE — right before the main call, after the
@@ -949,7 +1116,7 @@ pub(crate) async fn run_turn(
             Some(tx),
             &cancel,
             endpoint_recovery,
-            Some(pending_record.clone()),
+            None,
             false,
         )
         .await;
@@ -957,11 +1124,6 @@ pub(crate) async fn run_turn(
     let ((msg_id, choice, usage), captured_request, timing) = match completion {
         Ok(out) => out,
         Err(e) => {
-            if let Err(record_err) = pending_record.clone().await {
-                return Err(anyhow::anyhow!(
-                    "record_inference_request (dispatch) failed: {record_err}"
-                ));
-            }
             // Settle the dispatch-time record to its terminal status and
             // surface the failure (inline error + recorded event), unless this
             // was a clean cancel / drain unwind (those keep their dedicated
@@ -981,7 +1143,9 @@ pub(crate) async fn run_turn(
                 &e,
             )
             .await;
-            return Err(e.context(format!("completion call for agent `{}`", agent.name)));
+            let audit_settled = settle_inference_journal_error(&mut journal_attempt, &e).await;
+            let e = e.context(format!("completion call for agent `{}`", agent.name));
+            return Err(provider_error_remains_primary(e, audit_settled));
         }
     };
 
@@ -995,7 +1159,7 @@ pub(crate) async fn run_turn(
             "completed_ms": timing.completed_ms,
         }),
     );
-    if let Err(e) = record_inference_request_async(
+    if record_inference_request_async(
         session.clone(),
         call_id,
         completed_payload.clone(),
@@ -1003,8 +1167,12 @@ pub(crate) async fn run_turn(
         goal_provenance,
     )
     .await
+    .is_err()
     {
-        tracing::warn!(error = %e, "record_inference_request (completed) failed");
+        tracing::warn!("primary inference audit terminal write failed");
+    }
+    if !settle_inference_journal_success(&mut journal_attempt).await {
+        tracing::warn!("secondary inference audit reconciliation failed");
     }
     // Record the single `inference_request` timeline event for this call, now
     // that the provider reported usage (Part B). The export resolves the
@@ -1542,6 +1710,19 @@ pub(crate) async fn run_turn(
     }
 
     Ok(TurnOutcome::Continue)
+}
+
+#[cfg(test)]
+mod inference_audit_tests {
+    use super::provider_error_remains_primary;
+
+    #[test]
+    fn inference_provider_error_remains_primary() {
+        let provider = anyhow::anyhow!("provider-sentinel");
+        let returned = provider_error_remains_primary(provider, false);
+        assert_eq!(returned.to_string(), "provider-sentinel");
+        assert!(!returned.to_string().contains("audit"));
+    }
 }
 
 async fn inject_turn_start_system_messages(

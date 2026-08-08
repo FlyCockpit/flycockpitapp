@@ -564,6 +564,7 @@ impl Model {
             history,
             prompt,
             mut captured,
+            single_handoff,
         } = prepared;
         let system = system.as_str();
 
@@ -577,7 +578,9 @@ impl Model {
         // fired (e.g. the user pressed ctrl+c between turns). Cheap and
         // keeps the cancel path from racing a fresh round-trip.
         if cancel.is_cancelled() {
-            return Err(anyhow::Error::new(InferenceCancelled));
+            return Err(anyhow::Error::new(InferenceCancelled {
+                phase: InferencePhase::Prep,
+            }));
         }
 
         // Inference-dispatch chokepoint (`daemon-graceful-drain-shutdown.md`):
@@ -752,13 +755,13 @@ impl Model {
                             }
                         }
                     };
-                    let result = if compact_utility {
+                    let result = if single_handoff || compact_utility {
                         retry::with_retry_max(
                             agent_name,
                             &reconnect_target,
                             event_tx,
                             cancel,
-                            None::<&retry::TcpProbe>,
+                            probe.as_ref(),
                             1,
                             attempt,
                         )
@@ -833,7 +836,8 @@ impl Model {
                             let alternate_not_incompatible =
                                 endpoint_observation(provider_id, model_id, &base_url, alternate)
                                     != EndpointObservation::Incompatible;
-                            if !compact_utility
+                            if !single_handoff
+                                && !compact_utility
                                 && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
@@ -850,7 +854,8 @@ impl Model {
                                 endpoint = confirmed;
                                 continue;
                             }
-                            let approved = if !compact_utility
+                            let approved = if !single_handoff
+                                && !compact_utility
                                 && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
@@ -938,13 +943,13 @@ impl Model {
                     )
                     .await
                 };
-                if compact_utility {
+                if single_handoff || compact_utility {
                     retry::with_retry_max(
                         agent_name,
                         &reconnect_target,
                         event_tx,
                         cancel,
-                        None::<&retry::TcpProbe>,
+                        probe.as_ref(),
                         1,
                         attempt,
                     )
@@ -997,13 +1002,13 @@ impl Model {
                     )
                     .await
                 };
-                if compact_utility {
+                if single_handoff || compact_utility {
                     retry::with_retry_max(
                         agent_name,
                         &reconnect_target,
                         event_tx,
                         cancel,
-                        None::<&retry::TcpProbe>,
+                        probe.as_ref(),
                         1,
                         attempt,
                     )
@@ -1049,7 +1054,11 @@ impl Model {
                 // than logging a real failure — keep the dedicated
                 // sentinels the driver already special-cases.
                 if cancel.is_cancelled() || is_attempt_cancelled(&err) {
-                    return Err(anyhow::Error::new(InferenceCancelled));
+                    return Err(anyhow::Error::new(InferenceCancelled {
+                        phase: InferencePhase::from_rank(
+                            phase.load(std::sync::atomic::Ordering::SeqCst),
+                        ),
+                    }));
                 }
                 // Every other terminal failure (timeout / network /
                 // non-retryable HTTP) is mapped into the well-typed
@@ -1248,6 +1257,7 @@ impl Model {
             history,
             prompt,
             captured,
+            single_handoff: false,
         })
     }
 
@@ -1771,12 +1781,18 @@ where
     // during the initial round-trip aborts promptly. The request is now on
     // the wire: record `Dispatched` so a stall before the first token is
     // attributed to the dispatched (not prep) phase.
+    // Polling `request.stream()` can put bytes on the wire before it resolves,
+    // including when it resolves with an error. Advance first so every error
+    // or cancellation from that poll is conservatively post-handoff.
+    if cancel.is_cancelled() {
+        return Err(attempt_cancelled());
+    }
+    bump_phase(phase, InferencePhase::Dispatched);
     let mut stream = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(attempt_cancelled()),
         built = request.stream() => built?,
     };
-    bump_phase(phase, InferencePhase::Dispatched);
     await_pre_drain_record(pre_drain).await?;
     // Drive the chunk loop with TTFT + idle timeouts. The post-loop reads
     // below pick up the aggregated `choice` / `message_id` / `response` rig

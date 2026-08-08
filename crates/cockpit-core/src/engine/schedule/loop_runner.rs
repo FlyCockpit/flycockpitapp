@@ -67,7 +67,10 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     // shares the parent's project/agent/model/provider config.
     let fork_session =
         match crate::session::Session::create_fork(ctx.session.db.clone(), ctx.session.id, None) {
-            Ok(s) => Arc::new(s),
+            Ok(s) => {
+                s.set_external_journal(ctx.session.external_journal());
+                Arc::new(s)
+            }
             Err(e) => {
                 let _ = event_tx
                     .send(ScheduleEvent::Completed {

@@ -172,6 +172,7 @@ pub(crate) struct DbFaults {
     /// Every database call fails, modelling a real outage — reads included, so
     /// the pending-fallback drain takes its true failure path.
     pub db_offline: bool,
+    pub fail_prepared_commit: bool,
     pub fail_dispatching_commit: bool,
     /// Fail *after* the `dispatching` commit succeeded, to exercise the
     /// post-commit path where the capsule must be retained.
@@ -576,6 +577,11 @@ impl ExternalJournal {
         projection: &SanitizedProjection,
         now_wall_ms: i64,
     ) -> Result<ExternalJournalRecord, ExternalJournalError> {
+        if self.db_faults().db_offline || self.db_faults().fail_prepared_commit {
+            return Err(ExternalJournalError::Database(
+                "injected prepared commit failure".to_string(),
+            ));
+        }
         let encoded = projection.encode()?;
         let request = PrepareExternalOperation {
             operation_kind: projection.body.operation_kind_token(),

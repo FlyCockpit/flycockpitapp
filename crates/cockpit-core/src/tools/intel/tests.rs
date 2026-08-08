@@ -1452,7 +1452,7 @@ async fn search_in_process_preserves_columns_context_glob_and_case_insensitive()
 }
 
 #[tokio::test]
-async fn search_ranking_is_noop_without_existing_index_scores() {
+async fn search_refreshes_index_when_centrality_scores_tie() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "zcore.rs", "// gadget\n");
     write(tmp.path(), "acold.rs", "// gadget\n");
@@ -1474,8 +1474,8 @@ async fn search_ranking_is_noop_without_existing_index_scores() {
     assert_eq!(ranked.content, unranked.content);
     let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
     assert!(
-        index.tree_rows().await.unwrap().is_empty(),
-        "search ranking must not build the index just to rank results"
+        !index.tree_rows().await.unwrap().is_empty(),
+        "search must refresh its Intel index before reading centrality scores"
     );
 }
 

@@ -161,7 +161,7 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                     &mut logical_line,
                     &visible,
                     source_unchanged.then_some(range),
-                    None,
+                    table_row.map(|row| (row, table_col)),
                 );
             }
             Event::DisplayMath(text) => {
@@ -178,6 +178,10 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                     );
                     continue;
                 }
+                if pending_block_break == 0 && matches!(atoms.last(), Some(CopyAtom::Fragment(_))) {
+                    atoms.push(CopyAtom::Newline);
+                    logical_line += 1;
+                }
                 if pending_block_break > 0 && !atoms.is_empty() {
                     for _ in 0..pending_block_break {
                         atoms.push(CopyAtom::Newline);
@@ -187,7 +191,15 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                 pending_block_break = 0;
                 let visible = math_render::render_display(&text, width)
                     .map(|rows| rows.join("\n"))
-                    .unwrap_or_else(|| format!("$$\n{text}\n$$"));
+                    .unwrap_or_else(|| {
+                        let mut rows = vec!["$$".to_string()];
+                        rows.extend(text.lines().map(str::to_string));
+                        if text.is_empty() {
+                            rows.push(String::new());
+                        }
+                        rows.push("$$".to_string());
+                        rows.join("\n")
+                    });
                 push_copy_text(
                     &mut atoms,
                     &mut id,
@@ -1484,6 +1496,12 @@ mod tests {
             copied("| math |\n|---|\n| $$\\frac{a}{b}$$ |"),
             "math\n$$\\frac{a}{b}$$"
         );
+        let inline_math = semantic_copy_atoms("| $a$ | b |\n|---|---|\n| c | d |", 80);
+        assert!(inline_math.iter().any(|atom| matches!(
+            atom,
+            CopyAtom::Fragment(fragment)
+                if fragment.text == "a" && fragment.table_cell == Some((0, 0))
+        )));
     }
 
     #[test]

@@ -4627,11 +4627,17 @@ fn semantic_copy_rows(
         let mut col = 0usize;
         let mut row_emitted = false;
         let mut table_bars = 0usize;
+        let mut tab_cells_remaining = 0usize;
         for visible in semantic_graphemes(&text) {
             if row_index == body_start && col >= first_body_end {
                 break;
             }
             let width = visible.width().max(1);
+            if tab_cells_remaining > 0 && visible == " " {
+                tab_cells_remaining -= 1;
+                col = col.saturating_add(width);
+                continue;
+            }
             if visible == "│" {
                 table_bars += 1;
             }
@@ -4682,6 +4688,9 @@ fn semantic_copy_rows(
                 } else {
                     width
                 };
+                if fragment.text == "\t" {
+                    tab_cells_remaining = fragment_width.saturating_sub(1);
+                }
                 for cell in cells
                     .iter_mut()
                     .take(col.saturating_add(fragment_width))
@@ -9649,10 +9658,10 @@ mod render_history_spacing_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.launch.banner_enabled = false;
         app.markdown_opts.agent = true;
-        app.history = vec![agent("`a\tb`")].into();
+        app.history = vec![agent("`a\t b`")].into();
 
         render_history(&mut app, 24, 5);
-        assert_eq!(extract_full_semantic_selection(&app, 24, 5), "a\tb");
+        assert_eq!(extract_full_semantic_selection(&app, 24, 5), "a\t b");
         let tab_cells = app
             .chat_row_meta
             .iter()

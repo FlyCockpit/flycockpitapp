@@ -311,7 +311,26 @@ fn lexical_absolute(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     };
-    lexical_normalize(&abs)
+    normalize_macos_system_alias(&lexical_normalize(&abs))
+}
+
+// macOS exposes `/var` and `/tmp` as immutable system aliases for paths
+// under `/private`. Trust decisions compare lexical paths because a target
+// may not exist yet, so normalize those aliases before comparing a configured
+// trust root with a candidate `.cockpit` path.
+#[cfg(target_os = "macos")]
+fn normalize_macos_system_alias(path: &Path) -> PathBuf {
+    for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        if let Ok(remainder) = path.strip_prefix(alias) {
+            return Path::new(physical).join(remainder);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_macos_system_alias(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {

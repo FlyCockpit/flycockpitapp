@@ -33,6 +33,8 @@ export interface RedisClient {
     count: number,
   ): Promise<[string, string[]]>;
   get(key: string): Promise<string | null>;
+  incr(key: string): Promise<number>;
+  eval(script: string, numberOfKeys: number, ...args: string[]): Promise<unknown>;
 }
 const text = (value: unknown) => String(value);
 export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
@@ -389,9 +391,20 @@ export class RedisAuthorityObservationStore implements AuthorityObservationStore
     if (seconds === undefined) throw new Error("Redis TIME returned no seconds");
     return String(seconds);
   }
+  async nextLeaseGeneration(deploymentId: string, replicaId: string) {
+    return String(await this.redis.incr(`${this.prefix}:generation:${deploymentId}:${replicaId}`));
+  }
   async publishLease(lease: ObservationLease, ttlSeconds: 30) {
     const key = `${this.prefix}:${lease.deploymentId}:${lease.membershipGeneration}:${lease.replicaId}:${lease.replicaGeneration}`;
-    await this.redis.set(key, canonicalizeRfc8785(lease), "EX", ttlSeconds);
+    const result = await this.redis.eval(
+      `local old=redis.call('GET',KEYS[1]); if old then local g=cjson.decode(old).leaseGeneration; if string.len(g)>string.len(ARGV[2]) or (string.len(g)==string.len(ARGV[2]) and g>ARGV[2]) then return 0 end end; redis.call('SET',KEYS[1],ARGV[1],'EX',ARGV[3]); return 1`,
+      1,
+      key,
+      canonicalizeRfc8785(lease),
+      lease.leaseGeneration,
+      String(ttlSeconds),
+    );
+    if (result !== 1) throw new Error("stale observation lease generation");
   }
   async listLeases(deploymentId: string, membershipGeneration: string) {
     const prefix = `${this.prefix}:${deploymentId}:${membershipGeneration}:`,

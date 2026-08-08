@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import { AuthorityPublicSnapshot } from "@flycockpit/api/lib/remote-authority";
 import { RemoteAuthorityRuntime } from "@flycockpit/api/lib/remote-authority-runtime";
 import {
@@ -23,7 +22,11 @@ export function createServerRemoteAuthority(deps: {
       deps.env.REMOTE_GRANT_SIGNING_KEY_DIGESTS,
       deps.env.REMOTE_AUTHORITY_REPLICA_ID,
     ];
-  if (values.every((value) => value === undefined)) return { snapshot, runtime: undefined };
+  if (values.every((value) => value === undefined)) {
+    if (deps.env.NODE_ENV === "production")
+      throw new Error("remote authority configuration is required in production");
+    return { snapshot, runtime: undefined };
+  }
   if (values.some((value) => value === undefined))
     throw new Error("all remote-authority environment variables must be configured together");
   const runtime = new RemoteAuthorityRuntime({
@@ -32,7 +35,6 @@ export function createServerRemoteAuthority(deps: {
     deploymentId: deps.env.REMOTE_AUTHORITY_DEPLOYMENT_ID!,
     digests: deps.env.REMOTE_GRANT_SIGNING_KEY_DIGESTS!,
     replicaId: deps.env.REMOTE_AUTHORITY_REPLICA_ID!,
-    leaseGeneration: BigInt(`0x${randomBytes(8).toString("hex")}`).toString(),
     store: new PostgresAuthorityRuntimeStore(deps.prisma as unknown as SqlClient),
     observations: new RedisAuthorityObservationStore(deps.redis),
     snapshot,

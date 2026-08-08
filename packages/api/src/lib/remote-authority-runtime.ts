@@ -100,6 +100,7 @@ export interface AuthorityRuntimeStore {
 }
 export interface AuthorityObservationStore {
   redisTime(): Promise<string>;
+  nextLeaseGeneration(deploymentId: string, replicaId: string): Promise<string>;
   publishLease(lease: ObservationLease, ttlSeconds: 30): Promise<void>;
   listLeases(deploymentId: string, membershipGeneration: string): Promise<ObservationLease[]>;
 }
@@ -109,7 +110,6 @@ export interface AuthorityRuntimeOptions {
   deploymentId: string;
   digests: string;
   replicaId: string;
-  leaseGeneration: string;
   store: AuthorityRuntimeStore;
   observations: AuthorityObservationStore;
   snapshot: AuthorityPublicSnapshot;
@@ -129,6 +129,7 @@ export class RemoteAuthorityRuntime {
   #status?: FinalizedAuthorityStatus;
   #recoveryMinimumGeneration?: string;
   #lastSuccessfulTickAt = 0;
+  #leaseGeneration?: string;
   constructor(private readonly options: AuthorityRuntimeOptions) {
     this.config = parseAuthorityConfig({
       issuer: options.issuer,
@@ -143,6 +144,10 @@ export class RemoteAuthorityRuntime {
     let now: string;
     try {
       now = await this.options.observations.redisTime();
+      this.#leaseGeneration ??= await this.options.observations.nextLeaseGeneration(
+        this.config.deploymentId,
+        this.options.replicaId,
+      );
     } catch {
       return this.#fail("redis_unavailable");
     }
@@ -153,7 +158,7 @@ export class RemoteAuthorityRuntime {
     let ring: AuthorityRingFile;
     try {
       ring = await readAuthorityRingFile(this.options.keyFile, this.#ring?.revision, this.#ring);
-    } catch (error) {
+    } catch {
       return this.#fail("provider_unavailable");
     }
     const digest = authorityRingDigest(ring, this.config);
@@ -186,7 +191,7 @@ export class RemoteAuthorityRuntime {
         membershipGeneration: membership.membershipGeneration,
         replicaId: this.options.replicaId,
         replicaGeneration: localMember.replicaGeneration,
-        leaseGeneration: this.options.leaseGeneration,
+        leaseGeneration: this.#leaseGeneration,
         revision: ring.revision,
         digest,
         currentKid: ring.currentKid,
@@ -326,7 +331,7 @@ export class RemoteAuthorityRuntime {
         const elected = await this.options.store.acquireStatusLease({
           deploymentId: this.config.deploymentId,
           replicaId: this.options.replicaId,
-          leaseGeneration: this.options.leaseGeneration,
+          leaseGeneration: this.#leaseGeneration,
         });
         if (!elected) {
           const winner = await this.options.store.loadHighestFinalizedStatus({

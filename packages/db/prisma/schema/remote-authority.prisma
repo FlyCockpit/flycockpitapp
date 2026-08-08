@@ -123,11 +123,11 @@ model RemoteAuthorityStatus {
 }
 
 model RemoteAuthorityStatusLease {
-  deploymentId     String   @id
-  holderReplicaId  String
-  leaseGeneration  Decimal  @db.Decimal(20, 0)
-  expiresAt        DateTime
-  updatedAt        DateTime @updatedAt
+  deploymentId    String   @id
+  holderReplicaId String
+  leaseGeneration Decimal  @db.Decimal(20, 0)
+  expiresAt       DateTime
+  updatedAt       DateTime @updatedAt
 
   @@map("remote_authority_status_leases")
 }

@@ -192,6 +192,7 @@ app.get("/ready", async (c) => {
   const checks = {
     postgres: false,
     redis: false,
+    remoteAuthority: remoteAuthority.runtime ? remoteAuthority.runtime.decision.ready : true,
   };
   try {
     await withTimeout(prisma.$queryRaw`SELECT 1`, 3000, "postgres readiness check");
@@ -199,6 +200,11 @@ app.get("/ready", async (c) => {
 
     await withTimeout(redisConnection.ping(), 3000, "redis readiness check");
     checks.redis = true;
+
+    checks.remoteAuthority = remoteAuthority.runtime
+      ? remoteAuthority.runtime.decision.ready
+      : true;
+    if (!checks.remoteAuthority) return c.json({ ok: false, checks }, 503);
 
     return c.json({ ok: true, checks });
   } catch {

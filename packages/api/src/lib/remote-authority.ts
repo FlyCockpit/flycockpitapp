@@ -624,9 +624,8 @@ export async function verifyRemoteAuthorityStatusJws(
   if (signature.length !== 64) throw new Error("invalid P1363 width");
   const r = BigInt(`0x${signature.subarray(0, 32).toString("hex")}`),
     s = BigInt(`0x${signature.subarray(32).toString("hex")}`),
-    order = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
-    half = BigInt("0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8");
-  if (r === 0n || r >= order || s === 0n || s > half)
+    order = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+  if (r === 0n || r >= order || s === 0n || s >= order)
     throw new Error("invalid P-256 signature scalar");
   let header: unknown, payload: unknown;
   try {

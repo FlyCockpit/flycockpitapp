@@ -1900,8 +1900,10 @@ async fn symbol_find_ranking_flips_order_vs_disabled() {
 #[tokio::test]
 async fn search_ranks_central_file_first_and_is_additive() {
     let tmp = tempfile::tempdir().unwrap();
-    // Both files contain the search term `gadget`; `zcore.rs` is
-    // central (sorts last alphabetically), `acold.rs` is not.
+    // Both files contain the search term `gadget`; `zcore.rs` is central
+    // because ten callers invoke its `beacon` symbol, whereas `acold.rs` is
+    // isolated. Deliberately do not pre-freshen the index: SearchTool must do
+    // that itself before using centrality scores.
     write(tmp.path(), "zcore.rs", "// gadget\npub fn beacon() {}\n");
     write(tmp.path(), "acold.rs", "// gadget\n");
     let mut body = String::from("pub fn run() {\n");
@@ -1914,8 +1916,6 @@ async fn search_ranks_central_file_first_and_is_additive() {
     // ON: central zcore.rs's match emitted before acold.rs's.
     set_centrality(tmp.path(), true);
     let ctx = test_ctx(tmp.path());
-    let index = crate::intel::Index::new(ctx.session.db.clone(), tmp.path().to_path_buf());
-    index.ensure_fresh().await.unwrap();
     let on = SearchTool
         .call(serde_json::json!({ "pattern": "gadget" }), &ctx)
         .await
@@ -1925,14 +1925,23 @@ async fn search_ranks_central_file_first_and_is_additive() {
         .lines()
         .filter(|l| l.contains("gadget"))
         .collect();
+    let zcore_position = on_lines
+        .iter()
+        .position(|l| l.contains("zcore.rs"))
+        .expect("search must emit zcore.rs");
+    let acold_position = on_lines
+        .iter()
+        .position(|l| l.contains("acold.rs"))
+        .expect("search must emit acold.rs");
     assert!(
-        on_lines.iter().position(|l| l.contains("zcore.rs"))
-            < on_lines.iter().position(|l| l.contains("acold.rs")),
+        zcore_position < acold_position,
         "central zcore.rs match must come first; got:\n{}",
         on.content
     );
 
-    // OFF: file order (alphabetical from rg) → acold.rs first.
+    // OFF: ranking changes only order, never the matched-file set. Native
+    // walker order is intentionally not asserted because it is filesystem-
+    // dependent rather than alphabetical or a ranking result.
     set_centrality(tmp.path(), false);
     let ctx2 = test_ctx(tmp.path());
     let off = SearchTool

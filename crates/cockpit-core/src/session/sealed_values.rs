@@ -287,8 +287,8 @@ mod tests {
             "injection wrapper type must be removed"
         );
         assert!(
-            production.contains("sealed_value_exists"),
-            "existence check is the remaining public store API"
+            !production.contains("sealed_value_exists"),
+            "production session API must expose no sealed-value existence oracle"
         );
         assert!(
             !production.contains("pub async fn get_sealed_value")

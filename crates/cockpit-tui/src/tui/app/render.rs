@@ -4628,6 +4628,7 @@ fn semantic_copy_rows(
         let mut row_emitted = false;
         let mut table_bars = 0usize;
         let mut tab_cells_remaining = 0usize;
+        let chrome_end = markdown_chrome_prefix_width(line, &text, external_prefix);
         for visible in semantic_graphemes(&text) {
             if row_index == body_start && col >= first_body_end {
                 break;
@@ -4640,6 +4641,10 @@ fn semantic_copy_rows(
             }
             if visible == "│" {
                 table_bars += 1;
+            }
+            if col < chrome_end {
+                col = col.saturating_add(width);
+                continue;
             }
             while atoms.get(atom).is_some_and(|candidate| match candidate {
                 CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
@@ -4725,6 +4730,48 @@ fn semantic_copy_rows(
         newlines_before: breaks,
         fragments,
     }
+}
+
+/// Columns injected by the Markdown renderer rather than emitted by parser
+/// text events. These cells deliberately have no copy fragment and therefore
+/// cannot steal a same-prefix fragment from later semantic content.
+fn markdown_chrome_prefix_width(line: &Line<'_>, rendered: &str, external_prefix: usize) -> usize {
+    let body = rendered.chars().skip(external_prefix).collect::<String>();
+    if line.spans.iter().any(|span| {
+        span.style.add_modifier.contains(Modifier::DIM)
+            && span.content.trim_start().starts_with("```")
+    }) {
+        return rendered.width();
+    }
+    let code_line = line.spans.iter().any(|span| span.style.bg.is_some());
+    if code_line {
+        return external_prefix;
+    }
+    if body.starts_with("│ ") {
+        return external_prefix + 2;
+    }
+    if let Some(marker_width) = heading_marker_width(&body) {
+        return external_prefix + marker_width;
+    }
+    if let Some(marker_width) = list_marker_width(&body) {
+        return external_prefix + marker_width;
+    }
+    external_prefix
+}
+
+fn heading_marker_width(body: &str) -> Option<usize> {
+    let hashes = body.chars().take_while(|ch| *ch == '#').count();
+    (hashes > 0 && body.chars().nth(hashes) == Some(' ')).then_some(hashes + 1)
+}
+
+fn list_marker_width(body: &str) -> Option<usize> {
+    let leading = body.chars().take_while(|ch| *ch == ' ').count();
+    let rest = body.chars().skip(leading).collect::<String>();
+    if rest.starts_with("• ") {
+        return Some(leading + 2);
+    }
+    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    (digits > 0 && rest.chars().skip(digits).take(2).eq(['.', ' '])).then_some(leading + digits + 2)
 }
 
 fn render_transcript_find_bar(
@@ -9650,6 +9697,33 @@ mod render_history_spacing_tests {
         let copied = extract_full_semantic_selection(&app, 40, 12);
         assert_eq!(copied, "title\n\nlet x = 1;");
         assert!(!copied.contains('#') && !copied.contains('`') && !copied.contains('*'));
+
+        app.history = vec![agent("```diff\ndiff --git a/x b/x\n```\n\n1. 1999 follows")].into();
+        render_history(&mut app, 40, 12);
+        let code_row = find_row(&app, "diff --git");
+        let code = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (0, code_row as u16),
+                focus: (39, code_row as u16),
+                active: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code, "diff --git a/x b/x");
+        let list_row = find_row(&app, "1999 follows");
+        let item = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (0, list_row as u16),
+                focus: (39, list_row as u16),
+                active: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(item, "1999 follows");
     }
 
     #[test]

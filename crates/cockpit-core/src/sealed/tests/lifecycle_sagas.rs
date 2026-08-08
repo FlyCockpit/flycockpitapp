@@ -598,8 +598,7 @@ async fn sealed_cross_store_lifecycle_sagas() {
                     session_generation: 0,
                     action_id: crate::sealed::SealedActionId::parse("probe.publish")
                         .expect("action id"),
-                    action_revision: crate::sealed::SealedActionRevision::new(1)
-                        .expect("revision"),
+                    action_revision: crate::sealed::SealedActionRevision::new(1).expect("revision"),
                     issued_at_ms: 2_000,
                     expires_at_ms: None,
                 },

@@ -94,7 +94,12 @@ impl Harness {
 
         let denied = self
             .runtime
-            .use_sealed_value(&request, &ctx, &self.sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+            .use_sealed_value(
+                &request,
+                &ctx,
+                &self.sink,
+                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+            )
             .await
             .expect_err(&format!("`{branch}` must deny"));
 
@@ -149,7 +154,12 @@ async fn sealed_action_grant_authorization_precedes_lookup() {
         let mut request = harness.request();
         request.action_id = SealedActionId::parse("probe.other").expect("action id");
         let denied = runtime
-            .use_sealed_value(&request, &harness.context(), &sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+            .use_sealed_value(
+                &request,
+                &harness.context(),
+                &sink,
+                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+            )
             .await
             .expect_err("wrong action must deny");
         assert_eq!(runtime.literal_reads(), 0);
@@ -166,7 +176,12 @@ async fn sealed_action_grant_authorization_precedes_lookup() {
         );
         let sink = RecordingRedactionSink::new();
         let denied = runtime
-            .use_sealed_value(&harness.request(), &harness.context(), &sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+            .use_sealed_value(
+                &harness.request(),
+                &harness.context(),
+                &sink,
+                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+            )
             .await
             .expect_err("unavailable action must deny");
         assert_eq!(runtime.literal_reads(), 0);
@@ -184,7 +199,12 @@ async fn sealed_action_grant_authorization_precedes_lookup() {
         );
         let sink = RecordingRedactionSink::new();
         let denied = runtime
-            .use_sealed_value(&harness.request(), &harness.context(), &sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+            .use_sealed_value(
+                &harness.request(),
+                &harness.context(),
+                &sink,
+                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+            )
             .await
             .expect_err("a revised action must retire grants pinned to the old revision");
         assert_eq!(runtime.literal_reads(), 0);
@@ -401,12 +421,18 @@ async fn concurrent_uses_resolve_by_deterministic_compare_and_swap() {
     let ctx = harness.context();
 
     let (a, b) = tokio::join!(
-        harness
-            .runtime
-            .use_sealed_value(&request, &ctx, &harness.sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted)),
-        harness
-            .runtime
-            .use_sealed_value(&request, &ctx, &harness.sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+        harness.runtime.use_sealed_value(
+            &request,
+            &ctx,
+            &harness.sink,
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted)
+        ),
+        harness.runtime.use_sealed_value(
+            &request,
+            &ctx,
+            &harness.sink,
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted)
+        )
     );
 
     // Exactly one winner, and the loser is the ordinary content-free denial.
@@ -447,7 +473,12 @@ async fn a_delete_between_authorization_and_claim_denies_at_the_claim() {
 
     let denied = harness
         .runtime
-        .use_sealed_value(&harness.request(), &harness.context(), &harness.sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+        .use_sealed_value(
+            &harness.request(),
+            &harness.context(),
+            &harness.sink,
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+        )
         .await
         .expect_err("a deleted record denies");
     assert_eq!(denied.to_string(), SEALED_USE_DENIED_MESSAGE);

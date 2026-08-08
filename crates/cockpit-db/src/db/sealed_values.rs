@@ -103,6 +103,7 @@ impl Db {
     ///    the same transaction as the delete so a concurrent create cannot
     ///    slip between. A caller who reaches for the legacy path on a scoped
     ///    value gets an error, not a half-delete.
+    #[cfg(test)]
     pub(crate) async fn delete_sealed_value(
         &self,
         session_id: Uuid,

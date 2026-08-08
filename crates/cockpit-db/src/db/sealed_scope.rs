@@ -427,7 +427,9 @@ impl Db {
             // saga entry point rejects session scope at the store boundary,
             // rather than relying on the caller above it to have checked.
             if record.scope == SealedScopeKind::Session {
-                bail!("session-scope sealed values are created in a single transaction, not a saga");
+                bail!(
+                    "session-scope sealed values are created in a single transaction, not a saga"
+                );
             }
             if name_tombstoned_conn(conn, record.scope, &record.scope_key, &record.name)? {
                 bail!("sealed value name was retired and is never reused");
@@ -836,10 +838,10 @@ impl Db {
             // Route it through the same single-transaction cleanup the
             // supported path uses instead, which removes both stores,
             // tombstones the name, and fences outstanding grants.
-            if let Some(existing) = record_conn(conn, &record_id)? {
-                if existing.scope == SealedScopeKind::Session {
-                    return delete_session_sealed_value_conn(conn, &record_id, now_ms);
-                }
+            if let Some(existing) = record_conn(conn, &record_id)?
+                && existing.scope == SealedScopeKind::Session
+            {
+                return delete_session_sealed_value_conn(conn, &record_id, now_ms);
             }
             let removed = conn
                 .execute(

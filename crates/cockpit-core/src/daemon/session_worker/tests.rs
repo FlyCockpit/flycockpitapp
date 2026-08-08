@@ -449,26 +449,33 @@ async fn worker_delete_removes_the_scoped_sealed_value_completely() {
 
     let owner = crate::sealed::OwnerAuthority::for_test();
     let inventory = |db: Db, key: String| async move {
-        db.sealed_value_inventory(
-            cockpit_db::db::sealed_scope::SealedScopeKind::Session,
-            key,
-        )
-        .await
-        .unwrap()
+        db.sealed_value_inventory(cockpit_db::db::sealed_scope::SealedScopeKind::Session, key)
+            .await
+            .unwrap()
     };
-    assert!(session.sealed_value_exists(owner, "prod_token").await.unwrap());
+    assert!(
+        session
+            .sealed_value_exists(owner, "prod_token")
+            .await
+            .unwrap()
+    );
     assert_eq!(
         inventory(db.clone(), scope_key.clone()).await.len(),
         1,
         "the scoped record exists before the delete"
     );
 
-    let handle =
-        SessionWorkerHandle::test_handle(session.clone(), Arc::new(LockManager::in_memory(db.clone())));
+    let handle = SessionWorkerHandle::test_handle(
+        session.clone(),
+        Arc::new(LockManager::in_memory(db.clone())),
+    );
     assert!(handle.delete_sealed_value("prod_token").await.unwrap());
 
     assert!(
-        !session.sealed_value_exists(owner, "prod_token").await.unwrap(),
+        !session
+            .sealed_value_exists(owner, "prod_token")
+            .await
+            .unwrap(),
         "the literal is gone"
     );
     assert!(

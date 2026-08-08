@@ -118,7 +118,12 @@ async fn use_sealed_value_is_non_oracular() {
         .parameters
         .insert("retries".to_string(), SealedParamValue::Integer(9_999));
     let denied = runtime
-        .use_sealed_value(&over_bound, &use_context(&fixture, GENERATION, NOW), &sink, &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted))
+        .use_sealed_value(
+            &over_bound,
+            &use_context(&fixture, GENERATION, NOW),
+            &sink,
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+        )
         .await
         .expect_err("an out-of-band parameter is refused");
     assert_eq!(denied.to_string(), SEALED_USE_DENIED_MESSAGE);

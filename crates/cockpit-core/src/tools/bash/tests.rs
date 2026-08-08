@@ -1154,7 +1154,9 @@ async fn sealed_child_injection_is_absent() {
     let command = "printf ok";
     grant_command(&ctx, command, Scope::Session).await;
     ctx.session
-        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &ctx.redact,
+        .set_sealed_value(
+            crate::sealed::OwnerAuthority::for_test(),
+            &ctx.redact,
             "prod-token",
             "very-secret-literal",
             "deploy",
@@ -1204,7 +1206,9 @@ async fn sealed_shell_injection_removed() {
     let command = format!("printf %s \"{}SEALED_PROD_TOKEN\"", char::from(36));
     grant_command(&ctx, &command, Scope::Session).await;
     ctx.session
-        .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &ctx.redact,
+        .set_sealed_value(
+            crate::sealed::OwnerAuthority::for_test(),
+            &ctx.redact,
             "prod-token",
             "very-secret-literal",
             "deploy",

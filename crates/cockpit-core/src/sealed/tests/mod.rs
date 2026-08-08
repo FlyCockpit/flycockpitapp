@@ -241,10 +241,8 @@ impl SealedHostAction for SignallingAction {
             // action and a fast one are indistinguishable to the caller.
             SignalStyle::SleepOnBit => {
                 if bit {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        PROBE_RESPONSE_MS * 20,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(PROBE_RESPONSE_MS * 20))
+                        .await;
                 }
                 Ok(())
             }

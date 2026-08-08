@@ -141,7 +141,11 @@ async fn built_in_and_monty_use_paths_return_no_literal() {
         .call(args.clone(), &ctx)
         .await
         .expect("built-in sealed use");
-    assert_eq!(probe.invocations(), 1, "the built-in path reached the action");
+    assert_eq!(
+        probe.invocations(),
+        1,
+        "the built-in path reached the action"
+    );
     assert_eq!(
         probe.saw_literal().as_deref(),
         Some(TEST_LITERAL),
@@ -178,8 +182,8 @@ async fn built_in_and_monty_use_paths_return_no_literal() {
         .into_function()
         .expect("the sealed use tool adapts onto the Monty builtin surface"),
     ]));
-    let host = crate::mcp::builtin::HostContext::from_tool_ctx(&ctx)
-        .with_builtin_registry(registry);
+    let host =
+        crate::mcp::builtin::HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry);
     let monty = crate::mcp::builtin::invoke(&host, USE_SEALED_VALUE_TOOL, args.clone())
         .await
         .expect("monty sealed use");

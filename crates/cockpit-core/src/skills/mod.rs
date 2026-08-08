@@ -1943,8 +1943,10 @@ mod tests {
         let cfg = skills_cfg(vec![".agents/skills"], false);
 
         let target =
-            package_target_for_path(&alias.join(".agents/skills/target/SKILL.md"), &alias, &cfg)
-                .expect("workspace aliases should still identify managed skill packages");
+            crate::config::trust::with_workspace_trust_policy(trusted_policy(&alias), || {
+                package_target_for_path(&alias.join(".agents/skills/target/SKILL.md"), &alias, &cfg)
+            })
+            .expect("workspace aliases should still identify managed skill packages");
 
         assert_eq!(target.name, "target");
     }

@@ -321,14 +321,163 @@ impl Proposal {
     }
 }
 fn normalized_origin(s: &str) -> Result<&[u8]> {
-    if (1..=255).contains(&s.len())
-        && s.starts_with("https://")
-        && !s.ends_with('/')
-        && !s.contains(['?', '#', '@'])
+    let Some(authority) = s.strip_prefix("https://") else {
+        return err("origin must use HTTPS");
+    };
+    if !(1..=255).contains(&s.len())
+        || authority.is_empty()
+        || authority
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_uppercase())
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.ends_with(":443")
     {
-        Ok(s.as_bytes())
-    } else {
-        err("origin must be normalized HTTPS origin")
+        return err("origin must be a normalized HTTPS origin");
+    }
+    let host = authority.split_once(':').map_or(authority, |(host, port)| {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            ""
+        } else {
+            host
+        }
+    });
+    if host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+    {
+        return err("origin host is noncanonical");
+    }
+    Ok(s.as_bytes())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentTranscript {
+    pub enrollment_id: [u8; 16],
+    pub tenant_id: [u8; 16],
+    pub account_id: Option<[u8; 16]>,
+    pub instance_id: [u8; 16],
+    pub subject_kind: SubjectKind,
+    pub subject_id: [u8; 16],
+    pub generation: u64,
+    pub p256_x: [u8; 32],
+    pub p256_y: [u8; 32],
+    pub thumbprint: [u8; 32],
+    pub custody_class: CustodyClass,
+    pub presence_mode: PresenceMode,
+    pub public_origin: String,
+    pub initiator_role: EnrollmentRole,
+    pub confirmer_role: EnrollmentRole,
+    pub initiator_nonce: [u8; 32],
+    pub confirmer_nonce: [u8; 32],
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub service_version: u64,
+    pub policy_epoch: u64,
+    pub policy_digest: [u8; 32],
+    pub authority_epoch: u64,
+}
+fn valid_roles(a: EnrollmentRole, b: EnrollmentRole) -> bool {
+    a != b && (a == EnrollmentRole::ProposedSubject || b == EnrollmentRole::ProposedSubject)
+}
+impl EnrollmentTranscript {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        for value in [
+            &self.enrollment_id,
+            &self.tenant_id,
+            &self.instance_id,
+            &self.subject_id,
+        ] {
+            id(value)?;
+        }
+        if !valid_roles(self.initiator_role, self.confirmer_role) {
+            return err("invalid enrollment role pair");
+        }
+        if !matches!(self.expires_at.checked_sub(self.created_at), Some(1..=300)) {
+            return err("invalid transcript lifetime");
+        }
+        let origin = normalized_origin(&self.public_origin)?;
+        let mut w = Writer::new(FCEN);
+        w.bytes(&self.enrollment_id);
+        w.bytes(&self.tenant_id);
+        put_account(&mut w, self.subject_kind, &self.account_id)?;
+        w.bytes(&self.instance_id);
+        w.u8(self.subject_kind as u8);
+        w.bytes(&self.subject_id);
+        w.u64(self.generation);
+        w.bytes(&self.p256_x);
+        w.bytes(&self.p256_y);
+        w.bytes(&self.thumbprint);
+        w.u8(self.custody_class as u8);
+        w.u8(self.presence_mode as u8);
+        w.u16(origin.len() as u16);
+        w.bytes(origin);
+        w.u8(self.initiator_role as u8);
+        w.u8(self.confirmer_role as u8);
+        w.bytes(&self.initiator_nonce);
+        w.bytes(&self.confirmer_nonce);
+        w.i64(self.created_at);
+        w.i64(self.expires_at);
+        w.u64(self.service_version);
+        w.u64(self.policy_epoch);
+        w.bytes(&self.policy_digest);
+        w.u64(self.authority_epoch);
+        w.done(1024)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, FCEN, 1024)?;
+        let enrollment_id = r.take()?;
+        let tenant_id = r.take()?;
+        let present = r.u8()?;
+        if present > 1 {
+            return err("invalid account presence");
+        };
+        let account_id = if present == 1 { Some(r.take()?) } else { None };
+        let instance_id = r.take()?;
+        let subject_kind = r.u8()?.try_into()?;
+        match (subject_kind, account_id.is_some()) {
+            (SubjectKind::Client, true) | (SubjectKind::Daemon, false) => {}
+            (SubjectKind::Client, false) => return err("client account missing"),
+            (SubjectKind::Daemon, true) => return err("daemon account present"),
+        }
+        let v = Self {
+            enrollment_id,
+            tenant_id,
+            account_id,
+            instance_id,
+            subject_kind,
+            subject_id: r.take()?,
+            generation: r.u64()?,
+            p256_x: r.take()?,
+            p256_y: r.take()?,
+            thumbprint: r.take()?,
+            custody_class: r.u8()?.try_into()?,
+            presence_mode: r.u8()?.try_into()?,
+            public_origin: {
+                let n = r.u16()? as usize;
+                String::from_utf8(r.slice(n)?).map_err(|_| Error("origin utf8".into()))?
+            },
+            initiator_role: r.u8()?.try_into()?,
+            confirmer_role: r.u8()?.try_into()?,
+            initiator_nonce: r.take()?,
+            confirmer_nonce: r.take()?,
+            created_at: r.i64()?,
+            expires_at: r.i64()?,
+            service_version: r.u64()?,
+            policy_epoch: r.u64()?,
+            policy_digest: r.take()?,
+            authority_epoch: r.u64()?,
+        };
+        r.finish()?;
+        v.encode()?;
+        Ok(v)
     }
 }
 
@@ -411,8 +560,7 @@ impl EnrollmentConfirmation {
     pub fn encode(&self) -> Result<Vec<u8>> {
         id(&self.enrollment_id)?;
         if !(1..=2).contains(&self.decision)
-            || self.expires_at <= self.issued_at
-            || self.expires_at - self.issued_at > 60
+            || !matches!(self.expires_at.checked_sub(self.issued_at), Some(1..=60))
         {
             return err("confirmation decision or lifetime");
         };
@@ -643,4 +791,35 @@ impl PossessionProof {
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+pub fn possession_proof_signing_digest(
+    unsigned_proof: &[u8],
+    purpose: PossessionPurpose,
+) -> Result<[u8; 32]> {
+    if unsigned_proof.len() != 175
+        || unsigned_proof.get(..4) != Some(FCPP.as_slice())
+        || unsigned_proof.get(5) != Some(&(purpose as u8))
+    {
+        return err("invalid unsigned possession proof");
+    }
+    let mut h = Sha256::new();
+    h.update(possession_signature_domain(purpose));
+    h.update(unsigned_proof);
+    Ok(h.finalize().into())
+}
+pub fn enrollment_confirmation_signing_digest(
+    unsigned_confirmation: &[u8],
+    role: EnrollmentRole,
+) -> Result<[u8; 32]> {
+    if unsigned_confirmation.len() != 104
+        || unsigned_confirmation.get(..4) != Some(FCCF.as_slice())
+        || unsigned_confirmation.get(5) != Some(&(role as u8))
+    {
+        return err("invalid unsigned enrollment confirmation");
+    }
+    let mut h = Sha256::new();
+    h.update(enrollment_confirmation_domain(role));
+    h.update(unsigned_confirmation);
+    Ok(h.finalize().into())
 }

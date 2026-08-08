@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "valid": {
+    "magics": ["FCIP", "FCEN", "FCCE", "FCPC", "FCPP", "FCCF"],
+    "purposes": [
+      "enroll_proposed",
+      "renew_current",
+      "rotate_current",
+      "rotate_proposed",
+      "attempt_client",
+      "attempt_daemon",
+      "revoke_current"
+    ],
+    "roles": ["proposed_subject", "enrolled_counterpart", "control_plane_authorizer"],
+    "accountBranches": ["client_present", "daemon_absent"]
+  },
+  "malformed": [
+    "truncated",
+    "trailing",
+    "unknown_enum",
+    "client_missing_account",
+    "daemon_present_account",
+    "wrong_magic",
+    "wrong_version",
+    "invalid_lifetime",
+    "digest_mismatch"
+  ]
+}

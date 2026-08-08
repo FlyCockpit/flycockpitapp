@@ -91,15 +91,26 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                 logical_line += 1;
                 pending_block_break = 0;
             }
-            Event::Start(Tag::TableHead) => table_row = Some(0),
+            Event::Start(Tag::TableHead) => {
+                table_row = Some(0);
+                table_col = 0;
+            }
+            Event::Start(Tag::List(_)) => {
+                if pending_block_break == 0 && matches!(atoms.last(), Some(CopyAtom::Fragment(_))) {
+                    atoms.push(CopyAtom::Newline);
+                    logical_line += 1;
+                }
+            }
             Event::Start(Tag::TableRow) => {
                 table_row = Some(table_row.map_or(0, |row| row + 1));
                 table_col = 0;
             }
             Event::End(TagEnd::TableCell) => table_col += 1,
             Event::End(TagEnd::Item) => {
-                atoms.push(CopyAtom::Newline);
-                logical_line += 1;
+                if pending_block_break == 0 {
+                    atoms.push(CopyAtom::Newline);
+                    logical_line += 1;
+                }
             }
             Event::End(TagEnd::TableRow) => {
                 atoms.push(CopyAtom::Newline);

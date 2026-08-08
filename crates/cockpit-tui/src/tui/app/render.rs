@@ -2363,7 +2363,7 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
-        let (copy_rows, copy_breaks, copy_fragments) = semantic_copy_rows(
+        let copy = semantic_copy_rows(
             entry,
             lines,
             continuations,
@@ -2445,9 +2445,9 @@ impl App {
                 fork_hit,
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
-                copy_cells: copy_rows.get(i).cloned().unwrap_or_default(),
-                copy_fragments: Rc::clone(&copy_fragments),
-                copy_newlines_before: copy_breaks.get(i).copied().unwrap_or(0),
+                copy_cells: copy.cells.get(i).cloned().unwrap_or_default(),
+                copy_fragments: Rc::clone(&copy.fragments),
+                copy_newlines_before: copy.newlines_before.get(i).copied().unwrap_or(0),
                 copy_fallback_if_unmapped: base_copy.is_some()
                     && row_kind != ChatRowKind::Chip
                     && copy_body_start.is_none_or(|start| i < start),
@@ -4507,6 +4507,12 @@ fn rendered_line_text(line: &Line<'_>) -> String {
 /// Attach parser-emitted semantic fragments to the exact cells occupied by
 /// the corresponding rendered grapheme. Matching is a single forward walk of
 /// the render output and parser event stream; it never searches source text.
+struct SemanticCopyRows {
+    cells: Vec<Vec<Option<u32>>>,
+    newlines_before: Vec<usize>,
+    fragments: Rc<Vec<crate::tui::markdown::CopyFragment>>,
+}
+
 fn semantic_copy_rows(
     entry: &HistoryEntry,
     lines: &[Line<'static>],
@@ -4514,18 +4520,14 @@ fn semantic_copy_rows(
     body_start: Option<usize>,
     render_width: usize,
     pin_region: Option<&crate::tui::history::PinRegion>,
-) -> (
-    Vec<Vec<Option<u32>>>,
-    Vec<usize>,
-    Rc<Vec<crate::tui::markdown::CopyFragment>>,
-) {
+) -> SemanticCopyRows {
     use crate::tui::markdown::{CopyAtom, semantic_copy_atoms, semantic_graphemes};
     let Some(body_start) = body_start else {
-        return (
-            vec![Vec::new(); lines.len()],
-            vec![0; lines.len()],
-            Rc::new(Vec::new()),
-        );
+        return SemanticCopyRows {
+            cells: vec![Vec::new(); lines.len()],
+            newlines_before: vec![0; lines.len()],
+            fragments: Rc::new(Vec::new()),
+        };
     };
     let (source, semantic_width, external_prefix, table_bar_offset, body_has_timestamp) =
         match entry {
@@ -4562,11 +4564,11 @@ fn semantic_copy_rows(
                 body_start == 0,
             ),
             _ => {
-                return (
-                    vec![Vec::new(); lines.len()],
-                    vec![0; lines.len()],
-                    Rc::new(Vec::new()),
-                );
+                return SemanticCopyRows {
+                    cells: vec![Vec::new(); lines.len()],
+                    newlines_before: vec![0; lines.len()],
+                    fragments: Rc::new(Vec::new()),
+                };
             }
         };
     let atoms = semantic_copy_atoms(source, semantic_width);
@@ -4689,19 +4691,16 @@ fn semantic_copy_rows(
                 used.insert(fragment.id);
                 row_emitted = true;
                 if matched_atom == next_atom {
+                    hard_breaks = next_atom.saturating_sub(atom);
                     atom = next_atom + 1;
                 }
             }
             col = col.saturating_add(width);
         }
         if row_emitted {
-            if let Some(previous) = previous_mapped_row {
-                hard_breaks = if continuations.get(row_index).copied().unwrap_or(false) {
-                    0
-                } else {
-                    row_index.saturating_sub(previous)
-                };
-            } else {
+            if previous_mapped_row.is_none()
+                || continuations.get(row_index).copied().unwrap_or(false)
+            {
                 hard_breaks = 0;
             }
             previous_mapped_row = Some(row_index);
@@ -4709,7 +4708,11 @@ fn semantic_copy_rows(
         breaks.push(hard_breaks);
         rows.push(cells);
     }
-    (rows, breaks, fragments)
+    SemanticCopyRows {
+        cells: rows,
+        newlines_before: breaks,
+        fragments,
+    }
 }
 
 fn render_transcript_find_bar(
@@ -5668,10 +5671,10 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
         affordance_target_for_row, append_pending_render_rows, chat_visible_top,
-        extract_selection_plaintext, find_lines_rebuild_count, fingerprint_call_count,
-        geometry_recompute_count, history_entry_render_fingerprint, materialized_row_count,
-        pending_wrap_row_count, pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows,
-        prewrap_row_count, rendered_line_text, reset_find_lines_rebuild_count,
+        extract_selection_plaintext, extract_selection_semantic, find_lines_rebuild_count,
+        fingerprint_call_count, geometry_recompute_count, history_entry_render_fingerprint,
+        materialized_row_count, pending_wrap_row_count, pin_hit_for_visual_row, prewrap_call_count,
+        prewrap_entry_rows, prewrap_row_count, rendered_line_text, reset_find_lines_rebuild_count,
         reset_fingerprint_call_count, reset_geometry_recompute_count, reset_materialized_row_count,
         reset_pending_wrap_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
@@ -6527,6 +6530,19 @@ mod render_history_spacing_tests {
                 active: false,
             },
         )
+    }
+
+    fn extract_full_semantic_selection(app: &App, width: u16, height: u16) -> String {
+        extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, width, height),
+            Selection {
+                anchor: (0, 0),
+                focus: (width.saturating_sub(1), height.saturating_sub(1)),
+                active: false,
+            },
+        )
+        .expect("rendered Markdown selection has semantic provenance")
     }
 
     struct FullWrapReference {
@@ -9569,6 +9585,81 @@ mod render_history_spacing_tests {
             },
         );
         assert_eq!(text, "abcdefgh ijklmnopqr");
+    }
+
+    #[test]
+    fn selection_source_map_survives_wrap_and_viewport_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("alpha **wide界** omega repeated repeated tail")].into();
+
+        render_history(&mut app, 22, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 22, 8),
+            "alpha wide界 omega repeated repeated tail"
+        );
+
+        app.chat_scroll_offset = 1;
+        render_history(&mut app, 18, 4);
+        let visible = extract_full_semantic_selection(&app, 18, 4);
+        assert!(!visible.contains('*'));
+        assert!(visible.contains("wide界") || visible.contains("repeated"));
+    }
+
+    #[test]
+    fn selection_table_fragments_exclude_borders_and_padding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent(
+            "| A | long words here |\n|---|---|\n| x | y z |\n\n| C | D |\n|---|---|\n| q | r |",
+        )]
+        .into();
+
+        render_history(&mut app, 30, 16);
+        let copied = extract_full_semantic_selection(&app, 30, 16);
+        assert!(!copied.contains('│') && !copied.contains('─'));
+        assert!(copied.contains("A\tlong words here"), "{copied:?}");
+        assert!(copied.contains("C\tD"), "{copied:?}");
+    }
+
+    #[test]
+    fn selection_unmapped_chrome_never_guesses_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("# **title**\n\n```rs\nlet x = 1;\n```")].into();
+
+        render_history(&mut app, 40, 12);
+        let copied = extract_full_semantic_selection(&app, 40, 12);
+        assert!(copied.contains("title"));
+        assert!(copied.contains("let x = 1;"));
+        assert!(!copied.contains('#') && !copied.contains('`') && !copied.contains('*'));
+    }
+
+    #[test]
+    fn selection_tab_cells_copy_one_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("`a\tb`")].into();
+
+        render_history(&mut app, 24, 5);
+        assert_eq!(extract_full_semantic_selection(&app, 24, 5), "a\tb");
+        let tab_cells = app
+            .chat_row_meta
+            .iter()
+            .flat_map(|meta| meta.copy_cells.iter().flatten())
+            .fold(std::collections::HashMap::new(), |mut counts, id| {
+                *counts.entry(*id).or_insert(0usize) += 1;
+                counts
+            });
+        assert!(tab_cells.values().any(|count| *count > 1));
     }
 
     #[test]

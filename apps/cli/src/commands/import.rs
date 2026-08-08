@@ -45,13 +45,12 @@ async fn push_bulk_transfer(
     .map_err(|error| anyhow::anyhow!("import archive rejected: {error}"))?;
 
     let chunk_size = cockpit_core::daemon::bulk_staging::STAGED_CHUNK_BYTES;
-    let mut chunk_index: u32 = 0;
     // A zero-length archive still sends one chunk so the transfer completes.
-    for chunk in bytes.chunks(chunk_size).chain(if bytes.is_empty() {
+    for (chunk_index, chunk) in (0_u32..).zip(bytes.chunks(chunk_size).chain(if bytes.is_empty() {
         Some(&bytes[..0])
     } else {
         None
-    }) {
+    })) {
         match client
             .request_ok(Request::WriteBulkTransferChunk {
                 transfer: transfer.clone(),
@@ -65,7 +64,6 @@ async fn push_bulk_transfer(
                 "daemon returned unexpected response to bulk transfer chunk: {other:?}"
             ),
         }
-        chunk_index += 1;
     }
     Ok(transfer)
 }

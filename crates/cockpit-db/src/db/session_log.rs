@@ -19,6 +19,7 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -135,10 +136,13 @@ pub enum SessionEventKind {
     /// provider/model ids, a closed trigger, outcome, and optional redacted
     /// error text. Data/export only.
     ModelSwitch,
+    /// A configured hook handler reached an observable execution outcome.
+    /// Carries only bounded, redacted audit metadata and is data/export only.
+    HookRun,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -165,6 +169,7 @@ impl SessionEventKind {
         Self::ResourcePromotion,
         Self::Notice,
         Self::ModelSwitch,
+        Self::HookRun,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -195,8 +200,172 @@ impl SessionEventKind {
             SessionEventKind::ResourcePromotion => "resource_promotion",
             SessionEventKind::Notice => "notice",
             SessionEventKind::ModelSwitch => "model_switch",
+            SessionEventKind::HookRun => "hook_run",
         }
     }
+}
+
+const HOOK_EVENT_MAX_BYTES: usize = 128;
+const HOOK_CORRELATION_MAX_BYTES: usize = 256;
+const HOOK_REASON_MAX_BYTES: usize = 1_024;
+
+/// Closed outcome vocabulary for a configured hook invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunStatus {
+    Success,
+    Denied,
+    Blocked,
+    Failed,
+}
+
+impl HookRunStatus {
+    pub const ALL: [Self; 4] = [Self::Success, Self::Denied, Self::Blocked, Self::Failed];
+}
+
+/// The complete safe projection persisted for one configured hook invocation.
+///
+/// This deliberately has no payload, process-output, command, working-directory,
+/// environment, or transport fields. Import deserialization rejects every field
+/// outside this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookRunAudit {
+    pub event: String,
+    pub hook: String,
+    pub origin: String,
+    pub status: HookRunStatus,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+}
+
+impl HookRunAudit {
+    /// Parse an imported hook-run payload through the same closed validation
+    /// used for live writes. Unknown and sensitive fields are rejected by
+    /// `deny_unknown_fields` before any row can be restored.
+    pub fn from_json(value: &Value) -> Result<Self> {
+        let audit: Self = serde_json::from_value(value.clone())
+            .context("parsing closed hook_run audit payload")?;
+        audit.validated_import()
+    }
+
+    fn validated_live(mut self) -> Result<Self> {
+        self.validate_common()?;
+        self.reason = self
+            .reason
+            .map(|reason| truncate_utf8_bytes(&reason, HOOK_REASON_MAX_BYTES));
+        Ok(self)
+    }
+
+    fn validated_import(self) -> Result<Self> {
+        self.validate_common()?;
+        if let Some(reason) = self.reason.as_deref() {
+            anyhow::ensure!(
+                reason.len() <= HOOK_REASON_MAX_BYTES,
+                "hook_run `reason` exceeds {HOOK_REASON_MAX_BYTES} bytes"
+            );
+        }
+        Ok(self)
+    }
+
+    fn validate_common(&self) -> Result<()> {
+        validate_event_name(&self.event)?;
+        validate_hook_origin("hook", &self.hook)?;
+        validate_hook_origin("origin", &self.origin)?;
+        for (field, value, max) in [
+            (
+                "turn_id",
+                self.turn_id.as_deref(),
+                HOOK_CORRELATION_MAX_BYTES,
+            ),
+            ("tool_name", self.tool_name.as_deref(), HOOK_EVENT_MAX_BYTES),
+            (
+                "tool_call_id",
+                self.tool_call_id.as_deref(),
+                HOOK_CORRELATION_MAX_BYTES,
+            ),
+            (
+                "subagent_id",
+                self.subagent_id.as_deref(),
+                HOOK_CORRELATION_MAX_BYTES,
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_bounded_text(field, value, max)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_event_name(value: &str) -> Result<()> {
+    validate_bounded_text("event", value, HOOK_EVENT_MAX_BYTES)?;
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "hook_run `event` must be an ASCII identifier"
+    );
+    Ok(())
+}
+
+fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    anyhow::ensure!(!value.is_empty(), "hook_run `{field}` must not be empty");
+    anyhow::ensure!(
+        value.len() <= max_bytes,
+        "hook_run `{field}` exceeds {max_bytes} bytes"
+    );
+    Ok(())
+}
+
+fn validate_hook_origin(field: &str, value: &str) -> Result<()> {
+    let mut parts = value.split(':');
+    let layer = parts.next().unwrap_or_default();
+    let digest = parts.next().unwrap_or_default();
+    let index = parts.next().unwrap_or_default();
+    anyhow::ensure!(parts.next().is_none(), "invalid hook_run `{field}` origin");
+    anyhow::ensure!(
+        matches!(
+            layer,
+            "global" | "user" | "machine" | "project" | "explicit"
+        ),
+        "invalid hook_run `{field}` layer kind"
+    );
+    anyhow::ensure!(
+        digest.len() == 16
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid hook_run `{field}` source digest"
+    );
+    let parsed_index = index
+        .parse::<usize>()
+        .with_context(|| format!("invalid hook_run `{field}` handler index"))?;
+    anyhow::ensure!(
+        parsed_index.to_string() == index,
+        "invalid hook_run `{field}` handler index"
+    );
+    Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 /// Terminal lifecycle status of an inference attempt's dispatch-time record
@@ -335,6 +504,52 @@ pub fn now_ms() -> i64 {
 }
 
 impl Db {
+    /// Persist one live hook-run audit through its closed safe projection.
+    ///
+    /// Ledger failure must remain best-effort at the hook runtime call site:
+    /// callers must log and continue rather than alter or repeat a hook result.
+    pub async fn insert_hook_run(&self, session_id: Uuid, audit: HookRunAudit) -> Result<i64> {
+        let audit = audit.validated_live()?;
+        let data_json = serde_json::to_string(&audit).context("serializing hook_run audit")?;
+        let ts_ms = now_ms();
+        self.write(move |conn| Self::insert_hook_run_json_conn(conn, session_id, ts_ms, &data_json))
+            .await
+    }
+
+    /// Restore one imported hook-run row after closed typed parsing.
+    pub fn insert_imported_hook_run_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        ts_ms: i64,
+        data: &Value,
+    ) -> Result<i64> {
+        let audit = HookRunAudit::from_json(data)?;
+        let data_json = serde_json::to_string(&audit).context("serializing hook_run audit")?;
+        Self::insert_hook_run_json_conn(conn, session_id, ts_ms, &data_json)
+    }
+
+    fn insert_hook_run_json_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        ts_ms: i64,
+        data_json: &str,
+    ) -> Result<i64> {
+        // Hook correlations intentionally live only in the closed JSON
+        // projection. Populating generic columns would create a second,
+        // independently writable representation and weaken the sole-writer
+        // guarantee.
+        Self::insert_session_event_json_conn_unchecked(
+            conn,
+            session_id,
+            SessionEventKind::HookRun,
+            None,
+            None,
+            SessionEventContext::default(),
+            ts_ms,
+            data_json,
+        )
+    }
+
     pub async fn store_compaction_payload(
         &self,
         handoff_id: Uuid,
@@ -536,6 +751,7 @@ impl Db {
         context: SessionEventContext<'_>,
         data: &Value,
     ) -> Result<i64> {
+        reject_generic_hook_run(kind)?;
         let data_json = serde_json::to_string(data).context("serializing event data")?;
         let ts_ms = now_ms();
         let agent = agent.map(str::to_owned);
@@ -572,6 +788,23 @@ impl Db {
 
     #[allow(clippy::too_many_arguments)]
     pub fn insert_session_event_json_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        kind: SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        context: SessionEventContext<'_>,
+        ts_ms: i64,
+        data_json: &str,
+    ) -> Result<i64> {
+        reject_generic_hook_run(kind)?;
+        Self::insert_session_event_json_conn_unchecked(
+            conn, session_id, kind, agent, call_id, context, ts_ms, data_json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_session_event_json_conn_unchecked(
         conn: &Connection,
         session_id: Uuid,
         kind: SessionEventKind,
@@ -1105,6 +1338,14 @@ fn decode_event_row(row: RawSessionEventRow) -> Result<SessionEventRow> {
     })
 }
 
+fn reject_generic_hook_run(kind: SessionEventKind) -> Result<()> {
+    anyhow::ensure!(
+        kind != SessionEventKind::HookRun,
+        "hook_run events must use the typed hook-run writer"
+    );
+    Ok(())
+}
+
 fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("deserializing data_json"))
@@ -1114,6 +1355,249 @@ fn is_truncated_tail_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn hook_audit(status: HookRunStatus) -> HookRunAudit {
+        HookRunAudit {
+            event: "PreToolUse".to_string(),
+            hook: "project:0123456789abcdef:7".to_string(),
+            origin: "project:0123456789abcdef:7".to_string(),
+            status,
+            duration_ms: 42,
+            reason: None,
+            turn_id: None,
+            tool_name: None,
+            tool_call_id: None,
+            subagent_id: None,
+        }
+    }
+
+    #[test]
+    fn hook_run_event_kind_is_exhaustive_and_stable() {
+        let expected = [
+            "user_message",
+            "user_note",
+            "assistant_message",
+            "inference_request",
+            "tool_call",
+            "tandem_inference",
+            "tool_call_started",
+            "tool_call_completed",
+            "subagent_spawned",
+            "subagent_routing",
+            "subagent_report",
+            "context_pruned",
+            "session_compacted",
+            "permission_decision",
+            "interrupt_decision",
+            "tool_rejected",
+            "primary_swap",
+            "inference_failure",
+            "failed_turn_recovery",
+            "turn_interrupted",
+            "skill_auto_select",
+            "auto_prune_diagnostic",
+            "goal_progress_diagnostic",
+            "resource_promotion",
+            "notice",
+            "model_switch",
+            "hook_run",
+        ];
+        let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().filter(|kind| **kind == "hook_run").count(), 1);
+        assert_eq!(SessionEventKind::HookRun.as_str(), "hook_run");
+    }
+
+    #[tokio::test]
+    async fn hook_run_audit_serialization_is_closed_and_bounded() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        for status in HookRunStatus::ALL {
+            db.insert_hook_run(session.session_id, hook_audit(status))
+                .await
+                .unwrap();
+        }
+
+        let mut correlated = hook_audit(HookRunStatus::Denied);
+        correlated.reason = Some(format!("{}é", "r".repeat(HOOK_REASON_MAX_BYTES - 1)));
+        correlated.turn_id = Some("turn-1".to_string());
+        correlated.tool_name = Some("bash".to_string());
+        correlated.tool_call_id = Some("tool-call-1".to_string());
+        correlated.subagent_id = Some("subagent-1".to_string());
+        db.insert_hook_run(session.session_id, correlated)
+            .await
+            .unwrap();
+
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 5);
+        assert!(events.iter().all(|event| event.kind == "hook_run"));
+        assert_eq!(
+            events[..4]
+                .iter()
+                .map(|event| event.data["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["success", "denied", "blocked", "failed"]
+        );
+        let data = events.last().unwrap().data.as_object().unwrap();
+        assert_eq!(
+            data.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "duration_ms",
+                "event",
+                "hook",
+                "origin",
+                "reason",
+                "status",
+                "subagent_id",
+                "tool_call_id",
+                "tool_name",
+                "turn_id",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+        let reason = data["reason"].as_str().unwrap();
+        assert!(reason.len() <= HOOK_REASON_MAX_BYTES);
+        assert_eq!(reason, "r".repeat(HOOK_REASON_MAX_BYTES - 1));
+
+        for forbidden in [
+            "payload",
+            "output",
+            "argv",
+            "cwd",
+            "environment",
+            "stdout",
+            "stderr",
+            "http",
+            "unknown",
+        ] {
+            let mut value = serde_json::to_value(hook_audit(HookRunStatus::Success)).unwrap();
+            value[forbidden] = json!("secret");
+            assert!(
+                HookRunAudit::from_json(&value).is_err(),
+                "field {forbidden} must be rejected"
+            );
+        }
+
+        for field in ["hook", "origin"] {
+            let mut value = serde_json::to_value(hook_audit(HookRunStatus::Success)).unwrap();
+            value[field] = json!("/home/alice/.config/cockpit/config.toml");
+            assert!(HookRunAudit::from_json(&value).is_err());
+        }
+        let mut overlong = hook_audit(HookRunStatus::Success);
+        overlong.event = "é".repeat(HOOK_EVENT_MAX_BYTES);
+        assert!(
+            db.insert_hook_run(session.session_id, overlong)
+                .await
+                .is_err()
+        );
+        let mut invalid_event = hook_audit(HookRunStatus::Success);
+        invalid_event.event = "PreToolUse\nsecret".to_string();
+        assert!(
+            db.insert_hook_run(session.session_id, invalid_event)
+                .await
+                .is_err()
+        );
+        for (field, value) in [
+            ("turn_id", String::new()),
+            ("tool_name", "t".repeat(HOOK_EVENT_MAX_BYTES + 1)),
+            ("tool_call_id", "c".repeat(HOOK_CORRELATION_MAX_BYTES + 1)),
+            ("subagent_id", "s".repeat(HOOK_CORRELATION_MAX_BYTES + 1)),
+        ] {
+            let mut bounded = hook_audit(HookRunStatus::Success);
+            match field {
+                "turn_id" => bounded.turn_id = Some(value),
+                "tool_name" => bounded.tool_name = Some(value),
+                "tool_call_id" => bounded.tool_call_id = Some(value),
+                "subagent_id" => bounded.subagent_id = Some(value),
+                _ => unreachable!(),
+            }
+            assert!(
+                db.insert_hook_run(session.session_id, bounded)
+                    .await
+                    .is_err(),
+                "{field} must be non-empty and within its byte bound"
+            );
+        }
+        let mut oversized_import = hook_audit(HookRunStatus::Success);
+        oversized_import.reason = Some("é".repeat(HOOK_REASON_MAX_BYTES));
+        assert!(HookRunAudit::from_json(&serde_json::to_value(oversized_import).unwrap()).is_err());
+
+        let imported = serde_json::to_value(hook_audit(HookRunStatus::Blocked)).unwrap();
+        db.write(move |conn| {
+            Db::insert_imported_hook_run_conn(conn, session.session_id, 123, &imported)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_session_event_writer_rejects_hook_run() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let data = serde_json::to_value(hook_audit(HookRunStatus::Success)).unwrap();
+        assert!(
+            db.insert_session_event(
+                session.session_id,
+                SessionEventKind::HookRun,
+                None,
+                None,
+                &data,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            db.insert_session_event_with_origin(
+                session.session_id,
+                SessionEventKind::HookRun,
+                None,
+                None,
+                None,
+                &data,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            db.insert_session_event_with_context(
+                session.session_id,
+                SessionEventKind::HookRun,
+                None,
+                None,
+                SessionEventContext::default(),
+                &data,
+            )
+            .await
+            .is_err()
+        );
+        let data_json = serde_json::to_string(&data).unwrap();
+        db.write(move |conn| {
+            let result = Db::insert_session_event_json_conn(
+                conn,
+                session.session_id,
+                SessionEventKind::HookRun,
+                None,
+                None,
+                SessionEventContext::default(),
+                123,
+                &data_json,
+            );
+            assert!(result.is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.list_session_events(session.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     async fn insert_numbered_events(db: &Db, session_id: Uuid, count: usize) -> Vec<i64> {
         let mut seqs = Vec::new();

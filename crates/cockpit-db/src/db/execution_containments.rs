@@ -295,6 +295,40 @@ impl Db {
         .await
     }
 
+    /// Rows that are not ProvenEmpty for one `operation_id`.
+    ///
+    /// Write-scope recovery uses this to answer "did a containment for this
+    /// transfer ever get created?" when the transfer row itself crashed before
+    /// its containment ticket could be attached. It works only because the
+    /// write-scope operation id is *derived* from the transfer id
+    /// (`write_scope_containment_operation_id`) rather than supplied free-form,
+    /// so the durable transfer row is enough to find the containment without
+    /// storing a second pointer.
+    pub async fn list_nonempty_execution_containments_for_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<ExecutionContainmentRow>> {
+        let operation_id = operation_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {SELECT_COLS} FROM execution_containments
+                     WHERE operation_id = ?1 AND state != 'empty'
+                     ORDER BY created_at_wall_ms ASC"
+                ))
+                .context("preparing nonempty containments for operation")?;
+            let rows = stmt
+                .query_map(params![operation_id], map_row)
+                .context("querying nonempty containments for operation")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding execution_containment")?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn list_all_execution_containments(&self) -> Result<Vec<ExecutionContainmentRow>> {
         self.read(|conn| {
             let mut stmt = conn

@@ -31,10 +31,11 @@ impl SpawnTool {
     /// much recursion budget remains.
     pub fn for_depth(depth: u32, ceiling: u32) -> Self {
         let remaining = ceiling.saturating_sub(depth);
-        // One noun-phrase-dense sentence (token economy §10). The
-        // dedicated-output-folder guidance is in the description text itself.
+        // One noun-phrase-dense sentence (token economy §10). `write_scope` is
+        // an authority transfer, not an output suggestion: the guidance that it
+        // must be a dedicated strict subtree lives in the description text.
         let description = format!(
-            "Fan out to a parallel `bee` worker (depth {depth} of ceiling {ceiling}; {remaining} recursion left); give each child a dedicated `output_dir` or DB path."
+            "Fan out to a parallel `bee` worker (depth {depth} of ceiling {ceiling}; {remaining} recursion left); give each child a dedicated `write_scope` — a strict workspace-relative directory subtree of your own write authority."
         );
         Self { description }
     }
@@ -52,7 +53,12 @@ impl Tool for SpawnTool {
 
     fn defensive_description(&self) -> Option<String> {
         Some(format!(
-            "{} Use this only when the current slice can be split into independent child work; write a complete brief and a dedicated output_dir for every child.",
+            // A directive, not an enforcement claim. Nothing reserves a child's
+            // subtree against its parent, so promising the parent is locked out
+            // of it would assert a boundary the engine does not provide. State
+            // the expected behaviour instead, and let the inventory test in
+            // `write_scope::tests::spawn_rename_inventory` keep it that way.
+            "{} Use this only when the current slice can be split into independent child work; write a complete brief and a dedicated write_scope for every child. Treat each child's write_scope as that child's working area for the duration: do not write inside it yourself until the child returns.",
             self.description
         ))
     }
@@ -65,16 +71,16 @@ impl Tool for SpawnTool {
                     "type": "string",
                     "description": "Self-contained brief for the child: goal, scope of this slice, what to save and return"
                 },
-                "output_dir": {
+                "write_scope": {
                     "type": "string",
-                    "description": "Dedicated folder/DB path the child writes its results into (avoids same-file contention)"
+                    "description": "Required strict workspace-relative directory subtree of your own write authority, transferred to the child for the whole run; reads stay workspace-wide"
                 },
                 "model": {
                     "type": "string",
                     "description": "Optional child model selector (`provider/model` or `provider:model`). Capability/cost only: data custody is host policy, so a trusted (raw-custody) child cannot be requested here and delegated routing always applies the redacted untrusted filter"
                 }
             },
-            "required": ["prompt", "output_dir"]
+            "required": ["prompt", "write_scope"]
         })
     }
 

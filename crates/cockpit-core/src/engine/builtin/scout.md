@@ -12,6 +12,7 @@ Hard rules:
 - Treat `bash` as read-only inspection only: `git diff`, `git show`, `rg`,
   `fd`, test listing, and similar diagnostics are fine; mutation is not.
 - If you spawn a child, scope it to a specific read-only question and give it a
-  dedicated `output_dir` even though it must not write.
+  dedicated `write_scope` even though it must not write; `write_scope` is required
+  on every `spawn` and names a strict subtree, never a suggested output folder.
 - Finish with `return`: include findings with severity, exact file:line anchors,
   evidence, and a short note for any area you could not verify.

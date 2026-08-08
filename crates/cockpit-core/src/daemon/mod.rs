@@ -1238,6 +1238,10 @@ async fn run_foreground_inner_with_boot_db(
     // still requires ProvenEmpty within that bound.
     let containment_clean = if let Some(pc) = ctx.process_containment.as_ref() {
         let pc = pc.clone();
+        // The write-scope coordinator drains in the same barrier: shutdown may
+        // not report clean while a lease still holds authority or a permit is
+        // still held, exactly as it may not while a containment is nonempty.
+        let ws = ctx.write_scope.clone();
         let grace = drain_grace;
         // Prefer a real-time upper bound slightly above grace so a paused
         // Tokio clock cannot leave this future pending forever.
@@ -1255,7 +1259,22 @@ async fn run_foreground_inner_with_boot_db(
                     if let Err(error) = pc.begin_shutdown().await {
                         tracing::warn!(error = %error, "process containment begin_shutdown failed");
                     }
-                    pc.await_all_empty(Some(grace)).await
+                    // Close write-scope intake before draining, so no transfer
+                    // can begin while the barrier is running.
+                    if let Some(ws) = ws.as_ref()
+                        && let Err(error) = ws.begin_shutdown().await
+                    {
+                        tracing::warn!(error = %error, "write scope begin_shutdown failed");
+                    }
+                    pc.await_all_empty(Some(grace)).await?;
+                    if let Some(ws) = ws.as_ref() {
+                        ws.assert_shutdown_clean().await.map_err(|error| {
+                            crate::process_containment::ContainmentError::Internal(format!(
+                                "write scope not drained at shutdown: {error}"
+                            ))
+                        })?;
+                    }
+                    Ok::<(), crate::process_containment::ContainmentError>(())
                 };
                 match tokio::time::timeout(wall_cap, barrier).await {
                     Ok(Ok(())) => true,

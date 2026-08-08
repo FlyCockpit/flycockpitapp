@@ -60,6 +60,9 @@ struct Inner {
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    /// Durable write-scope authority. Late-installed like `scheduler`: the
+    /// coordinator is built in `boot_with_db`, after this registry exists.
+    write_scope: crate::write_scope::WriteScopeSource,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -350,6 +353,7 @@ impl SessionRegistry {
                 db,
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
+                write_scope: Arc::new(Mutex::new(None)),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
@@ -382,6 +386,17 @@ impl SessionRegistry {
 
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn set_write_scope(
+        &self,
+        coordinator: std::sync::Arc<crate::write_scope::WriteScopeCoordinator>,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.write_scope) = Some(coordinator);
+    }
+
+    fn write_scope_source(&self) -> crate::write_scope::WriteScopeSource {
+        self.inner.write_scope.clone()
     }
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -789,6 +804,7 @@ impl SessionRegistry {
             self.inner.lsp.clone(),
             self.inner.resource_scheduler.clone(),
             self.scheduler_source(),
+            self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
             trust_policy,
             Some(cleanup),

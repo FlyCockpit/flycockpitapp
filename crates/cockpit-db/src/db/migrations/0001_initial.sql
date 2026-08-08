@@ -1721,6 +1721,323 @@ CREATE INDEX idx_execution_containments_nonempty
     WHERE state NOT IN ('empty');
 
 
+-- ---- write-scope leases / transfers / permits -------------------------------
+-- Durable hierarchical write authority. A lease is one owner's exclusive write
+-- authority over a canonical directory subtree. A transfer moves a *strict*
+-- sub-scope from a parent lease to a child lease through an ordered, crash-safe
+-- phase sequence. A permit is the durable-generation right to perform one
+-- filesystem mutation (`mutation`) or to run arbitrary user code that can
+-- influence a scope (`execution`).
+--
+-- Authority is durable, never in-memory-only: every authority-changing
+-- transition increments the affected lease generation, which invalidates every
+-- older token. Generations never decrement and are never reused, so a late
+-- write carrying an old generation fails without reacquiring.
+--
+-- Paths are canonical absolute host paths. Reads are never scoped here; write
+-- scope is a *write* authority only.
+
+CREATE TABLE write_scope_leases (
+    lease_id                TEXT PRIMARY KEY,
+    -- NULL for a root lease (the session's base writable authority).
+    parent_lease_id         TEXT,
+    session_id              TEXT NOT NULL,
+    -- Owning task / async job, when the lease is bound to delegated work.
+    task_id                 TEXT,
+    -- Canonical absolute directory subtree this lease grants write authority over.
+    scope_path              TEXT NOT NULL,
+    -- Bumped by every authority-changing transition; invalidates older tokens.
+    generation              INTEGER NOT NULL,
+    state                   TEXT NOT NULL CHECK (state IN (
+        'active', 'transferring', 'delegated', 'returning', 'released'
+    )),
+    -- Opaque owner identity (agent/job); never a command, secret, or payload.
+    owner_id                TEXT NOT NULL,
+    -- Optimistic-concurrency version for same-parent transfer serialization.
+    version                 INTEGER NOT NULL,
+    created_at_wall_ms      INTEGER NOT NULL,
+    updated_at_wall_ms      INTEGER NOT NULL,
+    released_at_wall_ms     INTEGER,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_write_scope_leases_session
+    ON write_scope_leases (session_id);
+CREATE INDEX idx_write_scope_leases_parent
+    ON write_scope_leases (parent_lease_id);
+CREATE INDEX idx_write_scope_leases_live
+    ON write_scope_leases (session_id, state)
+    WHERE state NOT IN ('released');
+
+-- Generation monotonicity: never decrement, never reuse after rollback or
+-- recovery. A recovery that rolls an authority back still moves forward.
+CREATE TRIGGER write_scope_leases_generation_monotonic
+BEFORE UPDATE ON write_scope_leases
+WHEN NEW.generation < OLD.generation
+BEGIN
+    SELECT RAISE(ABORT, 'write scope lease generation must never decrement');
+END;
+
+-- Version is the CAS token for same-parent transfer serialization; a stale
+-- contender must lose rather than silently overwrite a newer version.
+CREATE TRIGGER write_scope_leases_version_monotonic
+BEFORE UPDATE ON write_scope_leases
+WHEN NEW.version <= OLD.version AND NEW.state IS NOT OLD.state
+BEGIN
+    SELECT RAISE(ABORT, 'write scope lease version must advance on state change');
+END;
+
+-- The legal authority transition graph, enforced by the storage layer rather
+-- than only by the caller. A durable layer that accepts `active -> delegated`
+-- would let a caller skip the exclusion barrier entirely.
+CREATE TRIGGER write_scope_leases_legal_transition
+BEFORE UPDATE ON write_scope_leases
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+    'active>transferring',
+    'active>released',
+    'transferring>delegated',
+    -- Unwind: a failed acquisition returns authority to the parent.
+    'transferring>active',
+    -- An owner that already delegated one sub-scope may delegate another.
+    'delegated>transferring',
+    'delegated>returning',
+    'delegated>released',
+    'returning>active',
+    -- Returning while other children remain delegated.
+    'returning>delegated',
+    'returning>released'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'write scope lease transition rejected by durable constraint');
+END;
+
+-- Released is terminal: a released authority is never resurrected, because a
+-- descendant token from an older generation must never become valid again.
+CREATE TRIGGER write_scope_leases_released_is_final
+BEFORE UPDATE ON write_scope_leases
+WHEN OLD.state = 'released' AND NEW.state <> 'released'
+BEGIN
+    SELECT RAISE(ABORT, 'released write scope lease is final');
+END;
+
+-- The scope a lease covers is fixed at creation. Re-pointing an existing lease
+-- would silently move authority without a generation bump.
+CREATE TRIGGER write_scope_leases_scope_immutable
+BEFORE UPDATE ON write_scope_leases
+WHEN NEW.scope_path <> OLD.scope_path
+BEGIN
+    SELECT RAISE(ABORT, 'write scope lease scope_path is immutable');
+END;
+
+
+CREATE TABLE write_scope_transfers (
+    transfer_id                 TEXT PRIMARY KEY,
+    session_id                  TEXT NOT NULL,
+    parent_lease_id             TEXT NOT NULL,
+    -- NULL until ChildActivated; a loser or an unsupported transfer never
+    -- creates a child lease at all.
+    child_lease_id              TEXT,
+    -- The strict canonical sub-scope being delegated.
+    sub_scope_path              TEXT NOT NULL,
+    phase                       TEXT NOT NULL CHECK (phase IN (
+        'prepared', 'parent_excluded', 'child_activated',
+        'child_terminal', 'parent_restored', 'committed'
+    )),
+    -- Parent generation observed by the Prepared CAS (`g`).
+    prepare_parent_generation   INTEGER NOT NULL,
+    -- Parent generation after Prepared (`g+1`), reissued at ParentExcluded.
+    parent_generation           INTEGER NOT NULL,
+    -- Child generation created at ChildActivated (`g+2`).
+    child_generation            INTEGER,
+    -- Fresh full-authority parent generation issued at ParentRestored.
+    restored_parent_generation  INTEGER,
+    -- Which ScopedWriteBackend answered the capability probe.
+    backend_kind                TEXT NOT NULL,
+    -- Closed capability: strict writable delegation requires 'proven'.
+    capability                  TEXT NOT NULL CHECK (capability IN (
+        'proven', 'unsupported'
+    )),
+    unsupported_reason          TEXT,
+    -- Containment generation that must return ProvenEmpty before return.
+    containment_id              TEXT,
+    -- The containment's OWN generation, which is a different counter from any
+    -- lease generation. The return barrier compares the oracle's reported
+    -- generation against this, so a ProvenEmpty for a different generation is
+    -- never mistaken for evidence about this child.
+    containment_generation      INTEGER,
+    -- Inode identity the backend recorded for the publication target when the
+    -- child started. A change means the target or an ancestor was replaced.
+    publication_identity        TEXT,
+    -- Execution-wide permit held across every descendant of the child.
+    execution_permit_id         TEXT,
+    -- Startup reconciliation marker; 'denied' is a permanent refusal to
+    -- restore authority under ambiguity.
+    recovery_phase              TEXT CHECK (recovery_phase IN (
+        'pending', 'reconciled', 'denied'
+    )),
+    version                     INTEGER NOT NULL,
+    created_at_wall_ms          INTEGER NOT NULL,
+    updated_at_wall_ms          INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
+    FOREIGN KEY (child_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_write_scope_transfers_parent
+    ON write_scope_transfers (parent_lease_id);
+CREATE INDEX idx_write_scope_transfers_child
+    ON write_scope_transfers (child_lease_id);
+CREATE INDEX idx_write_scope_transfers_session_phase
+    ON write_scope_transfers (session_id, phase);
+CREATE INDEX idx_write_scope_transfers_open
+    ON write_scope_transfers (session_id)
+    WHERE phase NOT IN ('committed');
+
+-- Phases advance by exactly one step. The single exception is closing out a
+-- transfer that never activated a child (`child_lease_id IS NULL`): recovery
+-- must be able to retire an abandoned Prepared/ParentExcluded row, and doing so
+-- hands no authority to anyone because no child ever existed.
+CREATE TRIGGER write_scope_transfers_phase_adjacent
+BEFORE UPDATE ON write_scope_transfers
+WHEN ((CASE NEW.phase
+        WHEN 'prepared' THEN 0
+        WHEN 'parent_excluded' THEN 1
+        WHEN 'child_activated' THEN 2
+        WHEN 'child_terminal' THEN 3
+        WHEN 'parent_restored' THEN 4
+        WHEN 'committed' THEN 5 END)
+      -
+      (CASE OLD.phase
+        WHEN 'prepared' THEN 0
+        WHEN 'parent_excluded' THEN 1
+        WHEN 'child_activated' THEN 2
+        WHEN 'child_terminal' THEN 3
+        WHEN 'parent_restored' THEN 4
+        WHEN 'committed' THEN 5 END)) > 1
+ AND NOT (NEW.phase = 'committed' AND OLD.child_lease_id IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'transfer phase advance rejected by durable constraint');
+END;
+
+-- Phases never rewind: a rewind could restore parent authority while a child
+-- still owns the sub-scope.
+CREATE TRIGGER write_scope_transfers_phase_forward_only
+BEFORE UPDATE ON write_scope_transfers
+WHEN (CASE NEW.phase
+        WHEN 'prepared' THEN 0
+        WHEN 'parent_excluded' THEN 1
+        WHEN 'child_activated' THEN 2
+        WHEN 'child_terminal' THEN 3
+        WHEN 'parent_restored' THEN 4
+        WHEN 'committed' THEN 5 END)
+     < (CASE OLD.phase
+        WHEN 'prepared' THEN 0
+        WHEN 'parent_excluded' THEN 1
+        WHEN 'child_activated' THEN 2
+        WHEN 'child_terminal' THEN 3
+        WHEN 'parent_restored' THEN 4
+        WHEN 'committed' THEN 5 END)
+BEGIN
+    SELECT RAISE(ABORT, 'write scope transfer phase must not rewind');
+END;
+
+-- Committed is terminal.
+CREATE TRIGGER write_scope_transfers_committed_is_final
+BEFORE UPDATE ON write_scope_transfers
+WHEN OLD.phase = 'committed' AND NEW.phase <> 'committed'
+BEGIN
+    SELECT RAISE(ABORT, 'committed write scope transfer is final');
+END;
+
+-- A child lease may only be attached once, at ChildActivated. Re-pointing it
+-- would orphan a live owner.
+CREATE TRIGGER write_scope_transfers_child_lease_write_once
+BEFORE UPDATE ON write_scope_transfers
+WHEN OLD.child_lease_id IS NOT NULL
+ AND NEW.child_lease_id IS NOT OLD.child_lease_id
+BEGIN
+    SELECT RAISE(ABORT, 'write scope transfer child lease is write-once');
+END;
+
+-- The delegated sub-scope is fixed at Prepared: the containment decision was
+-- made against exactly this path.
+CREATE TRIGGER write_scope_transfers_subscope_immutable
+BEFORE UPDATE ON write_scope_transfers
+WHEN NEW.sub_scope_path <> OLD.sub_scope_path
+BEGIN
+    SELECT RAISE(ABORT, 'write scope transfer sub_scope_path is immutable');
+END;
+
+-- Strict writable delegation never proceeds past exclusion without a Proven
+-- backend. Encoding it here means no code path can bypass the barrier.
+CREATE TRIGGER write_scope_transfers_requires_proven_backend
+BEFORE UPDATE ON write_scope_transfers
+WHEN NEW.capability <> 'proven'
+ AND NEW.phase NOT IN ('prepared')
+BEGIN
+    SELECT RAISE(ABORT, 'write scope transfer requires a proven scoped-write backend');
+END;
+
+
+CREATE TABLE write_scope_permits (
+    permit_id               TEXT PRIMARY KEY,
+    session_id              TEXT NOT NULL,
+    lease_id                TEXT NOT NULL,
+    -- Durable generation the permit was issued under; a transition that bumps
+    -- the lease generation invalidates the permit for new work but must still
+    -- drain the in-flight ones.
+    generation              INTEGER NOT NULL,
+    kind                    TEXT NOT NULL CHECK (kind IN ('mutation', 'execution')),
+    -- Which filesystem operation this permit protects. Needed to decide whether
+    -- two overlapping permits actually conflict: two content writes to distinct
+    -- files may proceed in parallel, but anything that can change what another
+    -- path *means* may not.
+    influence_kind          TEXT NOT NULL DEFAULT 'write_content',
+    -- Highest ancestor whose namespace this operation can influence. Overlap is
+    -- computed against this, not the target path: renaming/removing/replacing/
+    -- linking an ancestor changes the meaning of every descendant path.
+    influence_root          TEXT NOT NULL,
+    -- The concrete target (mutation) or the execution's effective write root.
+    target_path             TEXT NOT NULL,
+    state                   TEXT NOT NULL CHECK (state IN ('held', 'released')),
+    -- Execution permits only: the containment generation that must return
+    -- ProvenEmpty before the permit may be released.
+    containment_id          TEXT,
+    acquired_at_wall_ms     INTEGER NOT NULL,
+    released_at_wall_ms     INTEGER,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_write_scope_permits_lease
+    ON write_scope_permits (lease_id);
+CREATE INDEX idx_write_scope_permits_session_state
+    ON write_scope_permits (session_id, state);
+CREATE INDEX idx_write_scope_permits_held
+    ON write_scope_permits (session_id)
+    WHERE state = 'held';
+
+-- A released permit is final; resurrection would let a drained transfer barrier
+-- be re-entered after the authority already moved.
+CREATE TRIGGER write_scope_permits_released_is_final
+BEFORE UPDATE ON write_scope_permits
+WHEN OLD.state = 'released' AND NEW.state <> 'released'
+BEGIN
+    SELECT RAISE(ABORT, 'released write scope permit is final');
+END;
+
+-- Overlap is computed from the influence root, so it may not be narrowed after
+-- acquisition — that would shrink the barrier a transfer is waiting on.
+CREATE TRIGGER write_scope_permits_influence_immutable
+BEFORE UPDATE ON write_scope_permits
+WHEN NEW.influence_root <> OLD.influence_root OR NEW.kind <> OLD.kind
+BEGIN
+    SELECT RAISE(ABORT, 'write scope permit influence root and kind are immutable');
+END;
+
+
 -- ---- external side-effect journal ------------------------------------------
 -- One bounded, restart-safe, idempotent journal for non-idempotent external
 -- actions (computer input, transcription, sidecars, image generation,

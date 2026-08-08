@@ -187,7 +187,7 @@ fn failed_report_renders_compact_deterministic_prose() {
 }
 
 #[test]
-fn spawn_gate_clamps_to_ceiling_and_requires_output_dir() {
+fn spawn_gate_clamps_to_ceiling_and_requires_write_scope() {
     // Depth ceiling (GOALS §24): at the ceiling the spawn is refused and
     // the branch does its own work (clamp, don't crash). Below it, the
     // child depth advances by one.
@@ -198,9 +198,9 @@ fn spawn_gate_clamps_to_ceiling_and_requires_output_dir() {
     assert!(refused.contains("yourself"), "{refused}");
     // A ceiling of 0 refuses even the root's first spawn.
     assert!(spawn_gate(0, 0, "/tmp/out").is_err());
-    // Missing `output_dir` is refused with the dedicated-folder nudge.
+    // Missing `write_scope` is refused with the dedicated-folder nudge.
     let no_dir = spawn_gate(0, 3, "   ").unwrap_err();
-    assert!(no_dir.contains("output_dir"), "{no_dir}");
+    assert!(no_dir.contains("write_scope"), "{no_dir}");
     assert!(no_dir.contains("dedicated"), "{no_dir}");
 }
 
@@ -219,7 +219,7 @@ async fn set_swarm_config_threads_caps_to_authority() {
                     job_id: None,
                     worker: crate::engine::schedule::authority::SpawnWorkerKind::Bee,
                     prompt: "s".into(),
-                    output_dir: "/tmp/o".into(),
+                    write_scope: "/tmp/o".into(),
                     model: None,
                     model_origin: Default::default(),
                     depth: 1,

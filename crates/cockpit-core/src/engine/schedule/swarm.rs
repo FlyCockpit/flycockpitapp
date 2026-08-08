@@ -15,7 +15,7 @@
 //! and decides whether to schedule it (GOALS §22). The child receives a
 //! synchronous "scheduled/queued" tool result and continues; the grandchild's
 //! own findings bubble up the same way (the encouraged pattern: each leaf
-//! persists to its dedicated `output_dir`/DB and returns a compact pointer).
+//! persists to its dedicated `write_scope`/DB and returns a compact pointer).
 //!
 //! ## Depth ceiling (clamp, don't crash)
 //!
@@ -60,6 +60,96 @@ pub struct SwarmRunCtx {
 /// spirit as the noninteractive per-role caps).
 const SWARM_MAX_TURNS: usize = 64;
 
+/// A live delegation: the coordinator that owns it, and the transfer to drain.
+type ActiveDelegation = (
+    std::sync::Arc<crate::write_scope::WriteScopeCoordinator>,
+    uuid::Uuid,
+);
+
+/// Begin the durable write-scope transfer for a write-capable child.
+///
+/// Returns `Ok(None)` when no coordinator is installed (unit-test drivers), and
+/// `Err(refusal)` — a model-facing message — when the transfer is refused. A
+/// refusal here means the child never runs, which is the point: without a
+/// Proven backend the child cannot be given exclusive authority.
+async fn begin_write_scope_transfer(
+    spec: &SpawnSpec,
+    ctx: &ScheduleContext,
+) -> std::result::Result<Option<ActiveDelegation>, String> {
+    let Some(coordinator) = ctx.write_scope() else {
+        // No durable authority installed (unit-test driver). The dispatch gate
+        // already refused write-capable children on an unsupported backend.
+        return Ok(None);
+    };
+    let scope = match crate::write_scope::CanonicalScope::resolve_under(&ctx.cwd, &spec.write_scope)
+    {
+        Ok(scope) => scope,
+        Err(err) => {
+            return Err(format!(
+                "refused: `write_scope` is not a usable subtree of this workspace — {err}."
+            ));
+        }
+    };
+    // The parent's root lease for this session. Absent one there is no
+    // authority to transfer from, so the child cannot start.
+    let parent_lease_id = match coordinator.session_root_lease(ctx.session.id).await {
+        Ok(Some(lease_id)) => lease_id,
+        Ok(None) => {
+            return Err(
+                "refused: this session holds no durable write authority to delegate from."
+                    .to_string(),
+            );
+        }
+        Err(err) => return Err(format!("refused: write authority lookup failed — {err}")),
+    };
+
+    // ------------------------------------------------------------------
+    // The containment ticket must own the work it authorizes, and at THIS
+    // layer it cannot.
+    //
+    // A `bee` is not an OS process: `run_swarm_loop` below executes it as a
+    // task inside the daemon. `ProcessContainmentBarrier` contains processes,
+    // so containing "the child" here would mean containing some *other*
+    // process while the real writes happen in the uncontained daemon. An
+    // earlier revision papered over that by launching `current_exe()` as a
+    // placeholder — which both spawned a stray `cockpit` process per
+    // delegation and made `ProvenEmpty` a statement about the placeholder
+    // rather than about the child. The return barrier and parent restoration
+    // are built on that proof, so a false proof makes the whole lifecycle
+    // decorative.
+    //
+    // The spec places the execution-wide permit and containment at "shell/tool
+    // execution ... before the containment actor spawns native user code or
+    // creates/execs container/zerobox work" — i.e. at `tools/bash` and
+    // container exec, where user code genuinely becomes a process. Wiring it
+    // there (and threading the child's scope + generation token into
+    // `ToolCtx`) is a separate, sizeable integration.
+    //
+    // Until then this fails closed. Nothing is fabricated, no stray process is
+    // spawned, and no child ever runs behind a containment proof that does not
+    // cover it. Today this is unreachable anyway: the dispatch gate already
+    // refuses write-capable children on the direct workspace.
+    let _ = (&scope, &parent_lease_id, &coordinator, spec);
+    Err(
+        "refused: scoped writes are unsupported for swarm children on this build — a `bee` runs \
+         inside the daemon rather than as a contained process, so its descendants cannot be \
+         proven drained and exclusive authority over the scope cannot be honored. Do this \
+         slice's work yourself, or delegate a reviewer that needs no write tools (note that \
+         such a child can still write via `bash` within the session cwd)."
+            .to_string(),
+    )
+}
+
+/// Mark the child terminal and drain the return barrier.
+async fn finish_write_scope_transfer(
+    coordinator: &std::sync::Arc<crate::write_scope::WriteScopeCoordinator>,
+    transfer_id: uuid::Uuid,
+) -> std::result::Result<(), crate::write_scope::WriteScopeError> {
+    coordinator.child_terminal(transfer_id).await?;
+    coordinator.complete_return(transfer_id).await?;
+    Ok(())
+}
+
 /// Drive one recursive `Swarm` subagent to completion. Always sends
 /// exactly one [`ScheduleEvent::Completed`] so the authority reconciles its
 /// registry entry + the running-swarm count.
@@ -74,7 +164,53 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         cmd_tx,
     } = run;
 
-    let result = match run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx).await {
+    // AC7: capability + execution-wide permit + containment are acquired here,
+    // immediately BEFORE the child's first turn — i.e. before any native spawn
+    // or container create/exec. A write-capable child receives exclusive
+    // authority over its sub-scope, so the durable transfer must succeed first
+    // or the child must not run at all.
+    //
+    // A worker without Cockpit write tools receives no transferred authority
+    // and takes no lease. It is not mechanically prevented from writing via
+    // `bash`; see `SpawnWorkerKind::is_write_capable`.
+    let delegation = if spec.worker.is_write_capable() {
+        match begin_write_scope_transfer(&spec, &ctx).await {
+            Ok(handle) => handle,
+            Err(refusal) => {
+                let _ = event_tx
+                    .send(ScheduleEvent::Completed {
+                        job_id,
+                        label,
+                        kind: ScheduleKind::Swarm,
+                        result: refusal,
+                        failed: true,
+                        requests: Vec::new(),
+                    })
+                    .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let loop_outcome = run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx).await;
+
+    // The child is terminal either way. Invalidate its token and drain the
+    // return barrier before the parent is told anything, so the parent can
+    // never observe completion while the child still holds authority.
+    if let Some((coordinator, transfer_id)) = delegation.as_ref()
+        && let Err(error) = finish_write_scope_transfer(coordinator, *transfer_id).await
+    {
+        // Authority is retained, not restored: the rows stay for recovery.
+        tracing::warn!(
+            error = %error,
+            transfer_id = %transfer_id,
+            "swarm child return barrier did not complete; write authority retained"
+        );
+    }
+
+    let result = match loop_outcome {
         Ok(text) => text,
         Err(e) => {
             let _ = event_tx
@@ -190,13 +326,21 @@ async fn run_swarm_loop(
             // tool result so the child can keep going.
             TurnOutcome::Spawn {
                 prompt,
-                output_dir,
+                write_scope,
                 model,
                 task_call_id,
                 task_function_call_id,
             } => {
-                let pointer =
-                    route_child_spawn(spec, &prompt, &output_dir, model, cmd_tx, turn_tx).await;
+                let pointer = route_child_spawn(
+                    spec,
+                    &prompt,
+                    &write_scope,
+                    &ctx.cwd,
+                    model,
+                    cmd_tx,
+                    turn_tx,
+                )
+                .await;
                 next_prompt =
                     Message::tool_result_with_call_id(task_call_id, task_function_call_id, pointer);
             }
@@ -225,10 +369,12 @@ async fn run_swarm_loop(
 /// ceiling. The child's depth is `spec.depth`; a grandchild would be
 /// `spec.depth + 1`. When that would exceed the ceiling the spawn is refused
 /// and the branch must do the work inline (the tool result says so).
+#[allow(clippy::too_many_arguments)]
 async fn route_child_spawn(
     spec: &SpawnSpec,
     prompt: &str,
-    output_dir: &str,
+    write_scope: &str,
+    workspace_root: &std::path::Path,
     model: Option<String>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -240,6 +386,17 @@ async fn route_child_spawn(
              yourself as a leaf instead of delegating.",
             spec.max_depth, spec.depth
         );
+    }
+    // A running child fanning out further takes the same fail-closed barrier as
+    // the foreground path: a write-capable grandchild is a strict writable
+    // delegation and needs a backend that can isolate arbitrary child syscalls.
+    if let Some(refusal) = crate::engine::driver::scoped_write_refusal(
+        spec.worker,
+        workspace_root,
+        write_scope,
+        &crate::write_scope::DirectWorkspaceBackend,
+    ) {
+        return refusal;
     }
     if prompt.len() > MAX_SWARM_PROMPT_BYTES {
         return format!(
@@ -268,7 +425,7 @@ async fn route_child_spawn(
         job_id: None,
         worker: spec.worker,
         prompt: prompt.to_string(),
-        output_dir: output_dir.to_string(),
+        write_scope: write_scope.to_string(),
         model,
         model_origin,
         depth: child_depth,
@@ -416,24 +573,24 @@ fn swarm_child_brief(
 }
 
 /// Compose the child's brief: its slice question plus a standing instruction
-/// to persist findings to its dedicated output dir and return a compact
+/// to persist findings to its dedicated write scope and return a compact
 /// pointer + summary (the §10 aggregation pattern).
 fn compose_child_brief(spec: &SpawnSpec) -> String {
     format!(
         "{}\n\nSave your findings under `{}` (your dedicated output location — do not write \
          elsewhere). Return a compact summary plus a pointer to what you saved; do not dump the \
          full dataset back through your reply.",
-        spec.prompt, spec.output_dir
+        spec.prompt, spec.write_scope
     )
 }
 
 /// Budget-cap the child's terminal result for injection into main context
-/// (GOALS §10). Leads with a pointer to the output dir so the aggregating
+/// (GOALS §10). Leads with a pointer to the write scope so the aggregating
 /// parent knows where the detail lives.
 fn budget_result(label: &str, spec: &SpawnSpec, result: &str) -> String {
     let mut writer = BudgetedWriter::new(ASYNC_RESULT_TOKEN_CAP);
     let _ = writer.writeln(&format!("swarm `{label}` finished."));
-    let _ = writer.writeln(&format!("output saved under: {}", spec.output_dir));
+    let _ = writer.writeln(&format!("output saved under: {}", spec.write_scope));
     let trimmed = result.trim();
     if !trimmed.is_empty() {
         let _ = writer.writeln("summary:");
@@ -477,7 +634,7 @@ mod tests {
             job_id: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "find every firm in this state".into(),
-            output_dir: "/tmp/state-ca".into(),
+            write_scope: "/tmp/state-ca".into(),
             model: None,
             model_origin: Default::default(),
             depth,
@@ -719,6 +876,11 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             config,
             agent: Arc::new(parent),
+            // This test drives `run_swarm_loop` directly to check brief
+            // redaction; it never delegates write authority, so no coordinator
+            // is installed. `None` is "no durable write-scope lifecycle", which
+            // is the same value the sibling authority test uses.
+            write_scope: None,
         };
 
         let mut spec = spec(1, 3);
@@ -775,6 +937,21 @@ mod tests {
     #[tokio::test]
     async fn nested_spawn_cannot_launder_host_provenance() {
         async fn child_origin(parent: &SpawnSpec, child_model: Option<&str>) -> SpawnModelOrigin {
+            // The scenario this test describes is a goal-verification skeptic,
+            // which is dispatched as a `Scout` (see the
+            // `goalVerification.skepticModel` spawn in `driver`). Use that
+            // worker kind here: a write-capable grandchild is refused by the
+            // scoped-write barrier *before* dispatch, so it would never reach
+            // the provenance computation this test exists to pin. Provenance
+            // itself is worker-independent.
+            let mut parent = parent.clone();
+            parent.worker = SpawnWorkerKind::Scout;
+            let parent = &parent;
+
+            // `write_scope` is validated for every worker, so it must name a
+            // real subtree of the workspace.
+            let ws = workspace();
+
             let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(8);
             let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
             let handle = tokio::spawn(async move {
@@ -791,7 +968,8 @@ mod tests {
             let _ = route_child_spawn(
                 parent,
                 "deeper slice",
-                "/tmp/deeper",
+                "slice",
+                ws.path(),
                 child_model.map(str::to_string),
                 &cmd_tx,
                 &turn_tx,
@@ -838,6 +1016,14 @@ mod tests {
         );
     }
 
+    /// A workspace with one child subtree, so `write_scope` resolution is
+    /// exercised against a real directory rather than a synthetic path.
+    fn workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("slice")).unwrap();
+        tmp
+    }
+
     /// A child at the ceiling that calls `spawn` is refused — the
     /// branch degrades to a leaf (clamp, don't crash, GOALS §24). No request
     /// is sent to main.
@@ -847,7 +1033,17 @@ mod tests {
         let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
         // depth 3, ceiling 3 → a child would be depth 4 > 3: refused.
         let s = spec(3, 3);
-        let out = route_child_spawn(&s, "deeper", "/tmp/deeper", None, &cmd_tx, &turn_tx).await;
+        let ws = workspace();
+        let out = route_child_spawn(
+            &s,
+            "deeper",
+            "/tmp/deeper",
+            ws.path(),
+            None,
+            &cmd_tx,
+            &turn_tx,
+        )
+        .await;
         assert!(out.contains("refused"), "got {out}");
         assert!(out.contains("yourself"), "got {out}");
         assert!(
@@ -862,14 +1058,26 @@ mod tests {
     async fn route_child_spawn_routes_under_ceiling() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(8);
         let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
-        let s = spec(1, 3);
-        let routed = route_child_spawn(&s, "city slice", "/tmp/city", None, &cmd_tx, &turn_tx);
+        let mut s = spec(1, 3);
+        // No Cockpit write tools: a write-capable child is refused by the
+        // barrier (see `route_child_spawn_refuses_writable_delegation`).
+        s.worker = SpawnWorkerKind::Scout;
+        let ws = workspace();
+        let routed = route_child_spawn(
+            &s,
+            "city slice",
+            "slice",
+            ws.path(),
+            None,
+            &cmd_tx,
+            &turn_tx,
+        );
         tokio::pin!(routed);
         let result_tx = tokio::select! {
             maybe = cmd_rx.recv() => match maybe {
                 Some(ScheduleCommand::Spawn { spec, result_tx }) => {
                     assert_eq!(spec.depth, 2, "depth advances by one per edge");
-                    assert_eq!(spec.output_dir, "/tmp/city");
+                    assert_eq!(spec.write_scope, "slice");
                     assert_eq!(spec.max_depth, 3);
                     result_tx
                 }
@@ -888,10 +1096,12 @@ mod tests {
         let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
         let mut s = spec(1, 3);
         s.worker = SpawnWorkerKind::Scout;
+        let ws = workspace();
         let routed = route_child_spawn(
             &s,
             "adjudicate claim",
-            "/tmp/review-claim",
+            "slice",
+            ws.path(),
             Some("openrouter/reviewer".into()),
             &cmd_tx,
             &turn_tx,
@@ -914,10 +1124,39 @@ mod tests {
         assert!(out.contains("scheduled"), "got {out}");
     }
 
-    /// The child brief pins the dedicated output dir + the compact-pointer
+    /// A `bee` fanning out to a deeper `bee` is a strict writable delegation:
+    /// the grandchild would get exclusive authority over a subtree. The direct
+    /// workspace cannot isolate arbitrary child syscalls, so the request is
+    /// refused before anything is routed to main.
+    #[tokio::test]
+    async fn route_child_spawn_refuses_writable_delegation() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(8);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let s = spec(1, 3);
+        assert_eq!(s.worker, SpawnWorkerKind::Bee);
+        let ws = workspace();
+        let out = route_child_spawn(
+            &s,
+            "deeper slice",
+            "slice",
+            ws.path(),
+            None,
+            &cmd_tx,
+            &turn_tx,
+        )
+        .await;
+        assert!(out.contains("refused"), "got {out}");
+        assert!(out.contains("hard link"), "the refusal explains why: {out}");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a refused writable delegation must route nothing to main"
+        );
+    }
+
+    /// The child brief pins the dedicated write scope + the compact-pointer
     /// return convention (GOALS §10 aggregation pattern).
     #[test]
-    fn child_brief_pins_output_dir_and_compact_return() {
+    fn child_brief_pins_write_scope_and_compact_return() {
         let brief = compose_child_brief(&spec(1, 3));
         assert!(brief.contains("/tmp/state-ca"), "{brief}");
         assert!(brief.contains("dedicated output location"), "{brief}");

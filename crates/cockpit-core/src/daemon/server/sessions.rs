@@ -422,6 +422,28 @@ pub(super) async fn delete_session(
             });
         }
     }
+    // Write-scope barrier: block new transfers, then refuse to delete while any
+    // lease still holds authority or any permit is still held. Deleting the
+    // session rows underneath a live lease would drop the durable record of an
+    // authority that a still-running descendant believes it owns.
+    if let Some(ws) = ctx.write_scope.as_ref() {
+        let blockers = ws
+            .begin_session_deletion(session_id)
+            .await
+            .map_err(|e| ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!("write scope deletion barrier: {e}"),
+            })?;
+        if !blockers.is_empty() {
+            return Err(ErrorPayload {
+                code: ErrorCode::Internal,
+                message: format!(
+                    "session deletion blocked on {} outstanding write-scope lease(s)/permit(s)",
+                    blockers.len()
+                ),
+            });
+        }
+    }
     // Terminalize active run invocations at the deletion transaction's wall
     // time without cascading their durable rows with the session.
     let now_wall_ms = super::run_invocation::wall_ms_now();

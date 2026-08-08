@@ -5567,7 +5567,7 @@ mod tests {
     fn spawn_description_carries_depth_and_dedicated_folder_guidance() {
         // The per-task effective depth + ceiling are baked into the tool
         // description so the model can self-limit, and the description tells
-        // the caller to give each child a dedicated output folder/DB (the
+        // the caller to give each child a dedicated write scope/DB (the
         // primary contention-avoidance mechanism, GOALS §24 / §10).
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
@@ -5584,7 +5584,7 @@ mod tests {
         assert!(desc.contains("depth 1"), "depth in description: {desc}");
         assert!(desc.contains("ceiling 4"), "ceiling in description: {desc}");
         assert!(
-            desc.contains("output_dir") && desc.contains("dedicated"),
+            desc.contains("write_scope") && desc.contains("dedicated"),
             "dedicated-folder/DB guidance in description: {desc}"
         );
     }

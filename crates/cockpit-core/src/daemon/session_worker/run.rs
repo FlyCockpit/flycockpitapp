@@ -476,6 +476,7 @@ pub(super) async fn run_worker(
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    write_scope: crate::write_scope::WriteScopeSource,
     _global_bus: Option<EventSender>,
 ) {
     let session_id = session.id;
@@ -872,6 +873,35 @@ pub(super) async fn run_worker(
         driver.set_resource_scheduler(scheduler);
     }
     driver.set_daemon_scheduler_source(scheduler);
+    driver.set_write_scope_source(write_scope.clone());
+    // Open the session's root write authority. Every delegation descends from
+    // it, and it is what session deletion and shutdown drain against. Idempotent
+    // so a worker restart reuses the existing root rather than minting a second.
+    // Bind the clone in its own statement: an `if let` scrutinee keeps the
+    // MutexGuard temporary alive for the whole block, and holding a std guard
+    // across the `.await` below would make this future non-Send.
+    let installed_coordinator = crate::sync::lock_or_recover(&write_scope).clone();
+    if let Some(coordinator) = installed_coordinator {
+        match crate::write_scope::CanonicalScope::resolve_under(&project_root, ".") {
+            Ok(scope) => {
+                if let Err(error) = coordinator
+                    .ensure_session_root_lease(session.id, "session-root", scope)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "could not open the session write-scope root lease"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "session cwd does not resolve; no write-scope root lease opened"
+                );
+            }
+        }
+    }
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
     // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the

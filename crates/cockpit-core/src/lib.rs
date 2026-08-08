@@ -33,6 +33,7 @@ pub mod env_snapshot;
 pub mod envref;
 pub mod external_journal;
 pub mod external_runtime;
+pub mod generated_svg;
 pub mod git;
 pub mod gitignore;
 pub mod goal_scratch;

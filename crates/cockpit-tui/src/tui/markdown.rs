@@ -165,6 +165,19 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                 );
             }
             Event::DisplayMath(text) => {
+                if let Some(row) = table_row {
+                    let visible =
+                        math_render::render_inline(&text).unwrap_or_else(|| format!("$${text}$$"));
+                    push_copy_text(
+                        &mut atoms,
+                        &mut id,
+                        &mut logical_line,
+                        &visible,
+                        source_unchanged.then_some(range),
+                        Some((row, table_col)),
+                    );
+                    continue;
+                }
                 if pending_block_break > 0 && !atoms.is_empty() {
                     for _ in 0..pending_block_break {
                         atoms.push(CopyAtom::Newline);
@@ -183,6 +196,7 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                     source_unchanged.then_some(range),
                     None,
                 );
+                pending_block_break = 2;
             }
             _ => {}
         }
@@ -810,7 +824,11 @@ impl Emitter {
         let mut first = true;
         for piece in s.split('\n') {
             if !first {
-                self.flush_line();
+                if self.current.is_empty() {
+                    self.lines.push(Line::default());
+                } else {
+                    self.flush_line();
+                }
             }
             if !piece.is_empty() {
                 let start = self.current.iter().map(|span| span.content.width()).sum();
@@ -1393,6 +1411,9 @@ mod tests {
     fn selection_decodes_escapes_and_entities() {
         assert_eq!(copied(r"\*literal\* &amp; &#x1F642; �"), "*literal* & 🙂 �");
         assert_eq!(copied("a Vec<T> and <Button>"), "a Vec<T> and <Button>");
+        let html = "<pre>\na\n\nb\n</pre>";
+        assert_eq!(copied(html), html);
+        assert_eq!(render_to_strings(html).join("\n"), html);
     }
 
     #[test]
@@ -1459,6 +1480,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(cells.contains(&(0, 0)) && cells.iter().any(|cell| cell.0 >= 1));
         assert_eq!(copied("| A | B |\n|---|---|\n| x | y |"), "AB\nxy");
+        assert_eq!(
+            copied("| math |\n|---|\n| $$\\frac{a}{b}$$ |"),
+            "math\n$$\\frac{a}{b}$$"
+        );
     }
 
     #[test]

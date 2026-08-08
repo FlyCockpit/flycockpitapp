@@ -1,6 +1,8 @@
 use cockpit_proto::remote_identity_protocol::{
-    CustodyEvidence, EnrollmentConfirmation, EnrollmentTranscript, PossessionContext,
-    PossessionProof, Proposal, parse_remote_identity_certificate_jws,
+    CustodyEvidence, EnrollmentConfirmation, EnrollmentRole, EnrollmentTranscript,
+    PossessionContext, PossessionProof, PossessionPurpose, Proposal, derive_possession_challenge,
+    enrollment_confirmation_signing_digest, parse_remote_identity_certificate_jws,
+    possession_proof_signing_digest,
 };
 use serde_json::Value;
 fn unhex(value: &str) -> Vec<u8> {
@@ -12,6 +14,70 @@ fn unhex(value: &str) -> Vec<u8> {
             u8::from_str_radix(text, 16).unwrap()
         })
         .collect()
+}
+
+#[test]
+fn remote_identity_derivation_vectors() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/remote-identity-protocol-v1.json"
+    ))
+    .unwrap();
+    let valid = fixture["valid"].as_array().unwrap();
+    let derived = fixture["derivations"].as_array().unwrap();
+    let find = |name: &str| {
+        unhex(
+            derived.iter().find(|v| v["name"] == name).unwrap()["hex"]
+                .as_str()
+                .unwrap(),
+        )
+    };
+    let artifact = |name: &str| {
+        unhex(
+            valid.iter().find(|v| v["name"] == name).unwrap()["hex"]
+                .as_str()
+                .unwrap(),
+        )
+    };
+    for (name, purpose) in [
+        ("enroll_proposed", PossessionPurpose::EnrollProposed),
+        ("renew_current", PossessionPurpose::RenewCurrent),
+        ("rotate_current", PossessionPurpose::RotateCurrent),
+        ("rotate_proposed", PossessionPurpose::RotateProposed),
+        ("attempt_client", PossessionPurpose::AttemptClient),
+        ("attempt_daemon", PossessionPurpose::AttemptDaemon),
+        ("revoke_current", PossessionPurpose::RevokeCurrent),
+    ] {
+        let context = artifact(&format!("context_{name}"));
+        let proof = artifact(&format!("proof_{name}"));
+        assert_eq!(
+            derive_possession_challenge(purpose, &[16; 32], &[15; 16], &context)
+                .unwrap()
+                .as_slice(),
+            find(&format!("challenge_{name}"))
+        );
+        assert_eq!(
+            possession_proof_signing_digest(&proof[..175], purpose)
+                .unwrap()
+                .as_slice(),
+            find(&format!("proof_signature_{name}"))
+        );
+    }
+    for (name, role) in [
+        ("proposed_subject", EnrollmentRole::ProposedSubject),
+        ("enrolled_counterpart", EnrollmentRole::EnrolledCounterpart),
+        (
+            "control_plane_authorizer",
+            EnrollmentRole::ControlPlaneAuthorizer,
+        ),
+    ] {
+        let value = artifact(&format!("confirmation_{name}"));
+        assert_eq!(
+            enrollment_confirmation_signing_digest(&value[..104], role)
+                .unwrap()
+                .as_slice(),
+            find(&format!("confirmation_signature_{name}"))
+        );
+    }
 }
 fn reconstruct(codec: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     match codec {

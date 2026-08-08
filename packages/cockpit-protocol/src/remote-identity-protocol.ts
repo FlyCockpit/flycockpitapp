@@ -245,7 +245,7 @@ export function remoteIdentitySha256Sync(input: Uint8Array) {
     padded = new Uint8Array(((input.length + 9 + 63) >> 6) << 6);
   padded.set(input);
   padded[input.length] = 128;
-  new DataView(padded.buffer).setUint32(padded.length - 4, bit);
+  new DataView(padded.buffer).setBigUint64(padded.length - 8, BigInt(bit));
   const h = Uint32Array.from([
       0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
       0x5be0cd19,

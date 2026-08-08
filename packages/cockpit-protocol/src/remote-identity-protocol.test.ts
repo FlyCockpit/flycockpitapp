@@ -7,15 +7,18 @@ import {
   decodePossessionContext,
   decodePossessionProof,
   decodeRemoteIdentityProposal,
+  derivePossessionChallenge,
   encodeCustodyEvidence,
   encodeEnrollmentConfirmation,
   encodeEnrollmentTranscript,
   encodePossessionContext,
   encodePossessionProof,
   encodeRemoteIdentityProposal,
+  enrollmentConfirmationSigningDigest,
   PossessionPurpose,
   parseRemoteIdentityCertificateJws,
   possessionChallengeDomain,
+  possessionProofSigningDigest,
   possessionSignatureDomain,
   remoteIdentitySha256,
   remoteIdentitySha256Sync,
@@ -71,5 +74,43 @@ describe("remote_identity_protocol_cross_language_vectors", () => {
       Array.from(remoteIdentitySha256Sync(input), (x) => x.toString(16).padStart(2, "0")).join(""),
     ).toBe(expected);
     expect(await remoteIdentitySha256(input)).toEqual(remoteIdentitySha256Sync(input));
+  });
+  it("matches every checked derivation", async () => {
+    const expected = new Map(vectors.derivations.map((v) => [v.name, v.hex]));
+    for (const [name, purpose] of Object.entries(PossessionPurpose)) {
+      const context = fromHex(vectors.valid.find((v) => v.name === `context_${name}`)!.hex),
+        proof = fromHex(vectors.valid.find((v) => v.name === `proof_${name}`)!.hex);
+      expect(
+        Array.from(
+          await derivePossessionChallenge(
+            purpose,
+            new Uint8Array(32).fill(16),
+            new Uint8Array(16).fill(15),
+            context,
+          ),
+          (x) => x.toString(16).padStart(2, "0"),
+        ).join(""),
+      ).toBe(expected.get(`challenge_${name}`));
+      expect(
+        Array.from(await possessionProofSigningDigest(proof.slice(0, 175), purpose), (x) =>
+          x.toString(16).padStart(2, "0"),
+        ).join(""),
+      ).toBe(expected.get(`proof_signature_${name}`));
+    }
+    for (const [name, role] of Object.entries({
+      proposed_subject: 1,
+      enrolled_counterpart: 2,
+      control_plane_authorizer: 3,
+    } as const)) {
+      const confirmation = fromHex(
+        vectors.valid.find((v) => v.name === `confirmation_${name}`)!.hex,
+      );
+      expect(
+        Array.from(
+          await enrollmentConfirmationSigningDigest(confirmation.slice(0, 104), role),
+          (x) => x.toString(16).padStart(2, "0"),
+        ).join(""),
+      ).toBe(expected.get(`confirmation_signature_${name}`));
+    }
   });
 });

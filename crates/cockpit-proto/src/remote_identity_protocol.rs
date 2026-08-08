@@ -843,6 +843,39 @@ pub struct ParsedCertificateJws {
     pub signature_p1363: [u8; 64],
     pub signing_input: Vec<u8>,
 }
+fn canonical_json(value: &serde_json::Value) -> Result<String> {
+    match value {
+        serde_json::Value::Null => Ok("null".into()),
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {
+            serde_json::to_string(value).map_err(|e| Error(e.to_string()))
+        }
+        serde_json::Value::Array(values) => Ok(format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Result<Vec<_>>>()?
+                .join(",")
+        )),
+        serde_json::Value::Object(values) => {
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort();
+            Ok(format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| Ok(format!(
+                        "{}:{}",
+                        serde_json::to_string(key).map_err(|e| Error(e.to_string()))?,
+                        canonical_json(&values[key])?
+                    )))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(",")
+            ))
+        }
+    }
+}
 fn decode_canonical_b64url(text: &str) -> Result<Vec<u8>> {
     if text.is_empty() || text.contains('=') {
         return err("noncanonical base64url");
@@ -873,8 +906,8 @@ pub fn parse_remote_identity_certificate_jws(compact: &str) -> Result<ParsedCert
         serde_json::from_slice(&header_bytes).map_err(|_| Error("invalid header JSON".into()))?;
     let payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|_| Error("invalid payload JSON".into()))?;
-    if serde_json::to_vec(&header).map_err(|_| Error("header JSON".into()))? != header_bytes
-        || serde_json::to_vec(&payload).map_err(|_| Error("payload JSON".into()))? != payload_bytes
+    if canonical_json(&header)?.as_bytes() != header_bytes
+        || canonical_json(&payload)?.as_bytes() != payload_bytes
     {
         return err("noncanonical JSON");
     };

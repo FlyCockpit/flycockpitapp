@@ -233,6 +233,24 @@ malformed.push(
   { name: "high_s_proof", codec: "FCPP", hex: hex(high) },
   { name: "invalid_jws", codec: "JWS", hex: hex(enc.encode("x.y.z")) },
 );
+const certificateText = new TextDecoder().decode(
+    Buffer.from(valid.find((v) => v.codec === "JWS")!.hex, "hex"),
+  ),
+  certificateParts = certificateText.split(".");
+const reorderedHeader = b64(
+  enc.encode(
+    JSON.stringify({
+      typ: "flycockpit-remote-identity-certificate+jws",
+      alg: "ES256",
+      kid: "fixture-key",
+    }),
+  ),
+);
+malformed.push({
+  name: "noncanonical_jws_member_order",
+  codec: "JWS",
+  hex: hex(enc.encode(`${reorderedHeader}.${certificateParts[1]}.${certificateParts[2]}`)),
+});
 writeFileSync(
   new URL("../fixtures/remote-identity-protocol-v1.json", import.meta.url),
   `${JSON.stringify({ schemaVersion: 1, valid, malformed, derivations }, null, 2)}\n`,

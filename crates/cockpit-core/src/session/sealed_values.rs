@@ -64,8 +64,17 @@ impl Session {
     /// Store a sealed literal only after its unioned redaction table has been
     /// persisted.  The caller installs the returned table into the live worker
     /// before exposing any operation that could emit text.
-    pub async fn set_sealed_value(
+    ///
+    /// Owner-only. Creating, listing, deleting, and existence-testing sealed
+    /// values are all Owner lifecycle operations: an agent that could reach
+    /// any of them would have an inventory and an existence oracle over the
+    /// session's sealed values, which is exactly what this feature denies. The
+    /// [`OwnerAuthority`] token cannot be forged by agent-reachable code, and
+    /// these are `pub(crate)` so no new transport can grow onto them without
+    /// passing through the daemon's `owner_only` command table.
+    pub(crate) async fn set_sealed_value(
         &self,
+        _owner: crate::sealed::OwnerAuthority,
         redaction: &crate::redact::RedactionTable,
         value_id: &str,
         value: &str,
@@ -81,19 +90,43 @@ impl Session {
             .await
     }
 
-    pub async fn list_sealed_value_metadata(
+    /// Owner-only inventory. See [`Session::set_sealed_value`].
+    pub(crate) async fn list_sealed_value_metadata(
         &self,
+        _owner: crate::sealed::OwnerAuthority,
     ) -> Result<Vec<crate::db::sealed_values::SealedValueMetadata>> {
         self.db.list_sealed_value_metadata(self.id).await
     }
 
-    pub async fn delete_sealed_value(&self, value_id: &str) -> Result<bool> {
-        self.db.delete_sealed_value(self.id, value_id).await
+    /// Owner-only. See [`Session::set_sealed_value`].
+    ///
+    /// Routes through the scoped delete rather than the bare legacy row
+    /// delete: a session-scope *scoped* value is dual-written, so removing
+    /// only the `sealed_values` row would leave its `sealed_value_records`
+    /// row resolvable with no literal behind it, its name un-tombstoned and
+    /// its grants unfenced.
+    pub(crate) async fn delete_sealed_value(
+        &self,
+        _owner: crate::sealed::OwnerAuthority,
+        value_id: &str,
+    ) -> Result<bool> {
+        self.db
+            .delete_sealed_value_for_session(
+                self.id.to_string(),
+                value_id.to_owned(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
     }
 
-    /// Existence check only — sealed literals are never returned for injection
-    /// or generic child handoff (child-environment injection is retired).
-    pub async fn sealed_value_exists(&self, value_id: &str) -> Result<bool> {
+    /// Owner-only existence check. Sealed literals are never returned for
+    /// injection or generic child handoff, and existence itself is an oracle,
+    /// so this is gated like the rest. See [`Session::set_sealed_value`].
+    pub(crate) async fn sealed_value_exists(
+        &self,
+        _owner: crate::sealed::OwnerAuthority,
+        value_id: &str,
+    ) -> Result<bool> {
         self.db.sealed_value_exists(self.id, value_id).await
     }
 }
@@ -131,8 +164,7 @@ mod tests {
         let session = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
         let initial = crate::redact::RedactionTable::empty();
         session
-            .set_sealed_value(
-                &initial,
+            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &initial,
                 "prod_token",
                 "first-high-entropy-token",
                 "deploy",
@@ -147,8 +179,7 @@ mod tests {
                 .contains("first-high-entropy-token")
         );
         session
-            .set_sealed_value(
-                &first_table,
+            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &first_table,
                 "prod_token",
                 "second-high-entropy-token",
                 "deploy",
@@ -162,9 +193,9 @@ mod tests {
                 .scrub("first-high-entropy-token")
                 .contains("first-high-entropy-token")
         );
-        assert!(session.sealed_value_exists("prod_token").await.unwrap());
-        session.delete_sealed_value("prod_token").await.unwrap();
-        assert!(!session.sealed_value_exists("prod_token").await.unwrap());
+        assert!(session.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap());
+        session.delete_sealed_value(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap();
+        assert!(!session.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token").await.unwrap());
         let resumed = Session::resume(db, session.id).unwrap().unwrap();
         assert!(
             !resumed
@@ -182,8 +213,7 @@ mod tests {
         let parent = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
         let table = crate::redact::RedactionTable::empty();
         parent
-            .set_sealed_value(
-                &table,
+            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &table,
                 "before",
                 "before-high-entropy-token",
                 "test",
@@ -192,11 +222,10 @@ mod tests {
             .await
             .unwrap();
         let child = Session::create_fork(db, parent.id, None).unwrap();
-        assert!(child.sealed_value_exists("before").await.unwrap());
+        assert!(child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "before").await.unwrap());
         let parent_table = parent.persisted_redaction_table().unwrap().unwrap();
         parent
-            .set_sealed_value(
-                &parent_table,
+            .set_sealed_value(crate::sealed::OwnerAuthority::for_test(), &parent_table,
                 "after",
                 "after-high-entropy-token",
                 "test",
@@ -204,7 +233,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!child.sealed_value_exists("after").await.unwrap());
+        assert!(!child.sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "after").await.unwrap());
     }
 
     /// Source inspection: no injection resolver or literal-return API remains.

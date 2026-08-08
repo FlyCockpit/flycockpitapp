@@ -343,20 +343,25 @@ impl InterruptHub {
         self.interactive_clients.load(Ordering::SeqCst) > 0
     }
 
-    /// Add a sealed literal to the worker's live egress redaction table and
-    /// persist that table before a caller writes the value itself. Detached
-    /// hubs have no worker-owned table, so callers retain their local table.
-    pub fn seal_redaction_literal(
+    /// Register a sealed literal in the worker's live egress redaction table
+    /// and persist that table, under a caller-supplied canonical origin.
+    ///
+    /// Scoped sealed values carry a richer typed identity than a bare value id
+    /// (`sealed:1:<scope>:<record_id>:<version>:<name>`), which the downstream
+    /// historical-redaction inventory parses back out. This is the single
+    /// place where a sealed literal becomes redacted; the legacy
+    /// `sealed:<value_id>` wrapper is gone along with the agent-facing sealed
+    /// write paths that were its only callers.
+    pub fn seal_redaction_at_origin(
         &self,
         session: &crate::session::Session,
         value: String,
-        value_id: &str,
+        origin: &str,
     ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
         let Some(redaction) = &self.redaction else {
             return Ok(None);
         };
-        let table = current_redaction(redaction)
-            .with_forced_literal(value, format!("sealed:{value_id}"))?;
+        let table = current_redaction(redaction).with_forced_literal(value, origin.to_string())?;
         let table = Arc::new(table);
         session.persist_redaction_table(&table)?;
         set_current_redaction(redaction, table.clone());

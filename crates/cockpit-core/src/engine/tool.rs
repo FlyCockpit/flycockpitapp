@@ -2628,6 +2628,7 @@ mod llm_mode_tests {
             ("todo", ToolEffect::Dynamic),
             ("tool_result_retrieve", ToolEffect::Dynamic),
             ("unlock", ToolEffect::Dynamic),
+            ("use_sealed_value", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),
             ("websearch", ToolEffect::Dynamic),
             ("write", ToolEffect::Dynamic),

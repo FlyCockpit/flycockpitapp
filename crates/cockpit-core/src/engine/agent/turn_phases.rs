@@ -459,29 +459,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     return_structural!(task_refusal(&tc.id, tc.call_id.clone(), message));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
-                if mode == Some("sealed_fetch") && context == TaskContext::Fork {
-                    return_structural!(task_refusal(
-                        &tc.id,
-                        tc.call_id.clone(),
-                        "sealed-fetch tasks require fresh context".to_string(),
-                    ));
-                }
-                let sealed_fetch_value_id = (mode == Some("sealed_fetch"))
-                    .then(|| {
-                        args.get("value_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value_id| !value_id.is_empty())
-                            .map(str::to_string)
-                    })
-                    .flatten();
-                if mode == Some("sealed_fetch") && sealed_fetch_value_id.is_none() {
-                    return_structural!(task_refusal(
-                        &tc.id,
-                        tc.call_id.clone(),
-                        "`value_id` is required when task mode is `sealed_fetch`".to_string(),
-                    ));
-                }
                 let model = match crate::engine::model_roles::DelegationModelSelector::from_value(
                     args.get("model"),
                 ) {
@@ -494,8 +471,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         ));
                     }
                 };
-                let noninteractive = mode == Some("sealed_fetch")
-                    || resolve_interactivity(mode, &child, resume_handle.is_some());
+                let noninteractive = resolve_interactivity(mode, &child, resume_handle.is_some());
                 if context == TaskContext::Fork
                     && let Some(err) = fork_context_refusal(
                         session,
@@ -601,7 +577,6 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     context,
                     granted_tools,
                     todo_ids,
-                    sealed_fetch_value_id,
                     repair_notes,
                     task_call_id: tc.id.clone(),
                     task_function_call_id: tc.call_id.clone(),

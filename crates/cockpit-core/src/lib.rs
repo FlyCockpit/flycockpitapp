@@ -51,6 +51,7 @@ pub mod process;
 pub mod process_containment;
 pub mod providers;
 pub mod redact;
+pub mod sealed;
 pub mod secret_paths;
 pub mod secret_ref;
 pub mod secure_key;

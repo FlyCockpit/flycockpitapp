@@ -564,6 +564,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "unlock",
         "grep",
         "glob",
+        "use_sealed_value",
     ]
 }
 
@@ -798,6 +799,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Defer a decision to the orchestrator.",
             condition: None,
         },
+        BuiltinToolInventoryItem {
+            family: "Utility",
+            name: "use_sealed_value",
+            summary: "Use a granted sealed value by reference through a granted action.",
+            condition: Some("Requires an Owner-issued sealed-value action grant."),
+        },
     ]
 }
 
@@ -884,6 +891,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
+        Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
         Arc::new(tools::docs::ListPackagesTool::new(
             tools::docs::DocsResolution::new(),
             "pkg".to_string(),
@@ -910,6 +918,7 @@ fn materialize_tool_by_name(
     use crate::tools;
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
+        "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "write" => tb.with(Arc::new(tools::write::WriteTool)),

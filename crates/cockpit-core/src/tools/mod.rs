@@ -52,6 +52,7 @@ pub mod text_search;
 pub mod todo;
 pub mod tool_result_retrieve;
 pub mod unlock;
+pub mod use_sealed_value;
 pub mod web;
 pub mod write;
 

@@ -412,41 +412,122 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
     });
 }
 
+/// The worker deletes a *scoped* sealed value completely, on behalf of the
+/// daemon's `owner_only` `DeleteSealedValue` request.
+///
+/// A session-scope scoped value is dual-written — the record in
+/// `sealed_value_records`, the literal in the legacy `sealed_values` table —
+/// so this seeds it through the scoped create and then checks *both* stores
+/// plus the name tombstone. An earlier version of this test seeded only a
+/// legacy row and asserted only through the legacy existence check, which is
+/// why it passed identically while the delete was silently leaving the scoped
+/// record behind, resolvable with no literal under it.
 #[tokio::test]
-async fn deleting_sealed_value_evicts_live_injection_cache() {
+async fn worker_delete_removes_the_scoped_sealed_value_completely() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    db.upsert_sealed_value(
-        session.id,
-        "prod_token",
-        "very-high-entropy-token",
-        "deploy",
-        "user",
+    let scope_key = session.id.to_string();
+
+    db.create_session_sealed_value(
+        cockpit_db::db::sealed_scope::NewSealedValueRecord {
+            record_id: uuid::Uuid::new_v4().to_string(),
+            scope: cockpit_db::db::sealed_scope::SealedScopeKind::Session,
+            scope_key: scope_key.clone(),
+            name: "prod_token".to_string(),
+            description: "deployment credential".to_string(),
+            owner_principal: "owner".to_string(),
+            created_at_ms: 1_000,
+        },
+        "very-high-entropy-token".to_string(),
+        "deploy".to_string(),
+        "user".to_string(),
     )
     .await
     .unwrap();
-    let handle = SessionWorkerHandle::test_handle(session, Arc::new(LockManager::in_memory(db)));
-    assert!(handle.sealed_value_exists("prod_token").await.unwrap());
+
+    let owner = crate::sealed::OwnerAuthority::for_test();
+    let inventory = |db: Db, key: String| async move {
+        db.sealed_value_inventory(
+            cockpit_db::db::sealed_scope::SealedScopeKind::Session,
+            key,
+        )
+        .await
+        .unwrap()
+    };
+    assert!(session.sealed_value_exists(owner, "prod_token").await.unwrap());
+    assert_eq!(
+        inventory(db.clone(), scope_key.clone()).await.len(),
+        1,
+        "the scoped record exists before the delete"
+    );
+
+    let handle =
+        SessionWorkerHandle::test_handle(session.clone(), Arc::new(LockManager::in_memory(db.clone())));
     assert!(handle.delete_sealed_value("prod_token").await.unwrap());
-    assert!(!handle.sealed_value_exists("prod_token").await.unwrap());
+
+    assert!(
+        !session.sealed_value_exists(owner, "prod_token").await.unwrap(),
+        "the literal is gone"
+    );
+    assert!(
+        inventory(db.clone(), scope_key.clone()).await.is_empty(),
+        "the scoped record must go too, not just the legacy literal row"
+    );
+    assert!(
+        db.sealed_value_name_retired(
+            cockpit_db::db::sealed_scope::SealedScopeKind::Session,
+            scope_key,
+            "prod_token".to_string(),
+        )
+        .await
+        .unwrap(),
+        "a completed delete retires the name so it is never reused"
+    );
 }
 
-#[tokio::test]
-async fn creating_sealed_value_updates_live_redaction_before_returning() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
-    let handle = SessionWorkerHandle::test_handle(session, Arc::new(LockManager::in_memory(db)));
-
-    handle
-        .set_sealed_value("prod_token", "very-high-entropy-token", "deploy", "user")
-        .await
-        .unwrap();
-
-    let scrubbed = handle.redaction_table().scrub("very-high-entropy-token");
-    assert!(!scrubbed.contains("very-high-entropy-token"));
-    assert!(handle.sealed_value_exists("prod_token").await.unwrap());
+/// Source-level lint: the retired worker sealed methods must not grow back.
+///
+/// Scope, stated honestly. That these methods are *absent today* is enforced
+/// by the compiler — nothing can call a method that does not exist. What the
+/// compiler cannot catch is someone **re-adding** one later, which is the
+/// actual regression risk, since their callers (the agent-facing Monty
+/// builtins and the `sealed_fetch` delegation mode) were the half-done
+/// removal this batch already had to finish once.
+///
+/// So this is a lint, not a behavioural proof. It matches on bare `fn <name>`
+/// rather than a full signature, so a visibility change, an `async` change,
+/// or rustfmt splitting the line cannot slip past it — the earlier version of
+/// this test pinned exact `pub async fn …` strings and would have missed all
+/// three. It also drops a needle (`sealed_values:`) that could never have
+/// matched the regression it named.
+#[test]
+fn worker_sealed_create_and_existence_methods_do_not_grow_back() {
+    let source = include_str!("handle.rs");
+    let production = source
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("production module precedes any test module");
+    // Normalize so line breaks and repeated spaces cannot hide a match.
+    let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    for retired in [
+        "fn set_sealed_value",
+        "fn sealed_value_exists",
+        "fn seal_redaction_literal",
+    ] {
+        assert!(
+            !normalized.contains(retired),
+            "the retired worker sealed surface `{retired}` must not return; \
+             sealed writes and existence probes belong to the Owner-only \
+             scoped path, not to an agent-reachable worker method"
+        );
+    }
+    // The in-memory injection cache is gone with them: it was the thing that
+    // made an existence probe cheap enough to be an oracle.
+    assert!(
+        !normalized.contains("sealed_values :") && !normalized.contains("sealed_values:"),
+        "the worker must not carry an in-memory sealed value cache"
+    );
 }
 
 fn queued_user_message_for_test(text: &str) -> crate::engine::message::QueuedUserMessage {

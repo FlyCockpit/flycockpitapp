@@ -72,6 +72,7 @@ impl Session {
     /// [`OwnerAuthority`] token cannot be forged by agent-reachable code, and
     /// these are `pub(crate)` so no new transport can grow onto them without
     /// passing through the daemon's `owner_only` command table.
+    #[cfg(test)]
     pub(crate) async fn set_sealed_value(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -91,6 +92,7 @@ impl Session {
     }
 
     /// Owner-only inventory. See [`Session::set_sealed_value`].
+    #[cfg(test)]
     pub(crate) async fn list_sealed_value_metadata(
         &self,
         _owner: crate::sealed::OwnerAuthority,
@@ -122,6 +124,7 @@ impl Session {
     /// Owner-only existence check. Sealed literals are never returned for
     /// injection or generic child handoff, and existence itself is an oracle,
     /// so this is gated like the rest. See [`Session::set_sealed_value`].
+    #[cfg(test)]
     pub(crate) async fn sealed_value_exists(
         &self,
         _owner: crate::sealed::OwnerAuthority,

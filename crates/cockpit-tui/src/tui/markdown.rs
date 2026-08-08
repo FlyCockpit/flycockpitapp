@@ -57,7 +57,7 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
     let source_unchanged = normalized == src;
     for (event, range) in Parser::new_ext(&normalized, opts).into_offset_iter() {
         match event {
-            Event::Text(text) | Event::Code(text) => {
+            Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 if pending_block_break > 0 && !atoms.is_empty() {
                     for _ in 0..pending_block_break {
                         atoms.push(CopyAtom::Newline);
@@ -1392,6 +1392,7 @@ mod tests {
     #[test]
     fn selection_decodes_escapes_and_entities() {
         assert_eq!(copied(r"\*literal\* &amp; &#x1F642; �"), "*literal* & 🙂 �");
+        assert_eq!(copied("a Vec<T> and <Button>"), "a Vec<T> and <Button>");
     }
 
     #[test]

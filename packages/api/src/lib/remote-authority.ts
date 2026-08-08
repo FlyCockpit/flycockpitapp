@@ -236,26 +236,15 @@ export function validateThreeDigestPlan(
   d1: PublicAuthorityRing,
   d2: PublicAuthorityRing,
 ) {
-  if (
-    d0.issuer !== d1.issuer ||
-    d1.issuer !== d2.issuer ||
-    d0.deploymentId !== d1.deploymentId ||
-    d1.deploymentId !== d2.deploymentId
-  )
+  validateAdditiveAuthorityPublication(d0, d1);
+  if (d1.issuer !== d2.issuer || d1.deploymentId !== d2.deploymentId)
     throw new Error("issuer/deployment changes require a new lifecycle");
   if (
-    BigInt(d1.revision) !== BigInt(d0.revision) + 1n ||
     BigInt(d2.revision) !== BigInt(d1.revision) + 1n ||
-    BigInt(d1.authorityEpoch) !== BigInt(d0.authorityEpoch) + 1n ||
     BigInt(d2.authorityEpoch) !== BigInt(d1.authorityEpoch) + 1n
   )
     throw new Error("revision and epoch must increment by one");
   const k0 = d0.keys.find((k) => k.kid === d0.currentKid)!;
-  if (d1.currentKid !== k0.kid) throw new Error("D1 must retain K0");
-  for (const key of d0.keys) {
-    const next = d1.keys.find((k) => k.kid === key.kid);
-    if (!next || !same(next, key)) throw new Error("D1 must be strictly additive");
-  }
   const additions = d1.keys.filter((k) => !d0.keys.some((old) => old.kid === k.kid));
   if (additions.length !== 1 || additions[0]!.state !== "verification_only")
     throw new Error("D1 must add one verification-only key");
@@ -273,6 +262,27 @@ export function validateThreeDigestPlan(
           : key;
     if (!same(next, expected)) throw new Error("D2 changed forbidden key fields");
   }
+}
+
+export function validateAdditiveAuthorityPublication(
+  d0: PublicAuthorityRing,
+  d1: PublicAuthorityRing,
+) {
+  if (d0.issuer !== d1.issuer || d0.deploymentId !== d1.deploymentId)
+    throw new Error("issuer/deployment changes require a new lifecycle");
+  if (
+    BigInt(d1.revision) !== BigInt(d0.revision) + 1n ||
+    BigInt(d1.authorityEpoch) !== BigInt(d0.authorityEpoch) + 1n
+  )
+    throw new Error("revision and epoch must increment by one");
+  if (d1.currentKid !== d0.currentKid) throw new Error("D1 must retain K0");
+  for (const key of d0.keys) {
+    const next = d1.keys.find((candidate) => candidate.kid === key.kid);
+    if (!next || !same(next, key)) throw new Error("D1 must be strictly additive");
+  }
+  const additions = d1.keys.filter((key) => !d0.keys.some((old) => old.kid === key.kid));
+  if (additions.length !== 1 || additions[0]!.state !== "verification_only")
+    throw new Error("D1 must add one verification-only key");
 }
 
 export interface ReplicaMember {
@@ -346,18 +356,19 @@ export function reduceAuthorityRollout(args: {
   }
   if (args.previousRedisTime && BigInt(args.now) < BigInt(args.previousRedisTime))
     return unavailable("redis_time_regression");
-  for (const digest of args.plan) {
+  const localPlanIndex = args.plan.indexOf(args.localDigest);
+  if (localPlanIndex < 0) return unavailable("unconfigured_digest");
+  for (const digest of args.plan.slice(0, localPlanIndex + 1)) {
     const planned = args.rings.get(digest);
     if (!planned || publicAuthorityRingDigest(planned) !== digest)
       return unavailable("digest_ring_mismatch");
   }
   if (args.plan.length === 3) {
     try {
-      validateThreeDigestPlan(
-        args.rings.get(args.plan[0])!,
-        args.rings.get(args.plan[1])!,
-        args.rings.get(args.plan[2])!,
-      );
+      const d0 = args.rings.get(args.plan[0])!,
+        d1 = args.rings.get(args.plan[1]);
+      if (localPlanIndex >= 1) validateAdditiveAuthorityPublication(d0, d1!);
+      if (localPlanIndex === 2) validateThreeDigestPlan(d0, d1!, args.rings.get(args.plan[2])!);
     } catch {
       return unavailable("invalid_rotation_plan");
     }
@@ -878,10 +889,7 @@ export function validateLifecycleTransition(
     !/^[0-9a-f]{64}$/.test(value.statusBodyDigest)
   )
     throw new Error("invalid lifecycle digest");
-  if (
-    !replacementSignerKid ||
-    (replacementSignerKid === value.fromCurrentKid && value.toCurrentKid === value.fromCurrentKid)
-  )
+  if (!replacementSignerKid)
     throw new Error("transition requires an authorized non-revoked signer");
   return value;
 }

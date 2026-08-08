@@ -35,6 +35,12 @@ export interface FinalizedAuthorityStatus {
   status: RemoteAuthorityStatusV1;
 }
 export interface AuthorityRuntimeStore {
+  bootstrapAuthority(args: {
+    deploymentId: string;
+    replicaId: string;
+    ring: PublicAuthorityRing;
+    digest: string;
+  }): Promise<void>;
   loadLifecycle(deploymentId: string): Promise<AuthorityLifecycleRecord | null>;
   loadMembership(deploymentId: string): Promise<MembershipSnapshot>;
   loadPublicRings(
@@ -90,6 +96,7 @@ export interface AuthorityRuntimeStore {
     kid: string;
     signingGeneration: string;
   }): Promise<boolean>;
+  closeAndFreezeSigningFence(deploymentId: string, kid: string): Promise<boolean>;
   finalizeMint(args: {
     mintId: string;
     signingGeneration: string;
@@ -142,6 +149,7 @@ export class RemoteAuthorityRuntime {
   }
   async tick() {
     let now: string;
+    let convergenceLeases: ObservationLease[] = [];
     try {
       now = await this.options.observations.redisTime();
       this.#leaseGeneration ??= await this.options.observations.nextLeaseGeneration(
@@ -163,6 +171,17 @@ export class RemoteAuthorityRuntime {
     }
     const digest = authorityRingDigest(ring, this.config);
     if (!this.config.allowedDigests.includes(digest)) return this.#fail("unconfigured_digest");
+    const publicRing = publicAuthorityRing(ring, this.config);
+    try {
+      await this.options.store.bootstrapAuthority({
+        deploymentId: this.config.deploymentId,
+        replicaId: this.options.replicaId,
+        ring: publicRing,
+        digest,
+      });
+    } catch {
+      return this.#fail("authority_bootstrap_failed");
+    }
     let lifecycle = await this.options.store
       .loadLifecycle(this.config.deploymentId)
       .catch(() => null);
@@ -183,8 +202,7 @@ export class RemoteAuthorityRuntime {
       (signingKey.retireAt !== null && BigInt(signingKey.retireAt) <= time)
     )
       return this.#fail("signing_key_not_active");
-    const publicRing = publicAuthorityRing(ring, this.config),
-      issuerDigest = createHash("sha256").update(this.config.issuer).digest("hex"),
+    const issuerDigest = createHash("sha256").update(this.config.issuer).digest("hex"),
       lease: ObservationLease = {
         issuerDigest,
         deploymentId: this.config.deploymentId,
@@ -210,6 +228,7 @@ export class RemoteAuthorityRuntime {
         ),
         this.options.store.loadPublicRings(this.config.deploymentId, this.config.allowedDigests),
       ]);
+      convergenceLeases = leases;
       this.#decision = reduceAuthorityRollout({
         now,
         previousRedisTime,
@@ -224,6 +243,7 @@ export class RemoteAuthorityRuntime {
     } catch {
       return this.#fail("observation_unavailable");
     }
+    if (localMember.state !== "required") return this.#fail("replica_not_required");
     if (!this.#decision.ready) return this.#fail(this.#decision.reason);
     if (lifecycle.ringDigest !== digest) {
       if (
@@ -290,6 +310,25 @@ export class RemoteAuthorityRuntime {
           highestStatusGeneration: generation,
         };
       }
+    }
+    if (
+      this.config.allowedDigests.length === 3 &&
+      digest === this.config.allowedDigests[2] &&
+      convergenceLeases.every((lease) => lease.digest === digest)
+    ) {
+      const d1 = (
+        await this.options.store.loadPublicRings(this.config.deploymentId, [
+          this.config.allowedDigests[1]!,
+        ])
+      ).get(this.config.allowedDigests[1]!);
+      if (
+        !d1 ||
+        !(await this.options.store.closeAndFreezeSigningFence(
+          this.config.deploymentId,
+          d1.currentKid,
+        ))
+      )
+        return this.#fail("prior_signing_fence_not_frozen");
     }
     let status = await this.options.store
       .loadHighestFinalizedStatus({
@@ -382,6 +421,11 @@ export class RemoteAuthorityRuntime {
         return this.#fail("status_refresh_failed");
       }
     }
+    if (
+      this.#recoveryMinimumGeneration !== undefined &&
+      BigInt(status.status.statusGeneration) <= BigInt(this.#recoveryMinimumGeneration)
+    )
+      return this.#fail("fresh_recovery_status_required");
     if (BigInt(status.status.validUntil) <= BigInt(now)) return this.#fail("status_expired");
     this.#ring = ring;
     this.#signer = new FileAuthoritySigner(

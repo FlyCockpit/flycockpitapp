@@ -175,7 +175,16 @@ mountRemoteAuthorityRoutes(app, {
   now: () => Math.floor(Date.now() / 1000).toString(),
 });
 if (remoteAuthority.runtime) {
-  const tickRemoteAuthority = () => remoteAuthority.runtime?.tick().catch(() => undefined);
+  let authorityTickInFlight = false;
+  const tickRemoteAuthority = async () => {
+    if (authorityTickInFlight) return;
+    authorityTickInFlight = true;
+    try {
+      await remoteAuthority.runtime?.tick();
+    } finally {
+      authorityTickInFlight = false;
+    }
+  };
   void tickRemoteAuthority();
   setInterval(() => {
     void tickRemoteAuthority();

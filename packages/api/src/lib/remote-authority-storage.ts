@@ -39,6 +39,47 @@ export interface RedisClient {
 const text = (value: unknown) => String(value);
 export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
   constructor(private readonly db: SqlClient) {}
+  async bootstrapAuthority(args: {
+    deploymentId: string;
+    replicaId: string;
+    ring: PublicAuthorityRing;
+    digest: string;
+  }) {
+    await this.db.$transaction(
+      async (tx) => {
+        const inserted = await tx.$executeRawUnsafe(
+          `INSERT INTO remote_authority_lifecycle_state ("deploymentId","revision","ringDigest","authorityEpoch","currentKid","revokedKidsJson","generation","updatedAt") VALUES ($1,$2::numeric,$3,$4::numeric,$5,'[]',0,NOW()) ON CONFLICT ("deploymentId") DO NOTHING`,
+          args.deploymentId,
+          args.ring.revision,
+          args.digest,
+          args.ring.authorityEpoch,
+          args.ring.currentKid,
+        );
+        const members = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "membershipGeneration","replicaId" FROM remote_authority_replica_memberships WHERE "deploymentId"=$1 FOR UPDATE`,
+          args.deploymentId,
+        );
+        if (!members.some((member) => member.replicaId === args.replicaId)) {
+          const generation = members.length === 0 ? "1" : text(members[0]?.membershipGeneration);
+          await tx.$executeRawUnsafe(
+            `INSERT INTO remote_authority_replica_memberships ("deploymentId","membershipGeneration","replicaId","replicaGeneration","state","updatedAt") VALUES ($1,$2::numeric,$3,1,$4,NOW())`,
+            args.deploymentId,
+            generation,
+            args.replicaId,
+            members.length === 0 ? "required" : "joining",
+          );
+        }
+        if (inserted === 1)
+          await tx.$executeRawUnsafe(
+            `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT DO NOTHING`,
+            args.deploymentId,
+            args.ring.currentKid,
+            args.ring.authorityEpoch,
+          );
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }
   async loadLifecycle(deploymentId: string) {
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
         `SELECT "revision","ringDigest","authorityEpoch","currentKid","revokedKidsJson","generation" FROM remote_authority_lifecycle_state WHERE "deploymentId"=$1`,
@@ -209,12 +250,6 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
           text(row.authorityEpoch) !== args.from.authorityEpoch
         )
           return false;
-        if (args.from.currentKid !== args.to.currentKid)
-          await tx.$executeRawUnsafe(
-            `UPDATE remote_authority_signing_fences SET "state"='closing',"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='open'`,
-            args.deploymentId,
-            args.from.currentKid,
-          );
         await tx.$executeRawUnsafe(
           `INSERT INTO remote_authority_lifecycle_transitions ("transitionId","deploymentId","state","fromRevision","toRevision","fromDigest","toDigest","fromAuthorityEpoch","toAuthorityEpoch","fromCurrentKid","toCurrentKid","statusGeneration","statusBodyDigest","signingGeneration","signerKid","createdAt","updatedAt") VALUES ($1,$2,'reserved',$3::numeric,$4::numeric,$5,$6,$7::numeric,$8::numeric,$9,$10,$11::numeric,$12,$8::numeric,$13,NOW(),NOW()) ON CONFLICT ("transitionId") DO NOTHING`,
           args.transitionId,
@@ -314,6 +349,16 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
   }) {
     return this.db.$transaction(
       async (tx) => {
+        const existing = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "state","signingGeneration" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 FOR UPDATE`,
+          args.deploymentId,
+          args.kid,
+        );
+        if (
+          existing[0]?.state === "open" &&
+          text(existing[0]?.signingGeneration) === args.signingGeneration
+        )
+          return true;
         const lifecycle = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
           `SELECT "authorityEpoch","currentKid" FROM remote_authority_lifecycle_state WHERE "deploymentId"=$1 FOR UPDATE`,
           args.deploymentId,
@@ -337,6 +382,30 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         return (
           fence[0]?.state === "open" && text(fence[0]?.signingGeneration) === args.signingGeneration
         );
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }
+  async closeAndFreezeSigningFence(deploymentId: string, kid: string) {
+    return this.db.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_fences SET "state"='closing',"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='open'`,
+          deploymentId,
+          kid,
+        );
+        const pending = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT 1 FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND ("state"='reserved' OR "state"='signed') LIMIT 1 FOR UPDATE`,
+          deploymentId,
+          kid,
+        );
+        if (pending.length !== 0) return false;
+        await tx.$executeRawUnsafe(
+          `UPDATE remote_authority_signing_fences SET "state"='frozen',"cutoff"=COALESCE((SELECT MAX("signedAt") FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='finalized'),NOW()),"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='closing'`,
+          deploymentId,
+          kid,
+        );
+        return true;
       },
       { isolationLevel: "Serializable" },
     );

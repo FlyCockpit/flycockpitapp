@@ -2449,6 +2449,7 @@ impl App {
                 copy_fragments: Rc::clone(&copy_fragments),
                 copy_newlines_before: copy_breaks.get(i).copied().unwrap_or(0),
                 copy_fallback_if_unmapped: base_copy.is_some()
+                    && row_kind != ChatRowKind::Chip
                     && copy_body_start.is_none_or(|start| i < start),
             });
         }
@@ -4526,44 +4527,48 @@ fn semantic_copy_rows(
             Rc::new(Vec::new()),
         );
     };
-    let (source, semantic_width, external_prefix, body_has_timestamp) = match entry {
-        HistoryEntry::User {
-            text,
-            cleaned,
-            expanded,
-            preflight_pending,
-            ..
-        } => {
-            if *preflight_pending || cleaned.is_none() || *expanded {
-                (
-                    text.as_str(),
-                    render_width.saturating_sub(4).max(1),
-                    2,
-                    true,
-                )
-            } else {
-                (
-                    cleaned.as_deref().unwrap_or(text),
-                    render_width.saturating_sub(4).max(1),
-                    2,
-                    true,
-                )
+    let (source, semantic_width, external_prefix, table_bar_offset, body_has_timestamp) =
+        match entry {
+            HistoryEntry::User {
+                text,
+                cleaned,
+                expanded,
+                preflight_pending,
+                ..
+            } => {
+                if *preflight_pending || cleaned.is_none() || *expanded {
+                    (
+                        text.as_str(),
+                        render_width.saturating_sub(4).max(1),
+                        2,
+                        1,
+                        true,
+                    )
+                } else {
+                    (
+                        cleaned.as_deref().unwrap_or(text),
+                        render_width.saturating_sub(4).max(1),
+                        2,
+                        1,
+                        true,
+                    )
+                }
             }
-        }
-        HistoryEntry::Agent { text, .. } => (
-            text.as_str(),
-            render_width.saturating_sub(2 * AGENT_INDENT).max(1),
-            AGENT_INDENT,
-            body_start == 0,
-        ),
-        _ => {
-            return (
-                vec![Vec::new(); lines.len()],
-                vec![0; lines.len()],
-                Rc::new(Vec::new()),
-            );
-        }
-    };
+            HistoryEntry::Agent { text, .. } => (
+                text.as_str(),
+                render_width.saturating_sub(2 * AGENT_INDENT).max(1),
+                AGENT_INDENT,
+                0,
+                body_start == 0,
+            ),
+            _ => {
+                return (
+                    vec![Vec::new(); lines.len()],
+                    vec![0; lines.len()],
+                    Rc::new(Vec::new()),
+                );
+            }
+        };
     let atoms = semantic_copy_atoms(source, semantic_width);
     let fragments = Rc::new(
         atoms
@@ -4576,6 +4581,20 @@ fn semantic_copy_rows(
     );
     let mut atom = 0usize;
     let mut used = std::collections::HashSet::new();
+    let mut table_atoms: std::collections::HashMap<
+        (usize, String),
+        std::collections::VecDeque<usize>,
+    > = std::collections::HashMap::new();
+    for (index, candidate) in atoms.iter().enumerate() {
+        if let CopyAtom::Fragment(fragment) = candidate
+            && let Some((_, col)) = fragment.table_cell
+        {
+            table_atoms
+                .entry((col, fragment.text.clone()))
+                .or_default()
+                .push_back(index);
+        }
+    }
     let mut rows = Vec::with_capacity(lines.len());
     let mut breaks = Vec::with_capacity(lines.len());
     let mut previous_mapped_row = None;
@@ -4605,11 +4624,15 @@ fn semantic_copy_rows(
         }
         let mut col = 0usize;
         let mut row_emitted = false;
+        let mut table_bars = 0usize;
         for visible in semantic_graphemes(&text) {
             if row_index == body_start && col >= first_body_end {
                 break;
             }
             let width = visible.width().max(1);
+            if visible == "│" {
+                table_bars += 1;
+            }
             while atoms.get(atom).is_some_and(|candidate| match candidate {
                 CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
                 CopyAtom::Newline => false,
@@ -4629,23 +4652,23 @@ fn semantic_copy_rows(
             if visible != " "
                 && next.is_some_and(|fragment| fragment.text != visible)
                 && next.is_some_and(|fragment| fragment.table_cell.is_some())
-                && let Some((index, fragment)) =
-                    atoms
-                        .iter()
-                        .enumerate()
-                        .find_map(|(index, candidate)| match candidate {
-                            CopyAtom::Fragment(fragment)
-                                if fragment.text == visible
-                                    && fragment.table_cell.is_some()
-                                    && !used.contains(&fragment.id) =>
-                            {
-                                Some((index, fragment))
-                            }
-                            _ => None,
-                        })
+                && let Some(table_col) = table_bars.checked_sub(table_bar_offset + 1)
+                && let Some(queue) = table_atoms.get_mut(&(table_col, visible.clone()))
             {
-                matched_atom = index;
-                next = Some(fragment);
+                while queue.front().is_some_and(|index| {
+                    atoms.get(*index).is_some_and(|candidate| match candidate {
+                        CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
+                        CopyAtom::Newline => true,
+                    })
+                }) {
+                    queue.pop_front();
+                }
+                if let Some(index) = queue.pop_front()
+                    && let Some(CopyAtom::Fragment(fragment)) = atoms.get(index)
+                {
+                    matched_atom = index;
+                    next = Some(fragment);
+                }
             }
             if let Some(fragment) = next
                 && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
@@ -4666,7 +4689,6 @@ fn semantic_copy_rows(
                 used.insert(fragment.id);
                 row_emitted = true;
                 if matched_atom == next_atom {
-                    hard_breaks = hard_breaks.max(next_atom - atom);
                     atom = next_atom + 1;
                 }
             }

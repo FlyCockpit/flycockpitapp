@@ -754,9 +754,8 @@ pub fn render_entry(
                     None => (text.as_str(), None, false),
                 }
             };
-            let (lines, pin_region) =
+            let (lines, mut continuations, pin_region) =
                 render_user(body, *timestamp, width, md.user, chip, *persist_failed, pin);
-            let mut continuations = vec![false; lines.len()];
             if !md.user && lines.len() > 3 {
                 for continuation in continuations.iter_mut().take(lines.len() - 1).skip(2) {
                     *continuation = true;
@@ -1434,7 +1433,7 @@ fn render_user(
     chip: Option<&str>,
     failed: bool,
     pin: Option<PinControl>,
-) -> (Vec<Line<'static>>, Option<PinRegion>) {
+) -> (Vec<Line<'static>>, Vec<bool>, Option<PinRegion>) {
     if markdown {
         return render_user_markdown(text, timestamp, width, chip, failed, pin);
     }
@@ -1495,7 +1494,8 @@ fn render_user(
         gutter,
     ]));
 
-    (out, pin_region)
+    let continuations = vec![false; out.len()];
+    (out, continuations, pin_region)
 }
 
 /// Build the bubble's top border spans (`╭───╮`) with the fork/pin controls —
@@ -1603,12 +1603,14 @@ fn render_user_markdown(
     chip: Option<&str>,
     failed: bool,
     pin: Option<PinControl>,
-) -> (Vec<Line<'static>>, Option<PinRegion>) {
+) -> (Vec<Line<'static>>, Vec<bool>, Option<PinRegion>) {
     let bar_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
     // Content width inside the `│ ` bar (and a matching right margin), so
     // display-math blocks degrade to raw if they'd exceed the viewport.
     let md_width = (width as usize).saturating_sub(2 + 2).max(1);
-    let body = render_markdown_message_block(text, md_width, 0, 0, Style::default()).lines;
+    let body = render_markdown_message_block(text, md_width, 0, 0, Style::default());
+    let mut body_continuations = body.continuations.into_iter();
+    let body = body.lines;
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len() + 1);
     // The controls ride the first body line (no bubble to host a corner
@@ -1626,7 +1628,9 @@ fn render_user_markdown(
             Style::default().fg(TIMESTAMP_FG),
         )]));
     }
+    let mut continuations = vec![false; body_row_offset];
     for (i, line) in body.into_iter().enumerate() {
+        continuations.push(body_continuations.next().unwrap_or(false));
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
         spans.push(Span::styled("│ ".to_string(), bar_style));
         spans.extend(line.spans);
@@ -1651,8 +1655,10 @@ fn render_user_markdown(
             r
         });
         out.push(timestamped);
+        continuations.push(false);
     }
-    (out, pin_region)
+    continuations.resize(out.len(), false);
+    (out, continuations, pin_region)
 }
 
 fn render_interrupt_decision(

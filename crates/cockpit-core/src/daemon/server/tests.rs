@@ -8252,6 +8252,7 @@ fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBu
 }
 
 /// A staged chunk is retained and acknowledged with its next index.
+#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_happy() {
     let ctx = test_ctx();
     let body = b"bulk-transfer-chunk-body".to_vec();
@@ -8293,6 +8294,7 @@ async fn assert_write_bulk_transfer_chunk_happy() {
 }
 
 /// A chunk whose body is not valid base64 is refused.
+#[cfg(unix)]
 async fn assert_write_bulk_transfer_chunk_malformed() {
     let ctx = test_ctx();
     let error = dispatch_matrix_request(

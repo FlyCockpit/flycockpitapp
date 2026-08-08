@@ -458,6 +458,7 @@ mod linux_cgroup_namespace_guard {
         assert!(adapter.guard.verification.membership_proven);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn absent_broker_is_management_boundary_unavailable() {
         let adapter = LinuxCgroupAdapter::production();

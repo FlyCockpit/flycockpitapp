@@ -373,7 +373,7 @@ fn inspect(dir: &DirHandle) -> io::Result<Inspection> {
             }
         }
     }
-    verified.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    verified.sort_by_key(|entry| std::cmp::Reverse(entry.mtime));
     Ok(Inspection {
         verified_newest_first: verified,
         unsafe_entries_reported: unsafe_count,

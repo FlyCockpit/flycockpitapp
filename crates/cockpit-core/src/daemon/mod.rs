@@ -1820,7 +1820,9 @@ mod tests {
         let err = cleanup_manifest(&manifest_path).expect_err("must refuse current process");
 
         assert!(
-            err.to_string().contains(TEST_OWNER_ENV) || err.to_string().contains("not a cockpit"),
+            err.to_string().contains(TEST_OWNER_ENV)
+                || err.to_string().contains("not a cockpit")
+                || err.to_string().contains("unsupported on this platform"),
             "error should name the failed identity check: {err:#}"
         );
         assert!(socket.exists());

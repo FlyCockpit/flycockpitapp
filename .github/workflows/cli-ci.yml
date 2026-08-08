@@ -78,15 +78,12 @@ jobs:
           shared-key: ${{ runner.os }}-${{ matrix.toolchain }}
           workspaces: . -> target
 
-      # macOS exposes `/var` as an alias for `/private/var`. Keep tempfile's
-      # root in its physical spelling so lexical and canonical test paths
-      # agree. Do not prefix an already physical TMPDIR.
+      # macOS exposes `/var` as an alias for `/private/var`. Use the short,
+      # physical system temp root: it keeps lexical and canonical paths equal
+      # without exceeding the Unix-domain socket path limit in daemon tests.
       - name: Normalize macOS temporary directory
         if: contains(matrix.os, 'macos')
-        run: |
-          if [[ "$TMPDIR" == /var/* ]]; then
-            echo "TMPDIR=/private${TMPDIR}" >> "$GITHUB_ENV"
-          fi
+        run: echo "TMPDIR=/private/tmp" >> "$GITHUB_ENV"
 
       - name: Build
         if: contains(matrix.os, 'windows') == false

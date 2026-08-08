@@ -1272,7 +1272,11 @@ async fn command_directory_escape_detects_literal_absolute_paths() {
     std::fs::write(&inside, "ok").unwrap();
     assert_eq!(
         command_directory_escape("cat /etc/passwd", &root, &root, None).as_deref(),
-        Some(Path::new("/etc/passwd"))
+        Some(Path::new(if cfg!(target_os = "macos") {
+            "/private/etc/passwd"
+        } else {
+            "/etc/passwd"
+        }))
     );
     assert!(
         command_directory_escape(&format!("cat {}", inside.display()), &root, &root, None)

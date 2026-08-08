@@ -923,6 +923,72 @@ pub fn parse_remote_identity_certificate_jws(compact: &str) -> Result<ParsedCert
         crate::remote_protocol_id::decode_protocol_id_base64url(value)
             .map_err(|e| Error(e.to_string()))?;
     }
+    let kind = SubjectKind::try_from(
+        p.get("subjectKind")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| Error("invalid subjectKind".into()))?,
+    )?;
+    match (kind, p.get("accountId")) {
+        (SubjectKind::Client, Some(serde_json::Value::String(value))) => {
+            crate::remote_protocol_id::decode_protocol_id_base64url(value)
+                .map_err(|e| Error(e.to_string()))?;
+        }
+        (SubjectKind::Daemon, Some(serde_json::Value::Null)) => {}
+        _ => return err("invalid certificate account branch"),
+    }
+    for key in ["generation", "authorityEpoch", "iat", "exp"] {
+        let value = p
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error(format!("invalid {key}")))?;
+        crate::remote_protocol_id::parse_canonical_u64_decimal_string(value)
+            .map_err(|e| Error(e.to_string()))?;
+    }
+    CustodyClass::try_from(
+        p.get("custody")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| Error("invalid custody".into()))?,
+    )?;
+    PresenceMode::try_from(
+        p.get("presenceMode")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| Error("invalid presenceMode".into()))?,
+    )?;
+    let key = p
+        .get("publicKey")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Error("invalid publicKey".into()))?;
+    if key.len() != 4
+        || key.get("kty").and_then(|v| v.as_str()) != Some("EC")
+        || key.get("crv").and_then(|v| v.as_str()) != Some("P-256")
+    {
+        return err("invalid publicKey");
+    };
+    let x: [u8; 32] = decode_canonical_b64url(
+        key.get("x")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error("invalid x".into()))?,
+    )?
+    .try_into()
+    .map_err(|_| Error("x length".into()))?;
+    let y: [u8; 32] = decode_canonical_b64url(
+        key.get("y")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error("invalid y".into()))?,
+    )?
+    .try_into()
+    .map_err(|_| Error("y length".into()))?;
+    let thumbprint: [u8; 32] = decode_canonical_b64url(
+        p.get("thumbprint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error("invalid thumbprint".into()))?,
+    )?
+    .try_into()
+    .map_err(|_| Error("thumbprint length".into()))?;
+    validate_thumbprint(&x, &y, &thumbprint)?;
     let signing_input = format!("{}.{}", parts[0], parts[1]).into_bytes();
     Ok(ParsedCertificateJws {
         protected_header: header,

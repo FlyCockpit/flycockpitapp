@@ -1,5 +1,9 @@
 /** Transport-neutral remote identity wire codecs (v1). No trust or policy decisions live here. */
-import { decodeProtocolIdBase64Url } from "./remote-protocol-id";
+import {
+  canonicalizeRfc8785,
+  decodeProtocolIdBase64Url,
+  parseCanonicalU64DecimalString,
+} from "./remote-protocol-id";
 
 export const REMOTE_IDENTITY_MAGICS = {
   proposal: "FCIP",
@@ -56,6 +60,13 @@ const domains = [
 export class RemoteIdentityProtocolError extends Error {}
 function fail(message: string): never {
   throw new RemoteIdentityProtocolError(message);
+}
+function utf8(bytes: Uint8Array, name: string) {
+  try {
+    return td.decode(bytes);
+  } catch {
+    return fail(`invalid ${name} UTF-8`);
+  }
 }
 function enumValue(value: number, max: number, name: string): void {
   if (!Number.isInteger(value) || value < 1 || value > max) fail(`unknown ${name}`);
@@ -165,7 +176,9 @@ function preamble(w: Writer, magic: string) {
 }
 function readPreamble(r: Reader, magic: string, max: number) {
   if (r.bytes.length > max) fail("wire value exceeds limit");
-  if (td.decode(r.take(4)) !== magic || r.u8() !== 1) fail("wrong magic or version");
+  const expected = te.encode(magic),
+    actual = r.take(4);
+  if (!actual.every((b, i) => b === expected[i]) || r.u8() !== 1) fail("wrong magic or version");
 }
 function account(w: Writer, kind: SubjectKindV1, id?: Uint8Array) {
   enumValue(kind, 2, "subject kind");
@@ -370,7 +383,7 @@ export function decodeRemoteIdentityProposal(bytes: Uint8Array): RemoteIdentityP
     thumbprint = r.take(32),
     custodyClass = r.u8(),
     presenceMode = r.u8(),
-    issuer = td.decode(r.take(r.u16())),
+    issuer = utf8(r.take(r.u16()), "issuer"),
     serviceVersion = r.u64(),
     policyEpoch = r.u64(),
     policyDigest = r.take(32),
@@ -503,7 +516,7 @@ export function decodeEnrollmentTranscript(bytes: Uint8Array): EnrollmentTranscr
     thumbprint: r.take(32),
     custodyClass: r.u8(),
     presenceMode: r.u8(),
-    publicOrigin: td.decode(r.take(r.u16())),
+    publicOrigin: utf8(r.take(r.u16()), "origin"),
     initiatorRole: r.u8() as EnrollmentRoleV1,
     confirmerRole: r.u8() as EnrollmentRoleV1,
     initiatorNonce: r.take(32),
@@ -670,7 +683,7 @@ export async function possessionProofSigningDigest(
 ) {
   if (
     unsignedProof.length !== 175 ||
-    td.decode(unsignedProof.slice(0, 4)) !== "FCPP" ||
+    !unsignedProof.slice(0, 4).every((b, i) => b === te.encode("FCPP")[i]) ||
     unsignedProof[5] !== p
   )
     fail("invalid unsigned possession proof");
@@ -812,7 +825,7 @@ export async function enrollmentConfirmationSigningDigest(
 ) {
   if (
     unsignedConfirmation.length !== 104 ||
-    td.decode(unsignedConfirmation.slice(0, 4)) !== "FCCF" ||
+    !unsignedConfirmation.slice(0, 4).every((b, i) => b === te.encode("FCCF")[i]) ||
     unsignedConfirmation[5] !== role
   )
     fail("invalid unsigned enrollment confirmation");
@@ -856,13 +869,22 @@ export function parseRemoteIdentityCertificateJws(compact: string) {
     return bytes;
   };
   let header: unknown, payload: unknown;
+  const headerBytes = decode(parts[0]!),
+    payloadBytes = decode(parts[1]!);
   try {
-    header = JSON.parse(td.decode(decode(parts[0]!))) as unknown;
-    payload = JSON.parse(td.decode(decode(parts[1]!))) as unknown;
+    header = JSON.parse(utf8(headerBytes, "header")) as unknown;
+    payload = JSON.parse(utf8(payloadBytes, "payload")) as unknown;
   } catch (error) {
     if (error instanceof RemoteIdentityProtocolError) throw error;
     fail("invalid JWS JSON or UTF-8");
   }
+  if (
+    te.encode(canonicalizeRfc8785(header)).some((b, i) => b !== headerBytes[i]) ||
+    te.encode(canonicalizeRfc8785(header)).length !== headerBytes.length ||
+    te.encode(canonicalizeRfc8785(payload)).some((b, i) => b !== payloadBytes[i]) ||
+    te.encode(canonicalizeRfc8785(payload)).length !== payloadBytes.length
+  )
+    fail("noncanonical JWS JSON");
   const sig = decode(parts[2]!);
   validateLowSP1363(sig);
   if (!header || typeof header !== "object" || Array.isArray(header)) fail("invalid header");
@@ -907,6 +929,32 @@ export function parseRemoteIdentityCertificateJws(compact: string) {
     if (typeof p[k] !== "string") fail(`invalid ${k}`);
     decodeProtocolIdBase64Url(p[k] as string);
   }
+  if (p.subjectKind !== 1 && p.subjectKind !== 2) fail("invalid subjectKind");
+  if (
+    (p.subjectKind === 1 && typeof p.accountId !== "string") ||
+    (p.subjectKind === 2 && p.accountId !== null)
+  )
+    fail("invalid certificate account branch");
+  if (typeof p.accountId === "string") decodeProtocolIdBase64Url(p.accountId);
+  for (const k of ["generation", "authorityEpoch", "iat", "exp"])
+    parseCanonicalU64DecimalString(p[k]);
+  if (!p.publicKey || typeof p.publicKey !== "object" || Array.isArray(p.publicKey))
+    fail("invalid publicKey");
+  const key = p.publicKey as Record<string, unknown>;
+  if (
+    Object.keys(key).sort().join(",") !== "crv,kty,x,y" ||
+    key.kty !== "EC" ||
+    key.crv !== "P-256" ||
+    typeof key.x !== "string" ||
+    typeof key.y !== "string" ||
+    typeof p.thumbprint !== "string"
+  )
+    fail("invalid publicKey or thumbprint");
+  const x = decode(key.x),
+    y = decode(key.y),
+    thumbprint = decode(p.thumbprint);
+  keyCheck(x, y, thumbprint);
+  validateThumbprint(x, y, thumbprint);
   return {
     protectedHeader: h,
     payload: p,

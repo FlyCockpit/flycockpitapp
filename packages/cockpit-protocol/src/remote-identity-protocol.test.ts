@@ -1,31 +1,63 @@
 import { describe, expect, it } from "vitest";
 import vectors from "../fixtures/remote-identity-protocol-v1.json";
 import {
+  decodeCustodyEvidence,
+  decodeEnrollmentConfirmation,
+  decodeEnrollmentTranscript,
   decodePossessionContext,
+  decodePossessionProof,
+  decodeRemoteIdentityProposal,
+  encodeCustodyEvidence,
+  encodeEnrollmentConfirmation,
+  encodeEnrollmentTranscript,
   encodePossessionContext,
+  encodePossessionProof,
+  encodeRemoteIdentityProposal,
   PossessionPurpose,
+  parseRemoteIdentityCertificateJws,
   possessionChallengeDomain,
   possessionSignatureDomain,
 } from "./remote-identity-protocol";
 
+const fromHex = (value: string) =>
+  Uint8Array.from(value.match(/../g) ?? [], (byte) => Number.parseInt(byte, 16));
+function reconstruct(codec: string, bytes: Uint8Array): Uint8Array {
+  switch (codec) {
+    case "FCIP":
+      return encodeRemoteIdentityProposal(decodeRemoteIdentityProposal(bytes));
+    case "FCEN":
+      return encodeEnrollmentTranscript(decodeEnrollmentTranscript(bytes));
+    case "FCCE":
+      return encodeCustodyEvidence(decodeCustodyEvidence(bytes));
+    case "FCPC":
+      return encodePossessionContext(decodePossessionContext(bytes));
+    case "FCPP":
+      return encodePossessionProof(decodePossessionProof(bytes));
+    case "FCCF":
+      return encodeEnrollmentConfirmation(decodeEnrollmentConfirmation(bytes));
+    case "JWS":
+      parseRemoteIdentityCertificateJws(new TextDecoder().decode(bytes));
+      return bytes;
+    default:
+      throw new Error("unknown fixture codec");
+  }
+}
+
 describe("remote_identity_protocol_cross_language_vectors", () => {
-  it("has nonempty shared coverage and exact purpose contexts", () => {
-    expect(vectors.valid.magics.length).toBe(6);
-    expect(vectors.valid.purposes.length).toBe(7);
-    expect(vectors.valid.roles.length).toBe(3);
+  it("reconstructs and rejects the shared byte corpus", () => {
+    expect(vectors.valid.length).toBeGreaterThan(0);
     expect(vectors.malformed.length).toBeGreaterThan(0);
-    const digest = new Uint8Array(32).fill(7);
+    for (const vector of vectors.valid) {
+      const bytes = fromHex(vector.hex);
+      expect(bytes.length).toBeGreaterThan(0);
+      expect(reconstruct(vector.codec, bytes)).toEqual(bytes);
+    }
+    for (const vector of vectors.malformed) {
+      expect(() => reconstruct(vector.codec, fromHex(vector.hex))).toThrow();
+    }
+  });
+  it("exhausts purpose domains", () => {
     for (const purpose of Object.values(PossessionPurpose)) {
-      const context =
-        purpose === 1
-          ? { purpose, proposedIdentityDigest: digest, enrollmentTranscriptDigest: digest }
-          : purpose <= 4
-            ? { purpose, currentCertificateDigest: digest, proposedIdentityDigest: digest }
-            : purpose <= 6
-              ? { purpose, currentCertificateDigest: digest, attemptRequestDigest: digest }
-              : { purpose, currentCertificateDigest: digest, revocationRequestDigest: digest };
-      const bytes = encodePossessionContext(context);
-      expect(encodePossessionContext(decodePossessionContext(bytes))).toEqual(bytes);
       expect(possessionChallengeDomain(purpose).at(-1)).toBe(0);
       expect(possessionSignatureDomain(purpose).at(-1)).toBe(0);
     }

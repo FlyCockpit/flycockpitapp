@@ -60,14 +60,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # macOS exposes its temporary directory through `/var`, which is a
-      # symlink to `/private/var`. Keep every test process on the canonical
-      # spelling so path-identity assertions and security boundaries agree.
-      - name: Normalize macOS temporary root
-        if: contains(matrix.os, 'macos')
-        shell: bash
-        run: echo "TMPDIR=/private${TMPDIR}" >> "$GITHUB_ENV"
-
       - name: Install stable Rust
         if: matrix.toolchain == 'stable'
         uses: dtolnay/rust-toolchain@stable

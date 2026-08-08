@@ -9663,6 +9663,24 @@ mod render_history_spacing_tests {
     }
 
     #[test]
+    fn selection_user_markdown_reserves_timestamp_before_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.user = true;
+        app.history = vec![user(
+            "**first row is deliberately near the timestamp edge** and tail",
+        )]
+        .into();
+
+        render_history(&mut app, 30, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 30, 8),
+            "first row is deliberately near the timestamp edge and tail"
+        );
+    }
+
+    #[test]
     fn resize_recomputes_visual_row_count_and_clamps_scroll() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);

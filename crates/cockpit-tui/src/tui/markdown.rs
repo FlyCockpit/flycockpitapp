@@ -122,12 +122,22 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
             }
             Event::End(TagEnd::Table) => {
                 table_row = None;
+                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
+                    atoms.pop();
+                    logical_line = logical_line.saturating_sub(1);
+                }
                 pending_block_break = 2;
             }
             Event::End(TagEnd::Paragraph)
             | Event::End(TagEnd::Heading(_))
-            | Event::End(TagEnd::CodeBlock)
             | Event::End(TagEnd::BlockQuote(_)) => pending_block_break = 2,
+            Event::End(TagEnd::CodeBlock) => {
+                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
+                    atoms.pop();
+                    logical_line = logical_line.saturating_sub(1);
+                }
+                pending_block_break = 2;
+            }
             Event::End(TagEnd::List(_)) => {
                 if matches!(atoms.last(), Some(CopyAtom::Newline)) {
                     atoms.pop();

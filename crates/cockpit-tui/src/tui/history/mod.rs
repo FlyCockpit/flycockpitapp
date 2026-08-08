@@ -1608,7 +1608,8 @@ fn render_user_markdown(
     // Content width inside the `│ ` bar (and a matching right margin), so
     // display-math blocks degrade to raw if they'd exceed the viewport.
     let md_width = (width as usize).saturating_sub(2 + 2).max(1);
-    let body = render_markdown_message_block(text, md_width, 0, 0, Style::default());
+    let reserve_first = TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + agent_pin_reserve(pin);
+    let body = render_markdown_message_block(text, md_width, reserve_first, 0, Style::default());
     let mut body_continuations = body.continuations.into_iter();
     let body = body.lines;
 

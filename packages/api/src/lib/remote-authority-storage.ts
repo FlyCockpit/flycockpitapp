@@ -173,6 +173,18 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       { isolationLevel: "Serializable" },
     );
   }
+  async abortSupersededTransitions(
+    deploymentId: string,
+    lifecycleDigest: string,
+    allowedDigests: readonly string[],
+  ) {
+    await this.db.$executeRawUnsafe(
+      `UPDATE remote_authority_lifecycle_transitions SET "state"='aborted',"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "fromDigest"=$2 AND ("state"='reserved' OR "state"='status_signed') AND NOT ("toDigest" = ANY($3::text[]))`,
+      deploymentId,
+      lifecycleDigest,
+      [...allowedDigests],
+    );
+  }
   async loadPublicRings(deploymentId: string, digests: readonly string[]) {
     if (digests.length === 0) return new Map();
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
@@ -477,7 +489,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         );
         if (pending.length !== 0) return false;
         await tx.$executeRawUnsafe(
-          `UPDATE remote_authority_signing_fences SET "state"='frozen',"cutoff"=COALESCE((SELECT MAX("signedAt") FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='finalized'),NOW()),"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='closing'`,
+          `UPDATE remote_authority_signing_fences f SET "state"='frozen',"cutoff"=COALESCE((SELECT MAX(j."signedAt") FROM remote_authority_signing_journal j WHERE j."deploymentId"=$1 AND j."kid"=$2 AND j."signingGeneration"=f."signingGeneration" AND j."state"='finalized'),NOW()),"updatedAt"=NOW() WHERE f."deploymentId"=$1 AND f."kid"=$2 AND f."state"='closing'`,
           deploymentId,
           kid,
         );
@@ -495,9 +507,10 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       fence = fences[0];
     if (fence?.state !== "frozen" || !fence.cutoff) throw new Error("signing fence is not frozen");
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 ORDER BY "mintId"`,
+      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric ORDER BY "mintId"`,
       deploymentId,
       kid,
+      text(fence.signingGeneration),
     );
     const seconds = (value: unknown) =>
       Math.floor(new Date(value as string).getTime() / 1000).toString();

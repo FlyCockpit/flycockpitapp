@@ -14,6 +14,7 @@ import {
   canonicalAuthorityRing,
   createRemoteAuthorityStatusJws,
   FileAuthoritySigner,
+  normalizeAuthorityIssuer,
   type ObservationLease,
   type PublicAuthorityRing,
   parseAuthorityConfig,
@@ -100,6 +101,36 @@ describe("remote_authority_file_provider_rejects_unsafe_ring", () => {
   });
 });
 describe("remote_authority_canonical_digest_vectors", () => {
+  it("normalizes only bounded HTTPS origins and deployment/digest configuration", () => {
+    expect(normalizeAuthorityIssuer("https://EXAMPLE.com:443/")).toBe("https://example.com");
+    expect(normalizeAuthorityIssuer("https://EXAMPLE.com:8443/")).toBe("https://example.com:8443");
+    for (const issuer of [
+      "http://example.com",
+      "https://user@example.com",
+      "https://example.com/path",
+      "https://example.com/?query=1",
+      "https://example.com/#fragment",
+    ])
+      expect(() => normalizeAuthorityIssuer(issuer), issuer).toThrow();
+    const digest = "a".repeat(64);
+    for (const deploymentId of ["", "a".repeat(65), "bad id"])
+      expect(() =>
+        parseAuthorityConfig({
+          issuer: "https://example.com",
+          deploymentId,
+          digests: `["${digest}"]`,
+        }),
+      ).toThrow();
+    for (const digests of [
+      "[]",
+      `["${digest}","${digest}"]`,
+      `["${digest.toUpperCase()}"]`,
+      `[ "${digest}" ]`,
+    ])
+      expect(() =>
+        parseAuthorityConfig({ issuer: "https://example.com", deploymentId: "prod", digests }),
+      ).toThrow();
+  });
   it("binds issuer/deployment and exact u64 strings", () => {
     const value = ring([makeKey("é", "current"), makeKey("z", "verification_only")]);
     const digest = authorityRingDigest(value, cfg);
@@ -294,6 +325,50 @@ describe("remote_authority_jwks_and_status_public_only", () => {
       },
     );
     expect(verified.header.kid).toBe("k0");
+    const parts = status.split("."),
+      rejectTampered = async (headerChanges: Record<string, unknown>, payloadChanges = {}) => {
+        const header = {
+            ...(JSON.parse(Buffer.from(parts[0]!, "base64url").toString("utf8")) as object),
+            ...headerChanges,
+          },
+          payload = {
+            ...(JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as object),
+            ...payloadChanges,
+          },
+          compact = `${Buffer.from(canonicalizeRfc8785(header)).toString("base64url")}.${Buffer.from(canonicalizeRfc8785(payload)).toString("base64url")}.${parts[2]}`;
+        await expect(
+          verifyRemoteAuthorityStatusJws(compact, new RingAuthorityVerifier(value, "100"), {
+            issuer: cfg.issuer,
+            deploymentId: cfg.deploymentId,
+            ringDigest: digest,
+            authorityEpoch: "1",
+            minimumGeneration: "1",
+            now: "100",
+            authorizedSignerKid: "k0",
+          }),
+        ).rejects.toThrow();
+      };
+    await rejectTampered({ alg: "HS256" });
+    await rejectTampered({ typ: "wrong" });
+    await rejectTampered({ kid: "unknown" });
+    await rejectTampered({}, { aud: "wrong" });
+    await rejectTampered({}, { deploymentId: "other" });
+    await rejectTampered({}, { iss: "https://other.example" });
+    const revokedStatus = await createRemoteAuthorityStatusJws(
+      { ...verified.payload, revokedKids: ["k0"] },
+      signer,
+    );
+    await expect(
+      verifyRemoteAuthorityStatusJws(revokedStatus, new RingAuthorityVerifier(value, "100"), {
+        issuer: cfg.issuer,
+        deploymentId: cfg.deploymentId,
+        ringDigest: digest,
+        authorityEpoch: "1",
+        minimumGeneration: "1",
+        now: "100",
+        authorizedSignerKid: "k0",
+      }),
+    ).rejects.toThrow();
     const jwks = publicAuthorityJwks(value, "100");
     expect(JSON.stringify(jwks)).not.toContain('"d"');
     let monotonic = 0;

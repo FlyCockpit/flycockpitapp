@@ -97,6 +97,7 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     const publicRing = publicAuthorityRing(ring, { issuer, deploymentId });
     const store = {
       bootstrapAuthority: async () => undefined,
+      abortSupersededTransitions: async () => undefined,
       loadLifecycle: async () => lifecycle,
       loadMembership: async (): Promise<MembershipSnapshot> => ({
         membershipGeneration: "1",

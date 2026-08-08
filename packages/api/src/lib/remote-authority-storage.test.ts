@@ -93,7 +93,7 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
             {
               signingGeneration: "12",
               state: "frozen",
-              cutoff: new Date(20_000),
+              cutoff: new Date(19_000),
               updatedAt: new Date(21_000),
             },
           ];

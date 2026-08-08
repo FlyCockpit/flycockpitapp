@@ -47,6 +47,11 @@ export interface AuthorityRuntimeStore {
   loadMembership(deploymentId: string): Promise<MembershipSnapshot>;
   promoteJoiningReplica(deploymentId: string, replicaId: string): Promise<boolean>;
   drainReplica(deploymentId: string, replicaId: string): Promise<boolean>;
+  abortSupersededTransitions(
+    deploymentId: string,
+    lifecycleDigest: string,
+    allowedDigests: readonly string[],
+  ): Promise<void>;
   loadPublicRings(
     deploymentId: string,
     digests: readonly string[],
@@ -200,6 +205,15 @@ export class RemoteAuthorityRuntime {
       .loadLifecycle(this.config.deploymentId)
       .catch(() => null);
     if (!lifecycle) return this.#fail("lifecycle_missing");
+    try {
+      await this.options.store.abortSupersededTransitions(
+        this.config.deploymentId,
+        lifecycle.ringDigest,
+        this.config.allowedDigests,
+      );
+    } catch {
+      return this.#fail("transition_reconciliation_failed");
+    }
     const membership = await this.options.store
       .loadMembership(this.config.deploymentId)
       .catch(() => null);

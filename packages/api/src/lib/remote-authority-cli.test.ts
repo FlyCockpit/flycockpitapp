@@ -154,5 +154,45 @@ describe("remote_authority_key_cli_state_machine", () => {
       ]),
     ).rejects.toThrow();
     await expect(readFile(output)).rejects.toThrow();
+    await expect(
+      run([
+        "revoke",
+        ...common,
+        "--input",
+        input,
+        "--output",
+        output,
+        "--kid",
+        initialized.currentKid,
+        "--replacement-kid",
+        "missing",
+        "--expected-revision",
+        initialized.revision,
+        "--expected-digest",
+        initialized.digest,
+        "--expected-epoch",
+        initialized.authorityEpoch,
+      ]),
+    ).rejects.toThrow();
+    await expect(
+      run([
+        "promote",
+        ...common,
+        "--input",
+        input,
+        "--base",
+        input,
+        "--output",
+        output,
+        "--kid",
+        "missing",
+        "--expected-revision",
+        initialized.revision,
+        "--expected-digest",
+        initialized.digest,
+        "--expected-epoch",
+        initialized.authorityEpoch,
+      ]),
+    ).rejects.toThrow();
   });
 });

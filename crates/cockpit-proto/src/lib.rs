@@ -506,10 +506,14 @@ pub const MAX_NDJSON_FRAME_BYTES: usize = 1_048_576;
 
 /// Pasted-image upload limits. Chunks are base64 strings inside JSON frames,
 /// so keep the base64 payload below the bulk lane's 512 KiB logical cap.
-pub const MAX_SINGLE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_IMAGES_PER_USER_MESSAGE: usize = 4;
-pub const MAX_IMAGE_DIMENSION_PIXELS: u32 = 8192;
+pub const MAX_SINGLE_IMAGE_BYTES: usize =
+    cockpit_config::config::media_budget::PASTE_MAX_SINGLE_IMAGE_BYTES;
+pub const MAX_TOTAL_IMAGE_BYTES: usize =
+    cockpit_config::config::media_budget::PASTE_MAX_TOTAL_IMAGE_BYTES;
+pub const MAX_IMAGES_PER_USER_MESSAGE: usize =
+    cockpit_config::config::media_budget::PASTE_MAX_IMAGES_PER_REQUEST;
+pub const MAX_IMAGE_DIMENSION_PIXELS: u32 =
+    cockpit_config::config::media_budget::PASTE_MAX_EDGE_PIXELS;
 /// One attachment chunk's base64 body. Sized so the encoded chunk frame fits
 /// inside a single 512 KiB bulk-lane logical payload with envelope headroom.
 pub const MAX_ATTACHMENT_CHUNK_BASE64_BYTES: usize = 256 * 1024;

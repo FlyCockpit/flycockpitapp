@@ -29,6 +29,7 @@ pub mod dirs;
 pub mod effective_default;
 pub mod extended;
 mod files;
+pub mod media_budget;
 pub(crate) mod merge;
 pub mod model_defaults;
 pub mod model_policy;

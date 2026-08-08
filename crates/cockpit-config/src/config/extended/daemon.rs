@@ -56,7 +56,7 @@ impl Default for DaemonUploadLimitsConfig {
     }
 }
 
-pub const MAX_SINGLE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SINGLE_IMAGE_BYTES: usize = crate::config::media_budget::PASTE_MAX_SINGLE_IMAGE_BYTES;
 
 default_const!(default_daemon_uploads_per_client, usize, 4);
 

@@ -251,6 +251,19 @@ malformed.push({
   codec: "JWS",
   hex: hex(enc.encode(`${reorderedHeader}.${certificateParts[1]}.${certificateParts[2]}`)),
 });
+const badPayload = JSON.parse(
+  Buffer.from(certificateParts[1]!, "base64url").toString("utf8"),
+) as Record<string, unknown>;
+badPayload.custody = 9;
+malformed.push({
+  name: "unknown_certificate_custody",
+  codec: "JWS",
+  hex: hex(
+    enc.encode(
+      `${certificateParts[0]}.${b64(enc.encode(canonicalizeRfc8785(badPayload)))}.${certificateParts[2]}`,
+    ),
+  ),
+});
 writeFileSync(
   new URL("../fixtures/remote-identity-protocol-v1.json", import.meta.url),
   `${JSON.stringify({ schemaVersion: 1, valid, malformed, derivations }, null, 2)}\n`,

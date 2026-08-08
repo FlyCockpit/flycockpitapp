@@ -941,6 +941,8 @@ export function parseRemoteIdentityCertificateJws(compact: string) {
     decodeProtocolIdBase64Url(p[k] as string);
   }
   if (p.subjectKind !== 1 && p.subjectKind !== 2) fail("invalid subjectKind");
+  enumValue(p.custody as number, 3, "custody class");
+  enumValue(p.presenceMode as number, 4, "presence mode");
   if (typeof p.iss !== "string") fail("invalid iss");
   origin(p.iss);
   if (

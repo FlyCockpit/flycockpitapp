@@ -37,6 +37,7 @@ pub mod git;
 pub mod gitignore;
 pub mod goal_scratch;
 pub mod harness;
+pub mod image_generation_runtime;
 pub mod init;
 pub mod intel;
 pub mod jitter;

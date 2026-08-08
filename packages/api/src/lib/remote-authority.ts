@@ -872,7 +872,6 @@ export interface FrozenSigningJournalProof {
   schemaVersion: 1;
   deploymentId: string;
   kid: string;
-  signingGeneration: string;
   state: "frozen";
   cutoff: string;
   frozenAt: string;
@@ -890,16 +889,7 @@ export function validateFrozenSigningJournalProof(
     throw new Error("invalid signing journal proof");
   exact(
     input,
-    [
-      "schemaVersion",
-      "deploymentId",
-      "kid",
-      "signingGeneration",
-      "state",
-      "cutoff",
-      "frozenAt",
-      "rows",
-    ],
+    ["schemaVersion", "deploymentId", "kid", "state", "cutoff", "frozenAt", "rows"],
     "signing journal proof",
   );
   const proof = input as FrozenSigningJournalProof;
@@ -911,7 +901,6 @@ export function validateFrozenSigningJournalProof(
     !Array.isArray(proof.rows)
   )
     throw new Error("signing journal proof scope mismatch");
-  u64(proof.signingGeneration, "signing generation");
   u64(proof.cutoff, "signing cutoff");
   u64(proof.frozenAt, "frozen time");
   const finalized: bigint[] = [];

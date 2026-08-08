@@ -205,15 +205,6 @@ export class RemoteAuthorityRuntime {
       .loadLifecycle(this.config.deploymentId)
       .catch(() => null);
     if (!lifecycle) return this.#fail("lifecycle_missing");
-    try {
-      await this.options.store.abortSupersededTransitions(
-        this.config.deploymentId,
-        lifecycle.ringDigest,
-        this.config.allowedDigests,
-      );
-    } catch {
-      return this.#fail("transition_reconciliation_failed");
-    }
     const membership = await this.options.store
       .loadMembership(this.config.deploymentId)
       .catch(() => null);
@@ -256,14 +247,25 @@ export class RemoteAuthorityRuntime {
         );
         return this.#fail("membership_snapshot_changed");
       }
-      const [leases, rings] = await Promise.all([
-        this.options.observations.listLeases(
-          this.config.deploymentId,
-          membership.membershipGeneration,
-        ),
-        this.options.store.loadPublicRings(this.config.deploymentId, this.config.allowedDigests),
-      ]);
+      const observedLifecycleDigest = lifecycle.ringDigest,
+        [leases, rings] = await Promise.all([
+          this.options.observations.listLeases(
+            this.config.deploymentId,
+            membership.membershipGeneration,
+          ),
+          this.options.store.loadPublicRings(this.config.deploymentId, this.config.allowedDigests),
+        ]);
       convergenceLeases = leases;
+      if (
+        this.config.allowedDigests.length === 1 &&
+        leases.length > 0 &&
+        leases.every((item) => item.digest === observedLifecycleDigest)
+      )
+        await this.options.store.abortSupersededTransitions(
+          this.config.deploymentId,
+          observedLifecycleDigest,
+          this.config.allowedDigests,
+        );
       this.#decision = reduceAuthorityRollout({
         now,
         previousRedisTime,

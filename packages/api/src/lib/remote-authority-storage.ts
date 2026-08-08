@@ -500,29 +500,38 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
   }
   async loadFrozenSigningJournalProof(deploymentId: string, kid: string) {
     const fences = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-        `SELECT "signingGeneration","state","cutoff","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='frozen' ORDER BY "signingGeneration" DESC LIMIT 1`,
+        `SELECT "state","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='frozen' ORDER BY "signingGeneration"`,
         deploymentId,
         kid,
       ),
       fence = fences[0];
-    if (fence?.state !== "frozen" || !fence.cutoff) throw new Error("signing fence is not frozen");
+    if (fence?.state !== "frozen") throw new Error("signing fence is not frozen");
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 AND "signingGeneration"=$3::numeric ORDER BY "mintId"`,
+      `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 ORDER BY "mintId"`,
       deploymentId,
       kid,
-      text(fence.signingGeneration),
     );
     const seconds = (value: unknown) =>
-      Math.floor(new Date(value as string).getTime() / 1000).toString();
+        Math.floor(new Date(value as string).getTime() / 1000).toString(),
+      frozenAt = fences
+        .map((item) => BigInt(seconds(item.updatedAt)))
+        .reduce((left, right) => (left > right ? left : right))
+        .toString(),
+      finalized = rows.filter((row) => row.state === "finalized" && row.signedAt),
+      cutoff = finalized.length
+        ? finalized
+            .map((row) => BigInt(seconds(row.signedAt)))
+            .reduce((left, right) => (left > right ? left : right))
+            .toString()
+        : frozenAt;
     return validateFrozenSigningJournalProof(
       {
         schemaVersion: 1,
         deploymentId,
         kid,
-        signingGeneration: text(fence.signingGeneration),
         state: "frozen",
-        cutoff: seconds(fence.cutoff),
-        frozenAt: seconds(fence.updatedAt),
+        cutoff,
+        frozenAt,
         rows: rows.map((row) => ({
           mintId: text(row.mintId),
           state: text(row.state),

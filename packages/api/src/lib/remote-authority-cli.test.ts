@@ -78,7 +78,6 @@ describe("remote_authority_key_cli_state_machine", () => {
         schemaVersion: 1,
         deploymentId: "prod_1",
         kid: d0.currentKid,
-        signingGeneration: "1",
         state: "frozen",
         cutoff: "100",
         frozenAt: "101",
@@ -86,7 +85,7 @@ describe("remote_authority_key_cli_state_machine", () => {
       }),
       { mode: 0o600 },
     );
-    const retired = await run([
+    const retireArgs = [
       "retire",
       ...common,
       "--input",
@@ -97,15 +96,42 @@ describe("remote_authority_key_cli_state_machine", () => {
       d0.currentKid,
       "--signing-journal-proof",
       proofPath,
-      "--effective-at",
-      "2592160",
       "--expected-revision",
       d2.revision,
       "--expected-digest",
       d2.digest,
       "--expected-epoch",
       d2.authorityEpoch,
-    ]);
+    ];
+    await expect(run([...retireArgs, "--effective-at", "2592159"])).rejects.toThrow();
+    await writeFile(
+      proofPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        deploymentId: "other",
+        kid: d0.currentKid,
+        state: "frozen",
+        cutoff: "100",
+        frozenAt: "101",
+        rows: [{ mintId: "mint-1", state: "finalized", signedAt: "100" }],
+      }),
+      { mode: 0o600 },
+    );
+    await expect(run([...retireArgs, "--effective-at", "2592160"])).rejects.toThrow();
+    await writeFile(
+      proofPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        deploymentId: "prod_1",
+        kid: d0.currentKid,
+        state: "frozen",
+        cutoff: "100",
+        frozenAt: "101",
+        rows: [{ mintId: "mint-1", state: "finalized", signedAt: "100" }],
+      }),
+      { mode: 0o600 },
+    );
+    const retired = await run([...retireArgs, "--effective-at", "2592160"]);
     expect(retired.revision).toBe("4");
     const revoked = await run([
       "revoke",

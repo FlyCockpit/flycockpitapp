@@ -81,7 +81,27 @@ describe("RedisAuthorityObservationStore", () => {
 });
 
 describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
-  it("selects the newest frozen generation and reads its journal generation", async () => {
+  it("aborts only explicitly superseded transition targets", async () => {
+    const calls: Array<{ query: string; values: unknown[] }> = [],
+      db = {
+        $transaction: async <T>(fn: (tx: SqlClient) => Promise<T>) => fn(db),
+        $queryRawUnsafe: async () => [],
+        $executeRawUnsafe: async (query: string, ...values: unknown[]) => {
+          calls.push({ query, values });
+          return 1;
+        },
+      } satisfies SqlClient;
+    await new PostgresAuthorityRuntimeStore(db).abortSupersededTransitions(
+      "prod_1",
+      "a".repeat(64),
+      ["a".repeat(64)],
+    );
+    expect(calls[0]?.query).toContain("\"state\"='aborted'");
+    expect(calls[0]?.query).toContain('NOT ("toDigest" = ANY($3::text[]))');
+    expect(calls[0]?.values).toEqual(["prod_1", "a".repeat(64), ["a".repeat(64)]]);
+  });
+
+  it("proves the maximum cutoff across every frozen generation for a kid", async () => {
     const queries: Array<{ query: string; values: unknown[] }> = [];
     const db = {
       $transaction: async <T>(fn: (tx: SqlClient) => Promise<T>) => fn(db),
@@ -91,13 +111,15 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
         if (query.includes("remote_authority_signing_fences"))
           return [
             {
-              signingGeneration: "12",
               state: "frozen",
-              cutoff: new Date(19_000),
               updatedAt: new Date(21_000),
             },
+            { state: "frozen", updatedAt: new Date(22_000) },
           ];
-        return [{ mintId: "m1", state: "finalized", signedAt: new Date(19_000) }];
+        return [
+          { mintId: "m1", state: "finalized", signedAt: new Date(19_000) },
+          { mintId: "m2", state: "finalized", signedAt: new Date(20_000) },
+        ];
       },
     } satisfies SqlClient;
 
@@ -105,9 +127,10 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
       "prod_1",
       "k0",
     );
-    expect(proof.signingGeneration).toBe("12");
-    expect(queries[0]?.query).toContain('ORDER BY "signingGeneration" DESC LIMIT 1');
-    expect(queries[1]?.query).toContain('"signingGeneration"=$3::numeric');
-    expect(queries[1]?.values).toEqual(["prod_1", "k0", "12"]);
+    expect(proof.cutoff).toBe("20");
+    expect(proof.frozenAt).toBe("22");
+    expect(queries[0]?.query).toContain('ORDER BY "signingGeneration"');
+    expect(queries[1]?.query).not.toContain('"signingGeneration"=$3::numeric');
+    expect(queries[1]?.values).toEqual(["prod_1", "k0"]);
   });
 });

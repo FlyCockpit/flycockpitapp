@@ -1,0 +1,87 @@
+enum RemoteAuthorityReplicaState {
+  joining
+  required
+  draining
+}
+
+enum RemoteAuthoritySigningState {
+  reserved
+  signed
+  finalized
+  aborted
+}
+
+enum RemoteAuthorityFenceState {
+  open
+  closing
+  frozen
+}
+
+enum RemoteAuthorityTransitionState {
+  reserved
+  status_signed
+  committed
+  aborted
+}
+
+model RemoteAuthorityReplicaMembership {
+  deploymentId         String
+  membershipGeneration BigInt
+  replicaId            String
+  replicaGeneration    BigInt
+  state                RemoteAuthorityReplicaState
+  updatedAt            DateTime                    @updatedAt
+
+  @@id([deploymentId, replicaId])
+  @@index([deploymentId, membershipGeneration, state])
+}
+
+model RemoteAuthoritySigningJournal {
+  mintId            String                      @id
+  deploymentId      String
+  signingGeneration BigInt
+  kid               String
+  claimsHash        String
+  state             RemoteAuthoritySigningState
+  providerRequestId String                      @unique
+  signatureP1363    String?
+  compactJws        String?
+  signedAt          DateTime?
+  createdAt         DateTime                    @default(now())
+  updatedAt         DateTime                    @updatedAt
+
+  @@unique([deploymentId, mintId, claimsHash])
+  @@index([deploymentId, kid, state])
+}
+
+model RemoteAuthoritySigningFence {
+  deploymentId      String
+  kid               String
+  signingGeneration BigInt
+  state             RemoteAuthorityFenceState
+  cutoff            DateTime?
+  updatedAt         DateTime                  @updatedAt
+
+  @@id([deploymentId, kid])
+}
+
+model RemoteAuthorityLifecycleTransition {
+  transitionId       String                         @id
+  deploymentId       String
+  state              RemoteAuthorityTransitionState
+  fromRevision       BigInt
+  toRevision         BigInt
+  fromDigest         String
+  toDigest           String
+  fromAuthorityEpoch BigInt
+  toAuthorityEpoch   BigInt
+  fromCurrentKid     String
+  toCurrentKid       String
+  statusGeneration   BigInt
+  statusBodyDigest   String
+  signingGeneration  BigInt
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
+
+  @@index([deploymentId, state])
+}

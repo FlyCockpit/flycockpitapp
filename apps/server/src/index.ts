@@ -6,7 +6,6 @@ import {
   upsertPushSubscription,
 } from "@flycockpit/api/lib/push-subscription";
 import { getRelayJwks } from "@flycockpit/api/lib/relay-tokens";
-import { AuthorityPublicSnapshot } from "@flycockpit/api/lib/remote-authority";
 import { appRouter } from "@flycockpit/api/routers/index";
 import { auth, type Session } from "@flycockpit/auth";
 import { runWithAllowedUserCreation } from "@flycockpit/auth/user-creation-policy";
@@ -39,6 +38,7 @@ import {
 } from "./rate-limit.js";
 import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
+import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
@@ -168,11 +168,17 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 app.get("/api/meta/profile", (c) => c.json(getPublicDeploymentProfile()));
 mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
-const remoteAuthoritySnapshot = new AuthorityPublicSnapshot();
+const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
 mountRemoteAuthorityRoutes(app, {
-  snapshot: remoteAuthoritySnapshot,
+  snapshot: remoteAuthority.snapshot,
   now: () => Math.floor(Date.now() / 1000).toString(),
 });
+if (remoteAuthority.runtime) {
+  void remoteAuthority.runtime.tick();
+  setInterval(() => {
+    void remoteAuthority.runtime?.tick();
+  }, 10_000).unref();
+}
 
 // Liveness probe — answers whether this Node process can serve HTTP. Keep this
 // independent of external services so orchestrators do not restart healthy app

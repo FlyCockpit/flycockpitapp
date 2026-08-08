@@ -42,6 +42,7 @@
     "db:down": "turbo -F @flycockpit/db db:down",
     "generate:secret": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
     "generate:vapid": "pnpm -F @flycockpit/api exec web-push generate-vapid-keys",
+    "remote-authority-keys": "tsx scripts/remote-authority-keys.ts",
     "setup": "tsx scripts/setup.ts",
     "doctor": "tsx scripts/doctor.ts",
     "doctor:native": "tsx scripts/native-doctor.ts",

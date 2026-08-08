@@ -2,7 +2,9 @@ import { generateKeyPairSync } from "node:crypto";
 import { chmod, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalizeRfc8785 } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it } from "vitest";
+import fixture from "../../fixtures/remote-authority-v1.json";
 import {
   type AuthorityPrivateKey,
   AuthorityPublicSnapshot,
@@ -17,6 +19,7 @@ import {
   parseAuthorityRingFile,
   publicAuthorityJwks,
   publicAuthorityRing,
+  publicAuthorityRingDigest,
   REMOTE_AUTHORITY,
   RingAuthorityVerifier,
   reduceAuthorityRollout,
@@ -46,7 +49,7 @@ const ring = (keys: AuthorityPrivateKey[], revision = "1", epoch = "1"): Authori
     revision,
     authorityEpoch: epoch,
     currentKid: keys.find((k) => k.state === "current")!.kid,
-    keys: [...keys].sort((a, b) => a.kid.localeCompare(b.kid)),
+    keys: [...keys].sort((a, b) => Buffer.compare(Buffer.from(a.kid), Buffer.from(b.kid))),
   });
 const cfg = { issuer: "https://authority.example", deploymentId: "prod_1" };
 describe("remote_authority_file_provider_rejects_unsafe_ring", () => {
@@ -90,13 +93,20 @@ describe("remote_authority_canonical_digest_vectors", () => {
       }),
     ).not.toThrow();
   });
+  it("matches the Rust public-only fixture", () => {
+    expect(canonicalizeRfc8785(fixture.canonicalRing)).toBe(fixture.canonicalUtf8);
+    expect(publicAuthorityRingDigest(fixture.canonicalRing as PublicAuthorityRing)).toBe(
+      fixture.digest,
+    );
+    expect(fixture.u64Boundaries).toHaveLength(4);
+  });
 });
 describe("remote_authority_sign_verify_matrix", () => {
   it("signs only with current and verifies exact kid", async () => {
     const value = ring([makeKey("k0", "current")]),
       input = new TextEncoder().encode("claims"),
       signer = new FileAuthoritySigner(value.keys[0]!),
-      verifier = new RingAuthorityVerifier(value),
+      verifier = new RingAuthorityVerifier(value, "1"),
       signature = await signer.signP1363(input, "mint-1");
     expect(signature).toHaveLength(64);
     expect(await verifier.verifyP1363(input, signature, "k0")).toBe(true);
@@ -122,7 +132,7 @@ describe("remote_authority_three_digest_rollout", () => {
         cfg,
       );
     validateThreeDigestPlan(d0, d1, d2);
-    const digests = [d0, d1, d2].map((_ring, i) => `d${i}`),
+    const digests = [d0, d1, d2].map(publicAuthorityRingDigest),
       rings = new Map<string, PublicAuthorityRing>(digests.map((d, i) => [d, [d0, d1, d2][i]!]));
     const lease = (replicaId: string, digest: string): ObservationLease => ({
       issuerDigest: "issuer",
@@ -152,10 +162,10 @@ describe("remote_authority_three_digest_rollout", () => {
         issuerDigest: "issuer",
         deploymentId: cfg.deploymentId,
         snapshot,
-        leases: [lease("a", "d1"), lease("b", "d1")],
+        leases: [lease("a", digests[1]!), lease("b", digests[1]!)],
         plan: digests as [string, string, string],
         rings,
-        localDigest: "d2",
+        localDigest: digests[2]!,
       }).ready,
     ).toBe(true);
     expect(
@@ -164,10 +174,10 @@ describe("remote_authority_three_digest_rollout", () => {
         issuerDigest: "issuer",
         deploymentId: cfg.deploymentId,
         snapshot,
-        leases: [lease("a", "d0"), lease("b", "d2")],
+        leases: [lease("a", digests[0]!), lease("b", digests[2]!)],
         plan: digests as [string, string, string],
         rings,
-        localDigest: "d2",
+        localDigest: digests[2]!,
       }).ready,
     ).toBe(false);
   });

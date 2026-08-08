@@ -1,0 +1,40 @@
+{
+  "canonicalRing": {
+    "authorityEpoch": "3",
+    "currentKid": "z",
+    "deploymentId": "prod_1",
+    "issuer": "https://authority.example",
+    "keys": [
+      {
+        "activatedAt": "1",
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "z",
+        "retireAt": null,
+        "state": "current",
+        "x": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        "y": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+      },
+      {
+        "activatedAt": "2",
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "é",
+        "retireAt": null,
+        "state": "verification_only",
+        "x": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+        "y": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+      }
+    ],
+    "revision": "7",
+    "schemaVersion": 1
+  },
+  "canonicalUtf8": "{\"authorityEpoch\":\"3\",\"currentKid\":\"z\",\"deploymentId\":\"prod_1\",\"issuer\":\"https://authority.example\",\"keys\":[{\"activatedAt\":\"1\",\"alg\":\"ES256\",\"crv\":\"P-256\",\"kid\":\"z\",\"retireAt\":null,\"state\":\"current\",\"x\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"y\":\"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI\"},{\"activatedAt\":\"2\",\"alg\":\"ES256\",\"crv\":\"P-256\",\"kid\":\"é\",\"retireAt\":null,\"state\":\"verification_only\",\"x\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"y\":\"BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ\"}],\"revision\":\"7\",\"schemaVersion\":1}",
+  "digest": "742d7f195261e3fe8fc3ac4992d94bfbbd9b02055c102c3829fea956708fb24a",
+  "u64Boundaries": [
+    "9007199254740991",
+    "9007199254740992",
+    "9007199254740993",
+    "18446744073709551615"
+  ]
+}

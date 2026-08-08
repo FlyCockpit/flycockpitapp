@@ -84,6 +84,12 @@
     "./lib/remote-authority-file": {
       "default": "./src/lib/remote-authority-file.ts"
     },
+    "./lib/remote-authority-runtime": {
+      "default": "./src/lib/remote-authority-runtime.ts"
+    },
+    "./lib/remote-authority-storage": {
+      "default": "./src/lib/remote-authority-storage.ts"
+    },
     "./enterprise/relay-fleet": {
       "default": "./src/enterprise/relay-fleet.ts"
     }

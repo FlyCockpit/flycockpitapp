@@ -56,7 +56,12 @@ export interface PublicAuthorityRing {
   keys: PublicAuthorityKey[];
 }
 const exact = (actual: object, names: readonly string[], label: string) => {
-  if (Object.keys(actual).sort().join(",") !== [...names].sort().join(","))
+  const actualNames = Object.keys(actual).sort(),
+    expected = [...names].sort();
+  if (
+    actualNames.length !== expected.length ||
+    actualNames.some((name, index) => name !== expected[index])
+  )
     throw new Error(`${label} has missing or unknown fields`);
 };
 const b64 = (value: string, label: string) => {
@@ -127,7 +132,8 @@ function validateKey(raw: unknown, index: number): AuthorityPrivateKey {
   if (
     typeof key.kid !== "string" ||
     Buffer.byteLength(key.kid) < 1 ||
-    Buffer.byteLength(key.kid) > 128
+    Buffer.byteLength(key.kid) > 128 ||
+    Buffer.from(key.kid).some((byte) => byte < 32 || byte === 127)
   )
     throw new Error("invalid kid");
   if (
@@ -145,7 +151,11 @@ function validateKey(raw: unknown, index: number): AuthorityPrivateKey {
     y = key.y as string,
     d = key.d as string;
   u64(key.activatedAt, "activatedAt");
-  if (key.retireAt !== null) u64(key.retireAt, "retireAt");
+  if (key.retireAt !== null) {
+    u64(key.retireAt, "retireAt");
+    if (BigInt(key.retireAt as string) <= BigInt(key.activatedAt as string))
+      throw new Error("retirement must follow activation");
+  }
   const jwk = { kty: "EC", crv: "P-256", x, y, d };
   try {
     const privateKey = createPrivateKey({ key: jwk, format: "jwk" });
@@ -164,7 +174,8 @@ export function parseAuthorityRingFile(raw: unknown, previousRevision?: string):
     value.schemaVersion !== 1 ||
     typeof value.currentKid !== "string" ||
     !Array.isArray(value.keys) ||
-    value.keys.length === 0
+    value.keys.length === 0 ||
+    value.keys.length > 64
   )
     throw new Error("invalid ring header");
   const revision = u64(value.revision, "revision"),
@@ -181,6 +192,7 @@ export function parseAuthorityRingFile(raw: unknown, previousRevision?: string):
   const current = keys.filter((k) => k.state === "current");
   if (current.length !== 1 || current[0]!.kid !== value.currentKid)
     throw new Error("ring requires exactly one matching current key");
+  if (current[0]!.retireAt !== null) throw new Error("current key cannot be retired");
   return { schemaVersion: 1, revision, authorityEpoch, currentKid: value.currentKid, keys };
 }
 export function publicAuthorityRing(
@@ -209,9 +221,15 @@ export function authorityRingDigest(
 ) {
   return createHash("sha256").update(canonicalAuthorityRing(ring, config)).digest("hex");
 }
+export function publicAuthorityRingDigest(ring: PublicAuthorityRing) {
+  return createHash("sha256").update(canonicalizeRfc8785(ring)).digest("hex");
+}
 
 function same(a: unknown, b: unknown) {
   return canonicalizeRfc8785(a) === canonicalizeRfc8785(b);
+}
+function arraysEqual(a: readonly string[], b: readonly string[]) {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 export function validateThreeDigestPlan(
   d0: PublicAuthorityRing,
@@ -308,8 +326,42 @@ export function reduceAuthorityRollout(args: {
   });
   const required = args.snapshot.members.filter((m) => m.state === "required");
   if (required.length === 0) return unavailable("empty_required_membership");
+  try {
+    u64(args.now, "redis time");
+    u64(args.snapshot.membershipGeneration, "membership generation");
+    if (args.previousRedisTime) u64(args.previousRedisTime, "previous redis time");
+    for (const lease of args.leases) {
+      for (const [name, value] of [
+        ["replica generation", lease.replicaGeneration],
+        ["lease generation", lease.leaseGeneration],
+        ["revision", lease.revision],
+        ["authority epoch", lease.authorityEpoch],
+        ["observed redis time", lease.observedRedisTime],
+        ["expiry", lease.expiresAt],
+      ] as const)
+        u64(value, name);
+    }
+  } catch {
+    return unavailable("malformed_counter");
+  }
   if (args.previousRedisTime && BigInt(args.now) < BigInt(args.previousRedisTime))
     return unavailable("redis_time_regression");
+  for (const digest of args.plan) {
+    const planned = args.rings.get(digest);
+    if (!planned || publicAuthorityRingDigest(planned) !== digest)
+      return unavailable("digest_ring_mismatch");
+  }
+  if (args.plan.length === 3) {
+    try {
+      validateThreeDigestPlan(
+        args.rings.get(args.plan[0])!,
+        args.rings.get(args.plan[1])!,
+        args.rings.get(args.plan[2])!,
+      );
+    } catch {
+      return unavailable("invalid_rotation_plan");
+    }
+  }
   const observed: ObservationLease[] = [];
   for (const member of required) {
     const matches = args.leases.filter(
@@ -336,10 +388,10 @@ export function reduceAuthorityRollout(args: {
         r.currentKid !== l.currentKid ||
         r.revision !== l.revision ||
         r.authorityEpoch !== l.authorityEpoch ||
-        r.keys
-          .filter((k) => k.state !== "revoked")
-          .map((k) => k.kid)
-          .join("\0") !== l.publicKids.join("\0")
+        !arraysEqual(
+          r.keys.filter((k) => k.state !== "revoked").map((k) => k.kid),
+          l.publicKids,
+        )
       );
     })
   )
@@ -361,7 +413,7 @@ export function reduceAuthorityRollout(args: {
     return {
       ready: true,
       mayMint: true,
-      signingKid: args.rings.get(d0)!.currentKid,
+      signingKid: ring.currentKid,
       phase: args.localDigest === d0 ? "D0" : "D1",
       reason: "ready",
     };
@@ -417,6 +469,25 @@ export async function createRemoteAuthorityStatusJws(
   status: RemoteAuthorityStatusV1,
   signer: RemoteAuthoritySigner,
 ) {
+  exact(
+    status,
+    [
+      "schemaVersion",
+      "iss",
+      "aud",
+      "deploymentId",
+      "revision",
+      "ringDigest",
+      "authorityEpoch",
+      "statusGeneration",
+      "revokedKids",
+      "iat",
+      "validUntil",
+    ],
+    "status",
+  );
+  if (status.schemaVersion !== 1 || status.aud !== "flycockpit-remote-authority-status-v1")
+    throw new Error("invalid status version or audience");
   normalizeAuthorityIssuer(status.iss);
   if (
     !/^[A-Za-z0-9_-]{1,64}$/.test(status.deploymentId) ||
@@ -457,12 +528,124 @@ export async function createRemoteAuthorityStatusJws(
   if (Buffer.byteLength(compact) > 16_384) throw new Error("status JWS exceeds limit");
   return compact;
 }
-export function publicAuthorityJwks(ring: AuthorityRingFile, now: string) {
+function decodeB64(value: string) {
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.includes("="))
+    throw new Error("noncanonical base64url");
+  const bytes = Buffer.from(value, "base64url");
+  if (bytes.toString("base64url") !== value) throw new Error("noncanonical base64url");
+  return bytes;
+}
+export async function verifyRemoteAuthorityStatusJws(
+  compact: string,
+  verifier: RemoteAuthorityVerifier,
+  expected: {
+    issuer: string;
+    deploymentId: string;
+    ringDigest: string;
+    authorityEpoch: string;
+    minimumGeneration: string;
+    now: string;
+  },
+) {
+  if (Buffer.byteLength(compact) > 16_384) throw new Error("status JWS exceeds limit");
+  const parts = compact.split(".");
+  if (parts.length !== 3) throw new Error("invalid compact status");
+  const headerBytes = decodeB64(parts[0]!),
+    payloadBytes = decodeB64(parts[1]!),
+    signature = decodeB64(parts[2]!);
+  if (signature.length !== 64) throw new Error("invalid P1363 width");
+  const s = BigInt(`0x${signature.subarray(32).toString("hex")}`),
+    half = BigInt("0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8");
+  if (s === 0n || s > half) throw new Error("invalid high-S signature");
+  let header: unknown, payload: unknown;
+  try {
+    header = JSON.parse(headerBytes.toString("utf8"));
+    payload = JSON.parse(payloadBytes.toString("utf8"));
+  } catch {
+    throw new Error("invalid status JSON");
+  }
+  if (
+    Buffer.from(canonicalizeRfc8785(header)).compare(headerBytes) !== 0 ||
+    Buffer.from(canonicalizeRfc8785(payload)).compare(payloadBytes) !== 0
+  )
+    throw new Error("noncanonical status JSON");
+  if (!header || typeof header !== "object" || Array.isArray(header))
+    throw new Error("invalid status header");
+  exact(header, ["alg", "kid", "typ"], "status header");
+  const h = header as Record<string, unknown>;
+  if (
+    h.alg !== "ES256" ||
+    h.typ !== "flycockpit-remote-authority-status+jws" ||
+    typeof h.kid !== "string"
+  )
+    throw new Error("invalid status header");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    throw new Error("invalid status payload");
+  const p = payload as RemoteAuthorityStatusV1;
+  exact(
+    p,
+    [
+      "schemaVersion",
+      "iss",
+      "aud",
+      "deploymentId",
+      "revision",
+      "ringDigest",
+      "authorityEpoch",
+      "statusGeneration",
+      "revokedKids",
+      "iat",
+      "validUntil",
+    ],
+    "status payload",
+  );
+  await createRemoteAuthorityStatusJws(
+    { ...p },
+    {
+      kid: h.kid,
+      async signP1363() {
+        return new Uint8Array(64).fill(1);
+      },
+    },
+  ).catch((error) => {
+    if (error instanceof Error && error.message === "invalid provider signature") return;
+    throw error;
+  });
+  if (
+    p.iss !== expected.issuer ||
+    p.deploymentId !== expected.deploymentId ||
+    p.ringDigest !== expected.ringDigest ||
+    p.authorityEpoch !== expected.authorityEpoch ||
+    BigInt(p.statusGeneration) < BigInt(expected.minimumGeneration) ||
+    BigInt(expected.now) > BigInt(p.validUntil) + REMOTE_AUTHORITY.verificationSkew
+  )
+    throw new Error("status scope, generation, or time mismatch");
+  const input = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+  if (!(await verifier.verifyP1363(input, signature, h.kid)))
+    throw new Error("status signature invalid");
+  return { header: h, payload: p };
+}
+export interface AuthorityPublicJwks {
+  keys: Array<{
+    alg: "ES256";
+    crv: "P-256";
+    kid: string;
+    kty: "EC";
+    use: "sig";
+    x: string;
+    y: string;
+  }>;
+}
+export function publicAuthorityJwks(ring: AuthorityRingFile, now: string): AuthorityPublicJwks {
+  u64(now, "JWKS time");
   const time = BigInt(now);
   return {
     keys: ring.keys
       .filter(
-        (key) => key.state !== "revoked" && (key.retireAt === null || BigInt(key.retireAt) > time),
+        (key) =>
+          key.state !== "revoked" &&
+          BigInt(key.activatedAt) <= time &&
+          (key.retireAt === null || BigInt(key.retireAt) > time),
       )
       .map((key) => ({
         alg: "ES256",
@@ -482,8 +665,11 @@ export class AuthorityPublicSnapshot {
   #body:
     | { jwks: string; status: string; etagJwks: string; etagStatus: string; serveUntil: bigint }
     | undefined;
-  publish(jwks: unknown, status: string, statusValidUntil: string, now: string) {
+  publish(jwks: AuthorityPublicJwks, status: string, statusValidUntil: string, now: string) {
+    u64(statusValidUntil, "status expiry");
+    u64(now, "snapshot time");
     const jwksBody = canonicalizeRfc8785(jwks);
+    if (jwksBody.includes('"d"')) throw new Error("private key material cannot be published");
     this.#body = {
       jwks: jwksBody,
       status,
@@ -494,17 +680,147 @@ export class AuthorityPublicSnapshot {
     };
   }
   read(kind: "jwks" | "status", now: string) {
+    try {
+      u64(now, "snapshot time");
+    } catch {
+      return undefined;
+    }
     if (!this.#body || BigInt(now) > this.#body.serveUntil) return undefined;
     return kind === "jwks"
       ? { body: this.#body.jwks, etag: this.#body.etagJwks }
       : { body: this.#body.status, etag: this.#body.etagStatus };
   }
 }
+
+export type SigningJournalState = "reserved" | "signed" | "finalized" | "aborted";
+export interface SigningJournalEntry {
+  mintId: string;
+  signingGeneration: string;
+  kid: string;
+  claimsHash: string;
+  state: SigningJournalState;
+  signatureP1363?: string;
+  compactJws?: string;
+  signedAt?: string;
+}
+export interface SigningFence {
+  kid: string;
+  signingGeneration: string;
+  state: "open" | "closing" | "frozen";
+  cutoff?: string;
+}
+export type ProviderReconciliation = "confirmed_signed" | "confirmed_not_started" | "indeterminate";
+export function reserveAuthorityMint(
+  fence: SigningFence,
+  entry: Omit<SigningJournalEntry, "state">,
+): SigningJournalEntry {
+  if (
+    fence.state !== "open" ||
+    entry.kid !== fence.kid ||
+    entry.signingGeneration !== fence.signingGeneration
+  )
+    throw new Error("signing fence closed or generation mismatch");
+  return { ...entry, state: "reserved" };
+}
+export function reconcileAuthorityFence(args: {
+  fence: SigningFence;
+  rows: readonly SigningJournalEntry[];
+  provider: ReadonlyMap<string, ProviderReconciliation>;
+  postgresNow: string;
+}): { fence: SigningFence; rows: SigningJournalEntry[]; ready: boolean } {
+  u64(args.postgresNow, "Postgres time");
+  if (args.fence.state !== "closing") throw new Error("fence must be closing");
+  const rows = args.rows.map((row) => {
+    if (row.signingGeneration !== args.fence.signingGeneration) return row;
+    if (row.state === "reserved") {
+      const result = args.provider.get(row.mintId);
+      if (result === "confirmed_not_started") return { ...row, state: "aborted" as const };
+      if (result === "confirmed_signed") return { ...row, state: "signed" as const };
+    }
+    if (row.state === "signed")
+      return { ...row, state: "finalized" as const, signedAt: args.postgresNow };
+    return row;
+  });
+  const pending = rows.some(
+    (row) =>
+      row.signingGeneration === args.fence.signingGeneration &&
+      (row.state === "reserved" || row.state === "signed"),
+  );
+  if (pending) return { fence: args.fence, rows, ready: false };
+  const finalized = rows
+    .filter((row) => row.kid === args.fence.kid && row.state === "finalized" && row.signedAt)
+    .map((row) => BigInt(row.signedAt!));
+  const cutoff = finalized.length
+    ? finalized.reduce((a, b) => (a > b ? a : b)).toString()
+    : args.postgresNow;
+  return { fence: { ...args.fence, state: "frozen", cutoff }, rows, ready: true };
+}
+export function authorityRetirementFloor(cutoff: string) {
+  u64(cutoff, "signing cutoff");
+  return (
+    BigInt(cutoff) +
+    REMOTE_AUTHORITY.maxCertificateLifetime +
+    REMOTE_AUTHORITY.verificationSkew
+  ).toString();
+}
+
+export interface LifecycleTransition {
+  transitionId: string;
+  state: "reserved" | "status_signed" | "committed" | "aborted";
+  fromRevision: string;
+  toRevision: string;
+  fromDigest: string;
+  toDigest: string;
+  fromAuthorityEpoch: string;
+  toAuthorityEpoch: string;
+  fromCurrentKid: string;
+  toCurrentKid: string;
+  statusGeneration: string;
+  statusBodyDigest: string;
+  signingGeneration: string;
+}
+export function validateLifecycleTransition(
+  value: LifecycleTransition,
+  replacementSignerKid: string,
+) {
+  for (const key of [
+    "fromRevision",
+    "toRevision",
+    "fromAuthorityEpoch",
+    "toAuthorityEpoch",
+    "statusGeneration",
+    "signingGeneration",
+  ] as const)
+    u64(value[key], key);
+  if (
+    BigInt(value.toRevision) !== BigInt(value.fromRevision) + 1n ||
+    BigInt(value.toAuthorityEpoch) !== BigInt(value.fromAuthorityEpoch) + 1n
+  )
+    throw new Error("lifecycle counters must increment");
+  if (
+    !/^[0-9a-f]{64}$/.test(value.fromDigest) ||
+    !/^[0-9a-f]{64}$/.test(value.toDigest) ||
+    !/^[0-9a-f]{64}$/.test(value.statusBodyDigest)
+  )
+    throw new Error("invalid lifecycle digest");
+  if (
+    !replacementSignerKid ||
+    (replacementSignerKid === value.fromCurrentKid && value.toCurrentKid === value.fromCurrentKid)
+  )
+    throw new Error("transition requires an authorized non-revoked signer");
+  return value;
+}
 export class RingAuthorityVerifier implements RemoteAuthorityVerifier {
   #keys = new Map<string, ReturnType<typeof createPublicKey>>();
-  constructor(ring: AuthorityRingFile) {
+  constructor(ring: AuthorityRingFile, now: string) {
+    u64(now, "verifier time");
+    const time = BigInt(now);
     for (const key of ring.keys)
-      if (key.state !== "revoked")
+      if (
+        key.state !== "revoked" &&
+        BigInt(key.activatedAt) <= time &&
+        (key.retireAt === null || BigInt(key.retireAt) > time)
+      )
         this.#keys.set(
           key.kid,
           createPublicKey({

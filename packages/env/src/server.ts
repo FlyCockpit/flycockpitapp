@@ -41,6 +41,17 @@ export const env = createEnv({
     SERVER_PORT: z.coerce.number().int().min(1).max(65_535).optional(),
     BETTER_AUTH_SECRET: z.string().min(32),
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
+    REMOTE_GRANT_SIGNING_KEY_FILE: z.string().optional(),
+    REMOTE_AUTHORITY_DEPLOYMENT_ID: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,64}$/)
+      .optional(),
+    REMOTE_AUTHORITY_REPLICA_ID: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,128}$/)
+      .optional(),
+    REMOTE_AUTHORITY_ISSUER: z.string().optional(),
+    REMOTE_GRANT_SIGNING_KEY_DIGESTS: z.string().optional(),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SSO_ENABLED: strictBooleanFlag(),
     SSO_CLIENT_ID: z.string().optional(),

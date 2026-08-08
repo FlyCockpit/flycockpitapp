@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { generateKeyPairSync } from "node:crypto";
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { link, open, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   type AuthorityPrivateKey,
@@ -46,7 +46,14 @@ async function write(path: string, ring: AuthorityRingFile) {
     await handle.writeFile(`${JSON.stringify(ring, null, 2)}\n`);
     await handle.sync();
     await handle.close();
-    await rename(temp, path);
+    await link(temp, path);
+    await unlink(temp);
+    const directory = await open(dirname(path), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   } catch (error) {
     await handle.close().catch(() => {});
     await unlink(temp).catch(() => {});
@@ -137,7 +144,12 @@ async function main() {
         !prior.keys.some((k) => k.kid !== kid && k.state !== "revoked")
       )
         throw new Error("cannot revoke sole signer");
-      const replacement = required("replacement-kid");
+      const replacement = required("replacement-kid"),
+        replacementKey = prior.keys.find((k) => k.kid === replacement);
+      if (!replacementKey || replacementKey.state === "revoked" || replacement === kid)
+        throw new Error("replacement signer is invalid");
+      if (kid !== prior.currentKid && replacement !== prior.currentKid)
+        throw new Error("verification-only revocation must retain current signer");
       ring = {
         ...prior,
         revision: increment(prior.revision),
@@ -149,8 +161,8 @@ async function main() {
         })),
       };
     } else throw new Error("command must be initialize, publish, promote, retire, or revoke");
-    parseAuthorityRingFile(ring);
   }
+  ring = parseAuthorityRingFile(ring);
   await write(output, ring);
   const digest = authorityRingDigest(ring, cfg);
   process.stdout.write(

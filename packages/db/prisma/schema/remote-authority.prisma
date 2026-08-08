@@ -26,20 +26,21 @@ enum RemoteAuthorityTransitionState {
 
 model RemoteAuthorityReplicaMembership {
   deploymentId         String
-  membershipGeneration BigInt
+  membershipGeneration Decimal                     @db.Decimal(20, 0)
   replicaId            String
-  replicaGeneration    BigInt
+  replicaGeneration    Decimal                     @db.Decimal(20, 0)
   state                RemoteAuthorityReplicaState
   updatedAt            DateTime                    @updatedAt
 
   @@id([deploymentId, replicaId])
   @@index([deploymentId, membershipGeneration, state])
+  @@map("remote_authority_replica_memberships")
 }
 
 model RemoteAuthoritySigningJournal {
   mintId            String                      @id
   deploymentId      String
-  signingGeneration BigInt
+  signingGeneration Decimal                     @db.Decimal(20, 0)
   kid               String
   claimsHash        String
   state             RemoteAuthoritySigningState
@@ -52,36 +53,95 @@ model RemoteAuthoritySigningJournal {
 
   @@unique([deploymentId, mintId, claimsHash])
   @@index([deploymentId, kid, state])
+  @@map("remote_authority_signing_journal")
 }
 
 model RemoteAuthoritySigningFence {
   deploymentId      String
   kid               String
-  signingGeneration BigInt
+  signingGeneration Decimal                   @db.Decimal(20, 0)
   state             RemoteAuthorityFenceState
   cutoff            DateTime?
   updatedAt         DateTime                  @updatedAt
 
   @@id([deploymentId, kid])
+  @@map("remote_authority_signing_fences")
 }
 
 model RemoteAuthorityLifecycleTransition {
   transitionId       String                         @id
   deploymentId       String
   state              RemoteAuthorityTransitionState
-  fromRevision       BigInt
-  toRevision         BigInt
+  fromRevision       Decimal                        @db.Decimal(20, 0)
+  toRevision         Decimal                        @db.Decimal(20, 0)
   fromDigest         String
   toDigest           String
-  fromAuthorityEpoch BigInt
-  toAuthorityEpoch   BigInt
+  fromAuthorityEpoch Decimal                        @db.Decimal(20, 0)
+  toAuthorityEpoch   Decimal                        @db.Decimal(20, 0)
   fromCurrentKid     String
   toCurrentKid       String
-  statusGeneration   BigInt
+  statusGeneration   Decimal                        @db.Decimal(20, 0)
   statusBodyDigest   String
-  signingGeneration  BigInt
+  signingGeneration  Decimal                        @db.Decimal(20, 0)
   createdAt          DateTime                       @default(now())
   updatedAt          DateTime                       @updatedAt
 
   @@index([deploymentId, state])
+  @@map("remote_authority_lifecycle_transitions")
+}
+
+model RemoteAuthorityLifecycleState {
+  deploymentId    String   @id
+  revision        Decimal  @db.Decimal(20, 0)
+  ringDigest      String
+  authorityEpoch  Decimal  @db.Decimal(20, 0)
+  currentKid      String
+  revokedKidsJson String
+  generation      Decimal  @db.Decimal(20, 0)
+  updatedAt       DateTime @updatedAt
+
+  @@map("remote_authority_lifecycle_state")
+}
+
+model RemoteAuthorityStatus {
+  deploymentId     String
+  statusGeneration Decimal   @db.Decimal(20, 0)
+  revision         Decimal   @db.Decimal(20, 0)
+  ringDigest       String
+  authorityEpoch   Decimal   @db.Decimal(20, 0)
+  kid              String
+  compactJws       String
+  issuedAt         DateTime
+  validUntil       DateTime
+  finalizedAt      DateTime?
+
+  @@id([deploymentId, statusGeneration])
+  @@index([deploymentId, ringDigest, authorityEpoch, finalizedAt])
+  @@map("remote_authority_statuses")
+}
+
+model RemoteAuthorityRingSnapshot {
+  deploymentId   String
+  ringDigest     String
+  revision       Decimal  @db.Decimal(20, 0)
+  authorityEpoch Decimal  @db.Decimal(20, 0)
+  canonicalJson  String
+  observedAt     DateTime @default(now())
+
+  @@id([deploymentId, ringDigest])
+  @@map("remote_authority_ring_snapshots")
+}
+
+model RemoteAuthorityControlOutbox {
+  eventId      String    @id
+  deploymentId String
+  generation   Decimal   @db.Decimal(20, 0)
+  eventType    String
+  payload      String
+  createdAt    DateTime  @default(now())
+  deliveredAt  DateTime?
+
+  @@unique([deploymentId, generation, eventType])
+  @@index([deploymentId, deliveredAt, generation])
+  @@map("remote_authority_control_outbox")
 }

@@ -16,7 +16,8 @@
       "entry": [
         // Invoked by scripts/backup.sh via `node`, not statically imported.
         // Knip can't trace shell-script entry points, so declare it here.
-        "scripts/upload-backup-to-s3.mjs!"
+        "scripts/upload-backup-to-s3.mjs!",
+        "scripts/remote-authority-keys.ts!"
       ],
       "ignoreBinaries": [
         // Global local-dev CLI. Intentionally not listed in package.json.

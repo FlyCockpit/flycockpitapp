@@ -1,4 +1,6 @@
-use super::{App, CopyCommand, CopyFormat, parse_copy_command, parse_copy_format, select_agent_text};
+use super::{
+    App, CopyCommand, CopyFormat, parse_copy_command, parse_copy_format, select_agent_text,
+};
 use crate::tui::history::HistoryEntry;
 
 fn agent(text: &str) -> HistoryEntry {
@@ -189,11 +191,7 @@ fn trailing_garbage_after_a_complete_command_is_an_error() {
 
 #[test]
 fn select_agent_text_is_newest_first_one_indexed() {
-    let history = vec![
-        agent("oldest"),
-        agent("middle"),
-        agent("newest"),
-    ];
+    let history = vec![agent("oldest"), agent("middle"), agent("newest")];
     assert_eq!(select_agent_text(&history, None).as_deref(), Some("newest"));
     assert_eq!(
         select_agent_text(&history, Some(1)).as_deref(),

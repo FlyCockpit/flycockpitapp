@@ -1991,7 +1991,8 @@ impl App {
         // inside `cockpit_core::diagnostics::render`. Metadata only — see
         // `crate::clipboard::recovery::doctor_lines`.
         if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
-            let (lines, _) = crate::clipboard::recovery::doctor_lines(self.clipboard_recovery, &dir);
+            let (lines, _) =
+                crate::clipboard::recovery::doctor_lines(self.clipboard_recovery, &dir);
             rendered.push('\n');
             rendered.push_str(&lines.join("\n"));
         }
@@ -2133,9 +2134,7 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.show_toast(
-                    format!(
-                        "{e}. Usage: `/copy [N] [markdown|plain|rich] [file <path>]`"
-                    ),
+                    format!("{e}. Usage: `/copy [N] [markdown|plain|rich] [file <path>]`"),
                     ToastKind::Info,
                 );
                 return;
@@ -2158,13 +2157,15 @@ impl App {
         }
 
         let (msg, kind) = match command.format {
-            CopyFormat::Markdown => match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
-                Ok(result) => super::copy_actions::describe_delivered(
-                    &result,
-                    "Copied last response (markdown).".to_string(),
-                ),
-                Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
-            },
+            CopyFormat::Markdown => {
+                match crate::clipboard::copy_plain(&text, self.clipboard_recovery) {
+                    Ok(result) => super::copy_actions::describe_delivered(
+                        &result,
+                        "Copied last response (markdown).".to_string(),
+                    ),
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
             CopyFormat::Plain => {
                 let plain = crate::clipboard::markdown_to_plain(&text);
                 match crate::clipboard::copy_plain(&plain, self.clipboard_recovery) {
@@ -2213,7 +2214,12 @@ impl App {
     /// first request's disk write may still complete, but its result is
     /// discarded by the runner (never applied to a since-changed view) —
     /// see `crate::tui::app::async_actions::apply_async_action_result`.
-    pub(super) fn start_copy_to_file_action(&mut self, path: String, format: CopyFormat, text: String) {
+    pub(super) fn start_copy_to_file_action(
+        &mut self,
+        path: String,
+        format: CopyFormat,
+        text: String,
+    ) {
         let target = std::path::PathBuf::from(&path);
         let payload = Self::render_copy_file_payload(format, &text);
         if payload.len() > crate::clipboard::file_publish::MAX_PAYLOAD_BYTES {

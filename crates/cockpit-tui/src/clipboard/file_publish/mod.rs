@@ -86,7 +86,10 @@ impl std::fmt::Display for PublishError {
             Self::ParentNotADirectory => write!(f, "parent path is not a directory"),
             Self::PayloadTooLarge { max } => write!(f, "payload exceeds {max} bytes"),
             Self::UnsupportedAtomicNoClobber => {
-                write!(f, "atomic no-clobber file publication is not supported here")
+                write!(
+                    f,
+                    "atomic no-clobber file publication is not supported here"
+                )
             }
             Self::Cancelled => write!(f, "cancelled"),
             Self::Io(message) => write!(f, "{message}"),

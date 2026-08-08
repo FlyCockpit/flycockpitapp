@@ -16,7 +16,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use super::{Published, PublishError};
+use super::{PublishError, Published};
 
 fn cstring(component: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(component.as_encoded_bytes())
@@ -32,7 +32,10 @@ struct OpenedParent {
 }
 
 fn open_parent_nofollow(target: &Path) -> Result<OpenedParent, PublishError> {
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
         .ok_or_else(|| PublishError::Io("target has no file name".to_string()))?;
@@ -139,7 +142,12 @@ fn unlink_temp(parent: &File, name: &CStr) {
 /// replace-if-exists) without a real filesystem, and simulate a kernel
 /// that lacks `renameat2` (`ENOSYS`/`EINVAL`) without needing one.
 pub(super) trait PublishBackend {
-    fn rename_no_replace(&mut self, parent_fd: RawFd, from: &CStr, to: &CStr) -> Result<(), BackendError>;
+    fn rename_no_replace(
+        &mut self,
+        parent_fd: RawFd,
+        from: &CStr,
+        to: &CStr,
+    ) -> Result<(), BackendError>;
 }
 
 /// The three I/O barriers around publication that are *not* the rename
@@ -182,7 +190,12 @@ pub(super) struct RealBackend;
 
 #[cfg(target_os = "linux")]
 impl PublishBackend for RealBackend {
-    fn rename_no_replace(&mut self, parent_fd: RawFd, from: &CStr, to: &CStr) -> Result<(), BackendError> {
+    fn rename_no_replace(
+        &mut self,
+        parent_fd: RawFd,
+        from: &CStr,
+        to: &CStr,
+    ) -> Result<(), BackendError> {
         const RENAME_NOREPLACE: libc::c_uint = 1;
         // SAFETY: `parent_fd` is a live descriptor; `from`/`to` stay alive
         // for the call. Same source and destination directory (self-rename
@@ -221,7 +234,11 @@ impl PublishBackend for RealBackend {
 /// before returning `Ok`. Not used on macOS, which never falls back to
 /// `linkat` (its `renameatx_np` path is used exclusively).
 #[cfg(not(target_os = "macos"))]
-pub(super) fn linkat_fallback(parent_fd: RawFd, from: &CStr, to: &CStr) -> Result<(), BackendError> {
+pub(super) fn linkat_fallback(
+    parent_fd: RawFd,
+    from: &CStr,
+    to: &CStr,
+) -> Result<(), BackendError> {
     // SAFETY: `parent_fd` is a live descriptor; `from`/`to` stay alive for
     // the call.
     let linked = unsafe { libc::linkat(parent_fd, from.as_ptr(), parent_fd, to.as_ptr(), 0) };
@@ -247,7 +264,12 @@ pub(super) struct RealBackend;
 
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 impl PublishBackend for RealBackend {
-    fn rename_no_replace(&mut self, parent_fd: RawFd, from: &CStr, to: &CStr) -> Result<(), BackendError> {
+    fn rename_no_replace(
+        &mut self,
+        parent_fd: RawFd,
+        from: &CStr,
+        to: &CStr,
+    ) -> Result<(), BackendError> {
         linkat_fallback(parent_fd, from, to)
     }
 }
@@ -273,14 +295,26 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 impl PublishBackend for RealBackend {
-    fn rename_no_replace(&mut self, parent_fd: RawFd, from: &CStr, to: &CStr) -> Result<(), BackendError> {
+    fn rename_no_replace(
+        &mut self,
+        parent_fd: RawFd,
+        from: &CStr,
+        to: &CStr,
+    ) -> Result<(), BackendError> {
         // From <sys/fcntl.h>: RENAME_EXCL fails rather than replacing an
         // existing destination.
         const RENAME_EXCL: libc::c_uint = 0x0004;
         // SAFETY: `parent_fd` is a live descriptor; `from`/`to` stay alive
         // for the call.
-        let result =
-            unsafe { renameatx_np(parent_fd, from.as_ptr(), parent_fd, to.as_ptr(), RENAME_EXCL) };
+        let result = unsafe {
+            renameatx_np(
+                parent_fd,
+                from.as_ptr(),
+                parent_fd,
+                to.as_ptr(),
+                RENAME_EXCL,
+            )
+        };
         if result == 0 {
             return Ok(());
         }
@@ -308,8 +342,8 @@ pub(super) fn publish_with<B: PublishBackend, IO: PublishIo>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Published, PublishError> {
     let parent = open_parent_nofollow(target)?;
-    let (mut temp, temp_name) =
-        create_temp_exclusive(&parent.dir).map_err(|e| PublishError::Io(format!("creating temp file: {e}")))?;
+    let (mut temp, temp_name) = create_temp_exclusive(&parent.dir)
+        .map_err(|e| PublishError::Io(format!("creating temp file: {e}")))?;
 
     if let Err(error) = io_ops.write_payload(&mut temp, bytes) {
         unlink_temp(&parent.dir, &temp_name);
@@ -347,7 +381,8 @@ pub(super) fn publish_with<B: PublishBackend, IO: PublishIo>(
         return Err(PublishError::Cancelled);
     }
 
-    let publish_result = backend.rename_no_replace(parent.dir.as_raw_fd(), &temp_name, &parent.dest_name);
+    let publish_result =
+        backend.rename_no_replace(parent.dir.as_raw_fd(), &temp_name, &parent.dest_name);
     match publish_result {
         Ok(()) => {
             // Re-verify identity: reopen the just-published name (relative
@@ -383,7 +418,9 @@ pub(super) fn publish_with<B: PublishBackend, IO: PublishIo>(
             // distinction to the caller.
             let durability_confirmed = io_ops.sync_parent(&parent.dir).is_ok();
             Ok(Published {
-                path: parent.parent_dir.join(target.file_name().unwrap_or_default()),
+                path: parent
+                    .parent_dir
+                    .join(target.file_name().unwrap_or_default()),
                 bytes_written: bytes.len() as u64,
                 durability_confirmed,
             })

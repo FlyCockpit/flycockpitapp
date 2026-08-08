@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::{Published, PublishError};
+use super::{PublishError, Published};
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -125,8 +125,10 @@ fn open_relative(
     };
     let mut handle: HANDLE = std::ptr::null_mut();
     let mut io_status = IO_STATUS_BLOCK::default();
-    let open_options =
-        FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE;
+    let open_options = FILE_OPEN_REPARSE_POINT
+        | FILE_OPEN_FOR_BACKUP_INTENT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | FILE_NON_DIRECTORY_FILE;
     // SAFETY: `parent` is a live, retained directory handle; the name
     // buffer, object attributes, and status block remain live for the
     // call. Resolution is relative to `RootDirectory` only — never a path.
@@ -186,7 +188,11 @@ fn write_all_and_flush(file: &std::fs::File, bytes: &[u8]) -> io::Result<()> {
 
 /// Publish the open temp handle under `dest_name`, resolved relative to
 /// the held parent handle, with no replace-if-exists bit set.
-fn publish_no_replace(temp: &std::fs::File, parent: HANDLE, dest_name: &std::ffi::OsStr) -> io::Result<()> {
+fn publish_no_replace(
+    temp: &std::fs::File,
+    parent: HANDLE,
+    dest_name: &std::ffi::OsStr,
+) -> io::Result<()> {
     let dest_wide = wide(dest_name);
     let name_bytes = ((dest_wide.len() - 1) * std::mem::size_of::<u16>()) as u32;
     let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
@@ -244,7 +250,12 @@ pub(super) fn publish(
     let temp = open_relative(
         parent_handle,
         &temp_name_os,
-        DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | GENERIC_READ | SYNCHRONIZE,
+        DELETE
+            | FILE_WRITE_DATA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_READ_ATTRIBUTES
+            | GENERIC_READ
+            | SYNCHRONIZE,
         FILE_CREATE,
     )
     .map_err(|e| PublishError::Io(format!("creating temp file: {e}")))?;
@@ -283,7 +294,9 @@ pub(super) fn publish(
 
 fn remove_open_file(file: &std::fs::File) {
     use windows_sys::Win32::Storage::FileSystem::{FILE_DISPOSITION_INFO, FileDispositionInfo};
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true as _ };
+    let disposition = FILE_DISPOSITION_INFO {
+        DeleteFile: true as _,
+    };
     // SAFETY: `file` was opened with `DELETE` access; `disposition` matches
     // the exact layout `FileDispositionInfo` requires. Cleanup of our own
     // not-yet-published temp file only — never the caller's target.

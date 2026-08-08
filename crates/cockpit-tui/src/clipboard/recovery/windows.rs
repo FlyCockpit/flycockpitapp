@@ -61,7 +61,10 @@ const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
 fn last_error(context: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("{context}: {}", io::Error::last_os_error()))
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("{context}: {}", io::Error::last_os_error()),
+    )
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -226,7 +229,9 @@ fn build_owner_only_descriptor(owner_sid: &str) -> io::Result<OwnedSecurityDescr
         )
     };
     if converted == 0 {
-        return Err(last_error("building recovery directory security descriptor"));
+        return Err(last_error(
+            "building recovery directory security descriptor",
+        ));
     }
     Ok(OwnedSecurityDescriptor(descriptor))
 }
@@ -259,7 +264,11 @@ fn reject_reparse(handle: HANDLE, expect_directory: bool) -> io::Result<()> {
 /// FA}` (directory) or no broader than that same policy (file, which may
 /// legitimately have inherited, non-protected copies of the same two
 /// ACEs).
-fn verify_owner_only_dacl(handle: HANDLE, owner: &CurrentUserSid, require_protected: bool) -> io::Result<bool> {
+fn verify_owner_only_dacl(
+    handle: HANDLE,
+    owner: &CurrentUserSid,
+    require_protected: bool,
+) -> io::Result<bool> {
     let mut owner_sid: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -294,7 +303,8 @@ fn verify_owner_only_dacl(handle: HANDLE, owner: &CurrentUserSid, require_protec
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: `descriptor` is the live descriptor held above.
-        let queried = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        let queried =
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
         if queried == 0 {
             return Err(last_error("reading security descriptor control bits"));
         }
@@ -350,7 +360,9 @@ fn verify_owner_only_dacl(handle: HANDLE, owner: &CurrentUserSid, require_protec
 }
 
 fn well_known_local_system_sid() -> io::Result<Vec<u8>> {
-    use windows_sys::Win32::Security::{CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinLocalSystemSid};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinLocalSystemSid,
+    };
     let mut buffer = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
     let mut len = buffer.len() as u32;
     // SAFETY: `buffer` is exactly `len` bytes, matching what `CreateWellKnownSid` requires.
@@ -458,7 +470,8 @@ impl DirHandle {
         let descriptor = build_owner_only_descriptor(&owner.string_form)?;
         let wide_path = wide(&path.to_string_lossy());
         let mut attrs = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
@@ -517,8 +530,9 @@ impl DirHandle {
     }
 
     pub fn verify_private(&self) -> io::Result<()> {
-        reject_reparse(self.dir_handle(), true)
-            .map_err(|e| io::Error::other(format!("recovery directory reparse check failed: {e}")))?;
+        reject_reparse(self.dir_handle(), true).map_err(|e| {
+            io::Error::other(format!("recovery directory reparse check failed: {e}"))
+        })?;
         let dacl_ok = verify_owner_only_dacl(self.dir_handle(), &self.owner, true)?;
         let stat = WindowsDirStat {
             is_reparse_point: false,
@@ -535,13 +549,18 @@ impl DirHandle {
             self.dir_handle(),
             name,
             false,
-            DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | READ_CONTROL
+            DELETE
+                | FILE_WRITE_DATA
+                | FILE_WRITE_ATTRIBUTES
+                | FILE_READ_ATTRIBUTES
+                | READ_CONTROL
                 | SYNCHRONIZE,
             FILE_CREATE,
         )?;
         let stat = self.stat_open_file(&file)?;
-        policy::verify_windows_file(stat)
-            .map_err(|v| io::Error::other(format!("new recovery artifact failed containment: {v:?}")))?;
+        policy::verify_windows_file(stat).map_err(|v| {
+            io::Error::other(format!("new recovery artifact failed containment: {v:?}"))
+        })?;
         Ok(file)
     }
 
@@ -625,7 +644,9 @@ impl DirHandle {
                 use windows_sys::Win32::Storage::FileSystem::{
                     FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
                 };
-                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true as _ };
+                let disposition = FILE_DISPOSITION_INFO {
+                    DeleteFile: true as _,
+                };
                 // SAFETY: `file` was opened with `DELETE` access; `disposition`
                 // matches the exact layout `FileDispositionInfo` requires.
                 let removed = unsafe {
@@ -662,7 +683,9 @@ impl DirHandle {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
         };
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true as _ };
+        let disposition = FILE_DISPOSITION_INFO {
+            DeleteFile: true as _,
+        };
         // SAFETY: `verified` was opened with `DELETE` access; `disposition`
         // matches the exact layout `FileDispositionInfo` requires.
         let removed = unsafe {

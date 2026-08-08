@@ -13,7 +13,10 @@ use super::{ArtifactStatus, ClipboardRecovery};
 /// tests can point this at a scratch directory instead of the real one.
 pub fn doctor_lines(mode: ClipboardRecovery, dir: &std::path::Path) -> (Vec<String>, bool) {
     if mode == ClipboardRecovery::Off {
-        return (vec!["clipboard recovery: off (no artifact ever written)".to_string()], false);
+        return (
+            vec!["clipboard recovery: off (no artifact ever written)".to_string()],
+            false,
+        );
     }
 
     match super::artifact_status(dir) {

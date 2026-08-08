@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 import { generateKeyPairSync } from "node:crypto";
-import { link, open, readFile, unlink } from "node:fs/promises";
+import { open, rename, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   type AuthorityPrivateKey,
   type AuthorityRingFile,
+  authorityRetirementFloor,
   authorityRingDigest,
   parseAuthorityConfig,
   parseAuthorityRingFile,
   publicAuthorityRing,
   validateThreeDigestPlan,
 } from "../packages/api/src/lib/remote-authority";
+import { readAuthorityRingFile } from "../packages/api/src/lib/remote-authority-file";
 
 const [command, ...argv] = process.argv.slice(2);
 const flags = new Map<string, string>();
@@ -34,7 +36,7 @@ const config = () =>
   });
 async function load(path: string) {
   if (!isAbsolute(path)) throw new Error("input path must be absolute");
-  return parseAuthorityRingFile(JSON.parse(await readFile(path, "utf8")));
+  return readAuthorityRingFile(path);
 }
 async function write(path: string, ring: AuthorityRingFile) {
   if (!isAbsolute(path) || resolve(path) === resolve(flags.get("input") ?? "."))
@@ -48,8 +50,7 @@ async function write(path: string, ring: AuthorityRingFile) {
     await handle.writeFile(`${JSON.stringify(ring, null, 2)}\n`);
     await handle.sync();
     await handle.close();
-    await link(temp, path);
-    await unlink(temp);
+    await rename(temp, path);
     const directory = await open(dirname(path), "r");
     try {
       await directory.sync();
@@ -161,7 +162,8 @@ async function main() {
         now = BigInt(required("effective-at"));
       if (target?.state !== "verification_only" || target.retireAt !== null)
         throw new Error("only an unretired verification-only key may retire");
-      if (now < cutoff + 2_592_060n) throw new Error("retirement floor not reached");
+      if (now < BigInt(authorityRetirementFloor(cutoff.toString())))
+        throw new Error("retirement floor not reached");
       ring = {
         ...prior,
         revision: increment(prior.revision),

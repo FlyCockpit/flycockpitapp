@@ -429,6 +429,79 @@ export interface RemoteAuthoritySigner {
 export interface RemoteAuthorityVerifier {
   verifyP1363(input: Uint8Array, signature: Uint8Array, kid: string): Promise<boolean>;
 }
+export type NativeEs256Signature =
+  | { encoding: "ieee-p1363"; bytes: Uint8Array }
+  | { encoding: "der"; bytes: Uint8Array };
+
+const P256_ORDER = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+
+function readDerLength(bytes: Uint8Array, offset: number): [number, number] {
+  const first = bytes[offset];
+  if (first === undefined) throw new Error("truncated DER signature");
+  if (first < 0x80) return [first, offset + 1];
+  const width = first & 0x7f;
+  if (width === 0 || width > 2 || offset + width >= bytes.length)
+    throw new Error("invalid DER length");
+  if (bytes[offset + 1] === 0) throw new Error("nonminimal DER length");
+  let value = 0;
+  for (let i = 0; i < width; i++) value = value * 256 + bytes[offset + 1 + i]!;
+  if (value < 0x80) throw new Error("nonminimal DER length");
+  return [value, offset + width + 1];
+}
+
+function readDerScalar(bytes: Uint8Array, offset: number): [Buffer, number] {
+  if (bytes[offset] !== 0x02) throw new Error("invalid DER scalar");
+  const [length, start] = readDerLength(bytes, offset + 1),
+    end = start + length;
+  if (length === 0 || end > bytes.length) throw new Error("truncated DER scalar");
+  let scalar = Buffer.from(bytes.subarray(start, end));
+  if ((scalar[0]! & 0x80) !== 0) throw new Error("negative DER scalar");
+  if (scalar.length > 1 && scalar[0] === 0 && (scalar[1]! & 0x80) === 0)
+    throw new Error("nonminimal DER scalar");
+  if (scalar[0] === 0) scalar = scalar.subarray(1);
+  if (scalar.length > 32) throw new Error("oversized DER scalar");
+  return [Buffer.concat([Buffer.alloc(32 - scalar.length), scalar]), end];
+}
+
+/** Normalize a provider-native ES256 signature without exposing provider key material. */
+export function normalizeEs256Signature(value: NativeEs256Signature): Uint8Array {
+  let signature: Buffer;
+  if (value.encoding === "ieee-p1363") {
+    if (value.bytes.length !== 64) throw new Error("provider returned non-P1363 signature");
+    signature = Buffer.from(value.bytes);
+  } else {
+    const bytes = value.bytes;
+    if (bytes[0] !== 0x30) throw new Error("invalid DER signature");
+    const [length, start] = readDerLength(bytes, 1);
+    if (start + length !== bytes.length) throw new Error("invalid DER signature length");
+    const [r, next] = readDerScalar(bytes, start),
+      [s, end] = readDerScalar(bytes, next);
+    if (end !== bytes.length) throw new Error("trailing DER signature data");
+    signature = Buffer.concat([r, s]);
+  }
+  const r = BigInt(`0x${signature.subarray(0, 32).toString("hex")}`),
+    s = BigInt(`0x${signature.subarray(32).toString("hex")}`);
+  if (r === 0n || r >= P256_ORDER || s === 0n || s >= P256_ORDER)
+    throw new Error("provider returned invalid P-256 scalar");
+  if (s > P256_ORDER / 2n)
+    signature.set(Buffer.from((P256_ORDER - s).toString(16).padStart(64, "0"), "hex"), 32);
+  return signature;
+}
+
+export class InjectedAuthoritySigner implements RemoteAuthoritySigner {
+  constructor(
+    readonly kid: string,
+    private readonly providerSign: (
+      input: Uint8Array,
+      mintId: string,
+    ) => Promise<NativeEs256Signature>,
+  ) {
+    if (!kid || Buffer.byteLength(kid) > 128) throw new Error("invalid provider kid");
+  }
+  async signP1363(input: Uint8Array, mintId: string) {
+    return normalizeEs256Signature(await this.providerSign(input, mintId));
+  }
+}
 export class FileAuthoritySigner implements RemoteAuthoritySigner {
   readonly kid: string;
   #key: ReturnType<typeof createPrivateKey>;
@@ -442,12 +515,7 @@ export class FileAuthoritySigner implements RemoteAuthoritySigner {
   }
   async signP1363(input: Uint8Array, _mintId: string) {
     const value = sign("sha256", input, { key: this.#key, dsaEncoding: "ieee-p1363" });
-    if (value.length !== 64) throw new Error("provider returned non-P1363 signature");
-    const order = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
-      s = BigInt(`0x${value.subarray(32).toString("hex")}`),
-      normalized = s > order / 2n ? order - s : s;
-    value.set(Buffer.from(normalized.toString(16).padStart(64, "0"), "hex"), 32);
-    return value;
+    return normalizeEs256Signature({ encoding: "ieee-p1363", bytes: value });
   }
 }
 
@@ -844,5 +912,41 @@ export class RingAuthorityVerifier implements RemoteAuthorityVerifier {
         signature.length === 64 &&
         verify("sha256", input, { key, dsaEncoding: "ieee-p1363" }, signature),
     );
+  }
+  hasKid(kid: string) {
+    return this.#keys.has(kid);
+  }
+}
+
+/** Issuer-scoped verifier cache. Unknown-kid refresh is coalesced and rate limited. */
+export class CachedAuthorityVerifier implements RemoteAuthorityVerifier {
+  #verifier: RingAuthorityVerifier;
+  #refresh: Promise<void> | undefined;
+  #lastUnknownRefresh = Number.NEGATIVE_INFINITY;
+  constructor(
+    readonly issuer: string,
+    initialRing: AuthorityRingFile,
+    private readonly nowSeconds: () => number,
+    private readonly loadRing: () => Promise<AuthorityRingFile>,
+  ) {
+    normalizeAuthorityIssuer(issuer);
+    this.#verifier = new RingAuthorityVerifier(initialRing, String(Math.floor(nowSeconds())));
+  }
+  async verifyP1363(input: Uint8Array, signature: Uint8Array, kid: string) {
+    if (this.#verifier.hasKid(kid)) return this.#verifier.verifyP1363(input, signature, kid);
+    const now = this.nowSeconds();
+    if (this.#refresh) await this.#refresh;
+    else if (now - this.#lastUnknownRefresh >= Number(REMOTE_AUTHORITY.jwksCacheAge)) {
+      this.#lastUnknownRefresh = now;
+      this.#refresh = this.loadRing()
+        .then((ring) => {
+          this.#verifier = new RingAuthorityVerifier(ring, String(Math.floor(this.nowSeconds())));
+        })
+        .finally(() => {
+          this.#refresh = undefined;
+        });
+      await this.#refresh;
+    }
+    return this.#verifier.verifyP1363(input, signature, kid);
   }
 }

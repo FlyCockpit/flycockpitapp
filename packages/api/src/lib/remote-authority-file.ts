@@ -6,6 +6,7 @@ import { type AuthorityRingFile, parseAuthorityRingFile } from "./remote-authori
 export async function readAuthorityRingFile(
   path: string,
   previousRevision?: string,
+  previousRing?: AuthorityRingFile,
 ): Promise<AuthorityRingFile> {
   if (!isAbsolute(path)) throw new Error("REMOTE_GRANT_SIGNING_KEY_FILE must be absolute");
   const parent = dirname(path);
@@ -47,7 +48,17 @@ export async function readAuthorityRingFile(
     } catch {
       throw new Error("authority ring is not JSON");
     }
-    return parseAuthorityRingFile(raw, previousRevision);
+    const parsed = parseAuthorityRingFile(raw);
+    if (previousRevision !== undefined && BigInt(parsed.revision) <= BigInt(previousRevision)) {
+      if (
+        parsed.revision === previousRevision &&
+        previousRing &&
+        JSON.stringify(parsed) === JSON.stringify(previousRing)
+      )
+        return parsed;
+      throw new Error("authority ring revision is nonmonotonic or reused with changed bytes");
+    }
+    return parsed;
   } finally {
     await handle.close();
   }

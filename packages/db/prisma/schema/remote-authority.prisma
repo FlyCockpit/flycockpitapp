@@ -82,6 +82,8 @@ model RemoteAuthorityLifecycleTransition {
   toCurrentKid       String
   statusGeneration   Decimal                        @db.Decimal(20, 0)
   statusBodyDigest   String
+  statusCompactJws   String?
+  signerKid          String
   signingGeneration  Decimal                        @db.Decimal(20, 0)
   createdAt          DateTime                       @default(now())
   updatedAt          DateTime                       @updatedAt
@@ -118,6 +120,16 @@ model RemoteAuthorityStatus {
   @@id([deploymentId, statusGeneration])
   @@index([deploymentId, ringDigest, authorityEpoch, finalizedAt])
   @@map("remote_authority_statuses")
+}
+
+model RemoteAuthorityStatusLease {
+  deploymentId     String   @id
+  holderReplicaId  String
+  leaseGeneration  Decimal  @db.Decimal(20, 0)
+  expiresAt        DateTime
+  updatedAt        DateTime @updatedAt
+
+  @@map("remote_authority_status_leases")
 }
 
 model RemoteAuthorityRingSnapshot {

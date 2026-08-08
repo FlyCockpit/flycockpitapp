@@ -54,6 +54,30 @@ export interface AuthorityRuntimeStore {
     compactJws: string;
     bodyDigest: string;
   }): Promise<boolean>;
+  acquireStatusLease(args: {
+    deploymentId: string;
+    replicaId: string;
+    leaseGeneration: string;
+  }): Promise<boolean>;
+  prepareLifecycleTransition(args: {
+    transitionId: string;
+    deploymentId: string;
+    from: AuthorityLifecycleRecord;
+    to: PublicAuthorityRing;
+    toDigest: string;
+    statusGeneration: string;
+    statusBodyDigest: string;
+    signerKid: string;
+  }): Promise<boolean>;
+  markTransitionStatusSigned(transitionId: string, compactJws: string): Promise<boolean>;
+  commitLifecycleTransition(args: {
+    transitionId: string;
+    deploymentId: string;
+    status: RemoteAuthorityStatusV1;
+    compactJws: string;
+    signerKid: string;
+    revokedKids: string[];
+  }): Promise<boolean>;
   reserveMint(args: {
     deploymentId: string;
     mintId: string;
@@ -128,25 +152,16 @@ export class RemoteAuthorityRuntime {
     this.#lastRedisTime = now;
     let ring: AuthorityRingFile;
     try {
-      ring = await readAuthorityRingFile(this.options.keyFile, this.#ring?.revision);
+      ring = await readAuthorityRingFile(this.options.keyFile, this.#ring?.revision, this.#ring);
     } catch (error) {
-      if (this.#ring && error instanceof Error && error.message.includes("nonmonotonic"))
-        ring = this.#ring;
-      else return this.#fail("provider_unavailable");
+      return this.#fail("provider_unavailable");
     }
     const digest = authorityRingDigest(ring, this.config);
     if (!this.config.allowedDigests.includes(digest)) return this.#fail("unconfigured_digest");
-    const lifecycle = await this.options.store
+    let lifecycle = await this.options.store
       .loadLifecycle(this.config.deploymentId)
       .catch(() => null);
-    if (
-      !lifecycle ||
-      lifecycle.ringDigest !== digest ||
-      lifecycle.revision !== ring.revision ||
-      lifecycle.authorityEpoch !== ring.authorityEpoch ||
-      lifecycle.currentKid !== ring.currentKid
-    )
-      return this.#fail("lifecycle_mismatch");
+    if (!lifecycle) return this.#fail("lifecycle_missing");
     const membership = await this.options.store
       .loadMembership(this.config.deploymentId)
       .catch(() => null);
@@ -205,6 +220,72 @@ export class RemoteAuthorityRuntime {
       return this.#fail("observation_unavailable");
     }
     if (!this.#decision.ready) return this.#fail(this.#decision.reason);
+    if (lifecycle.ringDigest !== digest) {
+      if (
+        BigInt(ring.revision) !== BigInt(lifecycle.revision) + 1n ||
+        BigInt(ring.authorityEpoch) !== BigInt(lifecycle.authorityEpoch) + 1n
+      ) {
+        if (BigInt(ring.revision) > BigInt(lifecycle.revision))
+          return this.#fail("lifecycle_transition_required");
+      } else {
+        const generation = (BigInt(lifecycle.highestStatusGeneration) + 1n).toString(),
+          revokedKids = publicRing.keys
+            .filter((key) => key.state === "revoked")
+            .map((key) => key.kid),
+          body: RemoteAuthorityStatusV1 = {
+            schemaVersion: 1,
+            iss: this.config.issuer,
+            aud: "flycockpit-remote-authority-status-v1",
+            deploymentId: this.config.deploymentId,
+            revision: ring.revision,
+            ringDigest: digest,
+            authorityEpoch: ring.authorityEpoch,
+            statusGeneration: generation,
+            revokedKids,
+            iat: now,
+            validUntil: (BigInt(now) + REMOTE_AUTHORITY.statusLifetime).toString(),
+          },
+          signer = new FileAuthoritySigner(ring.keys.find((key) => key.kid === ring.currentKid)!),
+          transitionId = createHash("sha256")
+            .update(`${this.config.deploymentId}\0${lifecycle.ringDigest}\0${digest}`)
+            .digest("hex"),
+          bodyDigest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+        if (
+          !(await this.options.store.prepareLifecycleTransition({
+            transitionId,
+            deploymentId: this.config.deploymentId,
+            from: lifecycle,
+            to: publicRing,
+            toDigest: digest,
+            statusGeneration: generation,
+            statusBodyDigest: bodyDigest,
+            signerKid: signer.kid,
+          }))
+        )
+          return this.#fail("lifecycle_transition_conflict");
+        const compactJws = await createRemoteAuthorityStatusJws(body, signer);
+        if (
+          !(await this.options.store.markTransitionStatusSigned(transitionId, compactJws)) ||
+          !(await this.options.store.commitLifecycleTransition({
+            transitionId,
+            deploymentId: this.config.deploymentId,
+            status: body,
+            compactJws,
+            signerKid: signer.kid,
+            revokedKids,
+          }))
+        )
+          return this.#fail("lifecycle_transition_commit_failed");
+        lifecycle = {
+          revision: ring.revision,
+          ringDigest: digest,
+          authorityEpoch: ring.authorityEpoch,
+          currentKid: ring.currentKid,
+          revokedKids,
+          highestStatusGeneration: generation,
+        };
+      }
+    }
     let status = await this.options.store
       .loadHighestFinalizedStatus({
         deploymentId: this.config.deploymentId,
@@ -242,35 +323,56 @@ export class RemoteAuthorityRuntime {
         BigInt(status.status.statusGeneration) <= BigInt(this.#recoveryMinimumGeneration));
     if (!status || mustRecover || BigInt(status.status.validUntil) <= BigInt(now) + 40n) {
       try {
-        const signer = new FileAuthoritySigner(
-          ring.keys.find((k) => k.kid === this.#decision.signingKid)!,
-        );
-        const generation = (BigInt(lifecycle.highestStatusGeneration) + 1n).toString(),
-          body: RemoteAuthorityStatusV1 = {
-            schemaVersion: 1,
-            iss: this.config.issuer,
-            aud: "flycockpit-remote-authority-status-v1",
+        const elected = await this.options.store.acquireStatusLease({
+          deploymentId: this.config.deploymentId,
+          replicaId: this.options.replicaId,
+          leaseGeneration: this.options.leaseGeneration,
+        });
+        if (!elected) {
+          const winner = await this.options.store.loadHighestFinalizedStatus({
             deploymentId: this.config.deploymentId,
-            revision: ring.revision,
             ringDigest: digest,
             authorityEpoch: ring.authorityEpoch,
-            statusGeneration: generation,
-            revokedKids: [...new Set(lifecycle.revokedKids)].sort((a, b) =>
-              Buffer.compare(Buffer.from(a), Buffer.from(b)),
-            ),
-            iat: now,
-            validUntil: (BigInt(now) + 60n).toString(),
-          },
-          compactJws = await createRemoteAuthorityStatusJws(body, signer),
-          committed = await this.options.store.reserveAndFinalizeStatus({
-            deploymentId: this.config.deploymentId,
-            expectedGeneration: lifecycle.highestStatusGeneration,
-            status: body,
-            compactJws,
-            bodyDigest: createHash("sha256").update(compactJws).digest("hex"),
           });
-        if (!committed) return this.#fail("status_generation_conflict");
-        status = { status: body, compactJws };
+          if (winner && BigInt(winner.status.validUntil) > BigInt(now)) status = winner;
+          else return this.#fail("status_election_wait");
+        } else {
+          const signer = new FileAuthoritySigner(
+            ring.keys.find((k) => k.kid === this.#decision.signingKid)!,
+          );
+          const generation = (BigInt(lifecycle.highestStatusGeneration) + 1n).toString(),
+            body: RemoteAuthorityStatusV1 = {
+              schemaVersion: 1,
+              iss: this.config.issuer,
+              aud: "flycockpit-remote-authority-status-v1",
+              deploymentId: this.config.deploymentId,
+              revision: ring.revision,
+              ringDigest: digest,
+              authorityEpoch: ring.authorityEpoch,
+              statusGeneration: generation,
+              revokedKids: [...new Set(lifecycle.revokedKids)].sort((a, b) =>
+                Buffer.compare(Buffer.from(a), Buffer.from(b)),
+              ),
+              iat: now,
+              validUntil: (BigInt(now) + 60n).toString(),
+            },
+            compactJws = await createRemoteAuthorityStatusJws(body, signer),
+            committed = await this.options.store.reserveAndFinalizeStatus({
+              deploymentId: this.config.deploymentId,
+              expectedGeneration: lifecycle.highestStatusGeneration,
+              status: body,
+              compactJws,
+              bodyDigest: createHash("sha256").update(compactJws).digest("hex"),
+            });
+          if (!committed) {
+            status = await this.options.store.loadHighestFinalizedStatus({
+              deploymentId: this.config.deploymentId,
+              ringDigest: digest,
+              authorityEpoch: ring.authorityEpoch,
+            });
+            if (!status) return this.#fail("status_generation_conflict");
+          } else status = { status: body, compactJws };
+        }
       } catch {
         return this.#fail("status_refresh_failed");
       }
@@ -321,7 +423,6 @@ export class RemoteAuthorityRuntime {
       signingGeneration: generation,
       claimsHash,
     });
-    if (reserved.state === "finalized" && reserved.compactJws) return reserved.compactJws;
     if (
       reserved.deploymentId !== this.config.deploymentId ||
       reserved.kid !== this.#signer.kid ||
@@ -329,6 +430,7 @@ export class RemoteAuthorityRuntime {
       reserved.claimsHash !== claimsHash
     )
       throw new Error("mint request conflict");
+    if (reserved.state === "finalized" && reserved.compactJws) return reserved.compactJws;
     const signature = await this.#signer.signP1363(claims, mintId),
       jws = compact(signature),
       finalized = await this.options.store.finalizeMint({

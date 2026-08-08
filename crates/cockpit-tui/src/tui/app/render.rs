@@ -4770,10 +4770,6 @@ fn markdown_chrome_prefix_width(
     }) {
         return rendered.width();
     }
-    let code_line = line.spans.iter().any(|span| span.style.bg.is_some());
-    if code_line {
-        return external_prefix;
-    }
     let mut spans = line.spans.iter();
     if spans
         .next()
@@ -4782,6 +4778,9 @@ fn markdown_chrome_prefix_width(
         spans = line.spans.iter();
     }
     if let Some(marker) = spans.next() {
+        if marker.style.bg.is_some() {
+            return external_prefix;
+        }
         let text = marker.content.as_ref();
         if text.starts_with("│ ") {
             return external_prefix + 2;
@@ -9779,6 +9778,13 @@ mod render_history_spacing_tests {
         assert_eq!(
             extract_full_semantic_selection(&app, 22, 8),
             "a deliberately long ordered item that wraps across several rows"
+        );
+
+        app.history = vec![agent("- run `cargo test` now")].into();
+        render_history(&mut app, 30, 5);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 30, 5),
+            "run cargo test now"
         );
     }
 

@@ -2450,7 +2450,8 @@ impl App {
                 copy_newlines_before: copy.newlines_before.get(i).copied().unwrap_or(0),
                 copy_fallback_if_unmapped: base_copy.is_some()
                     && row_kind != ChatRowKind::Chip
-                    && copy_body_start.is_none_or(|start| i < start),
+                    && (copy_body_start.is_none_or(|start| i < start)
+                        || copy.incomplete.get(i).copied().unwrap_or(false)),
             });
         }
 
@@ -4510,6 +4511,7 @@ fn rendered_line_text(line: &Line<'_>) -> String {
 struct SemanticCopyRows {
     cells: Vec<Vec<Option<u32>>>,
     newlines_before: Vec<usize>,
+    incomplete: Vec<bool>,
     fragments: Rc<Vec<crate::tui::markdown::CopyFragment>>,
 }
 
@@ -4526,6 +4528,7 @@ fn semantic_copy_rows(
         return SemanticCopyRows {
             cells: vec![Vec::new(); lines.len()],
             newlines_before: vec![0; lines.len()],
+            incomplete: vec![false; lines.len()],
             fragments: Rc::new(Vec::new()),
         };
     };
@@ -4567,6 +4570,7 @@ fn semantic_copy_rows(
                 return SemanticCopyRows {
                     cells: vec![Vec::new(); lines.len()],
                     newlines_before: vec![0; lines.len()],
+                    incomplete: vec![false; lines.len()],
                     fragments: Rc::new(Vec::new()),
                 };
             }
@@ -4599,6 +4603,7 @@ fn semantic_copy_rows(
     }
     let mut rows = Vec::with_capacity(lines.len());
     let mut breaks = Vec::with_capacity(lines.len());
+    let mut incomplete = Vec::with_capacity(lines.len());
     let mut previous_mapped_row = None;
     let first_body_end = pin_region
         .into_iter()
@@ -4621,6 +4626,7 @@ fn semantic_copy_rows(
         let mut cells = vec![None; text.width()];
         if row_index < body_start {
             breaks.push(0);
+            incomplete.push(false);
             rows.push(cells);
             continue;
         }
@@ -4628,7 +4634,13 @@ fn semantic_copy_rows(
         let mut row_emitted = false;
         let mut table_bars = 0usize;
         let mut tab_cells_remaining = 0usize;
-        let chrome_end = markdown_chrome_prefix_width(line, &text, external_prefix);
+        let chrome_end = markdown_chrome_prefix_width(
+            line,
+            &text,
+            external_prefix,
+            continuations.get(row_index).copied().unwrap_or(false),
+        );
+        let mut row_incomplete = false;
         for visible in semantic_graphemes(&text) {
             if row_index == body_start && col >= first_body_end {
                 break;
@@ -4712,6 +4724,12 @@ fn semantic_copy_rows(
                     atom = next_atom + 1;
                 }
             }
+            if cells.get(col).is_none_or(Option::is_none)
+                && visible.chars().any(|ch| !ch.is_whitespace())
+                && !visible.chars().all(is_border_chrome)
+            {
+                row_incomplete = true;
+            }
             col = col.saturating_add(width);
         }
         if row_emitted {
@@ -4723,11 +4741,13 @@ fn semantic_copy_rows(
             previous_mapped_row = Some(row_index);
         }
         breaks.push(hard_breaks);
+        incomplete.push(row_incomplete);
         rows.push(cells);
     }
     SemanticCopyRows {
         cells: rows,
         newlines_before: breaks,
+        incomplete,
         fragments,
     }
 }
@@ -4735,8 +4755,15 @@ fn semantic_copy_rows(
 /// Columns injected by the Markdown renderer rather than emitted by parser
 /// text events. These cells deliberately have no copy fragment and therefore
 /// cannot steal a same-prefix fragment from later semantic content.
-fn markdown_chrome_prefix_width(line: &Line<'_>, rendered: &str, external_prefix: usize) -> usize {
-    let body = rendered.chars().skip(external_prefix).collect::<String>();
+fn markdown_chrome_prefix_width(
+    line: &Line<'_>,
+    rendered: &str,
+    external_prefix: usize,
+    continuation: bool,
+) -> usize {
+    if continuation {
+        return external_prefix;
+    }
     if line.spans.iter().any(|span| {
         span.style.add_modifier.contains(Modifier::DIM)
             && span.content.trim_start().starts_with("```")
@@ -4747,16 +4774,30 @@ fn markdown_chrome_prefix_width(line: &Line<'_>, rendered: &str, external_prefix
     if code_line {
         return external_prefix;
     }
-    if body.starts_with("│ ") {
-        return external_prefix + 2;
+    let mut spans = line.spans.iter();
+    if spans
+        .next()
+        .is_none_or(|span| span.content.width() != external_prefix)
+    {
+        spans = line.spans.iter();
     }
-    if let Some(marker_width) = heading_marker_width(&body) {
-        return external_prefix + marker_width;
-    }
-    if let Some(marker_width) = list_marker_width(&body) {
-        return external_prefix + marker_width;
+    if let Some(marker) = spans.next() {
+        let marker = marker.content.as_ref();
+        if marker == "│ "
+            || heading_marker_width(marker).is_some_and(|width| width == marker.width())
+            || list_marker_width(marker).is_some_and(|width| width == marker.width())
+        {
+            return external_prefix + marker.width();
+        }
     }
     external_prefix
+}
+
+fn is_border_chrome(ch: char) -> bool {
+    matches!(
+        ch,
+        '│' | '─' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘'
+    )
 }
 
 fn heading_marker_width(body: &str) -> Option<usize> {
@@ -5146,7 +5187,7 @@ pub(super) fn extract_selection_semantic(
             last_message = meta.history_index;
             row_table_cell = fragment.table_cell.or(row_table_cell);
         }
-        if !row_emitted && meta.copy_fallback_if_unmapped {
+        if meta.copy_fallback_if_unmapped {
             return None;
         }
     }

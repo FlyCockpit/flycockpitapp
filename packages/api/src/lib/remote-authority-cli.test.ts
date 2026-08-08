@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
@@ -126,6 +126,8 @@ describe("remote_authority_key_cli_state_machine", () => {
       d1.authorityEpoch,
     ]);
     expect(revoked.currentKid).toBe(d0.currentKid);
+    for (const path of [d0Path, d1Path, d2Path, retiredPath, revokedPath])
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(JSON.stringify({ d0, d1, d2, retired, revoked })).not.toContain('"d":');
   }, 30_000);
 

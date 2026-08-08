@@ -754,8 +754,15 @@ export function strongEtag(body: string) {
 }
 export class AuthorityPublicSnapshot {
   #body:
-    | { jwks: string; status: string; etagJwks: string; etagStatus: string; serveUntil: bigint }
+    | {
+        jwks: string;
+        status: string;
+        etagJwks: string;
+        etagStatus: string;
+        monotonicDeadline: number;
+      }
     | undefined;
+  constructor(private readonly monotonicSeconds = () => performance.now() / 1000) {}
   publish(jwks: AuthorityPublicJwks, status: string, statusValidUntil: string, now: string) {
     u64(statusValidUntil, "status expiry");
     u64(now, "snapshot time");
@@ -766,8 +773,13 @@ export class AuthorityPublicSnapshot {
       status,
       etagJwks: strongEtag(jwksBody),
       etagStatus: strongEtag(status),
-      serveUntil:
-        BigInt(statusValidUntil) < BigInt(now) + 60n ? BigInt(statusValidUntil) : BigInt(now) + 60n,
+      monotonicDeadline:
+        this.monotonicSeconds() +
+        Number(
+          BigInt(statusValidUntil) < BigInt(now) + 60n
+            ? BigInt(statusValidUntil) - BigInt(now)
+            : 60n,
+        ),
     };
   }
   read(kind: "jwks" | "status", now: string) {
@@ -776,7 +788,7 @@ export class AuthorityPublicSnapshot {
     } catch {
       return undefined;
     }
-    if (!this.#body || BigInt(now) > this.#body.serveUntil) return undefined;
+    if (!this.#body || this.monotonicSeconds() > this.#body.monotonicDeadline) return undefined;
     return kind === "jwks"
       ? { body: this.#body.jwks, etag: this.#body.etagJwks }
       : { body: this.#body.status, etag: this.#body.etagStatus };

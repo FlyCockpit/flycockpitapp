@@ -161,6 +161,20 @@ describe("remote_authority_three_digest_rollout", () => {
         cfg,
       );
     validateThreeDigestPlan(d0, d1, d2);
+    expect(() => validateThreeDigestPlan(d0, { ...d1, currentKid: "k1" }, d2)).toThrow();
+    expect(() =>
+      validateThreeDigestPlan(
+        d0,
+        { ...d1, keys: d1.keys.map((key) => ({ ...key, activatedAt: "2" })) },
+        d2,
+      ),
+    ).toThrow();
+    expect(() =>
+      validateThreeDigestPlan(d0, d1, {
+        ...d2,
+        keys: d2.keys.map((key) => (key.kid === "k0" ? { ...key, x: key.y } : key)),
+      }),
+    ).toThrow();
     const digests = [d0, d1, d2].map(publicAuthorityRingDigest),
       rings = new Map<string, PublicAuthorityRing>(digests.map((d, i) => [d, [d0, d1, d2][i]!]));
     const lease = (replicaId: string, digest: string): ObservationLease => ({
@@ -185,6 +199,39 @@ describe("remote_authority_three_digest_rollout", () => {
         { replicaId: "b", replicaGeneration: "1", state: "required" as const },
       ],
     };
+    for (const [name, local, observed] of [
+      ["D0-only", 0, [0, 0]],
+      ["D0/D1", 0, [0, 1]],
+      ["D0/D1-local-D1", 1, [0, 1]],
+      ["D1-only", 1, [1, 1]],
+      ["D1/D2", 2, [1, 2]],
+      ["D2-only", 2, [2, 2]],
+    ] as const) {
+      const decision = reduceAuthorityRollout({
+        now: "10",
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        snapshot,
+        leases: [lease("a", digests[observed[0]]!), lease("b", digests[observed[1]]!)],
+        plan: digests as [string, string, string],
+        rings,
+        localDigest: digests[local]!,
+      });
+      expect(decision.ready, name).toBe(true);
+      expect(decision.mayMint, name).toBe(true);
+    }
+    expect(
+      reduceAuthorityRollout({
+        now: "10",
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        snapshot,
+        leases: [lease("a", digests[2]!), lease("b", digests[2]!)],
+        plan: [digests[2]!] as [string],
+        rings,
+        localDigest: digests[2]!,
+      }),
+    ).toMatchObject({ ready: true, phase: "steady", signingKid: "k1" });
     expect(
       reduceAuthorityRollout({
         now: "10",
@@ -249,9 +296,11 @@ describe("remote_authority_jwks_and_status_public_only", () => {
     expect(verified.header.kid).toBe("k0");
     const jwks = publicAuthorityJwks(value, "100");
     expect(JSON.stringify(jwks)).not.toContain('"d"');
-    const snapshot = new AuthorityPublicSnapshot();
+    let monotonic = 0;
+    const snapshot = new AuthorityPublicSnapshot(() => monotonic);
     snapshot.publish(jwks, status, "160", "100");
     expect(snapshot.read("jwks", "160")).toBeDefined();
+    monotonic = 61;
     expect(snapshot.read("jwks", "161")).toBeUndefined();
     expect(REMOTE_AUTHORITY.statusLifetime).toBe(60n);
   });
@@ -327,6 +376,28 @@ describe("remote_authority_retirement_floor", () => {
     });
     expect(result.rows[0]?.state).toBe("aborted");
     expect(result.fence.state).toBe("frozen");
+    const indeterminate = reconcileAuthorityFence({
+      fence: { ...fence, state: "closing" },
+      rows: [reserved],
+      provider: new Map([["m1", "indeterminate"]]),
+      postgresNow: "101",
+    });
+    expect(indeterminate).toMatchObject({ ready: false, fence: { state: "closing" } });
+    const signed = reconcileAuthorityFence({
+      fence: { ...fence, state: "closing" },
+      rows: [reserved],
+      provider: new Map([["m1", "confirmed_signed"]]),
+      postgresNow: "102",
+    });
+    expect(signed.rows[0]?.state).toBe("signed");
+    const finalized = reconcileAuthorityFence({
+      fence: signed.fence,
+      rows: signed.rows,
+      provider: new Map(),
+      postgresNow: "103",
+    });
+    expect(finalized.rows[0]).toMatchObject({ state: "finalized", signedAt: "103" });
+    expect(finalized.fence).toMatchObject({ state: "frozen", cutoff: "103" });
     expect(authorityRetirementFloor("100")).toBe("2592160");
   });
 });
@@ -340,10 +411,12 @@ describe("remote_authority_outage_matrix", () => {
     statusExpiry,
     lastServed,
   }) => {
-    const snapshot = new AuthorityPublicSnapshot();
+    let monotonic = 0;
+    const snapshot = new AuthorityPublicSnapshot(() => monotonic);
     snapshot.publish({ keys: [] }, "status", statusExpiry, publishedAt);
     expect(snapshot.read("jwks", publishedAt)).toBeDefined();
     expect(snapshot.read("status", lastServed)?.body).toBe("status");
+    monotonic = Number(BigInt(lastServed) - BigInt(publishedAt) + 1n);
     expect(snapshot.read("jwks", (BigInt(lastServed) + 1n).toString())).toBeUndefined();
     expect(snapshot.read("status", (BigInt(lastServed) + 1n).toString())).toBeUndefined();
   });

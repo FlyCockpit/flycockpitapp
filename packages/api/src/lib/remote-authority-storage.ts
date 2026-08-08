@@ -234,7 +234,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     return this.db.$transaction(
       async (tx) => {
         const changed = await tx.$executeRawUnsafe(
-          `UPDATE remote_authority_lifecycle_state SET "generation"=$3::numeric,"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "generation"=$2::numeric AND "ringDigest"=$4 AND "authorityEpoch"=$5::numeric`,
+          `UPDATE remote_authority_lifecycle_state SET "generation"=$3::numeric,"updatedAt"=NOW() WHERE "deploymentId"=$1 AND "generation"=$2::numeric AND "ringDigest"=$4 AND "authorityEpoch"=$5::numeric AND NOT EXISTS (SELECT 1 FROM remote_authority_lifecycle_transitions WHERE "deploymentId"=$1 AND ("state"='reserved' OR "state"='status_signed'))`,
           args.deploymentId,
           args.expectedGeneration,
           args.status.statusGeneration,

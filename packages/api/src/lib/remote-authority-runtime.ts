@@ -139,7 +139,6 @@ export class RemoteAuthorityRuntime {
   };
   #status?: FinalizedAuthorityStatus;
   #recoveryMinimumGeneration?: string;
-  #lastSuccessfulTickAt = 0;
   #leaseGeneration?: string;
   constructor(private readonly options: AuthorityRuntimeOptions) {
     this.config = parseAuthorityConfig({
@@ -341,8 +340,8 @@ export class RemoteAuthorityRuntime {
             deploymentId: this.config.deploymentId,
             ringDigest: digest,
             authorityEpoch: ring.authorityEpoch,
-            minimumGeneration: generation,
-            now,
+            minimumGeneration: body.statusGeneration,
+            now: body.iat,
             authorizedSignerKid: ring.currentKid,
           });
         } else compactJws = await createRemoteAuthorityStatusJws(body, signer);
@@ -446,8 +445,22 @@ export class RemoteAuthorityRuntime {
             ringDigest: lifecycle.ringDigest,
             authorityEpoch: lifecycle.authorityEpoch,
           });
-          if (winner && BigInt(winner.status.validUntil) > BigInt(now)) status = winner;
-          else return this.#fail("status_election_wait");
+          if (winner && BigInt(winner.status.validUntil) > BigInt(now)) {
+            const verifiedWinner = await verifyRemoteAuthorityStatusJws(
+              winner.compactJws,
+              new RingAuthorityVerifier(servingPublicRing, now),
+              {
+                issuer: this.config.issuer,
+                deploymentId: this.config.deploymentId,
+                ringDigest: lifecycle.ringDigest,
+                authorityEpoch: lifecycle.authorityEpoch,
+                minimumGeneration: lifecycle.highestStatusGeneration,
+                now,
+                authorizedSignerKid: lifecycle.currentKid,
+              },
+            );
+            status = { compactJws: winner.compactJws, status: verifiedWinner.payload };
+          } else return this.#fail("status_election_wait");
         } else {
           const signer = new FileAuthoritySigner(
             ring.keys.find((k) => k.kid === this.#decision.signingKid)!,
@@ -512,7 +525,6 @@ export class RemoteAuthorityRuntime {
     )
       return this.#fail("signing_fence_unavailable");
     this.#recoveryMinimumGeneration = undefined;
-    this.#lastSuccessfulTickAt = Date.now();
     this.options.snapshot.publish(
       publicAuthorityJwks(servingPublicRing, now),
       status.compactJws,
@@ -524,14 +536,20 @@ export class RemoteAuthorityRuntime {
   async mint(mintId: string, claims: Uint8Array, compact: (signature: Uint8Array) => string) {
     if (!this.#decision.mayMint || !this.#signer || !this.#status)
       throw new Error("remote authority not ready");
-    const wallNow = BigInt(Math.floor(Date.now() / 1000));
-    if (
-      Date.now() - this.#lastSuccessfulTickAt > 10_000 ||
-      wallNow >= BigInt(this.#status.status.validUntil)
-    ) {
-      this.#fail("mint_freshness_expired");
-      throw new Error("remote authority freshness expired");
+    let redisNow: string;
+    try {
+      redisNow = await this.options.observations.redisTime();
+    } catch {
+      this.#fail("redis_unavailable");
+      throw new Error("remote authority Redis unavailable");
     }
+    if (
+      !this.#lastRedisTime ||
+      BigInt(redisNow) < BigInt(this.#lastRedisTime) ||
+      BigInt(redisNow) >= BigInt(this.#lastRedisTime) + REMOTE_AUTHORITY.leaseTtl ||
+      BigInt(redisNow) >= BigInt(this.#status.status.validUntil)
+    )
+      throw new Error("remote authority freshness expired");
     const claimsHash = createHash("sha256").update(claims).digest("hex"),
       generation = this.#ring!.authorityEpoch;
     const reserved = await this.options.store.reserveMint({

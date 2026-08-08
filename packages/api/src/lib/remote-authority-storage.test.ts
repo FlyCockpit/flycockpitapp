@@ -50,7 +50,7 @@ describe("RedisAuthorityObservationStore", () => {
     } satisfies RedisClient;
     const store = new RedisAuthorityObservationStore(redis);
 
-    await store.publishLease(lease("10"), 17);
+    await store.publishLease(lease("10"), 30);
     await expect(store.publishLease(lease("9"))).rejects.toThrow(
       "stale observation lease generation",
     );
@@ -59,7 +59,7 @@ describe("RedisAuthorityObservationStore", () => {
       "remote-authority:lease:prod_1:3:replica-a:2",
       expect.any(String),
       "10",
-      "17",
+      "30",
     ]);
   });
 

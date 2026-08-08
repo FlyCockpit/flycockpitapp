@@ -407,9 +407,9 @@ export function reduceAuthorityRollout(args: {
     };
   }
   const [d0, d1, d2] = args.plan;
+  if (observed.some((l) => l.digest === d0) && observed.some((l) => l.digest === d2))
+    return unavailable("d0_d2_coexistence");
   if (args.localDigest === d0 || args.localDigest === d1) {
-    if (observed.some((l) => l.digest === d2 && args.localDigest === d0))
-      return unavailable("d0_d2_coexistence");
     return {
       ready: true,
       mayMint: true,
@@ -554,9 +554,12 @@ export async function verifyRemoteAuthorityStatusJws(
     payloadBytes = decodeB64(parts[1]!),
     signature = decodeB64(parts[2]!);
   if (signature.length !== 64) throw new Error("invalid P1363 width");
-  const s = BigInt(`0x${signature.subarray(32).toString("hex")}`),
+  const r = BigInt(`0x${signature.subarray(0, 32).toString("hex")}`),
+    s = BigInt(`0x${signature.subarray(32).toString("hex")}`),
+    order = BigInt("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
     half = BigInt("0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8");
-  if (s === 0n || s > half) throw new Error("invalid high-S signature");
+  if (r === 0n || r >= order || s === 0n || s > half)
+    throw new Error("invalid P-256 signature scalar");
   let header: unknown, payload: unknown;
   try {
     header = JSON.parse(headerBytes.toString("utf8"));
@@ -620,6 +623,10 @@ export async function verifyRemoteAuthorityStatusJws(
     BigInt(expected.now) > BigInt(p.validUntil) + REMOTE_AUTHORITY.verificationSkew
   )
     throw new Error("status scope, generation, or time mismatch");
+  u64(expected.now, "expected time");
+  u64(expected.minimumGeneration, "minimum generation");
+  if (BigInt(p.iat) > BigInt(expected.now) + REMOTE_AUTHORITY.verificationSkew)
+    throw new Error("status issued in the future");
   const input = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
   if (!(await verifier.verifyP1363(input, signature, h.kid)))
     throw new Error("status signature invalid");
@@ -695,6 +702,7 @@ export class AuthorityPublicSnapshot {
 export type SigningJournalState = "reserved" | "signed" | "finalized" | "aborted";
 export interface SigningJournalEntry {
   mintId: string;
+  deploymentId: string;
   signingGeneration: string;
   kid: string;
   claimsHash: string;

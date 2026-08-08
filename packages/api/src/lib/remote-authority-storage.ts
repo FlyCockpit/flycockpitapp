@@ -25,8 +25,14 @@ export interface SqlClient {
 export interface RedisClient {
   time(): Promise<Array<string | number>>;
   set(key: string, value: string, mode: "EX", ttl: number): Promise<unknown>;
-  keys(pattern: string): Promise<string[]>;
-  mget(...keys: string[]): Promise<Array<string | null>>;
+  scan(
+    cursor: string,
+    matchToken: "MATCH",
+    pattern: string,
+    countToken: "COUNT",
+    count: number,
+  ): Promise<[string, string[]]>;
+  get(key: string): Promise<string | null>;
 }
 const text = (value: unknown) => String(value);
 export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
@@ -182,6 +188,33 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     );
     return this.getMint(args.mintId);
   }
+  async ensureOpenSigningFence(args: {
+    deploymentId: string;
+    kid: string;
+    signingGeneration: string;
+  }) {
+    return this.db.$transaction(
+      async (tx) => {
+        const lifecycle = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
+          `SELECT "authorityEpoch","currentKid" FROM remote_authority_lifecycle_state WHERE "deploymentId"=$1 FOR UPDATE`,
+          args.deploymentId,
+        );
+        if (
+          text(lifecycle[0]?.authorityEpoch) !== args.signingGeneration ||
+          lifecycle[0]?.currentKid !== args.kid
+        )
+          return false;
+        await tx.$executeRawUnsafe(
+          `INSERT INTO remote_authority_signing_fences ("deploymentId","kid","signingGeneration","state","updatedAt") VALUES ($1,$2,$3::numeric,'open',NOW()) ON CONFLICT ("deploymentId","kid","signingGeneration") DO NOTHING`,
+          args.deploymentId,
+          args.kid,
+          args.signingGeneration,
+        );
+        return true;
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }
   async finalizeMint(args: {
     mintId: string;
     signingGeneration: string;
@@ -208,6 +241,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     if (!row) throw new Error("signing reservation refused");
     return {
       mintId: text(row.mintId),
+      deploymentId: text(row.deploymentId),
       signingGeneration: text(row.signingGeneration),
       kid: text(row.kid),
       claimsHash: text(row.claimsHash),
@@ -232,14 +266,79 @@ export class RedisAuthorityObservationStore implements AuthorityObservationStore
     return String(seconds);
   }
   async publishLease(lease: ObservationLease, ttlSeconds: 30) {
-    const key = `${this.prefix}:${lease.deploymentId}:${lease.membershipGeneration}:${lease.replicaId}:${lease.replicaGeneration}:${lease.leaseGeneration}`;
+    const key = `${this.prefix}:${lease.deploymentId}:${lease.membershipGeneration}:${lease.replicaId}:${lease.replicaGeneration}`;
     await this.redis.set(key, canonicalizeRfc8785(lease), "EX", ttlSeconds);
   }
   async listLeases(deploymentId: string, membershipGeneration: string) {
-    const keys = await this.redis.keys(`${this.prefix}:${deploymentId}:${membershipGeneration}:*`);
-    if (keys.length === 0) return [];
-    return (await this.redis.mget(...keys))
-      .filter((value): value is string => value !== null)
-      .map((value) => JSON.parse(value) as ObservationLease);
+    const prefix = `${this.prefix}:${deploymentId}:${membershipGeneration}:`,
+      keys: string[] = [];
+    let cursor = "0";
+    do {
+      const [next, page] = await this.redis.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 100);
+      cursor = next;
+      keys.push(...page);
+    } while (cursor !== "0");
+    const leases: ObservationLease[] = [];
+    for (const key of keys) {
+      const value = await this.redis.get(key);
+      if (value === null) continue;
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("invalid observation lease");
+      const lease = parsed as Record<string, unknown>,
+        expected = [
+          "authorityEpoch",
+          "currentKid",
+          "deploymentId",
+          "digest",
+          "expiresAt",
+          "issuerDigest",
+          "leaseGeneration",
+          "membershipGeneration",
+          "observedRedisTime",
+          "publicKids",
+          "replicaGeneration",
+          "replicaId",
+          "revision",
+        ];
+      if (Object.keys(lease).sort().join("\0") !== expected.sort().join("\0"))
+        throw new Error("invalid observation lease members");
+      for (const field of [
+        "authorityEpoch",
+        "expiresAt",
+        "leaseGeneration",
+        "membershipGeneration",
+        "observedRedisTime",
+        "replicaGeneration",
+        "revision",
+      ])
+        if (typeof lease[field] !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(lease[field]))
+          throw new Error("invalid observation lease counter");
+      if (
+        lease.deploymentId !== deploymentId ||
+        lease.membershipGeneration !== membershipGeneration
+      )
+        throw new Error("observation lease scope mismatch");
+      const suffix = key.slice(prefix.length).split(":");
+      if (
+        suffix.length !== 2 ||
+        suffix[0] !== lease.replicaId ||
+        suffix[1] !== lease.replicaGeneration
+      )
+        throw new Error("observation lease key mismatch");
+      if (
+        typeof lease.digest !== "string" ||
+        !/^[0-9a-f]{64}$/.test(lease.digest) ||
+        typeof lease.issuerDigest !== "string" ||
+        !/^[0-9a-f]{64}$/.test(lease.issuerDigest) ||
+        typeof lease.currentKid !== "string" ||
+        typeof lease.replicaId !== "string" ||
+        !Array.isArray(lease.publicKids) ||
+        lease.publicKids.some((kid) => typeof kid !== "string")
+      )
+        throw new Error("invalid observation lease fields");
+      leases.push(lease as unknown as ObservationLease);
+    }
+    return leases;
   }
 }

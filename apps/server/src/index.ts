@@ -169,14 +169,16 @@ app.get("/api/meta/profile", (c) => c.json(getPublicDeploymentProfile()));
 mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
 const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
+app.use("/api/remote/*", createRateLimiterMiddleware(rpcLimiter));
 mountRemoteAuthorityRoutes(app, {
   snapshot: remoteAuthority.snapshot,
   now: () => Math.floor(Date.now() / 1000).toString(),
 });
 if (remoteAuthority.runtime) {
-  void remoteAuthority.runtime.tick();
+  const tickRemoteAuthority = () => remoteAuthority.runtime?.tick().catch(() => undefined);
+  void tickRemoteAuthority();
   setInterval(() => {
-    void remoteAuthority.runtime?.tick();
+    void tickRemoteAuthority();
   }, 10_000).unref();
 }
 

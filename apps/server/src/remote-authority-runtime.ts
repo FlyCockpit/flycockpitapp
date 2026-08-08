@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { AuthorityPublicSnapshot } from "@flycockpit/api/lib/remote-authority";
 import { RemoteAuthorityRuntime } from "@flycockpit/api/lib/remote-authority-runtime";
 import {
@@ -31,7 +32,7 @@ export function createServerRemoteAuthority(deps: {
     deploymentId: deps.env.REMOTE_AUTHORITY_DEPLOYMENT_ID!,
     digests: deps.env.REMOTE_GRANT_SIGNING_KEY_DIGESTS!,
     replicaId: deps.env.REMOTE_AUTHORITY_REPLICA_ID!,
-    leaseGeneration: crypto.randomUUID().replaceAll("-", ""),
+    leaseGeneration: BigInt(`0x${randomBytes(8).toString("hex")}`).toString(),
     store: new PostgresAuthorityRuntimeStore(deps.prisma as unknown as SqlClient),
     observations: new RedisAuthorityObservationStore(deps.redis),
     snapshot,

@@ -50,7 +50,7 @@ export const env = createEnv({
       .string()
       .regex(/^[A-Za-z0-9_-]{1,128}$/)
       .optional(),
-    REMOTE_AUTHORITY_ISSUER: z.string().optional(),
+    REMOTE_AUTHORITY_ISSUER: originUrl("REMOTE_AUTHORITY_ISSUER").optional(),
     REMOTE_GRANT_SIGNING_KEY_DIGESTS: z.string().optional(),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SSO_ENABLED: strictBooleanFlag(),

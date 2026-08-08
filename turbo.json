@@ -31,6 +31,8 @@
         "DATABASE_URL",
         "REDIS_URL",
         "RELAY_*",
+        "REMOTE_AUTHORITY_*",
+        "REMOTE_GRANT_SIGNING_KEY_*",
         "NODE_ENV",
         "PORT",
         "HOST",

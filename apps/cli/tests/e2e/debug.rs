@@ -1,18 +1,4 @@
-use std::path::{Path, PathBuf};
-
 use crate::support::{IsolatedHome, output_text};
-
-fn diagnostic_path(path: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        for (alias, physical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
-            if let Ok(remainder) = path.strip_prefix(alias) {
-                return Path::new(physical).join(remainder);
-            }
-        }
-    }
-    path.to_path_buf()
-}
 
 #[test]
 fn paths_reports_locations() {
@@ -27,24 +13,18 @@ fn paths_reports_locations() {
     let text = output_text(&output);
 
     assert!(
-        text.contains(&format!(
-            "database: {} (absent)",
-            diagnostic_path(&home.db_path()).display()
-        )),
+        text.contains(&format!("database: {} (absent)", home.db_path().display())),
         "{text}"
     );
     assert!(
         text.contains(&format!(
             "daemon socket: {} (absent)",
-            diagnostic_path(&home.socket_path()).display()
+            home.socket_path().display()
         )),
         "{text}"
     );
     assert!(
-        text.contains(&format!(
-            "log: {} (present)",
-            diagnostic_path(&home.log_file()).display()
-        )),
+        text.contains(&format!("log: {} (present)", home.log_file().display())),
         "{text}"
     );
 
@@ -54,13 +34,13 @@ fn paths_reports_locations() {
         .parent()
         .unwrap()
         .join(".cockpit");
-    let home_config_row = format!("{} (present)", diagnostic_path(&home_config).display());
-    let home_dot_row = format!("{} (absent)", diagnostic_path(&home_dot).display());
+    let home_config_row = format!("{} (present)", home_config.display());
+    let home_dot_row = format!("{} (absent)", home_dot.display());
     let local_row = format!(
         "{}/local-configs/",
-        diagnostic_path(home.db_path().parent().unwrap()).display()
+        home.db_path().parent().unwrap().display()
     );
-    let project_config_row = format!("{} (present)", diagnostic_path(&project_config).display());
+    let project_config_row = format!("{} (present)", project_config.display());
     let home_config_at = text.find(&home_config_row).expect("home config candidate");
     let home_dot_at = text.find(&home_dot_row).expect("home dot config candidate");
     let local_at = text

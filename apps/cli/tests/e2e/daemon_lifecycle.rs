@@ -32,18 +32,10 @@ async fn typed_client_sends_request_and_receives_event() {
         .await
         .expect("set caffeinate response");
 
-    let mut event = client
+    let event = client
         .next_caffeinate_state(Duration::from_secs(5))
         .await
         .expect("caffeinate event");
-    // An initial global-state snapshot may race with the client connection.
-    // If it does, consume the request-triggered transition that follows.
-    if event.active != response.active {
-        event = client
-            .next_caffeinate_state(Duration::from_secs(5))
-            .await
-            .expect("caffeinate transition event");
-    }
     assert_eq!(event.active, response.active);
     assert_eq!(event.lid_close_guaranteed, response.lid_close_guaranteed);
 }

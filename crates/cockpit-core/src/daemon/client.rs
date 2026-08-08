@@ -1157,7 +1157,7 @@ mod tests {
         assert!(remove_pending_request(&mut pending, id).is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn full_event_queue_does_not_block_pending_requests() {
         let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));
@@ -1186,7 +1186,7 @@ mod tests {
         daemon_task.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropped_events_emit_exactly_one_lag_marker() {
         let (client_stream, daemon_stream) = UnixStream::pair().expect("socket pair");
         let client = DaemonClient::from_proto(ProtoStream::new(client_stream));

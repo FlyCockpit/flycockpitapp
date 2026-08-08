@@ -17,6 +17,8 @@ import {
   parseRemoteIdentityCertificateJws,
   possessionChallengeDomain,
   possessionSignatureDomain,
+  remoteIdentitySha256,
+  remoteIdentitySha256Sync,
 } from "./remote-identity-protocol";
 
 const fromHex = (value: string) =>
@@ -61,5 +63,13 @@ describe("remote_identity_protocol_cross_language_vectors", () => {
       expect(possessionChallengeDomain(purpose).at(-1)).toBe(0);
       expect(possessionSignatureDomain(purpose).at(-1)).toBe(0);
     }
+  });
+  it("matches the SHA-256 known-answer vector", async () => {
+    const input = new TextEncoder().encode("abc"),
+      expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    expect(
+      Array.from(remoteIdentitySha256Sync(input), (x) => x.toString(16).padStart(2, "0")).join(""),
+    ).toBe(expected);
+    expect(await remoteIdentitySha256(input)).toEqual(remoteIdentitySha256Sync(input));
   });
 });

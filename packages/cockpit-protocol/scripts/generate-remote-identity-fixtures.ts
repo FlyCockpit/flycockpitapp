@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import {
   CustodyClass,
+  derivePossessionChallenge,
   EnrollmentRole,
   encodeCustodyEvidence,
   encodeEnrollmentConfirmation,
@@ -8,8 +9,10 @@ import {
   encodePossessionContext,
   encodePossessionProof,
   encodeRemoteIdentityProposal,
+  enrollmentConfirmationSigningDigest,
   PossessionPurpose,
   PresenceMode,
+  possessionProofSigningDigest,
   remoteIdentitySha256,
   SubjectKind,
 } from "../src/remote-identity-protocol";
@@ -51,6 +54,7 @@ const base = {
   expiresAt: 2000n,
 };
 const valid: { name: string; codec: string; hex: string }[] = [];
+const derivations: { name: string; hex: string }[] = [];
 const add = (name: string, codec: string, value: Uint8Array) =>
   valid.push({ name, codec, hex: hex(value) });
 add(
@@ -127,41 +131,50 @@ for (const [name, purpose] of Object.entries(PossessionPurpose)) {
           : { purpose: p, currentCertificateDigest: bytes(12), revocationRequestDigest: bytes(14) };
   const contextBytes = encodePossessionContext(context);
   add(`context_${name}`, "FCPC", contextBytes);
-  add(
-    `proof_${name}`,
-    "FCPP",
-    encodePossessionProof({
-      purpose: p,
-      subjectKind: p === 6 ? SubjectKind.daemon : SubjectKind.client,
-      subjectId: id(1),
-      certificateId: id(4),
-      generation: 1n,
-      requestId: id(15),
-      issuerStatusDigest: bytes(16),
-      challenge: bytes(17),
-      transcriptDigest: await remoteIdentitySha256(contextBytes),
-      issuedAt: 1000n,
-      expiresAt: 1060n,
-      signatureP1363: sig,
-    }),
+  const proofBytes = encodePossessionProof({
+    purpose: p,
+    subjectKind: p === 6 ? SubjectKind.daemon : SubjectKind.client,
+    subjectId: id(1),
+    certificateId: id(4),
+    generation: 1n,
+    requestId: id(15),
+    issuerStatusDigest: bytes(16),
+    challenge: bytes(17),
+    transcriptDigest: await remoteIdentitySha256(contextBytes),
+    issuedAt: 1000n,
+    expiresAt: 1060n,
+    signatureP1363: sig,
+  });
+  add(`proof_${name}`, "FCPP", proofBytes);
+  derivations.push(
+    {
+      name: `challenge_${name}`,
+      hex: hex(await derivePossessionChallenge(p, bytes(16), id(15), contextBytes)),
+    },
+    {
+      name: `proof_signature_${name}`,
+      hex: hex(await possessionProofSigningDigest(proofBytes.slice(0, 175), p)),
+    },
   );
 }
-for (const [name, role] of Object.entries(EnrollmentRole))
-  add(
-    `confirmation_${name}`,
-    "FCCF",
-    encodeEnrollmentConfirmation({
-      role,
-      decision: role === EnrollmentRole.control_plane_authorizer ? 2 : 1,
-      enrollmentId: id(7),
-      transcriptDigest: bytes(18),
-      sasVersion: 1,
-      confirmationNonce: bytes(19 + role),
-      issuedAt: 1000n,
-      expiresAt: 1060n,
-      signatureP1363: sig,
-    }),
-  );
+for (const [name, role] of Object.entries(EnrollmentRole)) {
+  const confirmation = encodeEnrollmentConfirmation({
+    role,
+    decision: role === EnrollmentRole.control_plane_authorizer ? 2 : 1,
+    enrollmentId: id(7),
+    transcriptDigest: bytes(18),
+    sasVersion: 1,
+    confirmationNonce: bytes(19 + role),
+    issuedAt: 1000n,
+    expiresAt: 1060n,
+    signatureP1363: sig,
+  });
+  add(`confirmation_${name}`, "FCCF", confirmation);
+  derivations.push({
+    name: `confirmation_signature_${name}`,
+    hex: hex(await enrollmentConfirmationSigningDigest(confirmation.slice(0, 104), role)),
+  });
+}
 for (const [name, kind, account] of [
   ["client", 1, b64(id(6))],
   ["daemon", 2, null],
@@ -200,13 +213,27 @@ for (const [name, kind, account] of [
 }
 const malformed = valid
   .filter((value) => value.codec !== "JWS")
-  .slice(0, 12)
   .map((value, index) => ({
     name: `truncated_${index}`,
     codec: value.codec,
     hex: value.hex.slice(0, -2),
   }));
+for (const codec of ["FCIP", "FCEN", "FCCE", "FCPC", "FCPP", "FCCF"]) {
+  const value = valid.find((v) => v.codec === codec)!;
+  const wrong = Uint8Array.from(Buffer.from(value.hex, "hex"));
+  wrong[4] = 2;
+  malformed.push(
+    { name: `wrong_version_${codec}`, codec, hex: hex(wrong) },
+    { name: `trailing_${codec}`, codec, hex: `${value.hex}00` },
+  );
+}
+const high = Uint8Array.from(Buffer.from(valid.find((v) => v.codec === "FCPP")!.hex, "hex"));
+high[207] = 128;
+malformed.push(
+  { name: "high_s_proof", codec: "FCPP", hex: hex(high) },
+  { name: "invalid_jws", codec: "JWS", hex: hex(enc.encode("x.y.z")) },
+);
 writeFileSync(
   new URL("../fixtures/remote-identity-protocol-v1.json", import.meta.url),
-  `${JSON.stringify({ schemaVersion: 1, valid, malformed }, null, 2)}\n`,
+  `${JSON.stringify({ schemaVersion: 1, valid, malformed, derivations }, null, 2)}\n`,
 );

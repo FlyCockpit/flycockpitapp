@@ -230,7 +230,7 @@ function validateLowSP1363(signature: Uint8Array) {
   )
     fail("invalid or high-S P1363 signature");
 }
-function sha256Sync(input: Uint8Array) {
+export function remoteIdentitySha256Sync(input: Uint8Array) {
   const k = Uint32Array.from([
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -307,7 +307,7 @@ function b64url(bytes: Uint8Array) {
 }
 function validateThumbprint(x: Uint8Array, y: Uint8Array, thumbprint: Uint8Array) {
   const json = te.encode(`{"crv":"P-256","kty":"EC","x":"${b64url(x)}","y":"${b64url(y)}"}`),
-    actual = sha256Sync(json);
+    actual = remoteIdentitySha256Sync(json);
   if (!actual.every((b, i) => b === thumbprint[i])) fail("thumbprint mismatch");
 }
 
@@ -550,7 +550,7 @@ export function encodeCustodyEvidence(v: CustodyEvidenceV1) {
   enumValue(v.presenceMode, 4, "presence mode");
   if (v.providerEvidence.length > 65000) fail("provider evidence too long");
   exact(v.evidenceDigest, 32, "evidence digest");
-  if (!sha256Sync(v.providerEvidence).every((b, i) => b === v.evidenceDigest[i]))
+  if (!remoteIdentitySha256Sync(v.providerEvidence).every((b, i) => b === v.evidenceDigest[i]))
     fail("evidence digest mismatch");
   const w = new Writer();
   preamble(w, "FCCE");
@@ -666,6 +666,7 @@ export async function derivePossessionChallenge(
   requestId: Uint8Array,
   contextBytes: Uint8Array,
 ) {
+  if (decodePossessionContext(contextBytes).purpose !== p) fail("context purpose mismatch");
   exact(status, 32, "status digest");
   nonzero(requestId, "requestId");
   const digest = await remoteIdentitySha256(contextBytes);
@@ -687,6 +688,11 @@ export async function possessionProofSigningDigest(
     unsignedProof[5] !== p
   )
     fail("invalid unsigned possession proof");
+  const checked = new Uint8Array(239);
+  checked.set(unsignedProof);
+  checked[206] = 1;
+  checked[238] = 1;
+  decodePossessionProof(checked);
   const d = possessionSignatureDomain(p),
     all = new Uint8Array(d.length + unsignedProof.length);
   all.set(d);
@@ -829,6 +835,11 @@ export async function enrollmentConfirmationSigningDigest(
     unsignedConfirmation[5] !== role
   )
     fail("invalid unsigned enrollment confirmation");
+  const checked = new Uint8Array(168);
+  checked.set(unsignedConfirmation);
+  checked[135] = 1;
+  checked[167] = 1;
+  decodeEnrollmentConfirmation(checked);
   const d = enrollmentConfirmationDomain(role),
     all = new Uint8Array(d.length + unsignedConfirmation.length);
   all.set(d);
@@ -930,6 +941,8 @@ export function parseRemoteIdentityCertificateJws(compact: string) {
     decodeProtocolIdBase64Url(p[k] as string);
   }
   if (p.subjectKind !== 1 && p.subjectKind !== 2) fail("invalid subjectKind");
+  if (typeof p.iss !== "string") fail("invalid iss");
+  origin(p.iss);
   if (
     (p.subjectKind === 1 && typeof p.accountId !== "string") ||
     (p.subjectKind === 2 && p.accountId !== null)
@@ -938,6 +951,8 @@ export function parseRemoteIdentityCertificateJws(compact: string) {
   if (typeof p.accountId === "string") decodeProtocolIdBase64Url(p.accountId);
   for (const k of ["generation", "authorityEpoch", "iat", "exp"])
     parseCanonicalU64DecimalString(p[k]);
+  if (parseCanonicalU64DecimalString(p.exp) <= parseCanonicalU64DecimalString(p.iat))
+    fail("invalid certificate lifetime");
   if (!p.publicKey || typeof p.publicKey !== "object" || Array.isArray(p.publicKey))
     fail("invalid publicKey");
   const key = p.publicKey as Record<string, unknown>;

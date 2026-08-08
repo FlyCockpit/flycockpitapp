@@ -740,6 +740,9 @@ pub fn derive_possession_challenge(
     context: &[u8],
 ) -> Result<[u8; 32]> {
     id(request)?;
+    if PossessionContext::decode(context)?.purpose != p {
+        return err("context purpose mismatch");
+    }
     let context_digest = Sha256::digest(context);
     let mut h = Sha256::new();
     h.update(possession_challenge_domain(p));
@@ -945,6 +948,22 @@ pub fn parse_remote_identity_certificate_jws(compact: &str) -> Result<ParsedCert
         crate::remote_protocol_id::parse_canonical_u64_decimal_string(value)
             .map_err(|e| Error(e.to_string()))?;
     }
+    normalized_origin(
+        p.get("iss")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error("invalid iss".into()))?,
+    )?;
+    let iat = crate::remote_protocol_id::parse_canonical_u64_decimal_string(
+        p.get("iat").and_then(|v| v.as_str()).expect("validated"),
+    )
+    .map_err(|e| Error(e.to_string()))?;
+    let exp = crate::remote_protocol_id::parse_canonical_u64_decimal_string(
+        p.get("exp").and_then(|v| v.as_str()).expect("validated"),
+    )
+    .map_err(|e| Error(e.to_string()))?;
+    if exp <= iat {
+        return err("invalid certificate lifetime");
+    }
     CustodyClass::try_from(
         p.get("custody")
             .and_then(|v| v.as_u64())
@@ -1008,6 +1027,11 @@ pub fn possession_proof_signing_digest(
     {
         return err("invalid unsigned possession proof");
     }
+    let mut checked = [0u8; 239];
+    checked[..175].copy_from_slice(unsigned_proof);
+    checked[206] = 1;
+    checked[238] = 1;
+    PossessionProof::decode(&checked)?;
     let mut h = Sha256::new();
     h.update(possession_signature_domain(purpose));
     h.update(unsigned_proof);
@@ -1023,6 +1047,11 @@ pub fn enrollment_confirmation_signing_digest(
     {
         return err("invalid unsigned enrollment confirmation");
     }
+    let mut checked = [0u8; 168];
+    checked[..104].copy_from_slice(unsigned_confirmation);
+    checked[135] = 1;
+    checked[167] = 1;
+    EnrollmentConfirmation::decode(&checked)?;
     let mut h = Sha256::new();
     h.update(enrollment_confirmation_domain(role));
     h.update(unsigned_confirmation);

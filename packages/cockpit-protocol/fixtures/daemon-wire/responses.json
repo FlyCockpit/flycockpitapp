@@ -1,4 +1,63 @@
 {
+  "app_flag": {
+    "data": { "key": "daemon_autostart_notice", "seen": false, "version": 7 },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "app_flag",
+    "v": 6
+  },
+  "app_flag_seen": {
+    "data": { "changed": true, "key": "daemon_autostart_notice", "version": 8 },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "app_flag_seen",
+    "v": 6
+  },
+  "assistant_session_resolved": {
+    "data": {
+      "created": true,
+      "session": {
+        "active_agent": "helper-bot",
+        "activity_state": "parked",
+        "created_by_principal": "flycockpit:user",
+        "descendant_count": 0,
+        "fork_count": 0,
+        "last_active_at": 1700000001,
+        "latest_activity_at": 1700000001,
+        "open_interrupts": 0,
+        "pin_count": 0,
+        "project_id": "proj",
+        "project_root": "/tmp/project",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "shared_with_collaborators": false,
+        "short_id": "abc123",
+        "started_at": 1700000000,
+        "turns": 0
+      }
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "assistant_session_resolved",
+    "v": 6
+  },
+  "startup_disclosures": {
+    "data": {
+      "config_generation": 7,
+      "connector": { "enabled": true, "status": "connected" },
+      "org_sync": { "cursor_seq": 4, "org_id": "org-fixture" }
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "startup_disclosures",
+    "v": 6
+  },
+  "workspace_trust_set": {
+    "data": { "config_generation": 8 },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "res",
+    "response": "workspace_trust_set",
+    "v": 6
+  },
   "ack": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",

@@ -3830,6 +3830,23 @@ impl SettingsCx {
                 ),
             ));
             lines.push(Line::from("[refresh detected media capabilities]"));
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Discard"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Discard(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[discard media capability draft]"));
+            }
         }
 
         // Read-only model metadata, surfaced (not hidden) for completeness:
@@ -5013,6 +5030,28 @@ impl SettingsPage for ProvidersPage {
                     KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
                     self,
                 );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Discard(provider, model),
+            ),
+        ) = (&mut *self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                );
+            if matches_source
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Discard"))
+            {
+                editor.multimodal_action("Discard", &parent.entry);
             }
             return Nav::Stay;
         }

@@ -1932,6 +1932,10 @@ impl SettingsEditor {
             _ => return false,
         }
         self.sync_media_drafts_from_multimodal();
+        if action == "Discard" {
+            self.status = Some("media capability draft discarded".into());
+            return true;
+        }
         if let Some(line) = self
             .multimodal
             .as_ref()

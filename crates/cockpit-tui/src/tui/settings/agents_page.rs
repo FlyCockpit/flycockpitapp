@@ -996,6 +996,14 @@ impl SettingsPage for AgentsPage {
         }
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() || self.detail.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_agents_page_key(key, self)
     }

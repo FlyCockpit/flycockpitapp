@@ -167,6 +167,12 @@ pub(super) enum SettingsPointerSurfaceKind {
     Lsp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsLocalBack {
+    NoLocalBack,
+    LocalBack,
+}
+
 pub struct SetupWizardDialog {
     run: cockpit_core::wizard::WizardRun,
     cursor: usize,
@@ -261,6 +267,11 @@ pub(super) trait SettingsPage: Any {
     fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind;
     fn pointer_surface_token(&self) -> u64 {
         self.pointer_surface_kind() as u64
+    }
+    /// Declare whether Back first cancels/leaves page-local state. The
+    /// dialog only pops its navigation stack for `NoLocalBack`.
+    fn resolve_header_back(&self) -> SettingsLocalBack {
+        SettingsLocalBack::NoLocalBack
     }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
@@ -2163,13 +2174,13 @@ impl SettingsDialog {
                         return SettingsPointerOutcome::Close;
                     }
                     SettingsPointerAction::Header(SettingsHeaderAction::Back) => {
-                        let nav = self.page.handle_key(
-                            &mut self.cx,
-                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        );
-                        // `Esc` is the page-local back contract. In an editor
-                        // it may intentionally cancel a draft and stay on the
-                        // page; never reinterpret that as a stack pop.
+                        let nav = match self.page.resolve_header_back() {
+                            SettingsLocalBack::LocalBack => self.page.handle_key(
+                                &mut self.cx,
+                                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            ),
+                            SettingsLocalBack::NoLocalBack => Nav::Back,
+                        };
                         let _ = self.apply_nav(nav);
                     }
                     SettingsPointerAction::Page(control) => {

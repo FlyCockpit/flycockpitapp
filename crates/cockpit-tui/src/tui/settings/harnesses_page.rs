@@ -761,6 +761,16 @@ impl SettingsPage for HarnessesPage {
         }
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            HarnessesPage::List(state) if state.adding.is_some() => {
+                super::SettingsLocalBack::LocalBack
+            }
+            HarnessesPage::Edit(_) => super::SettingsLocalBack::LocalBack,
+            HarnessesPage::List(_) => super::SettingsLocalBack::NoLocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_harnesses_page_key(key, self)
     }

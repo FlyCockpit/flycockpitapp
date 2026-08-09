@@ -1005,6 +1005,14 @@ impl SettingsPage for ToolsPage {
         super::SettingsPointerSurfaceKind::Tools
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() || self.delete_pending.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_tools_page_key(key, self)
     }

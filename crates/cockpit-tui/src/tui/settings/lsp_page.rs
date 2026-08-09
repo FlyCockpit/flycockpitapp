@@ -70,6 +70,14 @@ impl SettingsPage for LspPage {
         super::SettingsPointerSurfaceKind::Lsp
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         let row_count = LSP_SERVER_ROW_START
             + cx.project_context()

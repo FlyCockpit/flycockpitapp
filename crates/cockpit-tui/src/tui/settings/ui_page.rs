@@ -824,6 +824,14 @@ impl SettingsPage for InstructionsPage {
         super::SettingsPointerSurfaceKind::Instructions
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_instructions_page_key(key, self)
     }
@@ -896,6 +904,14 @@ impl SettingsPage for InstructionsPage {
 impl SettingsPage for RedactPatternsPage {
     fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
         super::SettingsPointerSurfaceKind::RedactPatterns
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
     }
 
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {

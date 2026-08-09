@@ -1172,6 +1172,13 @@ impl SettingsPage for McpPage {
         }
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            McpPage::List(_) => super::SettingsLocalBack::NoLocalBack,
+            McpPage::Add(_) => super::SettingsLocalBack::LocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match self {
             McpPage::List(s) => cx.handle_mcp_list_key(key, s),

@@ -4393,6 +4393,24 @@ impl SettingsPage for ProvidersPage {
         100 + ProvidersPage::pointer_surface_kind(self) as u64
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            ProvidersPage::List { .. } => super::SettingsLocalBack::NoLocalBack,
+            ProvidersPage::Add(_)
+            | ProvidersPage::Edit(_)
+            | ProvidersPage::Headers { .. }
+            | ProvidersPage::Models { .. }
+            | ProvidersPage::ModelSettings { .. }
+            | ProvidersPage::ProviderSettings { .. }
+            | ProvidersPage::FetchAll(_)
+            | ProvidersPage::FetchOnePrompt(_)
+            | ProvidersPage::FetchFallbackPrompt(_)
+            | ProvidersPage::DeepFetch { .. }
+            | ProvidersPage::CopilotSetup { .. }
+            | ProvidersPage::OAuthSetup { .. } => super::SettingsLocalBack::LocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_providers_page_key(key, self)
     }

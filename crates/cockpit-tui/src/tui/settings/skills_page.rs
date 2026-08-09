@@ -390,6 +390,14 @@ impl SettingsPage for SkillsPage {
         super::SettingsPointerSurfaceKind::Skills
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() || self.pointer_delete_pending.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_skills_page_key(key, self)
     }

@@ -3401,6 +3401,20 @@ impl SettingsPage for CategoryPage {
         }
     }
 
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some()
+            || self.path_editor.is_some()
+            || self.text_editor.is_some()
+            || self.utility_picker.is_some()
+            || self.shadowed_global.is_some()
+            || self.pending_external_edit.is_some()
+        {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_category_page_key(key, self)
     }

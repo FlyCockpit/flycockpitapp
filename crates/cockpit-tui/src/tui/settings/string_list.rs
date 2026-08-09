@@ -464,13 +464,11 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     p.kind.empty_hint(),
                 )));
-                controls.push(Some((
-                    SettingsPointerAction::List(ListAction::Edit(string_list_row_id(
-                        p.kind, i, val,
-                    ))),
-                    true,
-                    None,
-                )));
+                // The row is already in edit/grab mode. Save and Cancel below
+                // own its terminal pointer actions; publishing another Edit
+                // identity here merely aliases Save and is especially
+                // misleading for a newly-added empty row.
+                controls.push(None);
                 continue;
             }
             let marker = if on_cursor {

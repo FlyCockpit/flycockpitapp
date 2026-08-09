@@ -895,6 +895,70 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
                 _ => {}
             }
         }
+
+        let initial_tmp = TempDir::new().unwrap();
+        let initial = values(&fixture(&initial_tmp, kind), kind);
+        let row_id = |index: usize| ListRowId {
+            kind: ListKind::String(kind),
+            index,
+            value: initial[index].clone(),
+        };
+        let move_cases = [
+            (
+                SettingsPointerAction::List(ListAction::Edit(row_id(0))),
+                SettingsPointerAction::List(ListAction::MoveDown(row_id(0))),
+                false,
+            ),
+            (
+                SettingsPointerAction::List(ListAction::Edit(row_id(1))),
+                SettingsPointerAction::List(ListAction::MoveUp(row_id(1))),
+                false,
+            ),
+            (
+                SettingsPointerAction::List(ListAction::Add),
+                SettingsPointerAction::List(ListAction::MoveUp(ListRowId {
+                    kind: ListKind::String(kind),
+                    index: 2,
+                    value: String::new(),
+                })),
+                true,
+            ),
+        ];
+        for (begin, movement, added) in move_cases {
+            let source_tmp = TempDir::new().unwrap();
+            let mut source = fixture(&source_tmp, kind);
+            click_settings_action(&mut source, &begin);
+            let _ = render_settings_rows(&source, 100, 40);
+            assert!(
+                source
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .any(|target| {
+                        target.enabled
+                            && target.action == shell::SettingsPointerAction::Page(movement.clone())
+                    })
+            );
+
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fixture(&tmp, kind);
+            let disk_before = std::fs::read(&dialog.extended_path).ok();
+            click_settings_action(&mut dialog, &begin);
+            click_settings_action(&mut dialog, &movement);
+            if added {
+                type_chars(&mut dialog, "gamma");
+            }
+            let expected = if added {
+                vec![initial[0].clone(), "gamma".into(), initial[1].clone()]
+            } else {
+                vec![initial[1].clone(), initial[0].clone()]
+            };
+            click_settings_action(&mut dialog, &SettingsPointerAction::List(ListAction::Save));
+            assert_eq!(values(&dialog, kind), expected);
+            assert_eq!(persisted_values(&dialog, kind), expected);
+            assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+        }
     }
 }
 

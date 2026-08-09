@@ -961,10 +961,13 @@ impl MediaReservationLedger {
     }
 
     pub async fn next_fair_candidate(&self) -> Result<Option<String>, LedgerError> {
-        self.db.read(|conn| {
+        self.db.transaction(|conn| {
             let last:Option<String>=conn.query_row("SELECT last_session_id FROM media_scheduler_cursor WHERE singleton=1",[],|r|r.get(0))?;
             let candidate:Option<(String,String)>=conn.query_row("WITH heads AS (SELECT owner_session_key,MIN(queue_sequence) sequence FROM media_reservations WHERE state='reserved_queued' GROUP BY owner_session_key) SELECT h.owner_session_key,r.reservation_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",[last.as_deref().unwrap_or("")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
-            Ok(candidate.map(|(_, id)| id))
+            if let Some((session,id))=candidate {
+                conn.execute("UPDATE media_scheduler_cursor SET last_session_id=?1 WHERE singleton=1",[session])?;
+                Ok(Some(id))
+            } else { Ok(None) }
         }).await.map_err(LedgerError::Storage)
     }
 

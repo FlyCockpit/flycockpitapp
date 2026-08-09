@@ -1222,6 +1222,8 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
         token_budget: _,
         tokens_used: _,
         remaining_tokens: _,
+        elapsed_active_ms: _,
+        lifecycle_history: _,
         blocked_attempts: _,
         last_read_at: _,
         created_at: _,

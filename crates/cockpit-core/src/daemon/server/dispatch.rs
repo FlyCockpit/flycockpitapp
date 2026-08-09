@@ -3488,6 +3488,8 @@ pub(super) fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> prot
         token_budget: goal.token_budget,
         tokens_used: goal.tokens_used,
         remaining_tokens: goal.token_budget.saturating_sub(goal.tokens_used),
+        elapsed_active_ms: goal.elapsed_active_ms,
+        lifecycle_history: goal.lifecycle_history,
         blocked_attempts: goal.blocked_attempts,
         last_read_at: goal.last_read_at,
         created_at: goal.created_at,

@@ -39,7 +39,7 @@ pub struct InferenceCallRow {
 impl Db {
     pub async fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
         let row = row.clone();
-        self.write(move |conn| Self::insert_inference_call_conn(conn, &row))
+        self.transaction(move |conn| Self::insert_inference_call_conn(conn, &row))
             .await
     }
 
@@ -48,6 +48,22 @@ impl Db {
             "INSERT INTO inference_calls (call_id, session_id, project_id, project_root, model, provider, timestamp, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cost_usd_micros, is_utility) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![row.call_id.to_string(), row.session_id.to_string(), row.project_id, row.project_root, row.model, row.provider, row.timestamp, row.input_tokens, row.output_tokens, row.cached_input_tokens, row.cache_creation_input_tokens, row.cost_usd_micros, row.is_utility],
         ).context("inserting inference_call")?;
+        // Account usage at the immutable append boundary, in the same DB
+        // transaction as the call row. Aggregate snapshots can later shrink
+        // under retention and grow past an old baseline before anyone polls;
+        // charging each uniquely keyed call exactly once avoids that ambiguity.
+        conn.execute(
+            "UPDATE session_goals
+                SET tokens_used = tokens_used + MAX(0, ?1 + ?2)
+              WHERE session_id = ?3
+                AND disposition IN ('running', 'user_paused', 'infra_paused', 'blocked', 'no_progress_paused', 'budget_limited')",
+            params![
+                row.input_tokens,
+                row.output_tokens,
+                row.session_id.to_string()
+            ],
+        )
+        .context("accounting inference call against open session goal")?;
         Ok(())
     }
 

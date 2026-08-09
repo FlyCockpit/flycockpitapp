@@ -3243,6 +3243,13 @@ mod tests {
             token_budget: 100,
             tokens_used: 4,
             remaining_tokens: 96,
+            elapsed_active_ms: 1_250,
+            lifecycle_history: vec![cockpit_db::session_goals::GoalLifecycleHistoryEntry {
+                at: 0,
+                disposition,
+                phase: None,
+                reason: None,
+            }],
             blocked_attempts: 0,
             last_read_at: None,
             created_at: 0,
@@ -3333,6 +3340,8 @@ mod tests {
         let lines = history_lines(&app);
         assert!(lines.iter().any(|line| line.contains("no goal")));
         assert!(lines.iter().any(|line| line.contains("tokens 4/100")));
+        assert!(lines.iter().any(|line| line.contains("active 1250ms")));
+        assert!(lines.iter().any(|line| line.contains("1 transitions")));
         assert!(lines.iter().any(|line| line.contains("goal is now paused")));
         assert!(lines.iter().any(|line| line.contains("goal is now active")));
         assert!(

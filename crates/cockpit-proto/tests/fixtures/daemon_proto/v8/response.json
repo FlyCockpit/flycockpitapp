@@ -463,6 +463,21 @@
         "token_budget": 100,
         "tokens_used": 7,
         "remaining_tokens": 93,
+        "elapsed_active_ms": 2000,
+        "lifecycle_history": [
+          {
+            "at": 1700000000,
+            "disposition": "running",
+            "phase": "planning",
+            "reason": null
+          },
+          {
+            "at": 1700000001,
+            "disposition": "running",
+            "phase": "executing",
+            "reason": null
+          }
+        ],
         "updated_at": 1700000002
       }
     },
@@ -488,6 +503,21 @@
         "token_budget": 100,
         "tokens_used": 7,
         "remaining_tokens": 93,
+        "elapsed_active_ms": 2000,
+        "lifecycle_history": [
+          {
+            "at": 1700000000,
+            "disposition": "running",
+            "phase": "executing",
+            "reason": null
+          },
+          {
+            "at": 1700000002,
+            "disposition": "user_paused",
+            "phase": null,
+            "reason": { "kind": "user" }
+          }
+        ],
         "updated_at": 1700000002
       }
     },

@@ -988,6 +988,12 @@ async fn goal_rpc_reads_sets_and_clears() {
     assert_eq!(goal.session_id, session.session_id);
     assert_eq!(goal.objective, "ship daemon goal rpc");
     assert_eq!(goal.disposition, proto::GoalDisposition::Running);
+    assert!(goal.elapsed_active_ms >= 0);
+    assert_eq!(goal.lifecycle_history.len(), 1);
+    assert_eq!(
+        goal.lifecycle_history[0].disposition,
+        proto::GoalDisposition::Running
+    );
 
     let response = handle_request(
         Request::SetGoalStatus {
@@ -1003,6 +1009,11 @@ async fn goal_rpc_reads_sets_and_clears() {
         panic!("expected goal updated response");
     };
     assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
+    assert!(goal.lifecycle_history.len() >= 2);
+    assert_eq!(
+        goal.lifecycle_history.last().and_then(|entry| entry.reason),
+        Some(proto::GoalPauseReason::User)
+    );
 
     let response = handle_request(
         Request::SetGoalStatus {

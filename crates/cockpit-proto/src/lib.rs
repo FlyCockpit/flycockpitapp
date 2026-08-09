@@ -1296,7 +1296,7 @@ pub use cockpit_db::wire::{
 };
 
 pub use cockpit_db::db::session_goals::{
-    GoalContract, GoalDisposition, GoalPauseReason, GoalPhase,
+    GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
 };
 pub use cockpit_db::stats::{
     HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryModeRow,
@@ -1327,6 +1327,11 @@ pub struct GoalSummary {
     pub token_budget: i64,
     pub tokens_used: i64,
     pub remaining_tokens: i64,
+    /// Wall-clock milliseconds spent in the running disposition.
+    pub elapsed_active_ms: i64,
+    /// Bounded, oldest-to-newest durable lifecycle audit trail.
+    #[serde(default)]
+    pub lifecycle_history: Vec<GoalLifecycleHistoryEntry>,
     pub blocked_attempts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_read_at: Option<i64>,
@@ -3427,6 +3432,46 @@ mod tests {
             daemon_version: "0.0.test-daemon".to_string(),
             protocol_version,
         }
+    }
+
+    #[test]
+    fn goal_lifecycle_proto_round_trips_elapsed_and_history() {
+        let summary = GoalSummary {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            project_id: "project".into(),
+            objective: "ship".into(),
+            context: None,
+            disposition: GoalDisposition::UserPaused,
+            phase: None,
+            resume_phase: Some(GoalPhase::Executing),
+            pause_reason: Some(GoalPauseReason::User),
+            contract_available: true,
+            latest_gap_or_blocker: None,
+            verification_attempts: 2,
+            attempt_generation: 4,
+            token_budget: 100,
+            tokens_used: 25,
+            remaining_tokens: 75,
+            elapsed_active_ms: 12_345,
+            lifecycle_history: vec![GoalLifecycleHistoryEntry {
+                at: 7,
+                disposition: GoalDisposition::UserPaused,
+                phase: None,
+                reason: Some(GoalPauseReason::User),
+            }],
+            blocked_attempts: 0,
+            last_read_at: None,
+            created_at: 1,
+            updated_at: 7,
+        };
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert_eq!(encoded["elapsed_active_ms"], 12_345);
+        assert_eq!(encoded["lifecycle_history"][0]["reason"]["kind"], "user");
+        assert_eq!(
+            serde_json::from_value::<GoalSummary>(encoded).unwrap(),
+            summary
+        );
     }
 
     #[test]

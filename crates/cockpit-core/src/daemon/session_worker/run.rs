@@ -2182,15 +2182,6 @@ pub(super) async fn run_worker(
                 } => {
                     let result = replace_config_snapshot(&config_snapshot, *snapshot);
                     let changed = result.changed;
-                    let supervision_enabled = config_snapshot
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extended
-                        .goal_supervision
-                        .enabled;
-                    if changed && !supervision_enabled {
-                        let _ = session.db.pause_all_goals_for_operator_disable().await;
-                    }
                     let generation = send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,

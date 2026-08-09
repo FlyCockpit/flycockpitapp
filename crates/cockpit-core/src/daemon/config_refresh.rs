@@ -50,6 +50,12 @@ pub(crate) async fn refresh_session_config_explicit(
                 ExplicitConfigRefreshError::InvalidConfig(format!("{error:#}"))
             }
         })?;
+    apply_global_goal_supervision_kill_switch(db, &extended)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to apply global goal-supervision kill switch");
+            ExplicitConfigRefreshError::Internal
+        })?;
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
@@ -120,6 +126,8 @@ pub(crate) async fn refresh_session_config(
         }
     };
 
+    apply_global_goal_supervision_kill_switch(db, &extended).await?;
+
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
@@ -136,6 +144,20 @@ pub(crate) async fn refresh_session_config(
         applied_generation: replacement.generation,
         changed: replacement.changed,
     }))
+}
+
+/// A successful daemon config resolution is the ownership boundary for the
+/// global supervision master switch. Apply it directly to durable state before
+/// delivering any per-worker snapshot so detached sessions and sessions whose
+/// workers are not running cannot escape the operator disable.
+async fn apply_global_goal_supervision_kill_switch(
+    db: &Db,
+    extended: &crate::config::extended::ExtendedConfig,
+) -> Result<()> {
+    if !extended.goal_supervision.enabled {
+        db.pause_all_goals_for_operator_disable().await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,6 +220,70 @@ mod tests {
         responder.await.unwrap();
         assert_eq!(result.applied_generation, 7);
         assert!(result.changed);
+    }
+
+    #[tokio::test]
+    async fn successful_global_refresh_disables_detached_goal_without_its_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        db.set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+        let detached = db
+            .create_session("p", "/tmp/detached", "Build")
+            .await
+            .unwrap();
+        db.create_session_goal(detached.session_id, "p", "detached", None, Some(100))
+            .await
+            .unwrap();
+
+        let live =
+            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
+        let (handle, mut work_rx) = SessionWorkerHandle::test_handle_with_receiver(live, locks);
+        let responder = tokio::spawn(async move {
+            let SessionWork::ReplaceConfigSnapshot { respond_to, .. } =
+                work_rx.recv().await.expect("replacement work")
+            else {
+                panic!("unexpected work")
+            };
+            respond_to
+                .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                    generation: 1,
+                    changed: true,
+                })
+                .unwrap();
+        });
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.goal_supervision.enabled = false;
+        refresh_session_config_explicit(
+            &db,
+            &ConfigSource::fixed(
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ),
+            &handle,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        let paused = db
+            .current_session_goal(detached.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            paused.disposition,
+            crate::db::session_goals::GoalDisposition::UserPaused
+        );
+        assert_eq!(
+            paused.pause_reason,
+            Some(crate::db::session_goals::GoalPauseReason::OperatorDisabled)
+        );
     }
 
     #[tokio::test]

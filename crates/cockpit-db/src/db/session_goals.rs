@@ -881,6 +881,18 @@ impl Db {
                 ],
             )
             .context("updating session_goal")?;
+            record_lifecycle_history(
+                conn,
+                goal.id,
+                GoalLifecycleHistoryEntry {
+                    at: now,
+                    disposition,
+                    phase: None,
+                    reason: pause_reason
+                        .map(GoalPauseReason::parse)
+                        .transpose()?,
+                },
+            )?;
             Ok(GoalUpdateOutcome::Updated(load_goal(
                 conn, session_id, goal.id,
             )?))
@@ -1066,10 +1078,11 @@ impl Db {
                 return Ok(false);
             }
             goal.transition(GoalLifecycleEvent::RootFailed)?;
+            let now = Utc::now().timestamp();
             let changed = tx.execute(
                 "UPDATE goal_root_turns SET state = 'cancelled', audit_excerpt = 'root turn failed before evaluation', updated_at = ?1
                  WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'",
-                params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation, turn_id.to_string()],
+                params![now, goal_id.to_string(), attempt_generation, turn_id.to_string()],
             )?;
             if changed == 1 {
                 tx.execute(
@@ -1078,7 +1091,17 @@ impl Db {
                             elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000,
                             active_since = NULL, updated_at = ?1
                      WHERE id = ?2 AND attempt_generation = ?3 AND disposition = 'running' AND phase = 'executing'",
-                    params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation],
+                    params![now, goal_id.to_string(), attempt_generation],
+                )?;
+                record_lifecycle_history(
+                    &tx,
+                    goal_id,
+                    GoalLifecycleHistoryEntry {
+                        at: now,
+                        disposition: GoalDisposition::InfraPaused,
+                        phase: None,
+                        reason: Some(GoalPauseReason::RootTurnFailure),
+                    },
                 )?;
             }
             tx.commit()?;
@@ -1119,6 +1142,16 @@ impl Db {
                             active_since = NULL, updated_at = ?1
                      WHERE id = ?2 AND attempt_generation = ?3 AND disposition = 'running' AND phase = 'executing'",
                     params![now, goal_id.to_string(), attempt_generation],
+                )?;
+                record_lifecycle_history(
+                    conn,
+                    goal_id,
+                    GoalLifecycleHistoryEntry {
+                        at: now,
+                        disposition: GoalDisposition::UserPaused,
+                        phase: None,
+                        reason: Some(GoalPauseReason::User),
+                    },
                 )?;
             }
             Ok(changed == 1)
@@ -1350,7 +1383,7 @@ impl Db {
                                 streak: u8::try_from(streak).unwrap_or(u8::MAX),
                             })?;
                             if streak >= 3 {
-                                conn.execute("UPDATE session_goals SET disposition = 'blocked', phase = NULL, resume_phase = 'executing', evaluator_outcome_json = ?1, blocker_key = ?2, blocker_key_streak = ?3, updated_at = ?4 WHERE id = ?5 AND attempt_generation = ?6", params![decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
+                                conn.execute("UPDATE session_goals SET disposition = 'blocked', phase = NULL, resume_phase = 'executing', evaluator_outcome_json = ?1, blocker_key = ?2, blocker_key_streak = ?3, elapsed_active_ms = elapsed_active_ms + MAX(0, ?4 - COALESCE(active_since, ?4)) * 1000, active_since = NULL, updated_at = ?4 WHERE id = ?5 AND attempt_generation = ?6", params![decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
                                 record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::Blocked, phase: None, reason: None })?;
                             } else {
                                 conn.execute("UPDATE session_goals SET phase = 'executing', attempt_generation = ?1, evaluator_outcome_json = ?2, blocker_key = ?3, blocker_key_streak = ?4, updated_at = ?5 WHERE id = ?6 AND attempt_generation = ?7", params![transition.lifecycle.attempt_generation, decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
@@ -1583,18 +1616,14 @@ impl Db {
         let open_dispositiones = open_disposition_placeholders(2);
         let bind = bind_session_and_open_dispositiones(session_id.to_string());
         let bind_refs = param_refs(&bind);
-        // `inference_calls` can be compacted or replaced. Treat the persisted
-        // baseline as the last observed counter and add only positive deltas;
-        // a reset starts a new epoch instead of erasing already charged usage.
+        // Usage is charged exactly once by `insert_inference_call_conn`, in the
+        // same transaction as the uniquely keyed call row. This refresh keeps
+        // the aggregate checkpoint diagnostic current, but never derives usage
+        // from a resettable/retention-pruned snapshot.
         conn.execute(
             &format!(
                 "UPDATE session_goals
-                SET tokens_used = tokens_used + MAX(0, COALESCE((
-                    SELECT SUM(input_tokens + output_tokens)
-                    FROM inference_calls
-                    WHERE session_id = session_goals.session_id
-                ), 0) - token_accounting_baseline),
-                    token_accounting_baseline = COALESCE((
+                SET token_accounting_baseline = COALESCE((
                     SELECT SUM(input_tokens + output_tokens)
                     FROM inference_calls
                     WHERE session_id = session_goals.session_id
@@ -2253,8 +2282,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            matches!(out, GoalUpdateOutcome::Updated(g) if g.disposition == GoalDisposition::Blocked)
+        let GoalUpdateOutcome::Updated(blocked) = out else {
+            panic!("third blocker update must transition the goal")
+        };
+        assert_eq!(blocked.disposition, GoalDisposition::Blocked);
+        assert!(blocked.active_since.is_none());
+        assert_eq!(
+            blocked
+                .lifecycle_history
+                .last()
+                .map(|entry| entry.disposition),
+            Some(GoalDisposition::Blocked)
         );
     }
 
@@ -2335,7 +2373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_usage_accumulates_positive_deltas_across_counter_resets() {
+    async fn goal_usage_detects_counter_reset_with_new_tokens_before_next_refresh() {
         let (db, goal, _) = planning_fixture().await;
         db.insert_inference_call(&inference_row(&goal, 10))
             .await
@@ -2362,12 +2400,19 @@ mod tests {
         })
         .await
         .unwrap();
-        db.refresh_session_goal_usage(goal.session_id)
-            .await
-            .unwrap();
         db.insert_inference_call(&inference_row(&goal, 4))
             .await
             .unwrap();
+        // The append itself is the durable accounting boundary; no refresh
+        // occurs between the reset and this assertion.
+        assert_eq!(
+            db.current_session_goal(goal.session_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            14
+        );
         db.refresh_session_goal_usage(goal.session_id)
             .await
             .unwrap();
@@ -2612,6 +2657,16 @@ mod tests {
             .unwrap();
         assert_eq!(paused.disposition, GoalDisposition::InfraPaused);
         assert_eq!(paused.pause_reason, Some(GoalPauseReason::RootTurnFailure));
+        assert!(paused.active_since.is_none());
+        assert_eq!(
+            paused.lifecycle_history.last(),
+            Some(&GoalLifecycleHistoryEntry {
+                at: paused.updated_at,
+                disposition: GoalDisposition::InfraPaused,
+                phase: None,
+                reason: Some(GoalPauseReason::RootTurnFailure),
+            })
+        );
     }
 
     #[tokio::test]
@@ -2774,6 +2829,14 @@ mod tests {
                     .unwrap();
             } else {
                 assert_eq!(updated.disposition, GoalDisposition::Blocked);
+                assert!(updated.active_since.is_none());
+                assert_eq!(
+                    updated
+                        .lifecycle_history
+                        .last()
+                        .map(|entry| entry.disposition),
+                    Some(GoalDisposition::Blocked)
+                );
             }
         }
     }
@@ -3089,6 +3152,14 @@ mod tests {
             .unwrap();
         assert_eq!(paused.disposition, GoalDisposition::UserPaused);
         assert_eq!(paused.pause_reason, Some(GoalPauseReason::User));
+        assert!(paused.active_since.is_none());
+        assert_eq!(
+            paused
+                .lifecycle_history
+                .last()
+                .map(|entry| (entry.disposition, entry.reason,)),
+            Some((GoalDisposition::UserPaused, Some(GoalPauseReason::User)))
+        );
     }
 
     #[tokio::test]

@@ -54,57 +54,174 @@ fn canonical_project_root_bytes(
     Ok(text.as_bytes().to_vec())
 }
 
+fn push_fcor_resource(
+    resources: &mut Vec<AuthorizedFcorResource>,
+    kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
+    value: Vec<u8>,
+) {
+    resources.push(AuthorizedFcorResource { kind, value });
+}
+
+macro_rules! resolve_fcor_role {
+    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => param) => {};
+    ($resources:ident, $cwd:ident, $name:ident: ScheduledJobCreate => scheduled) => {{
+        use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+        push_fcor_resource(
+            &mut $resources,
+            Kind::SchedulerId,
+            $name.id.as_bytes().to_vec(),
+        );
+        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &$name.payload {
+            let canonical = crate::daemon::fs_api::canonical_project_root(project_root)?;
+            push_fcor_resource(
+                &mut $resources,
+                Kind::ProjectRoot,
+                canonical_project_root_bytes(&canonical)?,
+            );
+        }
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: Option<Uuid> => session) => {
+        if let Some(value) = $name {
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
+                value.as_bytes().to_vec(),
+            );
+        }
+    };
+    ($resources:ident, $cwd:ident, $name:ident: Uuid => session) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident: Option<String> => project_root_effective) => {{
+        let raw = $name
+            .as_deref()
+            .unwrap_or_else(|| $cwd.to_str().unwrap_or(""));
+        let canonical = crate::daemon::fs_api::canonical_project_root(raw)?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: String => project_root) => {{
+        let canonical = crate::daemon::fs_api::canonical_project_root($name)?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: Option<String> => project) => {
+        if let Some(value) = $name {
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectId,
+                value.as_bytes().to_vec(),
+            );
+        }
+    };
+    ($resources:ident, $cwd:ident, $name:ident: String => file_existing($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::Existing,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: String => file_write_target($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: Uuid => terminal) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::TerminalUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident: Uuid => upload) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::UploadUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident: Uuid => interrupt) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::InterruptUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident: Uuid => queue) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::QueueUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => legacy_message) => {
+        let _ = $name;
+    };
+    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => provider_model_right($left:ident)) => {};
+    ($resources:ident, $cwd:ident, $name:ident: String => provider_model_left($model:ident)) => {{
+        let value = proto::remote_operation_fcor::encode_provider_model_resource_v1($name, $model)
+            .map_err(|error| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: error.to_string(),
+            })?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::ProviderModel,
+            value,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident: Option<String> => provider_model_left($model:ident)) => {{
+        if let (Some(provider), Some(model)) = ($name.as_deref(), $model.as_deref()) {
+            let value =
+                proto::remote_operation_fcor::encode_provider_model_resource_v1(provider, model)
+                    .map_err(|error| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: error.to_string(),
+                    })?;
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::ProviderModel,
+                value,
+            );
+        }
+    }};
+}
+
+macro_rules! command_resolve_fcor_resources {
+    (($request:ident, $cwd:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request { $($pattern => { let mut resources = Vec::new(); $(resolve_fcor_role!(resources, $cwd, $fcor_field: $fcor_type => $fcor_role $(($($fcor_role_arg),*))?);)* Ok(resources) },)+ }
+    }};
+}
+
 /// Resolve path-bearing FCOR resources only after request authorization.
 /// Raw client path text never leaves this boundary.
 fn resolve_authorized_fcor_resources(
     request: &Request,
     daemon_cwd: &std::path::Path,
 ) -> std::result::Result<Vec<AuthorizedFcorResource>, ErrorPayload> {
-    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
-    let mut resources = Vec::new();
-    match request {
-        Request::Attach {
-            session_id,
-            project_root,
-            ..
-        } => {
-            if let Some(session_id) = session_id {
-                resources.push(AuthorizedFcorResource {
-                    kind: Kind::SessionUuid,
-                    value: session_id.as_bytes().to_vec(),
-                });
-            }
-            let requested = project_root
-                .as_deref()
-                .map(std::path::Path::new)
-                .unwrap_or(daemon_cwd);
-            let canonical = crate::daemon::fs_api::canonical_project_root(
-                requested.to_str().ok_or_else(|| ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: "project root is not valid UTF-8".into(),
-                })?,
-            )?;
-            resources.push(AuthorizedFcorResource {
-                kind: Kind::ProjectRoot,
-                value: canonical_project_root_bytes(&canonical)?,
-            });
-        }
-        Request::CreateScheduledJob { job } => {
-            resources.push(AuthorizedFcorResource {
-                kind: Kind::SchedulerId,
-                value: job.id.as_bytes().to_vec(),
-            });
-            if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
-                let canonical = crate::daemon::fs_api::canonical_project_root(project_root)?;
-                resources.push(AuthorizedFcorResource {
-                    kind: Kind::ProjectRoot,
-                    value: canonical_project_root_bytes(&canonical)?,
-                });
-            }
-        }
-        _ => {}
-    }
-    Ok(resources)
+    proto::command!(command_resolve_fcor_resources, request, daemon_cwd)
 }
 
 pub(super) async fn authorize_request_context(

@@ -1574,6 +1574,10 @@ pub struct App {
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pub(super) active_model_state_generation: u64,
+    /// Security disclosures must be fetched from the daemon before a session
+    /// attachment can be created. Failures leave this false and user actions
+    /// retry the RPC rather than silently entering the session.
+    pub(super) startup_disclosures_ready: bool,
     /// Complete daemon-confirmed session selection. Quick edits modify this
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
@@ -3058,6 +3062,9 @@ impl App {
             launch,
             config_snapshot,
             active_model_state_generation: 0,
+            // Existing unit harnesses construct App without an event loop or
+            // daemon fake; gate-focused tests explicitly set this false.
+            startup_disclosures_ready: cfg!(test),
             active_model_selection,
             composer,
             vim_setting,

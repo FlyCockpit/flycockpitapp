@@ -295,18 +295,24 @@ impl App {
                     self.container_availability = availability;
                 }
             }
-            AsyncActionKind::Internal("startup.remote_disclosures") => {
-                if let Ok(AsyncActionPayload::RemoteDisclosures {
+            AsyncActionKind::Internal("startup.remote_disclosures") => match result.payload {
+                Ok(AsyncActionPayload::RemoteDisclosures {
                     project_root,
                     org,
                     connector,
-                }) = result.payload
-                    && self.launch.cwd.to_string_lossy() == project_root
-                {
-                    self.org_sync_disclosure = org;
-                    self.connector_disclosure = connector;
+                }) => {
+                    if self.launch.cwd.to_string_lossy() == project_root {
+                        self.startup_disclosures_ready = true;
+                        self.org_sync_disclosure = org;
+                        self.connector_disclosure = connector;
+                    }
                 }
-            }
+                Ok(_) => {}
+                Err(error) => self.show_toast(
+                    format!("Startup disclosures Unavailable — {error}; Retry"),
+                    ToastKind::Warning,
+                ),
+            },
             AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
                 Ok(AsyncActionPayload::AssistantSessionResolved {
                     session_id,

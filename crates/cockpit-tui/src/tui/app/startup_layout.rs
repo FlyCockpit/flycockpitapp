@@ -152,6 +152,10 @@ impl App {
             },
         );
 
+        self.start_startup_disclosures_fetch();
+    }
+
+    pub(super) fn start_startup_disclosures_fetch(&mut self) {
         let disclosure_root = self.launch.cwd.to_string_lossy().into_owned();
         let disclosure_socket = self.startup_background.daemon_socket.clone();
         self.async_actions.start_blocking(

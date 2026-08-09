@@ -122,6 +122,18 @@ pub(super) enum SettingsPointerAction {
     DefaultModel(DefaultModelAction),
 }
 
+impl From<HarnessesAction> for SettingsPointerAction {
+    fn from(action: HarnessesAction) -> Self {
+        Self::Harnesses(action)
+    }
+}
+
+impl From<McpAction> for SettingsPointerAction {
+    fn from(action: McpAction) -> Self {
+        Self::Mcp(action)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum RootAction {
     Open(RootNodeId),

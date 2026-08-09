@@ -2819,7 +2819,7 @@ impl SettingsCx {
             let id_w = ids.iter().map(|s| s.chars().count()).max().unwrap_or(0);
             for (i, id) in ids.iter().enumerate() {
                 let row = i + 1;
-                let entry = self.config.providers.get(*id).unwrap();
+                let entry = self.config.providers.get(id.as_str()).unwrap();
                 let marker = if row == cursor { "▸ " } else { "  " };
                 let label = format!("{:<width$}", id, width = id_w);
                 let star = if entry.favorite.unwrap_or(false) {

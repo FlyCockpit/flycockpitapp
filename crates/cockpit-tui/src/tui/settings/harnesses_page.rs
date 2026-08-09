@@ -859,7 +859,7 @@ impl SettingsPage for HarnessesPage {
                 _ => Nav::Stay,
             };
         }
-        match (self, action) {
+        match (&mut *self, action) {
             (HarnessesPage::List(state), super::pointer_actions::HarnessesAction::Open(id)) => {
                 let Some(index) = cx.harness_names().iter().position(|name| name == &id.0) else {
                     return Nav::Stay;

@@ -16,7 +16,6 @@ impl ToolSurfacePicker {
         self.cursor
     }
 
-    #[cfg(test)]
     pub(crate) fn set_cursor(&mut self, cursor: usize) {
         self.cursor = cursor;
     }

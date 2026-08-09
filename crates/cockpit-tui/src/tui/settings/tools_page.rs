@@ -655,7 +655,8 @@ impl SettingsCx {
             BuiltinToolId, CredentialKind, McpServerId, McpToolId, SettingsPointerAction,
             ToolFieldId, ToolsAction, UserToolId,
         };
-        let selected = self.tools_page_rows().get(p.cursor);
+        let rows = self.tools_page_rows();
+        let selected = rows.get(p.cursor);
         let action = match index {
             10_000 => ToolsAction::DeleteUserTool(UserToolId(p.delete_pending.clone()?)),
             10_001 => ToolsAction::ToggleUserTool(UserToolId("cancel-delete".into())),
@@ -679,7 +680,7 @@ impl SettingsCx {
                 }
                 _ => return None,
             },
-            _ => match self.tools_page_rows().get(index)? {
+            _ => match rows.get(index)? {
                 ToolRow::WebProvider => ToolsAction::CycleWebProvider,
                 ToolRow::FirecrawlBaseUrl => ToolsAction::EditFirecrawlBaseUrl,
                 ToolRow::FirecrawlKey => ToolsAction::EditCredential(CredentialKind::Firecrawl),
@@ -1097,7 +1098,7 @@ impl SettingsPage for ToolsPage {
         let super::pointer_actions::SettingsPointerAction::Tools(action) = action else {
             return Nav::Stay;
         };
-        use super::pointer_actions::ToolsAction;
+        use super::pointer_actions::{ToolFieldId, ToolsAction};
         let key = match &action {
             ToolsAction::DeleteUserTool(_) if self.delete_pending.is_some() => {
                 Some(KeyCode::Char('d'))
@@ -1116,8 +1117,9 @@ impl SettingsPage for ToolsPage {
                 Some(KeyCode::Char('d'))
             }
             ToolsAction::ResetToolField(field) => {
+                let rows = cx.tools_page_rows();
                 let matches = matches!(
-                    (*field, cx.tools_page_rows().get(self.cursor)),
+                    (*field, rows.get(self.cursor)),
                     (
                         ToolFieldId::FirecrawlBaseUrl,
                         Some(ToolRow::FirecrawlBaseUrl)
@@ -1181,7 +1183,7 @@ impl SettingsPage for ToolsPage {
             self.cursor = self
                 .cursor
                 .saturating_add_signed(delta)
-                .min(cx.tool_rows().len().saturating_sub(1));
+                .min(cx.tools_page_rows().len().saturating_sub(1));
         }
         Nav::Stay
     }

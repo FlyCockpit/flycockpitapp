@@ -3695,8 +3695,7 @@ impl SettingsPage for CategoryPage {
                 cx.handle_category_utility_picker_key(
                     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     self,
-                );
-                Nav::Stay
+                )
             }
             _ => Nav::Stay,
         }
@@ -3710,7 +3709,7 @@ impl SettingsPage for CategoryPage {
         _row: u16,
     ) -> Nav {
         if matches!(
-            action,
+            &action,
             super::pointer_actions::SettingsPointerAction::Category(
                 super::pointer_actions::CategoryAction::PathEditBegin(_)
             )
@@ -3731,7 +3730,7 @@ impl SettingsPage for CategoryPage {
             return Nav::Stay;
         }
         if matches!(
-            action,
+            &action,
             super::pointer_actions::SettingsPointerAction::UtilityModel(
                 super::pointer_actions::UtilityModelAction::EditCustom
             )

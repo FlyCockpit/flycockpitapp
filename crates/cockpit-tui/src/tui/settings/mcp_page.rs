@@ -1317,7 +1317,7 @@ impl SettingsPage for McpPage {
                 return cx.handle_mcp_list_key(KeyEvent::new(key, KeyModifiers::NONE), state);
             }
         }
-        match (self, &action) {
+        match (&mut *self, &action) {
             (McpPage::List(state), super::pointer_actions::McpAction::Open(id)) => {
                 let names: Vec<_> = cx.load_mcp().servers.keys().cloned().collect();
                 let Some(index) = names.iter().position(|name| name == &id.0) else {

@@ -638,6 +638,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_skills_action_family_dispatches_from_fresh_sources();
     pointer_tool_credential_family_dispatches_from_fresh_sources();
     pointer_tool_custom_command_family_dispatches_from_fresh_sources();
     pointer_user_tool_action_family_dispatches_from_fresh_sources();
@@ -1159,6 +1160,188 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
                 _ => panic!("unclassified fresh standalone action {action:?}"),
             };
             assert!(semantic_outcome, "{action:?} produced no semantic outcome");
+        }
+    }
+}
+
+fn pointer_skills_action_family_dispatches_from_fresh_sources() {
+    use cockpit_config::extended::{ExtendedConfigDoc, SkillsConfig};
+    use pointer_actions::{ConfirmationChoice, SettingsPointerAction, SkillsAction};
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        enter_root_node(&mut dialog, "Skills");
+        dialog.extended.skills.scan_dirs = vec!["alpha/skills".into(), "beta/skills".into()];
+        dialog.extended.skills.auto_bang_commands = false;
+        dialog.extended.skills.ancestor_walk = false;
+        dialog
+            .save_extended()
+            .expect("persist Skills fixture baseline");
+        dialog
+    }
+
+    fn persisted(dialog: &SettingsDialog) -> SkillsConfig {
+        ExtendedConfigDoc::load(&dialog.extended_path)
+            .expect("reload pointer-written Skills config")
+            .config()
+            .skills
+    }
+
+    fn snapshot(skills: &SkillsConfig) -> serde_json::Value {
+        serde_json::to_value(skills).expect("serialize Skills assertion snapshot")
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Skills(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        actions.len(),
+        8,
+        "two rows publish edit and delete controls"
+    );
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let before = dialog.extended.skills.clone();
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Skills(SkillsAction::ToggleAutoBangCommands) => {
+                assert!(dialog.extended.skills.auto_bang_commands);
+                assert!(persisted(&dialog).auto_bang_commands);
+            }
+            SettingsPointerAction::Skills(SkillsAction::ToggleAncestorWalk) => {
+                assert!(dialog.extended.skills.ancestor_walk);
+                assert!(persisted(&dialog).ancestor_walk);
+            }
+            SettingsPointerAction::Skills(SkillsAction::AddScanDirectory) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.grabbed.is_some())
+                );
+                dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&before));
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&before));
+
+                let nested_tmp = TempDir::new().unwrap();
+                let mut nested = fixture(&nested_tmp);
+                click_settings_action(&mut nested, &action);
+                for ch in "gamma/skills".chars() {
+                    nested.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                }
+                nested.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                let mut expected = before.clone();
+                expected.scan_dirs.push("gamma/skills".into());
+                assert_eq!(snapshot(&nested.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&nested)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(ref id)) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.grabbed.is_some())
+                );
+                dialog.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(
+                    snapshot(&dialog.extended.skills),
+                    snapshot(&before),
+                    "cancel rolls back {id:?}"
+                );
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&before));
+
+                let nested_tmp = TempDir::new().unwrap();
+                let mut nested = fixture(&nested_tmp);
+                click_settings_action(&mut nested, &action);
+                nested.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                nested.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                let mut expected = before.clone();
+                let edited = expected
+                    .scan_dirs
+                    .iter_mut()
+                    .find(|path| path.as_str() == id.0)
+                    .expect("edited source row remains addressable");
+                edited.push('x');
+                assert_eq!(snapshot(&nested.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&nested)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(ref id)) => {
+                assert_eq!(
+                    snapshot(&dialog.extended.skills),
+                    snapshot(&before),
+                    "delete first arms {id:?}"
+                );
+                let _ = render_settings_rows(&dialog, 100, 80);
+                let confirmations = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::Skills(
+                                    SkillsAction::ConfirmDeleteScanDirectory(confirm_id, _),
+                                ),
+                            ),
+                            true,
+                        ) if confirm_id == id => Some(action.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(confirmations.len(), 2);
+                for confirmation in confirmations {
+                    let nested_tmp = TempDir::new().unwrap();
+                    let mut nested = fixture(&nested_tmp);
+                    click_settings_action(&mut nested, &action);
+                    click_settings_action(&mut nested, &confirmation);
+                    match confirmation {
+                        SettingsPointerAction::Skills(
+                            SkillsAction::ConfirmDeleteScanDirectory(
+                                _,
+                                ConfirmationChoice::Confirm,
+                            ),
+                        ) => {
+                            assert!(!nested.extended.skills.scan_dirs.contains(&id.0));
+                            assert_eq!(
+                                snapshot(&persisted(&nested)),
+                                snapshot(&nested.extended.skills)
+                            );
+                        }
+                        SettingsPointerAction::Skills(
+                            SkillsAction::ConfirmDeleteScanDirectory(_, ConfirmationChoice::Cancel),
+                        ) => {
+                            assert_eq!(snapshot(&nested.extended.skills), snapshot(&before));
+                            assert_eq!(snapshot(&persisted(&nested)), snapshot(&before));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            SettingsPointerAction::Skills(SkillsAction::Reset) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.reset.is_pending())
+                );
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&before));
+                click_settings_action(&mut dialog, &action);
+                let expected = SkillsConfig::seeded_default();
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(_, _)) => {
+                unreachable!("confirmation controls are only rendered after delete")
+            }
+            _ => unreachable!(),
         }
     }
 }

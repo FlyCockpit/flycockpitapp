@@ -308,6 +308,16 @@ impl MediaReservationLedger {
         Ok(released)
     }
 
+    pub async fn return_downstream_ownership(
+        &self,
+        invocation_id: &str,
+    ) -> Result<u64, LedgerError> {
+        let invocation = invocation_id.to_owned();
+        self.db.transaction(move|conn|Ok(u64::try_from(conn.execute(
+            "DELETE FROM media_downstream_ownership WHERE invocation_id=?1 AND released_wall_ms IS NULL",
+            [invocation])?)?)).await.map_err(LedgerError::Storage)
+    }
+
     /// Releases abandoned daemon uploads whose only storage was process
     /// memory. The operation discriminator and queued state are durable proof
     /// that no ready/published artifact existed; all other operation kinds and

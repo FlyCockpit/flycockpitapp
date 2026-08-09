@@ -208,9 +208,14 @@ async fn handle_send_user_message(
     let (item, queue) = match actor_result {
         Ok(result) => result,
         Err(error) => {
-            if error.code == ErrorCode::ModelGenerationStale {
-                release_message_image_refs(state, client_submission_id, &image_refs);
+            if let Err(cleanup_error) = ctx
+                .media_ledger
+                .return_downstream_ownership(&client_submission_id.to_string())
+                .await
+            {
+                tracing::warn!(%cleanup_error,invocation=%client_submission_id,"rejected user submission could not return media ownership");
             }
+            release_message_image_refs(state, client_submission_id, &image_refs);
             return Err(error);
         }
     };

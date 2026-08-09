@@ -3470,6 +3470,7 @@ mod tests {
         };
         let encoded = serde_json::to_value(&summary).unwrap();
         assert_eq!(encoded["elapsed_active_ms"], 12_345);
+        assert_eq!(encoded["max_verification_attempts"], 4);
         assert_eq!(encoded["lifecycle_history"][0]["reason"]["kind"], "user");
         assert_eq!(
             serde_json::from_value::<GoalSummary>(encoded).unwrap(),
@@ -4717,5 +4718,24 @@ mod tests {
                 changed: true
             }
         ));
+    }
+
+    #[test]
+    fn goal_summary_cap_is_present_in_every_v8_response_fixture() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 8);
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+
+        for response_name in ["goal_status", "goal_updated"] {
+            let response = fixture
+                .get(response_name)
+                .unwrap_or_else(|| panic!("v8 {response_name} fixture"));
+            assert_eq!(
+                response["data"]["goal"]["max_verification_attempts"], 4,
+                "v8 {response_name} must freeze the inclusive verification cap"
+            );
+            serde_json::from_value::<Response>(response.clone())
+                .unwrap_or_else(|error| panic!("v8 {response_name} must deserialize: {error}"));
+        }
     }
 }

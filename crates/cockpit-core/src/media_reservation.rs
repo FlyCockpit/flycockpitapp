@@ -277,6 +277,10 @@ impl MediaReservationLedger {
     ) -> Result<(), LedgerError> {
         let invocation_id = invocation_id.to_owned();
         self.db.transaction(move|conn| {
+            let unique_ids = reservation_ids.iter().collect::<std::collections::BTreeSet<_>>();
+            if unique_ids.len() != reservation_ids.len() {
+                return Err(anyhow!("duplicate_downstream_reservation"));
+            }
             let aggregate = dimension_name(MediaDimension::AggregateDecodedPixelsPerRequest);
             let mut total = 0u64;
             let mut limit = None;
@@ -289,16 +293,29 @@ impl MediaReservationLedger {
             }
             let effective=limit.unwrap_or(0);
             if total>effective { return Err(anyhow!("media_denied:aggregate_decoded_pixels_per_request:{total}:{effective}:0:request:policy")); }
+            let mut already_bound = 0usize;
+            for id in &reservation_ids {
+                if let Some(existing)=conn.query_row("SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",[id],|row|row.get::<_,String>(0)).optional()? {
+                    if existing != invocation_id { return Err(anyhow!("downstream_ownership_conflict")); }
+                    already_bound += 1;
+                }
+            }
+            if already_bound == reservation_ids.len() { return Ok(()); }
+            if already_bound != 0 { return Err(anyhow!("partial_downstream_ownership")); }
             for (index,id) in reservation_ids.iter().enumerate() {
                 let(state,published,version):(String,bool,u64)=conn.query_row("SELECT state,published,version FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?)))?;
                 if ReservationState::parse(&state)?!=ReservationState::Settling||!published{return Err(anyhow!("downstream_ownership_requires_published_settling"));}
-                if let Some(existing)=conn.query_row("SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",[id],|row|row.get::<_,String>(0)).optional()? { if existing!=invocation_id{return Err(anyhow!("downstream_ownership_conflict"));} }
-                let rows:Vec<(String,String,i64)>=conn.prepare("SELECT scope_kind,scope_id,delta FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2")?.query_map(params![id,aggregate],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-                for (kind,scope,delta) in rows { if delta!=0 { mutate_counter(conn,&kind,&scope,&aggregate,-delta)?; } }
-                conn.execute("UPDATE media_reservation_deltas SET delta=0,charged_after=0 WHERE reservation_id=?1 AND dimension=?2",params![id,aggregate])?;
+                let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+                let rows:Vec<(String,String,i64)>=conn.prepare("SELECT scope_kind,scope_id,SUM(delta) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2 GROUP BY scope_kind,scope_id HAVING SUM(delta)!=0")?.query_map(params![id,aggregate],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+                if rows.len() > 1 { return Err(anyhow!("aggregate_reservation_has_multiple_scopes")); }
+                for (kind,scope,delta) in rows {
+                    mutate_counter(conn,&kind,&scope,&aggregate,-delta)?;
+                    record_delta(conn,id,next,&aggregate,&kind,&scope,u64::try_from(delta.max(0))?,-delta,"release",wall_ms)?;
+                }
                 let target=if index==0{total}else{0};
-                if target>0 { mutate_counter(conn,"request",&invocation_id,&aggregate,i64::try_from(target)?)?; record_delta(conn,id,version,&aggregate,"request",&invocation_id,target,i64::try_from(target)?,"downstream_aggregate",wall_ms)?; }
+                if target>0 { mutate_counter(conn,"request",&invocation_id,&aggregate,i64::try_from(target)?)?; record_delta(conn,id,next,&aggregate,"request",&invocation_id,target,i64::try_from(target)?,"durable_invocation",wall_ms)?; }
                 conn.execute("INSERT INTO media_downstream_ownership(reservation_id,invocation_id,bound_wall_ms) VALUES(?1,?2,?3) ON CONFLICT(reservation_id) DO NOTHING",params![id,invocation_id,sqlite_i64(wall_ms)?])?;
+                conn.execute("UPDATE media_reservations SET version=?1 WHERE reservation_id=?2",params![sqlite_i64(next)?,id])?;
             }
             Ok(())
         }).await.map_err(classify_storage_error)
@@ -2370,12 +2387,31 @@ mod tests {
             .bind_downstream_ownership(ids.clone(), "submission", 5)
             .await
             .unwrap();
+        let facts_after_first=db.read(|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_reservation_deltas WHERE reservation_id IN ('image-a','image-b') AND dimension='aggregate_decoded_pixels_per_request'",[],|r|row_u64(r,0))?)).await.unwrap();
+        let versions_after_first=db.read(|conn|Ok(conn.query_row("SELECT SUM(version) FROM media_reservations WHERE reservation_id IN ('image-a','image-b')",[],|r|row_u64(r,0))?)).await.unwrap();
         ledger
             .bind_downstream_ownership(ids, "submission", 6)
             .await
             .unwrap();
         let charged=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='request' AND scope_id='submission' AND dimension='aggregate_decoded_pixels_per_request'",[],|r|row_u64(r,0))?)).await.unwrap();
         assert_eq!(charged, 100);
+        let (source_balance,facts_after_retry,versions_after_retry)=db.read(|conn|Ok((
+            conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id IN ('image-a','image-b') AND dimension='aggregate_decoded_pixels_per_request' AND NOT (scope_kind='request' AND scope_id='submission')",[],|r|row_u64(r,0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_reservation_deltas WHERE reservation_id IN ('image-a','image-b') AND dimension='aggregate_decoded_pixels_per_request'",[],|r|row_u64(r,0))?,
+            conn.query_row("SELECT SUM(version) FROM media_reservations WHERE reservation_id IN ('image-a','image-b')",[],|r|row_u64(r,0))?,
+        ))).await.unwrap();
+        assert_eq!(
+            source_balance, 0,
+            "compensating facts must exactly release reservation-local claims"
+        );
+        assert_eq!(
+            facts_after_retry, facts_after_first,
+            "an idempotent bind must append no duplicate facts"
+        );
+        assert_eq!(
+            versions_after_retry, versions_after_first,
+            "an idempotent bind must not create new versions"
+        );
     }
 
     #[tokio::test]

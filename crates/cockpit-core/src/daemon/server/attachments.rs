@@ -206,6 +206,42 @@ pub struct ValidatedPngAttachment {
     pub height: u64,
 }
 
+struct AbandonAttachmentOnDrop {
+    ledger: crate::media_reservation::MediaReservationLedger,
+    reservation_id: Option<String>,
+    wall_ms: u64,
+    decode_worker:
+        Option<tokio::task::JoinHandle<std::result::Result<ValidatedPngAttachment, ErrorPayload>>>,
+}
+
+impl Drop for AbandonAttachmentOnDrop {
+    fn drop(&mut self) {
+        let Some(id) = self.reservation_id.take() else {
+            return;
+        };
+        let worker = self.decode_worker.take();
+        let ledger = self.ledger.clone();
+        let wall_ms = self.wall_ms;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                // Dropping a spawn_blocking JoinHandle detaches the closure. It
+                // still owns decoded buffers and CPU capacity, so accounting
+                // cannot attest cleanup until the actual closure has returned.
+                if let Some(worker) = worker {
+                    let _ = worker.await;
+                }
+                let _ = ledger
+                    .abandon_local_operation(
+                        &id,
+                        &format!("abandoned-upload-destroyed:{id}"),
+                        wall_ms,
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
 pub(super) fn begin_attachment_upload(
     state: &mut MutableClientState,
     mime: String,
@@ -503,39 +539,15 @@ pub(super) async fn finish_attachment_upload_admitted(
         .media_reservation
         .take()
         .ok_or_else(|| internal("attachment upload is missing its durable media reservation"))?;
-    struct AbandonOnDrop {
-        ledger: crate::media_reservation::MediaReservationLedger,
-        reservation_id: Option<String>,
-        wall_ms: u64,
-    }
-    impl Drop for AbandonOnDrop {
-        fn drop(&mut self) {
-            let Some(id) = self.reservation_id.take() else {
-                return;
-            };
-            let ledger = self.ledger.clone();
-            let wall_ms = self.wall_ms;
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = ledger
-                        .abandon_local_operation(
-                            &id,
-                            &format!("abandoned-upload-destroyed:{id}"),
-                            wall_ms,
-                        )
-                        .await;
-                });
-            }
-        }
-    }
     let wall_ms = chrono::Utc::now()
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
-    let mut abandon = AbandonOnDrop {
+    let mut abandon = AbandonAttachmentOnDrop {
         ledger: ctx.media_ledger.clone(),
         reservation_id: Some(receipt.reservation_id.clone()),
         wall_ms,
+        decode_worker: None,
     };
     let config_root = state
         .attached
@@ -589,20 +601,26 @@ pub(super) async fn finish_attachment_upload_admitted(
             }
         }
     };
-    let validation = async {
-        if upload.bytes.len() != upload.byte_len {
-            return Err(bad_request(format!(
-                "attachment length mismatch: got {} bytes, expected {}",
-                upload.bytes.len(),
-                upload.byte_len
-            )));
-        }
-        if sha256_hex(&upload.bytes) != upload.sha256 {
-            return Err(bad_request("attachment SHA-256 mismatch"));
-        }
-        validate_png_attachment(upload.bytes).await
-    }
-    .await;
+    let validation = if upload.bytes.len() != upload.byte_len {
+        Err(bad_request(format!(
+            "attachment length mismatch: got {} bytes, expected {}",
+            upload.bytes.len(),
+            upload.byte_len
+        )))
+    } else if sha256_hex(&upload.bytes) != upload.sha256 {
+        Err(bad_request("attachment SHA-256 mismatch"))
+    } else {
+        abandon.decode_worker = Some(tokio::task::spawn_blocking(move || {
+            validate_png_attachment_blocking(upload.bytes)
+        }));
+        let result = abandon
+            .decode_worker
+            .as_mut()
+            .expect("decode worker was installed")
+            .await;
+        abandon.decode_worker.take();
+        result.map_err(internal)?
+    };
     let validated = match validation {
         Ok(validated) => validated,
         Err(error) => {
@@ -961,4 +979,73 @@ fn validate_message_attachment(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod decode_cleanup_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct TestClock;
+    impl crate::media_reservation::MonotonicClock for TestClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_decode_retains_cpu_charge_until_blocking_worker_terminates() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        db.transaction(|conn| {
+            conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('decode-drop',1,'p','s','upload','image','decode-drop-recovery','executing_local',1,1,100,0)",[])?;
+            conn.execute("INSERT INTO media_resource_counters(scope_kind,scope_id,dimension,charged,generation) VALUES('global','global','local_cpu_jobs_global',1,1)",[])?;
+            conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES('decode-drop',1,'local_cpu_jobs_global','global','global',1,1,1,'reserve',0)",[])?;
+            Ok(())
+        }).await.unwrap();
+        let ledger =
+            crate::media_reservation::MediaReservationLedger::new(db.clone(), Arc::new(TestClock));
+        let (release_worker, wait_for_release) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            wait_for_release.recv().unwrap();
+            Err(bad_request("cancelled test decode"))
+        });
+        drop(AbandonAttachmentOnDrop {
+            ledger,
+            reservation_id: Some("decode-drop".into()),
+            wall_ms: 1,
+            decode_worker: Some(worker),
+        });
+        tokio::task::yield_now().await;
+        let before=db.read(|conn|Ok((
+            conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND scope_id='global' AND dimension='local_cpu_jobs_global'",[],|row|row.get::<_,i64>(0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_cleanup_attestations WHERE reservation_id='decode-drop'",[],|row|row.get::<_,i64>(0))?,
+        ))).await.unwrap();
+        assert_eq!(
+            before,
+            (1, 0),
+            "cleanup proof and CPU release must wait for worker termination"
+        );
+        release_worker.send(()).unwrap();
+        for _ in 0..100 {
+            let state = db
+                .read(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT state FROM media_reservations WHERE reservation_id='decode-drop'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            if state == "released" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let after=db.read(|conn|Ok((
+            conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND scope_id='global' AND dimension='local_cpu_jobs_global'",[],|row|row.get::<_,i64>(0))?,
+            conn.query_row("SELECT state FROM media_reservations WHERE reservation_id='decode-drop'",[],|row|row.get::<_,String>(0))?,
+        ))).await.unwrap();
+        assert_eq!(after, (0, "released".into()));
+    }
 }

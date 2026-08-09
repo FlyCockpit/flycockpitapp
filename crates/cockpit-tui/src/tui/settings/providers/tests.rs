@@ -2476,9 +2476,15 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
             fresh.test_page(),
             TestPageRef::Providers(ProvidersPage::Add(state))
                 if state.saved_provider_id.as_deref() == Some("copilot")
-                    && state.fetch.is_some()
-                    && !state.is_step("copilot-auth")
+                    && state.fetch.is_none()
+                    && state.is_step("test-key-choice")
+                    && state.error.as_deref() == Some("saved.")
         ));
+        let saved = load_provider(&fresh.config_path, "copilot");
+        assert_eq!(saved.url, "https://api.githubcopilot.com");
+        assert!(saved.headers.iter().any(|header| {
+            header.name == "Authorization" && header.value == "Bearer $COPILOT_GITHUB_TOKEN"
+        }));
     }
 }
 

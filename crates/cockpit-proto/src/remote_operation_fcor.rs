@@ -450,8 +450,36 @@ mod tests {
                 .as_str()
                 .unwrap()
         );
-        assert!(CanonicalParamsV1::new().push_string("e\u{301}").is_err());
-        assert!(CanonicalParamsV1::new().push_string("nul\0value").is_err());
+        for invalid in fixture["invalidCanonicalCases"].as_array().unwrap() {
+            let rejected = match invalid["kind"].as_str().unwrap() {
+                "string" => CanonicalParamsV1::new()
+                    .push_string(invalid["value"].as_str().unwrap())
+                    .is_err(),
+                "utf16_string" => {
+                    let units: Vec<u16> = invalid["codeUnits"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|unit| unit.as_u64().unwrap() as u16)
+                        .collect();
+                    String::from_utf16(&units).is_err()
+                }
+                "string_map" => {
+                    let entries: Vec<(&str, &str)> = invalid["entries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|entry| {
+                            let pair = entry.as_array().unwrap();
+                            (pair[0].as_str().unwrap(), pair[1].as_str().unwrap())
+                        })
+                        .collect();
+                    CanonicalParamsV1::new().push_string_map(entries).is_err()
+                }
+                other => panic!("unknown invalid canonical case {other}"),
+            };
+            assert!(rejected, "{}", invalid["errorClass"]);
+        }
         let boundary = |encode: fn(&mut CanonicalParamsV1) -> Result<()>| {
             let mut params = CanonicalParamsV1::new();
             encode(&mut params).unwrap();
@@ -500,11 +528,6 @@ mod tests {
         assert_eq!(
             boundary(|p| p.push_string_map([("aa", "y"), ("b", "x")])),
             fixture["canonicalParams"]["encodedLengthSortedMapHex"]
-        );
-        assert!(
-            CanonicalParamsV1::new()
-                .push_string_map([("é", "x"), ("e\u{301}", "y")])
-                .is_err()
         );
         let mut rollback = CanonicalParamsV1::new();
         assert!(
@@ -560,6 +583,10 @@ mod tests {
         assert_eq!(
             boundary(|p| p.push_string_map([("a", "x")])),
             fixture["collectionCases"]["singleMapHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_list(std::iter::empty::<&u8>(), |_, _| Ok(()))),
+            fixture["collectionCases"]["emptyListHex"]
         );
         assert_eq!(
             boundary(|p| p.push_list([1_u16, 258].iter(), |item, value| {

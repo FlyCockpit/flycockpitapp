@@ -112,8 +112,25 @@
     "nonemptyStringHex": "0000000161",
     "emptyMapHex": "00000000",
     "singleMapHex": "0000000100000001610000000178",
+    "emptyListHex": "00000000",
     "u16ListHex": "0000000200010102"
   },
+  "invalidCanonicalCases": [
+    { "name": "decomposed string", "kind": "string", "value": "é", "errorClass": "non_nfc" },
+    { "name": "NUL string", "kind": "string", "value": "nul\u0000value", "errorClass": "nul" },
+    {
+      "name": "lone UTF-16 surrogate",
+      "kind": "utf16_string",
+      "codeUnits": [55296],
+      "errorClass": "invalid_unicode_scalar"
+    },
+    {
+      "name": "duplicate normalized map keys",
+      "kind": "string_map",
+      "entries": [["é", "x"], ["é", "y"]],
+      "errorClass": "duplicate_nfc_key"
+    }
+  ],
   "malformed": [
     { "name": "magic", "replaceByte": [0, 0] },
     { "name": "version", "replaceByte": [4, 2] },

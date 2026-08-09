@@ -89,9 +89,18 @@ describe("FCOR v1", () => {
     expect(Buffer.from(map.finish()).toString("hex")).toBe(
       vector.canonicalParams.sortedStringMapHex,
     );
-    expect(() => new CanonicalParamsV1().pushString("e\u0301")).toThrow();
-    expect(() => new CanonicalParamsV1().pushString("nul\0value")).toThrow();
-    expect(() => new CanonicalParamsV1().pushString("\ud800")).toThrow();
+    for (const invalid of vector.invalidCanonicalCases) {
+      const call = () => {
+        const params = new CanonicalParamsV1();
+        if (invalid.kind === "string" && "value" in invalid) params.pushString(invalid.value);
+        else if (invalid.kind === "utf16_string") {
+          params.pushString(
+            String.fromCharCode(...("codeUnits" in invalid ? invalid.codeUnits : [])),
+          );
+        } else if ("entries" in invalid) params.pushStringMap(invalid.entries);
+      };
+      expect(call, `${invalid.name}:${invalid.errorClass}`).toThrow();
+    }
     const boundary = (encode: (params: CanonicalParamsV1) => void) => {
       const params = new CanonicalParamsV1();
       encode(params);
@@ -129,14 +138,6 @@ describe("FCOR v1", () => {
         ]),
       ),
     ).toBe(vector.canonicalParams.encodedLengthSortedMapHex);
-    expect(() =>
-      boundary((params) =>
-        params.pushStringMap([
-          ["é", "x"],
-          ["e\u0301", "y"],
-        ]),
-      ),
-    ).toThrow();
     const rollback = new CanonicalParamsV1();
     expect(() =>
       rollback.pushOptional("x", (nested) => {
@@ -168,6 +169,9 @@ describe("FCOR v1", () => {
     expect(boundary((params) => params.pushStringMap([]))).toBe(vector.collectionCases.emptyMapHex);
     expect(boundary((params) => params.pushStringMap([["a", "x"]]))).toBe(
       vector.collectionCases.singleMapHex,
+    );
+    expect(boundary((params) => params.pushList([], () => {}))).toBe(
+      vector.collectionCases.emptyListHex,
     );
     expect(
       boundary((params) => params.pushList([1, 258], (item, value) => item.pushU16(value))),

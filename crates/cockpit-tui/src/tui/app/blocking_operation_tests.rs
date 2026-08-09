@@ -55,17 +55,54 @@ fn blocking_operation_manifest_is_complete() {
     }
 }
 
-#[test]
-fn no_owned_blocking_command_runs_on_event_loop() {
-    let source = include_str!("slash.rs");
-    assert!(source.contains("start_owned_blocking_action"));
-    assert!(source.contains("BlockingOperationKind::DoctorSnapshot"));
+#[tokio::test]
+async fn no_owned_blocking_command_runs_on_event_loop() {
+    let mut app = App::new(None, false);
+    let release = std::sync::Arc::new(std::sync::Barrier::new(7));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
+        let release = std::sync::Arc::clone(&release);
+        let entered = entered_tx.clone();
+        let action = registration.actions[0];
+        app.async_actions.start_blocking(
+            AsyncActionKind::Blocking(action),
+            AsyncActionPolicy::AllowConcurrent,
+            move || {
+                entered.send(action).unwrap();
+                release.wait();
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+    }
+    drop(entered_tx);
+    assert_eq!(entered_rx.iter().count(), 6);
 
-    let input = include_str!("input.rs");
-    assert!(!input.contains("attached_request_tx_blocking(\n                attached_request"));
+    app.handle_terminal_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    app.handle_terminal_event(crossterm::event::Event::Mouse(
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+    ));
+    app.handle_terminal_event(crossterm::event::Event::Resize(100, 40));
+    app.apply_event(cockpit_core::engine::TurnEvent::Notice {
+        text: "daemon reduced".to_string(),
+    });
 
-    let render = include_str!("render.rs");
-    assert!(!render.contains("cockpit_core::tags::suggestions(&self.launch.cwd"));
+    assert_eq!(app.composer.text(), "x");
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryEntry::Plain { line }) if line == "daemon reduced"
+    ));
+    assert_eq!(app.async_actions.pending_count(), 6);
+    release.wait();
 }
 
 #[test]

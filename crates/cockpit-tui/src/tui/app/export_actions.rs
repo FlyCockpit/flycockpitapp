@@ -8,8 +8,10 @@ use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response};
 use tokio::sync::mpsc;
 
 const EXPORT_ACTION_KEY: &str = "export";
-const EXPORT_TRANSCRIPT_ACTION: &str = "export.transcript";
-const EXPORT_DEBUG_ACTION: &str = "export.debug";
+const EXPORT_TRANSCRIPT_ACTION: &str =
+    blocking_operations::BlockingOperationKind::ExportWrite.action_name_at(0);
+const EXPORT_DEBUG_ACTION: &str =
+    blocking_operations::BlockingOperationKind::ExportWrite.action_name_at(1);
 
 impl App {
     /// `/export` (default) — ask the attached daemon for a redacted

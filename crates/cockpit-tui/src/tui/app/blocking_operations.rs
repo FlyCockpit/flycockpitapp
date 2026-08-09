@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub(super) enum BlockingOperationKind {
     CuratorMaintenance,
     DoctorSnapshot,
@@ -51,15 +52,24 @@ pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] =
 ];
 
 impl BlockingOperationKind {
-    pub(super) const fn action_name(self) -> &'static str {
-        match self {
-            Self::CuratorMaintenance => "curator.command",
-            Self::DoctorSnapshot => "doctor.snapshot",
-            Self::ExportWrite => "export.transcript",
-            Self::QueueMutation => "queue.edit",
-            Self::BtwTeardown => "btw.teardown",
-            Self::FileAutocomplete => "autocomplete.files",
+    const fn registration(self) -> BlockingOperationRegistration {
+        let mut index = 0;
+        while index < BLOCKING_OPERATION_MANIFEST.len() {
+            let registration = BLOCKING_OPERATION_MANIFEST[index];
+            if registration.kind as u8 == self as u8 {
+                return registration;
+            }
+            index += 1;
         }
+        panic!("blocking operation is absent from manifest")
+    }
+
+    pub(super) const fn action_name_at(self, index: usize) -> &'static str {
+        self.registration().actions[index]
+    }
+
+    pub(super) const fn action_name(self) -> &'static str {
+        self.action_name_at(0)
     }
 
     pub(super) const fn action_kind(self) -> AsyncActionKind {

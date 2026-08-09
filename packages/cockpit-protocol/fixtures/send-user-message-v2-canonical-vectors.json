@@ -37,6 +37,83 @@
       "attachment_set_digest_hex": "9a6fd0a5307dd03ee50b8ecaa225e6467c1eee181545cd32756b17b1138fc1b7"
     }
   ],
+  "compact_positive_vectors": [
+    {
+      "name": "present_empty_display",
+      "segments": [
+        {
+          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaabbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178010000000000000000",
+          "repeat": 1
+        }
+      ],
+      "message_request_digest_hex": "49d3fd32817e67fed8408e7ac37b60311d86b2d7bba7e84911bd2d936f4ce97e",
+      "attachment_set_digest_hex": "acb2a7bb2895a6d74943e16841aba8b98c4339ccfd2a1f701dc5df8e320f0c56"
+    },
+    {
+      "name": "exact_64_tags",
+      "segments": [
+        {
+          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaabbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb0101010101010101010101010101010101010101010101010101010101010101000000000000000102020202020202020202020202020202020202020202020202020202020202020000000178000040",
+          "repeat": 1
+        },
+        { "hex": "0001740000000170000000016400", "repeat": 64 },
+        { "hex": "0000", "repeat": 1 }
+      ],
+      "message_request_digest_hex": "1ce84ce5e80c5d9514465fb83111cb5e1c8811794b80d647fdae75fe894beb0e",
+      "attachment_set_digest_hex": "acb2a7bb2895a6d74943e16841aba8b98c4339ccfd2a1f701dc5df8e320f0c56"
+    },
+    {
+      "name": "exact_16_attachments",
+      "prefix_hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaabbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000010",
+      "generated_attachments": 16,
+      "message_request_digest_hex": "f5d3043d9bfbc04e5f09e8ca0ef7ca7f527783c74c20e668fb29a3594f88f29f",
+      "attachment_set_digest_hex": "c13cbe8a369e7ac194bb25f8023c4f4b5959f39815c89d3eee7852fc524a8664"
+    },
+    {
+      "name": "order_ab",
+      "segments": [
+        {
+          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaabbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000002000000000000400080000000000000010000000000000001010101010101010101010101010101010101010101010101010101010101010101000000000000400080000000000000020000000000000002020202020202020202020202020202020202020202020202020202020202020202",
+          "repeat": 1
+        }
+      ],
+      "message_request_digest_hex": "4f05bb6ff3e8c230283192c78ace9aedb2e784f20c440b181b4519302c123f40",
+      "attachment_set_digest_hex": "998fe114219ae55e7ae228e3a42a313628bf0254c4b4933348761ea8fc4e1b34"
+    },
+    {
+      "name": "order_ba",
+      "segments": [
+        {
+          "hex": "46434d3202aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaabbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb01010101010101010101010101010101010101010101010101010101010101010000000000000001020202020202020202020202020202020202020202020202020202020202020200000001780000000002000000000000400080000000000000020000000000000002020202020202020202020202020202020202020202020202020202020202020202000000000000400080000000000000010000000000000001010101010101010101010101010101010101010101010101010101010101010101",
+          "repeat": 1
+        }
+      ],
+      "message_request_digest_hex": "caf426102efc0e5d3b39cc0b750050f508178b9de93db6e5d34f2c6a587d51ad",
+      "attachment_set_digest_hex": "55d217450b95507620e8aada28dd37630d332381e9aa207c697274df30d0ccdc"
+    }
+  ],
+  "semantic_error_cases": [
+    { "name": "empty_tool", "mutation": "empty_tool", "error": "invalid tag tool" },
+    {
+      "name": "detail_one_over",
+      "mutation": "detail_one_over",
+      "rust_error": "tag field exceeds limit",
+      "ts_error": "tag detail exceeds byte limit"
+    },
+    { "name": "empty_forced_skill", "mutation": "empty_skill", "error": "invalid forced skill" },
+    {
+      "name": "invalid_forced_skill_char",
+      "mutation": "invalid_skill",
+      "rust_error": "non-canonical forced skill",
+      "ts_error": "invalid forced skill"
+    },
+    {
+      "name": "multibyte_tool_byte_one_over",
+      "mutation": "multibyte_tool",
+      "rust_error": "invalid tag tool",
+      "ts_error": "tag tool exceeds byte limit"
+    }
+  ],
   "predicate_vectors": [
     {
       "text": "\t\n\u000b\f\r \u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000",

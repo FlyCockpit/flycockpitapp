@@ -2253,9 +2253,12 @@ impl SettingsDialog {
                             mouse.column,
                             mouse.row,
                         );
-                        let _ = self.apply_nav(nav);
+                        let close = self.apply_nav(nav);
                         #[cfg(test)]
                         pointer_acceptance_tests::record_dispatched_action(&action);
+                        if close {
+                            return SettingsPointerOutcome::Close;
+                        }
                     }
                 }
             }

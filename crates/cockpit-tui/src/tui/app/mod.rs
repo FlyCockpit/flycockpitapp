@@ -3793,6 +3793,7 @@ impl App {
                 }
                 if shortcut_intent {
                     // The shortcut is an intent, never literal composer text.
+                    self.handle_paste(String::new());
                 }
                 if paste_unavailable {
                     self.show_toast("Paste unavailable", ToastKind::Error);

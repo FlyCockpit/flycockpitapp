@@ -667,6 +667,47 @@ fn dispatch_enabled_category_descriptor_actions() {
             before, after,
             "descriptor activation had no rendered outcome for {setting:?}"
         );
+        match setting {
+            SettingId::AutoTitleModel
+            | SettingId::TranslationModel
+            | SettingId::CheapCodeModel
+            | SettingId::CompactModel
+            | SettingId::PredictNextMessageModel
+            | SettingId::SmartCodeModel
+            | SettingId::ReasoningModel
+            | SettingId::GoalVerificationModel
+            | SettingId::HarnessReportSummarizationModel
+            | SettingId::SkillInjectionModel
+            | SettingId::UtilityModel => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.utility_picker.is_some()
+            )),
+            SettingId::DelegationMaxParallel
+            | SettingId::LoopGuardThreshold
+            | SettingId::GoalVerificationSkepticCount
+            | SettingId::GoalVerificationMaxRounds
+            | SettingId::ScheduleMaxConcurrent
+            | SettingId::DialogLockoutMs
+            | SettingId::MaxPrimaryRounds => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.is_editing()
+            )),
+            SettingId::ScheduleAllowUnboundedLoops
+            | SettingId::DeepthinkEnabled
+            | SettingId::TextEmbeddedRecovery
+            | SettingId::Concurrency
+            | SettingId::AgentChoosesSubagentModel
+            | SettingId::GoalVerificationEnabled => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if !page.is_editing()
+            )),
+            SettingId::Instructions
+            | SettingId::CompactPrompt
+            | SettingId::AgentDirs
+            | SettingId::PackagesDir
+            | SettingId::TimeInjectionInterval => {}
+            _ => unreachable!("unclassified Behavior descriptor fixture: {setting:?}"),
+        }
     }
 }
 

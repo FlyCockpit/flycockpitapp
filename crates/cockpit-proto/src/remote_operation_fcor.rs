@@ -915,10 +915,18 @@ mod tests {
             display_name: None,
             relay_choice: None,
         };
+        let invalid_schedule = crate::ScheduledJobSchedule::Cron {
+            expr: "e\u{301}".into(),
+        };
+        let invalid_curator = crate::CuratorAction::Pin {
+            name: "e\u{301}".into(),
+        };
         for invalid in [
             (&invalid_account as &dyn CanonicalFcorValueV1),
             (&invalid_relay as &dyn CanonicalFcorValueV1),
             (&invalid_credential as &dyn CanonicalFcorValueV1),
+            (&invalid_schedule as &dyn CanonicalFcorValueV1),
+            (&invalid_curator as &dyn CanonicalFcorValueV1),
         ] {
             let mut out = CanonicalParamsV1::new();
             out.push_u8(4);
@@ -1092,6 +1100,45 @@ mod tests {
                 relay_choice: None,
             },
             "0000000e68747470733a2f2f782e7465737400000001690000000174000000017500000001650000",
+        );
+        exact(
+            &crate::ScheduledJobCreate {
+                id: "resource-id".into(),
+                owner: "o".into(),
+                schedule: crate::ScheduledJobSchedule::Every { seconds: 1 },
+                payload: crate::ScheduledJobPayload::RunPrompt {
+                    assistant: "a".into(),
+                    prompt: "p".into(),
+                    project_root: "/resource-root".into(),
+                },
+                enabled: true,
+                missed_run_policy: crate::MissedRunPolicy::Skip,
+            },
+            "000000016f00020000000000000001000100000001610000000170010001",
+        );
+        exact(
+            &crate::StoredFlycockpitCredential {
+                server_url: "https://x.test".into(),
+                instance_id: "i".into(),
+                instance_token: "t".into(),
+                account: crate::AccountInfo {
+                    user_id: "u".into(),
+                    email: "e".into(),
+                },
+                display_name: Some("d".into()),
+                relay_choice: Some(crate::RelayChoice {
+                    relay_id: "R".into(),
+                    region: Some("z".into()),
+                    ws_url: "w".into(),
+                    rtt_ms: Some(2),
+                    chosen_at: 1,
+                }),
+            },
+            "0000000e68747470733a2f2f782e74657374000000016900000001740000000175000000016501000000016401000000015201000000017a00000001770100000000000000020000000000000001",
+        );
+        assert_eq!(
+            crate::normalize_server_url("http://[::1]/").unwrap(),
+            "http://[::1]"
         );
     }
 

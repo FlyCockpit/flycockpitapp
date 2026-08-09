@@ -488,12 +488,7 @@ pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
         url.scheme() == "https" || (url.scheme() == "http" && loopback),
         "server URL must use HTTPS except for localhost development"
     );
-    let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
-    if let Some(port) = url.port() {
-        origin.push(':');
-        origin.push_str(&port.to_string());
-    }
-    Ok(origin)
+    Ok(url.origin().ascii_serialization())
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]

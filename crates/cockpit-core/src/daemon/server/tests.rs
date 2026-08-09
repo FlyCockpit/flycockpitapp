@@ -971,6 +971,24 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
             .unwrap()
             .as_bytes()
     );
+    if let Request::CreateScheduledJob { job } = &scheduled {
+        use proto::remote_operation_fcor::CanonicalFcorValueV1;
+        let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
+        job.encode_fcor_value_v1(&mut params).unwrap();
+        let params = params.into_bytes();
+        assert!(
+            !params
+                .windows(job.id.len())
+                .any(|window| window == job.id.as_bytes())
+        );
+        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+            assert!(
+                !params
+                    .windows(project_root.len())
+                    .any(|window| window == project_root.as_bytes())
+            );
+        }
+    }
 
     let callback = Request::CreateScheduledJob {
         job: proto::ScheduledJobCreate {

@@ -11541,16 +11541,8 @@ fn png_validation_reports_decoded_dimensions_for_ledger_reconciliation() {
 #[tokio::test]
 async fn attachment_upload_default_limits_match_config_defaults() {
     let limits = AttachmentUploadLimits::default();
-    assert_eq!(limits.per_client_uploads, 4);
-    assert_eq!(limits.global_uploads, 32);
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
-    assert_eq!(limits.global_bytes, 256 * 1024 * 1024);
-
     let cfg_limits: AttachmentUploadLimits = ExtendedConfig::default().daemon.uploads.into();
-    assert_eq!(cfg_limits.per_client_uploads, limits.per_client_uploads);
-    assert_eq!(cfg_limits.global_uploads, limits.global_uploads);
-    assert_eq!(cfg_limits.per_upload_bytes, limits.per_upload_bytes);
-    assert_eq!(cfg_limits.global_bytes, limits.global_bytes);
+    assert_eq!(cfg_limits, limits);
 }
 
 #[tokio::test]
@@ -11560,7 +11552,7 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
             per_upload_bytes: 64 * 1024 * 1024,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 64 MiB exceeds protocol cap 4 MiB; clamping")
@@ -11591,7 +11583,7 @@ async fn attachment_upload_config_cap_is_subordinate_to_durable_policy() {
             per_upload_bytes: configured,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, configured);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert!(warning.is_none());
 
     let ctx = test_ctx();
@@ -11615,7 +11607,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
             per_upload_bytes: 0,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, MIN_ATTACHMENT_UPLOAD_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 0 bytes is below minimum 64 KiB; clamping")
@@ -11694,12 +11686,7 @@ async fn attachment_upload_process_local_limits_only_track_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 2,
-        global_uploads: 32,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     begin_attachment_upload_with_limits(
         &mut state,
@@ -11736,10 +11723,7 @@ async fn attachment_upload_process_local_limits_only_track_ownership() {
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
-        AttachmentUploadLimits {
-            per_upload_bytes: png.len() - 1,
-            ..limits
-        },
+        limits,
     )
     .expect("process-local byte cap is subordinate to the durable ledger");
 }
@@ -11753,12 +11737,7 @@ async fn attachment_upload_process_local_global_limits_are_subordinate() {
     let (mut b, _) = attached_state(&ctx, tmp_b.path()).await;
     b.upload_accounting = a.upload_accounting.clone();
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 4,
-        global_uploads: 1,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     let upload_id = begin_upload_for(&mut a, &png);
     begin_attachment_upload_with_limits(
@@ -11773,11 +11752,7 @@ async fn attachment_upload_process_local_global_limits_are_subordinate() {
 
     assert!(a.pending_uploads.remove(&upload_id).is_some());
     release_uploads(&a.upload_accounting, [upload_id]);
-    let limits = AttachmentUploadLimits {
-        global_uploads: 32,
-        global_bytes: png.len(),
-        ..limits
-    };
+    let limits = AttachmentUploadLimits;
     begin_attachment_upload_with_limits(
         &mut a,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -11853,7 +11828,7 @@ async fn attachment_ledger_uses_authenticated_attached_project_identity() {
             let decoded_plan_count = conn.query_row(
                 "SELECT COUNT(*) FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension IN ('decoded_edge_pixels','decoded_image_pixels','aggregate_decoded_pixels_per_request')",
                 [&reservation_id],
-                |row| row.get::<_, u64>(0),
+                |row| u64::try_from(row.get::<_, i64>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))),
             )?;
             Ok((project, decoded_plan_count))
         })

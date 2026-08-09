@@ -2733,19 +2733,8 @@ impl Drop for MutableClientState {
 
 const MIN_ATTACHMENT_UPLOAD_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy)]
-struct AttachmentUploadLimits {
-    per_client_uploads: usize,
-    global_uploads: usize,
-    per_upload_bytes: usize,
-    global_bytes: usize,
-}
-
-impl Default for AttachmentUploadLimits {
-    fn default() -> Self {
-        DaemonUploadLimitsConfig::default().into()
-    }
-}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachmentUploadLimits;
 
 impl AttachmentUploadLimits {
     fn from_config(config: DaemonUploadLimitsConfig) -> Self {
@@ -2757,16 +2746,8 @@ impl AttachmentUploadLimits {
     }
 
     fn from_config_with_warning(config: DaemonUploadLimitsConfig) -> (Self, Option<String>) {
-        let (per_upload_bytes, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
-        (
-            Self {
-                per_client_uploads: config.per_client_uploads,
-                global_uploads: config.global_uploads,
-                per_upload_bytes,
-                global_bytes: config.global_bytes,
-            },
-            warning,
-        )
+        let (_, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
+        (Self, warning)
     }
 }
 
@@ -2819,17 +2800,6 @@ struct UploadAccounting {
 }
 
 impl UploadAccounting {
-    fn pending_bytes(&self) -> usize {
-        self.pending.values().sum()
-    }
-
-    fn consumed_bytes(&self) -> usize {
-        self.consumed_message_attachments
-            .values()
-            .map(|consumed| consumed.attachment.bytes.len())
-            .sum()
-    }
-
     /// Track which in-memory upload owns bytes. Durable evaluated ledger plans
     /// are the sole capacity/admission authority.
     fn track_pending(&mut self, upload_id: Uuid, byte_len: usize) {

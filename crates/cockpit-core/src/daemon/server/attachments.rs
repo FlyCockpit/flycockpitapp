@@ -199,6 +199,7 @@ pub fn validate_png_attachment_blocking(
     })
 }
 
+#[derive(Debug)]
 pub struct ValidatedPngAttachment {
     pub bytes: Vec<u8>,
     pub width: u64,

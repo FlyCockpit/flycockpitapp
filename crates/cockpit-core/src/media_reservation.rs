@@ -492,6 +492,7 @@ impl MediaReservationLedger {
                     MediaDimension::RetainedBytesPerSession,
                     MediaDimension::DecodedEdgePixels,
                     MediaDimension::DecodedImagePixels,
+                    MediaDimension::AggregateDecodedPixelsPerRequest,
                 ] {
                     release_dimension_balance(
                         conn,
@@ -806,17 +807,22 @@ impl MediaReservationLedger {
                 conn.execute("UPDATE media_reservations SET state='accounting_corrupt',quarantined=1,published=0,version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,id])?;
                 return Ok(ReservationReceipt{reservation_id:id,state:ReservationState::AccountingCorrupt,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline});
             }
+            let outstanding:i64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name],|r|r.get(0))?;
             if actual > estimated {
                 if !next.allows(ReservationState::OverageQuarantined){return Err(anyhow!("invalid_transition"));}
-                let extra=actual.checked_sub(estimated).ok_or_else(||anyhow!("accounting_overflow"))?;
+                let extra=actual.checked_sub(u64::try_from(outstanding.max(0))?).ok_or_else(||anyhow!("accounting_overflow"))?;
                 mutate_counter(conn,scope_kind,&scope_id,&dimension_name,i64::try_from(extra)?)?;
                 record_delta(conn,&id,next_version,&dimension_name,scope_kind,&scope_id,actual,i64::try_from(extra)?,"overage",wall_ms)?;
                 next=ReservationState::OverageQuarantined;
                 conn.execute("UPDATE media_reservations SET quarantined=1,published=0 WHERE reservation_id=?1",[&id])?;
+            } else if !verified_cleanup {
+                if !matches!(next,ReservationState::ExecutingLocal|ReservationState::ReconcilingExternal){return Err(anyhow!("invalid_transition"));}
+                let target=i64::try_from(actual)?;
+                let adjustment=target.checked_sub(outstanding).ok_or_else(||anyhow!("accounting_overflow"))?;
+                if adjustment!=0{mutate_counter(conn,scope_kind,&scope_id,&dimension_name,adjustment)?;record_delta(conn,&id,next_version,&dimension_name,scope_kind,&scope_id,actual,adjustment,"actual",wall_ms)?;}
             } else if verified_cleanup && dimension.scope_policy().release.is_reclaimable() {
                 if !matches!(next,ReservationState::Settling|ReservationState::OverageQuarantined|ReservationState::CancellationRequested|ReservationState::ReconcilingExternal){return Err(anyhow!("invalid_transition"));}
                 if matches!(dimension.scope_policy().release,cockpit_config::config::media_budget::MediaRelease::VerifiedDeletion|cockpit_config::config::media_budget::MediaRelease::BytesDestroyed)&&!deletion_is_proven(conn,&id,&dimension_name)?{return Err(anyhow!("verified_deletion_required"));}
-                let outstanding:i64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name],|r|r.get(0))?;
                 let target=i64::try_from(actual)?;
                 let release=outstanding.checked_sub(target).ok_or_else(||anyhow!("accounting_overflow"))?.max(0);
                 if release>0{mutate_counter(conn,scope_kind,&scope_id,&dimension_name,-release)?;record_delta(conn,&id,next_version,&dimension_name,scope_kind,&scope_id,actual,-release,"cleanup",wall_ms)?;}
@@ -975,12 +981,12 @@ impl MediaReservationLedger {
 
     pub async fn publication_allowed(&self, reservation_id: &str) -> Result<bool, LedgerError> {
         let id = reservation_id.to_owned();
-        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('released','overage_quarantined','accounting_corrupt') FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
+        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND cancellation_requested=0 AND state='settling' FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
     }
 
     pub async fn authorize_publication(&self, reservation_id: &str) -> Result<(), LedgerError> {
         let id = reservation_id.to_owned();
-        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('overage_quarantined','accounting_corrupt','cancellation_requested')",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
+        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state='settling'",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
     }
 
     pub async fn repair_accounting(
@@ -1445,6 +1451,7 @@ fn release_restart_dimensions(
         MediaDimension::RetainedBytesPerSession,
         MediaDimension::DecodedEdgePixels,
         MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
     ] {
         release_dimension_balance(conn, id, version, &dimension_name(dimension), wall_ms)?;
     }
@@ -1785,6 +1792,7 @@ mod tests {
                 vec![
                     plan(MediaDimension::QueuedOperationsGlobal, 1, None),
                     plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::AggregateDecodedPixelsPerRequest, 9, None),
                     plan(MediaDimension::OperationDeadlineSeconds, 10, None),
                 ],
             ))
@@ -1810,6 +1818,11 @@ mod tests {
                 ("queued_operations_global".into(), 0),
                 ("queued_operations_per_session".into(), 0),
             ]
+        );
+        let aggregate = db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE dimension='aggregate_decoded_pixels_per_request'",[],|row|row_u64(row,0))?)).await.unwrap();
+        assert_eq!(
+            aggregate, 0,
+            "queued cancellation releases aggregate decode reservation"
         );
         assert!(
             !ledger
@@ -2109,19 +2122,25 @@ mod tests {
                 "overage",
                 vec![
                     plan(MediaDimension::EncodedBytesPerObject, 10, None),
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
                     plan(MediaDimension::OperationDeadlineSeconds, 10, None),
                 ],
             ))
             .await
             .unwrap();
-        let settling = ledger
-            .settle_verified(&receipt.reservation_id, receipt.version, Vec::new(), 2)
+        let executing = ledger
+            .promote(
+                &receipt.reservation_id,
+                receipt.version,
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                2,
+            )
             .await
             .unwrap();
         let over = ledger
             .reconcile_actual(
                 &receipt.reservation_id,
-                settling.version,
+                executing.version,
                 MediaDimension::EncodedBytesPerObject,
                 11,
                 false,
@@ -2139,6 +2158,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executing_actual_reconciliation_replaces_estimate_exactly() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        let receipt = ledger
+            .reserve(request(
+                "actual-replaces-estimate",
+                vec![
+                    plan(MediaDimension::DecodedImagePixels, 100, None),
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let executing = ledger
+            .promote(
+                &receipt.reservation_id,
+                receipt.version,
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                2,
+            )
+            .await
+            .unwrap();
+        let reconciled = ledger
+            .reconcile_actual(
+                &executing.reservation_id,
+                executing.version,
+                MediaDimension::DecodedImagePixels,
+                40,
+                false,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciled.state, ReservationState::ExecutingLocal);
+        let (counter, balance) = db.read(|conn|Ok((
+            conn.query_row("SELECT charged FROM media_resource_counters WHERE dimension='decoded_image_pixels'",[],|row|row_u64(row,0))?,
+            conn.query_row("SELECT SUM(delta) FROM media_reservation_deltas WHERE reservation_id='actual-replaces-estimate' AND dimension='decoded_image_pixels'",[],|row|row_u64(row,0))?,
+        ))).await.unwrap();
+        assert_eq!((counter, balance), (40, 40));
+    }
+
+    #[tokio::test]
+    async fn publication_requires_post_reconciliation_settling_state() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db, Arc::new(Clock(AtomicU64::new(0))));
+        let receipt = ledger
+            .reserve(request(
+                "publication-state",
+                vec![
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .authorize_publication(&receipt.reservation_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            !ledger
+                .publication_allowed(&receipt.reservation_id)
+                .await
+                .unwrap()
+        );
+        let executing = ledger
+            .promote(
+                &receipt.reservation_id,
+                receipt.version,
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .authorize_publication(&executing.reservation_id)
+                .await
+                .is_err()
+        );
+        let settling = ledger
+            .complete_local_allocation(&executing.reservation_id, executing.version, 3)
+            .await
+            .unwrap();
+        ledger
+            .authorize_publication(&settling.reservation_id)
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .publication_allowed(&settling.reservation_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn media_budget_restart_recovery() {
         let db = Db::open_in_memory().unwrap();
         let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
@@ -2149,6 +2268,7 @@ mod tests {
                     plan(MediaDimension::QueuedOperationsGlobal, 1, None),
                     plan(MediaDimension::QueuedOperationsPerSession, 1, None),
                     plan(MediaDimension::RetainedBytesPerSession, 5, None),
+                    plan(MediaDimension::AggregateDecodedPixelsPerRequest, 13, None),
                     plan(MediaDimension::OperationDeadlineSeconds, 10, None),
                 ],
             ))
@@ -2170,6 +2290,7 @@ mod tests {
         assert!(values.contains(&("retained_bytes_per_session".into(), 0)));
         assert!(ledger.recovery_complete().await.unwrap());
         assert!(values.contains(&("queued_operations_global".into(), 0)));
+        assert!(values.contains(&("aggregate_decoded_pixels_per_request".into(), 0)));
     }
 
     #[test]

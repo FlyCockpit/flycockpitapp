@@ -151,6 +151,9 @@ fn print_cancel(format: OutputFormat, result: &proto::RunInvocationCancelResultV
                         result.state.as_str()
                     )
                 }
+                proto::RunInvocationCancelOutcome::NotFound => {
+                    format!("invocation {}: not_found", result.client_submission_id)
+                }
             };
             println!("{line}");
         }

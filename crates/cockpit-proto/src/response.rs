@@ -537,6 +537,7 @@ pub enum ClientSubmissionReceiptStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunInvocationLifecycleState {
+    NotFound,
     Accepted,
     Queued,
     Dispatching,
@@ -555,6 +556,7 @@ pub enum RunInvocationLifecycleState {
 impl RunInvocationLifecycleState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
             Self::Accepted => "accepted",
             Self::Queued => "queued",
             Self::Dispatching => "dispatching",
@@ -667,6 +669,8 @@ pub enum RunInvocationCancelOutcome {
     CancellationRequested,
     AlreadyCancelled,
     AlreadyTerminal,
+    /// The authoritative lookup installed or observed a durable tombstone.
+    NotFound,
 }
 
 impl RunInvocationCancelOutcome {
@@ -675,6 +679,7 @@ impl RunInvocationCancelOutcome {
             Self::CancellationRequested => "cancellation_requested",
             Self::AlreadyCancelled => "already_cancelled",
             Self::AlreadyTerminal => "already_terminal",
+            Self::NotFound => "not_found",
         }
     }
 }

@@ -485,7 +485,108 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::CancelRunInvocation {
             client_submission_id,
-        } => run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await,
+        } => {
+            if let Some(operation) = remote_operation {
+                let canonical_request = Request::CancelRunInvocation {
+                    client_submission_id,
+                };
+                let params = canonical_request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&canonical_request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let digest = principal_digest(&state.principal);
+                let is_owner = state.principal.is_owner();
+                let now = wall_ms_now();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: now,
+                    },
+                    move |conn| {
+                        let lookup = crate::db::Db::lookup_or_tombstone_run_invocation_conn(
+                            conn, client_submission_id, &digest, now, is_owner,
+                        )?;
+                        let row = match lookup {
+                            crate::db::run_invocations::LookupRunInvocationOutcome::Found(row) => *row,
+                            crate::db::run_invocations::LookupRunInvocationOutcome::LookupBusy => anyhow::bail!("invocation lookup busy"),
+                            crate::db::run_invocations::LookupRunInvocationOutcome::NotFoundInstalledTombstone
+                            | crate::db::run_invocations::LookupRunInvocationOutcome::NotFoundExistingTombstone => {
+                                let receipt = proto::RunInvocationCancelResultV1 {
+                                    schema_version: proto::RunInvocationCancelResultV1::SCHEMA_VERSION,
+                                    client_submission_id,
+                                    outcome: proto::RunInvocationCancelOutcome::NotFound,
+                                    state: proto::RunInvocationLifecycleState::NotFound,
+                                    state_version: 0,
+                                };
+                                let bytes = serde_json::to_vec(&receipt)?;
+                                return Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                    value: (receipt, None), safe_response: bytes.clone(),
+                                    outbox_kind: "cancel_run_invocation".into(), outbox_payload: bytes,
+                                });
+                            }
+                        };
+                        let updated = if row.cancel_result.is_some() {
+                            row
+                        } else {
+                            let (state_name, result) = if row.terminal_at_wall_ms.is_some() {
+                                (row.state.as_str(), "already_terminal")
+                            } else {
+                                ("cancellation_requested", "cancellation_requested")
+                            };
+                            crate::db::Db::update_run_invocation_state_conn(
+                                conn, client_submission_id, row.state_version, state_name,
+                                row.remaining_ms, Some(true), Some(result), now,
+                            )?.ok_or_else(|| anyhow::anyhow!("invocation not found"))?
+                        };
+                        let result = match updated.cancel_result.as_deref() {
+                            Some("cancellation_requested") => proto::RunInvocationCancelOutcome::CancellationRequested,
+                            Some("already_cancelled") => proto::RunInvocationCancelOutcome::AlreadyCancelled,
+                            Some("already_terminal") => proto::RunInvocationCancelOutcome::AlreadyTerminal,
+                            _ => anyhow::bail!("invalid cancellation result"),
+                        };
+                        let receipt = proto::RunInvocationCancelResultV1 {
+                            schema_version: proto::RunInvocationCancelResultV1::SCHEMA_VERSION,
+                            client_submission_id, outcome: result,
+                            state: run_invocation::parse_lifecycle_state(&updated.state)
+                                .map_err(|error| anyhow::anyhow!(error.message))?,
+                            state_version: updated.state_version,
+                        };
+                        let bytes = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: (receipt, Some(updated.session_id)), safe_response: bytes.clone(),
+                            outbox_kind: "cancel_run_invocation".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let (result, session_id, applied) = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((result, session_id)) => (result, session_id, true),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => {
+                        let result: proto::RunInvocationCancelResultV1 = serde_json::from_slice(&bytes).map_err(internal)?;
+                        (result, None, false)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if applied
+                    && result.outcome == proto::RunInvocationCancelOutcome::CancellationRequested
+                    && let Some(session_id) = session_id
+                    && let Some(handle) = ctx.registry.live_handle(session_id)
+                {
+                    let _ = handle.send_work(SessionWork::Cancel).await;
+                }
+                Ok(Response::RunInvocationCancelResult { result })
+            } else {
+                run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
+            }
+        }
 
         Request::SteerDelegation {
             session_id,

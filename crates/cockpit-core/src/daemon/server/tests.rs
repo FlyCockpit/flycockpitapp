@@ -2454,6 +2454,179 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     );
 }
 
+#[tokio::test]
+async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
+    let ctx = test_ctx();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222229").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "invocation-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: None,
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333339").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let digest = crate::daemon::server::run_invocation_principal_digest(&principal);
+    let invocation_id = Uuid::new_v4();
+    ctx.db
+        .accept_run_invocation(
+            invocation_id,
+            digest,
+            Uuid::new_v4(),
+            "{}".into(),
+            "opts".into(),
+            "content".into(),
+            None,
+            None,
+            1_700_000_000_000,
+        )
+        .await
+        .unwrap();
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-dddddddddddd").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut applied_bytes = None;
+    for label in ["apply", "replay"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                operation,
+                Request::CancelRunInvocation {
+                    client_submission_id: invocation_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        let Body::Response { id, response } = recv_writer_body(&mut writer_rx, label).await else {
+            panic!("expected cancellation response")
+        };
+        assert_eq!(id, request_id);
+        let bytes = serde_json::to_vec(&response).unwrap();
+        if let Some(applied) = &applied_bytes {
+            assert_eq!(&bytes, applied);
+        } else {
+            applied_bytes = Some(bytes);
+        }
+    }
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::CancelRunInvocation {
+                client_submission_id: Uuid::new_v4(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict));
+    let row = ctx
+        .db
+        .lookup_or_tombstone_run_invocation(
+            invocation_id,
+            crate::daemon::server::run_invocation_principal_digest(&state.principal),
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        )
+        .await
+        .unwrap();
+    let crate::db::run_invocations::LookupRunInvocationOutcome::Found(row) = row else {
+        panic!("invocation missing")
+    };
+    assert_eq!(
+        row.state_version, 2,
+        "replay/conflict performed a second domain write"
+    );
+
+    let absent_id = Uuid::new_v4();
+    let absent_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-eeeeeeeeeeee").unwrap(),
+    )
+    .unwrap();
+    let mut absent_bytes = None;
+    for label in ["absent apply", "absent replay"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                absent_operation,
+                Request::CancelRunInvocation {
+                    client_submission_id: absent_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        let Body::Response { response, .. } = recv_writer_body(&mut writer_rx, label).await else {
+            panic!("expected authoritative absent response")
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        if let Some(applied) = &absent_bytes {
+            assert_eq!(&bytes, applied);
+        } else {
+            absent_bytes = Some(bytes);
+        }
+    }
+    let reuse = ctx
+        .db
+        .accept_run_invocation(
+            absent_id,
+            crate::daemon::server::run_invocation_principal_digest(&state.principal),
+            Uuid::new_v4(),
+            "{}".into(),
+            "opts".into(),
+            "content".into(),
+            None,
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        reuse,
+        crate::db::run_invocations::AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable
+    ));
+}
+
 fn table_for(secret: &str) -> Arc<RedactionTable> {
     let cfg = crate::config::extended::RedactConfig {
         enabled: true,

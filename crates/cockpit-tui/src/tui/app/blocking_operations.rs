@@ -26,41 +26,27 @@ pub(super) enum BlockingOperationSite {
 #[cfg(test)]
 pub(super) struct BlockingOperationSiteAuthority {
     pub(super) site: BlockingOperationSite,
-    pub(super) handler: &'static str,
-    pub(super) source: &'static str,
 }
 
 #[cfg(test)]
 pub(super) const ALL_BLOCKING_OPERATION_SITES: &[BlockingOperationSiteAuthority] = &[
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::SlashCurator,
-        handler: "handle_curator_command",
-        source: include_str!("slash.rs"),
     },
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::SlashDoctor,
-        handler: "handle_doctor_command",
-        source: include_str!("slash.rs"),
     },
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::SlashExport,
-        handler: "start_export_action",
-        source: include_str!("export_actions.rs"),
     },
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::QueueEditKey,
-        handler: "edit_queued_messages",
-        source: include_str!("input.rs"),
     },
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::SlashBtw,
-        handler: "handle_btw_command",
-        source: include_str!("btw_pane.rs"),
     },
     BlockingOperationSiteAuthority {
         site: BlockingOperationSite::ComposerSuggestions,
-        handler: "reset_at_window",
-        source: include_str!("input.rs"),
     },
 ];
 

@@ -60,11 +60,15 @@ fn blocking_operation_manifest_is_complete() {
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
         }
-        let authority = ALL_BLOCKING_OPERATION_SITES
+        ALL_BLOCKING_OPERATION_SITES
             .iter()
             .find(|authority| authority.site == registration.site)
             .unwrap_or_else(|| panic!("manifest contains undeclared site {:?}", registration.site));
-        validate_handler_source(authority.source, authority.handler, registration.wrapper)
+        let (source, handler) = derive_wrapper_handler(registration.wrapper)
+            .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
+        validate_handler_source(source, &handler, registration.wrapper)
+            .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
+        validate_site_reachability(registration.site, &handler)
             .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
     }
     let declared = ALL_BLOCKING_OPERATION_SITES
@@ -75,6 +79,101 @@ fn blocking_operation_manifest_is_complete() {
         sites, declared,
         "manifest must cover every sealed site exactly once"
     );
+}
+
+const PRODUCTION_ROUTING_SOURCES: &[&str] = &[
+    include_str!("slash.rs"),
+    include_str!("input.rs"),
+    include_str!("export_actions.rs"),
+    include_str!("btw_pane.rs"),
+];
+
+fn derive_wrapper_handler(wrapper: &str) -> Result<(&'static str, String), String> {
+    let mut found = Vec::new();
+    for source in PRODUCTION_ROUTING_SOURCES {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .map_err(|e| e.to_string())?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or("Rust parser returned no tree")?;
+        let mut functions = Vec::new();
+        collect_all_functions(tree.root_node(), &mut functions);
+        for function in functions {
+            let Some(name) = function
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            else {
+                continue;
+            };
+            if analyze_handler_source(source, name, wrapper).is_ok_and(|calls| calls == 1) {
+                found.push((*source, name.to_string()));
+            }
+        }
+    }
+    if found.len() != 1 {
+        return Err(format!(
+            "wrapper `{wrapper}` has {} production handlers",
+            found.len()
+        ));
+    }
+    Ok(found.pop().unwrap())
+}
+
+fn collect_all_functions<'tree>(
+    node: tree_sitter::Node<'tree>,
+    found: &mut Vec<tree_sitter::Node<'tree>>,
+) {
+    if node.kind() == "function_item" {
+        found.push(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_all_functions(child, found);
+    }
+}
+
+fn validate_site_reachability(
+    site: super::blocking_operations::BlockingOperationSite,
+    handler: &str,
+) -> Result<(), String> {
+    use super::blocking_operations::BlockingOperationSite::*;
+    let slash = include_str!("slash.rs");
+    let input = include_str!("input.rs");
+    let reachable = match site {
+        SlashCurator => {
+            slash.contains("name: \"curator\"")
+                && slash.contains("run: run_curator")
+                && handler == "handle_curator_command"
+        }
+        SlashDoctor => {
+            slash.contains("name: \"doctor\"")
+                && slash.contains("run: run_doctor")
+                && handler == "handle_doctor_command"
+        }
+        SlashExport => {
+            slash.contains("name: \"export\"")
+                && slash.contains("run: run_export")
+                && handler == "start_export_action"
+        }
+        SlashBtw => {
+            slash.contains("name: \"btw\"")
+                && slash.contains("run: run_btw")
+                && handler == "handle_btw_command"
+        }
+        QueueEditKey => {
+            input.contains("KeyCode::Up")
+                && input.contains("self.history_up()")
+                && handler == "edit_queued_messages"
+        }
+        ComposerSuggestions => {
+            input.contains("self.reset_at_window()") && handler == "reset_at_window"
+        }
+    };
+    reachable.then_some(()).ok_or_else(|| {
+        format!("handler `{handler}` is unreachable from its production registration")
+    })
 }
 
 fn validate_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<(), String> {
@@ -211,6 +310,13 @@ fn sealed_site_catalog_detects_a_deleted_manifest_row() {
         .map(|registration| registration.site)
         .collect::<std::collections::HashSet<_>>();
     assert_ne!(declared, missing_one);
+}
+
+#[test]
+fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
+    use super::blocking_operations::BlockingOperationSite;
+    assert!(validate_site_reachability(BlockingOperationSite::SlashCurator, "bypass").is_err());
+    assert!(derive_wrapper_handler("unclassified_owned_dispatch").is_err());
 }
 
 #[tokio::test]

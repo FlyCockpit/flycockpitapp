@@ -2631,7 +2631,7 @@ CREATE TABLE remote_attachment_operations (
     logical_attachment_id          TEXT    NOT NULL,
     operation_id                   TEXT    NOT NULL,
     authenticated_device_id        TEXT    NOT NULL,
-    authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation >= 0),
+    authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation > 0),
     operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
     operation_class                TEXT    NOT NULL CHECK (operation_class IN (
         'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
@@ -2654,6 +2654,25 @@ CREATE INDEX idx_remote_attachment_operations_retire
     ON remote_attachment_operations (retire_at_ms)
     WHERE retire_at_ms IS NOT NULL;
 
+CREATE TRIGGER remote_attachment_operation_capacity_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN (SELECT COUNT(*) FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 100000
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_operation_response_capacity
+BEFORE UPDATE OF safe_response ON remote_attachment_operations
+WHEN (SELECT COALESCE(SUM(length(safe_response)), 0)
+      FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     - COALESCE(length(OLD.safe_response), 0)
+     + COALESCE(length(NEW.safe_response), 0) > 536870912
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
 -- Operation identity, actor binding, request digest, class, and sequence are
 -- immutable after reservation. Reuse with changed bytes or actor generation
 -- is resolved as a typed conflict by the reservation API, never by UPDATE.
@@ -2669,6 +2688,21 @@ WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
   OR NEW.created_at_ms IS NOT OLD.created_at_ms
 BEGIN
     SELECT RAISE(ABORT, 'remote attachment operation binding is immutable');
+END;
+
+CREATE TRIGGER remote_attachment_operation_transition_guard
+BEFORE UPDATE ON remote_attachment_operations
+WHEN (OLD.state <> 'reserved' AND NEW.state <> OLD.state)
+  OR (OLD.state = 'reserved' AND NEW.state NOT IN ('reserved', 'committed', 'rejected', 'outcome_unknown'))
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR (OLD.safe_response IS NOT NULL AND NEW.safe_response IS NOT OLD.safe_response)
+  OR (OLD.event_high_water_mark IS NOT NULL
+      AND (NEW.event_high_water_mark IS NULL OR NEW.event_high_water_mark < OLD.event_high_water_mark))
+  OR (OLD.retire_at_ms IS NOT NULL
+      AND (NEW.retire_at_ms IS NULL OR NEW.retire_at_ms <> OLD.retire_at_ms))
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote attachment operation transition');
 END;
 
 CREATE TABLE remote_attachment_outbox (
@@ -2689,6 +2723,24 @@ CREATE TABLE remote_attachment_outbox (
 CREATE INDEX idx_remote_attachment_outbox_operation
     ON remote_attachment_outbox (logical_attachment_id, operation_seq)
     WHERE operation_seq IS NOT NULL;
+
+CREATE TRIGGER remote_attachment_outbox_capacity_insert
+BEFORE INSERT ON remote_attachment_outbox
+WHEN (SELECT COUNT(*) FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 200000
+  OR (SELECT COALESCE(SUM(length(canonical_payload)), 0)
+      FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     + length(NEW.canonical_payload) > 2147483648
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_outbox_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_immutable
+BEFORE UPDATE ON remote_attachment_outbox
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
+END;
 
 CREATE TABLE remote_attachment_outbox_snapshots (
     logical_attachment_id       TEXT PRIMARY KEY,

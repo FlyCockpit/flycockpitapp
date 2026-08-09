@@ -3568,79 +3568,106 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
-async fn characterize_operation_reservation(
+#[derive(Debug, PartialEq, Eq)]
+enum CharacterizedDispatchOutcome {
+    Applied(Vec<u8>),
+    Conflict,
+}
+
+async fn characterize_operation_dispatch(
     db: &crate::db::Db,
+    _request_id: Uuid,
     operation_id: Uuid,
     request_hash: [u8; 32],
-) -> crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome {
-    use crate::db::remote_attachment_operations::{RemoteOperationClass, ReserveRemoteOperation};
+    side_effects: &std::sync::atomic::AtomicUsize,
+) -> CharacterizedDispatchOutcome {
+    use crate::db::remote_attachment_operations::{
+        CommitRemoteOperation, RemoteOperationClass, ReserveRemoteOperation,
+        ReserveRemoteOperationOutcome,
+    };
     let operation_id = operation_id.to_string();
-    db.reserve_remote_attachment_operation(ReserveRemoteOperation {
-        logical_attachment_id: "attachment-characterization",
-        operation_id: &operation_id,
-        authenticated_device_id: "device-characterization",
-        authenticated_device_generation: 1,
-        operation_class: RemoteOperationClass::TransactionalMutation,
-        request_hash,
-        now_ms: 1,
-    })
-    .await
-    .unwrap()
+    let reservation = db
+        .reserve_remote_attachment_operation(ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+            operation_id: &operation_id,
+            authenticated_device_id: "00000000-0000-4000-8000-000000000002",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::TransactionalMutation,
+            request_hash,
+            now_ms: 1,
+        })
+        .await
+        .unwrap();
+    match reservation {
+        ReserveRemoteOperationOutcome::Reserved(_) => {
+            side_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let outcome = b"committed byte-identical outcome".to_vec();
+            let delivery_id = Uuid::new_v4().to_string();
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+                operation_id: &operation_id,
+                safe_response: &outcome,
+                outbox_delivery_id: &delivery_id,
+                outbox_kind: "characterized_dispatch",
+                outbox_payload: b"bounded event",
+                now_ms: 2,
+            })
+            .await
+            .unwrap();
+            CharacterizedDispatchOutcome::Applied(outcome)
+        }
+        ReserveRemoteOperationOutcome::Replay(replay) => {
+            CharacterizedDispatchOutcome::Applied(replay.safe_response.unwrap())
+        }
+        ReserveRemoteOperationOutcome::OperationConflict => CharacterizedDispatchOutcome::Conflict,
+        other => panic!("unexpected dispatch reservation: {other:?}"),
+    }
+}
+
+fn characterized_operation_id() -> Uuid {
+    Uuid::parse_str("01890f3e-4c00-7000-8000-000000000001").unwrap()
 }
 
 #[tokio::test]
 async fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
-    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
-        Replay, Reserved,
-    };
     let db = crate::db::Db::open_in_memory().unwrap();
-    let operation_id = Uuid::new_v4();
-    let first = characterize_operation_reservation(&db, operation_id, [1; 32]).await;
-    let replay = characterize_operation_reservation(&db, operation_id, [1; 32]).await;
-    let Reserved(first) = first else {
-        panic!("first submission must reserve")
-    };
-    let Replay(replay) = replay else {
-        panic!("same operation must replay")
-    };
-    assert_eq!(replay.operation_seq, first.operation_seq);
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let request_id = Uuid::new_v4();
+    let first =
+        characterize_operation_dispatch(&db, request_id, operation_id, [1; 32], &effects).await;
+    let replay =
+        characterize_operation_dispatch(&db, request_id, operation_id, [1; 32], &effects).await;
+    assert_eq!(replay, first);
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn remote_operation_same_operation_different_bytes_conflicts() {
-    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
-        OperationConflict, Reserved,
-    };
     let db = crate::db::Db::open_in_memory().unwrap();
-    let operation_id = Uuid::new_v4();
-    assert!(matches!(
-        characterize_operation_reservation(&db, operation_id, [1; 32]).await,
-        Reserved(_)
-    ));
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let first =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [1; 32], &effects).await;
     assert_eq!(
-        characterize_operation_reservation(&db, operation_id, [2; 32]).await,
-        OperationConflict
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [2; 32], &effects).await,
+        CharacterizedDispatchOutcome::Conflict
     );
+    assert!(matches!(first, CharacterizedDispatchOutcome::Applied(_)));
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
-    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
-        Replay, Reserved,
-    };
     let db = crate::db::Db::open_in_memory().unwrap();
-    let operation_id = Uuid::new_v4();
-    let _first_request_id = Uuid::new_v4();
-    let first = characterize_operation_reservation(&db, operation_id, [3; 32]).await;
-    let _fresh_request_id = Uuid::new_v4();
-    let replay = characterize_operation_reservation(&db, operation_id, [3; 32]).await;
-    let Reserved(first) = first else {
-        panic!("first submission must reserve")
-    };
-    let Replay(replay) = replay else {
-        panic!("fresh request id must replay")
-    };
-    assert_eq!(replay.operation_seq, first.operation_seq);
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let first =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [3; 32], &effects).await;
+    let replay =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [3; 32], &effects).await;
+    assert_eq!(replay, first);
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 fn dispatch_matrix_class_for_command(

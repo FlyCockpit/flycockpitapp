@@ -17,6 +17,21 @@ pub const MAX_OUTBOX_EVENTS_PER_ATTACHMENT: u64 = 200_000;
 pub const MAX_OUTBOX_PAYLOAD_BYTES_PER_ATTACHMENT: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_OUTBOX_PAYLOAD_BYTES: usize = 512 * 1024;
 
+fn operation_reservation_at_capacity(row_count: u64, response_bytes: u64) -> bool {
+    row_count >= MAX_OPERATION_ROWS_PER_ATTACHMENT
+        || response_bytes >= MAX_SAFE_RESPONSE_BYTES_PER_ATTACHMENT
+}
+
+fn response_would_exceed_capacity(response_bytes: u64, added_bytes: usize) -> bool {
+    response_bytes.saturating_add(added_bytes as u64) > MAX_SAFE_RESPONSE_BYTES_PER_ATTACHMENT
+}
+
+fn outbox_would_exceed_capacity(event_count: u64, payload_bytes: u64, added_bytes: usize) -> bool {
+    event_count >= MAX_OUTBOX_EVENTS_PER_ATTACHMENT
+        || payload_bytes.saturating_add(added_bytes as u64)
+            > MAX_OUTBOX_PAYLOAD_BYTES_PER_ATTACHMENT
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteOperationClass {
     TransactionalMutation,
@@ -190,9 +205,7 @@ fn reserve_conn(
         [&request.logical_attachment_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if row_count >= MAX_OPERATION_ROWS_PER_ATTACHMENT as i64
-        || response_bytes >= MAX_SAFE_RESPONSE_BYTES_PER_ATTACHMENT as i64
-    {
+    if operation_reservation_at_capacity(row_count.try_into()?, response_bytes.try_into()?) {
         return Ok(ReserveRemoteOperationOutcome::AttachmentLedgerCapacity);
     }
     let next_seq: i64 = conn.query_row(
@@ -260,9 +273,7 @@ fn commit_conn(
         [&request.logical_attachment_id],
         |row| row.get(0),
     )?;
-    if response_bytes.saturating_add(request.safe_response.len() as i64)
-        > MAX_SAFE_RESPONSE_BYTES_PER_ATTACHMENT as i64
-    {
+    if response_would_exceed_capacity(response_bytes.try_into()?, request.safe_response.len()) {
         return Ok(CommitRemoteOperationOutcome::AttachmentLedgerCapacity);
     }
     let (event_count, payload_bytes, next_event_seq): (i64, i64, i64) = conn.query_row(
@@ -272,10 +283,11 @@ fn commit_conn(
         [&request.logical_attachment_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if event_count >= MAX_OUTBOX_EVENTS_PER_ATTACHMENT as i64
-        || payload_bytes.saturating_add(request.outbox_payload.len() as i64)
-            > MAX_OUTBOX_PAYLOAD_BYTES_PER_ATTACHMENT as i64
-    {
+    if outbox_would_exceed_capacity(
+        event_count.try_into()?,
+        payload_bytes.try_into()?,
+        request.outbox_payload.len(),
+    ) {
         return Ok(CommitRemoteOperationOutcome::AttachmentOutboxCapacity);
     }
     conn.execute(
@@ -480,6 +492,98 @@ mod tests {
                 .await
                 .is_err()
         );
+        let mut overflow = reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32]);
+        overflow.authenticated_device_generation = u64::MAX;
+        assert!(
+            db.reserve_remote_attachment_operation(overflow)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_capacity_boundaries_are_inclusive_without_large_allocations() {
+        assert!(!operation_reservation_at_capacity(99_999, 536_870_911));
+        assert!(operation_reservation_at_capacity(100_000, 0));
+        assert!(operation_reservation_at_capacity(0, 536_870_912));
+        assert!(!response_would_exceed_capacity(536_870_911, 1));
+        assert!(response_would_exceed_capacity(536_870_912, 1));
+        assert!(!outbox_would_exceed_capacity(199_999, 2_147_483_647, 1));
+        assert!(outbox_would_exceed_capacity(200_000, 0, 0));
+        assert!(outbox_would_exceed_capacity(0, 2_147_483_648, 1));
+        let schema = include_str!("migrations/0001_initial.sql");
+        for required in [
+            "remote_attachment_operation_capacity_insert",
+            "remote_attachment_operation_response_capacity",
+            "remote_attachment_outbox_capacity_insert",
+            ">= 100000",
+            "> 536870912",
+            ">= 200000",
+            "> 2147483648",
+        ] {
+            assert!(
+                schema.contains(required),
+                "missing schema bound: {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_malformed_nil_wrong_version_and_extra_hyphen_ids() {
+        for (index, operation_id) in [
+            "00000000-0000-0000-0000-000000000000",
+            "01890f3e-4c00-4000-8000-000000000001",
+            "01890f3e-4c00-7000-8000-00000-000001",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = Db::open_in_memory().unwrap();
+            let operation_id = operation_id.to_owned();
+            assert!(
+                db.write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO remote_attachment_operations
+                         (logical_attachment_id, operation_id, authenticated_device_id,
+                          authenticated_device_generation, operation_seq, operation_class,
+                          state, request_hash, created_at_ms, updated_at_ms)
+                         VALUES (?1, ?2, ?3, 1, ?4, 'transactional_mutation',
+                                 'reserved', zeroblob(32), 1, 1)",
+                        params![ATTACHMENT, operation_id, DEVICE, index as i64 + 1],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .is_err(),
+                "schema accepted malformed operation id at case {index}"
+            );
+        }
+
+        for (attachment, device) in [
+            ("00000000-0000-0000-0000-000000000000", DEVICE),
+            (ATTACHMENT, "00000000-0000-0000-0000-000000000000"),
+            (ATTACHMENT, "00000000-0000-4000-7000-000000000002"),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            let attachment = attachment.to_owned();
+            let device = device.to_owned();
+            assert!(
+                db.write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO remote_attachment_operations
+                         (logical_attachment_id, operation_id, authenticated_device_id,
+                          authenticated_device_generation, operation_seq, operation_class,
+                          state, request_hash, created_at_ms, updated_at_ms)
+                         VALUES (?1, '01890f3e-4c00-7000-8000-000000000099', ?2, 1, 1,
+                                 'transactional_mutation', 'reserved', zeroblob(32), 1, 1)",
+                        params![attachment, device],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]

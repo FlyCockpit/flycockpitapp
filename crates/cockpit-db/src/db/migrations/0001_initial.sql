@@ -2632,7 +2632,10 @@ CREATE TABLE remote_attachment_operations (
         length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
         AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
         AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
         AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
     ),
     operation_id                   TEXT    NOT NULL CHECK (
         length(operation_id) = 36 AND operation_id = lower(operation_id)
@@ -2640,13 +2643,18 @@ CREATE TABLE remote_attachment_operations (
         AND substr(operation_id, 15, 1) = '7'
         AND substr(operation_id, 19, 1) = '-' AND substr(operation_id, 20, 1) GLOB '[89ab]'
         AND substr(operation_id, 24, 1) = '-'
+        AND length(replace(operation_id, '-', '')) = 32
         AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(operation_id, '-', '') <> '00000000000000000000000000000000'
     ),
     authenticated_device_id        TEXT    NOT NULL CHECK (
         length(authenticated_device_id) = 36 AND authenticated_device_id = lower(authenticated_device_id)
         AND substr(authenticated_device_id, 9, 1) = '-' AND substr(authenticated_device_id, 14, 1) = '-'
         AND substr(authenticated_device_id, 19, 1) = '-' AND substr(authenticated_device_id, 24, 1) = '-'
+        AND substr(authenticated_device_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(authenticated_device_id, '-', '')) = 32
         AND replace(authenticated_device_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(authenticated_device_id, '-', '') <> '00000000000000000000000000000000'
     ),
     authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation > 0),
     operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
@@ -2748,7 +2756,9 @@ CREATE TABLE remote_attachment_outbox (
         AND substr(delivery_id, 9, 1) = '-' AND substr(delivery_id, 14, 1) = '-'
         AND substr(delivery_id, 19, 1) = '-' AND substr(delivery_id, 20, 1) GLOB '[89ab]'
         AND substr(delivery_id, 24, 1) = '-'
+        AND length(replace(delivery_id, '-', '')) = 32
         AND replace(delivery_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(delivery_id, '-', '') <> '00000000000000000000000000000000'
     ),
     operation_seq          INTEGER CHECK (operation_seq IS NULL OR operation_seq > 0),
     kind                   TEXT    NOT NULL CHECK (length(kind) BETWEEN 1 AND 255),
@@ -2788,7 +2798,10 @@ CREATE TABLE remote_attachment_outbox_snapshots (
         length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
         AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
         AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
         AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
     ),
     compacted_through_event_seq INTEGER NOT NULL CHECK (compacted_through_event_seq >= 0),
     snapshot_high_water_mark    INTEGER NOT NULL CHECK (snapshot_high_water_mark >= compacted_through_event_seq),

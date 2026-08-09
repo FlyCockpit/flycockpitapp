@@ -318,7 +318,6 @@ pub(crate) struct PendingModelSelection {
 
 pub(crate) struct QueuedModelSubmission {
     pub client_submission_id: uuid::Uuid,
-    pub fence_sequence: u64,
     /// Composer buffer at the instant this submission was held. A matching
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,

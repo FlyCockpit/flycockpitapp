@@ -2685,7 +2685,6 @@ impl App {
             );
             pending.queued_submission = Some(super::QueuedModelSubmission {
                 client_submission_id,
-                fence_sequence,
                 composer_text: self.composer.text().to_string(),
                 display: submitted,
                 submission,
@@ -5545,8 +5544,8 @@ mod paste_routing_tests {
         assert_eq!(preserved.original_data, "original");
     }
 
-    #[test]
-    fn identified_path_literal_completion_preserves_unowned_probe_capture() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn identified_path_literal_completion_preserves_unowned_probe_capture() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
         let request = app
@@ -5574,6 +5573,10 @@ mod paste_routing_tests {
             crate::tui::structured_paste::PasteSource::BracketedPty,
             request_id,
         );
+        // Let the production path-probe task enter the current-thread
+        // scheduler. The probe remains authoritative until that real task
+        // reports its result through the async-action runner.
+        tokio::task::yield_now().await;
 
         let preserved = app
             .pending_paste_probes

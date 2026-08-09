@@ -1662,5 +1662,6 @@ export function createEnvelope(id: string, request: ClientRequest): ClientEnvelo
   return clientEnvelopeSchema.parse({ v: PROTOCOL_VERSION, kind: "req", id, ...request });
 }
 
+export * from "./remote-admin-passkey";
 export * from "./remote-protocol-id";
 export * from "./remote-transport-lanes";

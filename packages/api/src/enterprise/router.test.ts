@@ -239,8 +239,8 @@ describe("enterpriseRouter", () => {
     });
   });
 
-  it("allows org admins to create exports and writes an audit row", async () => {
-    db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "ORG_ADMIN" });
+  it("allows owners to create exports and writes an audit row", async () => {
+    db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "OWNER" });
     db.enterpriseLogExport.create.mockResolvedValue({
       id: "export-1",
       orgId: "org-1",
@@ -261,7 +261,7 @@ describe("enterpriseRouter", () => {
     );
   });
 
-  it("blocks non-org-admin export creation", async () => {
+  it("blocks members from export creation", async () => {
     db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "MEMBER" });
     const client = createRouterClient(enterpriseRouter, { context: buildContext() });
     await expect(

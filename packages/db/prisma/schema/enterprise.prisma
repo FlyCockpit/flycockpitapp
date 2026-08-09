@@ -1,6 +1,41 @@
 enum EnterpriseOrgMemberRole {
-  ORG_ADMIN
+  OWNER
+  SECURITY_ADMIN
   MEMBER
+}
+
+enum RemoteAdminCredentialState {
+  ACTIVE
+  REVOKED
+}
+
+enum RemoteAdminCustodyClass {
+  SYNCED_PASSKEY
+  EXTERNAL_SECURITY_KEY
+  UNKNOWN
+}
+
+enum RemoteAdminCounterState {
+  ACTIVE
+  SUSPECT
+}
+
+enum RemoteAdminCeremonyKind {
+  OWNER_BOOTSTRAP
+  SECURITY_ADMIN_BOOTSTRAP
+  REGISTRATION
+  ASSERTION
+  APPROVAL
+  RECOVERY_RECONFIRM
+}
+
+enum RemoteAdminRecoveryState {
+  PENDING
+  COOLING
+  READY
+  EXECUTED
+  CANCELLED
+  EXPIRED
 }
 
 enum EnterpriseLogEventKind {
@@ -25,29 +60,194 @@ enum EnterpriseLogExportStatus {
 }
 
 model EnterpriseOrg {
-  id                   String                @id @default(cuid(2))
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @default(now()) @updatedAt
-  name                 String
-  slug                 String                @unique
-  policyVersion        Int                   @default(1)
-  logSyncMandated      Boolean               @default(false)
-  syncSessionEvents    Boolean               @default(true)
-  syncMessageEvents    Boolean               @default(true)
-  syncToolCallEvents   Boolean               @default(true)
-  syncInferenceEvents  Boolean               @default(true)
-  syncTruncationEvents Boolean               @default(true)
-  includeLocalModels   Boolean               @default(false)
-  backfill             Boolean               @default(false)
-  backlogPolicy        String                @default("since_join")
-  retentionDays        Int                   @default(365)
-  Members              EnterpriseOrgMember[]
-  LogBatches           EnterpriseLogBatch[]
-  LogEvents            EnterpriseLogEvent[]
-  LogExports           EnterpriseLogExport[]
-  AuditLogs            EnterpriseAuditLog[]
+  id                       String                          @id @default(cuid(2))
+  createdAt                DateTime                        @default(now())
+  updatedAt                DateTime                        @default(now()) @updatedAt
+  name                     String
+  slug                     String                          @unique
+  policyVersion            Int                             @default(1)
+  logSyncMandated          Boolean                         @default(false)
+  syncSessionEvents        Boolean                         @default(true)
+  syncMessageEvents        Boolean                         @default(true)
+  syncToolCallEvents       Boolean                         @default(true)
+  syncInferenceEvents      Boolean                         @default(true)
+  syncTruncationEvents     Boolean                         @default(true)
+  includeLocalModels       Boolean                         @default(false)
+  backfill                 Boolean                         @default(false)
+  backlogPolicy            String                          @default("since_join")
+  retentionDays            Int                             @default(365)
+  Members                  EnterpriseOrgMember[]
+  LogBatches               EnterpriseLogBatch[]
+  LogEvents                EnterpriseLogEvent[]
+  LogExports               EnterpriseLogExport[]
+  AuditLogs                EnterpriseAuditLog[]
+  RemoteAdminRegistry      RemoteAdminRegistry?
+  RemoteAdminCredentials   RemoteAdminCredential[]
+  RemoteAdminStepUps       RemoteAdminStepUp[]
+  RemoteAdminCeremonies    RemoteAdminCeremony[]
+  RemoteAdminApprovals     RemoteAdminApproval[]
+  RemoteAdminRecoveries    RemoteAdminRecoveryProposal[]
+  RemoteAdminNotifications RemoteAdminNotificationOutbox[]
 
   @@map("enterprise_org")
+}
+
+model RemoteAdminRegistry {
+  id                           String                         @id @default(cuid(2))
+  orgId                        String                         @unique
+  tenantProtocolId             Bytes                          @unique
+  generation                   BigInt                         @default(0)
+  rpId                         String
+  origin                       String
+  ownerBootstrapSealed         Boolean                        @default(false)
+  securityAdminBootstrapSealed Boolean                        @default(false)
+  recoveryCoolingSeconds       Int                            @default(259200)
+  recoveryProposalTtlSeconds   Int                            @default(604800)
+  recoveryGovernanceDigest     Bytes?
+  recoveryGovernanceEvidence   Bytes?
+  createdAt                    DateTime                       @default(now())
+  updatedAt                    DateTime                       @updatedAt
+  EnterpriseOrg                EnterpriseOrg                  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  CounterStates                RemoteAdminCredentialCounter[]
+
+  @@map("remote_admin_registry")
+}
+
+model RemoteAdminCredential {
+  id                  String                     @id @default(cuid(2))
+  orgId               String
+  principalId         String
+  principalProtocolId Bytes
+  role                EnterpriseOrgMemberRole
+  credentialIdHash    Bytes
+  coseAlg             Int                        @default(-7)
+  p256X               Bytes
+  p256Y               Bytes
+  declaredCustody     RemoteAdminCustodyClass
+  state               RemoteAdminCredentialState @default(ACTIVE)
+  registryGeneration  BigInt
+  createdAt           DateTime                   @default(now())
+  revokedAt           DateTime?
+  EnterpriseOrg       EnterpriseOrg              @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, credentialIdHash])
+  @@index([orgId, state, role])
+  @@map("remote_admin_credential")
+}
+
+model RemoteAdminCredentialCounter {
+  id                    String                  @id @default(cuid(2))
+  registryId            String
+  tenantId              Bytes
+  credentialIdHash      Bytes
+  registryGeneration    BigInt
+  lastAcceptedSignCount BigInt                  @default(0)
+  state                 RemoteAdminCounterState @default(ACTIVE)
+  stateGeneration       BigInt                  @default(1)
+  Registry              RemoteAdminRegistry     @relation(fields: [registryId], references: [id], onDelete: Cascade)
+
+  @@unique([registryId, credentialIdHash])
+  @@map("remote_admin_credential_counter")
+}
+
+model RemoteAdminCeremony {
+  id              String                  @id
+  orgId           String?
+  principalId     String
+  nominatorId     String?
+  nomineeId       String?
+  sessionId       String?
+  kind            RemoteAdminCeremonyKind
+  action          String
+  requestDigest   Bytes
+  requestPayload  Json?
+  challengeHash   Bytes
+  issuedAt        DateTime                @default(now())
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  committedResult Json?
+  committedDigest Bytes?
+  createdAt       DateTime                @default(now())
+  EnterpriseOrg   EnterpriseOrg?          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, principalId, expiresAt])
+  @@map("remote_admin_ceremony")
+}
+
+model RemoteAdminStepUp {
+  id                 String                  @id
+  orgId              String
+  principalId        String
+  role               EnterpriseOrgMemberRole
+  credentialIdHash   Bytes
+  registryGeneration BigInt
+  action             String
+  sessionId          String
+  challengeId        String
+  issuedAt           DateTime
+  expiresAt          DateTime
+  consumedAt         DateTime?
+  EnterpriseOrg      EnterpriseOrg           @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, principalId, expiresAt])
+  @@map("remote_admin_step_up")
+}
+
+model RemoteAdminApproval {
+  id                     String                  @id
+  orgId                  String
+  principalId            String
+  role                   EnterpriseOrgMemberRole
+  credentialIdHash       Bytes
+  registryGeneration     BigInt
+  operation              Int
+  canonicalRequestDigest Bytes
+  operationEpoch         BigInt
+  evidenceDigest         Bytes
+  evidenceBytes          Bytes
+  challengeId            String
+  issuedAt               DateTime
+  expiresAt              DateTime
+  consumedAt             DateTime?
+  EnterpriseOrg          EnterpriseOrg           @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, operation, operationEpoch, expiresAt])
+  @@map("remote_admin_approval")
+}
+
+model RemoteAdminRecoveryProposal {
+  id                    String                   @id
+  orgId                 String
+  requestDigest         Bytes
+  operationEpoch        BigInt
+  ownerPrincipalId      String
+  securityPrincipalId   String
+  ownerReconfirmedAt    DateTime?
+  securityReconfirmedAt DateTime?
+  coolingEndsAt         DateTime
+  expiresAt             DateTime
+  state                 RemoteAdminRecoveryState @default(PENDING)
+  cancelledById         String?
+  executedAt            DateTime?
+  createdAt             DateTime                 @default(now())
+  EnterpriseOrg         EnterpriseOrg            @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, state, expiresAt])
+  @@map("remote_admin_recovery_proposal")
+}
+
+model RemoteAdminNotificationOutbox {
+  id            String        @id @default(cuid(2))
+  orgId         String
+  event         String
+  recipients    Json
+  payload       Json
+  createdAt     DateTime      @default(now())
+  deliveredAt   DateTime?
+  EnterpriseOrg EnterpriseOrg @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@map("remote_admin_notification_outbox")
 }
 
 model EnterpriseOrgMember {

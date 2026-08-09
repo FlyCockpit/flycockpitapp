@@ -23,6 +23,19 @@ export const Route = createFileRoute("/$lang/admin/enterprise")({
 
 type EnterpriseOverview = Awaited<ReturnType<typeof orpc.enterprise.overview.call>>;
 
+const fromBase64Url = (value: string) => {
+  const padded = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+};
+const toBase64Url = (value: ArrayBuffer) => {
+  let binary = "";
+  for (const byte of new Uint8Array(value)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
 function EnterpriseAdmin() {
   const queryClient = useQueryClient();
   const { trigger } = useHaptics();
@@ -31,14 +44,59 @@ function EnterpriseAdmin() {
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: orpc.enterprise.key() });
   const bootstrap = useMutation({
-    ...orpc.enterprise.bootstrap.mutationOptions({
+    mutationFn: async ({ name }: { name: string }) => {
+      const ceremony = await orpc.enterprise.bootstrap.call({ name });
+      if (!window.PublicKeyCredential) throw new Error("WebAuthn is required.");
+      const created = (await navigator.credentials.create({
+        publicKey: {
+          challenge: fromBase64Url(ceremony.challenge),
+          rp: { id: ceremony.rpId, name: "FlyCockpit" },
+          user: {
+            id: new TextEncoder().encode(crypto.randomUUID()),
+            name: "enterprise-owner",
+            displayName: "Enterprise owner",
+          },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          timeout: 300_000,
+          authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
+          attestation: "none",
+        },
+      })) as PublicKeyCredential | null;
+      if (!created || !(created.response instanceof AuthenticatorAttestationResponse))
+        throw new Error("Passkey registration was cancelled.");
+      const publicKey = created.response.getPublicKey();
+      if (!publicKey || created.response.getPublicKeyAlgorithm() !== -7)
+        throw new Error("An ES256 passkey is required.");
+      const credentialIdHash = await crypto.subtle.digest("SHA-256", created.rawId);
+      const asserted = (await navigator.credentials.get({
+        publicKey: {
+          challenge: fromBase64Url(ceremony.challenge),
+          rpId: ceremony.rpId,
+          allowCredentials: [{ type: "public-key", id: created.rawId }],
+          timeout: 300_000,
+          userVerification: "required",
+        },
+      })) as PublicKeyCredential | null;
+      if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
+        throw new Error("Passkey verification was cancelled.");
+      return orpc.enterprise.completeOwnerBootstrap.call({
+        challengeId: ceremony.challengeId,
+        credentialIdHash: toBase64Url(credentialIdHash),
+        publicKeySpki: toBase64Url(publicKey),
+        declaredCustody: "UNKNOWN",
+        authenticatorData: toBase64Url(asserted.response.authenticatorData),
+        clientDataJson: toBase64Url(asserted.response.clientDataJSON),
+        signatureDer: toBase64Url(asserted.response.signature),
+      });
+    },
+    ...{
       onSuccess: () => {
         invalidate();
         trigger("success");
         toast.success(t("admin:enterprise.bootstrapSuccess"));
       },
       onError: () => trigger("error"),
-    }),
+    },
     meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
   });
   const updatePolicy = useMutation({

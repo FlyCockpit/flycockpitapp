@@ -16,6 +16,8 @@ describe("remote_wire_magic_registry_cross_language_vectors", () => {
       { magic: "FCPC", symbolicType: "RemoteIdentityPossessionContextV1" },
       { magic: "FCPP", symbolicType: "RemoteIdentityPossessionProofV1" },
       { magic: "FCCF", symbolicType: "RemoteEnrollmentConfirmationV1" },
+      { magic: "FCWA", symbolicType: "RemoteAdminApprovalEvidenceV1" },
+      { magic: "FCWR", symbolicType: "RemoteCredentialRegistryV1" },
     ]);
     expect(() => parseRemoteWireMagicRegistry([])).toThrow();
     expect(() => parseRemoteWireMagicRegistry([...registry, registry[0]])).toThrow();

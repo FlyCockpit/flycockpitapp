@@ -265,7 +265,7 @@
   },
   {
     "magic": "FCWA",
-    "symbolicType": "RemoteWebsocketAuthorizationV1",
+    "symbolicType": "RemoteAdminApprovalEvidenceV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -295,6 +295,18 @@
   },
   {
     "magic": "FCWR",
+    "symbolicType": "RemoteCredentialRegistryV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
+    "magic": "FCWY",
+    "symbolicType": "RemoteWebsocketAuthorizationV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
+    "magic": "FCWZ",
     "symbolicType": "RemoteWebsocketResultV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1

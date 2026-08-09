@@ -2103,4 +2103,182 @@ mod tests {
         .unwrap();
         assert_eq!(db.purge_cleared_goal_tombstones(now).await.unwrap(), 1);
     }
+
+    async fn verification_fixture() -> (Db, SessionGoal, Vec<GoalControlJob>) {
+        let (db, _, evaluator) = evaluator_fixture().await;
+        let verifying = db
+            .finish_goal_control_job(
+                evaluator,
+                Ok(r#"{"decision":"candidate_complete","evidence":"tests pass"}"#),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut jobs = Vec::new();
+        while let Some(job) = db
+            .lease_goal_control_job(
+                verifying.id,
+                verifying.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+        {
+            jobs.push(job);
+        }
+        (db, verifying, jobs)
+    }
+
+    #[tokio::test]
+    async fn goal_cold_panel_is_completion_authority() {
+        let (db, verifying, jobs) = verification_fixture().await;
+        assert!(!jobs.is_empty());
+        assert!(
+            jobs.iter()
+                .all(|job| job.role == GoalControlRole::ColdSkeptic)
+        );
+        let mut last = None;
+        for job in jobs {
+            last = db
+                .finish_goal_control_job(job, Ok(r#"{"verdict":"approve","evidence":"verified"}"#))
+                .await
+                .unwrap();
+        }
+        let complete = last.unwrap();
+        assert_eq!(complete.id, verifying.id);
+        assert_eq!(complete.disposition, GoalDisposition::Complete);
+    }
+
+    #[tokio::test]
+    async fn goal_malformed_skeptic_verdict_refutes() {
+        let (db, verifying, jobs) = verification_fixture().await;
+        for (index, job) in jobs.into_iter().enumerate() {
+            db.finish_goal_control_job(
+                job,
+                if index < 2 {
+                    Ok("malformed")
+                } else {
+                    Ok(r#"{"verdict":"approve","evidence":"verified"}"#)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let goal = db
+            .current_session_goal(verifying.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(goal.disposition, GoalDisposition::Complete);
+        assert!(!goal.unresolved_gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_supervision_resolution_and_reload_pauses_open_goals() {
+        let (db, goal, _) = planning_fixture().await;
+        let paused = db
+            .pause_open_goal_for_operator_disable(goal.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.disposition, GoalDisposition::UserPaused);
+        assert_eq!(paused.resume_phase, Some(GoalPhase::Planning));
+        assert_eq!(paused.pause_reason, Some(GoalPauseReason::OperatorDisabled));
+    }
+
+    #[tokio::test]
+    async fn goal_supervision_reenable_does_not_resume_existing_goal() {
+        let (db, goal, _) = planning_fixture().await;
+        db.pause_open_goal_for_operator_disable(goal.session_id)
+            .await
+            .unwrap();
+        let still_paused = db
+            .current_session_goal(goal.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_paused.disposition, GoalDisposition::UserPaused);
+        assert_eq!(
+            still_paused.pause_reason,
+            Some(GoalPauseReason::OperatorDisabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_blocker_key_requires_three_consecutive_matches() {
+        let (db, _, mut evaluator) = evaluator_fixture().await;
+        for expected in 1..=3 {
+            let updated = db
+                .finish_goal_control_job(
+                    evaluator,
+                    Ok(r#"{"decision":"blocked","blocker_key":"same","explanation":"waiting"}"#),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.blocker_key_streak, expected);
+            if expected < 3 {
+                assert_eq!(updated.disposition, GoalDisposition::Running);
+                let turn = db
+                    .begin_goal_root_turn(updated.id, updated.attempt_generation)
+                    .await
+                    .unwrap();
+                let evaluating = db
+                    .finish_goal_root_turn(updated.id, updated.attempt_generation, turn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                evaluator = db
+                    .lease_goal_control_job(
+                        evaluating.id,
+                        evaluating.attempt_generation,
+                        Utc::now().timestamp(),
+                        60,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+            } else {
+                assert_eq!(updated.disposition, GoalDisposition::Blocked);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_root_turn_result_is_ignored_after_non_running_transition() {
+        let (db, _, planner) = planning_fixture().await;
+        let raw = serde_json::to_string(&contract()).unwrap();
+        let executing = db
+            .finish_goal_control_job(planner, Ok(&raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        db.set_session_goal_status(executing.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        assert!(
+            db.finish_goal_root_turn(executing.id, executing.attempt_generation, turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_restore_demotes_inflight_phase_to_user_paused() {
+        let (db, goal, _) = planning_fixture().await;
+        let restored = db
+            .restore_supervised_goals(goal.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.disposition, GoalDisposition::UserPaused);
+        assert_eq!(restored.resume_phase, Some(GoalPhase::Planning));
+        assert_eq!(restored.pause_reason, Some(GoalPauseReason::Restart));
+    }
 }

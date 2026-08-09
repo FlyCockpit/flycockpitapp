@@ -2255,10 +2255,19 @@ pub(super) async fn handle_serialized_request(
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
                 })?;
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
             let receipt = recovery
                 .register_local_path(
                     request,
                     &attached.handle.project_root,
+                    &extended.media_resources,
+                    ctx.media_ledger.clock_now_ms(),
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await

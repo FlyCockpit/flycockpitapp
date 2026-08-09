@@ -48,6 +48,8 @@ impl MediaStorageRecovery {
         &self,
         request: RegisterLocalPathMediaV1,
         project_root: &Path,
+        policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+        monotonic_now_ms: u64,
         now_unix_ms: i64,
     ) -> Result<LocalPathRegistrationReceiptV1> {
         validate_registration(&request)?;
@@ -104,14 +106,9 @@ impl MediaStorageRecovery {
         ));
         let attachment_id = Uuid::now_v7();
         let receipt_id = Uuid::now_v7();
-        let reservation_id = Uuid::now_v7().to_string();
-        let reservation_digest = crate::intel::hex_lower(&Sha256::digest(
-            format!(
-                "local-path-reservation-v1\0{reservation_id}\0{}",
-                before.len()
-            )
-            .as_bytes(),
-        ));
+        let reservation_id = format!("local-path:{attachment_id}");
+        let plans = local_path_plans(policy, before.len())?;
+        let reservation_digest = digest_json(b"local-path-reservation-v1", &plans)?;
         let held = BorrowedSourceHandle {
             file: source,
             evidence_digest: evidence_digest.clone(),
@@ -128,6 +125,7 @@ impl MediaStorageRecovery {
                 return Ok((serde_json::from_str(&receipt_json)?, None));
             }
             let media_kind = match request_for_tx.requested_media_kind { RequestedLocalPathMediaKind::Image=>MediaKind::Image, RequestedLocalPathMediaKind::Audio=>MediaKind::Audio, RequestedLocalPathMediaKind::Video=>MediaKind::Video };
+            crate::media_reservation::reserve_conn(conn, crate::media_reservation::ReserveRequest { reservation_id: reservation_id.clone(), recovery_id: reservation_id.clone(), owner: crate::media_reservation::MediaOwner { project_id: request_for_tx.canonical_project_digest.clone(), session_id: request_for_tx.session_id.to_string() }, operation: "local_path_attachment_registration".into(), purpose: "borrowed_media".into(), plans, wall_ms: u64::try_from(now_unix_ms).context("negative registration time")? }, monotonic_now_ms)?;
             let record=MediaAttachmentRecord{attachment_id,session_id:request_for_tx.session_id,canonical_project_digest:request_for_tx.canonical_project_digest.clone(),media_kind,source_kind:MediaSourceKind::LocalPath,canonical_container:"application/octet-stream".into(),canonical_mime:"application/octet-stream".into(),availability:MediaAvailability::Registered,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:1,source_identity_digest:identity.clone(),source_byte_length:before.len(),source_sha256:sha256.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None};
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;
             let receipt=LocalPathRegistrationReceiptV1{schema_version:1,kind:"localPathMediaRegistrationReceipt".into(),receipt_id,local_operation_id:request_for_tx.local_operation_id,owner_principal_digest:request_for_tx.owner_principal_digest.clone(),session_id:request_for_tx.session_id,canonical_project_digest:request_for_tx.canonical_project_digest.clone(),client_draft_id:request_for_tx.client_draft_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),result:LocalPathRegistrationResultV1::Registered{attachment_id,attachment_version:1,availability_state:"registered".into(),availability_generation:1,reference_generation:1,reservation_id:reservation_id.clone(),reservation_digest:reservation_digest.clone(),source_evidence_digest:evidence_digest.clone()},committed_at_unix_ms:now_unix_ms};
@@ -309,6 +307,42 @@ fn digest_json<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
     digest.update([0]);
     digest.update(serde_json::to_vec(value)?);
     Ok(crate::intel::hex_lower(&digest.finalize()))
+}
+
+fn local_path_plans(
+    policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+    byte_length: u64,
+) -> Result<Vec<cockpit_config::config::media_budget::MediaReservationPlan>> {
+    use cockpit_config::config::media_budget::{
+        MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
+    };
+    [
+        (MediaDimension::QueuedOperationsGlobal, 1),
+        (MediaDimension::QueuedOperationsPerSession, 1),
+        (MediaDimension::EncodedBytesPerObject, byte_length),
+        (MediaDimension::RetainedBytesPerSession, byte_length),
+        (MediaDimension::LocalCpuJobsGlobal, 1),
+        (
+            MediaDimension::OperationDeadlineSeconds,
+            policy
+                .limits()
+                .get(MediaDimension::OperationDeadlineSeconds),
+        ),
+    ]
+    .into_iter()
+    .map(|(dimension, requested)| {
+        policy
+            .evaluate(MediaEvaluationRequest {
+                dimension,
+                requested: Some(requested),
+                current_scope: 0,
+                profile: Some(PASTE_IMAGE_PROFILE),
+                adapter_limit: None,
+                request_limit: None,
+            })
+            .map_err(anyhow::Error::new)
+    })
+    .collect()
 }
 
 fn modified_ns(metadata: &std::fs::Metadata) -> Result<u128> {

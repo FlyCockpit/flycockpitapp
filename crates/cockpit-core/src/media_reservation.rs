@@ -477,48 +477,90 @@ impl MediaReservationLedger {
     ) -> Result<ReservationReceipt, LedgerError> {
         validate_plans(&request.plans)?;
         let now = self.clock.now_ms();
-        let deadline = request
-            .plans
-            .iter()
-            .find(|plan| plan.dimension == MediaDimension::OperationDeadlineSeconds)
-            .ok_or_else(|| anyhow!("evaluated plan omitted operation deadline"))?
-            .requested
-            .checked_mul(1_000)
-            .and_then(|duration| now.checked_add(duration))
-            .ok_or(LedgerError::Overflow)?;
-        let session = request.owner.session_id.clone();
-        let receipt = self.db.transaction(move |conn| {
-            if let Some((recovery,state,version,sequence,stored_deadline))=conn.query_row("SELECT recovery_id,state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&request.reservation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,row_u64(r,2)?,row_u64(r,3)?,row_u64(r,4)?))).optional()? {
+        let receipt = self
+            .db
+            .transaction(move |conn| reserve_conn(conn, request, now))
+            .await
+            .map_err(classify_storage_error)?;
+        Ok(receipt)
+    }
+}
+
+pub(crate) fn reserve_conn(
+    conn: &rusqlite::Connection,
+    request: ReserveRequest,
+    monotonic_now_ms: u64,
+) -> Result<ReservationReceipt> {
+    validate_plans(&request.plans).map_err(|error| anyhow!(error))?;
+    let deadline = request
+        .plans
+        .iter()
+        .find(|plan| plan.dimension == MediaDimension::OperationDeadlineSeconds)
+        .ok_or_else(|| anyhow!("evaluated plan omitted operation deadline"))?
+        .requested
+        .checked_mul(1_000)
+        .and_then(|duration| monotonic_now_ms.checked_add(duration))
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    if let Some((recovery,state,version,sequence,stored_deadline))=conn.query_row("SELECT recovery_id,state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&request.reservation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,row_u64(r,2)?,row_u64(r,3)?,row_u64(r,4)?))).optional()? {
                 if recovery!=request.recovery_id{return Err(anyhow!("idempotency_conflict"));}
                 return Ok(ReservationReceipt{reservation_id:request.reservation_id,state:ReservationState::parse(&state)?,version,queue_sequence:sequence,deadline_monotonic_ms:stored_deadline});
             }
-            for (kind, id) in [("global", "global"), ("project", request.owner.project_id.as_str()), ("session", request.owner.session_id.as_str())] {
-                if conn.query_row("SELECT 1 FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2", params![kind,id], |_| Ok(())).optional()?.is_some() {
-                    return Err(anyhow!("accounting_blocked"));
-                }
-            }
-            let queue_sequence = conn.query_row("UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1", [], |row| row_u64(row, 0))?;
-            let policy_version = request.plans[0].policy_version;
-            conn.execute(
+    for (kind, id) in [
+        ("global", "global"),
+        ("project", request.owner.project_id.as_str()),
+        ("session", request.owner.session_id.as_str()),
+    ] {
+        if conn
+            .query_row(
+                "SELECT 1 FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2",
+                params![kind, id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(anyhow!("accounting_blocked"));
+        }
+    }
+    let queue_sequence = conn.query_row("UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1", [], |row| row_u64(row, 0))?;
+    let policy_version = request.plans[0].policy_version;
+    conn.execute(
                 "INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved_queued',1,?8,?9,?10)",
                 params![request.reservation_id, sqlite_i64(policy_version)?, request.owner.project_id, request.owner.session_id, request.operation, request.purpose, request.recovery_id, sqlite_i64(queue_sequence)?, sqlite_i64(deadline)?, sqlite_i64(request.wall_ms)?],
             )?;
-            for plan in &request.plans {
-                conn.execute(
+    for plan in &request.plans {
+        conn.execute(
                     "INSERT INTO media_reservation_plan_facts(reservation_id,dimension,plan_json) VALUES(?1,?2,?3)",
                     params![request.reservation_id, dimension_name(plan.dimension), serde_json::to_string(plan)?],
                 )?;
-            }
-            for plan in request.plans.iter().filter(|plan| reserves_at_enqueue(plan)) {
-                acquire(conn, &request, plan, 1, request.wall_ms)?;
-            }
-            for plan in request.plans.iter().filter(|plan| matches!(plan.scope_policy.charge,MediaCharge::AcquireAtPromotion|MediaCharge::AcceptedOrPossiblyAccepted|MediaCharge::AtHandoff)) { record_deferred_estimate(conn,&request,plan,request.wall_ms)?; }
-            Ok(ReservationReceipt { reservation_id: request.reservation_id, state: ReservationState::ReservedQueued, version: 1, queue_sequence, deadline_monotonic_ms: deadline })
-        }).await.map_err(classify_storage_error)?;
-        let _ = session;
-        Ok(receipt)
     }
+    for plan in request
+        .plans
+        .iter()
+        .filter(|plan| reserves_at_enqueue(plan))
+    {
+        acquire(conn, &request, plan, 1, request.wall_ms)?;
+    }
+    for plan in request.plans.iter().filter(|plan| {
+        matches!(
+            plan.scope_policy.charge,
+            MediaCharge::AcquireAtPromotion
+                | MediaCharge::AcceptedOrPossiblyAccepted
+                | MediaCharge::AtHandoff
+        )
+    }) {
+        record_deferred_estimate(conn, &request, plan, request.wall_ms)?;
+    }
+    Ok(ReservationReceipt {
+        reservation_id: request.reservation_id,
+        state: ReservationState::ReservedQueued,
+        version: 1,
+        queue_sequence,
+        deadline_monotonic_ms: deadline,
+    })
+}
 
+impl MediaReservationLedger {
     pub async fn transition(
         &self,
         id: &str,

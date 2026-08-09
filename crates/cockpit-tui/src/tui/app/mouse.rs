@@ -55,6 +55,16 @@ impl App {
             self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
+        // The keys overlay is visually topmost and therefore owns pointer
+        // input before links or settings targets underneath it.
+        if let Some(overlay) = self.keys_overlay.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => overlay.scroll_up(),
+                MouseEventKind::ScrollDown => overlay.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(url) = self
@@ -114,14 +124,13 @@ impl App {
             self.open_auth_failure_provider();
             return;
         }
-        // Which-key overlay (`which-key-overlay.md`): rendered on top of every
-        // pane, so it intercepts the wheel first. Wheel scrolls it; every other
-        // mouse event is eaten so nothing reaches the pane/chat underneath.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                _ => {}
+        if self.mouse_capture
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.sync_mouse_capture_from_dialog();
+                self.resync_config_after_local_write();
             }
             return;
         }

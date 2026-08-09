@@ -58,7 +58,7 @@ use std::any::Any;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -77,7 +77,10 @@ use cockpit_config::providers::{
 };
 use cockpit_core::daemon::proto::Request;
 use cockpit_core::providers::models_fetch::FetchOutcome;
-use shell::{SettingsScrollStates, marker, muted_style, selected_or_field};
+use shell::{
+    SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsPointerTarget,
+    SettingsScrollStates, marker, muted_style, selected_or_field,
+};
 
 /// Height (in rows) the dialog wants when active.
 pub const DIALOG_HEIGHT: u16 = 20;
@@ -140,6 +143,12 @@ pub enum Dialog {
     Settings(Box<SettingsDialog>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsPointerOutcome {
+    Consumed,
+    Close,
+}
+
 pub struct SetupWizardDialog {
     run: cockpit_core::wizard::WizardRun,
     cursor: usize,
@@ -158,6 +167,7 @@ pub struct SettingsDialog {
     /// exact boxed page object, including cursor and scroll state.
     stack: Vec<PageBox>,
     cx: SettingsCx,
+    pointer_surface: SettingsPointerSurface,
 }
 
 fn setup_wizard_dialog(
@@ -678,6 +688,15 @@ pub(super) enum Nav {
 // ── Dialog top-level ─────────────────────────────────────────────────────
 
 impl Dialog {
+    pub(crate) fn handle_settings_pointer(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> Option<SettingsPointerOutcome> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        Some(settings.handle_pointer(mouse))
+    }
     pub fn is_active(&self) -> bool {
         !matches!(self, Dialog::None)
     }
@@ -1582,6 +1601,7 @@ impl SettingsDialog {
         Self {
             page: root_page(0),
             stack: Vec::new(),
+            pointer_surface: SettingsPointerSurface::default(),
             cx: SettingsCx {
                 config_path,
                 extended_path,
@@ -1958,6 +1978,86 @@ impl SettingsDialog {
         self.apply_nav(nav)
     }
 
+    fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        let Some(area) = self.pointer_surface.area.get() else {
+            return SettingsPointerOutcome::Consumed;
+        };
+        if mouse.column < area.x
+            || mouse.column >= area.right()
+            || mouse.row < area.y
+            || mouse.row >= area.bottom()
+        {
+            return SettingsPointerOutcome::Consumed;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let code = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                };
+                for _ in 0..3 {
+                    let nav = self
+                        .page
+                        .handle_key(&mut self.cx, KeyEvent::new(code, KeyModifiers::NONE));
+                    if !matches!(nav, Nav::Stay) {
+                        let _ = self.apply_nav(nav);
+                        break;
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(target) = self.pointer_surface.hit(mouse.column, mouse.row) else {
+                    return SettingsPointerOutcome::Consumed;
+                };
+                if !target.enabled {
+                    return SettingsPointerOutcome::Consumed;
+                }
+                match target.action {
+                    SettingsPointerAction::Header(SettingsHeaderAction::Close) => {
+                        return SettingsPointerOutcome::Close;
+                    }
+                    SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker) => {
+                        self.back_to_picker = true;
+                        return SettingsPointerOutcome::Close;
+                    }
+                    SettingsPointerAction::Header(SettingsHeaderAction::Back) => {
+                        let nav = self.page.handle_key(
+                            &mut self.cx,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        );
+                        if matches!(nav, Nav::Stay) && !self.stack.is_empty() {
+                            let _ = self.apply_nav(Nav::Back);
+                        } else {
+                            let _ = self.apply_nav(nav);
+                        }
+                    }
+                    SettingsPointerAction::ActivateVisibleRow(row) => {
+                        let _ = self.page.handle_key(
+                            &mut self.cx,
+                            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                        );
+                        for _ in 0..row {
+                            let _ = self.page.handle_key(
+                                &mut self.cx,
+                                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                            );
+                        }
+                        let nav = self.page.handle_key(
+                            &mut self.cx,
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        );
+                        if self.apply_nav(nav) {
+                            return SettingsPointerOutcome::Close;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        SettingsPointerOutcome::Consumed
+    }
+
     fn enter_mcp(&mut self) {
         self.page = mcp_page(mcp_page::McpPage::List(mcp_page::ListState {
             cursor: 0,
@@ -1987,6 +2087,7 @@ impl SettingsDialog {
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
+        self.pointer_surface.clear_for(area);
         let title = self.title();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1994,13 +2095,49 @@ impl SettingsDialog {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        let mut header = vec![Span::raw("[Close settings]")];
+        self.pointer_surface.register(SettingsPointerTarget {
+            rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
+            action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
+            enabled: true,
+        });
+        let root = self.page.as_any().is::<RootPage>();
+        if !root || !self.stack.is_empty() {
+            header.push(Span::raw("  [Back]"));
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
+                action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
+                enabled: true,
+            });
+        } else if self.picker_cwd.is_some() {
+            header.push(Span::raw("  [Back to config picker]"));
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
+                action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
+                enabled: true,
+            });
+        }
+        frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
-            .render_with_links(&self.cx, frame, layout[0], links);
-        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
+            .render_with_links(&self.cx, frame, layout[1], links);
+        for y in 0..layout[1].height {
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(layout[1].x, layout[1].y + y, layout[1].width, 1),
+                action: SettingsPointerAction::ActivateVisibleRow(usize::from(y)),
+                enabled: true,
+            });
+        }
+        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }
-        frame.render_widget(help_line(self.help_text()), layout[1]);
+        let help = format!("{}  click: activate  wheel: scroll", self.help_text());
+        frame.render_widget(help_line(&help), layout[2]);
     }
 
     fn title(&self) -> String {

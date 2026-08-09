@@ -151,6 +151,52 @@ pub(super) struct SettingsScrollStates {
     states: RefCell<BTreeMap<String, ListState>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsHeaderAction {
+    Close,
+    Back,
+    BackToConfigPicker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsPointerAction {
+    Header(SettingsHeaderAction),
+    ActivateVisibleRow(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SettingsPointerTarget {
+    pub rect: Rect,
+    pub action: SettingsPointerAction,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SettingsPointerSurface {
+    pub area: std::cell::Cell<Option<Rect>>,
+    pub targets: RefCell<Vec<SettingsPointerTarget>>,
+}
+
+impl SettingsPointerSurface {
+    pub fn clear_for(&self, area: Rect) {
+        self.area.set(Some(area));
+        self.targets.borrow_mut().clear();
+    }
+
+    pub fn register(&self, target: SettingsPointerTarget) {
+        self.targets.borrow_mut().push(target);
+    }
+
+    pub fn hit(&self, column: u16, row: u16) -> Option<SettingsPointerTarget> {
+        self.targets.borrow().iter().rev().copied().find(|target| {
+            column >= target.rect.x
+                && column < target.rect.right()
+                && row >= target.rect.y
+                && row < target.rect.bottom()
+        })
+    }
+}
+
 impl SettingsScrollStates {
     pub(super) fn render_lines(
         &self,

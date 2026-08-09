@@ -37,18 +37,49 @@ export interface MessageIngressEnvelopeV2 {
   session_locator: string;
   request: SendUserMessageV2;
 }
-export type LocalOwnerDirectSendUserMessageV2 = MessageIngressEnvelopeV2;
-export type AuthenticatedRemoteOperationEnvelopeV2 = MessageIngressEnvelopeV2;
+export interface LocalOwnerDirectSendUserMessageV2 extends MessageIngressEnvelopeV2 {
+  ingress: "local_owner_direct";
+}
+export interface AuthenticatedRemoteOperationEnvelopeV2 extends MessageIngressEnvelopeV2 {
+  ingress: "authenticated_remote";
+}
+export type ValidatedMessageIngressV2 =
+  | (LocalOwnerDirectSendUserMessageV2 & { actor: { kind: "local_owner" } })
+  | (AuthenticatedRemoteOperationEnvelopeV2 & {
+      actor: { kind: "remote_device"; id: Uint8Array; generation: bigint };
+    });
 
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-export function validateMessageIngressEnvelopeV2(envelope: MessageIngressEnvelopeV2) {
+function validateEnvelopeIdentities(envelope: MessageIngressEnvelopeV2) {
   if (!UUID_V7.test(envelope.request_id)) throw new Error("request_id must be UUIDv7");
   if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
   if (!envelope.session_locator) throw new Error("empty session locator");
   uuid(envelope.request.client_submission_id);
-  if (envelope.operation_id === envelope.request.client_submission_id)
-    throw new Error("operation and submission identities must differ");
-  return envelope;
+  if (
+    new Set([envelope.request_id, envelope.operation_id, envelope.request.client_submission_id])
+      .size !== 3
+  )
+    throw new Error("request, operation, and submission identities must be pairwise distinct");
+}
+export function validateLocalOwnerDirectMessageV2(
+  envelope: LocalOwnerDirectSendUserMessageV2,
+): ValidatedMessageIngressV2 {
+  validateEnvelopeIdentities(envelope);
+  return { ...envelope, actor: { kind: "local_owner" } };
+}
+export function validateAuthenticatedRemoteMessageV2(
+  envelope: AuthenticatedRemoteOperationEnvelopeV2,
+  actor: { id: Uint8Array; generation: bigint },
+): ValidatedMessageIngressV2 {
+  validateEnvelopeIdentities(envelope);
+  if (
+    actor.id.length !== 16 ||
+    !actor.id.some(Boolean) ||
+    actor.generation <= 0n ||
+    actor.generation > 0xffffffffffffffffn
+  )
+    throw new Error("invalid remote actor binding");
+  return { ...envelope, actor: { kind: "remote_device", ...actor } };
 }
 
 export function validateFcm2Length(length: number) {

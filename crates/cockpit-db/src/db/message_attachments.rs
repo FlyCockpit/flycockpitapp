@@ -39,7 +39,6 @@ pub struct AcceptMessageInput {
     pub queue_item_id: [u8; 16],
     pub canonical_message: Vec<u8>,
     pub attachments: Vec<MessageAttachmentReferenceInput>,
-    pub safe_outcome: Vec<u8>,
     pub outbox_sequence: i64,
     pub now_ms: i64,
 }
@@ -47,8 +46,52 @@ pub struct AcceptMessageInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptMessageResult {
     Accepted,
-    Replayed { safe_outcome: Vec<u8> },
+    Replayed { safe_outcome: MessageSafeOutcome },
     Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageSafeOutcome {
+    Accepted { queue_item_id: [u8; 16] },
+    Materialized { message_seq: u64 },
+    TerminalRejected,
+    Removed,
+}
+
+impl MessageSafeOutcome {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = b"FCMS\x01".to_vec();
+        match self {
+            Self::Accepted { queue_item_id } => {
+                out.push(1);
+                out.extend_from_slice(queue_item_id);
+            }
+            Self::Materialized { message_seq } => {
+                out.push(2);
+                out.extend_from_slice(&message_seq.to_be_bytes());
+            }
+            Self::TerminalRejected => out.push(3),
+            Self::Removed => out.push(4),
+        }
+        out
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.starts_with(b"FCMS\x01"),
+            "invalid message safe outcome"
+        );
+        match bytes.get(5).copied() {
+            Some(1) if bytes.len() == 22 => Ok(Self::Accepted {
+                queue_item_id: bytes[6..22].try_into()?,
+            }),
+            Some(2) if bytes.len() == 14 => Ok(Self::Materialized {
+                message_seq: u64::from_be_bytes(bytes[6..14].try_into()?),
+            }),
+            Some(3) if bytes.len() == 6 => Ok(Self::TerminalRejected),
+            Some(4) if bytes.len() == 6 => Ok(Self::Removed),
+            _ => anyhow::bail!("invalid message safe outcome"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +139,13 @@ impl Db {
             conn.execute("INSERT INTO session_events (session_id,ts_ms,type,data_json) VALUES (?1,?2,'user_message',?3)", params![session_id.to_string(),now_ms,history_data_json])?;
             let message_seq = conn.last_insert_rowid();
             for (fold_ordinal, submission) in submissions.iter().enumerate() {
-                let changed = conn.execute("UPDATE message_submission_receipts SET state='materialized',message_seq=?3,fold_ordinal=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),message_seq,fold_ordinal as i64,now_ms])?;
+                let outcome = MessageSafeOutcome::Materialized { message_seq: message_seq as u64 }.encode();
+                let changed = conn.execute("UPDATE message_submission_receipts SET state='materialized',message_seq=?3,fold_ordinal=?4,safe_outcome=?5,updated_at=?6 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),message_seq,fold_ordinal as i64,outcome,now_ms])?;
                 ensure!(changed == 1, "message receipt is not accepted");
-                conn.execute("UPDATE message_operation_receipts SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),now_ms])?;
-                conn.execute("UPDATE message_queue_items SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+                let operation_changed = conn.execute("UPDATE message_operation_receipts SET state='materialized',safe_outcome=?3,updated_at=?4 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),outcome,now_ms])?;
+                ensure!(operation_changed == 1, "message operation is not accepted");
+                let queue_changed = conn.execute("UPDATE message_queue_items SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+                ensure!(queue_changed == 1, "message queue item is not accepted");
             }
             Ok(message_seq)
         }).await
@@ -110,11 +156,11 @@ impl Db {
         session_id: Uuid,
         submission: [u8; 16],
         state: TerminalMessageState,
-        safe_outcome: Vec<u8>,
         now_ms: i64,
     ) -> Result<bool> {
         self.transaction(move |conn| {
             let state = match state { TerminalMessageState::TerminalRejected => "terminal_rejected", TerminalMessageState::Removed => "removed" };
+            let safe_outcome = match state { "terminal_rejected" => MessageSafeOutcome::TerminalRejected, _ => MessageSafeOutcome::Removed }.encode();
             let changed = conn.execute("UPDATE message_submission_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
             if changed == 0 { return Ok(false); }
             conn.execute("UPDATE message_operation_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
@@ -186,13 +232,22 @@ fn accept_conn(
     }
     let session = input.session_id.to_string();
     let existing = conn.query_row(
-        "SELECT actor_kind, actor_id, actor_generation, request_hash, message_request_digest, client_submission_id, safe_outcome
-           FROM message_operation_receipts WHERE session_id=?1 AND operation_id=?2",
+        "SELECT o.actor_kind,o.actor_id,o.actor_generation,o.request_hash,o.message_request_digest,o.client_submission_id,o.safe_outcome,s.attachment_set_digest
+           FROM message_operation_receipts o LEFT JOIN message_submission_receipts s ON s.session_id=o.session_id AND s.operation_id=o.operation_id
+          WHERE o.session_id=?1 AND o.operation_id=?2",
         params![session, input.operation_id.as_slice()],
-        |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<Vec<u8>>>(1)?, row.get::<_,Vec<u8>>(2)?, row.get::<_,Vec<u8>>(3)?, row.get::<_,Vec<u8>>(4)?, row.get::<_,Vec<u8>>(5)?, row.get::<_,Vec<u8>>(6)?)),
+        |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<Vec<u8>>>(1)?, row.get::<_,Vec<u8>>(2)?, row.get::<_,Vec<u8>>(3)?, row.get::<_,Vec<u8>>(4)?, row.get::<_,Vec<u8>>(5)?, row.get::<_,Vec<u8>>(6)?, row.get::<_,Option<Vec<u8>>>(7)?)),
     ).optional().context("reading message operation receipt")?;
-    if let Some((kind, id, generation, request_hash, message_digest, submission, outcome)) =
-        existing
+    if let Some((
+        kind,
+        id,
+        generation,
+        request_hash,
+        message_digest,
+        submission,
+        outcome,
+        attachment_digest,
+    )) = existing
     {
         let (expected_kind, expected_id, expected_generation) = actor_parts(input.actor);
         if kind == expected_kind
@@ -201,9 +256,10 @@ fn accept_conn(
             && request_hash == input.request_hash
             && message_digest == input.message_request_digest
             && submission == input.client_submission_id
+            && attachment_digest.as_deref() == Some(input.attachment_set_digest.as_slice())
         {
             return Ok(AcceptMessageResult::Replayed {
-                safe_outcome: outcome,
+                safe_outcome: MessageSafeOutcome::decode(&outcome)?,
             });
         }
         return Ok(AcceptMessageResult::Conflict);
@@ -217,13 +273,17 @@ fn accept_conn(
     }
     join.validate_and_join(conn, input)?;
     let (actor_kind, actor_id, actor_generation) = actor_parts(input.actor);
+    let safe_outcome = MessageSafeOutcome::Accepted {
+        queue_item_id: input.queue_item_id,
+    }
+    .encode();
     conn.execute("INSERT INTO message_operation_receipts
       (session_id,operation_id,actor_kind,actor_id,actor_generation,request_hash,message_request_digest,client_submission_id,state,safe_outcome,outbox_sequence,created_at,updated_at)
       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,?11,?11)",
-      params![session,input.operation_id.as_slice(),actor_kind,actor_id,actor_generation,input.request_hash.as_slice(),input.message_request_digest.as_slice(),input.client_submission_id.as_slice(),input.safe_outcome,input.outbox_sequence,input.now_ms])?;
+      params![session,input.operation_id.as_slice(),actor_kind,actor_id,actor_generation,input.request_hash.as_slice(),input.message_request_digest.as_slice(),input.client_submission_id.as_slice(),safe_outcome,input.outbox_sequence,input.now_ms])?;
     conn.execute("INSERT INTO message_submission_receipts
       (session_id,client_submission_id,operation_id,message_request_digest,attachment_set_digest,state,queue_item_id,safe_outcome,created_at,updated_at)
-      VALUES (?1,?2,?3,?4,?5,'accepted',?6,?7,?8,?8)", params![session,input.client_submission_id.as_slice(),input.operation_id.as_slice(),input.message_request_digest.as_slice(),input.attachment_set_digest.as_slice(),input.queue_item_id.as_slice(),input.safe_outcome,input.now_ms])?;
+      VALUES (?1,?2,?3,?4,?5,'accepted',?6,?7,?8,?8)", params![session,input.client_submission_id.as_slice(),input.operation_id.as_slice(),input.message_request_digest.as_slice(),input.attachment_set_digest.as_slice(),input.queue_item_id.as_slice(),safe_outcome,input.now_ms])?;
     conn.execute("INSERT INTO message_queue_items (session_id,queue_item_id,client_submission_id,canonical_message,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'accepted',?5,?5)", params![session,input.queue_item_id.as_slice(),input.client_submission_id.as_slice(),input.canonical_message,input.now_ms])?;
     for (ordinal, attachment) in input.attachments.iter().enumerate() {
         conn.execute("INSERT INTO message_attachment_references (session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![session,input.client_submission_id.as_slice(),ordinal as i64,attachment.attachment_id.as_slice(),attachment.attachment_version.to_be_bytes().as_slice(),attachment.checksum.as_slice(),attachment.kind,input.now_ms])?;
@@ -270,7 +330,6 @@ mod tests {
                 checksum: [8; 32],
                 kind: 2,
             }],
-            safe_outcome: b"accepted".to_vec(),
             outbox_sequence: 1,
             now_ms: 10,
         }
@@ -295,7 +354,9 @@ mod tests {
                 .await
                 .unwrap(),
             AcceptMessageResult::Replayed {
-                safe_outcome: b"accepted".to_vec()
+                safe_outcome: MessageSafeOutcome::Accepted {
+                    queue_item_id: [6; 16]
+                }
             }
         );
         let mut changed = original.clone();
@@ -318,7 +379,6 @@ mod tests {
                 session.session_id,
                 original.client_submission_id,
                 TerminalMessageState::Removed,
-                b"removed".to_vec(),
                 11
             )
             .await
@@ -329,7 +389,6 @@ mod tests {
                 session.session_id,
                 original.client_submission_id,
                 TerminalMessageState::Removed,
-                b"removed".to_vec(),
                 12
             )
             .await
@@ -340,7 +399,7 @@ mod tests {
                 .await
                 .unwrap(),
             AcceptMessageResult::Replayed {
-                safe_outcome: b"removed".to_vec()
+                safe_outcome: MessageSafeOutcome::Removed
             }
         );
     }

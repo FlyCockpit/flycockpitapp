@@ -2558,6 +2558,70 @@ pub(super) async fn handle_serialized_request(
                 .ok_or_else(unavailable)?;
             Ok(Response::MediaUploadStatus(status))
         }
+        Request::FinalizeMediaUpload(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Finalize {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.payload
+            else {
+                return Err(bad_request("media upload action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != digest
+                || request.actor_role != role
+                || request.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = recovery
+                .finalize_media_upload(request, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalMediaMutation(receipt))
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,

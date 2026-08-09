@@ -44,6 +44,165 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn finalize_media_upload(
+        &self,
+        request: cockpit_db::media_attachments::FinalizeMediaUploadV1,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use cockpit_db::media_attachments::{
+            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaAttachmentComponent,
+            MediaAttachmentRecord, MediaAvailability, MediaKind, MediaSourceKind,
+            MediaUploadActionV1, MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
+        };
+        cockpit_db::Db::validate_local_media_mutation_v1(&request)?;
+        let LocalMediaMutationPayloadV1::Finalize {
+            session_id,
+            canonical_project_digest,
+            client_draft_id,
+            upload_id,
+            upload_generation,
+            chunk_count,
+            total_bytes,
+            object_sha256,
+        } = &request.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let session = *session_id;
+        let project = canonical_project_digest.clone();
+        let draft = *client_draft_id;
+        let upload = *upload_id;
+        let generation = *upload_generation;
+        let chunks = *chunk_count;
+        let total = *total_bytes;
+        let expected = object_sha256.clone();
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&request)?;
+        let domain = format!("finalize:{session}:{project}:{draft}:{upload}:{generation}");
+        let op = request.local_operation_id;
+        let pre_domain = domain.clone();
+        let pre_request = request_digest.clone();
+        let pre_semantic = semantic_digest.clone();
+        if let Some(receipt) = self
+            .db
+            .transaction(move |conn| {
+                preflight_local_operation(
+                    conn,
+                    op,
+                    "finalize",
+                    &pre_domain,
+                    &pre_request,
+                    &pre_semantic,
+                    now_unix_ms,
+                )
+            })
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let query_project = project.clone();
+        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,acknowledged_chunks,state,upload_generation,reservation_id,media_kind FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),query_project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
+        ensure!(
+            snapshot.3 == "open"
+                && snapshot.4.parse::<u64>()? == generation
+                && snapshot.2 == chunks
+                && snapshot.1.parse::<u64>()? == total,
+            "finalize count or length conflict"
+        );
+        let mut held = self
+            .owned_root
+            .open_file_verified(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        let before = stable_identity_digest(&held)?;
+        let (actual_len, actual_sha) = read_full_digest(&mut held)?;
+        let after = stable_identity_digest(&held)?;
+        ensure!(
+            before == after && actual_len == total && actual_sha == expected,
+            "finalize object checksum mismatch"
+        );
+        let storage_id = Uuid::now_v7();
+        let target = storage_id.to_string();
+        self.owned_root
+            .rename_into_noreplace(&snapshot.0, &self.owned_root, &target)
+            .map_err(anyhow::Error::new)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let reopened = self
+            .owned_root
+            .open_file_verified(&target)
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            stable_identity_digest(&reopened)? == before,
+            "quarantine rename identity mismatch"
+        );
+        drop(reopened);
+        let attachment = Uuid::now_v7();
+        let component = Uuid::now_v7();
+        let media_kind = match snapshot.6.as_str() {
+            "image" => MediaKind::Image,
+            "audio" => MediaKind::Audio,
+            "video" => MediaKind::Video,
+            _ => anyhow::bail!("invalid upload media kind"),
+        };
+        let next = generation
+            .checked_add(1)
+            .context("upload generation overflow")?;
+        let expires = now_unix_ms
+            .checked_add(86_400_000)
+            .context("draft expiry overflow")?;
+        let mutation = request;
+        let transition = MediaUploadLastTransitionV1::Local {
+            action: MediaUploadActionV1::Finalize,
+            local_operation_id: mutation.local_operation_id,
+            outcome: RemoteMediaOperationOutcomeV1::Applied,
+        };
+        let record = MediaAttachmentRecord {
+            attachment_id: attachment,
+            session_id: session,
+            canonical_project_digest: project.clone(),
+            media_kind,
+            source_kind: MediaSourceKind::AuthenticatedSessionUpload,
+            canonical_container: "pending_probe".into(),
+            canonical_mime: "application/octet-stream".into(),
+            availability: MediaAvailability::Quarantined,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: before.clone(),
+            source_byte_length: total,
+            source_sha256: actual_sha.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: Some(expires),
+            first_referenced_at_unix_ms: None,
+        };
+        let component_record = MediaAttachmentComponent {
+            component_id: component,
+            attachment_id: attachment,
+            attachment_version: 1,
+            component_kind: "quarantined_original".into(),
+            storage_id,
+            lifecycle_state: "ready".into(),
+            component_generation: 1,
+            stable_identity_digest: before,
+            byte_length: total,
+            sha256: actual_sha,
+            reservation_id: snapshot.5.clone(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:1,reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
+            self.owned_root
+                .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
+                .map_err(anyhow::Error::new)?;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+        }
+        result.map(|(receipt, _)| receipt)
+    }
     pub(crate) async fn cancel_media_upload(
         &self,
         request: cockpit_db::media_attachments::CancelMediaUploadV1,
@@ -1342,6 +1501,90 @@ mod tests {
                 reason: cockpit_db::media_attachments::MediaUploadTerminalReasonV1::ClientCancelled
             }
         ));
+        let second_draft = Uuid::now_v7();
+        let second_begin = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "11".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: second_draft,
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: 7,
+                reservation_digest: digest_json(
+                    b"media-upload-reservation-v1",
+                    &local_path_plans(&policy, 7).unwrap(),
+                )
+                .unwrap(),
+            },
+        };
+        let second = recovery
+            .begin_media_upload(second_begin, &policy, 40, 40)
+            .await
+            .unwrap();
+        let second_upload = second.subject_id;
+        let second_append = cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
+            mutation: LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: "11".repeat(32),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Append {
+                    session_id,
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: second_draft,
+                    upload_id: second_upload,
+                    upload_generation: 1,
+                    chunk_index: 0,
+                    chunk_length: 7,
+                    chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                },
+            },
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        recovery
+            .append_media_upload_chunk(second_append, 41)
+            .await
+            .unwrap();
+        let finalize = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "11".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Finalize {
+                session_id,
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: second_draft,
+                upload_id: second_upload,
+                upload_generation: 2,
+                chunk_count: 1,
+                total_bytes: 7,
+                object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+            },
+        };
+        let finalized = recovery
+            .finalize_media_upload(finalize.clone(), 42)
+            .await
+            .unwrap();
+        assert!(matches!(
+            finalized.transition,
+            LocalMediaMutationTransitionV1::UploadToAttachment {
+                upload_generation_before: 2,
+                upload_generation_after: 3,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1
+            }
+        ));
+        assert_eq!(
+            recovery.finalize_media_upload(finalize, 43).await.unwrap(),
+            finalized
+        );
         let counts = db
             .read(|conn| {
                 Ok((
@@ -1361,12 +1604,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(counts, (1, 1, 4, 1));
+        assert_eq!(counts, (2, 2, 7, 2));
         assert_eq!(
             std::fs::read_dir(temp.path().join("media"))
                 .unwrap()
                 .count(),
-            0
+            1
         );
         let state: String = db
             .read(|conn| {

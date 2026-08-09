@@ -319,6 +319,16 @@ fn resolve_provider_request_inner_with_sources(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
+    crate::config::providers::validate_provider_headers(provider_id, &entry.headers)?;
+    let openrouter_origin = match entry.template.as_deref() {
+        Some(template) => {
+            if crate::providers::template_by_id(template).is_none() {
+                anyhow::bail!("provider `{provider_id}` references unknown template `{template}`");
+            }
+            request_kind == ProviderRequestKind::Template && template == "openrouter"
+        }
+        None => false,
+    };
     let is_copilot = request_kind == ProviderRequestKind::Copilot;
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
     let mut missing_other: Vec<String> = Vec::new();
@@ -438,10 +448,49 @@ fn resolve_provider_request_inner_with_sources(
     // require auth; a provider that actually needs it surfaces a clear
     // 401 from `fetch_models`.
 
+    validate_resolved_provider_headers(provider_id, &headers)?;
+    if openrouter_origin {
+        merge_openrouter_attribution(&mut headers);
+    }
+
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, env_lookup)?,
         headers,
     })
+}
+
+fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHeader]) -> Result<()> {
+    for header in headers {
+        if reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(&header.value).is_err()
+        {
+            return Err(
+                crate::config::providers::ProviderHeaderConfigError::new(provider_id).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_openrouter_attribution(headers: &mut Vec<ResolvedHeader>) {
+    for (name, default) in [
+        ("HTTP-Referer", "https://flycockpit.dev"),
+        ("X-OpenRouter-Title", "FlyCockpit"),
+    ] {
+        match headers
+            .iter()
+            .position(|header| header.name.eq_ignore_ascii_case(name))
+        {
+            Some(index) if headers[index].value.is_empty() => {
+                headers.remove(index);
+            }
+            Some(_) => {}
+            None => headers.push(ResolvedHeader {
+                name: name.to_string(),
+                value: default.to_string(),
+            }),
+        }
+    }
 }
 
 pub(crate) fn resolve_codex_model_list_request(
@@ -1899,6 +1948,148 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_rust_provider_header_override() {
+        let entry = ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            headers: vec![
+                HeaderSpec {
+                    name: "http-referer".into(),
+                    value: "https://override.test".into(),
+                },
+                HeaderSpec {
+                    name: "X-OpenRouter-Title".into(),
+                    value: String::new(),
+                },
+                HeaderSpec {
+                    name: "X-Title".into(),
+                    value: "unrelated".into(),
+                },
+            ],
+            ..ProviderEntry::default()
+        };
+        let request =
+            resolve_provider_request_with_sources("renamed", &entry, |_| None, |_| None).unwrap();
+        assert_eq!(
+            resolved_header_value(&request, "HTTP-Referer"),
+            Some("https://override.test")
+        );
+        assert_eq!(resolved_header_value(&request, "X-OpenRouter-Title"), None);
+        assert_eq!(
+            resolved_header_value(&request, "X-Title"),
+            Some("unrelated")
+        );
+
+        let stock = ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            ..ProviderEntry::default()
+        };
+        let request =
+            resolve_provider_request_with_sources("work", &stock, |_| None, |_| None).unwrap();
+        assert_eq!(
+            resolved_header_value(&request, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            resolved_header_value(&request, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+    }
+
+    #[test]
+    fn openrouter_identity_uses_registry_origin() {
+        let custom = ProviderEntry {
+            url: "https://openrouter.ai/api/v1".into(),
+            ..ProviderEntry::default()
+        };
+        let request =
+            resolve_provider_request_with_sources("openrouter", &custom, |_| None, |_| None)
+                .unwrap();
+        assert_eq!(resolved_header_value(&request, "HTTP-Referer"), None);
+
+        let unknown = ProviderEntry {
+            template: Some("openrouter-lookalike".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            ..ProviderEntry::default()
+        };
+        assert!(
+            resolve_provider_request_with_sources("custom", &unknown, |_| None, |_| None).is_err()
+        );
+    }
+
+    #[test]
+    fn provider_header_normalization_rejects_invalid_or_duplicate() {
+        for headers in [
+            vec![
+                HeaderSpec {
+                    name: "X-Test".into(),
+                    value: "one".into(),
+                },
+                HeaderSpec {
+                    name: "x-test".into(),
+                    value: "two".into(),
+                },
+            ],
+            vec![HeaderSpec {
+                name: "bad name".into(),
+                value: "secret-value".into(),
+            }],
+            vec![HeaderSpec {
+                name: "X-Test".into(),
+                value: "bad\r\nvalue".into(),
+            }],
+        ] {
+            let entry = ProviderEntry {
+                url: "https://example.test/v1".into(),
+                headers,
+                ..ProviderEntry::default()
+            };
+            let error =
+                resolve_provider_request_with_sources("safe-id", &entry, |_| None, |_| None)
+                    .unwrap_err();
+            let typed = error
+                .downcast_ref::<crate::config::providers::ProviderHeaderConfigError>()
+                .unwrap();
+            assert_eq!(typed.code(), "provider_header_invalid");
+            assert_eq!(
+                typed.to_string(),
+                "Provider 'safe-id' has invalid or duplicate HTTP header configuration; edit provider headers before retrying."
+            );
+            assert!(!format!("{error:#}").contains("secret-value"));
+        }
+    }
+
+    #[test]
+    fn openrouter_attribution_cross_adapter_fixture() {
+        let mut headers = Vec::new();
+        merge_openrouter_attribution(&mut headers);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].name, "HTTP-Referer");
+        assert_eq!(headers[0].value, "https://flycockpit.dev");
+        assert_eq!(headers[1].name, "X-OpenRouter-Title");
+        assert_eq!(headers[1].value, "FlyCockpit");
+    }
+
+    #[test]
+    fn openrouter_origin_cannot_be_forged_downstream() {
+        for (id, url, credential_ref) in [
+            ("openrouter", "https://example.test/v1", None),
+            ("custom", "https://openrouter.ai/api/v1", None),
+            ("custom", "https://example.test/v1", Some("openrouter")),
+        ] {
+            let entry = ProviderEntry {
+                url: url.into(),
+                credential_ref: credential_ref.map(str::to_string),
+                ..ProviderEntry::default()
+            };
+            let request =
+                resolve_provider_request_with_sources(id, &entry, |_| None, |_| None).unwrap();
+            assert_eq!(resolved_header_value(&request, "HTTP-Referer"), None);
+        }
+    }
+
+    #[test]
     fn resolved_request_expands_injected_secret_refs() {
         let entry = ProviderEntry {
             url: "https://api.example.test/v1".into(),
@@ -1928,6 +2119,14 @@ mod tests {
             .iter()
             .map(|header| (header.name.as_str(), header.value.as_str()))
             .collect()
+    }
+
+    fn resolved_header_value<'a>(request: &'a ResolvedRequest, name: &str) -> Option<&'a str> {
+        request
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
     }
 
     #[test]

@@ -468,7 +468,7 @@ pub(super) fn build_anthropic_model_with_can_delegate(
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
     let client = builder
-        .http_client(UsageAliasHttpClient::new(extra_headers))
+        .http_client(UsageAliasHttpClient::new(extra_headers)?)
         .build()
         .with_context(|| format!("building anthropic client for `{provider_id}`"))?;
 
@@ -606,7 +606,7 @@ pub(super) fn build_chatgpt_model_with_utility_limit(
         // system prompt is the only instruction source. An empty default is
         // a no-op when a real preamble is present.
         .default_instructions("")
-        .http_client(UsageAliasHttpClient::new(extra_headers))
+        .http_client(UsageAliasHttpClient::new(extra_headers)?)
         .build()
         .with_context(|| format!("building native ChatGPT client for `{provider_id}`"))?;
 
@@ -813,7 +813,7 @@ pub(super) fn build_openai_model_from_resolved_with_utility_limit_and_can_delega
     let client = openai::CompletionsClient::builder()
         .api_key(token)
         .base_url(&resolved.base_url)
-        .http_client(UsageAliasHttpClient::new(extra_headers))
+        .http_client(UsageAliasHttpClient::new(extra_headers)?)
         .build()
         .with_context(|| format!("building openai-compatible client for `{provider_id}`"))?;
     Ok(Model::OpenAi {

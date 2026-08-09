@@ -10,7 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // `OpenAI` is invoked as `new OpenAI(...)` so the mock must be constructable —
 // a `class` works where a `vi.fn(() => ...)` factory does not.
 const chatCompletionsCreate = vi.fn();
+const openAIOptions = vi.fn();
 class MockOpenAI {
+  constructor(options: unknown) {
+    openAIOptions(options);
+  }
   chat = { completions: { create: chatCompletionsCreate } };
 }
 
@@ -39,6 +43,44 @@ const { OpenRouterProvider } = await import("./openrouter.js");
 describe("OpenRouterProvider", () => {
   beforeEach(() => {
     chatCompletionsCreate.mockReset();
+    openAIOptions.mockReset();
+  });
+
+  it("openrouter_typescript_override_sources", () => {
+    const previous = process.env.BETTER_AUTH_URL;
+    try {
+      delete process.env.BETTER_AUTH_URL;
+      new OpenRouterProvider("test-key");
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          defaultHeaders: {
+            "HTTP-Referer": "https://flycockpit.dev",
+            "X-OpenRouter-Title": "FlyCockpit Translation",
+          },
+        }),
+      );
+
+      new OpenRouterProvider("test-key", { httpReferer: "", title: null });
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({ defaultHeaders: {} }),
+      );
+
+      new OpenRouterProvider("test-key", {
+        httpReferer: "https://example.test",
+        title: "Custom",
+      });
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          defaultHeaders: {
+            "HTTP-Referer": "https://example.test",
+            "X-OpenRouter-Title": "Custom",
+          },
+        }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.BETTER_AUTH_URL;
+      else process.env.BETTER_AUTH_URL = previous;
+    }
   });
 
   it("translates plaintext into es-MX with deterministic temperature and the default model", async () => {

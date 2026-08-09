@@ -1176,11 +1176,10 @@ fn merge_applies_frontier_defaults_for_openai_and_grok_templates() {
     }
 }
 
-/// `effective_template` prefers the stored `template`, otherwise falls back
-/// to the config-map key when that key itself names a known template — and
-/// resolves to `None` for a renamed/custom provider with no stored template.
+/// `effective_template` requires stored immutable identity; mutable map keys
+/// never establish template provenance.
 #[test]
-fn effective_template_prefers_stored_then_falls_back_to_known_key() {
+fn effective_template_requires_persisted_identity() {
     // Stored template wins even under a renamed key.
     let renamed = ProviderEntry {
         template: Some("anthropic".into()),
@@ -1192,12 +1191,13 @@ fn effective_template_prefers_stored_then_falls_back_to_known_key() {
         Some("anthropic")
     );
 
-    // Pre-`template` config whose key still names a known template.
+    // A map key never establishes immutable template identity.
     let legacy = ProviderEntry {
         url: "https://x".into(),
         ..ProviderEntry::default()
     };
-    assert_eq!(legacy.effective_template("anthropic"), Some("anthropic"));
+    assert_eq!(legacy.effective_template("anthropic"), None);
+    assert_eq!(legacy.effective_template("openrouter"), None);
 
     // Custom provider with no stored template and a non-template key.
     let custom = ProviderEntry {
@@ -1206,11 +1206,7 @@ fn effective_template_prefers_stored_then_falls_back_to_known_key() {
     };
     assert_eq!(custom.effective_template("my-endpoint"), None);
 
-    // Nous Research is a known template identity.
-    assert_eq!(
-        legacy.effective_template("nous-research"),
-        Some("nous-research")
-    );
+    assert_eq!(legacy.effective_template("nous-research"), None);
     let renamed_nous = ProviderEntry {
         template: Some("nous-research".into()),
         url: "https://inference-api.nousresearch.com/v1".into(),

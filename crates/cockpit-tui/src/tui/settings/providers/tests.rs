@@ -4101,6 +4101,35 @@ fn header_editor_list_keeps_secret_refs_visible() {
 }
 
 #[test]
+fn provider_header_editor_rejects_invalid_or_duplicate_on_entry_save_reopen() {
+    let original = vec![HeaderSpec {
+        name: "X-Test".into(),
+        value: "valid".into(),
+    }];
+    let mut editor = HeaderEditor::new_for_provider("p", original.clone(), false);
+    <HeaderEditor as RowListEditor>::start_add(&mut editor);
+    editor.name_buf = TextField::new("x-test".into());
+    editor.value_buf = TextField::new("secret-value".into());
+    let error = <HeaderEditor as RowListEditor>::commit_edit_fields(&mut editor).unwrap_err();
+    assert_eq!(
+        error,
+        "Provider 'p' has invalid or duplicate HTTP header configuration; edit provider headers before retrying."
+    );
+    assert_eq!(editor.rows(), original.as_slice());
+    assert!(!error.contains("secret-value"));
+
+    editor.name_buf = TextField::new("HTTP-Referer".into());
+    editor.value_buf = TextField::new(String::new());
+    <HeaderEditor as RowListEditor>::commit_edit_fields(&mut editor).unwrap();
+    assert!(
+        editor
+            .rows()
+            .iter()
+            .any(|row| row.name == "HTTP-Referer" && row.value.is_empty())
+    );
+}
+
+#[test]
 fn literal_key_entry_writes_secret_ref() {
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let store_path = tmp.path().join("state/cockpit/credentials.json");

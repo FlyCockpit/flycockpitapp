@@ -28,6 +28,7 @@ pub const MAX_INVENTORY_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 /// Process-wide inventory generation additive; advances on config-driven
 /// inventory source changes. Combined with the skills catalog generation.
 static INVENTORY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 type InventoryBarrierCb = Box<dyn Fn() + Send + Sync>;
 
@@ -61,6 +62,19 @@ pub fn current_inventory_generation() -> u64 {
     INVENTORY_GENERATION
         .load(Ordering::SeqCst)
         .saturating_add(crate::skills::catalog_generation())
+}
+
+pub fn current_config_generation() -> u64 {
+    CONFIG_GENERATION.load(Ordering::SeqCst)
+}
+
+pub fn compare_and_bump_config_generation(expected: u64) -> Option<u64> {
+    let next = expected.checked_add(1)?;
+    CONFIG_GENERATION
+        .compare_exchange(expected, next, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()?;
+    bump_inventory_generation();
+    Some(next)
 }
 
 #[cfg(test)]

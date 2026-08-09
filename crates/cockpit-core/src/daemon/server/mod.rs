@@ -455,6 +455,33 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(&mut note.content, redact);
         }
         proto::Response::ProjectNoteRenamed { name } => scrub_string(name, redact),
+        proto::Response::WorkspaceTrustSet {
+            config_generation: _,
+        }
+        | proto::Response::AppFlag { .. }
+        | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::StartupDisclosures {
+            org_sync,
+            connector,
+            config_generation: _,
+        } => {
+            if let Some(org) = org_sync {
+                scrub_string(&mut org.org_id, redact);
+            }
+            if let Some(connector) = connector {
+                scrub_string(&mut connector.status, redact);
+                scrub_option_string(&mut connector.relay_url, redact);
+                scrub_option_string(&mut connector.relay_id, redact);
+                scrub_option_string(&mut connector.relay_region, redact);
+                scrub_option_string(&mut connector.last_error, redact);
+            }
+        }
+        proto::Response::AssistantSessionResolved {
+            session,
+            created: _,
+        } => {
+            scrub_session_summary(session, redact);
+        }
         proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }

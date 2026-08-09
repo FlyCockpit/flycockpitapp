@@ -3,6 +3,51 @@ use super::authz::*;
 use super::sessions::*;
 use super::*;
 
+static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
+    match key {
+        proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
+    }
+}
+
+fn workspace_trust_mode_to_db(
+    mode: proto::WorkspaceTrustMode,
+) -> crate::db::workspace_trust::WorkspaceTrustMode {
+    match mode {
+        proto::WorkspaceTrustMode::Trust => crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        proto::WorkspaceTrustMode::IgnoreConfig => {
+            crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        }
+        proto::WorkspaceTrustMode::Untrusted => {
+            crate::db::workspace_trust::WorkspaceTrustMode::Untrusted
+        }
+    }
+}
+
+fn org_disclosure_to_proto(
+    value: crate::db::org_sync::OrgSyncDisclosure,
+) -> proto::OrgSyncDisclosure {
+    proto::OrgSyncDisclosure {
+        org_id: value.org_id,
+        cursor_seq: value.cursor_seq,
+        last_synced_at_ms: value.last_synced_at_ms,
+    }
+}
+
+fn connector_disclosure_to_proto(
+    value: crate::db::connector::ConnectorDisclosure,
+) -> proto::ConnectorDisclosure {
+    proto::ConnectorDisclosure {
+        enabled: value.enabled,
+        status: value.status,
+        relay_url: value.relay_url,
+        relay_id: value.relay_id,
+        relay_region: value.relay_region,
+        last_error: value.last_error,
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn handle_request(
     request: Request,
@@ -660,6 +705,147 @@ pub(super) async fn handle_serialized_request(
             ensure_project_note_member(&ctx.db, &project_root, id).await?;
             ctx.db.delete_project_note(id).await.map_err(internal)?;
             Ok(Response::Ack)
+        }
+
+        Request::SetWorkspaceTrust {
+            project_root,
+            mode,
+            expected_config_generation,
+        } => {
+            let _guard = WORKSPACE_TRUST_RPC_LOCK.lock().await;
+            let current = inventory::current_config_generation();
+            if current != expected_config_generation {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: format!(
+                        "workspace trust config generation is {current}, expected {expected_config_generation}"
+                    ),
+                });
+            }
+            ctx.db
+                .set_workspace_trust(
+                    PathBuf::from(&project_root).as_path(),
+                    workspace_trust_mode_to_db(mode),
+                )
+                .await
+                .map_err(internal)?;
+            let config_generation = inventory::compare_and_bump_config_generation(current)
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "workspace trust config generation changed concurrently".into(),
+                })?;
+            Ok(Response::WorkspaceTrustSet { config_generation })
+        }
+        Request::GetStartupDisclosures { project_root: _ } => {
+            let (org_sync, connector) =
+                if let Some(credential) = crate::auth::flycockpit::maybe_load_credential() {
+                    let org = ctx
+                        .db
+                        .org_sync_disclosure_for_server(&credential.server_url)
+                        .await
+                        .map_err(internal)?
+                        .map(org_disclosure_to_proto);
+                    let connector = ctx
+                        .db
+                        .connector_disclosure(&credential.server_url, &credential.instance_id)
+                        .await
+                        .map_err(internal)?
+                        .map(connector_disclosure_to_proto);
+                    (org, connector)
+                } else {
+                    (None, None)
+                };
+            Ok(Response::StartupDisclosures {
+                org_sync,
+                connector,
+                config_generation: inventory::current_config_generation(),
+            })
+        }
+        Request::GetAppFlag { key } => {
+            let db_key = app_flag_db_key(key);
+            let version = ctx
+                .db
+                .read(move |conn| crate::db::Db::app_flag_version_conn(conn, db_key))
+                .await
+                .map_err(internal)?;
+            Ok(Response::AppFlag {
+                key,
+                seen: version > 0,
+                version,
+            })
+        }
+        Request::MarkAppFlagSeen {
+            key,
+            expected_version,
+        } => {
+            let db_key = app_flag_db_key(key);
+            let outcome = ctx
+                .db
+                .write(move |conn| {
+                    crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)
+                })
+                .await
+                .map_err(internal)?;
+            let Some((version, changed)) = outcome else {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "app flag version changed; refresh before retrying".into(),
+                });
+            };
+            Ok(Response::AppFlagSeen {
+                key,
+                version,
+                changed,
+            })
+        }
+        Request::ResolveAssistantSession {
+            assistant_id,
+            project_root,
+            mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+        } => {
+            let assistant_for_db = assistant_id.clone();
+            let project_root_for_db = project_root.clone();
+            let (session, created) = ctx
+                .db
+                .write(move |conn| {
+                    let assistant = crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("assistant `{assistant_for_db}` not found")
+                        })?;
+                    crate::assistants::load_from_row(&assistant)?;
+                    let (row, created) =
+                        match crate::db::Db::most_recent_session_for_assistant_conn(
+                            conn,
+                            &assistant_for_db,
+                        )? {
+                            Some(row) => (row, false),
+                            None => {
+                                let project_id =
+                                    crate::session::project_id_for(Path::new(&project_root_for_db));
+                                let row = crate::db::Db::build_new_assistant_session_row_conn(
+                                    conn,
+                                    &project_id,
+                                    &project_root_for_db,
+                                    &assistant_for_db,
+                                    &assistant_for_db,
+                                )?;
+                                (crate::db::Db::insert_session_row_conn(conn, &row)?, true)
+                            }
+                        };
+                    let summary = crate::db::Db::list_session_summaries_conn(
+                        conn,
+                        Some(&row.project_id),
+                        None,
+                        100,
+                    )?
+                    .into_iter()
+                    .find(|summary| summary.session_id == row.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("resolved assistant session is unavailable"))?;
+                    Ok((summary, created))
+                })
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            Ok(Response::AssistantSessionResolved { session, created })
         }
 
         Request::ListAssistants => {

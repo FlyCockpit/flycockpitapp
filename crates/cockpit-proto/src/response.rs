@@ -194,6 +194,31 @@ pub enum Response {
         name: String,
     },
 
+    WorkspaceTrustSet {
+        config_generation: u64,
+    },
+    StartupDisclosures {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_sync: Option<OrgSyncDisclosure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connector: Option<ConnectorDisclosure>,
+        config_generation: u64,
+    },
+    AppFlag {
+        key: AppFlagKey,
+        seen: bool,
+        version: u64,
+    },
+    AppFlagSeen {
+        key: AppFlagKey,
+        version: u64,
+        changed: bool,
+    },
+    AssistantSessionResolved {
+        session: SessionSummary,
+        created: bool,
+    },
+
     Assistants {
         assistants: Vec<AssistantSummary>,
     },
@@ -670,6 +695,11 @@ macro_rules! response_variants {
             (Response::ProjectNotes { .. }, "project_notes");
             (Response::ProjectNoteCreated { .. }, "project_note_created");
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
+            (Response::WorkspaceTrustSet { .. }, "workspace_trust_set");
+            (Response::StartupDisclosures { .. }, "startup_disclosures");
+            (Response::AppFlag { .. }, "app_flag");
+            (Response::AppFlagSeen { .. }, "app_flag_seen");
+            (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");

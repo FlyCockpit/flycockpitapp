@@ -975,6 +975,8 @@ pub enum ErrorCode {
     HashMismatch,
     /// Requested path is locked by another writer.
     LockConflict,
+    /// Optimistic generation/version did not match authoritative state.
+    Conflict,
     /// Workspace trust is unset or explicitly refuses access.
     WorkspaceTrust,
     /// A user message was deterministically rejected before entering the
@@ -1044,6 +1046,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "path_outside_root" => Self::PathOutsideRoot,
             "hash_mismatch" => Self::HashMismatch,
             "lock_conflict" => Self::LockConflict,
+            "conflict" => Self::Conflict,
             "workspace_trust" => Self::WorkspaceTrust,
             "user_message_not_accepted" => Self::UserMessageNotAccepted,
             "user_message_terminated" => Self::UserMessageTerminated,
@@ -1078,6 +1081,7 @@ impl std::fmt::Display for ErrorCode {
             Self::PathOutsideRoot => "path_outside_root",
             Self::HashMismatch => "hash_mismatch",
             Self::LockConflict => "lock_conflict",
+            Self::Conflict => "conflict",
             Self::WorkspaceTrust => "workspace_trust",
             Self::UserMessageNotAccepted => "user_message_not_accepted",
             Self::UserMessageTerminated => "user_message_terminated",
@@ -1332,6 +1336,48 @@ pub struct ProjectNote {
     pub project_root: String,
     pub name: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceTrustMode {
+    Trust,
+    IgnoreConfig,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgSyncDisclosure {
+    pub org_id: String,
+    pub cursor_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorDisclosure {
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppFlagKey {
+    DaemonAutostartNotice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantSessionResolutionMode {
+    MostRecentOrCreate,
 }
 
 /// Metadata for a session sealed value.  The literal is deliberately absent

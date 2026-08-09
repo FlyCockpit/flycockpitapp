@@ -323,6 +323,27 @@ pub enum Request {
         id: Uuid,
     },
 
+    SetWorkspaceTrust {
+        project_root: String,
+        mode: WorkspaceTrustMode,
+        expected_config_generation: u64,
+    },
+    GetStartupDisclosures {
+        project_root: String,
+    },
+    GetAppFlag {
+        key: AppFlagKey,
+    },
+    MarkAppFlagSeen {
+        key: AppFlagKey,
+        expected_version: u64,
+    },
+    ResolveAssistantSession {
+        assistant_id: String,
+        project_root: String,
+        mode: AssistantSessionResolutionMode,
+    },
+
     /// List persisted assistant definitions.
     ListAssistants,
 
@@ -1169,6 +1190,11 @@ macro_rules! request_variants {
             (Request::SetProjectNoteContent { .. }, "set_project_note_content");
             (Request::RenameProjectNote { .. }, "rename_project_note");
             (Request::DeleteProjectNote { .. }, "delete_project_note");
+            (Request::SetWorkspaceTrust { .. }, "set_workspace_trust");
+            (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
+            (Request::GetAppFlag { .. }, "get_app_flag");
+            (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
+            (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
@@ -1308,6 +1334,11 @@ macro_rules! command {
             (Request::SetProjectNoteContent { project_root, .. }, "set_project_note_content", owner_only, none, true, serialized, path(project_root));
             (Request::RenameProjectNote { project_root, .. }, "rename_project_note", owner_only, none, true, serialized, path(project_root));
             (Request::DeleteProjectNote { project_root, .. }, "delete_project_note", owner_only, none, true, serialized, path(project_root));
+            (Request::SetWorkspaceTrust { project_root, .. }, "set_workspace_trust", owner_only, none, true, serialized, path(project_root));
+            (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, serialized, path(project_root));
+            (Request::GetAppFlag { .. }, "get_app_flag", owner_only, none, false, serialized, none);
+            (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen", owner_only, none, true, serialized, none);
+            (Request::ResolveAssistantSession { project_root, .. }, "resolve_assistant_session", owner_only, none, true, serialized, path(project_root));
             (Request::ListAssistants, "list_assistants", owner_only, none, false, concurrent, none);
             (Request::UpsertAssistant { .. }, "upsert_assistant", owner_only, none, true, serialized, none);
             (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, serialized, none);

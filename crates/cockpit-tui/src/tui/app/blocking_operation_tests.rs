@@ -27,7 +27,7 @@ fn activate_composer(app: &mut App) {
 
 #[test]
 fn blocking_operation_manifest_is_complete() {
-    use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
+    use super::blocking_operations::{ALL_BLOCKING_OPERATION_SITES, BLOCKING_OPERATION_MANIFEST};
 
     let app = App::new(None, false);
     for registration in BLOCKING_OPERATION_MANIFEST {
@@ -37,7 +37,6 @@ fn blocking_operation_manifest_is_complete() {
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
     let mut actions = std::collections::HashSet::new();
-    let mut handlers = std::collections::HashSet::new();
     let mut wrappers = std::collections::HashSet::new();
     for registration in BLOCKING_OPERATION_MANIFEST {
         assert!(
@@ -51,7 +50,6 @@ fn blocking_operation_manifest_is_complete() {
             registration.kind,
         );
         assert!(!registration.actions.is_empty());
-        assert!(handlers.insert(registration.handler), "duplicate handler");
         assert!(wrappers.insert(registration.wrapper), "duplicate wrapper");
         for action in registration.actions {
             assert!(actions.insert(*action), "duplicate action: {action}");
@@ -62,13 +60,21 @@ fn blocking_operation_manifest_is_complete() {
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
         }
-        validate_handler_source(
-            registration.source,
-            registration.handler,
-            registration.wrapper,
-        )
-        .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
+        let authority = ALL_BLOCKING_OPERATION_SITES
+            .iter()
+            .find(|authority| authority.site == registration.site)
+            .unwrap_or_else(|| panic!("manifest contains undeclared site {:?}", registration.site));
+        validate_handler_source(authority.source, authority.handler, registration.wrapper)
+            .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
     }
+    let declared = ALL_BLOCKING_OPERATION_SITES
+        .iter()
+        .map(|authority| authority.site)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        sites, declared,
+        "manifest must cover every sealed site exactly once"
+    );
 }
 
 fn validate_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<(), String> {
@@ -98,7 +104,10 @@ fn analyze_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<
         ));
     }
     let mut wrapper_calls = 0;
-    inspect_handler_calls(handlers[0], source.as_bytes(), wrapper, &mut wrapper_calls)?;
+    let body = handlers[0]
+        .child_by_field_name("body")
+        .ok_or("handler has no executable body")?;
+    inspect_handler_calls(body, source.as_bytes(), wrapper, &mut wrapper_calls)?;
     Ok(wrapper_calls)
 }
 
@@ -128,13 +137,16 @@ fn inspect_handler_calls(
     wrapper: &str,
     wrapper_calls: &mut usize,
 ) -> Result<(), String> {
+    if matches!(node.kind(), "closure_expression" | "function_item") {
+        return Ok(());
+    }
     if node.kind() == "call_expression"
         && let Some(function) = node.child_by_field_name("function")
     {
         let callable = function
             .utf8_text(source)
             .map_err(|error| error.to_string())?;
-        if callable.rsplit('.').next() == Some(wrapper) {
+        if callable == format!("self.{wrapper}") {
             *wrapper_calls += 1;
         }
         const FORBIDDEN: &[&str] = &[
@@ -168,6 +180,15 @@ fn handler_source_gate_rejects_bypasses() {
         .is_err()
     );
     assert!(validate_handler_source("fn h(){ self.wrong(); }", "h", "dispatch").is_err());
+    assert!(validate_handler_source("fn h(){ other.dispatch(); }", "h", "dispatch").is_err());
+    assert!(
+        validate_handler_source(
+            "fn h(){ let fake = || self.dispatch(); drop(fake); }",
+            "h",
+            "dispatch"
+        )
+        .is_err()
+    );
     assert!(
         validate_handler_source(
             "fn h(){ self.dispatch(); std::fs::read(\"x\"); }",
@@ -176,6 +197,20 @@ fn handler_source_gate_rejects_bypasses() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn sealed_site_catalog_detects_a_deleted_manifest_row() {
+    use super::blocking_operations::{ALL_BLOCKING_OPERATION_SITES, BLOCKING_OPERATION_MANIFEST};
+    let declared = ALL_BLOCKING_OPERATION_SITES
+        .iter()
+        .map(|authority| authority.site)
+        .collect::<std::collections::HashSet<_>>();
+    let missing_one = BLOCKING_OPERATION_MANIFEST[1..]
+        .iter()
+        .map(|registration| registration.site)
+        .collect::<std::collections::HashSet<_>>();
+    assert_ne!(declared, missing_one);
 }
 
 #[tokio::test]

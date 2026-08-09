@@ -7,11 +7,7 @@ pub(super) struct BlockingOperationRegistration {
     #[cfg(test)]
     pub(super) binding: fn(&App) -> BlockingOperationKind,
     #[cfg(test)]
-    pub(super) handler: &'static str,
-    #[cfg(test)]
     pub(super) wrapper: &'static str,
-    #[cfg(test)]
-    pub(super) source: &'static str,
     pub(super) kind: BlockingOperationKind,
     pub(super) actions: &'static [&'static str],
 }
@@ -27,8 +23,49 @@ pub(super) enum BlockingOperationSite {
     ComposerSuggestions,
 }
 
+#[cfg(test)]
+pub(super) struct BlockingOperationSiteAuthority {
+    pub(super) site: BlockingOperationSite,
+    pub(super) handler: &'static str,
+    pub(super) source: &'static str,
+}
+
+#[cfg(test)]
+pub(super) const ALL_BLOCKING_OPERATION_SITES: &[BlockingOperationSiteAuthority] = &[
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::SlashCurator,
+        handler: "handle_curator_command",
+        source: include_str!("slash.rs"),
+    },
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::SlashDoctor,
+        handler: "handle_doctor_command",
+        source: include_str!("slash.rs"),
+    },
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::SlashExport,
+        handler: "start_export_action",
+        source: include_str!("export_actions.rs"),
+    },
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::QueueEditKey,
+        handler: "edit_queued_messages",
+        source: include_str!("input.rs"),
+    },
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::SlashBtw,
+        handler: "handle_btw_command",
+        source: include_str!("btw_pane.rs"),
+    },
+    BlockingOperationSiteAuthority {
+        site: BlockingOperationSite::ComposerSuggestions,
+        handler: "reset_at_window",
+        source: include_str!("input.rs"),
+    },
+];
+
 macro_rules! blocking_operation_manifest {
-    ($( $kind:ident => $site:ident => $source:literal => $handler:ident => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
+    ($( $kind:ident => $site:ident => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
@@ -40,11 +77,7 @@ macro_rules! blocking_operation_manifest {
                 #[cfg(test)]
                 binding: App::$binding,
                 #[cfg(test)]
-                handler: stringify!($handler),
-                #[cfg(test)]
                 wrapper: stringify!($binding),
-                #[cfg(test)]
-                source: include_str!($source),
                 kind: BlockingOperationKind::$kind,
                 actions: &[$($action),+],
             }),+
@@ -61,12 +94,12 @@ macro_rules! blocking_operation_manifest {
 }
 
 blocking_operation_manifest! {
-    CuratorMaintenance => SlashCurator => "slash.rs" => handle_curator_command => curator_blocking_operation => [curator_action_name => "curator.command"],
-    DoctorSnapshot => SlashDoctor => "slash.rs" => handle_doctor_command => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
-    ExportWrite => SlashExport => "export_actions.rs" => start_export_action => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
-    QueueMutation => QueueEditKey => "input.rs" => edit_queued_messages => queue_blocking_operation => [queue_action_name => "queue.edit"],
-    BtwTeardown => SlashBtw => "btw_pane.rs" => handle_btw_command => btw_blocking_operation => [btw_action_name => "btw.teardown"],
-    FileAutocomplete => ComposerSuggestions => "input.rs" => reset_at_window => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
+    CuratorMaintenance => SlashCurator => curator_blocking_operation => [curator_action_name => "curator.command"],
+    DoctorSnapshot => SlashDoctor => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
+    ExportWrite => SlashExport => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
+    QueueMutation => QueueEditKey => queue_blocking_operation => [queue_action_name => "queue.edit"],
+    BtwTeardown => SlashBtw => btw_blocking_operation => [btw_action_name => "btw.teardown"],
+    FileAutocomplete => ComposerSuggestions => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
 }
 
 impl BlockingOperationKind {

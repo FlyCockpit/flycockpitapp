@@ -278,9 +278,8 @@ pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Pat
     }
 }
 
-/// Publish through an owned temporary file and a no-replace hard link.  The
-/// target either remains absent or contains the complete verified export;
-/// failures clean up the partial file and never overwrite an earlier export.
+/// Publish through the shared platform-held atomic no-clobber implementation.
+/// Its blocking callable owns its relative temporary handle through cleanup.
 pub(super) async fn write_export_no_clobber(
     out_path: &std::path::Path,
     bytes: &[u8],
@@ -290,23 +289,10 @@ pub(super) async fn write_export_no_clobber(
     if !crate::tui::async_action::secure_export_cleanup_supported() {
         return Err(format!("{command}: secure export cleanup is unavailable"));
     }
-    let file_name = out_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("{command}: invalid export path"))?;
-    let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::now_v7()));
-    let worker_temp = temp.clone();
     let worker_out = out_path.to_path_buf();
     let worker_bytes = bytes.to_vec();
     let worker_shutdown = std::sync::Arc::clone(shutdown);
-    shutdown.own_export_temp(temp.clone());
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&worker_temp)
-            .map_err(|error| format!("{command}: creating export failed: {error}"))?;
+    tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         {
             let mut observer = EXPORT_WRITE_THREAD_OBSERVER.lock().unwrap();
@@ -318,43 +304,16 @@ pub(super) async fn write_export_no_clobber(
                 let _ = sender.send(std::thread::current().id());
             }
         }
-        file.write_all(&worker_bytes)
-            .map_err(|error| format!("{command}: writing export failed: {error}"))?;
-        if worker_shutdown.is_cancelled() {
-            return Err(format!("{command}: export cancelled by shutdown"));
-        }
-        file.sync_all()
-            .map_err(|error| format!("{command}: syncing export failed: {error}"))?;
-        drop(file);
-        std::fs::hard_link(&worker_temp, &worker_out).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("{command}: export already exists: {}", worker_out.display())
-            } else {
-                format!("{command}: publishing export failed: {error}")
-            }
-        })?;
-        Ok(())
+        crate::clipboard::file_publish::publish_no_clobber_bounded_elsewhere(
+            &worker_out,
+            &worker_bytes,
+            &|| worker_shutdown.is_cancelled(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{command}: publishing export failed: {error}"))
     })
     .await
-    .map_err(|error| format!("{command}: export worker failed: {error}"))?;
-    let cleanup_temp = temp.clone();
-    let cleanup = tokio::task::spawn_blocking(move || {
-        crate::tui::async_action::secure_unlink_owned_temp(&cleanup_temp)
-    })
-    .await
-    .map_err(|error| format!("{command}: cleanup worker failed: {error}"))?;
-    match (result, cleanup) {
-        (result, Ok(())) => {
-            shutdown.release_export_temp();
-            result
-        }
-        (Err(error), Err(cleanup_error)) => Err(format!(
-            "{error}; cleaning partial export failed: {cleanup_error}"
-        )),
-        (Ok(()), Err(cleanup_error)) => Err(format!(
-            "{command}: export published, but cleaning temporary file failed: {cleanup_error}"
-        )),
-    }
+    .map_err(|error| format!("{command}: export worker failed: {error}"))?
 }
 
 /// Pull a staged bulk transfer chunk by chunk and verify it end to end.

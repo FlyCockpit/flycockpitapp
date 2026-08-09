@@ -637,6 +637,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_harness_list_actions_dispatch_from_fresh_sources();
+    pointer_instruction_list_actions_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -932,20 +933,22 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
         }
     }
 
-    // `custom` is the trailing BTreeMap row and can be clipped from the
-    // smaller inventory render above. Prove and dispatch its destructive
-    // identity independently from a tall, fresh real source.
-    let custom_delete = SettingsPointerAction::Harnesses(HarnessesAction::Delete(
-        pointer_actions::HarnessId("custom".into()),
-    ));
-    let tmp = TempDir::new().unwrap();
-    let mut dialog = populated_harness_list_pointer_fixture(&tmp);
-    click_settings_action(&mut dialog, &custom_delete);
-    assert!(dialog.extended.harnesses.contains_key("custom"));
-    assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
-    ));
+    // Delete is published only for the selected row. Independently select
+    // and dispatch every real source identity, including rows clipped from
+    // the smaller inventory render above.
+    for name in ["alpha", "beta", "custom"] {
+        let delete = SettingsPointerAction::Harnesses(HarnessesAction::Delete(
+            pointer_actions::HarnessId(name.into()),
+        ));
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+        click_settings_action(&mut dialog, &delete);
+        assert!(dialog.extended.harnesses.contains_key(name));
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
+        ));
+    }
 }
 
 /// Render the concrete nested states whose discriminants form the strict
@@ -1171,6 +1174,77 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
     }
 
     let tmp = TempDir::new().unwrap();
+    let mut source = dialog_with_models(&tmp);
+    open_utility_picker(&mut source);
+    click_settings_action(
+        &mut source,
+        &pointer_actions::SettingsPointerAction::UtilityModel(
+            pointer_actions::UtilityModelAction::OpenCustom,
+        ),
+    );
+    let _ = render_settings_rows(&source, 90, 24);
+    let custom_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::EditCustom
+                        | pointer_actions::UtilityModelAction::CommitCustom
+                        | pointer_actions::UtilityModelAction::CancelCustom,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(custom_actions.len(), 3);
+    for action in custom_actions {
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::OpenCustom,
+            ),
+        );
+        if matches!(
+            action,
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CommitCustom
+            )
+        ) {
+            type_chars(&mut dialog, "custom-provider:model");
+        }
+        click_settings_action(&mut dialog, &action);
+        match action {
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::EditCustom,
+            ) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.utility_picker.is_some()
+            )),
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CommitCustom,
+            ) => assert_eq!(
+                dialog.extended.utility_model.as_deref(),
+                Some("custom-provider:model")
+            ),
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CancelCustom,
+            ) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.utility_picker.is_none()
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch").unwrap();
     open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
@@ -1209,6 +1283,59 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         d.extended.sandbox.dockerfile, before,
         "suggestion click follows Enter commit path"
     );
+}
+
+fn instructions_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.extended.agent_guidance_files = vec!["AGENTS.md".into(), "GUIDE.md".into()];
+    dialog.page = super::instructions_page(super::ui_page::InstructionsPage::new());
+    dialog
+}
+
+fn pointer_instruction_list_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, SettingsPointerAction};
+    let tmp = TempDir::new().unwrap();
+    let source = instructions_pointer_fixture(&tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::List(
+                        ListAction::Add | ListAction::Edit(_) | ListAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, SettingsPointerAction::List(ListAction::Add)))
+    );
+    for action in actions {
+        let mut dialog = instructions_pointer_fixture(&tmp);
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::List(ListAction::Add | ListAction::Edit(_)) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Instructions(page) if page.grabbed.is_some()
+                ))
+            }
+            SettingsPointerAction::List(ListAction::Delete(_)) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Instructions(page) if page.delete.is_pending()
+            )),
+            _ => unreachable!(),
+        }
+    }
 }
 
 pub(super) fn run_pointer_header_back_matrix() {

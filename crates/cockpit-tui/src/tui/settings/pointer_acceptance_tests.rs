@@ -423,9 +423,12 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     PAYLOAD_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
     WIZARD_SOURCE_COVERAGE.with(|coverage| coverage.borrow_mut().clear());
     super::tests::run_pointer_dialog_regression_matrix();
+    super::tests::run_pointer_picker_suggestion_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
     dispatch_enabled_category_descriptor_actions();
+    dispatch_all_rendered_numeric_inline_begin_actions();
+    dispatch_category_nested_editor_actions();
     ACTION_COVERAGE.with(|coverage| {
         let coverage = coverage.borrow();
         let missing = coverage
@@ -555,6 +558,199 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     });
 }
 
+fn dispatch_all_rendered_numeric_inline_begin_actions() {
+    use super::category::{Category, SettingId};
+    for (category, setting) in [
+        (Category::Interface, SettingId::ExitTailLines),
+        (Category::Behavior, SettingId::LoopGuardThreshold),
+        (Category::Behavior, SettingId::MaxPrimaryRounds),
+        (Category::Behavior, SettingId::ScheduleMaxConcurrent),
+        (Category::Behavior, SettingId::DelegationMaxParallel),
+        (Category::Behavior, SettingId::GoalVerificationSkepticCount),
+        (Category::Behavior, SettingId::GoalVerificationMaxRounds),
+        (Category::Behavior, SettingId::DialogLockoutMs),
+        (Category::Behavior, SettingId::TimeInjectionInterval),
+        (Category::Privacy, SettingId::RedactMinSecretLength),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, category, setting);
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let activate = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.enabled
+                    && target.action
+                        == RenderAction::Page(SettingsPointerAction::Category(
+                            CategoryAction::DescriptorActivate(setting),
+                        ))
+            })
+            .cloned()
+            .expect("numeric descriptor source is rendered");
+        click_target(&mut dialog, &activate);
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let begin = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.enabled
+                    && target.action
+                        == RenderAction::Page(SettingsPointerAction::Category(
+                            CategoryAction::InlineEditBegin(setting),
+                        ))
+            })
+            .cloned()
+            .expect("numeric inline-edit source is rendered");
+        click_target(&mut dialog, &begin);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if page.is_editing()
+        ));
+    }
+}
+
+fn activate_category_descriptor(
+    dialog: &mut super::SettingsDialog,
+    category: super::category::Category,
+    setting: super::category::SettingId,
+) {
+    super::tests::open_category_on(dialog, category, setting);
+    let _ = render_settings_rows(dialog, 100, 50);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled
+                && target.action
+                    == RenderAction::Page(SettingsPointerAction::Category(
+                        CategoryAction::DescriptorActivate(setting),
+                    ))
+        })
+        .cloned()
+        .expect("category descriptor source is rendered");
+    click_target(dialog, &target);
+}
+
+fn dispatch_category_nested_editor_actions() {
+    use super::category::{Category, SettingId};
+
+    let tmp = TempDir::new().unwrap();
+    let suggestion_root = tmp.path().join("package-suggestions");
+    std::fs::create_dir_all(suggestion_root.join("alpha")).unwrap();
+    std::fs::create_dir_all(suggestion_root.join("alpine")).unwrap();
+    let mut source = fresh_dialog(&tmp);
+    activate_category_descriptor(&mut source, Category::Behavior, SettingId::PackagesDir);
+    if let super::TestPageMut::Category(page) = source.test_page_mut() {
+        page.path_editor
+            .as_mut()
+            .expect("packages path editor")
+            .set_text_for_test("a".into(), &suggestion_root);
+    }
+    let _ = render_settings_rows(&source, 100, 50);
+    let path_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                RenderAction::Page(
+                    action @ SettingsPointerAction::Category(
+                        CategoryAction::PathEditBegin(SettingId::PackagesDir)
+                        | CategoryAction::PathEditCommit(SettingId::PackagesDir)
+                        | CategoryAction::PathEditCancel(SettingId::PackagesDir)
+                        | CategoryAction::SuggestionSelect(SettingId::PackagesDir, _),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(path_actions.iter().any(|action| matches!(
+        action,
+        SettingsPointerAction::Category(CategoryAction::SuggestionSelect(_, _))
+    )));
+    for action in path_actions {
+        let mut dialog = fresh_dialog(&tmp);
+        activate_category_descriptor(&mut dialog, Category::Behavior, SettingId::PackagesDir);
+        if let super::TestPageMut::Category(page) = dialog.test_page_mut() {
+            page.path_editor
+                .as_mut()
+                .expect("fresh packages path editor")
+                .set_text_for_test("a".into(), &suggestion_root);
+        }
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("dynamic packages editor action is rerendered");
+        click_target(&mut dialog, &target);
+        match action {
+            SettingsPointerAction::Category(CategoryAction::PathEditBegin(_)) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.is_path_editing()
+            )),
+            _ => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if !page.is_path_editing()
+            )),
+        }
+    }
+
+    let mut source = fresh_dialog(&tmp);
+    activate_category_descriptor(&mut source, Category::Behavior, SettingId::CompactPrompt);
+    let _ = render_settings_rows(&source, 100, 50);
+    let text_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                RenderAction::Page(
+                    action @ SettingsPointerAction::Category(
+                        CategoryAction::TextEditorSave(SettingId::CompactPrompt)
+                        | CategoryAction::TextEditorCancel(SettingId::CompactPrompt),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(text_actions.len(), 2);
+    for action in text_actions {
+        let mut dialog = fresh_dialog(&tmp);
+        activate_category_descriptor(&mut dialog, Category::Behavior, SettingId::CompactPrompt);
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("compact prompt editor action is rendered");
+        click_target(&mut dialog, &target);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if !page.is_editing()
+        ));
+    }
+}
+
 fn dispatch_enabled_category_descriptor_actions() {
     use super::category::Category;
     use super::category::SettingId;
@@ -629,6 +825,19 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::SkillInjectionModel),
         (Category::Behavior, SettingId::MaxPrimaryRounds),
         (Category::Behavior, SettingId::UtilityModel),
+        (Category::Behavior, SettingId::SandboxEscalationEnabled),
+        (Category::Behavior, SettingId::CommandProfileJava),
+        (Category::Behavior, SettingId::CommandProfileWrappers),
+        (Category::Behavior, SettingId::CommandProfileGo),
+        (Category::Behavior, SettingId::CommandProfileRust),
+        (Category::Behavior, SettingId::CommandProfilePython),
+        (Category::Behavior, SettingId::CommandProfileCustomProfiles),
+        (Category::Behavior, SettingId::CommandProfileNode),
+        (Category::Behavior, SettingId::PredictNextMessage),
+        (Category::Behavior, SettingId::ShellCompression),
+        (Category::Behavior, SettingId::InlineThink),
+        (Category::Behavior, SettingId::HintToolCallCorrections),
+        (Category::Behavior, SettingId::ApprovalMode),
     ] {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
@@ -688,7 +897,9 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::GoalVerificationMaxRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DialogLockoutMs
-            | SettingId::MaxPrimaryRounds => assert!(matches!(
+            | SettingId::MaxPrimaryRounds
+            | SettingId::CommandProfileWrappers
+            | SettingId::CommandProfileCustomProfiles => assert!(matches!(
                 dialog.test_page(),
                 TestPageRef::Category(page) if page.is_editing()
             )),
@@ -697,7 +908,18 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::TextEmbeddedRecovery
             | SettingId::Concurrency
             | SettingId::AgentChoosesSubagentModel
-            | SettingId::GoalVerificationEnabled => assert!(matches!(
+            | SettingId::GoalVerificationEnabled
+            | SettingId::SandboxEscalationEnabled
+            | SettingId::CommandProfileJava
+            | SettingId::CommandProfileGo
+            | SettingId::CommandProfileRust
+            | SettingId::CommandProfilePython
+            | SettingId::CommandProfileNode
+            | SettingId::PredictNextMessage
+            | SettingId::ShellCompression
+            | SettingId::InlineThink
+            | SettingId::HintToolCallCorrections
+            | SettingId::ApprovalMode => assert!(matches!(
                 dialog.test_page(),
                 TestPageRef::Category(page) if !page.is_editing()
             )),

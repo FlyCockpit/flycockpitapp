@@ -1720,22 +1720,19 @@ fn runner_failure_before_session_creation_binds_retry_to_first_runner() {
 #[test]
 fn slash_dispatch_failures_use_same_failed_user_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
-    for (label, dispatch) in [(
-        "/init",
-        App::dispatch_init_turn as fn(&mut App, &str, String),
-    )] {
-        let mut app = App::new(Some(tmp.path()), false);
-        app.agent_runner = Some(Err("model missing".to_string()));
-        dispatch(&mut app, "thing", "wire".to_string());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.agent_runner = Some(Err("model missing".to_string()));
+    app.dispatch_init_turn("thing", "wire".to_string());
 
-        assert!(!app.busy, "{label} failed dispatch ends its span");
-        assert!(!app.current_session_persisted);
-        assert!(newest_user_failed(&app));
-        assert!(
-            error_lines(&app).iter().any(|line| line.starts_with(label)),
-            "{label} failure uses the shared error path"
-        );
-    }
+    assert!(!app.busy, "/init failed dispatch ends its span");
+    assert!(!app.current_session_persisted);
+    assert!(newest_user_failed(&app));
+    assert!(
+        error_lines(&app)
+            .iter()
+            .any(|line| line.starts_with("/init")),
+        "/init failure uses the shared error path"
+    );
 
     let mut app = App::new(Some(tmp.path()), false);
     app.agent_runner = Some(Err("model missing".to_string()));

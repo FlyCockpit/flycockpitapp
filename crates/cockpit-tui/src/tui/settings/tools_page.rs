@@ -563,6 +563,35 @@ impl SettingsCx {
                 .render_line(p.cursor == reset_row, "reset to defaults"),
         );
 
+        if let Some(row) = self.tools_page_rows().get(p.cursor) {
+            match row {
+                ToolRow::UserTool(name) if p.delete_pending.as_deref() == Some(name) => {
+                    lines.push(Line::default());
+                    lines.push(Line::from(format!("Delete {name}?")));
+                    bindings.push((lines.len(), SettingsControlId(10_000)));
+                    lines.push(Line::from("[Delete]"));
+                    bindings.push((lines.len(), SettingsControlId(10_001)));
+                    lines.push(Line::from("[Cancel]"));
+                }
+                ToolRow::UserTool(_) => {
+                    bindings.push((lines.len(), SettingsControlId(10_002)));
+                    lines.push(Line::from("[Enable/disable]"));
+                    bindings.push((lines.len(), SettingsControlId(10_003)));
+                    lines.push(Line::from("[Delete]"));
+                }
+                ToolRow::FirecrawlBaseUrl
+                | ToolRow::WebFetchCommand
+                | ToolRow::WebSearchCommand => {
+                    bindings.push((lines.len(), SettingsControlId(10_004)));
+                    lines.push(Line::from("[Reset field]"));
+                }
+                ToolRow::Builtin(_) | ToolRow::McpTool { .. } => {
+                    lines.push(Line::from(Span::styled("[Read only]", muted_style())));
+                }
+                _ => {}
+            }
+        }
+
         if let Some(field) = &p.editing {
             let label = match field {
                 ToolField::WebFetchCommand => "fetch command",
@@ -596,6 +625,14 @@ impl SettingsCx {
             muted,
         )));
 
+        let rows = self.tools_page_rows();
+        bindings.retain(|(_, id)| {
+            id.0 >= 10_000
+                || !matches!(
+                    rows.get(id.0 as usize),
+                    Some(ToolRow::Builtin(_) | ToolRow::McpTool { .. })
+                )
+        });
         (lines, bindings)
     }
 
@@ -978,6 +1015,21 @@ impl SettingsPage for ToolsPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        let key = match index {
+            10_000 if self.delete_pending.is_some() => Some(KeyCode::Char('d')),
+            10_001 if self.delete_pending.is_some() => {
+                self.delete_pending = None;
+                self.status = Some("delete cancelled".into());
+                return Nav::Stay;
+            }
+            10_002 if self.delete_pending.is_none() => Some(KeyCode::Char('t')),
+            10_003 if self.delete_pending.is_none() => Some(KeyCode::Char('d')),
+            10_004 => Some(KeyCode::Char('r')),
+            _ => None,
+        };
+        if let Some(key) = key {
+            return cx.handle_tools_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
         if index >= cx.tool_rows().len() {
             return Nav::Stay;
         }

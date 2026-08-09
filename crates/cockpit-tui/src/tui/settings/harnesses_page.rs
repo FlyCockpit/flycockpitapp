@@ -793,7 +793,9 @@ impl SettingsPage for HarnessesPage {
 
     fn pointer_surface_token(&self) -> u64 {
         match self {
+            HarnessesPage::List(state) if state.adding.is_some() => 202,
             HarnessesPage::List(_) => 200,
+            HarnessesPage::Edit(state) if state.editing.is_some() => 203,
             HarnessesPage::Edit(_) => 201,
         }
     }

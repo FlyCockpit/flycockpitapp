@@ -14,7 +14,13 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 thread_local! {
-    static ACTION_COVERAGE: RefCell<(HashSet<String>, HashSet<String>)> = RefCell::default();
+    static ACTION_COVERAGE: RefCell<(HashSet<String>, HashSet<String>, HashSet<u64>)> = RefCell::default();
+}
+
+pub(super) fn record_rendered_surface(token: u64) {
+    ACTION_COVERAGE.with(|coverage| {
+        coverage.borrow_mut().2.insert(token);
+    });
 }
 
 fn action_variant_key(action: &SettingsPointerAction) -> String {
@@ -385,6 +391,22 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             !coverage.0.is_empty(),
             "real rendered matrix collected no actions"
         );
+        for token in (100..=112)
+            .chain([200, 201, 202, 203])
+            .chain([400, 401, 402])
+            .chain(500..=509)
+        {
+            assert!(
+                coverage.2.contains(&token),
+                "nested settings surface token {token} was never concretely rendered"
+            );
+        }
+        for mode in 0..=5 {
+            assert!(
+                (0..5).any(|category| coverage.2.contains(&(600 + category * 6 + mode))),
+                "category editor mode {mode} was never concretely rendered"
+            );
+        }
     });
 }
 

@@ -2301,6 +2301,8 @@ impl SettingsDialog {
         links: &mut crate::tui::links::LinkRegistry,
     ) {
         let surface_token = self.page.pointer_surface_token();
+        #[cfg(test)]
+        pointer_acceptance_tests::record_rendered_surface(surface_token);
         self.pointer_surface
             .enabled
             .set(self.extended.tui.mouse_capture);

@@ -3233,10 +3233,10 @@ mod tests {
             context: None,
             disposition,
             phase: (disposition == GoalDisposition::Running)
-                .then_some(cockpit_db::session_goals::GoalPhase::Executing),
+                .then_some(cockpit_core::daemon::proto::GoalPhase::Executing),
             resume_phase: None,
             pause_reason: (disposition == GoalDisposition::UserPaused)
-                .then_some(cockpit_db::session_goals::GoalPauseReason::User),
+                .then_some(cockpit_core::daemon::proto::GoalPauseReason::User),
             contract_available: true,
             latest_gap_or_blocker: None,
             verification_attempts: 2,
@@ -3246,7 +3246,7 @@ mod tests {
             tokens_used: 4,
             remaining_tokens: 96,
             elapsed_active_ms: 1_250,
-            lifecycle_history: vec![cockpit_db::session_goals::GoalLifecycleHistoryEntry {
+            lifecycle_history: vec![cockpit_core::daemon::proto::GoalLifecycleHistoryEntry {
                 at: 0,
                 disposition,
                 phase: None,

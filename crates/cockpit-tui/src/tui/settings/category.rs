@@ -3431,6 +3431,7 @@ impl SettingsPage for CategoryPage {
             && self.text_editor.is_none()
             && self.utility_picker.is_none()
         {
+            self.reset.disarm();
             self.cursor = self
                 .cursor
                 .saturating_add_signed(delta)

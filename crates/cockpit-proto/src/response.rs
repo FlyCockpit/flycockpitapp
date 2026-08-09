@@ -170,6 +170,11 @@ pub enum Response {
         goal: GoalSummary,
     },
 
+    /// Deterministic secret-free terminal projection for remote goal mutations.
+    RemoteGoalOutcome {
+        outcome: RemoteGoalOutcomeV1,
+    },
+
     GoalCleared {
         cleared: bool,
     },
@@ -674,8 +679,20 @@ impl RunInvocationCancelOutcome {
     }
 }
 
+/// Versioned, content-free response for a remote goal mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteGoalOutcomeV1 {
+    pub schema_version: u8,
+    pub session_id: Uuid,
+    pub goal_id: Uuid,
+    pub attempt_generation: i64,
+    pub disposition: GoalDisposition,
+}
+
 /// Versioned, content-free cancel response for a run invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunInvocationCancelResultV1 {
     pub schema_version: u32,
     pub client_submission_id: Uuid,
@@ -712,6 +729,7 @@ macro_rules! response_variants {
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
+            (Response::RemoteGoalOutcome { .. }, "remote_goal_outcome");
             (Response::GoalCleared { .. }, "goal_cleared");
             (Response::PinChanged { .. }, "pin_changed");
             (Response::PinToggled { .. }, "pin_toggled");

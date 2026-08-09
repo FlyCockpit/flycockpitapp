@@ -2146,6 +2146,38 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         Body::Response { id, response }
             if id == first_id && matches!(*response, Response::GoalCleared { cleared: true })
     ));
+    let late_status_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            late_status_replay_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal status replay after later clear").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, late_status_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), status_applied);
+            assert!(
+                !serde_json::to_vec(&response)
+                    .unwrap()
+                    .windows(b"finish safely".len())
+                    .any(|bytes| bytes == b"finish safely")
+            );
+        }
+        other => panic!("unexpected late goal status replay: {other:?}"),
+    }
     let replay_id = Uuid::new_v4();
     handle_envelope(
         Envelope::remote_request(

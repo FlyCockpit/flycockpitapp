@@ -36,16 +36,6 @@ impl std::fmt::Display for GoalMutationRejected {
 }
 impl std::error::Error for GoalMutationRejected {}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteGoalOutcomeV1 {
-    schema_version: u8,
-    session_id: Uuid,
-    goal_id: Uuid,
-    attempt_generation: i64,
-    disposition: proto::GoalDisposition,
-}
-
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
@@ -948,7 +938,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     move |conn| {
                         let goal = crate::db::Db::set_session_goal_status_conn(conn, session_id, status)
                             .map_err(|error| GoalMutationRejected(error.to_string()))?;
-                        let receipt = RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
+                        let receipt = proto::RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
                         let safe_response = serde_json::to_vec(&receipt)?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: "set_goal_status".into(), outbox_payload: safe_response })
                     },
@@ -969,14 +959,6 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         "invalid remote goal replay receipt"
                     )));
                 }
-                let goal = ctx
-                    .db
-                    .session_goal_by_id(session_id, receipt.goal_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        internal(anyhow::anyhow!("remote goal replay target disappeared"))
-                    })?;
                 if status == proto::GoalDisposition::Running
                     && let Some(attached) = state
                         .attached
@@ -989,9 +971,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         .await
                         .map_err(internal)?;
                 }
-                return Ok(Response::GoalUpdated {
-                    goal: goal_to_proto(goal),
-                });
+                return Ok(Response::RemoteGoalOutcome { outcome: receipt });
             }
             let goal = ctx
                 .db

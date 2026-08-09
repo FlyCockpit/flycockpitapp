@@ -314,6 +314,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Assistants { assistants } => {
             for assistant in assistants {

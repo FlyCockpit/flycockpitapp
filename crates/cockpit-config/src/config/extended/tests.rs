@@ -2274,10 +2274,10 @@ fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
         r#"{"response_metrics_tokenizer":"invalid-project"}"#,
     )
     .unwrap();
-    let _refuse = crate::config::trust::enter_workspace_trust_policy(
+    let _ignore_config = crate::config::trust::enter_workspace_trust_policy(
         crate::config::trust::WorkspaceTrustPolicy {
             root: crate::config::trust::resolve_trust_root(&project).unwrap(),
-            mode: crate::db::workspace_trust::WorkspaceTrustMode::Refuse,
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         },
     );
     let load = load_for_cwd_for_daemon_contract(&project);

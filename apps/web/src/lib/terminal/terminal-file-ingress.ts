@@ -71,8 +71,8 @@ export type TerminalIngressTransport = {
 
 export type TerminalIngressClock = {
   now(): number;
-  setTimer(callback: () => void, milliseconds: number): number;
-  clearTimer(timer: number): void;
+  setTimer(callback: () => void, milliseconds: number): ReturnType<typeof globalThis.setTimeout>;
+  clearTimer(timer: ReturnType<typeof globalThis.setTimeout>): void;
 };
 
 export type TerminalIngressOutcome =
@@ -119,8 +119,8 @@ class HashError extends Error {}
 
 const browserClock: TerminalIngressClock = {
   now: () => performance.now(),
-  setTimer: (callback, milliseconds) => window.setTimeout(callback, milliseconds),
-  clearTimer: (timer) => window.clearTimeout(timer),
+  setTimer: (callback, milliseconds) => globalThis.setTimeout(callback, milliseconds),
+  clearTimer: (timer) => globalThis.clearTimeout(timer),
 };
 
 export class TerminalFileIngressController {

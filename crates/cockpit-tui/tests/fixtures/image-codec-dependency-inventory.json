@@ -673,6 +673,18 @@
           "provenance": "image-requester"
         },
         {
+          "from": "cockpit-core@0.1.0",
+          "to": "image@0.25.10",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "cockpit-core@0.1.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-requester"
+        },
+        {
           "from": "cockpit-tui@0.1.0",
           "to": "arboard@3.6.1",
           "target": "aarch64-apple-darwin",
@@ -955,6 +967,18 @@
           "provenance": "image-requester"
         },
         {
+          "from": "cockpit-core@0.1.0",
+          "to": "image@0.25.10",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "cockpit-core@0.1.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-requester"
+        },
+        {
           "from": "cockpit-tui@0.1.0",
           "to": "arboard@3.6.1",
           "target": "x86_64-pc-windows-msvc",
@@ -1233,6 +1257,18 @@
         {
           "from": "arboard@3.6.1",
           "to": "image@0.25.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-core@0.1.0",
+          "to": "image@0.25.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "cockpit-core@0.1.0",
           "target": "x86_64-unknown-linux-gnu",
           "provenance": "image-requester"
         },

@@ -122,19 +122,19 @@ fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn strip_optional_duplicate_marker<'a>(row: &'a str, context: &str) -> &'a str {
+fn strip_optional_duplicate_marker<'a>(row: &'a str, context: &str) -> (&'a str, bool) {
     let Some(without_marker) = row.strip_suffix(" (*)") else {
-        return row;
+        return (row, false);
     };
     assert!(
         !without_marker.ends_with(" (*)"),
         "{context} contains repeated duplicate markers: {row}"
     );
-    without_marker
+    (without_marker, true)
 }
 
 fn tree_package_key(row: &str) -> String {
-    let package = strip_optional_duplicate_marker(row, "cargo tree package row");
+    let (package, _) = strip_optional_duplicate_marker(row, "cargo tree package row");
     let (name, version) = package
         .rsplit_once(" v")
         .unwrap_or_else(|| panic!("unexpected cargo tree package row: {row}"));
@@ -181,6 +181,7 @@ fn tree_package_key_rejects_repeated_duplicate_markers() {
 fn target_package_features(
     feature_tree: &str,
     graph_packages: &BTreeSet<String>,
+    expected_root: &str,
 ) -> BTreeMap<String, BTreeSet<String>> {
     // `cargo tree -e features` does not print a package row when the package has
     // no activated features. Seed the inventory from the independently observed
@@ -192,8 +193,8 @@ fn target_package_features(
         .map(|package| (package, BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
     let mut reported_packages = BTreeSet::new();
-    let mut feature_activations = Vec::new();
-    let mut feature_ancestors = Vec::new();
+    let mut feature_nodes = Vec::<(usize, String, Option<String>, bool)>::new();
+    let mut feature_ancestors = Vec::<bool>::new();
 
     for line in feature_tree.lines() {
         let depth_end = line
@@ -224,10 +225,17 @@ fn target_package_features(
                 "cargo feature-tree depth jumps past its parent: {line}"
             );
         }
+        if depth > 0 && feature_ancestors[depth - 1] {
+            panic!("cargo feature-tree duplicate marker node has a child: {line}");
+        }
         feature_ancestors.truncate(depth);
-        feature_ancestors.push(());
         let row = &line[depth_end..];
-        let row = strip_optional_duplicate_marker(row, "cargo feature-tree row");
+        let (row, duplicate) = strip_optional_duplicate_marker(row, "cargo feature-tree row");
+        assert!(
+            depth > 0 || !duplicate,
+            "cargo feature-tree root cannot have a duplicate marker: {line}"
+        );
+        feature_ancestors.push(duplicate);
         if let Some((subject, features)) = row.split_once('|') {
             let Some((name, version)) = subject.rsplit_once(" v") else {
                 panic!("unexpected cargo feature-tree package row: {row}");
@@ -244,6 +252,12 @@ fn target_package_features(
                 "malformed cargo feature-tree package row with trailing tokens: {row}"
             );
             let key = format!("{name}@{version}");
+            if depth == 0 {
+                assert_eq!(
+                    key, expected_root,
+                    "cargo feature-tree root package drift"
+                );
+            }
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
             };
@@ -267,6 +281,7 @@ fn target_package_features(
                 );
             }
             *actual = observed;
+            feature_nodes.push((depth, key, None, duplicate));
             continue;
         }
 
@@ -290,27 +305,49 @@ fn target_package_features(
                 .any(|package| package.starts_with(&package_prefix)),
             "cargo feature tree contains activation for package outside normal/build graph: {subject}"
         );
-        feature_activations.push((subject.to_owned(), package_name, &feature[..feature.len() - 1]));
+        assert!(depth > 0, "cargo feature-tree root must be a package row: {line}");
+        feature_nodes.push((
+            depth,
+            package_name.to_owned(),
+            Some(feature[..feature.len() - 1].to_owned()),
+            duplicate,
+        ));
     }
 
-    for (subject, package_name, feature) in feature_activations {
-        let package_prefix = format!("{package_name}@");
-        let matching_packages = reported_packages
-            .iter()
-            .filter(|package| package.starts_with(&package_prefix))
-            .filter(|package| package_features[*package].contains(feature))
-            .collect::<Vec<_>>();
-        match matching_packages.as_slice() {
-            [_] => {}
-            [] => panic!(
-                "cargo feature activation is absent from every reported resolved feature set: \
-                 {subject}"
-            ),
-            packages => panic!(
-                "cargo feature activation is ambiguous across package versions for {subject}: \
-                 {packages:?}"
-            ),
+    let mut resolved_activations = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for (index, (depth, package_name, feature, duplicate)) in feature_nodes.iter().enumerate() {
+        let Some(feature) = feature else { continue };
+        let identity = (package_name.clone(), feature.clone());
+        if *duplicate {
+            let matches = resolved_activations.get(&identity).cloned().unwrap_or_default();
+            assert_eq!(
+                matches.len(),
+                1,
+                "duplicate cargo feature activation does not identify one prior package: \
+                 {package_name} feature \"{feature}\""
+            );
+            continue;
         }
+        let Some((child_depth, child_key, child_feature, _)) = feature_nodes.get(index + 1) else {
+            panic!("cargo feature activation has no package child: {package_name} feature \"{feature}\"");
+        };
+        assert!(
+            child_feature.is_none() && *child_depth == depth + 1,
+            "cargo feature activation has no immediate package child: {package_name} feature \"{feature}\""
+        );
+        let package_prefix = format!("{package_name}@");
+        assert!(
+            child_key.starts_with(&package_prefix),
+            "cargo feature activation child package mismatch: {package_name} feature \"{feature}\" -> {child_key}"
+        );
+        assert!(
+            package_features[child_key].contains(feature),
+            "cargo feature activation is absent from child resolved feature set: {package_name} feature \"{feature}\" -> {child_key}"
+        );
+        resolved_activations
+            .entry(identity)
+            .or_default()
+            .insert(child_key.clone());
     }
 
     assert!(
@@ -335,7 +372,7 @@ fn target_package_feature_inventory_is_total_for_featureless_graph_packages() {
     );
 
     assert_eq!(
-        target_package_features(feature_tree, &graph_packages),
+        target_package_features(feature_tree, &graph_packages, "image@0.25.10"),
         BTreeMap::from([
             ("autocfg@1.5.1".to_owned(), BTreeSet::new()),
             (
@@ -356,17 +393,19 @@ fn target_package_feature_inventory_rejects_unobserved_packages() {
     target_package_features(
         "0image v0.25.10|png\n1surprise v1.0.0|default\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
 #[test]
 #[should_panic(expected =
-    "feature activation is absent from every reported resolved feature set: png feature \"fake\""
+    "feature activation is absent from child resolved feature set: png feature \"fake\""
 )]
 fn target_package_feature_inventory_rejects_unreported_activations() {
     target_package_features(
         "0image v0.25.10|png\n1png feature \"fake\"\n2png v0.18.0|default,std\n",
         &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -376,6 +415,7 @@ fn target_package_feature_inventory_rejects_empty_versions_precisely() {
     target_package_features(
         "0image v|png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -385,6 +425,7 @@ fn target_package_feature_inventory_rejects_empty_feature_tokens() {
     target_package_features(
         "0image v0.25.10|png,,jpeg\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -394,6 +435,7 @@ fn target_package_feature_inventory_rejects_duplicate_feature_tokens() {
     target_package_features(
         "0image v0.25.10|png,png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -403,6 +445,7 @@ fn target_package_feature_inventory_rejects_package_trailing_tokens() {
     target_package_features(
         "0image v0.25.10 unexpected|png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -412,6 +455,7 @@ fn target_package_feature_inventory_requires_package_depths() {
     target_package_features(
         "image v0.25.10|png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -421,6 +465,27 @@ fn target_package_feature_inventory_requires_activation_depths() {
     target_package_features(
         "0image v0.25.10|png\npng feature \"default\"\n",
         &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+        "image@0.25.10",
+    );
+}
+
+#[test]
+#[should_panic(expected = "cargo feature-tree root package drift")]
+fn target_package_feature_inventory_requires_the_requested_root() {
+    target_package_features(
+        "0png v0.18.0|default\n",
+        &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+        "image@0.25.10",
+    );
+}
+
+#[test]
+#[should_panic(expected = "feature-tree duplicate marker node has a child")]
+fn target_package_feature_inventory_requires_duplicate_markers_to_be_leaves() {
+    target_package_features(
+        "0image v0.25.10|png\n1png feature \"default\" (*)\n2png v0.18.0|default\n",
+        &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+        "image@0.25.10",
     );
 }
 
@@ -431,7 +496,7 @@ fn dependency_tree_graph(
 ) -> (BTreeSet<String>, BTreeSet<EdgeFixture>) {
     let mut packages = BTreeSet::new();
     let mut edges = BTreeSet::new();
-    let mut ancestors = Vec::<String>::new();
+    let mut ancestors = Vec::<(String, bool)>::new();
     for line in tree.lines() {
         let depth_end = line
             .find(|character: char| !character.is_ascii_digit())
@@ -452,10 +517,19 @@ fn dependency_tree_graph(
                 "cargo tree depth jumps past its parent: {line}"
             );
         }
-        let package = tree_package_key(&line[depth_end..]);
+        if depth > 0 && ancestors[depth - 1].1 {
+            panic!("cargo tree duplicate marker node has a child: {line}");
+        }
+        let (row, duplicate) =
+            strip_optional_duplicate_marker(&line[depth_end..], "cargo tree package row");
+        assert!(
+            depth > 0 || !duplicate,
+            "cargo tree root cannot have a duplicate marker: {line}"
+        );
+        let package = tree_package_key(row);
         packages.insert(package.clone());
         ancestors.truncate(depth);
-        if let Some(parent) = ancestors.last() {
+        if let Some((parent, _)) = ancestors.last() {
             edges.insert(EdgeFixture {
                 from: parent.clone(),
                 to: package.clone(),
@@ -463,7 +537,7 @@ fn dependency_tree_graph(
                 provenance,
             });
         }
-        ancestors.push(package);
+        ancestors.push((package, duplicate));
     }
     assert!(!packages.is_empty(), "cargo tree graph is empty");
     (packages, edges)
@@ -500,6 +574,16 @@ fn dependency_tree_graph_rejects_multiple_roots() {
 fn dependency_tree_graph_rejects_depth_jumps() {
     dependency_tree_graph(
         "0image v0.25.10\n2png v0.18.0\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cargo tree duplicate marker node has a child")]
+fn dependency_tree_graph_requires_duplicate_markers_to_be_leaves() {
+    dependency_tree_graph(
+        "0image v0.25.10\n1png v0.18.0 (*)\n2miniz_oxide v0.8.0\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
     );
@@ -741,7 +825,8 @@ fn tui_image_codec_dependency_inventory() {
         let (graph_packages, graph_edges) =
             dependency_tree_graph(&dependency_tree, target, Provenance::ImageDescendant);
         let feature_tree = cargo_tree(workspace, triple, "image@0.25.10", "features", "{p}|{f}");
-        let target_package_features = target_package_features(&feature_tree, &graph_packages);
+        let target_package_features =
+            target_package_features(&feature_tree, &graph_packages, "image@0.25.10");
         let image_tree_features = &target_package_features["image@0.25.10"];
 
         let resolved_features = expected

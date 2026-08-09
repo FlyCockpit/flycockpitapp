@@ -226,6 +226,126 @@ pub struct VerifiedBlockedComponent {
     pub deletion_evidence_digest: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverSecurityBlockedComponentV1 {
+    pub component_id: Uuid,
+    pub component_kind: String,
+    pub component_generation: u64,
+    pub recorded_evidence_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaSecurityRecoveryDisposition {
+    RetainBlocked,
+    ResumeVerifiedCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverSecurityBlockedMediaV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub local_request_id: Uuid,
+    pub owner_principal_digest: String,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub expected_availability_generation: u64,
+    pub affected_components: Vec<RecoverSecurityBlockedComponentV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub borrowed_source_evidence_digest: Option<String>,
+    pub disposition: MediaSecurityRecoveryDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaSecurityRecoveryOutcome {
+    RetainedBlocked,
+    CleanupResumed,
+    RejectedStale,
+    RejectedUnverifiable,
+    RejectedInUse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaSecurityRecoveryComponentTransitionV1 {
+    pub component_id: Uuid,
+    pub component_kind: String,
+    pub generation_before: u64,
+    pub generation_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMediaOwnerReceiptV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub receipt_id: Uuid,
+    pub local_request_id: Uuid,
+    pub owner_principal_digest: String,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub disposition: MediaSecurityRecoveryDisposition,
+    pub request_digest: String,
+    pub affected_set_digest: String,
+    pub outcome: MediaSecurityRecoveryOutcome,
+    pub availability_generation_before: u64,
+    pub availability_generation_after: u64,
+    pub components: Vec<MediaSecurityRecoveryComponentTransitionV1>,
+    pub committed_at_unix_ms: i64,
+}
+
+/// Non-serializable proof minted after the storage verifier has held and
+/// re-read every source/component handle. Private fields prevent transport
+/// decoding or a caller-supplied digest from becoming proof authority.
+#[derive(Debug)]
+pub struct HeldHandleRecoveryProof {
+    attachment_id: Uuid,
+    attachment_version: u64,
+    availability_generation: u64,
+    borrowed_source_evidence_digest: Option<String>,
+    components: Vec<VerifiedBlockedComponent>,
+}
+
+impl HeldHandleRecoveryProof {
+    pub(crate) fn from_storage_verifier(
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_generation: u64,
+        borrowed_source_evidence_digest: Option<String>,
+        components: Vec<VerifiedBlockedComponent>,
+    ) -> Self {
+        Self {
+            attachment_id,
+            attachment_version,
+            availability_generation,
+            borrowed_source_evidence_digest,
+            components,
+        }
+    }
+
+    pub fn matches_request(&self, request: &RecoverSecurityBlockedMediaV1) -> bool {
+        self.attachment_id == request.attachment_id
+            && self.attachment_version == request.attachment_version
+            && self.availability_generation == request.expected_availability_generation
+            && self.borrowed_source_evidence_digest == request.borrowed_source_evidence_digest
+            && self.components.len() == request.affected_components.len()
+            && self
+                .components
+                .iter()
+                .zip(&request.affected_components)
+                .all(|(proof, requested)| {
+                    proof.component_id == requested.component_id
+                        && proof.component_kind == requested.component_kind
+                        && proof.component_generation == requested.component_generation
+                        && component_recorded_evidence_digest(proof)
+                            == requested.recorded_evidence_digest
+                })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSecurityRecoveryRequest {
     pub local_request_id: Uuid,
@@ -251,6 +371,55 @@ pub struct MediaSecurityRecoveryReceipt {
 }
 
 impl super::Db {
+    pub fn validate_recover_security_blocked_media_v1(
+        request: &RecoverSecurityBlockedMediaV1,
+        source_kind: MediaSourceKind,
+    ) -> Result<()> {
+        ensure!(
+            request.schema_version == 1 && request.kind == "recoverSecurityBlockedMedia",
+            "invalid recovery request schema or kind"
+        );
+        ensure!(
+            request.local_request_id.get_version_num() == 7,
+            "local recovery request id must be UUIDv7"
+        );
+        validate_digest(&request.owner_principal_digest, "owner principal digest")?;
+        ensure!(
+            request.attachment_version > 0 && request.expected_availability_generation > 0,
+            "recovery versions and generations must be positive"
+        );
+        ensure!(
+            !request.affected_components.is_empty() && request.affected_components.len() <= 256,
+            "security recovery requires 1..=256 components"
+        );
+        ensure!(
+            request
+                .affected_components
+                .windows(2)
+                .all(|pair| pair[0].component_id < pair[1].component_id),
+            "security recovery components must be sorted and unique"
+        );
+        for component in &request.affected_components {
+            ensure!(
+                component.component_generation > 0,
+                "component generation must be positive"
+            );
+            validate_digest(
+                &component.recorded_evidence_digest,
+                "recorded evidence digest",
+            )?;
+        }
+        match (
+            source_kind.is_borrowed(),
+            &request.borrowed_source_evidence_digest,
+        ) {
+            (true, Some(digest)) => validate_digest(digest, "borrowed source evidence digest")?,
+            (false, None) => {}
+            _ => bail!("borrowed source evidence presence does not match source ownership"),
+        }
+        Ok(())
+    }
+
     /// The dedicated persistence reducer for an Owner-local, handle-verified
     /// security recovery. Authorization and filesystem proofs happen before
     /// this call; the complete component set and all generations are rechecked
@@ -779,6 +948,30 @@ fn security_recovery_digests(
     );
     field(&mut complete, affected_set_digest.as_bytes());
     Ok((hex_lower(&complete.finalize()), affected_set_digest))
+}
+
+fn component_recorded_evidence_digest(component: &VerifiedBlockedComponent) -> String {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, component.component_id.as_bytes());
+    field(&mut hasher, component.component_kind.as_bytes());
+    field(&mut hasher, &component.component_generation.to_be_bytes());
+    field(&mut hasher, component.stable_identity_digest.as_bytes());
+    field(&mut hasher, &component.byte_length.to_be_bytes());
+    field(&mut hasher, component.sha256.as_bytes());
+    field(&mut hasher, component.reservation_id.as_bytes());
+    field(
+        &mut hasher,
+        component
+            .deletion_evidence_digest
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    hex_lower(&hasher.finalize())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

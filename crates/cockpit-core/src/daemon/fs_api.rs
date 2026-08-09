@@ -665,7 +665,10 @@ fn resolve_for_write(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
     if !canonical_ancestor.starts_with(root) {
         return Err(path_outside_root(path));
     }
-    Ok(root.join(rel))
+    let unresolved = joined
+        .strip_prefix(ancestor)
+        .map_err(|_| bad_request(format!("parent for `{path}` is unavailable")))?;
+    Ok(canonical_ancestor.join(unresolved))
 }
 
 fn clean_relative_path(path: &str) -> Result<PathBuf, ErrorPayload> {
@@ -857,6 +860,30 @@ mod tests {
 
         let err = resolve_for_write(&root.canonicalize().unwrap(), "link.txt").unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_target_canonicalizes_symlink_alias_and_observes_retarget() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        symlink("first", root.join("alias")).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(
+            resolve_for_write(&canonical_root, "alias/new.txt").unwrap(),
+            resolve_for_write(&canonical_root, "first/new.txt").unwrap()
+        );
+        std::fs::remove_file(root.join("alias")).unwrap();
+        symlink("second", root.join("alias")).unwrap();
+        assert_eq!(
+            resolve_for_write(&canonical_root, "alias/new.txt").unwrap(),
+            canonical_root.join("second/new.txt")
+        );
     }
 
     #[test]

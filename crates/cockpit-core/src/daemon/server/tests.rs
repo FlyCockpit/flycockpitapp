@@ -1035,6 +1035,53 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
 }
 
 #[tokio::test]
+async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
+    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("old.txt"), "old").unwrap();
+    let root_text = root.path().to_string_lossy().into_owned();
+    let rename = Request::FsRename {
+        project_root: root_text.clone(),
+        from_path: "old.txt".into(),
+        to_path: "new.txt".into(),
+    };
+    let resources = authorize_request_context(&rename, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        resources.iter().map(|item| item.kind).collect::<Vec<_>>(),
+        vec![Kind::ProjectRoot, Kind::FilePath, Kind::FilePath]
+    );
+    assert!(resources[1].value.ends_with(b"old.txt"));
+    assert!(resources[2].value.ends_with(b"new.txt"));
+
+    let guidance = Request::GuidanceEstimate {
+        project_root: root_text,
+        provider: Some("anthropic".into()),
+        model: Some("claude-sonnet-4".into()),
+    };
+    let resources = authorize_request_context(&guidance, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        resources.iter().map(|item| item.kind).collect::<Vec<_>>(),
+        vec![Kind::ProjectRoot, Kind::ProviderModel]
+    );
+    assert_eq!(
+        resources[1].value,
+        proto::remote_operation_fcor::encode_provider_model_resource_v1(
+            "anthropic",
+            "claude-sonnet-4"
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
     let ctx = test_ctx();
     let state = MutableClientState::detached_for_test();

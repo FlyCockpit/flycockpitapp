@@ -44,6 +44,135 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Reconcile durable upload rows against the held storage root before the
+    /// daemon accepts upload traffic. Appends may have reached the file but
+    /// not SQLite, so a longer temporary is safely truncated to the durable
+    /// offset. Missing/short temporaries fail closed; expired drafts are
+    /// securely removed and release their reservation in the same commit.
+    pub(crate) async fn reconcile_media_uploads(&self, now_unix_ms: i64) -> Result<usize> {
+        use cockpit_db::media_attachments::{
+            MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
+        };
+        let rows = self.db.read(|conn| {
+            let mut statement = conn.prepare("SELECT upload_id,temporary_storage_id,acknowledged_bytes,upload_generation,expires_at_unix_ms,reservation_id FROM media_uploads WHERE state='open' ORDER BY creation_sequence")?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        }).await?;
+        let mut repaired = 0usize;
+        for (upload_id, storage_id, acknowledged, generation, expires, reservation_id) in rows {
+            let acknowledged = acknowledged.parse::<u64>()?;
+            let generation = generation.parse::<u64>()?;
+            let opened = self.owned_root.open_file_verified(&storage_id);
+            let mut file = match opened {
+                Ok(file) => file,
+                Err(_) => {
+                    let transition = MediaUploadLastTransitionV1::System {
+                        action: MediaUploadSystemActionV1::StartupReconcile,
+                        outcome: RemoteMediaOperationOutcomeV1::Applied,
+                    };
+                    self.commit_upload_reconcile(
+                        upload_id,
+                        generation,
+                        reservation_id,
+                        "failed",
+                        "storage_failure",
+                        None,
+                        transition,
+                        now_unix_ms,
+                    )
+                    .await?;
+                    repaired += 1;
+                    continue;
+                }
+            };
+            let length = file.metadata()?.len();
+            if length < acknowledged {
+                let transition = MediaUploadLastTransitionV1::System {
+                    action: MediaUploadSystemActionV1::StartupReconcile,
+                    outcome: RemoteMediaOperationOutcomeV1::Applied,
+                };
+                self.commit_upload_reconcile(
+                    upload_id,
+                    generation,
+                    reservation_id,
+                    "failed",
+                    "storage_failure",
+                    None,
+                    transition,
+                    now_unix_ms,
+                )
+                .await?;
+                repaired += 1;
+                continue;
+            }
+            if length > acknowledged {
+                file.set_len(acknowledged)?;
+                file.sync_all()?;
+                repaired += 1;
+            }
+            if expires > now_unix_ms {
+                continue;
+            }
+            let identity = stable_identity_digest(&file)?;
+            let (_, checksum) = read_full_digest(&mut file)?;
+            self.owned_root
+                .remove_file(&storage_id)
+                .map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "expired upload temporary was not deleted"
+                );
+            }
+            let evidence = crate::intel::hex_lower(&Sha256::digest(
+                format!("media-upload-expire-v1\0{identity}\0{acknowledged}\0{checksum}")
+                    .as_bytes(),
+            ));
+            let transition = MediaUploadLastTransitionV1::System {
+                action: MediaUploadSystemActionV1::Expire,
+                outcome: RemoteMediaOperationOutcomeV1::Applied,
+            };
+            self.commit_upload_reconcile(
+                upload_id,
+                generation,
+                reservation_id,
+                "expired",
+                "draft_expired",
+                Some(evidence),
+                transition,
+                now_unix_ms,
+            )
+            .await?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    async fn commit_upload_reconcile(
+        &self,
+        upload_id: String,
+        generation: u64,
+        reservation_id: String,
+        state: &'static str,
+        reason: &'static str,
+        evidence: Option<String>,
+        transition: cockpit_db::media_attachments::MediaUploadLastTransitionV1,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.db.transaction(move |conn| {
+            let next = generation.checked_add(1).context("upload generation overflow")?;
+            let changed = conn.execute(
+                "UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,terminal_reason=?3,cleanup_evidence_digest=?4,last_transition_json=?5,updated_at_unix_ms=?6 WHERE upload_id=?7 AND upload_generation=?8 AND state='open'",
+                params![state,next.to_string(),reason,evidence,serde_json::to_string(&transition)?,now_unix_ms,upload_id,generation.to_string()],
+            )?;
+            ensure!(changed == 1, "upload reconcile lost compare-and-swap");
+            crate::media_reservation::cancel_reserved_media_conn(conn, &reservation_id, u64::try_from(now_unix_ms)?)?;
+            Ok(())
+        }).await
+    }
+
     pub(crate) async fn finalize_media_upload(
         &self,
         request: cockpit_db::media_attachments::FinalizeMediaUploadV1,
@@ -1446,6 +1575,31 @@ mod tests {
                 .unwrap(),
             appended
         );
+        let upload_for_storage = upload_id.to_string();
+        let temporary_storage: String = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT temporary_storage_id FROM media_uploads WHERE upload_id=?1",
+                    [upload_for_storage],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(temp.path().join("media").join(&temporary_storage))
+            .unwrap()
+            .write_all(b"uncommitted")
+            .unwrap();
+        let reopened = MediaStorageRecovery::open(db.clone(), &temp.path().join("media")).unwrap();
+        assert_eq!(reopened.reconcile_media_uploads(22).await.unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(temp.path().join("media").join(&temporary_storage))
+                .unwrap()
+                .len(),
+            7
+        );
         let cancel = LocalMediaMutationV1 {
             schema_version: 1,
             kind: "localMediaMutation".into(),
@@ -1618,6 +1772,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn expired_upload_is_deleted_released_and_survives_reopen() {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+            MediaUploadStateDetailV1, MediaUploadTerminalReasonV1,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
+            Ok(())
+        }).await.unwrap();
+        let root = temp.path().join("media");
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &root).unwrap();
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let draft = Uuid::now_v7();
+        let receipt = recovery
+            .begin_media_upload(
+                LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: "11".repeat(32),
+                    actor_role: LocalMediaActorRoleV1::Owner,
+                    payload: LocalMediaMutationPayloadV1::Begin {
+                        session_id,
+                        canonical_project_digest: "22".repeat(32),
+                        client_draft_id: draft,
+                        media_kind: RequestedLocalPathMediaKind::Image,
+                        declared_total_bytes: 7,
+                        reservation_digest: digest_json(
+                            b"media-upload-reservation-v1",
+                            &local_path_plans(&policy, 7).unwrap(),
+                        )
+                        .unwrap(),
+                    },
+                },
+                &policy,
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+        drop(recovery);
+        let reopened = MediaStorageRecovery::open(db.clone(), &root).unwrap();
+        assert_eq!(
+            reopened.reconcile_media_uploads(86_400_010).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened.reconcile_media_uploads(86_400_011).await.unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let upload_id = receipt.subject_id;
+        let status = db
+            .read(move |conn| {
+                cockpit_db::Db::media_upload_status_for_owner_conn(
+                    conn,
+                    &cockpit_db::media_attachments::GetMediaUploadStatusV1 {
+                        schema_version: 1,
+                        kind: "getMediaUploadStatus".into(),
+                        session_id,
+                        canonical_project_digest: "22".repeat(32),
+                        client_draft_id: draft,
+                        upload_id,
+                        upload_generation: 2,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            status.detail,
+            MediaUploadStateDetailV1::Expired {
+                reason: MediaUploadTerminalReasonV1::DraftExpired
+            }
+        ));
+        let reservation_state: String = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT state FROM media_reservations", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reservation_state, "released");
     }
 
     struct Fixture {

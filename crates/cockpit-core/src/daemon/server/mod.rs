@@ -2098,6 +2098,13 @@ pub(crate) async fn boot_with_db(
         terminal_factory,
         crate::daemon::config_source::ConfigSource::production(),
     );
+    if let Some(storage) = &ctx.media_storage_recovery {
+        storage
+            .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling authenticated media uploads")?;
+    }
+    timer.phase("media_upload_reconcile");
     // Installation identity + secure-key actor: under single-instance lock
     // (caller already holds pid/socket). Registration + keyring I/O stay on the
     // dedicated actor OS thread. Boot handshake runs on a short-lived std thread

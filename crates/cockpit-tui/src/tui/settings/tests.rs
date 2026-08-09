@@ -3595,7 +3595,7 @@ fn category_wrapped_values_continue_under_value_column() {
     if let TestPageMut::Category(p) = d.test_page_mut() {
         p.cursor = p.cursor_of(SettingId::LlmMode).expect("llm mode");
     }
-    let rendered = render_settings_rows(&d, 62, 18).join("\n");
+    let rendered = render_settings_rows(&d, 62, 30).join("\n");
     let continuation = rendered
         .lines()
         .find(|line| line.contains("decomposition"))

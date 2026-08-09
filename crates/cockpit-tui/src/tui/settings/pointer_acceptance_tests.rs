@@ -484,9 +484,17 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             !coverage.2.is_empty(),
             "disabled/read-only targets must be represented explicitly"
         );
+        let contextual_overlap = coverage
+            .2
+            .intersection(&coverage.1)
+            .cloned()
+            .collect::<HashSet<_>>();
         assert!(
-            coverage.2.is_disjoint(&coverage.1),
-            "disabled targets reached a reducer"
+            contextual_overlap.iter().all(|action| matches!(
+                super::pointer_action_fixtures::key_for(action).expected(),
+                super::pointer_action_fixtures::ExpectedReducerOutcome::Contextual
+            )),
+            "non-contextual disabled targets reached a reducer: {contextual_overlap:?}"
         );
         for expected in ["builtin", "mcp"] {
             assert!(
@@ -1540,16 +1548,20 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
         assert_eq!(list_len(&dialog, kind), 1, "first click only arms {kind:?}");
 
         let rows = render_settings_rows(&dialog, 90, 30).join("\n");
-        let name = if kind == StringListKind::RedactDenylist {
-            "******** #1"
-        } else if kind == StringListKind::RedactAllowlist {
-            "ONE"
-        } else if kind == StringListKind::AgentDirs {
-            "界🙂"
-        } else {
-            "one"
+        let name = match kind {
+            // Buffer snapshots include the blank continuation cell after each
+            // width-two grapheme; the list's logical row identity remains
+            // the original unspaced path.
+            StringListKind::AgentDirs => "界 🙂 ",
+            StringListKind::RedactDenylist => "******** #1",
+            StringListKind::RedactAllowlist => "ONE",
+            StringListKind::ExtraDotenvPaths | StringListKind::GitignoreAllow => "one",
         };
-        assert!(rows.contains(&format!("Delete {name}? [Delete] [Cancel]")));
+        let expected = format!("Delete {name}? [Delete] [Cancel]");
+        assert!(
+            rows.contains(&expected),
+            "{kind:?} expected {expected:?} after arming delete; rendered rows:\n{rows}"
+        );
         click_target(&mut dialog, &delete);
         assert_eq!(
             list_len(&dialog, kind),

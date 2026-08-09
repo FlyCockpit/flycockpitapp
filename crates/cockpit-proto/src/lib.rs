@@ -875,8 +875,102 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[serde(rename = "replay_req")]
+    RemoteReplayRequest {
+        id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "afterEventSeq")]
+        after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+        limit: RemoteReplayLimit,
+    },
+    #[serde(rename = "replay_res")]
+    RemoteReplayResponse {
+        id: Uuid,
+        events: Vec<RemoteOutboxDeliveryV1>,
+        #[serde(rename = "highWaterMark")]
+        high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    },
+    #[serde(rename = "replay_ack")]
+    RemoteReplayAck {
+        #[serde(rename = "deliveryId")]
+        delivery_id: CanonicalRfcUuidV1,
+        #[serde(rename = "leaseToken")]
+        lease_token: CanonicalRfcUuidV1,
+    },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteOutboxDeliveryV1 {
+    pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub kind: String,
+    pub canonical_payload: Vec<u8>,
+    pub lease_token: CanonicalRfcUuidV1,
+    pub lease_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalRfcUuidV1(Uuid);
+
+impl CanonicalRfcUuidV1 {
+    pub fn new(value: Uuid) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !value.is_nil() && value.get_variant() == uuid::Variant::RFC4122,
+            "UUID must be nonnil RFC variant"
+        );
+        Ok(Self(value))
+    }
+    pub fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Serialize for CanonicalRfcUuidV1 {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.hyphenated().to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+        if value.hyphenated().to_string() != text {
+            return Err(serde::de::Error::custom(
+                "UUID must use canonical lowercase hyphenated spelling",
+            ));
+        }
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RemoteReplayLimit(u16);
+
+impl RemoteReplayLimit {
+    pub fn new(value: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=256).contains(&value), "replay limit must be 1..=256");
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteReplayLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::new(u16::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2232,6 +2326,9 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
+        Body::RemoteReplayRequest { .. }
+        | Body::RemoteReplayResponse { .. }
+        | Body::RemoteReplayAck { .. } => false,
         Body::Unknown => true,
     }
 }

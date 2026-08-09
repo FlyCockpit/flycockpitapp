@@ -54,7 +54,7 @@ pub(crate) async fn drain_kind_once(ctx: &Arc<DaemonContext>, kind: &str) -> Res
     let now = chrono::Utc::now().timestamp_millis();
     let Some(lease) = ctx
         .db
-        .claim_remote_outbox_delivery(CONSUMER, kind, now, LEASE_MS)
+        .claim_remote_outbox_delivery(CONSUMER, kind, None, None, now, LEASE_MS)
         .await?
     else {
         return Ok(false);
@@ -216,6 +216,8 @@ mod tests {
             .claim_remote_outbox_delivery(
                 CONSUMER,
                 "cancel_run_invocation",
+                None,
+                None,
                 chrono::Utc::now().timestamp_millis() + LEASE_MS + 1,
                 LEASE_MS,
             )

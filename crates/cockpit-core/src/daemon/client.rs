@@ -399,6 +399,11 @@ async fn run_io(
                             Body::Request { id, request, .. } => {
                                 tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
                             }
+                            Body::RemoteReplayRequest { .. }
+                            | Body::RemoteReplayResponse { .. }
+                            | Body::RemoteReplayAck { .. } => {
+                                tracing::debug!("ignoring remote replay control frame on local client transport");
+                            }
                             Body::Unknown => {
                                 tracing::debug!("dropping unknown daemon protocol body");
                             }

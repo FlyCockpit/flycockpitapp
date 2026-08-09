@@ -92,6 +92,42 @@ export const remoteOperationIdentityV1Schema = z
   })
   .strict();
 export type RemoteOperationIdentityV1 = z.infer<typeof remoteOperationIdentityV1Schema>;
+export const remoteReplayRequestV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_req"),
+    id: canonicalRfcUuidSchema,
+    afterEventSeq: canonicalU64DecimalStringSchema.optional(),
+    limit: z.number().int().min(1).max(256),
+  })
+  .strict();
+export const remoteOutboxDeliveryV1Schema = z
+  .object({
+    eventSeq: canonicalU64DecimalStringSchema,
+    deliveryId: canonicalRfcUuidSchema,
+    kind: z.string().min(1).max(255),
+    canonicalPayload: z.array(z.number().int().min(0).max(255)).max(524288),
+    leaseToken: canonicalRfcUuidSchema,
+    leaseExpiresAtMs: safeI64NumberSchema,
+  })
+  .strict();
+export const remoteReplayResponseV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_res"),
+    id: canonicalRfcUuidSchema,
+    events: z.array(remoteOutboxDeliveryV1Schema).max(256),
+    highWaterMark: canonicalU64DecimalStringSchema,
+  })
+  .strict();
+export const remoteReplayAckV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_ack"),
+    deliveryId: canonicalRfcUuidSchema,
+    leaseToken: canonicalRfcUuidSchema,
+  })
+  .strict();
 const clientSubmissionIdSchema = uuidSchema.refine(
   (value) => value !== "00000000-0000-0000-0000-000000000000",
   { message: "client_submission_id must not be nil" },
@@ -1684,6 +1720,6 @@ export function createEnvelope(id: string, request: ClientRequest): ClientEnvelo
 }
 
 export * from "./remote-admin-passkey";
+export * from "./remote-operation-fcor";
 export * from "./remote-protocol-id";
 export * from "./remote-transport-lanes";
-export * from "./remote-operation-fcor";

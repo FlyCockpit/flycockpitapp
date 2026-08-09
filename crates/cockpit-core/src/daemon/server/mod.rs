@@ -3771,6 +3771,113 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
+        Body::RemoteReplayRequest {
+            id,
+            after_event_seq,
+            limit,
+        } => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "remote replay requires an authenticated actor".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot replay mutations".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let mut cursor = after_event_seq
+                .as_ref()
+                .map(|value| value.get())
+                .unwrap_or(0);
+            let mut events = Vec::with_capacity(limit.get() as usize);
+            for _ in 0..limit.get() {
+                let Some(lease) = ctx
+                    .db
+                    .claim_remote_outbox_delivery(
+                        &consumer,
+                        "*",
+                        Some(&attachment),
+                        Some(cursor),
+                        chrono::Utc::now().timestamp_millis(),
+                        30_000,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                cursor = lease.event_seq;
+                events.push(proto::RemoteOutboxDeliveryV1 {
+                    event_seq: proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                        lease.event_seq,
+                    ),
+                    delivery_id: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(
+                        &lease.delivery_id,
+                    )?)?,
+                    kind: lease.kind,
+                    canonical_payload: lease.canonical_payload,
+                    lease_token: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(&lease.lease_id)?)?,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                });
+            }
+            let high_water = ctx.db.remote_outbox_high_water(&attachment).await?;
+            let envelope = Envelope {
+                v: proto::PROTOCOL_VERSION,
+                body: Body::RemoteReplayResponse {
+                    id,
+                    events,
+                    high_water_mark:
+                        proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(high_water),
+                },
+            };
+            let _ = send_writer_envelope(writer_tx, envelope).await;
+        }
+        Body::RemoteReplayAck {
+            delivery_id,
+            lease_token,
+        } => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let _ = ctx
+                .db
+                .ack_remote_outbox_delivery(
+                    &attachment,
+                    &delivery_id.get().to_string(),
+                    &consumer,
+                    &lease_token.get().to_string(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+        }
+        Body::RemoteReplayResponse { id, .. } => {
+            tracing::warn!(%id, "client sent a replay response; ignoring");
+        }
         Body::Response { id, .. } => {
             tracing::warn!(id = %id, "client sent a response envelope; ignoring");
         }
@@ -3932,6 +4039,9 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        Body::RemoteReplayRequest { .. } => "replay_request",
+        Body::RemoteReplayResponse { .. } => "replay_response",
+        Body::RemoteReplayAck { .. } => "replay_ack",
         Body::Unknown => "unknown",
     }
 }

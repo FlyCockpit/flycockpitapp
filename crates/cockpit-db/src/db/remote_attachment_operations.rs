@@ -124,12 +124,25 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    pub async fn remote_outbox_high_water(&self, logical_attachment_id: &str) -> Result<u64> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        let attachment = logical_attachment_id.to_owned();
+        self.read(move |conn| {
+            let value: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(event_seq),0) FROM remote_attachment_outbox WHERE logical_attachment_id=?1",
+                [&attachment], |row| row.get(0),
+            )?;
+            value.try_into().context("negative remote outbox high water")
+        }).await
+    }
     /// Claims the oldest event for one independent consumer. A worker ack is
     /// deliberately unrelated to the snapshot cursor used for client replay.
     pub async fn claim_remote_outbox_delivery(
         &self,
         consumer_kind: &str,
         outbox_kind: &str,
+        logical_attachment_id: Option<&str>,
+        after_event_seq: Option<u64>,
         now_ms: i64,
         lease_duration_ms: i64,
     ) -> Result<Option<RemoteOutboxDeliveryLease>> {
@@ -147,6 +160,7 @@ impl Db {
         );
         let consumer_kind = consumer_kind.to_owned();
         let outbox_kind = outbox_kind.to_owned();
+        let attachment_filter = logical_attachment_id.map(str::to_owned);
         self.transaction(move |conn| {
             let candidate: Option<(String, i64, String, String, Vec<u8>, Option<i64>)> = conn
                 .query_row(
@@ -156,9 +170,11 @@ impl Db {
                        LEFT JOIN remote_attachment_outbox_deliveries d
                          ON d.logical_attachment_id=o.logical_attachment_id
                         AND d.delivery_id=o.delivery_id AND d.consumer_kind=?1
-                      WHERE o.kind=?3 AND (d.state IS NULL OR (d.state='leased' AND d.lease_expires_at_ms<=?2))
+                      WHERE (?3='*' OR o.kind=?3) AND o.event_seq>?4
+                        AND (?5 IS NULL OR o.logical_attachment_id=?5)
+                        AND (d.state IS NULL OR (d.state='leased' AND d.lease_expires_at_ms<=?2))
                       ORDER BY o.created_at_ms, o.logical_attachment_id, o.event_seq LIMIT 1",
-                    params![consumer_kind, now_ms, outbox_kind],
+                    params![consumer_kind, now_ms, outbox_kind, after_event_seq.unwrap_or(0) as i64, attachment_filter],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
                 )
                 .optional()?;
@@ -1354,19 +1370,19 @@ mod tests {
         .await
         .unwrap();
         let first = db
-            .claim_remote_outbox_delivery("worker", "wake_goal", 20, 100)
+            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 20, 100)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(first.attempts, 1);
         assert!(
-            db.claim_remote_outbox_delivery("worker", "wake_goal", 119, 100)
+            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 119, 100)
                 .await
                 .unwrap()
                 .is_none()
         );
         let second = db
-            .claim_remote_outbox_delivery("worker", "wake_goal", 120, 100)
+            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 120, 100)
             .await
             .unwrap()
             .unwrap();
@@ -1384,13 +1400,13 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            db.claim_remote_outbox_delivery("worker", "wake_goal", 500, 100)
+            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 500, 100)
                 .await
                 .unwrap()
                 .is_none()
         );
         let transport = db
-            .claim_remote_outbox_delivery("transport", "wake_goal", 500, 100)
+            .claim_remote_outbox_delivery("transport", "wake_goal", None, None, 500, 100)
             .await
             .unwrap()
             .unwrap();
@@ -1423,7 +1439,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
         assert!(
-            db.claim_remote_outbox_delivery("transport", "wake_goal", 700, 100)
+            db.claim_remote_outbox_delivery("transport", "wake_goal", None, None, 700, 100)
                 .await
                 .unwrap()
                 .is_none()
@@ -1462,7 +1478,7 @@ mod tests {
             .await
             .unwrap();
             let lease = db
-                .claim_remote_outbox_delivery("worker", "restart_effect", 10, 100)
+                .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 10, 100)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1473,13 +1489,13 @@ mod tests {
         {
             let db = Db::open(&path).unwrap();
             assert!(
-                db.claim_remote_outbox_delivery("worker", "restart_effect", 109, 100)
+                db.claim_remote_outbox_delivery("worker", "restart_effect", None, None, 109, 100)
                     .await
                     .unwrap()
                     .is_none()
             );
             let lease = db
-                .claim_remote_outbox_delivery("worker", "restart_effect", 110, 100)
+                .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 110, 100)
                 .await
                 .unwrap()
                 .unwrap();

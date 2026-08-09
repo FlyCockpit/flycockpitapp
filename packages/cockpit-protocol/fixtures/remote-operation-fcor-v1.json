@@ -1,0 +1,6 @@
+{
+  "requestKind": "daemon_status",
+  "resources": [{ "kind": "daemon_global", "valueHex": "" }],
+  "paramsHex": "",
+  "canonicalHex": "46434f52010d6461656d6f6e5f73746174757300010b0000000000000000"
+}

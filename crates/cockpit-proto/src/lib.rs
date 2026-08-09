@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_identity_protocol;
+pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
 pub mod remote_transport;
 pub mod remote_wire_magic_registry;

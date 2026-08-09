@@ -266,18 +266,29 @@ impl App {
             self.dispatch_next_ready_paste_fence();
             return;
         }
-        let existing = self
+        let existing_probe = self
             .pending_paste_probes
             .remove(&correlation_id)
-            .map(|probe| {
-                if let Some(action_id) = probe.async_action_id {
+            .map(|mut probe| {
+                if let Some(action_id) = probe.async_action_id.take() {
                     self.async_actions.abort_id(action_id);
                 }
-                probe.request
+                probe.request.source = source;
+                probe
             });
-        let Some(mut request) =
-            existing.or_else(|| self.allocate_paste_request_with_id(source, correlation_id))
-        else {
+        let identified_probe = if let Some(probe) = existing_probe {
+            Some(probe)
+        } else if let Some(request) = self.allocate_paste_request_with_id(source, correlation_id) {
+            Some(super::PendingPasteProbe {
+                request,
+                original_data: data.clone(),
+                source_draft_generation: self.draft_generation,
+                owner_fence: None,
+                original_offset: self.composer.cursor(),
+                deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                async_action_id: None,
+            })
+        } else {
             crate::tui::input_source::acknowledge_native_paste(
                 correlation_id,
                 crate::tui::structured_paste::DedupResult::Busy,
@@ -285,8 +296,7 @@ impl App {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
             return;
         };
-        request.source = source;
-        self.handle_paste_inner(data, Some(request));
+        self.handle_paste_inner(data, identified_probe);
         if !self.pending_paste_probes.contains_key(&correlation_id) {
             let result = self
                 .paste_correlations
@@ -3233,7 +3243,7 @@ impl App {
     fn handle_paste_inner(
         &mut self,
         data: String,
-        mut identified_request: Option<crate::tui::structured_paste::PasteRequest>,
+        mut identified_probe: Option<super::PendingPasteProbe>,
     ) {
         // Any authoritative non-empty paste supersedes an unclaimed native
         // clipboard probe from the same shortcut before routing is frozen.
@@ -3324,29 +3334,28 @@ impl App {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
-            let Some(request) = identified_request.take().or_else(|| {
+            let Some(mut probe) = identified_probe.take().or_else(|| {
                 self.allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+                    .map(|request| super::PendingPasteProbe {
+                        request,
+                        original_data: data.clone(),
+                        source_draft_generation: self.draft_generation,
+                        owner_fence: None,
+                        original_offset: self.composer.cursor(),
+                        deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        async_action_id: None,
+                    })
             }) else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            let request_id = request.paste_correlation_id;
-            let request_generation = request.paste_generation;
-            self.pending_paste_probes.insert(
-                request_id,
-                super::PendingPasteProbe {
-                    request,
-                    original_data: data.clone(),
-                    source_draft_generation: self.draft_generation,
-                    owner_fence: None,
-                    original_offset: self.composer.cursor(),
-                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
-                    async_action_id: None,
-                },
-            );
+            let request_id = probe.request.paste_correlation_id;
+            let request_generation = probe.request.paste_generation;
+            probe.original_data = data.clone();
+            let source_draft_generation = probe.source_draft_generation;
+            let cursor = probe.original_offset;
+            self.pending_paste_probes.insert(request_id, probe);
             let terminal_generation = self.terminal_input_generation;
-            let source_draft_generation = self.draft_generation;
-            let cursor = self.composer.cursor();
             let action_id = self
                 .async_actions
                 .start(
@@ -3384,30 +3393,29 @@ impl App {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
-            let Some(request) = identified_request.take().or_else(|| {
+            let Some(mut probe) = identified_probe.take().or_else(|| {
                 self.allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
+                    .map(|request| super::PendingPasteProbe {
+                        request,
+                        original_data: data.clone(),
+                        source_draft_generation: self.draft_generation,
+                        owner_fence: None,
+                        original_offset: self.composer.cursor(),
+                        deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        async_action_id: None,
+                    })
             }) else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            let request_id = request.paste_correlation_id;
-            let request_generation = request.paste_generation;
-            self.pending_paste_probes.insert(
-                request_id,
-                super::PendingPasteProbe {
-                    request,
-                    original_data: data.clone(),
-                    source_draft_generation: self.draft_generation,
-                    owner_fence: None,
-                    original_offset: self.composer.cursor(),
-                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
-                    async_action_id: None,
-                },
-            );
+            let request_id = probe.request.paste_correlation_id;
+            let request_generation = probe.request.paste_generation;
+            probe.original_data = data.clone();
+            let source_draft_generation = probe.source_draft_generation;
+            let cursor = probe.original_offset;
+            self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
             let terminal_generation = self.terminal_input_generation;
-            let source_draft_generation = self.draft_generation;
-            let cursor = self.composer.cursor();
             let action_id = self
                 .async_actions
                 .start(
@@ -5534,6 +5542,51 @@ mod paste_routing_tests {
         assert_eq!(preserved.request.paste_generation, generation);
         assert_eq!(preserved.deadline, deadline);
         assert_eq!(preserved.original_data, "original");
+    }
+
+    #[test]
+    fn identified_path_literal_completion_preserves_unowned_probe_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            .expect("fixture claims native shortcut correlation");
+        let request_id = request.paste_correlation_id;
+        let generation = request.paste_generation;
+        let deadline = std::time::Duration::from_millis(1_111);
+        app.pending_paste_probes.insert(
+            request_id,
+            crate::tui::app::PendingPasteProbe {
+                request,
+                original_data: String::new(),
+                source_draft_generation: 77,
+                owner_fence: None,
+                original_offset: 5,
+                deadline,
+                async_action_id: None,
+            },
+        );
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(1_000);
+        app.handle_identified_paste(
+            "'/tmp/authoritative.png'".to_string(),
+            crate::tui::structured_paste::PasteSource::BracketedPty,
+            request_id,
+        );
+
+        let preserved = app
+            .pending_paste_probes
+            .get(&request_id)
+            .expect("path probe keeps the native shortcut's original capture");
+        assert_eq!(preserved.request.paste_generation, generation);
+        assert_eq!(
+            preserved.request.source,
+            crate::tui::structured_paste::PasteSource::BracketedPty
+        );
+        assert_eq!(preserved.source_draft_generation, 77);
+        assert_eq!(preserved.original_offset, 5);
+        assert_eq!(preserved.deadline, deadline);
+        assert!(preserved.async_action_id.is_some());
     }
 
     #[test]

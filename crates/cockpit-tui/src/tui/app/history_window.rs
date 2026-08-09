@@ -122,7 +122,10 @@ impl HistoryWindow {
             })
             .cloned()
             .collect::<Vec<_>>();
-        self.truncate(start);
+        // This is a tail rewrite, not a history reset. In particular, a busy
+        // optimistic dispatch can begin at index zero while the window still
+        // has daemon-backed pages before `older_cursor`.
+        self.log.truncate(start);
         self.extend(terminal_notices);
     }
 
@@ -267,5 +270,25 @@ mod tests {
         assert!(
             matches!(&history[2], HistoryEntry::InferenceError { summary, .. } if summary == "provider failed")
         );
+    }
+
+    #[test]
+    fn retain_terminal_notices_since_preserves_pagination_at_zero() {
+        let mut history = HistoryWindow::from_history_page(
+            vec![HistoryEntry::CommandError {
+                line: "dispatch failed".to_string(),
+            }],
+            Some(41),
+            true,
+        );
+
+        history.retain_terminal_notices_since(0);
+
+        assert_eq!(history.len(), 1);
+        assert!(
+            matches!(&history[0], HistoryEntry::CommandError { line } if line == "dispatch failed")
+        );
+        assert_eq!(history.older_cursor(), Some(41));
+        assert!(history.has_older());
     }
 }

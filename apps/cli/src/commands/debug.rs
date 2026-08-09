@@ -161,7 +161,10 @@ fn truncate_for_debug(text: &str, limit: usize) -> String {
 /// turning into new repair-catalog entries.
 async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
     let db = Db::open_default()?;
-    let project_id = args.project.as_ref().map(project_id_for);
+    let project_id = args
+        .project
+        .as_ref()
+        .map(|project| project_id_for(project.as_path()));
     let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
 
     let rows = db

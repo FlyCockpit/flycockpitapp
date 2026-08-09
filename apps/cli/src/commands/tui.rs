@@ -2,7 +2,7 @@ use std::io::{IsTerminal, stdin, stdout};
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::welcome;

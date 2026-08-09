@@ -100,6 +100,16 @@ pub struct ValidatedMessageIngress {
     pub operation_id: Uuid,
     pub session_locator: String,
     pub command: SendUserMessageV2,
+    pub provenance: MessageIngressProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageIngressProvenance {
+    LocalOwner,
+    AuthenticatedRemote {
+        actor_id: [u8; 16],
+        actor_generation: u64,
+    },
 }
 
 fn validate_ingress(
@@ -107,25 +117,39 @@ fn validate_ingress(
     operation_id: Uuid,
     session_locator: String,
     command: SendUserMessageV2,
+    provenance: MessageIngressProvenance,
 ) -> Result<ValidatedMessageIngress> {
     ensure!(
-        request_id.get_version_num() == 7,
-        "request_id must be UUIDv7"
+        request_id.get_version_num() == 7 && request_id.get_variant() == uuid::Variant::RFC4122,
+        "request_id must be RFC UUIDv7"
     );
     ensure!(
-        operation_id.get_version_num() == 7,
-        "operation_id must be UUIDv7"
+        operation_id.get_version_num() == 7 && operation_id.get_variant() == uuid::Variant::RFC4122,
+        "operation_id must be RFC UUIDv7"
     );
     ensure!(!session_locator.is_empty(), "empty session locator");
     ensure!(
-        operation_id != command.client_submission_id,
-        "operation and submission identities must differ"
+        request_id != operation_id
+            && request_id != command.client_submission_id
+            && operation_id != command.client_submission_id,
+        "request, operation, and submission identities must be pairwise distinct"
     );
+    if let MessageIngressProvenance::AuthenticatedRemote {
+        actor_id,
+        actor_generation,
+    } = provenance
+    {
+        ensure!(
+            actor_id != [0; 16] && actor_generation > 0,
+            "invalid remote actor binding"
+        );
+    }
     Ok(ValidatedMessageIngress {
         request_id,
         operation_id,
         session_locator,
         command,
+        provenance,
     })
 }
 
@@ -136,17 +160,26 @@ impl LocalOwnerDirectSendUserMessageV2 {
             self.operation_id,
             self.session_locator,
             self.request,
+            MessageIngressProvenance::LocalOwner,
         )
     }
 }
 
 impl AuthenticatedRemoteOperationEnvelopeV2 {
-    pub fn into_validated(self) -> Result<ValidatedMessageIngress> {
+    pub fn into_validated(
+        self,
+        actor_id: [u8; 16],
+        actor_generation: u64,
+    ) -> Result<ValidatedMessageIngress> {
         validate_ingress(
             self.request_id,
             self.operation_id,
             self.session_locator,
             self.request,
+            MessageIngressProvenance::AuthenticatedRemote {
+                actor_id,
+                actor_generation,
+            },
         )
     }
 }

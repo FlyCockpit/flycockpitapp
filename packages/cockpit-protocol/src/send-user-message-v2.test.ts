@@ -8,7 +8,7 @@ import {
   messageRequestDigest,
   FCM2_MAX_BYTES,
   validateFcm2Length,
-  validateMessageIngressEnvelopeV2,
+  validateLocalOwnerDirectMessageV2,
 } from "./send-user-message-v2";
 
 const fixture = JSON.parse(
@@ -60,7 +60,8 @@ function compactBytes(vector: {
 describe("send_user_message_v2_canonical_vectors", () => {
   it("validates distinct UUIDv7 transport and operation identities", () => {
     const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
-    const envelope = validateMessageIngressEnvelopeV2({
+    const envelope = validateLocalOwnerDirectMessageV2({
+      ingress: "local_owner_direct",
       request_id: "018f47a2-7b3c-7def-8123-000000000001",
       operation_id: "018f47a2-7b3c-7def-8123-000000000002",
       session_locator: "opaque-session",

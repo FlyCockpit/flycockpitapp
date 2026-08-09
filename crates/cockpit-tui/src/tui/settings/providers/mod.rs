@@ -3093,6 +3093,7 @@ impl SettingsCx {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
 
         lines.push(Line::from(vec![
             Span::styled("Provider: ", muted),
@@ -3196,6 +3197,7 @@ impl SettingsCx {
 
         for (idx, action) in actions.iter().enumerate() {
             let selected = idx == s.cursor;
+            bindings.push((lines.len(), SettingsControlId(idx as u64)));
             if *action == EditAction::Save {
                 lines.push(save_button_line("[save changes]", selected));
                 continue;
@@ -3241,8 +3243,16 @@ impl SettingsCx {
         )));
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:edit", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:edit",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:edit"),
+        );
     }
 
     /// Full-pane render for the Headers sub-page. The header rows are
@@ -4191,6 +4201,11 @@ impl SettingsPage for ProvidersPage {
             ProvidersPage::List { cursor, .. } if index <= cx.config.providers.len() => {
                 *cursor = index;
             }
+            ProvidersPage::Edit(state)
+                if index < edit_menu_actions(&state.provider_id, &state.entry).len() =>
+            {
+                state.cursor = index;
+            }
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4213,6 +4228,15 @@ impl SettingsPage for ProvidersPage {
             *cursor = cursor
                 .saturating_add_signed(delta)
                 .min(cx.config.providers.len());
+        } else if region == SettingsScrollRegionId("providers:edit")
+            && let ProvidersPage::Edit(state) = self
+            && state.editing_field.is_none()
+        {
+            state.delete_pending = false;
+            state.cursor = state
+                .cursor
+                .saturating_add_signed(delta)
+                .min(edit_menu_actions(&state.provider_id, &state.entry).len() - 1);
         }
         Nav::Stay
     }

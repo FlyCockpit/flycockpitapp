@@ -1173,6 +1173,49 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         assert_eq!(d.extended.utility_model.as_deref().unwrap_or(""), expected);
     }
 
+    // Dispatch every concrete model identity published by the live picker,
+    // not just one representative entry. The acceptance inventory compares
+    // exact source payloads so a newly rendered model cannot hide behind the
+    // shared `Select` discriminant.
+    let source_tmp = TempDir::new().unwrap();
+    let mut source = dialog_with_models(&source_tmp);
+    open_utility_picker(&mut source);
+    let _ = render_settings_rows(&source, 90, 24);
+    let select_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::Select(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!select_actions.is_empty());
+    for action in select_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(&mut dialog, &action);
+        let pointer_actions::SettingsPointerAction::UtilityModel(
+            pointer_actions::UtilityModelAction::Select(id),
+        ) = action
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            dialog.extended.utility_model.as_deref(),
+            Some(id.0.as_str())
+        );
+    }
+
     let tmp = TempDir::new().unwrap();
     let mut source = dialog_with_models(&tmp);
     open_utility_picker(&mut source);

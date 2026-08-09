@@ -646,7 +646,11 @@ fn dispatch_category_nested_editor_actions() {
     std::fs::create_dir_all(suggestion_root.join("alpha")).unwrap();
     std::fs::create_dir_all(suggestion_root.join("alpine")).unwrap();
     let mut source = fresh_dialog(&tmp);
-    activate_category_descriptor(&mut source, Category::Behavior, SettingId::PackagesDir);
+    super::tests::open_category_on(&mut source, Category::Behavior, SettingId::PackagesDir);
+    source.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
     if let super::TestPageMut::Category(page) = source.test_page_mut() {
         page.path_editor
             .as_mut()
@@ -680,7 +684,11 @@ fn dispatch_category_nested_editor_actions() {
     )));
     for action in path_actions {
         let mut dialog = fresh_dialog(&tmp);
-        activate_category_descriptor(&mut dialog, Category::Behavior, SettingId::PackagesDir);
+        super::tests::open_category_on(&mut dialog, Category::Behavior, SettingId::PackagesDir);
+        dialog.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         if let super::TestPageMut::Category(page) = dialog.test_page_mut() {
             page.path_editor
                 .as_mut()
@@ -708,6 +716,13 @@ fn dispatch_category_nested_editor_actions() {
             )),
         }
     }
+
+    dispatch_path_editor_actions(
+        Category::Privacy,
+        SettingId::SandboxDockerfile,
+        "Dock",
+        &suggestion_root,
+    );
 
     let mut source = fresh_dialog(&tmp);
     activate_category_descriptor(&mut source, Category::Behavior, SettingId::CompactPrompt);
@@ -748,6 +763,130 @@ fn dispatch_category_nested_editor_actions() {
             dialog.test_page(),
             TestPageRef::Category(page) if !page.is_editing()
         ));
+    }
+
+    for setting in [
+        SettingId::CommandProfileWrappers,
+        SettingId::CommandProfileCustomProfiles,
+    ] {
+        dispatch_text_editor_actions(setting);
+    }
+}
+
+fn dispatch_path_editor_actions(
+    category: super::category::Category,
+    setting: super::category::SettingId,
+    seed: &str,
+    cwd: &std::path::Path,
+) {
+    let source_tmp = TempDir::new().unwrap();
+    let mut source = fresh_dialog(&source_tmp);
+    super::tests::open_category_on(&mut source, category, setting);
+    source.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    if let super::TestPageMut::Category(page) = source.test_page_mut() {
+        page.path_editor
+            .as_mut()
+            .expect("path editor source")
+            .set_text_for_test(seed.into(), cwd);
+    }
+    let _ = render_settings_rows(&source, 100, 50);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                RenderAction::Page(
+                    action @ SettingsPointerAction::Category(
+                        CategoryAction::PathEditBegin(id)
+                        | CategoryAction::PathEditCommit(id)
+                        | CategoryAction::PathEditCancel(id)
+                        | CategoryAction::SuggestionSelect(id, _),
+                    ),
+                ),
+                true,
+            ) if *id == setting => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(actions.len() >= 3, "path editor controls are rendered");
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, category, setting);
+        dialog.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        if let super::TestPageMut::Category(page) = dialog.test_page_mut() {
+            page.path_editor
+                .as_mut()
+                .expect("fresh path editor")
+                .set_text_for_test(seed.into(), cwd);
+        }
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("path action rerenders from the same deterministic source");
+        click_target(&mut dialog, &target);
+    }
+}
+
+fn dispatch_text_editor_actions(setting: super::category::SettingId) {
+    use super::category::Category;
+    let source_tmp = TempDir::new().unwrap();
+    let mut source = fresh_dialog(&source_tmp);
+    super::tests::open_category_on(&mut source, Category::Behavior, setting);
+    source.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let _ = render_settings_rows(&source, 100, 50);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                RenderAction::Page(
+                    action @ SettingsPointerAction::Category(
+                        CategoryAction::TextEditorSave(id) | CategoryAction::TextEditorCancel(id),
+                    ),
+                ),
+                true,
+            ) if *id == setting => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 2);
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, Category::Behavior, setting);
+        dialog.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("text editor action rerenders from a fresh source");
+        click_target(&mut dialog, &target);
     }
 }
 
@@ -858,6 +997,14 @@ fn dispatch_enabled_category_descriptor_actions() {
             .cloned()
             .expect("source category descriptor action is rendered");
         click_target(&mut dialog, &target);
+        if setting == SettingId::PackagesDir
+            && let super::TestPageMut::Category(page) = dialog.test_page_mut()
+        {
+            page.path_editor
+                .as_mut()
+                .expect("packages path editor")
+                .set_text_for_test("no-such-pointer-fixture-prefix".into(), tmp.path());
+        }
         if matches!(
             setting,
             SettingId::Instructions
@@ -930,6 +1077,57 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::TimeInjectionInterval => {}
             _ => unreachable!("unclassified Behavior descriptor fixture: {setting:?}"),
         }
+    }
+
+    // These source rows are reached by the broader navigation/render matrix
+    // above. Exercise each from its own real category source so exact action
+    // coverage cannot depend on which test happened to share this worker
+    // thread.
+    for (category, setting) in [
+        (Category::Behavior, SettingId::DefaultPrimaryAgent),
+        (Category::Behavior, SettingId::LlmMode),
+        (Category::Privacy, SettingId::SandboxDefaultMode),
+        (Category::Privacy, SettingId::SandboxDockerfile),
+        (Category::Privacy, SettingId::RedactEnabled),
+        (Category::Privacy, SettingId::RedactScanEnvironment),
+        (Category::Privacy, SettingId::RedactScanDotenv),
+        (Category::Privacy, SettingId::RedactScanSshKeys),
+        (Category::Privacy, SettingId::RedactPatterns),
+        (Category::Privacy, SettingId::InjectionThreshold),
+        (Category::Privacy, SettingId::InjectionResultAction),
+        (Category::Privacy, SettingId::InjectionCheckPrompt),
+        (Category::Privacy, SettingId::InjectionModel),
+        (Category::Privacy, SettingId::PreflightEnabled),
+        (Category::Privacy, SettingId::PreflightModel),
+        (Category::Privacy, SettingId::PreflightPrompt),
+        (Category::Privacy, SettingId::RedactExtraDotenvPaths),
+        (Category::Privacy, SettingId::RedactPlaceholder),
+        (Category::Privacy, SettingId::RedactDenylist),
+        (Category::Privacy, SettingId::RedactAllowlist),
+        (Category::Privacy, SettingId::GitignoreAllow),
+        (Category::Privacy, SettingId::AllowRemoteConfig),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, category, setting);
+        let target = {
+            let _ = render_settings_rows(&dialog, 100, 50);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled
+                        && target.action
+                            == RenderAction::Page(SettingsPointerAction::Category(
+                                CategoryAction::DescriptorActivate(setting),
+                            ))
+                })
+                .cloned()
+                .expect("category descriptor source is rendered")
+        };
+        click_target(&mut dialog, &target);
     }
 }
 

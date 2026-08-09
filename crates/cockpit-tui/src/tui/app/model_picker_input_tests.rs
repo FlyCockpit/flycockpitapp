@@ -1322,9 +1322,12 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     app.agent_runner = Some(Ok(runner));
 
     let queued = exact_queued_submission();
-    let expected = serde_json::to_value(&queued.submission).unwrap();
     app.composer.set(queued.composer_text.clone());
     let requested = preference_bearing_selection("p", "a");
+    let mut expected_submission = queued.submission.clone();
+    expected_submission.expected_model_state_generation = Some(1);
+    expected_submission.expected_model = Some(requested.clone());
+    let expected = serde_json::to_value(expected_submission).unwrap();
     let selection_id = uuid::Uuid::new_v4();
     install_pending_model_submission(
         &mut app,
@@ -1667,8 +1670,11 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
 
     let queued = exact_queued_submission();
     let expected_queued = queued_submission_value(&queued);
-    let expected_submission = serde_json::to_value(&queued.submission).unwrap();
     let pending_requested = preference_bearing_selection("pending-provider", "pending-model");
+    let mut expected_submission = queued.submission.clone();
+    expected_submission.expected_model_state_generation = Some(1);
+    expected_submission.expected_model = Some(pending_requested.clone());
+    let expected_submission = serde_json::to_value(expected_submission).unwrap();
     app.composer.set(queued.composer_text.clone());
     let old_selection_id = uuid::Uuid::new_v4();
     install_pending_model_submission(

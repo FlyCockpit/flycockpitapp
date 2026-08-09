@@ -1768,15 +1768,14 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
         .collect();
     let mut validation = Ok(());
     for doc in &docs {
-        if let Some(value) = doc.raw_field("response_metrics_tokenizer") {
-            if let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
-                && validation.is_ok()
-            {
-                validation = Err(InvalidResponseMetricsTokenizer {
-                    path: doc.path.clone(),
-                    source,
-                });
-            }
+        if let Some(value) = doc.raw_field("response_metrics_tokenizer")
+            && let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+            && validation.is_ok()
+        {
+            validation = Err(InvalidResponseMetricsTokenizer {
+                path: doc.path.clone(),
+                source,
+            });
         }
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();

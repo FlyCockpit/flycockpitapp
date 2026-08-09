@@ -636,6 +636,7 @@ impl SettingsCx {
         if let Some(buf) = &s.editing {
             let field = FIELDS[s.cursor.min(FIELDS.len() - 1)];
             lines.push(Line::default());
+            let edit_line = lines.len();
             push_text_field_at_cursor(
                 &mut lines,
                 area.width,
@@ -645,6 +646,39 @@ impl SettingsCx {
                 true,
                 None,
             );
+            let field_x = field.label().chars().count().saturating_add(2) as u16;
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(field_x),
+                        area.y.saturating_add(edit_line as u16),
+                        area.width.saturating_sub(field_x),
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(SettingsControlId(1000)),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            let action_line = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled("[Save]", selected_style()),
+                Span::raw("  "),
+                Span::styled("[Cancel]", selected_style()),
+            ]));
+            for (id, x, width) in [(1001, 0, 6), (1002, 8, 8)] {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x + x,
+                            area.y.saturating_add(action_line as u16),
+                            width,
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(SettingsControlId(id)),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
@@ -724,6 +758,20 @@ impl SettingsPage for HarnessesPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        if matches!(self, HarnessesPage::Edit(state) if state.editing.is_some()) {
+            return match index {
+                1000 => Nav::Stay,
+                1001 => cx.handle_harnesses_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                ),
+                1002 => cx.handle_harnesses_page_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    self,
+                ),
+                _ => Nav::Stay,
+            };
+        }
         let valid = match self {
             HarnessesPage::List(_) => index < cx.harness_names().len() + 3,
             HarnessesPage::Edit(_) => index < FIELDS.len(),
@@ -736,6 +784,29 @@ impl SettingsPage for HarnessesPage {
             HarnessesPage::Edit(state) => state.cursor = index,
         }
         cx.handle_harnesses_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: SettingsControlId,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if control.0 == 1000
+            && let HarnessesPage::Edit(state) = self
+            && let Some(buf) = state.editing.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| target.action == super::shell::SettingsPointerAction::Page(control))
+                .map_or(column, |target| target.rect.x);
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+        }
+        Nav::Stay
     }
 
     fn handle_pointer_scroll(

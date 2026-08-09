@@ -135,13 +135,13 @@ pub enum AsyncActionPayload {
     ImagePathProbe {
         terminal_generation: Option<u64>,
         original: String,
-        composer_snapshot: String,
+        source_draft_generation: u64,
         cursor: usize,
         png: Option<Vec<u8>>,
     },
     NativeImagePaste {
         terminal_generation: Option<u64>,
-        composer_snapshot: String,
+        source_draft_generation: u64,
         cursor: usize,
         png: Option<Vec<u8>>,
     },

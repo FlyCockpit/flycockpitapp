@@ -2368,6 +2368,7 @@ impl App {
             }
         }
         self.composer.clear();
+        self.draft_generation = self.draft_generation.saturating_add(1);
         // The buffer is gone — its paste blocks go with it.
         self.paste_registry.clear();
         self.at_dismissed = false;
@@ -2860,7 +2861,7 @@ impl App {
 
         if data.is_empty() {
             let terminal_generation = self.terminal_input_generation;
-            let composer_snapshot = self.composer.text().to_string();
+            let source_draft_generation = self.draft_generation;
             let cursor = self.composer.cursor();
             self.async_actions.start(
                 crate::tui::async_action::AsyncActionKind::Internal("paste.native_image"),
@@ -2880,7 +2881,7 @@ impl App {
                     Ok(
                         crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
                             terminal_generation,
-                            composer_snapshot,
+                            source_draft_generation,
                             cursor,
                             png,
                         },
@@ -2901,7 +2902,7 @@ impl App {
             }
             let original = data.clone();
             let terminal_generation = self.terminal_input_generation;
-            let composer_snapshot = self.composer.text().to_string();
+            let source_draft_generation = self.draft_generation;
             let cursor = self.composer.cursor();
             self.async_actions.start(
                 kind,
@@ -2921,7 +2922,7 @@ impl App {
                         crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                             terminal_generation,
                             original,
-                            composer_snapshot,
+                            source_draft_generation,
                             cursor,
                             png: normalized,
                         },

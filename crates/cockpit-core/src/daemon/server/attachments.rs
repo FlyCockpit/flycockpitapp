@@ -421,6 +421,7 @@ pub(super) fn upload_attachment_chunk(
     })
 }
 
+#[cfg(test)]
 pub(super) async fn finish_attachment_upload(
     state: &mut MutableClientState,
     upload_id: Uuid,

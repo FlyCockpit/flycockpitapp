@@ -1848,11 +1848,12 @@ mod tests {
             .bind_downstream_ownership(vec![completed.reservation_id.clone()], "invocation-1", 3)
             .await
             .unwrap();
+        let completed_id_for_ownership = completed.reservation_id.clone();
         let ownership = db
-            .read(|conn| {
+            .read(move |conn| {
                 Ok(conn.query_row(
                     "SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",
-                    [&completed.reservation_id],
+                    [&completed_id_for_ownership],
                     |row| row.get::<_, String>(0),
                 )?)
             })

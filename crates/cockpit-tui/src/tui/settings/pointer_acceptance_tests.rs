@@ -429,6 +429,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
     dispatch_enabled_category_descriptor_actions();
     dispatch_all_rendered_numeric_inline_begin_actions();
+    dispatch_inline_numeric_terminal_actions();
     dispatch_category_nested_editor_actions();
     ACTION_COVERAGE.with(|coverage| {
         let coverage = coverage.borrow();
@@ -572,6 +573,59 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             );
         }
     });
+}
+
+fn dispatch_inline_numeric_terminal_actions() {
+    use super::category::{Category, SettingId};
+    for terminal_action in [
+        CategoryAction::InlineEditCommit(SettingId::ExitTailLines),
+        CategoryAction::InlineEditCancel(SettingId::ExitTailLines),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        let original = dialog.extended.tui.exit_tail_lines;
+        super::tests::open_category_on(&mut dialog, Category::Interface, SettingId::ExitTailLines);
+        dialog.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for _ in 0..original.to_string().len() {
+            dialog.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Backspace,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        for ch in "123".chars() {
+            dialog.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let action = SettingsPointerAction::Category(terminal_action.clone());
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("numeric terminal action renders from active inline editor");
+        click_target(&mut dialog, &target);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if !page.is_editing()
+        ));
+        match terminal_action {
+            CategoryAction::InlineEditCommit(_) => {
+                assert_eq!(dialog.extended.tui.exit_tail_lines, 123)
+            }
+            CategoryAction::InlineEditCancel(_) => {
+                assert_eq!(dialog.extended.tui.exit_tail_lines, original)
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn dispatch_all_rendered_numeric_inline_begin_actions() {

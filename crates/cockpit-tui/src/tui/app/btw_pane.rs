@@ -877,6 +877,10 @@ impl App {
     }
 
     pub(super) fn close_btw_pane(&mut self) {
+        self.async_actions
+            .abort_key(&crate::tui::async_action::AsyncActionKey::new(
+                "btw.transition",
+            ));
         self.btw_pane = None;
     }
 

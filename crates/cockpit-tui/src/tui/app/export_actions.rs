@@ -75,7 +75,7 @@ impl App {
         let file_stem = file_stem.to_string();
         let exports_dir = exports_dir.to_path_buf();
         self.async_actions.start(
-            AsyncActionKind::Internal(action),
+            AsyncActionKind::Blocking(action),
             AsyncActionPolicy::Replace(AsyncActionKey::new(EXPORT_ACTION_KEY)),
             async move {
                 export_via_attached_daemon(

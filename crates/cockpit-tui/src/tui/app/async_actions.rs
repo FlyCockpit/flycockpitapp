@@ -744,12 +744,12 @@ impl App {
                 Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("/curator: {e}")),
             },
-            AsyncActionKind::Internal("export.transcript") => match result.payload {
+            AsyncActionKind::Blocking("export.transcript") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
             },
-            AsyncActionKind::Internal("export.debug") => match result.payload {
+            AsyncActionKind::Blocking("export.debug") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export debug: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),

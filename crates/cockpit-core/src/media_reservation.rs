@@ -707,11 +707,56 @@ impl MediaReservationLedger {
     }
 
     pub async fn next_fair_candidate(&self) -> Result<Option<String>, LedgerError> {
-        self.db.transaction(|conn| {
+        self.db.read(|conn| {
             let last:Option<String>=conn.query_row("SELECT last_session_id FROM media_scheduler_cursor WHERE singleton=1",[],|r|r.get(0))?;
             let candidate:Option<(String,String)>=conn.query_row("WITH heads AS (SELECT owner_session_key,MIN(queue_sequence) sequence FROM media_reservations WHERE state='reserved_queued' GROUP BY owner_session_key) SELECT h.owner_session_key,r.reservation_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",[last.as_deref().unwrap_or("")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
-            if let Some((session,id))=candidate{conn.execute("UPDATE media_scheduler_cursor SET last_session_id=?1 WHERE singleton=1",[session])?;Ok(Some(id))}else{Ok(None)}
+            Ok(candidate.map(|(_, id)| id))
         }).await.map_err(LedgerError::Storage)
+    }
+
+    /// Atomically chooses and promotes one session-fair queue head.
+    ///
+    /// Selection, execution-cap acquisition, queue release, state/version
+    /// advancement, and cursor progress share one SQLite transaction. A
+    /// losing scheduler therefore cannot double-dispatch, and a denied global
+    /// execution cap leaves both the candidate and fairness cursor unchanged.
+    pub async fn claim_next_fair(
+        &self,
+        execution_dimension: MediaDimension,
+        wall_ms: u64,
+    ) -> Result<Option<ReservationReceipt>, LedgerError> {
+        if execution_dimension.scope_policy().charge != MediaCharge::AcquireAtPromotion {
+            return Err(LedgerError::InvalidTransition);
+        }
+        let dimension = dimension_name(execution_dimension);
+        let now = self.clock.now_ms();
+        self.db.transaction(move |conn| {
+            let last: Option<String> = conn.query_row(
+                "SELECT last_session_id FROM media_scheduler_cursor WHERE singleton=1", [], |row| row.get(0))?;
+            let candidate: Option<(String,String,u64,u64,String)> = conn.query_row(
+                "WITH heads AS (SELECT owner_session_key,MIN(queue_sequence) sequence FROM media_reservations WHERE state='reserved_queued' AND deadline_monotonic_ms>?2 GROUP BY owner_session_key) SELECT h.owner_session_key,r.reservation_id,r.version,r.deadline_monotonic_ms,r.project_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",
+                params![last.as_deref().unwrap_or(""), sqlite_i64(now)?],
+                |row| Ok((row.get(0)?, row.get(1)?, row_u64(row,2)?, row_u64(row,3)?, row.get(4)?)),
+            ).optional()?;
+            let Some((session,id,version,deadline,project)) = candidate else { return Ok(None); };
+            ensure_unblocked(conn, &project, &session)?;
+            let plan_json: String = conn.query_row(
+                "SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",
+                params![id, dimension], |row| row.get(0))?;
+            let plan: MediaReservationPlan = serde_json::from_str(&plan_json)?;
+            validate_mutation_policy(conn, &id, &plan)?;
+            let owner = MediaOwner { project_id: project, session_id: session.clone() };
+            let next_version = version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
+            acquire_plan(conn, &id, &owner, &plan, next_version, wall_ms)?;
+            release_queued(conn, &id, &owner, next_version, wall_ms)?;
+            let changed = conn.execute(
+                "UPDATE media_reservations SET state='executing_local',version=?1 WHERE reservation_id=?2 AND version=?3 AND state='reserved_queued'",
+                params![sqlite_i64(next_version)?, id, sqlite_i64(version)?])?;
+            if changed != 1 { return Err(anyhow!("stale_version")); }
+            conn.execute("UPDATE media_scheduler_cursor SET last_session_id=?1 WHERE singleton=1", [&session])?;
+            let sequence = conn.query_row("SELECT queue_sequence FROM media_reservations WHERE reservation_id=?1", [&id], |row| row_u64(row,0))?;
+            Ok(Some(ReservationReceipt { reservation_id:id, state:ReservationState::ExecutingLocal, version:next_version, queue_sequence:sequence, deadline_monotonic_ms:deadline }))
+        }).await.map_err(classify_storage_error)
     }
 }
 
@@ -1630,6 +1675,79 @@ mod tests {
                 Some("a1".into()),
                 Some("b1".into())
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_claims_make_progress_and_round_robin_sessions() {
+        let ledger = MediaReservationLedger::new(
+            Db::open_in_memory().unwrap(),
+            Arc::new(Clock(AtomicU64::new(0))),
+        );
+        let plans = || {
+            vec![
+                plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, Some(4)),
+                plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+            ]
+        };
+        for (id, session) in [("a1", "a"), ("a2", "a"), ("b1", "b"), ("b2", "b")] {
+            let mut value = request(id, plans());
+            value.owner.session_id = session.into();
+            ledger.reserve(value).await.unwrap();
+        }
+        let mut claimed = Vec::new();
+        for _ in 0..4 {
+            claimed.push(
+                ledger
+                    .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reservation_id,
+            );
+        }
+        assert_eq!(claimed, ["a1", "b1", "a2", "b2"]);
+        assert!(
+            ledger
+                .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_cap_denial_does_not_advance_or_drop_candidate() {
+        let ledger = MediaReservationLedger::new(
+            Db::open_in_memory().unwrap(),
+            Arc::new(Clock(AtomicU64::new(0))),
+        );
+        let plans = || {
+            vec![
+                plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, Some(1)),
+                plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+            ]
+        };
+        ledger.reserve(request("first", plans())).await.unwrap();
+        ledger.reserve(request("second", plans())).await.unwrap();
+        ledger
+            .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ledger
+                .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+                .await,
+            Err(LedgerError::Denied(_))
+        ));
+        assert_eq!(
+            ledger.next_fair_candidate().await.unwrap(),
+            Some("second".into())
         );
     }
 

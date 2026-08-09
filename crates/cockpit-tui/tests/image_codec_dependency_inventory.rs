@@ -493,6 +493,7 @@ fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
     provenance: Provenance,
+    expected_root: &str,
 ) -> (BTreeSet<String>, BTreeSet<EdgeFixture>) {
     let mut packages = BTreeSet::new();
     let mut edges = BTreeSet::new();
@@ -527,6 +528,9 @@ fn dependency_tree_graph(
             "cargo tree root cannot have a duplicate marker: {line}"
         );
         let package = tree_package_key(row);
+        if depth == 0 {
+            assert_eq!(package, expected_root, "cargo tree root package drift");
+        }
         packages.insert(package.clone());
         ancestors.truncate(depth);
         if let Some((parent, _)) = ancestors.last() {
@@ -546,7 +550,12 @@ fn dependency_tree_graph(
 #[test]
 #[should_panic(expected = "cargo tree graph is empty")]
 fn dependency_tree_graph_rejects_empty_graphs() {
-    dependency_tree_graph("", TargetTriple::Linux, Provenance::ImageDescendant);
+    dependency_tree_graph(
+        "",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+        "image@0.25.10",
+    );
 }
 
 #[test]
@@ -556,6 +565,7 @@ fn dependency_tree_graph_rejects_nonzero_first_depth() {
         "1image v0.25.10\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
+        "image@0.25.10",
     );
 }
 
@@ -566,6 +576,7 @@ fn dependency_tree_graph_rejects_multiple_roots() {
         "0image v0.25.10\n0png v0.18.0\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
+        "image@0.25.10",
     );
 }
 
@@ -576,6 +587,7 @@ fn dependency_tree_graph_rejects_depth_jumps() {
         "0image v0.25.10\n2png v0.18.0\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
+        "image@0.25.10",
     );
 }
 
@@ -586,6 +598,18 @@ fn dependency_tree_graph_requires_duplicate_markers_to_be_leaves() {
         "0image v0.25.10\n1png v0.18.0 (*)\n2miniz_oxide v0.8.0\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
+        "image@0.25.10",
+    );
+}
+
+#[test]
+#[should_panic(expected = "cargo tree root package drift")]
+fn dependency_tree_graph_requires_the_requested_root() {
+    dependency_tree_graph(
+        "0png v0.18.0\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+        "image@0.25.10",
     );
 }
 
@@ -823,7 +847,12 @@ fn tui_image_codec_dependency_inventory() {
         // package even though Cargo resolves and executes it for this graph.
         let dependency_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal,build", "{p}");
         let (graph_packages, graph_edges) =
-            dependency_tree_graph(&dependency_tree, target, Provenance::ImageDescendant);
+            dependency_tree_graph(
+                &dependency_tree,
+                target,
+                Provenance::ImageDescendant,
+                "image@0.25.10",
+            );
         let feature_tree = cargo_tree(workspace, triple, "image@0.25.10", "features", "{p}|{f}");
         let target_package_features =
             target_package_features(&feature_tree, &graph_packages, "image@0.25.10");
@@ -1001,7 +1030,12 @@ fn tui_image_codec_dependency_inventory() {
         }
 
         let tui_tree = cargo_tree(workspace, triple, "cockpit-tui", "normal", "{p}");
-        let (_, tui_edges) = dependency_tree_graph(&tui_tree, target, Provenance::TuiNormal);
+        let (_, tui_edges) = dependency_tree_graph(
+            &tui_tree,
+            target,
+            Provenance::TuiNormal,
+            "cockpit-tui@0.1.0",
+        );
         let observed_provenance = image_requester_subgraph(&tui_edges);
         let expected_provenance = expected
             .provenance_edges

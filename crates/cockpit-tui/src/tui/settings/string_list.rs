@@ -686,8 +686,8 @@ impl SettingsPage for StringListPage {
     }
 }
 
-fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{kind:?}:{index}:{value}"))
+fn string_list_row_id(kind: StringListKind, _index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{kind:?}:{value}"))
 }
 
 impl StringListPage {

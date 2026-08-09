@@ -862,8 +862,8 @@ fn render_grab_list(
     );
 }
 
-fn grab_list_row_id(key: &str, index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{key}:{index}:{value}"))
+fn grab_list_row_id(key: &str, _index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{key}:{value}"))
 }
 
 impl SettingsPage for InstructionsPage {

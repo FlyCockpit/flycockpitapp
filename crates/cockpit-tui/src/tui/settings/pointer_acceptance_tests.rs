@@ -66,7 +66,7 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
         SettingsPointerAction::Tools(ToolsAction::EditUserToolCommand(UserToolId("tool".into()))),
         SettingsPointerAction::Tools(ToolsAction::AddUserTool),
         SettingsPointerAction::Tools(ToolsAction::ToggleUserTool(UserToolId("tool".into()))),
-        SettingsPointerAction::Tools(ToolsAction::ResetToolField(ToolFieldId("field".into()))),
+        SettingsPointerAction::Tools(ToolsAction::ResetToolField(ToolFieldId::FirecrawlBaseUrl)),
         SettingsPointerAction::Tools(ToolsAction::McpJump),
         SettingsPointerAction::Tools(ToolsAction::Reset),
         SettingsPointerAction::Tools(ToolsAction::DeleteUserTool(UserToolId("tool".into()))),
@@ -621,6 +621,9 @@ fn settings_pointer_hover_and_help_are_truthful() {
 
 #[test]
 fn settings_pointer_action_registry_is_exhaustive_and_operable() {
+    super::tests::run_pointer_dialog_regression_matrix();
+    super::providers::tests::run_pointer_provider_regression_matrix();
+    super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
     let fixtures = fixture_actions();
     let surface = SettingsPointerSurface::default();
     surface.clear_for(Rect::new(0, 0, 80, fixtures.len() as u16));
@@ -654,6 +657,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
 
 #[test]
 fn settings_pointer_copilot_setup_is_explicit_and_exactly_once() {
+    super::providers::tests::copilot_setup_effect_accepts_only_its_live_operation_once();
     let mut gate = PointerOperationGate::default();
     let id = gate.begin();
     assert_eq!(gate.pending(), Some(id));
@@ -737,6 +741,7 @@ fn settings_pointer_header_navigation_is_complete() {
 
 #[test]
 fn settings_pointer_oauth_copy_actions_are_effect_safe() {
+    super::providers::tests::oauth_copy_completion_is_flow_scoped_and_exactly_once();
     let mut gate = PointerOperationGate::default();
     let live = gate.begin();
     assert!(!gate.complete(PointerOperationId(live.0 + 1)));

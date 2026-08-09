@@ -3274,7 +3274,7 @@ fn committed_entry_records_template_identity() {
 }
 
 #[test]
-fn copilot_setup_effect_accepts_only_its_live_operation_once() {
+pub(super) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
     struct Spy {
         calls: usize,
     }
@@ -3316,7 +3316,7 @@ fn copilot_setup_effect_accepts_only_its_live_operation_once() {
 }
 
 #[test]
-fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
+pub(super) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     let (flow_id, operation_id) = state.begin_copy_for_test();
     state.complete_copy(flow_id, operation_id, Ok("copied".into()));

@@ -667,7 +667,18 @@ impl SettingsCx {
                 ToolRow::UserTool(name) => ToolsAction::DeleteUserTool(UserToolId(name.clone())),
                 _ => return None,
             },
-            10_004 => ToolsAction::ResetToolField(ToolFieldId(format!("row:{}", p.cursor))),
+            10_004 => match selected? {
+                ToolRow::FirecrawlBaseUrl => {
+                    ToolsAction::ResetToolField(ToolFieldId::FirecrawlBaseUrl)
+                }
+                ToolRow::WebFetchCommand => {
+                    ToolsAction::ResetToolField(ToolFieldId::WebFetchCommand)
+                }
+                ToolRow::WebSearchCommand => {
+                    ToolsAction::ResetToolField(ToolFieldId::WebSearchCommand)
+                }
+                _ => return None,
+            },
             _ => match self.tools_page_rows().get(index)? {
                 ToolRow::WebProvider => ToolsAction::CycleWebProvider,
                 ToolRow::FirecrawlBaseUrl => ToolsAction::EditFirecrawlBaseUrl,
@@ -1104,7 +1115,23 @@ impl SettingsPage for ToolsPage {
             ToolsAction::DeleteUserTool(_) if self.delete_pending.is_none() => {
                 Some(KeyCode::Char('d'))
             }
-            ToolsAction::ResetToolField(_) => Some(KeyCode::Char('r')),
+            ToolsAction::ResetToolField(field) => {
+                let matches = matches!(
+                    (*field, cx.tools_page_rows().get(self.cursor)),
+                    (
+                        ToolFieldId::FirecrawlBaseUrl,
+                        Some(ToolRow::FirecrawlBaseUrl)
+                    ) | (ToolFieldId::WebFetchCommand, Some(ToolRow::WebFetchCommand))
+                        | (
+                            ToolFieldId::WebSearchCommand,
+                            Some(ToolRow::WebSearchCommand)
+                        )
+                );
+                if !matches {
+                    return Nav::Stay;
+                }
+                Some(KeyCode::Char('r'))
+            }
             _ => None,
         };
         if let Some(key) = key {

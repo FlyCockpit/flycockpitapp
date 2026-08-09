@@ -1347,7 +1347,7 @@ impl SettingsPage for AgentsPage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::fs;
@@ -2000,6 +2000,10 @@ mod tests {
         if let super::super::Dialog::Settings(s) = &mut outer {
             assert_ne!(page(s).status.as_deref(), Some("late duplicate"));
         }
+    }
+
+    pub(super) fn run_pointer_external_edit_exactly_once_regression() {
+        external_editor_request_is_drained_when_editor_set();
     }
 
     #[test]

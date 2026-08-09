@@ -26,8 +26,12 @@ pub(super) struct UtilityModelId(pub String);
 pub(super) struct RootNodeId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct StableRowId(pub String);
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct ToolFieldId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ToolFieldId {
+    FirecrawlBaseUrl,
+    WebFetchCommand,
+    WebSearchCommand,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct BuiltinToolId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

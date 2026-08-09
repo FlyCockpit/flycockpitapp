@@ -528,6 +528,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lowered_limit_trigger_fixture_proves_count_and_aggregate_byte_behavior() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ops (attachment TEXT NOT NULL, response BLOB);
+             CREATE TRIGGER ops_rows BEFORE INSERT ON ops
+             WHEN (SELECT COUNT(*) FROM ops WHERE attachment = NEW.attachment) >= 2
+             BEGIN SELECT RAISE(ABORT, 'attachment_ledger_capacity'); END;
+             CREATE TRIGGER ops_bytes BEFORE UPDATE OF response ON ops
+             WHEN (SELECT COALESCE(SUM(length(response)), 0) FROM ops WHERE attachment = NEW.attachment)
+                  - COALESCE(length(OLD.response), 0) + COALESCE(length(NEW.response), 0) > 8
+             BEGIN SELECT RAISE(ABORT, 'attachment_ledger_capacity'); END;
+             CREATE TABLE events (attachment TEXT NOT NULL, payload BLOB NOT NULL);
+             CREATE TRIGGER event_cap BEFORE INSERT ON events
+             WHEN (SELECT COUNT(*) FROM events WHERE attachment = NEW.attachment) >= 2
+               OR (SELECT COALESCE(SUM(length(payload)), 0) FROM events WHERE attachment = NEW.attachment)
+                  + length(NEW.payload) > 8
+             BEGIN SELECT RAISE(ABORT, 'attachment_outbox_capacity'); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
+                .is_err()
+        );
+        conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 1", [])
+            .unwrap();
+        conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 2", [])
+            .unwrap();
+        assert!(
+            conn.execute("UPDATE ops SET response = zeroblob(5) WHERE rowid = 2", [])
+                .is_err()
+        );
+        conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
+            .unwrap();
+        conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO events VALUES ('a', zeroblob(1))", [])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_single_response_and_event_over_512_kib() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000098";
+        db.reserve_remote_attachment_operation(reserve(operation, [8; 32]))
+            .await
+            .unwrap();
+        let oversized = vec![0_u8; MAX_SAFE_RESPONSE_BYTES + 1];
+        assert!(
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: ATTACHMENT,
+                operation_id: operation,
+                safe_response: &oversized,
+                outbox_delivery_id: "00000000-0000-4000-8000-000000000098",
+                outbox_kind: "oversized",
+                outbox_payload: b"event",
+                now_ms: 2,
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: ATTACHMENT,
+                operation_id: operation,
+                safe_response: b"safe",
+                outbox_delivery_id: "00000000-0000-4000-8000-000000000098",
+                outbox_kind: "oversized",
+                outbox_payload: &oversized,
+                now_ms: 2,
+            })
+            .await
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn schema_rejects_malformed_nil_wrong_version_and_extra_hyphen_ids() {
         for (index, operation_id) in [
@@ -672,6 +754,97 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn direct_sql_guards_every_operation_and_outbox_mutation_axis() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000030";
+        let reserved_operation = "01890f3e-4c00-7000-8000-000000000032";
+        db.reserve_remote_attachment_operation(reserve(operation, [3; 32]))
+            .await
+            .unwrap();
+        db.reserve_remote_attachment_operation(reserve(reserved_operation, [4; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"original",
+            outbox_delivery_id: "00000000-0000-4000-8000-000000000031",
+            outbox_kind: "committed",
+            outbox_payload: b"event",
+            now_ms: 20,
+        })
+        .await
+        .unwrap();
+        let attachment = ATTACHMENT.to_owned();
+        let operation = operation.to_owned();
+        let reserved_operation = reserved_operation.to_owned();
+        db.write(move |conn| {
+            let operation_updates = [
+                "authenticated_device_id = '00000000-0000-4000-8000-000000000099'",
+                "request_hash = zeroblob(32)",
+                "operation_class = 'nonrepeatable_mutation'",
+                "operation_seq = 2",
+                "dispatch_generation = -1",
+                "updated_at_ms = 19",
+                "event_high_water_mark = 0",
+                "safe_response = X'02'",
+                "safe_response = NULL",
+            ];
+            for assignment in operation_updates {
+                let sql = format!(
+                    "UPDATE remote_attachment_operations SET {assignment}
+                     WHERE logical_attachment_id = ?1 AND operation_id = ?2"
+                );
+                assert!(
+                    conn.execute(&sql, params![attachment, operation]).is_err(),
+                    "guard accepted {assignment}"
+                );
+            }
+            conn.execute(
+                "UPDATE remote_attachment_operations SET dispatch_generation = 2, updated_at_ms = 21
+                 WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                params![attachment, reserved_operation],
+            )?;
+            assert!(conn.execute(
+                "UPDATE remote_attachment_operations SET dispatch_generation = 1, updated_at_ms = 22
+                 WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                params![attachment, reserved_operation],
+            ).is_err());
+            conn.execute(
+                "UPDATE remote_attachment_operations SET retire_at_ms = 100
+                 WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                params![attachment, operation],
+            )?;
+            for retire in ["retire_at_ms = NULL", "retire_at_ms = 101"] {
+                let sql = format!(
+                    "UPDATE remote_attachment_operations SET {retire}
+                     WHERE logical_attachment_id = ?1 AND operation_id = ?2"
+                );
+                assert!(conn.execute(&sql, params![attachment, operation]).is_err());
+            }
+            assert!(
+                conn.execute(
+                    "UPDATE remote_attachment_outbox SET kind = 'changed'
+                 WHERE logical_attachment_id = ?1 AND event_seq = 1",
+                    [&attachment],
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    "DELETE FROM remote_attachment_outbox
+                 WHERE logical_attachment_id = ?1 AND event_seq = 1",
+                    [&attachment],
+                )
+                .is_err()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -2793,6 +2793,12 @@ BEGIN
     SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
 END;
 
+CREATE TRIGGER remote_attachment_outbox_delete_forbidden
+BEFORE DELETE ON remote_attachment_outbox
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
+END;
+
 CREATE TABLE remote_attachment_outbox_snapshots (
     logical_attachment_id       TEXT PRIMARY KEY CHECK (
         length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)

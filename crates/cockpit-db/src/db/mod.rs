@@ -1240,6 +1240,34 @@ mod tests {
     }
 
     #[test]
+    fn media_ledger_is_an_append_only_upgrade_for_existing_v2_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, &MIGRATIONS[..2]).unwrap();
+        let existing_checksums = conn
+            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        migrate_with(&conn, MIGRATIONS).unwrap();
+
+        let upgraded_checksums = conn
+            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(&upgraded_checksums[..2], existing_checksums);
+        assert_eq!(upgraded_checksums.len(), 3);
+        assert_eq!(current_schema_version(&conn).unwrap(), 3);
+        conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
     fn newer_database_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();

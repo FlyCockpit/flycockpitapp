@@ -342,20 +342,28 @@ impl MediaReservationLedger {
     }
 
     /// Releases abandoned daemon uploads whose only storage was process
-    /// memory. The operation discriminator and queued state are durable proof
-    /// that no ready/published artifact existed; all other operation kinds and
-    /// states remain blocked for their owner-specific recovery path.
+    /// memory. The operation discriminator, absence of artifact facts, and a
+    /// pre-publication state are durable proof that no ready/published artifact
+    /// existed. Executing uploads lost their decoder task with the daemon
+    /// process, so cancellation plus a zero-materialized cleanup attestation is
+    /// truthful for them. All other operation kinds and states remain blocked
+    /// for their owner-specific recovery path.
     pub async fn recover_ephemeral_attachment_uploads(
         &self,
         wall_ms: u64,
     ) -> Result<u64, LedgerError> {
         let rows = self.db.read(|conn| {
-            let mut statement=conn.prepare("SELECT reservation_id,version FROM media_reservations r WHERE operation='attachment_upload' AND state='reserved_queued' AND external_operation_id IS NULL AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)")?;
-            Ok(statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+            let mut statement=conn.prepare("SELECT reservation_id,version,state FROM media_reservations r WHERE operation='attachment_upload' AND state IN ('reserved_queued','executing_local') AND external_operation_id IS NULL AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)")?;
+            Ok(statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
         }).await.map_err(LedgerError::Storage)?;
         let mut recovered = 0_u64;
-        for (id, version) in rows {
-            self.request_cancellation(&id, version, wall_ms).await?;
+        for (id, version, state) in rows {
+            let cancelled = self.request_cancellation(&id, version, wall_ms).await?;
+            if ReservationState::parse(&state)? == ReservationState::ExecutingLocal {
+                let checksum = format!("restart-in-memory-attachment-destroyed:{id}");
+                self.destroy_local_artifacts(&id, cancelled.version, &checksum, wall_ms)
+                    .await?;
+            }
             recovered = recovered.checked_add(1).ok_or(LedgerError::Overflow)?;
         }
         Ok(recovered)
@@ -1770,7 +1778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_releases_only_provably_ephemeral_queued_uploads() {
+    async fn restart_releases_only_provably_ephemeral_uploads() {
         let ledger = MediaReservationLedger::new(
             Db::open_in_memory().unwrap(),
             Arc::new(Clock(AtomicU64::new(0))),
@@ -1779,6 +1787,7 @@ mod tests {
             vec![
                 plan(MediaDimension::QueuedOperationsGlobal, 1, None),
                 plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
                 plan(MediaDimension::EncodedBytesPerObject, 4, None),
                 plan(MediaDimension::RetainedBytesPerSession, 4, None),
                 plan(MediaDimension::OperationDeadlineSeconds, 10, None),
@@ -1787,6 +1796,18 @@ mod tests {
         let mut upload = request("ephemeral-upload", plans());
         upload.operation = "attachment_upload".into();
         ledger.reserve(upload).await.unwrap();
+        let mut executing = request("executing-upload", plans());
+        executing.operation = "attachment_upload".into();
+        let executing = ledger.reserve(executing).await.unwrap();
+        ledger
+            .promote(
+                &executing.reservation_id,
+                executing.version,
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                1,
+            )
+            .await
+            .unwrap();
         ledger
             .reserve(request("other-media", plans()))
             .await
@@ -1796,7 +1817,7 @@ mod tests {
                 .recover_ephemeral_attachment_uploads(2)
                 .await
                 .unwrap(),
-            1
+            2
         );
         assert!(
             !ledger.recovery_complete().await.unwrap(),
@@ -1804,6 +1825,10 @@ mod tests {
         );
         assert!(matches!(
             ledger.request_cancellation("ephemeral-upload", 1, 3).await,
+            Err(LedgerError::StaleVersion) | Err(LedgerError::InvalidTransition)
+        ));
+        assert!(matches!(
+            ledger.request_cancellation("executing-upload", 3, 3).await,
             Err(LedgerError::StaleVersion) | Err(LedgerError::InvalidTransition)
         ));
     }

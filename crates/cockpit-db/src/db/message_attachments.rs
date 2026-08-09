@@ -241,3 +241,135 @@ fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) 
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Allow;
+    impl MessageAcceptanceJoin for Allow {
+        fn validate_and_join(&self, _: &Connection, _: &AcceptMessageInput) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn input(session_id: Uuid) -> AcceptMessageInput {
+        AcceptMessageInput {
+            session_id,
+            operation_id: [1; 16],
+            actor: MessageActor::LocalOwner,
+            request_hash: [2; 32],
+            message_request_digest: [3; 32],
+            attachment_set_digest: [4; 32],
+            client_submission_id: [5; 16],
+            queue_item_id: [6; 16],
+            canonical_message: b"FCM2".to_vec(),
+            attachments: vec![MessageAttachmentReferenceInput {
+                attachment_id: [7; 16],
+                attachment_version: u64::MAX,
+                checksum: [8; 32],
+                kind: 2,
+            }],
+            safe_outcome: b"accepted".to_vec(),
+            outbox_sequence: 1,
+            now_ms: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn message_attachment_exactly_once_accept_replay_conflict_and_release() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let original = input(session.session_id);
+        assert_eq!(
+            db.accept_message_with_attachments(original.clone(), Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Accepted
+        );
+        assert_eq!(
+            db.accept_message_with_attachments(original.clone(), Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Replayed {
+                safe_outcome: b"accepted".to_vec()
+            }
+        );
+        let mut changed = original.clone();
+        changed.request_hash[0] ^= 1;
+        assert_eq!(
+            db.accept_message_with_attachments(changed, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
+        assert_eq!(
+            db.message_attachment_receipts(session.session_id, original.client_submission_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            db.terminate_accepted_message(
+                session.session_id,
+                original.client_submission_id,
+                TerminalMessageState::Removed,
+                b"removed".to_vec(),
+                11
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.terminate_accepted_message(
+                session.session_id,
+                original.client_submission_id,
+                TerminalMessageState::Removed,
+                b"removed".to_vec(),
+                12
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.accept_message_with_attachments(original, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Replayed {
+                safe_outcome: b"removed".to_vec()
+            }
+        );
+    }
+
+    struct Deny;
+    impl MessageAcceptanceJoin for Deny {
+        fn validate_and_join(&self, _: &Connection, _: &AcceptMessageInput) -> Result<()> {
+            anyhow::bail!("capability changed")
+        }
+    }
+
+    #[tokio::test]
+    async fn message_attachment_cleanup_race_denial_leaves_no_partial_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let input = input(session.session_id);
+        assert!(
+            db.accept_message_with_attachments(input.clone(), Arc::new(Deny))
+                .await
+                .is_err()
+        );
+        assert!(
+            db.message_attachment_receipts(session.session_id, input.client_submission_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

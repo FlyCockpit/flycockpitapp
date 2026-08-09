@@ -195,6 +195,131 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     copilot_setup_effect_accepts_only_its_live_operation_once();
     oauth_copy_completion_is_flow_scoped_and_exactly_once();
     pointer_enabled_list_and_edit_actions_dispatch_through_dialog();
+    pointer_headers_surface_dispatches_every_enabled_control();
+    pointer_reachable_nested_surfaces_render_and_dispatch();
+}
+
+fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
+    let (tmp, mut dialog) = dialog_with_config(config);
+    let entry = dialog.config.providers["p"].clone();
+    dialog.page =
+        super::super::providers_page(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+    (tmp, dialog)
+}
+
+fn descend_provider(
+    dialog: &mut SettingsDialog,
+    matches: impl Fn(&super::super::pointer_actions::ProvidersAction) -> bool,
+) {
+    let _ = render_provider_rows(dialog, 110, 60);
+    let target = dialog.pointer_surface.targets.borrow().iter().find(|target| {
+        matches!(&target.action, super::super::shell::SettingsPointerAction::Page(super::super::pointer_actions::SettingsPointerAction::Providers(action)) if target.enabled && matches(action))
+    }).cloned().expect("nested provider source action");
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            kind,
+            target.rect.x,
+            target.rect.y,
+        ));
+    }
+}
+
+#[test]
+fn pointer_reachable_nested_surfaces_render_and_dispatch() {
+    use super::super::pointer_actions::ProvidersAction;
+    let config = one_provider_config(None);
+    for path in [0, 1, 2, 3] {
+        let (_tmp, mut dialog) = edit_fixture(config.clone());
+        match path {
+            0 => descend_provider(&mut dialog, |action| {
+                matches!(action, ProvidersAction::ManageModels(_))
+            }),
+            1 => descend_provider(&mut dialog, |action| {
+                matches!(action, ProvidersAction::ProviderSettings(_))
+            }),
+            2 => {
+                descend_provider(&mut dialog, |action| {
+                    matches!(action, ProvidersAction::ManageModels(_))
+                });
+                descend_provider(&mut dialog, |action| {
+                    matches!(action, ProvidersAction::ModelSettings(_, _))
+                });
+            }
+            3 => descend_provider(&mut dialog, |action| {
+                matches!(action, ProvidersAction::DeepFetchConfirm(_, _))
+            }),
+            _ => unreachable!(),
+        }
+        let _ = render_provider_rows(&dialog, 110, 60);
+        let actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ super::super::pointer_actions::SettingsPointerAction::Providers(_),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Each nested source is real and rendered. Its actions are covered by
+        // the dedicated editor matrices; this traversal makes the concrete
+        // variant itself part of the strict surface inventory.
+        assert!(
+            !actions.is_empty(),
+            "nested provider surface {path} has no enabled controls"
+        );
+    }
+}
+
+fn headers_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
+    let (tmp, mut dialog) = dialog_with_config(config);
+    let entry = dialog.config.providers["p"].clone();
+    dialog.page = super::super::providers_page(ProvidersPage::Headers {
+        editor: HeaderEditor::new(
+            vec![HeaderSpec {
+                name: "X-Test".into(),
+                value: "one".into(),
+            }],
+            false,
+        ),
+        parent: Box::new(EditState::new("p".into(), entry)),
+    });
+    (tmp, dialog)
+}
+
+#[test]
+fn pointer_headers_surface_dispatches_every_enabled_control() {
+    let config = one_provider_config(None);
+    let (_tmp, source) = headers_fixture(config.clone());
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(_),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!actions.is_empty(), "Headers must render enabled controls");
+    for action in actions {
+        let (_tmp, mut dialog) = headers_fixture(config.clone());
+        click_rendered_provider_action(&mut dialog, &action);
+    }
 }
 
 fn click_rendered_provider_action(

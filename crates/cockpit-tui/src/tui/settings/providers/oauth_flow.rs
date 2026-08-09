@@ -407,6 +407,7 @@ pub(crate) struct OAuthFlowState {
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
     copy_operation: super::super::shell::PointerOperationGate,
+    effects: OAuthEffects,
 }
 
 impl OAuthFlowState {
@@ -421,6 +422,16 @@ impl OAuthFlowState {
     pub(crate) fn new_with_acknowledgement_for_test(provider: OAuthProvider) -> Self {
         let mut state = Self::new(provider);
         state.acknowledgement_required = true;
+        state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_acknowledgement_with_effects_for_test(
+        provider: OAuthProvider,
+        effects: OAuthEffects,
+    ) -> Self {
+        let mut state = Self::new_with_effects(provider, effects);
+        state.acknowledgement_required = false;
         state
     }
 
@@ -474,7 +485,31 @@ impl OAuthFlowState {
             spinner_tick: 0,
             acknowledgement_required: acknowledgement_required(provider),
             copy_operation: super::super::shell::PointerOperationGate::default(),
+            effects,
         }
+    }
+
+    pub(super) fn submit_pointer_copy(
+        &mut self,
+        flow_id: OAuthFlowId,
+        kind: super::super::pointer_actions::OAuthCopyKind,
+    ) -> bool {
+        if self.flow_id != flow_id {
+            return false;
+        }
+        let value = match kind {
+            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
+                self.authorize_url().map(ToOwned::to_owned)
+            }
+            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
+                self.device_login().map(|login| login.user_code.clone())
+            }
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        self.submit_copy(Some(&value), None, self.effects);
+        true
     }
 
     pub(super) fn complete_copy(

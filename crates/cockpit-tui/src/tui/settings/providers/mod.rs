@@ -3026,14 +3026,9 @@ impl SettingsCx {
             wrap_oauth_render_lines_with_controls(lines, controls, area.width);
         let link_regions = prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
             .unwrap_or_default();
-        let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states.render_bound_lines(
-            frame,
-            area,
-            "providers:oauth-setup",
-            lines,
-            selected_line,
-            controls.into_iter().filter_map(|(line, control)| {
+        let mut bindings = controls
+            .into_iter()
+            .filter_map(|(line, control)| {
                 oauth_options(s, OAuthHost::Standalone)
                     .get(control)
                     .map(|option| {
@@ -3047,7 +3042,28 @@ impl SettingsCx {
                             ),
                         )
                     })
-            }),
+            })
+            .collect::<Vec<_>>();
+        if s.authorize_url().is_some() {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::CopyOAuth(
+                        s.flow_id,
+                        super::pointer_actions::OAuthCopyKind::AuthorizationUrl,
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[copy authorization URL]"));
+        }
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:oauth-setup",
+            lines,
+            selected_line,
+            bindings,
             &self.pointer_surface,
             SettingsScrollRegionId("providers:oauth-setup"),
         );
@@ -5096,6 +5112,14 @@ impl SettingsPage for ProvidersPage {
                 }
                 return cx.handle_providers_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
             }
+        }
+        if let (
+            ProvidersPage::OAuthSetup { state, .. },
+            super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, kind),
+        ) = (&mut *self, &provider_action)
+        {
+            state.submit_pointer_copy(*flow_id, *kind);
+            return Nav::Stay;
         }
         if let (
             ProvidersPage::ModelSettings { editor, parent, .. },

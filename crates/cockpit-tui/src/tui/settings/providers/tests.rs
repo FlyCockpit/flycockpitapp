@@ -6217,6 +6217,46 @@ pub(crate) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
 
 #[test]
 pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
+    use super::super::pointer_actions::{OAuthCopyKind, ProvidersAction, SettingsPointerAction};
+
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
+    let mut visible = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+        OAuthProvider::Grok,
+        fake_oauth_effects(),
+    );
+    visible.set_browser_session_for_test("https://example.test/oauth");
+    let visible_flow_id = visible.flow_id;
+    dialog.page = super::super::providers_page(standalone_oauth_page(OAuthProvider::Grok, visible));
+    let _ = render_provider_rows(&dialog, 110, 60);
+    let action = SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+        visible_flow_id,
+        OAuthCopyKind::AuthorizationUrl,
+    ));
+    assert_eq!(
+        super::super::pointer_action_fixtures::key_for(&action),
+        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+            super::super::pointer_action_fixtures::ProvidersFixture::CopyAuthorizationUrl,
+        )
+    );
+    click_rendered_provider_action(&mut dialog, &action);
+    assert_eq!(
+        oauth_effects_log(),
+        vec!["copy:https://example.test/oauth".to_string()]
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+            if state.flow_id == visible_flow_id
+                && state.status.as_ref().is_some_and(|status| {
+                    status.as_ref().is_ok_and(|message| message.contains("copied OAuth URL"))
+                })
+    ));
+    drop(tmp);
+
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     let (flow_id, operation_id) = state.begin_copy_for_test();
     state.complete_copy(flow_id, operation_id, Ok("copied".into()));

@@ -293,6 +293,8 @@ impl MediaStorageRecovery {
             before == after && actual_len == total && actual_sha == expected,
             "finalize object checksum mismatch"
         );
+        let (canonical_container, canonical_mime) =
+            probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
         let storage_id = Uuid::now_v7();
         let target = storage_id.to_string();
         self.owned_root
@@ -310,12 +312,7 @@ impl MediaStorageRecovery {
         drop(reopened);
         let attachment = Uuid::now_v7();
         let component = Uuid::now_v7();
-        let media_kind = match snapshot.6.as_str() {
-            "image" => MediaKind::Image,
-            "audio" => MediaKind::Audio,
-            "video" => MediaKind::Video,
-            _ => anyhow::bail!("invalid upload media kind"),
-        };
+        let media_kind = media_kind_from_text(&snapshot.6)?;
         let next = generation
             .checked_add(1)
             .context("upload generation overflow")?;
@@ -334,8 +331,8 @@ impl MediaStorageRecovery {
             canonical_project_digest: project.clone(),
             media_kind,
             source_kind: MediaSourceKind::AuthenticatedSessionUpload,
-            canonical_container: "pending_probe".into(),
-            canonical_mime: "application/octet-stream".into(),
+            canonical_container: canonical_container.into(),
+            canonical_mime: canonical_mime.into(),
             availability: MediaAvailability::Quarantined,
             attachment_version: 1,
             availability_generation: 1,
@@ -1023,6 +1020,43 @@ pub(crate) fn media_upload_reservation_digest(
     )
 }
 
+fn media_kind_from_text(value: &str) -> Result<MediaKind> {
+    match value {
+        "image" => Ok(MediaKind::Image),
+        "audio" => Ok(MediaKind::Audio),
+        "video" => Ok(MediaKind::Video),
+        _ => anyhow::bail!("invalid upload media kind"),
+    }
+}
+
+/// Byte-authoritative first-stage classification. Containers whose identity
+/// also depends on stream evidence remain rejected until bounded FFprobe and
+/// full decode-to-null have supplied that evidence.
+fn probe_upload_container(
+    file: &mut File,
+    declared: MediaKind,
+) -> Result<(&'static str, &'static str)> {
+    let mut header = [0u8; 32];
+    file.seek(SeekFrom::Start(0))?;
+    let read = file.read(&mut header)?;
+    file.seek(SeekFrom::Start(0))?;
+    let bytes = &header[..read];
+    let classified = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some((MediaKind::Image, "png", "image/png"))
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some((MediaKind::Image, "jpeg", "image/jpeg"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some((MediaKind::Image, "gif", "image/gif"))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some((MediaKind::Image, "webp", "image/webp"))
+    } else {
+        None
+    };
+    let (kind, container, mime) = classified.context("ambiguous_or_unsupported_container")?;
+    ensure!(kind == declared, "ambiguous_or_unsupported_container");
+    Ok((container, mime))
+}
+
 fn modified_ns(metadata: &std::fs::Metadata) -> Result<u128> {
     Ok(metadata
         .modified()?
@@ -1434,6 +1468,29 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn upload_container_probe_is_byte_authoritative_and_kind_exact() {
+        for (bytes, container, mime) in [
+            (&b"\x89PNG\r\n\x1a\n"[..], "png", "image/png"),
+            (&b"\xff\xd8\xff\xe0"[..], "jpeg", "image/jpeg"),
+            (&b"GIF89a"[..], "gif", "image/gif"),
+            (&b"RIFF\x04\0\0\0WEBP"[..], "webp", "image/webp"),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            assert_eq!(
+                probe_upload_container(&mut file, MediaKind::Image).unwrap(),
+                (container, mime)
+            );
+        }
+        let mut wrong_kind = tempfile::tempfile().unwrap();
+        wrong_kind.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        assert!(probe_upload_container(&mut wrong_kind, MediaKind::Audio).is_err());
+        let mut caller_claim = tempfile::tempfile().unwrap();
+        caller_claim.write_all(b"photo.png").unwrap();
+        assert!(probe_upload_container(&mut caller_claim, MediaKind::Image).is_err());
+    }
+
     #[tokio::test]
     async fn local_path_registration_reserves_atomically_replays_and_conflicts() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1568,7 +1625,9 @@ mod tests {
         let recovery =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
-        let plans = local_path_plans(&policy, 7).unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\n";
+        let byte_length = bytes.len() as u64;
+        let plans = local_path_plans(&policy, byte_length).unwrap();
         let reservation_digest = digest_json(b"media-upload-reservation-v1", &plans).unwrap();
         let request = LocalMediaMutationV1 {
             schema_version: 1,
@@ -1581,7 +1640,7 @@ mod tests {
                 canonical_project_digest: "22".repeat(32),
                 client_draft_id: Uuid::now_v7(),
                 media_kind: RequestedLocalPathMediaKind::Image,
-                declared_total_bytes: 7,
+                declared_total_bytes: byte_length,
                 reservation_digest,
             },
         };
@@ -1627,7 +1686,7 @@ mod tests {
         else {
             unreachable!()
         };
-        *declared_total_bytes = 6;
+        *declared_total_bytes = byte_length - 1;
         assert!(
             recovery
                 .begin_media_upload(conflict, &policy, 4, 13)
@@ -1636,7 +1695,6 @@ mod tests {
                 .to_string()
                 .contains("conflict")
         );
-        let bytes = b"content";
         let append = cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
             mutation: LocalMediaMutationV1 {
                 schema_version: 1,
@@ -1651,7 +1709,7 @@ mod tests {
                     upload_id,
                     upload_generation: 1,
                     chunk_index: 0,
-                    chunk_length: 7,
+                    chunk_length: byte_length as u32,
                     chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
                 },
             },
@@ -1698,7 +1756,7 @@ mod tests {
             std::fs::metadata(temp.path().join("media").join(&temporary_storage))
                 .unwrap()
                 .len(),
-            7
+            byte_length
         );
         let cancel = LocalMediaMutationV1 {
             schema_version: 1,
@@ -1772,7 +1830,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(status.acknowledged_bytes, 7);
+        assert_eq!(status.acknowledged_bytes, byte_length);
         assert_eq!(status.expires_at_unix_ms, 86_400_010);
         assert!(matches!(
             status.detail,
@@ -1792,10 +1850,10 @@ mod tests {
                 canonical_project_digest: "22".repeat(32),
                 client_draft_id: second_draft,
                 media_kind: RequestedLocalPathMediaKind::Image,
-                declared_total_bytes: 7,
+                declared_total_bytes: byte_length,
                 reservation_digest: digest_json(
                     b"media-upload-reservation-v1",
-                    &local_path_plans(&policy, 7).unwrap(),
+                    &local_path_plans(&policy, byte_length).unwrap(),
                 )
                 .unwrap(),
             },
@@ -1819,7 +1877,7 @@ mod tests {
                     upload_id: second_upload,
                     upload_generation: 1,
                     chunk_index: 0,
-                    chunk_length: 7,
+                    chunk_length: byte_length as u32,
                     chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
                 },
             },
@@ -1842,7 +1900,7 @@ mod tests {
                 upload_id: second_upload,
                 upload_generation: 2,
                 chunk_count: 1,
-                total_bytes: 7,
+                total_bytes: byte_length,
                 object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
             },
         };
@@ -2001,7 +2059,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(finalized_status.acknowledged_bytes, 7);
+        assert_eq!(finalized_status.acknowledged_bytes, byte_length);
         assert!(matches!(
             finalized_status.detail,
             cockpit_db::media_attachments::MediaUploadStateDetailV1::Materialized {
@@ -2009,6 +2067,17 @@ mod tests {
                 attachment_version: 1,
             }
         ));
+        let canonical: (String, String) = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT canonical_container,canonical_mime FROM media_attachments",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(canonical, ("png".into(), "image/png".into()));
         let counts = db
             .read(|conn| {
                 Ok((

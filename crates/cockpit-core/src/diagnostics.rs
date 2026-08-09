@@ -991,6 +991,8 @@ fn compose_doctor_integration_health(
     cwd: &Path,
     harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
     sandbox_enabled: bool,
+    cancel: &crate::external_runtime::CancelToken,
+    observer: impl FnMut(&crate::external_runtime::ExternalRuntimeSnapshot),
 ) -> Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>> {
     let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
         harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
@@ -1038,8 +1040,10 @@ fn compose_doctor_integration_health(
                 &server.args,
             ));
     }
-    crate::external_runtime::compose_settings_doctor_health(cwd, &compose)
-        .map_err(anyhow::Error::new)
+    crate::external_runtime::compose_settings_doctor_health_for_invocation(
+        cwd, &compose, cancel, observer,
+    )
+    .map_err(anyhow::Error::new)
 }
 
 /// Bounded, daemon-independent dependency snapshot used by CLI doctor and the
@@ -1057,7 +1061,13 @@ pub fn dependency_projection_with_deadline_for_run(
     deadline: Duration,
     sandbox_enabled: bool,
 ) -> Result<crate::external_runtime::DependencyProjection> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    enum WorkerUpdate {
+        Progress(crate::external_runtime::ExternalRuntimeSnapshot),
+        Complete(Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>>),
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(crate::external_runtime::CancelToken::new());
+    let worker_cancel = cancel.clone();
     let worker_cwd = cwd.clone();
     let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
     let selected_harnesses: std::collections::BTreeSet<String> = harnesses
@@ -1071,59 +1081,80 @@ pub fn dependency_projection_with_deadline_for_run(
     std::thread::Builder::new()
         .name("dependency-doctor".into())
         .spawn(move || {
-            let result =
-                compose_doctor_integration_health(&worker_cwd, &harnesses, sandbox_enabled).map(
-                    |snapshot| {
-                        crate::external_runtime::project_dependencies(
-                            Some(snapshot.as_ref()),
-                            &crate::external_runtime::global_registry().descriptors(),
-                        )
-                    },
-                );
-            let _ = tx.send(result);
+            let progress_tx = tx.clone();
+            let result = compose_doctor_integration_health(
+                &worker_cwd,
+                &harnesses,
+                sandbox_enabled,
+                &worker_cancel,
+                move |snapshot| {
+                    let _ = progress_tx.send(WorkerUpdate::Progress(snapshot.clone()));
+                },
+            );
+            let _ = tx.send(WorkerUpdate::Complete(result));
         })
         .context("starting dependency diagnostics worker")?;
-    match rx.recv_timeout(deadline) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let descriptors = crate::external_runtime::global_registry().descriptors();
-            let platform = crate::external_runtime::detect_host_platform();
-            let next_generation = crate::external_runtime::global_health_store()
-                .current()
-                .map_or(1, |value| value.generation.saturating_add(1));
-            let mut snapshot =
-                crate::external_runtime::ExternalRuntimeSnapshot::empty(next_generation, platform);
-            for descriptor in &descriptors {
-                snapshot
-                    .entries
-                    .entry(descriptor.id.as_str().to_owned())
-                    .or_insert_with(|| crate::external_runtime::HealthEntry {
-                        id: descriptor.id.clone(),
-                        state: if dependency_descriptor_applicable(
-                            descriptor,
-                            &cwd,
-                            platform,
-                            sandbox_enabled,
-                            &selected_harnesses,
-                        ) {
-                            crate::external_runtime::HealthState::Pending
-                        } else {
-                            crate::external_runtime::HealthState::NotApplicable
-                        },
-                        importance: descriptor.importance,
-                        target: descriptor.target,
-                        remedy: Some(descriptor.remedy.clone()),
-                        platform,
-                    });
+    let expires = std::time::Instant::now() + deadline;
+    let mut latest = None;
+    loop {
+        let remaining = expires.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(WorkerUpdate::Progress(snapshot)) => {
+                latest = Some(snapshot);
+                continue;
             }
-            let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
-            Ok(crate::external_runtime::project_dependencies(
-                Some(&snapshot),
-                &descriptors,
-            ))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("dependency diagnostics worker disconnected")
+            Ok(WorkerUpdate::Complete(result)) => {
+                let snapshot = result?;
+                return Ok(crate::external_runtime::project_dependencies(
+                    Some(snapshot.as_ref()),
+                    &crate::external_runtime::global_registry().descriptors(),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                cancel.cancel();
+                let descriptors = crate::external_runtime::global_registry().descriptors();
+                let platform = crate::external_runtime::detect_host_platform();
+                let next_generation = crate::external_runtime::global_health_store()
+                    .current()
+                    .map_or(1, |value| value.generation.saturating_add(1));
+                let mut snapshot = latest.unwrap_or_else(|| {
+                    crate::external_runtime::ExternalRuntimeSnapshot::empty(
+                        next_generation,
+                        platform,
+                    )
+                });
+                for descriptor in &descriptors {
+                    snapshot
+                        .entries
+                        .entry(descriptor.id.as_str().to_owned())
+                        .or_insert_with(|| crate::external_runtime::HealthEntry {
+                            id: descriptor.id.clone(),
+                            state: if dependency_descriptor_applicable(
+                                descriptor,
+                                &cwd,
+                                platform,
+                                sandbox_enabled,
+                                &selected_harnesses,
+                            ) {
+                                crate::external_runtime::HealthState::Pending
+                            } else {
+                                crate::external_runtime::HealthState::NotApplicable
+                            },
+                            importance: descriptor.importance,
+                            target: descriptor.target,
+                            remedy: Some(descriptor.remedy.clone()),
+                            platform,
+                        });
+                }
+                let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
+                return Ok(crate::external_runtime::project_dependencies(
+                    Some(&snapshot),
+                    &descriptors,
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("dependency diagnostics worker disconnected");
+            }
         }
     }
 }

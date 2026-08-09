@@ -20,6 +20,7 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use adapters::compose_settings_doctor_health_for_invocation;
 pub use adapters::{
     ConfiguredCommandInput, GhAuthState, ID_ACCEL_FD, ID_ACCEL_GSED, ID_ACCEL_RG, ID_GH, ID_GIT,
     ID_HARNESS_CLAUDE, ID_HARNESS_CODEX, ID_HARNESS_GEMINI, ID_HARNESS_OPENCODE, ID_JQ_EXTERNAL,
@@ -53,8 +54,8 @@ pub use probe::{
 pub use projection::{
     DEPENDENCY_HEADLESS_SCHEMA_VERSION, DependenciesPageState, DependencyProjection,
     DependencyProjectionRow, DependencyStartupPolicy, DependencyViewState,
-    current_startup_dependency_policy, freeze_pending_as_timed_out, project_dependencies,
-    startup_dependency_policy,
+    current_dependency_context_line, current_startup_dependency_policy,
+    freeze_pending_as_timed_out, project_dependencies, startup_dependency_policy,
 };
 pub use safety_adapters::{
     ContainerEngineMode, ContainerEngineSelection, ContainerRuntime as SafetyContainerRuntime,

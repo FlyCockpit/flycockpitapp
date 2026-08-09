@@ -944,6 +944,34 @@ pub fn refresh_snapshot(
     deadlines: ProbeDeadlines,
     cancel: &CancelToken,
 ) -> super::health::ExternalRuntimeSnapshot {
+    refresh_snapshot_with_observer(
+        generation,
+        descriptors,
+        executor,
+        path_env,
+        cwd,
+        ctx,
+        deadlines,
+        cancel,
+        |_| {},
+    )
+}
+
+/// Refresh descriptors while exposing immutable invocation-local progress.
+/// The observer runs after each completed row and never receives a snapshot
+/// that can subsequently be mutated by the worker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_snapshot_with_observer(
+    generation: u64,
+    descriptors: &[ExternalRuntimeDescriptor],
+    executor: &dyn ProbeExecutor,
+    path_env: Option<&str>,
+    cwd: &Path,
+    ctx: &EvaluationContext,
+    deadlines: ProbeDeadlines,
+    cancel: &CancelToken,
+    mut observer: impl FnMut(&super::health::ExternalRuntimeSnapshot),
+) -> super::health::ExternalRuntimeSnapshot {
     let platform = ctx.platform;
     let mut snapshot = super::health::ExternalRuntimeSnapshot::empty(generation, platform);
     for descriptor in descriptors {
@@ -969,6 +997,7 @@ pub fn refresh_snapshot(
         snapshot
             .entries
             .insert(descriptor.id.as_str().to_string(), entry);
+        observer(&snapshot);
     }
     for descriptor in descriptors {
         if let Some(group) = &descriptor.group {

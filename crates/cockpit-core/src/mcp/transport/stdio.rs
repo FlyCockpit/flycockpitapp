@@ -87,7 +87,13 @@ impl StdioClient {
             Some(&launch_cancel),
         )
         .map_err(|err| {
-            anyhow::anyhow!("stdio MCP launch blocked by external-runtime health: {err}")
+            anyhow::anyhow!(
+                "{}",
+                crate::external_runtime::current_dependency_context_line(&format!(
+                    "mcp.stdio.{server_name}"
+                ))
+                .unwrap_or_else(|| err.to_string())
+            )
         })?;
         // Recheck immediately before spawn — late cancel after health.
         if runtime

@@ -68,6 +68,24 @@ impl DependencyProjection {
             .map(|row| format!("{}: {}", row.id, row.reason))
             .collect()
     }
+
+    /// Canonical contextual failure text. This is deliberately the exact row
+    /// used by Settings, doctor, and headless projections.
+    pub fn contextual_line(&self, id: &str) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| format!("{}: {}", row.id, row.reason))
+    }
+}
+
+pub fn current_dependency_context_line(id: &str) -> Option<String> {
+    let snapshot = super::global_health_store().current()?;
+    let projection = project_dependencies(
+        Some(snapshot.as_ref()),
+        &super::global_registry().descriptors(),
+    );
+    projection.contextual_line(id)
 }
 
 fn is_required(importance: DependencyImportance) -> bool {

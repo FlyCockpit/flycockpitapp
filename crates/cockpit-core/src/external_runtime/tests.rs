@@ -37,6 +37,11 @@ fn dependency_headless_schema_and_shared_reason_are_stable() {
         unknown.render_lines()[0],
         format!("runtime.test: {}", unknown.rows[0].reason)
     );
+    assert_eq!(
+        unknown.contextual_line("runtime.test").as_deref(),
+        Some(unknown.render_lines()[0].as_str()),
+        "Settings/doctor/context/headless must use byte-identical row text"
+    );
 }
 
 #[test]

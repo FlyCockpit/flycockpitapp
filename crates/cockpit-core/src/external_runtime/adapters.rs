@@ -523,6 +523,37 @@ pub fn compose_settings_doctor_health_with_executor(
     executor: &dyn super::probe::ProbeExecutor,
     path_env: Option<&str>,
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
+    compose_settings_doctor_health_internal(cwd, input, executor, path_env, None, true, |_| {})
+}
+
+/// Invocation-owned composition used by bounded diagnostics. It reports
+/// progressive immutable snapshots and never publishes process-global state.
+pub(crate) fn compose_settings_doctor_health_for_invocation(
+    cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+    cancel: &super::probe::CancelToken,
+    observer: impl FnMut(&ExternalRuntimeSnapshot),
+) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
+    compose_settings_doctor_health_internal(
+        cwd,
+        input,
+        &super::probe::SystemProbeExecutor,
+        None,
+        Some(cancel),
+        false,
+        observer,
+    )
+}
+
+fn compose_settings_doctor_health_internal(
+    cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+    executor: &dyn super::probe::ProbeExecutor,
+    path_env: Option<&str>,
+    invocation_cancel: Option<&super::probe::CancelToken>,
+    publish_global: bool,
+    mut observer: impl FnMut(&ExternalRuntimeSnapshot),
+) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
     let registry = super::registry::global_registry();
     ensure_integration_adapters_registered(&registry)?;
     let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
@@ -575,9 +606,16 @@ pub fn compose_settings_doctor_health_with_executor(
     }
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
-    let generation = store.begin_refresh();
-    let cancel = super::probe::CancelToken::new();
-    let mut snapshot = super::probe::refresh_snapshot(
+    let generation = if publish_global {
+        store.begin_refresh()
+    } else {
+        store
+            .current()
+            .map_or(1, |snapshot| snapshot.generation.saturating_add(1))
+    };
+    let local_cancel = super::probe::CancelToken::new();
+    let cancel = invocation_cancel.unwrap_or(&local_cancel);
+    let mut snapshot = super::probe::refresh_snapshot_with_observer(
         generation,
         &descriptors,
         executor,
@@ -585,7 +623,8 @@ pub fn compose_settings_doctor_health_with_executor(
         cwd,
         &ctx,
         super::probe::ProbeDeadlines::default(),
-        &cancel,
+        cancel,
+        &mut observer,
     );
     snapshot.groups.insert(
         "computer-use".to_owned(),
@@ -609,7 +648,7 @@ pub fn compose_settings_doctor_health_with_executor(
                 cwd,
                 &ctx,
                 super::probe::ProbeDeadlines::default(),
-                &cancel,
+                cancel,
                 generation,
                 engine_mode,
             );
@@ -619,6 +658,9 @@ pub fn compose_settings_doctor_health_with_executor(
                 }
             }
         }
+    }
+    if !publish_global {
+        return Ok(Arc::new(snapshot));
     }
     if !store.publish(snapshot.clone()) {
         // A newer full refresh or live handoff superseded this composition;

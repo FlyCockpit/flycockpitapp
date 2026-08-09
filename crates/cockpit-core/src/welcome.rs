@@ -257,7 +257,15 @@ pub fn print(project: Option<&Path>) {
     // Headless splash: no event loop to fill the branch pill in later, so
     // fetch git status synchronously here.
     let info = load(project, true);
-    print_header(&info);
+    // A fresh headless process has no daemon-held snapshot. Construct the
+    // invocation-local projection before applying the welcome policy so
+    // startup behavior does not silently depend on earlier process state.
+    let startup_projection = crate::diagnostics::dependency_projection_with_deadline(
+        info.cwd.clone(),
+        std::time::Duration::from_secs(2),
+    )
+    .ok();
+    print_header_with_projection(&info, startup_projection.as_ref());
     println!();
     println!("{INPUT_PREFIX}");
     println!("{}", info.agent_name);
@@ -304,10 +312,20 @@ pub fn header_lines(info: &LaunchInfo) -> Vec<String> {
 /// header lands in normal terminal output — it scrolls naturally with
 /// the chat and ends up in scrollback once enough messages arrive.
 pub fn print_header(info: &LaunchInfo) {
+    print_header_with_projection(info, None);
+}
+
+fn print_header_with_projection(
+    info: &LaunchInfo,
+    fresh: Option<&crate::external_runtime::DependencyProjection>,
+) {
     for line in header_lines(info) {
         println!("{line}");
     }
-    if let Some(policy) = crate::external_runtime::current_startup_dependency_policy()
+    let policy = fresh
+        .map(crate::external_runtime::startup_dependency_policy)
+        .or_else(crate::external_runtime::current_startup_dependency_policy);
+    if let Some(policy) = policy
         && let Some(summary) = policy.summary
     {
         println!("dependency warning: {summary}");

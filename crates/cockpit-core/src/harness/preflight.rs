@@ -66,7 +66,8 @@ pub async fn preflight_with_env(
         {
             return Err(PreflightError::NotOnPath {
                 harness: harness_name.to_string(),
-                command: format!("{} ({err})", cfg.command),
+                command: crate::external_runtime::current_dependency_context_line(&adapter_id)
+                    .unwrap_or_else(|| format!("{} ({err})", cfg.command)),
             });
         }
     } else {
@@ -80,7 +81,10 @@ pub async fn preflight_with_env(
         )
         .map_err(|err| PreflightError::NotOnPath {
             harness: harness_name.to_string(),
-            command: format!("{} ({err})", cfg.command),
+            command: crate::external_runtime::current_dependency_context_line(&format!(
+                "harness.custom.{harness_name}"
+            ))
+            .unwrap_or_else(|| format!("{} ({err})", cfg.command)),
         })?;
     }
 

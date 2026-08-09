@@ -1654,6 +1654,7 @@ fn providers_from_view(
 #[allow(private_interfaces)]
 pub struct App {
     pub(super) monotonic_origin: Instant,
+    pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
@@ -2002,6 +2003,8 @@ pub struct App {
     pub(super) deferred_fence_dispatches:
         std::collections::HashMap<uuid::Uuid, DeferredFenceDispatch>,
     pub(super) next_paste_generation: u64,
+    pub(super) paste_correlations: crate::tui::structured_paste::PasteCorrelationCache,
+    pub(super) pending_session_switch_order: Option<(u64, uuid::Uuid)>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
     /// `Some(false)` after `i` (inner), in operator-pending / visual
     /// contexts; the next char picks the object (`w`, `"`, `(`, …). `None`
@@ -3170,6 +3173,7 @@ impl App {
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
             monotonic_origin: Instant::now(),
+            paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
             config_snapshot,
             active_model_state_generation: 0,
@@ -3280,6 +3284,8 @@ impl App {
             pending_paste_probes: Default::default(),
             deferred_fence_dispatches: Default::default(),
             next_paste_generation: 0,
+            paste_correlations: Default::default(),
+            pending_session_switch_order: None,
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,

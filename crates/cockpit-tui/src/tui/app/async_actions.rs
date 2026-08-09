@@ -289,6 +289,12 @@ impl App {
                         self.fail_pending_session_switch_submissions();
                     }
                 }
+                if label == "session.switch"
+                    && let Some((sequence, _)) = self.pending_session_switch_order.take()
+                {
+                    let _ = self.submission_order.complete(sequence);
+                    self.dispatch_next_ready_paste_fence();
+                }
             }
             AsyncActionKind::Internal("session.fork") => match result.payload {
                 Ok(AsyncActionPayload::ForkSessionSwitched {

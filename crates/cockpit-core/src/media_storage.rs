@@ -5,7 +5,7 @@
 //! writer transaction while all verified file handles remain live.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -44,6 +44,105 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn append_media_upload_chunk(
+        &self,
+        request: cockpit_db::media_attachments::AppendMediaUploadChunkV1,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use base64::Engine as _;
+        use cockpit_db::media_attachments::{
+            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaUploadActionV1,
+            MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
+        };
+        cockpit_db::Db::validate_local_media_mutation_v1(&request.mutation)?;
+        let LocalMediaMutationPayloadV1::Append {
+            session_id,
+            canonical_project_digest,
+            client_draft_id,
+            upload_id,
+            upload_generation,
+            chunk_index,
+            chunk_length,
+            chunk_sha256,
+        } = &request.mutation.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let session_id = *session_id;
+        let project = canonical_project_digest.clone();
+        let draft = *client_draft_id;
+        let upload_id = *upload_id;
+        let generation = *upload_generation;
+        let index = *chunk_index;
+        let length = *chunk_length;
+        let checksum = chunk_sha256.clone();
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&request.mutation)?;
+        let domain =
+            format!("append:{session_id}:{project}:{draft}:{upload_id}:{generation}:{index}");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&request.data_base64)?;
+        ensure!(
+            bytes.len() == usize::try_from(length)?
+                && crate::intel::hex_lower(&Sha256::digest(&bytes)) == checksum,
+            "chunk bytes do not match binding"
+        );
+        let op = request.mutation.local_operation_id;
+        let binding = request_digest.clone();
+        let semantic = semantic_digest.clone();
+        let domain_pre = domain.clone();
+        if let Some(receipt) = self
+            .db
+            .transaction(move |conn| {
+                preflight_local_operation(
+                    conn,
+                    op,
+                    "append",
+                    &domain_pre,
+                    &binding,
+                    &semantic,
+                    now_unix_ms,
+                )
+            })
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let snapshot=self.db.read(move|conn|{conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,next_chunk_index,state,upload_generation,declared_total_bytes FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload_id.to_string(),session_id.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional().map_err(Into::into)}).await?.context("media_attachment_unavailable")?;
+        ensure!(
+            snapshot.3 == "open" && snapshot.4.parse::<u64>()? == generation && snapshot.2 == index,
+            "upload generation or chunk index conflict"
+        );
+        let offset = snapshot.1.parse::<u64>()?;
+        let declared = snapshot.5.parse::<u64>()?;
+        let after = offset
+            .checked_add(u64::from(length))
+            .context("upload length overflow")?;
+        ensure!(after <= declared, "declared upload length exceeded");
+        let mut file = self
+            .owned_root
+            .open_file_verified(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            file.metadata()?.len() == offset,
+            "upload temporary differs from durable offset"
+        );
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let mutation = request.mutation;
+        let transition = MediaUploadLastTransitionV1::Local {
+            action: MediaUploadActionV1::Append,
+            local_operation_id: mutation.local_operation_id,
+            outcome: RemoteMediaOperationOutcomeV1::Applied,
+        };
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET upload_generation=?1,acknowledged_chunks=acknowledged_chunks+1,acknowledged_bytes=?2,next_chunk_index=?3,last_transition_json=?4,updated_at_unix_ms=?5 WHERE upload_id=?6 AND upload_generation=?7 AND next_chunk_index=?8 AND acknowledged_bytes=?9 AND state='open'",params![next.to_string(),after.to_string(),index.checked_add(1).context("chunk index overflow")?,serde_json::to_string(&transition)?,now_unix_ms,upload_id.to_string(),generation.to_string(),index,offset.to_string()])?;ensure!(changed==1,"upload append lost compare-and-swap");conn.execute("INSERT INTO media_upload_chunks(upload_id,chunk_index,byte_length,sha256,storage_offset,acknowledged_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![upload_id.to_string(),index,length,checksum,offset.to_string(),now_unix_ms])?;let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"append".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:generation,generation_after:next},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"append",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
+            file.set_len(offset)?;
+            file.sync_all()?
+        }
+        result.map(|(receipt, _)| receipt)
+    }
     pub(crate) async fn begin_media_upload(
         &self,
         request: cockpit_db::media_attachments::BeginMediaUploadV1,
@@ -344,6 +443,35 @@ impl MediaStorageRecovery {
 
 fn is_uuid_v7(value: Uuid) -> bool {
     !value.is_nil() && value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
+}
+
+fn preflight_local_operation(
+    conn: &Connection,
+    operation_id: Uuid,
+    action: &str,
+    domain: &str,
+    request_digest: &str,
+    semantic_digest: &str,
+    now: i64,
+) -> Result<Option<cockpit_db::media_attachments::LocalMediaMutationReceiptV1>> {
+    if let Some((stored,json))=conn.query_row("SELECT operation_request_digest,receipt_json FROM local_media_operations WHERE local_operation_id=?1",[operation_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?{ensure!(stored==request_digest,"local_operation_conflict");return Ok(Some(serde_json::from_str(&json)?))}
+    if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM local_media_operations WHERE action=?1 AND domain_key=?2 AND is_alias=0",params![action,domain],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?{ensure!(stored_semantic==semantic_digest,"local_domain_conflict");conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",params![operation_id.to_string(),authoritative,action,domain,request_digest,semantic_digest,json,now])?;return Ok(Some(serde_json::from_str(&json)?))}
+    Ok(None)
+}
+
+fn commit_local_operation(
+    conn: &Connection,
+    receipt: &cockpit_db::media_attachments::LocalMediaMutationReceiptV1,
+    action: &str,
+    domain: &str,
+    request_digest: &str,
+    semantic_digest: &str,
+    now: i64,
+) -> Result<()> {
+    let json = serde_json::to_string(receipt)?;
+    conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?1,?2,?3,?4,?5,?6,0,?7)",params![receipt.local_operation_id.to_string(),action,domain,request_digest,semantic_digest,json,now])?;
+    conn.execute("INSERT INTO local_media_operation_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,?2,?3)",params![receipt.local_operation_id.to_string(),match receipt.outcome{cockpit_db::media_attachments::LocalMediaMutationOutcomeV1::Applied=>"applied",cockpit_db::media_attachments::LocalMediaMutationOutcomeV1::Rejected=>"rejected"},now])?;
+    Ok(())
 }
 
 fn validate_registration(request: &RegisterLocalPathMediaV1) -> Result<()> {
@@ -953,6 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_upload_begin_is_atomic_replayable_and_domain_unique() {
+        use base64::Engine as _;
         use cockpit_db::media_attachments::{
             LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationTransitionV1,
             LocalMediaMutationV1,
@@ -985,6 +1114,13 @@ mod tests {
             .begin_media_upload(request.clone(), &policy, 1, 10)
             .await
             .unwrap();
+        let upload_id = first.subject_id;
+        let draft_id = match &request.payload {
+            LocalMediaMutationPayloadV1::Begin {
+                client_draft_id, ..
+            } => *client_draft_id,
+            _ => unreachable!(),
+        };
         assert!(matches!(
             first.transition,
             LocalMediaMutationTransitionV1::Upload {
@@ -1025,6 +1161,45 @@ mod tests {
                 .to_string()
                 .contains("conflict")
         );
+        let bytes = b"content";
+        let append = cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
+            mutation: LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: "11".repeat(32),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Append {
+                    session_id,
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: draft_id,
+                    upload_id,
+                    upload_generation: 1,
+                    chunk_index: 0,
+                    chunk_length: 7,
+                    chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                },
+            },
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        let appended = recovery
+            .append_media_upload_chunk(append.clone(), 20)
+            .await
+            .unwrap();
+        assert!(matches!(
+            appended.transition,
+            LocalMediaMutationTransitionV1::Upload {
+                generation_before: 1,
+                generation_after: 2
+            }
+        ));
+        assert_eq!(
+            recovery
+                .append_media_upload_chunk(append, 21)
+                .await
+                .unwrap(),
+            appended
+        );
         let counts = db
             .read(|conn| {
                 Ok((
@@ -1037,17 +1212,20 @@ mod tests {
                     conn.query_row("SELECT COUNT(*) FROM local_media_operations", [], |r| {
                         r.get::<_, i64>(0)
                     })?,
+                    conn.query_row("SELECT COUNT(*) FROM media_upload_chunks", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
                 ))
             })
             .await
             .unwrap();
-        assert_eq!(counts, (1, 1, 2));
-        assert_eq!(
-            std::fs::read_dir(temp.path().join("media"))
-                .unwrap()
-                .count(),
-            1
-        );
+        assert_eq!(counts, (1, 1, 3, 1));
+        let entry = std::fs::read_dir(temp.path().join("media"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(entry.path()).unwrap(), bytes);
     }
 
     struct Fixture {

@@ -131,7 +131,12 @@ pub struct LocalMediaMutationV1 {
 }
 
 pub type BeginMediaUploadV1 = LocalMediaMutationV1;
-pub type AppendMediaUploadChunkV1 = LocalMediaMutationV1;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppendMediaUploadChunkV1 {
+    pub mutation: LocalMediaMutationV1,
+    pub data_base64: String,
+}
 pub type FinalizeMediaUploadV1 = LocalMediaMutationV1;
 pub type CancelMediaUploadV1 = LocalMediaMutationV1;
 

@@ -768,6 +768,25 @@ impl SettingsCx {
         }
         if let Some(detail) = &p.detail {
             self.render_agent_detail(frame, area, detail);
+            let action_y = area.bottom().saturating_sub(1);
+            for (id, x, width) in [(2100, 0, 15), (2101, 17, 6)] {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x + x,
+                            action_y,
+                            width.min(area.width.saturating_sub(x)),
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(SettingsControlId(id)),
+                        enabled: x < area.width,
+                        disabled_reason: (x >= area.width).then_some("control is clipped"),
+                    });
+            }
+            frame.render_widget(
+                Line::from("[Edit raw file]  [Save]"),
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
 
@@ -848,6 +867,48 @@ impl SettingsCx {
                 red.add_modifier(Modifier::BOLD),
             )));
             controls.push(None);
+            lines.push(Line::from("[Reset]"));
+            controls.push(Some((SettingsControlId(2300), true, None)));
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((SettingsControlId(2301), true, None)));
+        } else if p.delete.is_pending() || p.reset_one.is_pending() {
+            let verb = if p.delete.is_pending() {
+                "Delete"
+            } else {
+                "Reset"
+            };
+            let name = p
+                .rows
+                .get(p.cursor)
+                .map_or("agent", |row| row.name.as_str());
+            lines.push(Line::default());
+            controls.push(None);
+            lines.push(Line::from(format!("{verb} {name}?")));
+            controls.push(None);
+            lines.push(Line::from(format!("[{verb}]")));
+            controls.push(Some((SettingsControlId(2200), true, None)));
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((SettingsControlId(2202), true, None)));
+        } else {
+            lines.push(Line::default());
+            controls.push(None);
+            lines.push(Line::from("[Open]"));
+            controls.push(Some((SettingsControlId(2201), true, None)));
+            lines.push(Line::from("[Edit raw file]"));
+            controls.push(Some((SettingsControlId(2203), true, None)));
+            if let Some(kind) = p.rows.get(p.cursor).map(|row| &row.kind) {
+                let (label, id) = match kind {
+                    AgentKind::Custom => ("[Delete]", 2204),
+                    AgentKind::Builtin { overridden: true } => ("[Reset]", 2205),
+                    AgentKind::Builtin { overridden: false } => ("", 0),
+                };
+                if id != 0 {
+                    lines.push(Line::from(label));
+                    controls.push(Some((SettingsControlId(id), true, None)));
+                }
+            }
+            lines.push(Line::from("[Reset all]"));
+            controls.push(Some((SettingsControlId(2206), true, None)));
         }
 
         if let Some(status) = &p.status {
@@ -957,6 +1018,18 @@ impl SettingsPage for AgentsPage {
                 _ => Nav::Stay,
             };
         }
+        if self.detail.is_some() && index == 2100 {
+            return cx.handle_agents_page_key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                self,
+            );
+        }
+        if self.detail.is_some() && index == 2101 {
+            return cx.handle_agents_page_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                self,
+            );
+        }
         if let Some(detail) = self.detail.as_mut() {
             if index >= cockpit_core::agents::tool_surface_catalog().len() {
                 return Nav::Stay;
@@ -964,6 +1037,67 @@ impl SettingsPage for AgentsPage {
             detail.picker.set_cursor(index);
             return cx
                 .handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self);
+        }
+        match index {
+            2300 if self.confirm_reset => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2301 if self.confirm_reset => {
+                self.confirm_reset = false;
+                self.status = Some("reset cancelled".into());
+                return Nav::Stay;
+            }
+            2200 if self.delete.is_pending() => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2200 if self.reset_one.is_pending() => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2201 => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2202 => {
+                self.disarm_guards();
+                self.status = Some("action cancelled".into());
+                return Nav::Stay;
+            }
+            2203 => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2204 => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2205 => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            2206 => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            _ => {}
         }
         if index >= self.rows.len() {
             return Nav::Stay;

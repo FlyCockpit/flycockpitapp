@@ -183,12 +183,20 @@ fn target_package_features(
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
             };
-            let observed = features
-                .trim_end_matches(" (*)")
-                .split(',')
-                .filter(|feature| !feature.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<BTreeSet<_>>();
+            let features = features.trim_end_matches(" (*)");
+            let mut observed = BTreeSet::new();
+            if !features.is_empty() {
+                for feature in features.split(',') {
+                    assert!(
+                        !feature.is_empty(),
+                        "malformed cargo feature list contains an empty token for {key}: {features}"
+                    );
+                    assert!(
+                        observed.insert(feature.to_owned()),
+                        "malformed cargo feature list contains duplicate token for {key}: {feature}"
+                    );
+                }
+            }
             if !reported_packages.insert(key.clone()) && *actual != observed {
                 panic!(
                     "cargo feature tree reported conflicting feature sets for {key}: \
@@ -299,6 +307,24 @@ fn target_package_feature_inventory_rejects_unreported_activations() {
 fn target_package_feature_inventory_rejects_empty_versions_precisely() {
     target_package_features(
         "0image v|png\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "feature list contains an empty token for image@0.25.10: png,,jpeg")]
+fn target_package_feature_inventory_rejects_empty_feature_tokens() {
+    target_package_features(
+        "0image v0.25.10|png,,jpeg\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "feature list contains duplicate token for image@0.25.10: png")]
+fn target_package_feature_inventory_rejects_duplicate_feature_tokens() {
+    target_package_features(
+        "0image v0.25.10|png,png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
     );
 }

@@ -8,6 +8,71 @@ const CATALOG: &str = include_str!("../../../crates/cockpit-core/src/external_ru
 const GENERATOR: &str = include_str!("../scripts/generate-release-assets.sh");
 const SHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.sh");
 const POWERSHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.ps1");
+const CARGO_DIST_SHELL_TEMPLATE: &str = include_str!("fixtures/cargo-dist-0.32-installer.sh.j2");
+const CARGO_DIST_POWERSHELL_TEMPLATE: &str =
+    include_str!("fixtures/cargo-dist-0.32-installer.ps1.j2");
+
+#[test]
+fn patcher_matches_pinned_cargo_dist_032_templates() {
+    use std::{fs, path::PathBuf, process::Command};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/distrib")
+        .join(format!("cargo-dist-template-check-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    // Exact upstream v0.32.0 template bytes. Updating either capture requires
+    // reviewing cargo-dist's anchors and recording the new upstream digest.
+    let digests = Command::new("sha256sum")
+        .args([
+            "tests/fixtures/cargo-dist-0.32-installer.sh.j2",
+            "tests/fixtures/cargo-dist-0.32-installer.ps1.j2",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    let digests = String::from_utf8(digests.stdout).unwrap();
+    assert!(digests.contains("b3ed5db0b9219a2145f9a5c08f2be4800fe31944709fe7242938f35c6941b96d"));
+    assert!(digests.contains("8c4f2e02811a4acbb6982c50def8282a779952c71d86d9c0615848e0d9ead144"));
+    let shell = root.join("installer.sh");
+    let powershell = root.join("installer.ps1");
+    fs::write(
+        &shell,
+        CARGO_DIST_SHELL_TEMPLATE.replace("{{ install_success_msg }}", "everything's installed!"),
+    )
+    .unwrap();
+    fs::write(
+        &powershell,
+        CARGO_DIST_POWERSHELL_TEMPLATE
+            .replace("{{ install_success_msg }}", "everything's installed!"),
+    )
+    .unwrap();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/patch-dist-assets.py");
+    let program = r#"import importlib.util, pathlib, sys
+spec=importlib.util.spec_from_file_location('patch_dist_assets', sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.patch_shell_installer(pathlib.Path(sys.argv[2]))
+m.patch_powershell_installer(pathlib.Path(sys.argv[3]))
+"#;
+    let output = Command::new("python3")
+        .args(["-c", program])
+        .arg(script)
+        .arg(&shell)
+        .arg(&powershell)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patched_shell = fs::read_to_string(shell).unwrap();
+    let patched_powershell = fs::read_to_string(powershell).unwrap();
+    assert!(patched_shell.contains("ensure ln \"$_install_temp/$_bin_name\" \"$_install_target\""));
+    assert!(patched_shell.contains("umask 077"));
+    assert!(patched_powershell.contains("[System.IO.File]::Move($staged_file, $installed_target)"));
+    assert!(!patched_powershell.contains("Move-Item -LiteralPath \"$staged_file\""));
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn runtime_release_contract_tests() {

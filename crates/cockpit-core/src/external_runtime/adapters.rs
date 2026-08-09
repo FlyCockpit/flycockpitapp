@@ -110,6 +110,27 @@ pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> b
     }
 }
 
+/// Select the executables used by the media inspection/decoding path.
+///
+/// Callers must obtain the pair through this gate immediately before spawning
+/// either process. Returning paths independently would permit an incompatible
+/// FFmpeg/FFprobe pair to escape the health rule.
+pub fn select_media_runtime_pair(
+    snapshot: &ExternalRuntimeSnapshot,
+) -> Result<(&str, &str), &'static str> {
+    if !media_runtime_pair_is_compatible(snapshot) {
+        return Err("media inspection requires a healthy compatible FFmpeg/FFprobe pair");
+    }
+    let resolved = |id| match &snapshot.get(id)?.state {
+        HealthState::Available { resolved_path, .. } => resolved_path.as_deref(),
+        _ => None,
+    };
+    match (resolved(ID_MEDIA_FFMPEG), resolved(ID_MEDIA_FFPROBE)) {
+        (Some(ffmpeg), Some(ffprobe)) => Ok((ffmpeg, ffprobe)),
+        _ => Err("media inspection requires resolved FFmpeg and FFprobe paths"),
+    }
+}
+
 // ── ID builders for configured commands ─────────────────────────────────────
 
 /// Runtime ID for a user-configured custom harness command.

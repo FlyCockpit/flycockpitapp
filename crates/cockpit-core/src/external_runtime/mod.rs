@@ -34,9 +34,9 @@ pub use adapters::{
     media_runtime_pair_is_compatible, register_integration_adapters, require_available_for_launch,
     require_available_for_launch_uncancelled, require_configured_command_available_for_launch,
     require_configured_command_available_for_launch_with_cancel, require_live_available_for_launch,
-    require_live_available_for_launch_with_cancel, stdio_mcp_id, upsert_custom_harness,
-    upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers, upsert_stdio_mcp,
-    upsert_stdio_mcp_servers,
+    require_live_available_for_launch_with_cancel, select_media_runtime_pair, stdio_mcp_id,
+    upsert_custom_harness, upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers,
+    upsert_stdio_mcp, upsert_stdio_mcp_servers,
 };
 pub(crate) use adapters::{
     compose_settings_doctor_health_for_invocation, invocation_descriptor_roster,

@@ -61,6 +61,10 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
 
     let available = snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 7.0"));
     assert!(media_runtime_pair_is_compatible(&available));
+    assert_eq!(
+        select_media_runtime_pair(&available),
+        Ok(("/tools/ffmpeg", "/tools/ffprobe"))
+    );
     assert!(matches!(
         available.get(ID_MEDIA_FFMPEG).unwrap().state,
         HealthState::Available { .. }
@@ -72,6 +76,7 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
         snapshot(Some("version unknown"), Some("version unknown")),
     ] {
         assert!(!media_runtime_pair_is_compatible(&unhealthy));
+        assert!(select_media_runtime_pair(&unhealthy).is_err());
         assert!(unhealthy.entries.values().any(|entry| {
             matches!(
                 entry.state,

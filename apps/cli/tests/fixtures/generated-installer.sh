@@ -9,10 +9,13 @@ set -eu
 arch=${COCKPIT_FIXTURE_ARCH:-$(uname -m)}
 case "$arch" in x86_64|amd64|aarch64|arm64) ;; *) echo "unsupported architecture: $arch" >&2; exit 1 ;; esac
 
-stage="$COCKPIT_FIXTURE_STAGE_ROOT/cockpit-installer-$$"
+old_umask=$(umask)
+umask 077
+stage=$(mktemp -d "$COCKPIT_FIXTURE_STAGE_ROOT/cockpit-installer.XXXXXXXXXX")
+umask "$old_umask"
 cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT HUP INT TERM
-mkdir -p "$stage/unpack"
+mkdir "$stage/unpack"
 
 actual=$(sha256sum "$COCKPIT_FIXTURE_ARCHIVE" | awk '{print $1}')
 [ "$actual" = "$COCKPIT_FIXTURE_SHA256" ] || { echo 'checksum verification failed' >&2; exit 1; }
@@ -25,8 +28,8 @@ mkdir -p "$COCKPIT_FIXTURE_DEST"
 [ ! -e "$COCKPIT_FIXTURE_DEST/cockpit" ] || { echo 'destination already exists' >&2; exit 1; }
 cp "$bin" "$stage/cockpit"
 chmod +x "$stage/cockpit"
-mv "$stage/cockpit" "$COCKPIT_FIXTURE_DEST/cockpit"
+ln "$stage/cockpit" "$COCKPIT_FIXTURE_DEST/cockpit"
+rm "$stage/cockpit"
 
 notice=$(find "$stage/unpack" -type f -name runtime-prerequisite-notice.sh | head -n 1)
 [ -z "$notice" ] || sh "$notice" || true
-

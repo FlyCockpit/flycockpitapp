@@ -25,6 +25,27 @@ export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 
 const U32_MAX = 0xffffffff;
 export const MAX_FCOR_V1_BYTES = U32_MAX;
+export const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES = 2_631_500;
+export const sendUserMessageV2OpaqueRegistration = {
+  requestKind: "send_user_message",
+  magic: new Uint8Array([0x46, 0x43, 0x4d, 0x32]),
+  maximumBytes: MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+  owner: "message-attachment-protocol-foundation",
+} as const;
+
+export type OpaqueCanonicalParamsDecoder = (bytes: Uint8Array) => void;
+
+export function validateRegisteredSendUserMessageV2(
+  bytes: Uint8Array,
+  foundationDecoder: OpaqueCanonicalParamsDecoder,
+): void {
+  const registration = sendUserMessageV2OpaqueRegistration;
+  if (bytes.length > registration.maximumBytes) throw new Error("FCM2 exceeds registered maximum");
+  if (!registration.magic.every((byte, index) => bytes[index] === byte)) {
+    throw new Error("FCM2 has wrong magic");
+  }
+  foundationDecoder(bytes);
+}
 
 export class CanonicalParamsV1 {
   readonly #bytes: number[] = [];
@@ -45,6 +66,7 @@ export class CanonicalParamsV1 {
     this.pushBigFixed(value, 8);
   }
   pushI64(value: bigint): void {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n) throw new Error("i64 out of range");
     this.pushBigFixed(BigInt.asUintN(64, value), 8);
   }
   pushUuid(value: Uint8Array): void {
@@ -57,7 +79,7 @@ export class CanonicalParamsV1 {
     this.#bytes.push(...value);
   }
   pushString(value: string): void {
-    if (value.includes("\0") || value.normalize("NFC") !== value) {
+    if (hasUnpairedSurrogate(value) || value.includes("\0") || value.normalize("NFC") !== value) {
       throw new Error("canonical string must be NUL-free NFC");
     }
     this.pushBytes(new TextEncoder().encode(value));
@@ -66,17 +88,25 @@ export class CanonicalParamsV1 {
     value: T | undefined,
     encode: (params: CanonicalParamsV1, value: T) => void,
   ): void {
-    this.pushU8(value === undefined ? 0 : 1);
-    if (value !== undefined) encode(this, value);
+    if (value === undefined) {
+      this.pushU8(0);
+      return;
+    }
+    const nested = new CanonicalParamsV1();
+    encode(nested, value);
+    this.pushU8(1);
+    this.#bytes.push(...nested.finish());
   }
   pushStringMap(entries: Iterable<readonly [string, string]>): void {
     const encoded = [...entries].map(([key, value]) => {
+      if (hasUnpairedSurrogate(key) || key.includes("\0")) throw new Error("invalid map key");
+      const normalizedKey = key.normalize("NFC");
       const encodedKey = new CanonicalParamsV1();
-      encodedKey.pushString(key);
+      encodedKey.pushString(normalizedKey);
       const encodedValue = new CanonicalParamsV1();
       encodedValue.pushString(value);
       return {
-        normalizedKey: key.normalize("NFC"),
+        normalizedKey,
         key: encodedKey.finish(),
         value: encodedValue.finish(),
       };
@@ -102,6 +132,17 @@ export class CanonicalParamsV1 {
     for (let shift = width - 1; shift >= 0; shift -= 1)
       this.#bytes.push(Number((value >> BigInt(shift * 8)) & 0xffn));
   }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(++index);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

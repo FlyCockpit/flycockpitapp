@@ -81,7 +81,15 @@
   ],
   "canonicalParams": {
     "primitiveHex": "ff011234010203040102030405060708fffffffffffffffe000102030405060708090a0b0c0d0e0f",
-    "sortedStringMapHex": "000000020000000161000000017800000001620000000179"
+    "sortedStringMapHex": "000000020000000161000000017800000001620000000179",
+    "u64MaxHex": "ffffffffffffffff",
+    "i64MinHex": "8000000000000000",
+    "i64MaxHex": "7fffffffffffffff",
+    "optionNoneHex": "00",
+    "optionSomeU16Hex": "011234",
+    "emptyBytesHex": "00000000",
+    "composedStringHex": "00000002c3a9",
+    "encodedLengthSortedMapHex": "00000002000000016200000001780000000261610000000179"
   },
   "malformed": [
     { "name": "magic", "replaceByte": [0, 0] },

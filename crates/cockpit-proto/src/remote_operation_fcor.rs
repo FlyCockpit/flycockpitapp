@@ -8,6 +8,50 @@ use uuid::Uuid;
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
 pub const FCOR_SCHEMA_VERSION: u8 = 1;
 pub const MAX_FCOR_V1_BYTES: u64 = u32::MAX as u64;
+pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
+pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 2_631_500;
+
+/// Foundation-owned semantic validation seam for an opaque canonical codec.
+/// The ledger never parses or re-encodes the returned bytes.
+pub trait OpaqueCanonicalParamsDecoder {
+    fn validate(&self, bytes: &[u8]) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpaqueCanonicalParamsRegistrationV1 {
+    pub request_kind: &'static str,
+    pub magic: [u8; 4],
+    pub maximum_bytes: usize,
+    pub owner: &'static str,
+}
+
+pub const SEND_USER_MESSAGE_V2_REGISTRATION: OpaqueCanonicalParamsRegistrationV1 =
+    OpaqueCanonicalParamsRegistrationV1 {
+        request_kind: "send_user_message",
+        magic: FCM2_MAGIC,
+        maximum_bytes: MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+        owner: "message-attachment-protocol-foundation",
+    };
+
+pub fn validate_registered_opaque_params(
+    registration: OpaqueCanonicalParamsRegistrationV1,
+    bytes: &[u8],
+    decoder: &dyn OpaqueCanonicalParamsDecoder,
+) -> Result<()> {
+    ensure!(
+        registration == SEND_USER_MESSAGE_V2_REGISTRATION,
+        "unknown opaque canonical parameter registration"
+    );
+    ensure!(
+        bytes.len() <= registration.maximum_bytes,
+        "opaque params exceed registered maximum"
+    );
+    ensure!(
+        bytes.starts_with(&registration.magic),
+        "opaque params have wrong magic"
+    );
+    decoder.validate(bytes)
+}
 
 pub fn checked_fcor_v1_size(
     request_kind_len: u64,
@@ -94,8 +138,11 @@ impl CanonicalParamsV1 {
     ) -> Result<()> {
         match value {
             Some(value) => {
+                let mut nested = Self::new();
+                encode(&mut nested, value)?;
                 self.push_u8(1);
-                encode(self, value)
+                self.0.extend(nested.0);
+                Ok(())
             }
             None => {
                 self.push_u8(0);
@@ -110,11 +157,13 @@ impl CanonicalParamsV1 {
     ) -> Result<()> {
         let mut encoded = Vec::new();
         for (key, value) in entries {
+            ensure!(!key.contains('\0'), "canonical map key contains NUL");
+            let normalized_key = key.nfc().collect::<String>();
             let mut key_bytes = Self::new();
-            key_bytes.push_string(key)?;
+            key_bytes.push_string(&normalized_key)?;
             let mut value_bytes = Self::new();
             value_bytes.push_string(value)?;
-            encoded.push((key.nfc().collect::<String>(), key_bytes.0, value_bytes.0));
+            encoded.push((normalized_key, key_bytes.0, value_bytes.0));
         }
         encoded.sort_by(|left, right| left.1.cmp(&right.1));
         ensure!(
@@ -380,6 +429,109 @@ mod tests {
         );
         assert!(CanonicalParamsV1::new().push_string("e\u{301}").is_err());
         assert!(CanonicalParamsV1::new().push_string("nul\0value").is_err());
+        let boundary = |encode: fn(&mut CanonicalParamsV1) -> Result<()>| {
+            let mut params = CanonicalParamsV1::new();
+            encode(&mut params).unwrap();
+            hex(&params.into_bytes())
+        };
+        assert_eq!(
+            boundary(|p| {
+                p.push_u64(u64::MAX);
+                Ok(())
+            }),
+            fixture["canonicalParams"]["u64MaxHex"]
+        );
+        assert_eq!(
+            boundary(|p| {
+                p.push_i64(i64::MIN);
+                Ok(())
+            }),
+            fixture["canonicalParams"]["i64MinHex"]
+        );
+        assert_eq!(
+            boundary(|p| {
+                p.push_i64(i64::MAX);
+                Ok(())
+            }),
+            fixture["canonicalParams"]["i64MaxHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_optional::<u8>(None, |_, _| Ok(()))),
+            fixture["canonicalParams"]["optionNoneHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_optional(Some(&0x1234_u16), |nested, value| {
+                nested.push_u16(*value);
+                Ok(())
+            })),
+            fixture["canonicalParams"]["optionSomeU16Hex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_bytes(&[])),
+            fixture["canonicalParams"]["emptyBytesHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_string("é")),
+            fixture["canonicalParams"]["composedStringHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_string_map([("aa", "y"), ("b", "x")])),
+            fixture["canonicalParams"]["encodedLengthSortedMapHex"]
+        );
+        assert!(
+            CanonicalParamsV1::new()
+                .push_string_map([("é", "x"), ("e\u{301}", "y")])
+                .is_err()
+        );
+        let mut rollback = CanonicalParamsV1::new();
+        assert!(
+            rollback
+                .push_optional(Some(&1_u8), |nested, _| {
+                    nested.push_u8(7);
+                    bail!("fail")
+                })
+                .is_err()
+        );
+        assert!(rollback.into_bytes().is_empty());
+
+        struct FoundationDecoder;
+        impl OpaqueCanonicalParamsDecoder for FoundationDecoder {
+            fn validate(&self, bytes: &[u8]) -> Result<()> {
+                ensure!(bytes == b"FCM2foundation-owned", "semantic rejection");
+                Ok(())
+            }
+        }
+        let opaque = b"FCM2foundation-owned";
+        validate_registered_opaque_params(
+            SEND_USER_MESSAGE_V2_REGISTRATION,
+            opaque,
+            &FoundationDecoder,
+        )
+        .unwrap();
+        let fcor = encode_fcor_v1("send_user_message", &[], opaque).unwrap();
+        assert!(
+            fcor.ends_with(opaque),
+            "ledger must embed FCM2 byte-identically"
+        );
+        assert!(
+            validate_registered_opaque_params(
+                OpaqueCanonicalParamsRegistrationV1 {
+                    request_kind: "other",
+                    ..SEND_USER_MESSAGE_V2_REGISTRATION
+                },
+                opaque,
+                &FoundationDecoder,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_registered_opaque_params(
+                SEND_USER_MESSAGE_V2_REGISTRATION,
+                b"BAD!foundation-owned",
+                &FoundationDecoder,
+            )
+            .is_err()
+        );
     }
 
     fn hex(bytes: &[u8]) -> String {

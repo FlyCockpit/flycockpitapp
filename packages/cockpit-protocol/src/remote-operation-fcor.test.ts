@@ -5,6 +5,7 @@ import {
   checkedFcorV1Size,
   encodeFcorV1,
   hashFcorV1,
+  validateRegisteredSendUserMessageV2,
   validateFcorV1,
 } from "./remote-operation-fcor";
 
@@ -90,5 +91,70 @@ describe("FCOR v1", () => {
     );
     expect(() => new CanonicalParamsV1().pushString("e\u0301")).toThrow();
     expect(() => new CanonicalParamsV1().pushString("nul\0value")).toThrow();
+    expect(() => new CanonicalParamsV1().pushString("\ud800")).toThrow();
+    const boundary = (encode: (params: CanonicalParamsV1) => void) => {
+      const params = new CanonicalParamsV1();
+      encode(params);
+      return Buffer.from(params.finish()).toString("hex");
+    };
+    expect(boundary((params) => params.pushU64((1n << 64n) - 1n))).toBe(
+      vector.canonicalParams.u64MaxHex,
+    );
+    expect(() => boundary((params) => params.pushU64(1n << 64n))).toThrow();
+    expect(boundary((params) => params.pushI64(-(1n << 63n)))).toBe(
+      vector.canonicalParams.i64MinHex,
+    );
+    expect(boundary((params) => params.pushI64((1n << 63n) - 1n))).toBe(
+      vector.canonicalParams.i64MaxHex,
+    );
+    expect(() => boundary((params) => params.pushI64(-(1n << 63n) - 1n))).toThrow();
+    expect(() => boundary((params) => params.pushI64(1n << 63n))).toThrow();
+    expect(boundary((params) => params.pushOptional(undefined, () => {}))).toBe(
+      vector.canonicalParams.optionNoneHex,
+    );
+    expect(
+      boundary((params) => params.pushOptional(0x1234, (nested, value) => nested.pushU16(value))),
+    ).toBe(vector.canonicalParams.optionSomeU16Hex);
+    expect(boundary((params) => params.pushBytes(new Uint8Array()))).toBe(
+      vector.canonicalParams.emptyBytesHex,
+    );
+    expect(boundary((params) => params.pushString("é"))).toBe(
+      vector.canonicalParams.composedStringHex,
+    );
+    expect(
+      boundary((params) =>
+        params.pushStringMap([
+          ["aa", "y"],
+          ["b", "x"],
+        ]),
+      ),
+    ).toBe(vector.canonicalParams.encodedLengthSortedMapHex);
+    expect(() =>
+      boundary((params) =>
+        params.pushStringMap([
+          ["é", "x"],
+          ["e\u0301", "y"],
+        ]),
+      ),
+    ).toThrow();
+    const rollback = new CanonicalParamsV1();
+    expect(() =>
+      rollback.pushOptional("x", (nested) => {
+        nested.pushU8(7);
+        throw new Error("fail");
+      }),
+    ).toThrow();
+    expect(rollback.finish()).toEqual(new Uint8Array());
+    const opaque = new TextEncoder().encode("FCM2foundation-owned");
+    let decoded: Uint8Array | undefined;
+    validateRegisteredSendUserMessageV2(opaque, (bytes) => {
+      decoded = bytes;
+    });
+    expect(decoded).toBe(opaque);
+    expect(() =>
+      validateRegisteredSendUserMessageV2(new TextEncoder().encode("BAD!"), () => {}),
+    ).toThrow();
+    const opaqueFcor = encodeFcorV1("send_user_message", [], opaque);
+    expect(opaqueFcor.subarray(-opaque.length)).toEqual(opaque);
   });
 });

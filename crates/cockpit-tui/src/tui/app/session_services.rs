@@ -1,6 +1,23 @@
 use super::*;
 
 impl App {
+    pub(super) fn mark_submission_fence_handed_off(
+        &mut self,
+        client_submission_id: uuid::Uuid,
+        wire_digest: [u8; 32],
+    ) {
+        if let Some(fence) = self.submission_fences.get_mut(&client_submission_id)
+            && matches!(
+                fence.lifecycle,
+                crate::tui::structured_paste::FenceLifecycle::Ready
+                    | crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
+            )
+        {
+            fence.assembled_wire_digest = Some(wire_digest);
+            fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+        }
+    }
+
     pub(super) fn session_switch_action_key() -> AsyncActionKey {
         AsyncActionKey::new("session.switch")
     }
@@ -31,7 +48,17 @@ impl App {
         });
     }
 
-    fn mark_delivery_unconfirmed(&mut self, ids: &[uuid::Uuid]) -> Result<(), ()> {
+    pub(super) fn mark_delivery_unconfirmed(&mut self, ids: &[uuid::Uuid]) -> Result<(), ()> {
+        let attachment_epoch = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| {
+                runner
+                    .attachment_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or_default();
         let records = ids
             .iter()
             .map(|id| {
@@ -45,6 +72,10 @@ impl App {
                     surfaced: false,
                     probe_in_flight: false,
                     next_probe_at: self.event_loop_monotonic_now,
+                    probe_deadline: self.event_loop_monotonic_now
+                        + std::time::Duration::from_secs(2),
+                    probe_attachment_epoch: attachment_epoch,
+                    probe_exhausted: false,
                 })
             })
             .collect::<Option<Vec<_>>>()
@@ -61,19 +92,49 @@ impl App {
     }
 
     pub(super) fn service_delivery_unconfirmed_reconciliation(&mut self) -> bool {
-        let Some(socket) = self
+        let socket = self
+            .sessions_daemon_socket()
+            .map(std::path::Path::to_path_buf);
+        let attachment_epoch = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
-            .map(|runner| runner.socket.clone())
-        else {
+            .map(|runner| {
+                runner
+                    .attachment_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or_default();
+        let now = self.event_loop_monotonic_now;
+        for record in self.delivery_unconfirmed_records.values_mut() {
+            if record.probe_attachment_epoch != attachment_epoch {
+                record.probe_attachment_epoch = attachment_epoch;
+                record.probe_deadline = now + std::time::Duration::from_secs(2);
+                record.next_probe_at = now;
+                record.probe_exhausted = false;
+                record.probe_in_flight = false;
+            }
+            if now >= record.probe_deadline {
+                record.probe_exhausted = true;
+                record.probe_in_flight = false;
+            }
+        }
+        let Some(socket) = socket else {
+            for record in self
+                .delivery_unconfirmed_records
+                .values_mut()
+                .filter(|record| !record.probe_exhausted)
+            {
+                record.next_probe_at = now + std::time::Duration::from_millis(250);
+            }
             return false;
         };
-        let now = self.event_loop_monotonic_now;
         let pending = self
             .delivery_unconfirmed_records
             .values_mut()
-            .filter(|record| !record.probe_in_flight && now >= record.next_probe_at)
+            .filter(|record| {
+                !record.probe_exhausted && !record.probe_in_flight && now >= record.next_probe_at
+            })
             .map(|record| {
                 record.probe_in_flight = true;
                 (
@@ -263,6 +324,7 @@ impl App {
                 return Ok(true);
             }
         }
+        self.pending_session_switch_reconcile_started_at = None;
         let cancelled = self
             .submission_fences
             .iter()
@@ -296,7 +358,6 @@ impl App {
         ) {
             return Ok(changed);
         }
-        self.pending_session_switch_reconcile_started_at = None;
         self.pending_new_session = false;
 
         let switch_task = match self.agent_runner.as_ref() {

@@ -169,6 +169,15 @@ impl App {
             self.pending_ephemeral_session_switch_intent = None;
             return;
         }
+        let wire_digests = pending
+            .iter()
+            .map(|pending| {
+                (
+                    pending.optimistic_submission_id,
+                    crate::tui::structured_paste::user_submission_wire_digest(&pending.submission),
+                )
+            })
+            .collect::<Vec<_>>();
         let submissions = pending
             .iter_mut()
             .map(|pending| {
@@ -185,6 +194,9 @@ impl App {
         };
         match result {
             Ok(()) => {
+                for (id, digest) in wire_digests {
+                    self.mark_submission_fence_handed_off(id, digest);
+                }
                 self.pending_session_switch_target = None;
                 self.pending_ephemeral_session_switch_intent = None;
                 self.current_session_persisted = true;
@@ -348,6 +360,8 @@ impl App {
                 continue;
             }
             let submission = std::mem::take(&mut retained.pending.submission);
+            let wire_digest =
+                crate::tui::structured_paste::user_submission_wire_digest(&submission);
             let result = match self.agent_runner.as_ref() {
                 Some(Ok(runner)) => runner.try_send_optimistic_input(
                     submission,
@@ -357,6 +371,10 @@ impl App {
             };
             match result {
                 Ok(()) => {
+                    self.mark_submission_fence_handed_off(
+                        retained.pending.optimistic_submission_id,
+                        wire_digest,
+                    );
                     changed = true;
                     self.current_session_persisted = true;
                     if retained.pending.owns_working_span {

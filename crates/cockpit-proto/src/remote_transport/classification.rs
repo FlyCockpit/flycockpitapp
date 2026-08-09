@@ -1588,7 +1588,6 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Response, "subagent_transcript"),
     (RemoteMessageKind::Response, "sessions"),
     (RemoteMessageKind::Response, "session_messages"),
-    (RemoteMessageKind::Response, "client_submission_receipt"),
     (RemoteMessageKind::Response, "history_page"),
     (RemoteMessageKind::Response, "subagent_history_page"),
     (RemoteMessageKind::Response, "pins_with_text"),
@@ -1770,7 +1769,7 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 114);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 115);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 73);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }

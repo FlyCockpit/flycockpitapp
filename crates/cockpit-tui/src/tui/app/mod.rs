@@ -352,6 +352,9 @@ pub(crate) struct DeliveryUnconfirmedRecord {
     pub surfaced: bool,
     pub probe_in_flight: bool,
     pub next_probe_at: std::time::Duration,
+    pub probe_deadline: std::time::Duration,
+    pub probe_attachment_epoch: u64,
+    pub probe_exhausted: bool,
 }
 
 pub(crate) struct ModelSelectionRetry {
@@ -3669,7 +3672,7 @@ impl App {
             let delivery_receipt_wait = self
                 .delivery_unconfirmed_records
                 .values()
-                .filter(|record| !record.probe_in_flight)
+                .filter(|record| !record.probe_exhausted && !record.probe_in_flight)
                 .map(|record| record.next_probe_at.saturating_sub(terminal_input.now()))
                 .min();
 

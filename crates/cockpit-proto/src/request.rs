@@ -1391,7 +1391,7 @@ macro_rules! command {
             (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, serialized, none);
             (Request::ListSessions { .. }, "list_sessions", public_read, none, false, concurrent, none);
             (Request::ReadSessionMessages { session_id, .. }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, concurrent, none);
-            (Request::ReadClientSubmissionReceipt { session_id, .. }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, serialized, none);
+            (Request::ReadClientSubmissionReceipt { session_id, .. }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, concurrent, none);
             (Request::ReadHistoryPage { session_id, .. }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, concurrent, none);
             (Request::ReadSubagentHistoryPage { session_id, .. }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, concurrent, none);
             (Request::SessionLiveStatus { .. }, "session_live_status", public_read, none, false, concurrent, none);

@@ -52,7 +52,7 @@
   ],
   "counts": {
     "event": 76,
-    "request": 114,
+    "request": 115,
     "response": 73
   },
   "messages": {
@@ -885,6 +885,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "read_client_submission_receipt"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "read_history_page"
       },
       {
@@ -1290,6 +1296,12 @@
         "inlinePayloadBound": "paged",
         "lane": "interactive",
         "tag": "session_messages"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "client_submission_receipt"
       },
       {
         "class": "bounded_request_response",

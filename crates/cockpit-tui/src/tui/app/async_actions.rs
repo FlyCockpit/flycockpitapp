@@ -247,22 +247,41 @@ impl App {
                                 record.probe_in_flight = false;
                                 record.next_probe_at = self.event_loop_monotonic_now
                                     + std::time::Duration::from_millis(250);
+                                if record.next_probe_at >= record.probe_deadline {
+                                    record.probe_exhausted = true;
+                                }
                             }
                         }
                         Ok(status) => {
-                            if let Some(record) = self
+                            let (outcome, wire_fingerprint) = match status {
+                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Accepted {
+                                    wire_fingerprint,
+                                    ..
+                                } => ("accepted".to_string(), wire_fingerprint),
+                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal {
+                                    disposition,
+                                    wire_fingerprint,
+                                } => (disposition, wire_fingerprint),
+                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
+                            };
+                            if wire_fingerprint.is_empty() {
+                                if let Some(record) = self
+                                    .delivery_unconfirmed_records
+                                    .get_mut(&client_submission_id)
+                                {
+                                    record.probe_in_flight = false;
+                                    record.probe_exhausted = true;
+                                }
+                            } else if let Some(record) = self
                                 .delivery_unconfirmed_records
                                 .remove(&client_submission_id)
                             {
                                 self.submission_fences.remove(&client_submission_id);
-                                let outcome = match status {
-                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Accepted { .. } => "accepted",
-                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal { ref disposition, .. } => disposition,
-                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
-                                };
                                 self.push_plain(format!(
-                                    "Delivery {outcome} for message {} in session {}.",
-                                    record.client_submission_id, record.session_id
+                                    "Delivery {outcome} for message {} in session {} (daemon wire {}).",
+                                    record.client_submission_id,
+                                    record.session_id,
+                                    wire_fingerprint
                                 ));
                             }
                         }

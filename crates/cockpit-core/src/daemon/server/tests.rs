@@ -3569,6 +3569,7 @@ fn dispatch_matrix_class_for_command(
         | ("git_diff_file", "project_files", false)
         | ("list_sessions", "public_read", false)
         | ("read_session_messages", "custom", false)
+        | ("read_client_submission_receipt", "custom", false)
         | ("read_history_page", "custom", false)
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
@@ -3581,7 +3582,6 @@ fn dispatch_matrix_class_for_command(
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
         | ("subagent_transcript", "custom", false)
-        | ("read_client_submission_receipt", "custom", false)
         | ("resource_snapshot", "owner_only", false)
         | ("list_scheduled_jobs", "owner_only", false)
         | ("list_assistants", "owner_only", false)
@@ -3616,6 +3616,7 @@ enum ReadonlyDispatchCaseKind {
     GitDiffFile,
     ListSessions,
     ReadSessionMessages,
+    ReadClientSubmissionReceipt,
     ReadHistoryPage,
     ReadSubagentHistoryPage,
     SessionLiveStatus,
@@ -3663,6 +3664,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "read_session_messages",
             case: ReadonlyDispatchCaseKind::ReadSessionMessages,
+        },
+        ReadonlyDispatchCase {
+            kind: "read_client_submission_receipt",
+            case: ReadonlyDispatchCaseKind::ReadClientSubmissionReceipt,
         },
         ReadonlyDispatchCase {
             kind: "read_history_page",
@@ -5783,6 +5788,26 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].seq, seq);
             }
+            Self::ReadClientSubmissionReceipt => {
+                let ctx = test_ctx();
+                let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadClientSubmissionReceipt {
+                        session_id: session.session_id,
+                        client_submission_id: Uuid::new_v4(),
+                    },
+                )
+                .await
+                .expect("receipt probe happy");
+                assert!(matches!(
+                    response,
+                    Response::ClientSubmissionReceipt {
+                        status: proto::ClientSubmissionReceiptStatus::Pending,
+                        ..
+                    }
+                ));
+            }
             Self::ReadHistoryPage => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -6117,6 +6142,25 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(session_id, unknown_session_id);
                 assert!(messages.is_empty());
                 assert!(!has_more);
+            }
+            Self::ReadClientSubmissionReceipt => {
+                let ctx = test_ctx();
+                let response = dispatch_matrix_request(
+                    &ctx,
+                    Request::ReadClientSubmissionReceipt {
+                        session_id: Uuid::new_v4(),
+                        client_submission_id: Uuid::new_v4(),
+                    },
+                )
+                .await
+                .expect("unknown receipt remains pending");
+                assert!(matches!(
+                    response,
+                    Response::ClientSubmissionReceipt {
+                        status: proto::ClientSubmissionReceiptStatus::Pending,
+                        ..
+                    }
+                ));
             }
             Self::ReadHistoryPage => {
                 let ctx = test_ctx();

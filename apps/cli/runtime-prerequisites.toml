@@ -1,0 +1,24 @@
+[surface]
+title = "Runtime prerequisites"
+description = "Optional host tools used by Cockpit features"
+doctor_command = "cockpit doctor --dependencies-json"
+settings_label = "Settings → Dependencies"
+docs_url = "https://docs.flycockpit.com/reference/runtime-prerequisites/"
+
+[media]
+ids = ["media.ffmpeg", "media.ffprobe"]
+rule_id = "ffmpeg-ffprobe-compatible-pair"
+native_formats = ["PNG", "JPEG", "GIF", "WebP"]
+external_audio_formats = ["WAV", "MP3", "M4A", "FLAC", "Ogg"]
+external_video_formats = ["MP4", "WebM", "MOV"]
+install_url = "https://ffmpeg.org/download.html"
+verify_commands = ["ffmpeg -version", "ffprobe -version"]
+
+[bubblewrap]
+id = "safety.bubblewrap"
+install_url = "https://github.com/containers/bubblewrap/blob/main/README.md"
+verify_command = "bwrap --version"
+
+[release_assets]
+completions = ["cockpit.bash", "_cockpit", "cockpit.fish"]
+man_pages = ["cockpit.1"]

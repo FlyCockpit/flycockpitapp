@@ -25,4 +25,4 @@ cargo run --locked -p cockpit-cli -- completion bash > "$completion_dir/cockpit.
 cargo run --locked -p cockpit-cli -- completion zsh > "$completion_dir/_cockpit"
 cargo run --locked -p cockpit-cli -- completion fish > "$completion_dir/cockpit.fish"
 cargo run --locked -p cockpit-cli --example generate-manpages -- "$man_dir"
-python3 apps/cli/scripts/generate-runtime-docs.py
+python3 apps/cli/scripts/generate-runtime-docs.py --check

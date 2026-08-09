@@ -23,11 +23,47 @@ def patch_shell_installer(path: Path) -> None:
     if [ -f "$_src_dir/install-shell-assets.sh" ]; then
         sh "$_src_dir/install-shell-assets.sh" || true
     fi
+    if [ -f "$_src_dir/runtime-prerequisite-notice.sh" ]; then
+        sh "$_src_dir/runtime-prerequisite-notice.sh" || true
+    fi
 '''
     if replacement in text:
         return
     if needle not in text:
         raise SystemExit(f"could not find shell installer insertion point in {path}")
+    path.write_text(text.replace(needle, replacement, 1))
+
+
+def patch_powershell_installer(path: Path) -> None:
+    text = path.read_text()
+    copy_needle = '''    Copy-Item "$bin_path" -Destination "$dest_dir" -ErrorAction Stop
+    Remove-Item "$bin_path" -Recurse -Force -ErrorAction Stop
+'''
+    copy_replacement = '''    $staged_file = Join-Path "$dest_dir" (".cockpit-install-" + [Guid]::NewGuid().ToString("N"))
+    try {
+      Copy-Item "$bin_path" -Destination "$staged_file" -ErrorAction Stop
+      Move-Item -LiteralPath "$staged_file" -Destination (Join-Path "$dest_dir" "$installed_file") -Force -ErrorAction Stop
+      Remove-Item "$bin_path" -Recurse -Force -ErrorAction Stop
+    } finally {
+      Remove-Item -LiteralPath "$staged_file" -Force -ErrorAction SilentlyContinue
+    }
+'''
+    if copy_replacement not in text:
+        if copy_needle not in text:
+            raise SystemExit(f"could not find PowerShell binary copy block in {path}")
+        text = text.replace(copy_needle, copy_replacement, 1)
+
+    needle = '  Write-Information "everything\'s installed!"\n'
+    replacement = needle + '''  $archiveRoot = Split-Path -Parent $artifacts["bin_paths"][0]
+  $notice = Join-Path $archiveRoot "runtime-prerequisite-notice.ps1"
+  if (Test-Path -LiteralPath $notice -PathType Leaf) {
+    & $notice
+  }
+'''
+    if replacement in text:
+        return
+    if needle not in text:
+        raise SystemExit(f"could not find PowerShell installer insertion point in {path}")
     path.write_text(text.replace(needle, replacement, 1))
 
 
@@ -60,6 +96,7 @@ def main() -> int:
     if distrib != Path("target/distrib"):
         raise SystemExit("cargo-dist assets must remain in target/distrib")
     patch_shell_installer(distrib / "cockpit-cli-installer.sh")
+    patch_powershell_installer(distrib / "cockpit-cli-installer.ps1")
     patch_homebrew_formula(distrib / "cockpit.rb")
     return 0
 

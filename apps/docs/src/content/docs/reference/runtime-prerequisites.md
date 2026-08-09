@@ -17,16 +17,16 @@ checks are read-only. Open **Settings → Dependencies** or run
 
 Install a compatible FFmpeg/FFprobe pair using the official instructions at
 https://ffmpeg.org/download.html. Verify with `ffmpeg -version` and
-`ffprobe -version`; refresh the health snapshot in Settings or rerun `cockpit
-doctor --dependencies-json`. Uninstall using the same system package source.
+`ffprobe -version`; refresh the health snapshot in Settings or rerun `cockpit doctor --dependencies-json`.
+Uninstall using the same system package source.
 Unknown platforms receive only the official link and verification commands.
 
 ## Linux shell sandbox
 
 Bubblewrap (`safety.bubblewrap`) strengthens the host shell sandbox on Linux.
 Its absence produces a warning but never makes installation fail and never
-runs a package manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md,
-verify with `bwrap --version`, refresh dependency health, and uninstall using
+runs a package manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md, verify with
+`bwrap --version`, refresh dependency health, and uninstall using
 the system package source if it is no longer wanted.
 
 ## Cockpit installation assets

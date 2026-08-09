@@ -16,13 +16,10 @@ installers = ["shell", "powershell", "homebrew"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
-# Printed by both generated installers. Keep this wording aligned with the
-# checked runtime-prerequisites document via generate-runtime-docs.py.
-install-success-msg = "Cockpit installed. Missing Bubblewrap is only a warning. Selected audio/video inputs require compatible FFmpeg and FFprobe; run `cockpit doctor --dependencies-json` for read-only guidance."
 # Generated release assets are copied into archives/installers alongside the binary.
 # cargo-dist 0.32 `include` only copies pre-existing files, so the release workflow
 # runs `scripts/generate-release-assets.sh` before `dist build`.
-include = ["target/dist/completions", "target/dist/man", "apps/cli/scripts/install-shell-assets.sh", "apps/cli/generated/runtime-prerequisites.txt"]
+include = ["target/dist/completions", "target/dist/man", "apps/cli/scripts/install-shell-assets.sh", "apps/cli/scripts/runtime-prerequisite-notice.sh", "apps/cli/scripts/runtime-prerequisite-notice.ps1", "apps/cli/generated/runtime-prerequisites.txt"]
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program

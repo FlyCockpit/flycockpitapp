@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -17,36 +18,37 @@ CATALOG = ROOT / "crates/cockpit-core/src/external_runtime/adapters.rs"
 DOC = ROOT / "apps/docs/src/content/docs/reference/runtime-prerequisites.md"
 WARNING = ROOT / "apps/cli/generated/runtime-prerequisites.txt"
 IDS = ("ID_MEDIA_FFMPEG", "ID_MEDIA_FFPROBE", "ID_BUBBLEWRAP")
+METADATA = ROOT / "apps/cli/runtime-prerequisites.toml"
 
 DOCUMENT_TEMPLATE = """---
-title: Runtime prerequisites
-description: Optional host tools used by Cockpit features
+title: {title}
+description: {description}
 ---
 
 Cockpit does not download, bundle, or install external runtimes. Dependency
-checks are read-only. Open **Settings → Dependencies** or run
-`cockpit doctor --dependencies-json` to see current health and catalog guidance.
+checks are read-only. Open **{settings_label}** or run
+`{doctor_command}` to see current health and catalog guidance.
 
 ## Media support
 
 | Selected input | Decoder | Catalog health IDs | Behavior when unavailable |
 | --- | --- | --- | --- |
-| PNG, JPEG, GIF, WebP | Native | None | Decodes natively |
-| WAV, MP3, M4A, FLAC, Ogg | FFmpeg + FFprobe | `{ffmpeg_id}`, `{ffprobe_id}` | Selection fails closed |
-| MP4, WebM, MOV | FFmpeg + FFprobe | `{ffmpeg_id}`, `{ffprobe_id}` | Selection fails closed |
+| {native_formats} | Native | None | Decodes natively |
+| {audio_formats} | FFmpeg + FFprobe | `{ffmpeg_id}`, `{ffprobe_id}` | Selection fails closed |
+| {video_formats} | FFmpeg + FFprobe | `{ffmpeg_id}`, `{ffprobe_id}` | Selection fails closed |
 
 Install a compatible FFmpeg/FFprobe pair using the official instructions at
-https://ffmpeg.org/download.html. Verify with `ffmpeg -version` and
-`ffprobe -version`; refresh the health snapshot in Settings or rerun `cockpit
-doctor --dependencies-json`. Uninstall using the same system package source.
+{media_url}. Verify with `{ffmpeg_verify}` and
+`{ffprobe_verify}`; refresh the health snapshot in Settings or rerun `{doctor_command}`.
+Uninstall using the same system package source.
 Unknown platforms receive only the official link and verification commands.
 
 ## Linux shell sandbox
 
 Bubblewrap (`{bubblewrap_id}`) strengthens the host shell sandbox on Linux.
 Its absence produces a warning but never makes installation fail and never
-runs a package manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md,
-verify with `bwrap --version`, refresh dependency health, and uninstall using
+runs a package manager. Follow {bubblewrap_url}, verify with
+`{bubblewrap_verify}`, refresh dependency health, and uninstall using
 the system package source if it is no longer wanted.
 
 ## Cockpit installation assets
@@ -60,17 +62,17 @@ prompted. Shell completions and man pages are explicit archive assets; see the
 CLI README for installation and removal steps.
 """
 
-WARNING_TEXT = """Cockpit external runtime notice
+WARNING_TEMPLATE = """Cockpit external runtime notice
 
 Cockpit does not install host dependencies. Missing Bubblewrap is a warning and
 does not fail installation. Selected audio/video inputs require a compatible
 FFmpeg and FFprobe pair; images decode natively. Diagnose with:
-  cockpit doctor --dependencies-json
-Documentation: https://docs.flycockpit.com/reference/runtime-prerequisites/
+  {doctor_command}
+Documentation: {docs_url}
 """
 
 
-def catalog_values() -> dict[str, str]:
+def catalog_values(metadata: dict) -> dict[str, str]:
     source = CATALOG.read_text()
     missing = [item for item in IDS[:2] if source.count(item) < 3]
     safety = (CATALOG.parent / "safety_adapters.rs").read_text()
@@ -84,6 +86,11 @@ def catalog_values() -> dict[str, str]:
         if not match:
             raise SystemExit(f"could not read catalog value for {name}")
         values[name] = match.group(1)
+    expected = [*metadata["media"]["ids"], metadata["bubblewrap"]["id"]]
+    if list(values.values()) != expected:
+        raise SystemExit("runtime metadata IDs do not match the registered Rust catalog")
+    if metadata["media"]["rule_id"] not in source:
+        raise SystemExit("runtime metadata compatibility rule is not registered")
     return values
 
 
@@ -91,22 +98,39 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    values = catalog_values()
+    metadata = tomllib.loads(METADATA.read_text())
+    values = catalog_values(metadata)
+    surface = metadata["surface"]
+    media = metadata["media"]
+    bubblewrap = metadata["bubblewrap"]
     document = DOCUMENT_TEMPLATE.format(
+        title=surface["title"],
+        description=surface["description"],
+        settings_label=surface["settings_label"],
+        doctor_command=surface["doctor_command"],
         ffmpeg_id=values[IDS[0]],
         ffprobe_id=values[IDS[1]],
         bubblewrap_id=values[IDS[2]],
+        native_formats=", ".join(media["native_formats"]),
+        audio_formats=", ".join(media["external_audio_formats"]),
+        video_formats=", ".join(media["external_video_formats"]),
+        media_url=media["install_url"],
+        ffmpeg_verify=media["verify_commands"][0],
+        ffprobe_verify=media["verify_commands"][1],
+        bubblewrap_url=bubblewrap["install_url"],
+        bubblewrap_verify=bubblewrap["verify_command"],
     )
+    warning = WARNING_TEMPLATE.format(**surface)
     if args.check:
         if not DOC.exists() or DOC.read_text() != document:
             raise SystemExit(f"generated documentation drift: {DOC.relative_to(ROOT)}")
-        if not WARNING.exists() or WARNING.read_text() != WARNING_TEXT:
+        if not WARNING.exists() or WARNING.read_text() != warning:
             raise SystemExit(f"generated warning drift: {WARNING.relative_to(ROOT)}")
         return 0
     DOC.parent.mkdir(parents=True, exist_ok=True)
     DOC.write_text(document)
     WARNING.parent.mkdir(parents=True, exist_ok=True)
-    WARNING.write_text(WARNING_TEXT)
+    WARNING.write_text(warning)
     return 0
 
 

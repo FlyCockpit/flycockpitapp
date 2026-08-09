@@ -152,7 +152,7 @@ impl ConfigDoc {
         )
         .context("recovering a pending default-model transaction")?;
         let generation = next_load_effective_generation();
-        let (masks, unmaskable) = effective_default::masked_layers(paths);
+        let (mut masks, mut unmaskable) = effective_default::masked_layers(paths);
         if !unmaskable.is_empty() {
             anyhow::bail!(
                 "{} configuration layer(s) have a pending default-model transaction that cannot be masked; run `cockpit doctor` to inspect the journal",
@@ -160,6 +160,34 @@ impl ConfigDoc {
             );
         }
 
+        let (mut providers, mut layers) =
+            Self::providers_and_layer_snapshot_with_masks(paths, &masks);
+        // The mask probe and capture both happen outside the cross-process
+        // mutation lock. If a transaction appeared between them, the first
+        // capture may contain its partially committed active-model bytes.
+        // Reprobe once and rebuild both projections from the same masked read.
+        if masks.is_empty()
+            && unmaskable.is_empty()
+            && effective_default::any_journal_present(paths)
+        {
+            (masks, unmaskable) = effective_default::masked_layers(paths);
+            if !unmaskable.is_empty() {
+                anyhow::bail!(
+                    "{} configuration layer(s) have a pending default-model transaction that cannot be masked; run `cockpit doctor` to inspect the journal",
+                    unmaskable.len()
+                );
+            }
+            if !masks.is_empty() {
+                (providers, layers) = Self::providers_and_layer_snapshot_with_masks(paths, &masks);
+            }
+        }
+        Ok((providers.with_resolution_generation(generation), layers))
+    }
+
+    fn providers_and_layer_snapshot_with_masks(
+        paths: &[PathBuf],
+        masks: &HashMap<PathBuf, Vec<u8>>,
+    ) -> (ProvidersConfig, Vec<(PathBuf, Value)>) {
         let mut merged = Value::Object(Map::new());
         let mut layers = Vec::new();
         for path in paths {
@@ -190,9 +218,8 @@ impl ConfigDoc {
             raw: merged,
             originally_loaded_providers: BTreeMap::new(),
         }
-        .providers()
-        .with_resolution_generation(generation);
-        Ok((providers, layers))
+        .providers();
+        (providers, layers)
     }
 
     pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {

@@ -227,6 +227,15 @@ fn click_rendered_provider_action(
 
 #[test]
 fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
+    // Several visible provider controls intentionally start async-backed
+    // production effects (model refetch/OAuth). Keep this synchronous matrix
+    // deterministic while still entering the real reducers: spawned work is
+    // owned by this runtime and cancelled when the fixture completes.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("provider pointer test runtime");
+    let _runtime_guard = runtime.enter();
     let config = one_provider_config(None);
     let provider_id = "p".to_string();
     let entry = config.providers[&provider_id].clone();

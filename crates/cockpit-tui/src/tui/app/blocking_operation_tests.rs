@@ -80,11 +80,9 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
 
-    app.handle_terminal_event(crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
+    app.handle_key_insert(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
     ));
     app.handle_terminal_event(crossterm::event::Event::Mouse(
         crossterm::event::MouseEvent {
@@ -105,6 +103,7 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         Some(HistoryEntry::Plain { line }) if line == "daemon reduced"
     ));
     assert_eq!(app.async_actions.pending_count(), 6);
+    tokio::task::yield_now().await;
     release.wait();
 }
 
@@ -196,14 +195,13 @@ async fn queue_edit_does_not_block_key_handler() {
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
-    app.handle_terminal_event(crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
+    app.handle_key_insert(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
     ));
     assert_eq!(app.composer.text(), "x");
     assert_eq!(app.async_actions.pending_count(), 1);
+    tokio::task::yield_now().await;
     barrier.wait();
 }
 
@@ -214,6 +212,7 @@ async fn btw_teardown_does_not_block_during_session() {
     app.handle_btw_command("end");
     app.handle_terminal_event(crossterm::event::Event::Resize(91, 37));
     assert_eq!(app.async_actions.pending_count(), 1);
+    tokio::task::yield_now().await;
     barrier.wait();
 }
 

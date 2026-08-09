@@ -2,7 +2,9 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockingOperationRegistration {
+    #[cfg(test)]
     pub(super) site: &'static str,
+    #[cfg(test)]
     pub(super) binding: fn(&App) -> BlockingOperationKind,
     pub(super) kind: BlockingOperationKind,
     pub(super) actions: &'static [&'static str],
@@ -16,7 +18,9 @@ macro_rules! blocking_operation_manifest {
 
         pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
             $(BlockingOperationRegistration {
+                #[cfg(test)]
                 site: $site,
+                #[cfg(test)]
                 binding: App::$binding,
                 kind: BlockingOperationKind::$kind,
                 actions: &[$($action),+],

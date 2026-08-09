@@ -803,6 +803,8 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
 
     let mut history = driver.stack[0].history.clone();
     let prompt = crate::engine::message::build_user_message(UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: UserSubmissionKind::User,
         origin: Default::default(),
         text: "next root message".into(),

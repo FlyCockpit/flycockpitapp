@@ -1,23 +1,47 @@
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::future::{pending, poll_fn};
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream};
 use futures::{Stream, StreamExt};
 
 pub const MAX_DRAIN_PER_PASS: usize = 256;
+static NEXT_TERMINAL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// A terminal event stamped at the instant the underlying event stream yields it.
+///
+/// Keeping this envelope at the source prevents redraws, reducer stalls and drain
+/// batching from changing shortcut and rapid-paste timing decisions.
+#[derive(Debug)]
+pub struct ObservedTerminalEvent {
+    pub event: io::Result<Event>,
+    pub observed_at: Duration,
+    pub terminal_generation: u64,
+}
+
+type MonotonicClock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 pub struct TerminalInput {
     stream: Option<TerminalInputStream>,
+    clock: MonotonicClock,
+    generation: u64,
     #[cfg(test)]
     test_stream: bool,
 }
 
 impl TerminalInput {
     pub fn new() -> Self {
+        let origin = Instant::now();
         Self {
             stream: Some(TerminalInputStream::new()),
+            clock: Arc::new(move || origin.elapsed()),
+            generation: next_generation(),
             #[cfg(test)]
             test_stream: false,
         }
@@ -25,27 +49,48 @@ impl TerminalInput {
 
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
+        Self::new_for_test_with_clock(Arc::new(|| Duration::ZERO))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_clock(clock: MonotonicClock) -> Self {
         Self {
-            stream: Some(TerminalInputStream::TestLive),
+            stream: Some(TerminalInputStream::TestLive(VecDeque::new())),
+            clock,
+            generation: next_generation(),
             test_stream: true,
         }
     }
 
-    pub async fn next(&mut self) -> Option<io::Result<Event>> {
+    pub async fn next(&mut self) -> Option<ObservedTerminalEvent> {
         match self.stream.as_mut() {
-            Some(stream) => stream.next().await,
+            Some(stream) => stream.next().await.map(|event| ObservedTerminalEvent {
+                event,
+                observed_at: (self.clock)(),
+                terminal_generation: self.generation,
+            }),
             None => pending().await,
         }
     }
 
-    pub async fn drain_ready<F>(&mut self, cap: usize, on_event: F) -> Result<bool>
+    pub async fn drain_ready<F>(&mut self, cap: usize, mut on_event: F) -> Result<bool>
     where
-        F: FnMut(Option<io::Result<Event>>) -> Result<bool>,
+        F: FnMut(Option<ObservedTerminalEvent>) -> Result<bool>,
     {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(false);
         };
-        stream.drain_ready(cap, on_event).await
+        let clock = Arc::clone(&self.clock);
+        let generation = self.generation;
+        stream
+            .drain_ready(cap, move |item| {
+                on_event(item.map(|event| ObservedTerminalEvent {
+                    event,
+                    observed_at: clock(),
+                    terminal_generation: generation,
+                }))
+            })
+            .await
     }
 
     pub fn suspend(&mut self) {
@@ -55,6 +100,7 @@ impl TerminalInput {
     pub fn resume(&mut self) {
         if self.stream.is_none() {
             self.stream = Some(self.new_stream());
+            self.generation = next_generation();
         }
     }
 
@@ -62,13 +108,42 @@ impl TerminalInput {
         self.stream.is_none()
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn now(&self) -> Duration {
+        (self.clock)()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_events(
+        clock: MonotonicClock,
+        events: impl IntoIterator<Item = io::Result<Event>>,
+    ) -> Self {
+        Self {
+            stream: Some(TerminalInputStream::TestLive(events.into_iter().collect())),
+            clock,
+            generation: next_generation(),
+            test_stream: true,
+        }
+    }
+
     fn new_stream(&self) -> TerminalInputStream {
         #[cfg(test)]
         if self.test_stream {
-            return TerminalInputStream::TestLive;
+            return TerminalInputStream::TestLive(VecDeque::new());
         }
         TerminalInputStream::new()
     }
+}
+
+fn next_generation() -> u64 {
+    NEXT_TERMINAL_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("terminal input generation exhausted")
 }
 
 impl Default for TerminalInput {
@@ -80,7 +155,7 @@ impl Default for TerminalInput {
 enum TerminalInputStream {
     Real(EventStream),
     #[cfg(test)]
-    TestLive,
+    TestLive(VecDeque<io::Result<Event>>),
 }
 
 impl TerminalInputStream {
@@ -92,7 +167,10 @@ impl TerminalInputStream {
         match self {
             Self::Real(stream) => stream.next().await,
             #[cfg(test)]
-            Self::TestLive => pending().await,
+            Self::TestLive(events) => match events.pop_front() {
+                Some(event) => Some(event),
+                None => pending().await,
+            },
         }
     }
 
@@ -103,7 +181,18 @@ impl TerminalInputStream {
         match self {
             Self::Real(stream) => drain_ready_impl(stream, cap, on_event).await,
             #[cfg(test)]
-            Self::TestLive => Ok(false),
+            Self::TestLive(events) => {
+                let mut on_event = on_event;
+                for _ in 0..cap {
+                    let Some(event) = events.pop_front() else {
+                        break;
+                    };
+                    if on_event(Some(event))? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 }
@@ -240,6 +329,50 @@ mod tests {
         assert!(registered.will_wake(&our_waker));
         registered.wake();
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_input_observation_time_is_source_time() {
+        let mut input = TerminalInput::new_for_test();
+        let first = input.generation();
+        input.suspend();
+        input.resume();
+        assert!(input.generation() > first);
+
+        let ticks = Arc::new(AtomicUsize::new(4));
+        let observed = Arc::clone(&ticks);
+        let input = TerminalInput::new_for_test_with_clock(Arc::new(move || {
+            Duration::from_millis(observed.fetch_add(1, Ordering::SeqCst) as u64)
+        }));
+        assert_eq!((input.clock)(), Duration::from_millis(4));
+        assert_eq!((input.clock)(), Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn timestamped_test_stream_preserves_yield_order_and_time() {
+        let ticks = Arc::new(AtomicUsize::new(10));
+        let observed = Arc::clone(&ticks);
+        let mut input = TerminalInput::new_for_test_events(
+            Arc::new(move || Duration::from_millis(observed.fetch_add(5, Ordering::SeqCst) as u64)),
+            [
+                Ok(Event::Resize(1, 1)),
+                Ok(Event::Resize(2, 2)),
+                Ok(Event::Resize(3, 3)),
+            ],
+        );
+        let first = input.next().await.unwrap();
+        assert_eq!(first.observed_at, Duration::from_millis(10));
+        let mut drained = Vec::new();
+        input
+            .drain_ready(2, |item| {
+                drained.push(item.unwrap());
+                Ok(false)
+            })
+            .await
+            .unwrap();
+        assert_eq!(drained[0].observed_at, Duration::from_millis(15));
+        assert_eq!(drained[1].observed_at, Duration::from_millis(20));
+        assert!(matches!(drained[1].event, Ok(Event::Resize(3, 3))));
     }
 
     #[tokio::test]

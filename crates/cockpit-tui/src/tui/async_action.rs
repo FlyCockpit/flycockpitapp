@@ -132,6 +132,19 @@ pub enum AsyncActionPayload {
         block_id: u64,
         tokens: usize,
     },
+    ImagePathProbe {
+        terminal_generation: Option<u64>,
+        original: String,
+        composer_snapshot: String,
+        cursor: usize,
+        png: Option<Vec<u8>>,
+    },
+    NativeImagePaste {
+        terminal_generation: Option<u64>,
+        composer_snapshot: String,
+        cursor: usize,
+        png: Option<Vec<u8>>,
+    },
     PinState {
         session_id: uuid::Uuid,
         count: usize,
@@ -311,6 +324,13 @@ impl AsyncActionRunner {
 
     pub fn has_pending_kind(&self, kind: &AsyncActionKind) -> bool {
         self.pending.values().any(|pending| &pending.kind == kind)
+    }
+
+    pub fn pending_kind_count(&self, kind: &AsyncActionKind) -> usize {
+        self.pending
+            .values()
+            .filter(|pending| &pending.kind == kind)
+            .count()
     }
 
     pub fn has_pending_key(&self, key: &AsyncActionKey) -> bool {
@@ -577,6 +597,28 @@ mod tests {
         assert!(matches!(start, AsyncActionStart::Started(_)));
         assert_eq!(runner.pending_count(), 1);
         assert!(runner.is_pending(start.id()));
+    }
+
+    #[tokio::test]
+    async fn paste_probe_off_event_loop() {
+        let mut runner = AsyncActionRunner::default();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        runner.start(
+            AsyncActionKind::Internal("paste.test_probe"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let _ = release_rx.await;
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        assert_eq!(runner.pending_count(), 1);
+        // A parked probe does not own this reducer turn.
+        let mut reducer_progress = 0;
+        reducer_progress += 1;
+        assert_eq!(reducer_progress, 1);
+        release_tx.send(()).unwrap();
+        runner.notifier().notified().await;
+        assert_eq!(runner.drain_completed().len(), 1);
     }
 
     #[tokio::test]

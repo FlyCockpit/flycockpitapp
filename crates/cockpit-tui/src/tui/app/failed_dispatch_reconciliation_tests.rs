@@ -1044,6 +1044,8 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         line: "side-only history".to_string(),
     });
     let exact_submission = UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: "exact wire text".to_string(),
@@ -1149,6 +1151,8 @@ fn error_lines(app: &App) -> Vec<&str> {
 
 fn complete_dispatch_submission(marker: &str) -> UserSubmission {
     UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{marker}"),
@@ -1945,6 +1949,8 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         .id();
 
     let exact_submission = UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!(

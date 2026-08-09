@@ -173,6 +173,9 @@ fn classify_user_message_response(
             proto::ErrorCode::UserMessageTerminated => {
                 Err(UserSubmissionSendError::Rejected(error.message))
             }
+            proto::ErrorCode::ModelGenerationStale => {
+                Err(UserSubmissionSendError::Rejected(error.message))
+            }
             proto::ErrorCode::Internal | proto::ErrorCode::Shutdown => {
                 Err(UserSubmissionSendError::Ambiguous(error.message))
             }
@@ -2065,6 +2068,8 @@ fn try_spawn_inner(
                         .map_err(classify_image_upload_error)?;
                     match client
                         .request(Request::SendUserMessage {
+                            expected_model_state_generation: sub.expected_model_state_generation,
+                            expected_model: sub.expected_model,
                             client_submission_id,
                             text: sub.text,
                             display_text: sub.display_text,
@@ -3953,6 +3958,8 @@ mod tests {
 
     fn complete_test_submission() -> cockpit_core::engine::message::UserSubmission {
         cockpit_core::engine::message::UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
             origin: Default::default(),
             text: "wire text with expanded tag and image sentinel".to_string(),

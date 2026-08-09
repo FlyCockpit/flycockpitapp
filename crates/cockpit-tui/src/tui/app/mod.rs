@@ -112,7 +112,7 @@ use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
     ToolCallState, classify_subagent_status, route_text_delta,
 };
-use crate::tui::input_source::{MAX_DRAIN_PER_PASS, TerminalInput};
+use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
 use cockpit_core::engine::message::{QueueTarget, QueuedUserMessage};
@@ -316,6 +316,7 @@ pub(crate) struct PendingModelSelection {
 }
 
 pub(crate) struct QueuedModelSubmission {
+    pub client_submission_id: uuid::Uuid,
     /// Composer buffer at the instant this submission was held. A matching
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,
@@ -1965,6 +1966,9 @@ pub struct App {
     /// inline text + emit real image parts (vision) or text notes
     /// (non-vision). Cleared on submit and `/new`.
     pub(super) paste_registry: crate::tui::paste::PasteRegistry,
+    pub(super) terminal_paste_classifier: crate::tui::structured_paste::TerminalPasteClassifier,
+    pub(super) terminal_input_generation: Option<u64>,
+    pub(super) next_submission_fence_sequence: u64,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
     /// `Some(false)` after `i` (inner), in operator-pending / visual
     /// contexts; the next char picks the object (`w`, `"`, `(`, …). `None`
@@ -2888,6 +2892,13 @@ async fn wait_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
     }
 }
 
+async fn wait_optional_duration(duration: Option<std::time::Duration>) {
+    match duration {
+        Some(duration) => tokio::time::sleep(duration).await,
+        None => pending::<()>().await,
+    }
+}
+
 fn clear_redraw(needs_redraw: &mut bool) {
     *needs_redraw = false;
 }
@@ -3225,6 +3236,10 @@ impl App {
             at_cache: std::cell::RefCell::new(None),
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
+            terminal_paste_classifier:
+                crate::tui::structured_paste::TerminalPasteClassifier::default(),
+            terminal_input_generation: None,
+            next_submission_fence_sequence: 0,
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,
@@ -3574,6 +3589,10 @@ impl App {
                 .and_then(|runner| runner.as_ref().ok())
                 .map(AgentRunner::event_notifier);
             let async_notify = self.async_actions.notifier();
+            let paste_wait = self
+                .terminal_paste_classifier
+                .next_deadline()
+                .map(|deadline| deadline.saturating_sub(terminal_input.now()));
 
             if self.animation_tick_active() {
                 let animation = tokio::time::sleep(ANIMATION_TICK);
@@ -3594,6 +3613,13 @@ impl App {
                     }
                     _ = async_notify.notified() => {
                         needs_redraw = self.drain_async_actions();
+                    }
+                    _ = wait_optional_duration(paste_wait) => {
+                        let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());
+                        if self.apply_terminal_paste_decision(decision) {
+                            break;
+                        }
+                        needs_redraw = true;
                     }
                     _ = &mut animation => {
                         needs_redraw = true;
@@ -3616,6 +3642,13 @@ impl App {
                     }
                     _ = async_notify.notified() => {
                         needs_redraw = self.drain_async_actions();
+                    }
+                    _ = wait_optional_duration(paste_wait) => {
+                        let decision = self.terminal_paste_classifier.flush_due(terminal_input.now());
+                        if self.apply_terminal_paste_decision(decision) {
+                            break;
+                        }
+                        needs_redraw = true;
                     }
                 }
             }
@@ -3666,10 +3699,16 @@ impl App {
         Ok(changed)
     }
 
-    fn handle_event_stream_item(&mut self, item: Option<std::io::Result<Event>>) -> Result<bool> {
+    fn handle_event_stream_item(&mut self, item: Option<ObservedTerminalEvent>) -> Result<bool> {
         match item {
-            Some(Ok(event)) => Ok(self.handle_terminal_event(event)),
-            Some(Err(error)) => Err(error.into()),
+            Some(observed) => match observed.event {
+                Ok(event) => Ok(self.handle_observed_terminal_event(
+                    event,
+                    observed.observed_at,
+                    observed.terminal_generation,
+                )),
+                Err(error) => Err(error.into()),
+            },
             None => Ok(true),
         }
     }
@@ -3687,6 +3726,73 @@ impl App {
             }
             Event::Resize(_, _) => false,
             _ => false,
+        }
+    }
+
+    fn handle_observed_terminal_event(
+        &mut self,
+        event: Event,
+        observed_at: std::time::Duration,
+        terminal_generation: u64,
+    ) -> bool {
+        if self.terminal_input_generation != Some(terminal_generation) {
+            let replay = self.terminal_paste_classifier.cancel();
+            self.terminal_input_generation = Some(terminal_generation);
+            for key in replay {
+                if self.handle_key(key) {
+                    return true;
+                }
+            }
+        }
+        if !self.structured_paste_composer_eligible() {
+            for key in self.terminal_paste_classifier.cancel() {
+                if self.handle_key(key) {
+                    return true;
+                }
+            }
+            return self.handle_terminal_event(event);
+        }
+        let decision = self.terminal_paste_classifier.observe(event, observed_at);
+        self.apply_terminal_paste_decision(decision)
+    }
+
+    fn apply_terminal_paste_decision(
+        &mut self,
+        decision: crate::tui::structured_paste::ClassifierDecision,
+    ) -> bool {
+        use crate::tui::structured_paste::ClassifierDecision;
+        match decision {
+            ClassifierDecision::Ordinary(event) => self.handle_terminal_event(event),
+            ClassifierDecision::Replay {
+                keys,
+                boundary,
+                shortcut_intent,
+                paste_unavailable,
+            } => {
+                let mut exit = false;
+                for key in keys {
+                    exit |= self.handle_key(key);
+                }
+                if shortcut_intent {
+                    // The shortcut is an intent, never literal composer text.
+                }
+                if paste_unavailable {
+                    self.show_toast("Paste unavailable", ToastKind::Error);
+                }
+                if let Some(event) = boundary {
+                    exit |= self.handle_terminal_event(event);
+                }
+                exit
+            }
+            ClassifierDecision::Paste { text, .. } => {
+                self.handle_paste(text);
+                false
+            }
+            ClassifierDecision::ShortcutIntent | ClassifierDecision::Pending => false,
+            ClassifierDecision::PasteUnavailable => {
+                self.show_toast("Paste unavailable", ToastKind::Error);
+                false
+            }
         }
     }
 

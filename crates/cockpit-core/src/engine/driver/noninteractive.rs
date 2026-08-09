@@ -953,6 +953,8 @@ impl Driver {
                 input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+                    expected_model_state_generation: None,
+                    expected_model: None,
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
                     display_text: None,
@@ -2667,6 +2669,8 @@ impl Driver {
                 input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
                     origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+                    expected_model_state_generation: None,
+                    expected_model: None,
                     kind: UserSubmissionKind::User,
                     text: self.with_time_prelude(prepared.text),
                     display_text: None,

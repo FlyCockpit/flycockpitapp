@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "x86_64-unknown-linux-gnu": {
+      "tuiFeatures": ["gif", "jpeg", "png", "webp"],
+      "arboardFeatures": ["png"],
+      "resolvedFeatures": ["gif", "jpeg", "png", "webp"],
+      "probeFormats": ["gif", "jpeg", "png", "webp"]
+    },
+    "aarch64-apple-darwin": {
+      "tuiFeatures": ["gif", "jpeg", "png", "webp"],
+      "arboardFeatures": ["tiff"],
+      "resolvedFeatures": ["gif", "jpeg", "png", "tiff", "webp"],
+      "probeFormats": ["gif", "jpeg", "png", "webp"]
+    },
+    "x86_64-pc-windows-msvc": {
+      "tuiFeatures": ["gif", "jpeg", "png", "webp"],
+      "arboardFeatures": ["bmp", "png"],
+      "resolvedFeatures": ["bmp", "gif", "jpeg", "png", "webp"],
+      "probeFormats": ["gif", "jpeg", "png", "webp"]
+    }
+  },
+  "codecPackages": [
+    {
+      "name": "image",
+      "version": "0.25.10",
+      "checksum": "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": "1.88.0"
+    },
+    {
+      "name": "png",
+      "version": "0.18.1",
+      "checksum": "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": "1.73"
+    },
+    {
+      "name": "zune-core",
+      "version": "0.5.1",
+      "checksum": "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9",
+      "license": "MIT OR Apache-2.0 OR Zlib",
+      "rustVersion": "1.75.0"
+    },
+    {
+      "name": "zune-jpeg",
+      "version": "0.5.15",
+      "checksum": "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296",
+      "license": "MIT OR Apache-2.0 OR Zlib",
+      "rustVersion": "1.75.0"
+    },
+    {
+      "name": "gif",
+      "version": "0.14.2",
+      "checksum": "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": "1.62"
+    },
+    {
+      "name": "color_quant",
+      "version": "1.1.0",
+      "checksum": "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b",
+      "license": "MIT",
+      "rustVersion": null
+    },
+    {
+      "name": "weezl",
+      "version": "0.1.12",
+      "checksum": "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": null
+    },
+    {
+      "name": "image-webp",
+      "version": "0.2.4",
+      "checksum": "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": "1.80.1"
+    },
+    {
+      "name": "quick-error",
+      "version": "2.0.1",
+      "checksum": "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3",
+      "license": "MIT/Apache-2.0",
+      "rustVersion": null
+    },
+    {
+      "name": "tiff",
+      "version": "0.11.3",
+      "checksum": "b63feaf3343d35b6ca4d50483f94843803b0f51634937cc2ec519fc32232bc52",
+      "license": "MIT",
+      "rustVersion": "1.85.0"
+    },
+    {
+      "name": "fax",
+      "version": "0.2.7",
+      "checksum": "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a",
+      "license": "MIT",
+      "rustVersion": "1.71"
+    },
+    {
+      "name": "half",
+      "version": "2.7.1",
+      "checksum": "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b",
+      "license": "MIT OR Apache-2.0",
+      "rustVersion": "1.81"
+    },
+    {
+      "name": "zerocopy",
+      "version": "0.8.55",
+      "checksum": "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb",
+      "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
+      "rustVersion": "1.56.0"
+    }
+  ]
+}

@@ -416,6 +416,35 @@ pub(super) fn claim_message_image_refs(
     Ok(images)
 }
 
+/// Roll back only this submission's freshly claimed refs when the session
+/// actor proves the model fence stale before queue insertion.
+pub(super) fn release_message_image_refs(
+    state: &mut MutableClientState,
+    client_submission_id: Uuid,
+    refs: &[proto::ImageAttachmentRef],
+) {
+    let origin_principal = state.principal.tag();
+    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    for image_ref in refs {
+        let matches = accounting
+            .consumed_message_attachments
+            .get(&image_ref.id)
+            .is_some_and(|consumed| {
+                consumed.client_submission_id == client_submission_id
+                    && consumed.origin_principal == origin_principal
+            });
+        if matches
+            && let Some(consumed) = accounting
+                .consumed_message_attachments
+                .remove(&image_ref.id)
+        {
+            state
+                .ready_attachments
+                .insert(image_ref.id, consumed.attachment);
+        }
+    }
+}
+
 fn validate_image_ref_shape(
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<(), ErrorPayload> {

@@ -805,6 +805,8 @@ async fn all_unwind_paths_drain_pending_input() {
             let (id, _) = queue
                 .push(
                     UserSubmission {
+                        expected_model_state_generation: None,
+                        expected_model: None,
                         kind: UserSubmissionKind::User,
                         origin: Default::default(),
                         text: text.to_string(),

@@ -149,6 +149,8 @@ fn runner_with_input(
 
 fn complete_submission(index: usize) -> UserSubmission {
     UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{index}"),

@@ -551,7 +551,7 @@ impl App {
                         trigger,
                         message,
                     );
-                } else if let Some(queued) = queued {
+                } else if let Some(mut queued) = queued {
                     tracing::info!(
                         session_id = ?self.launch.session_id,
                         %selection_id,
@@ -568,7 +568,10 @@ impl App {
                         self.at_selected = 0;
                         self.at_scroll = 0;
                     }
-                    self.dispatch_optimistic_user_submission(
+                    queued.submission.expected_model_state_generation = Some(generation);
+                    queued.submission.expected_model = requested.clone();
+                    self.dispatch_optimistic_user_submission_with_id(
+                        queued.client_submission_id,
                         queued.display,
                         queued.submission,
                         "engine",

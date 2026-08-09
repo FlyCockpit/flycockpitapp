@@ -2032,25 +2032,6 @@ impl SettingsDialog {
                             let _ = self.apply_nav(nav);
                         }
                     }
-                    SettingsPointerAction::ActivateVisibleRow(row) => {
-                        let _ = self.page.handle_key(
-                            &mut self.cx,
-                            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-                        );
-                        for _ in 0..row {
-                            let _ = self.page.handle_key(
-                                &mut self.cx,
-                                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                            );
-                        }
-                        let nav = self.page.handle_key(
-                            &mut self.cx,
-                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        );
-                        if self.apply_nav(nav) {
-                            return SettingsPointerOutcome::Close;
-                        }
-                    }
                 }
             }
             _ => {}
@@ -2126,13 +2107,6 @@ impl SettingsDialog {
         frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
             .render_with_links(&self.cx, frame, layout[1], links);
-        for y in 0..layout[1].height {
-            self.pointer_surface.register(SettingsPointerTarget {
-                rect: Rect::new(layout[1].x, layout[1].y + y, layout[1].width, 1),
-                action: SettingsPointerAction::ActivateVisibleRow(usize::from(y)),
-                enabled: true,
-            });
-        }
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }

@@ -161,7 +161,6 @@ pub(super) enum SettingsHeaderAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsPointerAction {
     Header(SettingsHeaderAction),
-    ActivateVisibleRow(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

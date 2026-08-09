@@ -3071,7 +3071,9 @@ async fn run_in_process_client(
             }
         }
     }
-    if let Err(error) = drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+    if let Err(error) =
+        attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await
+    {
         tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
     }
 }
@@ -3518,7 +3520,7 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
-                    if let Err(error) = drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+                    if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
                         tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
                     }
                     return;

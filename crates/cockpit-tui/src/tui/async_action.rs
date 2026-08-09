@@ -598,6 +598,27 @@ mod tests {
         Vec::new()
     }
 
+    #[tokio::test]
+    async fn owned_async_actions_reject_stale_view_generation() {
+        let mut runner = AsyncActionRunner::default();
+        let (release, barrier) = oneshot::channel::<()>();
+        runner.start(
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Text("stale".to_string()))
+            },
+        );
+
+        runner.advance_view_generation();
+        let _ = release.send(());
+        tokio::task::yield_now().await;
+
+        assert!(runner.drain_completed().is_empty());
+        assert_eq!(runner.pending_count(), 0);
+    }
+
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {
         assert!(matches!(
             &result.payload,

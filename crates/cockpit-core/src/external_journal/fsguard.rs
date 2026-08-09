@@ -874,6 +874,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn windows_private_dacl_contract_has_apply_and_deny_verification_seams() {
+        let source = include_str!("fsguard.rs");
+        assert!(source.contains("crate::goal_scratch::set_private(&resolved)"));
+        assert!(source.contains("crate::goal_scratch::set_private(&path)"));
+        assert!(source.contains("crate::goal_scratch::verify_private_dacl(&self.path)"));
+        assert!(source.contains("crate::goal_scratch::verify_private_dacl(&path)"));
+        let verifier = include_str!("../goal_scratch.rs");
+        assert!(verifier.contains("DACL is not protected current-owner-only full control"));
+        assert!(verifier.contains("sddl.matches(\"(A;\").count() != 1"));
+    }
+
     /// A symlinked ancestor must not break the spool: macOS resolves `/var` to
     /// `/private/var`, so `$TMPDIR` — and any data directory beneath it — is
     /// reached through a symlink on a stock machine.

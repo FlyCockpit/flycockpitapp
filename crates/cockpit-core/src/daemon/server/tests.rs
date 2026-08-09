@@ -1502,12 +1502,17 @@ async fn media_security_recovery_denial_precedes_operation_table() {
     assert_eq!(rows, 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_authority() {
     use cockpit_db::media_attachments::{
-        LocalPathRegistrationResultV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
+        LocalPathRegistrationResultV1, MediaAttachmentComponent, MediaAvailability,
+        MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome,
+        RecoverSecurityBlockedComponentV1, RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1,
+        RequestedLocalPathMediaKind, VerifiedBlockedComponent,
     };
     use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -1549,10 +1554,123 @@ async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_au
     let Response::LocalPathMediaRegistration(first_receipt) = first else {
         panic!("unexpected registration response")
     };
-    assert!(matches!(
-        first_receipt.result,
-        LocalPathRegistrationResultV1::Registered { .. }
-    ));
+    let LocalPathRegistrationResultV1::Registered {
+        attachment_id,
+        reservation_id,
+        source_evidence_digest,
+        ..
+    } = first_receipt.result.clone()
+    else {
+        panic!("registration rejected")
+    };
+    let storage_id = Uuid::now_v7();
+    let component_id = Uuid::now_v7();
+    let component_path = temp.path().join("media").join(storage_id.to_string());
+    std::fs::write(&component_path, b"derived bytes").unwrap();
+    std::fs::set_permissions(&component_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let metadata = std::fs::metadata(&component_path).unwrap();
+    let mut identity_hash = Sha256::new();
+    identity_hash.update(b"unix-file-identity-v1");
+    identity_hash.update(metadata.dev().to_be_bytes());
+    identity_hash.update(metadata.ino().to_be_bytes());
+    let identity = crate::intel::hex_lower(&identity_hash.finalize());
+    let checksum = crate::intel::hex_lower(&Sha256::digest(b"derived bytes"));
+    let component = MediaAttachmentComponent {
+        component_id,
+        attachment_id,
+        attachment_version: 1,
+        component_kind: "image_model".into(),
+        storage_id,
+        lifecycle_state: "security_blocked".into(),
+        component_generation: 1,
+        stable_identity_digest: identity.clone(),
+        byte_length: 13,
+        sha256: checksum.clone(),
+        reservation_id,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+    };
+    let inserted = component.clone();
+    ctx.db
+        .transaction(move |conn| {
+            cockpit_db::Db::transition_media_attachment_conn(
+                conn,
+                attachment_id,
+                1,
+                1,
+                MediaAvailability::SecurityBlocked,
+                2,
+            )?;
+            cockpit_db::Db::insert_media_attachment_component_conn(conn, &inserted)
+        })
+        .await
+        .unwrap();
+    let proof = VerifiedBlockedComponent {
+        component_id,
+        component_kind: "image_model".into(),
+        component_generation: 1,
+        stable_identity_digest: identity,
+        byte_length: 13,
+        sha256: checksum,
+        reservation_id: component.reservation_id,
+        deletion_evidence_digest: None,
+    };
+    fn field(h: &mut Sha256, b: &[u8]) {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b)
+    }
+    let mut evidence = Sha256::new();
+    field(&mut evidence, proof.component_id.as_bytes());
+    field(&mut evidence, proof.component_kind.as_bytes());
+    field(&mut evidence, &proof.component_generation.to_be_bytes());
+    field(&mut evidence, proof.stable_identity_digest.as_bytes());
+    field(&mut evidence, &proof.byte_length.to_be_bytes());
+    field(&mut evidence, proof.sha256.as_bytes());
+    field(&mut evidence, proof.reservation_id.as_bytes());
+    field(&mut evidence, b"");
+    let recorded = crate::intel::hex_lower(&evidence.finalize());
+    let recovery = RecoverSecurityBlockedMediaV1 {
+        schema_version: 1,
+        kind: "recoverSecurityBlockedMedia".into(),
+        local_request_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        attachment_id,
+        attachment_version: 1,
+        expected_availability_generation: 2,
+        affected_components: vec![RecoverSecurityBlockedComponentV1 {
+            component_id,
+            component_kind: "image_model".into(),
+            component_generation: 1,
+            recorded_evidence_digest: recorded,
+        }],
+        borrowed_source_evidence_digest: Some(source_evidence_digest),
+        disposition: MediaSecurityRecoveryDisposition::ResumeVerifiedCleanup,
+    };
+    let recovered = handle_request(
+        Request::RecoverSecurityBlockedMedia(recovery.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaOwnerRecovery(recovery_receipt) = recovered else {
+        panic!("unexpected recovery response")
+    };
+    assert_eq!(
+        recovery_receipt.outcome,
+        MediaSecurityRecoveryOutcome::CleanupResumed
+    );
+    let replayed = handle_request(
+        Request::RecoverSecurityBlockedMedia(recovery),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaOwnerRecovery(replayed_receipt) = replayed else {
+        panic!("unexpected recovery replay")
+    };
+    assert_eq!(replayed_receipt, recovery_receipt);
     std::fs::remove_file(project.join("source.bin")).unwrap();
     let replay = handle_request(
         Request::RegisterLocalPathMedia(request.clone()),

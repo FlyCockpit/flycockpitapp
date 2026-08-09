@@ -237,7 +237,7 @@ fn set_private(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn set_private(path: &Path) -> Result<()> {
+pub(crate) fn set_private(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
@@ -286,7 +286,12 @@ fn set_private(path: &Path) -> Result<()> {
             return Err(std::io::Error::last_os_error()).context("applying private goal DACL");
         }
     }
-    verify_checked_dir(path)
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        verify_checked_dir(path)
+    } else {
+        verify_private_dacl(path)
+    }
 }
 
 #[cfg(windows)]
@@ -324,7 +329,7 @@ fn verify_no_reparse_components(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn verify_private_dacl(path: &Path) -> Result<()> {
+pub(crate) fn verify_private_dacl(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 

@@ -77,10 +77,23 @@ pub(crate) fn classify_sample_error(
     status: Option<u16>,
     typed_timeout: bool,
 ) -> CompactSampleClass {
+    let lower = message.to_ascii_lowercase();
     if cancelled {
         CompactSampleClass::Cancelled
     } else if is_context_overflow_text(message) {
         CompactSampleClass::ContextOverflow
+    } else if [
+        "authentication",
+        "unauthorized",
+        "invalid api key",
+        "invalid request",
+        "schema validation",
+        "malformed request",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        CompactSampleClass::Deterministic
     } else if typed_timeout || status.is_none() {
         CompactSampleClass::Transient
     } else if matches!(status, Some(408 | 429 | 500..=599)) {
@@ -220,6 +233,12 @@ mod tests {
         for status in [400, 401] {
             assert_eq!(
                 classify_sample_error(false, "rejected", Some(status), false),
+                CompactSampleClass::Deterministic
+            );
+        }
+        for text in ["authentication failed", "invalid request schema"] {
+            assert_eq!(
+                classify_sample_error(false, text, None, false),
                 CompactSampleClass::Deterministic
             );
         }

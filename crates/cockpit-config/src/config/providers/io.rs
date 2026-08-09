@@ -137,6 +137,64 @@ impl ConfigDoc {
         Ok(merged.with_resolution_generation(generation))
     }
 
+    /// Resolve providers and capture the readable `config.json` layers from
+    /// the same post-recovery read. Daemon config adoption uses this to avoid
+    /// combining provider metadata from one filesystem instant with extended
+    /// settings and strict-field provenance from another.
+    pub(crate) fn try_load_effective_with_layer_snapshot(
+        paths: &[PathBuf],
+    ) -> Result<(ProvidersConfig, Vec<(PathBuf, Value)>)> {
+        use crate::config::effective_default;
+
+        effective_default::recover_layer_journals(
+            paths,
+            effective_default::JournalRecovery::read_only(),
+        )
+        .context("recovering a pending default-model transaction")?;
+        let generation = next_load_effective_generation();
+        let (masks, unmaskable) = effective_default::masked_layers(paths);
+        if !unmaskable.is_empty() {
+            anyhow::bail!(
+                "{} configuration layer(s) have a pending default-model transaction that cannot be masked; run `cockpit doctor` to inspect the journal",
+                unmaskable.len()
+            );
+        }
+
+        let mut merged = Value::Object(Map::new());
+        let mut layers = Vec::new();
+        for path in paths {
+            let mask = masks.get(path).map(Vec::as_slice);
+            if mask.is_none() && !path.exists() {
+                merge_provider_files_for_layer(&mut merged, path);
+                continue;
+            }
+            match Self::load_with_mask(path, mask) {
+                Ok(doc) => {
+                    let mut layer = doc.raw;
+                    layers.push((path.clone(), layer.clone()));
+                    warn_inline_providers_ignored(path, &layer);
+                    warn_malformed_provider_layer_metadata(path, &layer);
+                    if let Some(obj) = layer.as_object_mut() {
+                        obj.remove("providers");
+                    }
+                    deep_merge_value(&mut merged, &layer);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
+                }
+            }
+            merge_provider_files_for_layer(&mut merged, path);
+        }
+        let providers = Self {
+            path: PathBuf::new(),
+            raw: merged,
+            originally_loaded_providers: BTreeMap::new(),
+        }
+        .providers()
+        .with_resolution_generation(generation);
+        Ok((providers, layers))
+    }
+
     pub fn providers_from_paths(paths: &[PathBuf]) -> ProvidersConfig {
         Self::providers_from_paths_with_masks(paths, &HashMap::new())
     }

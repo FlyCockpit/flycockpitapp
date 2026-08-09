@@ -2221,6 +2221,7 @@ fn daemon_effective_load_rejects_invalid_response_metrics_tokenizer() {
     let _trust = enter_trusted_workspace(&project);
     assert!(
         load_for_cwd_for_daemon_contract(&project)
+            .unwrap()
             .response_metrics_tokenizer_validation
             .is_err()
     );
@@ -2238,9 +2239,43 @@ fn invalid_response_metrics_tokenizer_fails_effective_load() {
     )
     .unwrap();
     let _trust = enter_trusted_workspace(&project);
-    let load = load_for_cwd_for_daemon_contract(&project);
+    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
     assert_eq!(load.participating_layers.len(), 1);
     assert!(load.response_metrics_tokenizer_validation.is_err());
+}
+
+#[test]
+fn daemon_load_projects_provider_and_extended_values_from_one_layer_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    let path = project.join(".cockpit/config.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{
+            "active_model":{"provider":"snapshot-provider","model":"snapshot-model"},
+            "response_metrics_tokenizer":"o200k_base",
+            "max_primary_rounds":37
+        }"#,
+    )
+    .unwrap();
+    let _trust = enter_trusted_workspace(&project);
+    crate::config::providers::reset_load_effective_call_count();
+
+    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
+
+    let active = load.providers.active_model.unwrap();
+    assert_eq!(active.provider, "snapshot-provider");
+    assert_eq!(active.model, "snapshot-model");
+    assert_eq!(load.config.max_primary_rounds, 37);
+    assert_eq!(
+        load.config.response_metrics_tokenizer,
+        cockpit_tokenizer::TiktokenEncoding::O200k
+    );
+    assert!(load.response_metrics_tokenizer_validation.is_ok());
+    assert_eq!(load.participating_layers, vec![path]);
+    assert_eq!(crate::config::providers::load_effective_call_count(), 1);
 }
 
 #[test]
@@ -2263,7 +2298,7 @@ fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
     .unwrap();
     {
         let _trust = enter_trusted_workspace(&project);
-        let load = load_for_cwd_for_daemon_contract(&project);
+        let load = load_for_cwd_for_daemon_contract(&project).unwrap();
         assert!(load.response_metrics_tokenizer_validation.is_err());
         assert_eq!(load.participating_layers.len(), 2);
     }
@@ -2280,7 +2315,7 @@ fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
         },
     );
-    let load = load_for_cwd_for_daemon_contract(&project);
+    let load = load_for_cwd_for_daemon_contract(&project).unwrap();
     assert!(load.response_metrics_tokenizer_validation.is_ok());
     assert_eq!(load.participating_layers, vec![global]);
 }
@@ -2295,7 +2330,7 @@ fn daemon_tokenizer_validation_keeps_whole_document_failures_advisory() {
     let _trust = enter_trusted_workspace(&project);
     for contents in ["not json", "[]"] {
         std::fs::write(&path, contents).unwrap();
-        let load = load_for_cwd_for_daemon_contract(&project);
+        let load = load_for_cwd_for_daemon_contract(&project).unwrap();
         assert!(load.response_metrics_tokenizer_validation.is_ok());
         assert_eq!(
             load.config.response_metrics_tokenizer,

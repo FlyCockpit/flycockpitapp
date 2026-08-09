@@ -1746,19 +1746,26 @@ fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
 /// advisory, while an explicitly present malformed response tokenizer in any
 /// participating (trust-filtered) readable layer rejects daemon adoption.
 pub struct DaemonExtendedConfigLoad {
+    pub providers: crate::config::providers::ProvidersConfig,
     pub config: ExtendedConfig,
     pub response_metrics_tokenizer_validation:
         std::result::Result<(), InvalidResponseMetricsTokenizer>,
     pub participating_layers: Vec<PathBuf>,
 }
 
-pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> DaemonExtendedConfigLoad {
+pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConfigLoad> {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
-    // Read each participating layer exactly once. Whole-document failures
-    // retain the advisory skip behavior, while readable object documents
-    // preserve raw field presence for the narrow strict validation below.
-    let docs = load_existing_docs_from_paths(&paths);
+    // Provider recovery/migration is a barrier. Only after it completes do we
+    // capture every readable participating config layer once; providers,
+    // extended settings, strict validation, and provenance are all projected
+    // from that one trust-filtered snapshot.
+    let (providers, captured) =
+        crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
+    let docs: Vec<_> = captured
+        .into_iter()
+        .map(|(path, raw)| ExtendedConfigDoc { path, raw })
+        .collect();
     let mut validation = Ok(());
     for doc in &docs {
         if let Some(value) = doc.raw_field("response_metrics_tokenizer") {
@@ -1774,11 +1781,12 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> DaemonExtendedConfigLoad 
     }
     let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
     let config = resolve_loaded_docs(&docs);
-    DaemonExtendedConfigLoad {
+    Ok(DaemonExtendedConfigLoad {
+        providers,
         config,
         response_metrics_tokenizer_validation: validation,
         participating_layers,
-    }
+    })
 }
 
 #[derive(Debug)]

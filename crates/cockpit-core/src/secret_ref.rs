@@ -53,11 +53,17 @@ pub fn load_effective(cwd: &Path) -> ProvidersConfig {
 /// typed error rather than serving a snapshot that might disagree with the
 /// session's durable model.
 pub fn try_load_effective(cwd: &Path) -> anyhow::Result<ProvidersConfig> {
+    prepare_effective_layers(cwd);
+    let paths = crate::config::dirs::config_file_paths_for_load(cwd);
+    ConfigDoc::try_load_effective_from_paths(&paths)
+}
+
+/// Complete the best-effort provider credential migration before another
+/// subsystem captures configuration layers for an effective resolution.
+pub(crate) fn prepare_effective_layers(cwd: &Path) {
     if let Err(error) = migrate_effective_layers_once(cwd) {
         tracing::warn!(%error, "provider secret migration could not complete");
     }
-    let paths = crate::config::dirs::config_file_paths_for_load(cwd);
-    ConfigDoc::try_load_effective_from_paths(&paths)
 }
 
 /// Project a resolved [`ProvidersConfig`] to the redacted view the daemon

@@ -149,9 +149,10 @@ impl ConfigSource {
             ))
         }) as Arc<LoadFn>;
         let daemon_load = Arc::new(|cwd: &Path| {
-            let extended = crate::config::extended::load_for_cwd_for_daemon_contract(cwd);
+            crate::secret_ref::prepare_effective_layers(cwd);
+            let extended = crate::config::extended::load_for_cwd_for_daemon_contract(cwd)?;
             Ok(DaemonConfigLoad {
-                providers: crate::secret_ref::try_load_effective(cwd)?,
+                providers: extended.providers,
                 extended: extended.config,
                 response_metrics_tokenizer_validation: extended
                     .response_metrics_tokenizer_validation,

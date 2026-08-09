@@ -3249,6 +3249,17 @@ impl SettingsCx {
                     OAuthFlowView::Copilot(state),
                     OAuthHost::AddWizard,
                 );
+                controls.push((lines.len(), 0));
+                let primary_label = if state.outcome.is_none()
+                    && state.shell.is_some()
+                    && state.rc_path.is_some()
+                    && !state.already_configured
+                {
+                    "[Set up Copilot auth]"
+                } else {
+                    "[Continue]"
+                };
+                lines.push(Line::from(primary_label));
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -4951,8 +4962,8 @@ fn provider_add_pointer_action(
         | WizardStepId::Url
         | WizardStepId::ApiKey
         | WizardStepId::EnvVar => WizardControlId::EditText,
-        WizardStepId::CopilotAuth
-        | WizardStepId::Saving
+        WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
+        WizardStepId::Saving
         | WizardStepId::TestKey
         | WizardStepId::TestSkipped
         | WizardStepId::Fetching
@@ -5551,6 +5562,7 @@ impl SettingsPage for ProvidersPage {
                     state.headers.cursor = index;
                 }
                 Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
+                Some("copilot-auth") if index == 0 => {}
                 Some("grok-oauth" | "codex-oauth")
                     if state.oauth_auth.as_ref().is_some_and(|oauth| {
                         !oauth.paste_focused && index < oauth.option_count(OAuthHost::AddWizard)

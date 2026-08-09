@@ -209,6 +209,7 @@ fixture_enum!(ProvidersFixture {
     WizardCodexSkipContinue,
     WizardCodexContinue,
     WizardCodexAcknowledge,
+    WizardCopilotContinue,
     WizardCopilotNoControl,
     WizardSavingNoControl,
     WizardTestKeyNoControl,
@@ -323,8 +324,7 @@ impl PayloadFixtureKey {
         !matches!(
             self,
             Self::WizardStep(
-                ProviderWizardStep::CopilotAuth
-                    | ProviderWizardStep::Saving
+                ProviderWizardStep::Saving
                     | ProviderWizardStep::TestKey
                     | ProviderWizardStep::TestSkipped
                     | ProviderWizardStep::Fetching
@@ -350,6 +350,7 @@ fixture_enum!(WizardPayloadControlKey {
     Header,
     AddHeader,
     ContinueHeaders,
+    CopilotContinue,
     EditText
 });
 
@@ -384,6 +385,7 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         WizardControlId::Header(_) => WizardPayloadControlKey::Header,
         WizardControlId::AddHeader => WizardPayloadControlKey::AddHeader,
         WizardControlId::ContinueHeaders => WizardPayloadControlKey::ContinueHeaders,
+        WizardControlId::CopilotContinue => WizardPayloadControlKey::CopilotContinue,
         WizardControlId::EditText => WizardPayloadControlKey::EditText,
     }
 }
@@ -827,6 +829,7 @@ enum WizardControlKind {
     Header,
     AddHeader,
     ContinueHeaders,
+    CopilotContinue,
     EditText,
 }
 
@@ -844,6 +847,7 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::Header(_) => WizardControlKind::Header,
         WizardControlId::AddHeader => WizardControlKind::AddHeader,
         WizardControlId::ContinueHeaders => WizardControlKind::ContinueHeaders,
+        WizardControlId::CopilotContinue => WizardControlKind::CopilotContinue,
         WizardControlId::EditText => WizardControlKind::EditText,
     }
 }
@@ -905,7 +909,11 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
             codex_oauth_fixture(option)
         }
         ProviderWizardStep::CopilotAuth
-        | ProviderWizardStep::Saving
+            if matches!(control, WizardControlKind::CopilotContinue) =>
+        {
+            ProvidersFixture::WizardCopilotContinue
+        }
+        ProviderWizardStep::Saving
         | ProviderWizardStep::TestKey
         | ProviderWizardStep::TestSkipped
         | ProviderWizardStep::Fetching
@@ -919,6 +927,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         | ProviderWizardStep::AuthMethod
         | ProviderWizardStep::ApiKey
         | ProviderWizardStep::EnvVar
+        | ProviderWizardStep::CopilotAuth
         | ProviderWizardStep::TestKeyChoice => {
             unreachable!("wizard control does not belong to its sealed source step")
         }

@@ -225,6 +225,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state();
     pointer_add_api_key_field_renders_and_dispatches_from_fresh_state();
     pointer_add_env_var_field_renders_and_dispatches_from_fresh_state();
+    pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state();
     pointer_add_test_key_choices_render_and_dispatch_from_fresh_state();
     pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
@@ -2416,6 +2417,69 @@ fn pointer_add_env_var_field_renders_and_dispatches_from_fresh_state() {
             if state.is_step("env-var")
                 && state.env_var_field.text() == "ANTHROPIC_API_KEY_STABLE"
     ));
+}
+
+#[test]
+fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut state = AddState::new();
+        state.enter_template_for_test(template_cursor("copilot"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("id"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("url"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("copilot-auth"));
+        state
+            .copilot_auth
+            .as_mut()
+            .expect("Copilot transition initializes auth state")
+            .outcome = Some(Ok("fixture auth ready".into()));
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        ProviderWizardStep::CopilotAuth,
+                        WizardControlId::CopilotContinue,
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions.len(),
+        1,
+        "Copilot auth publishes its exact Continue source"
+    );
+
+    for action in actions {
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        assert!(fresh.config.providers.contains_key("copilot"));
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::Add(state))
+                if state.saved_provider_id.as_deref() == Some("copilot")
+                    && state.fetch.is_some()
+                    && !state.is_step("copilot-auth")
+        ));
+    }
 }
 
 #[test]

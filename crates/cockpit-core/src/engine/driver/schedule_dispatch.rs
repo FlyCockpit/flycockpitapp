@@ -38,7 +38,7 @@ impl Driver {
                     self.schedule.swarm_completed();
                 }
                 if self
-                    .handle_goal_verification_completion(&job_id, &result, failed, input_rx, tx)
+                    .handle_goal_supervision_completion(&job_id, &result, failed, input_rx, tx)
                     .await?
                 {
                     return Ok(());

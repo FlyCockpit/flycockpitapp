@@ -298,6 +298,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "create_goal",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "goal_status",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1391,7 +1396,7 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "goal_verification_progress",
+        "goal_supervision_progress",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),

@@ -163,7 +163,7 @@ fn def_with_normal(
         tool_tiers: std::collections::BTreeMap::<String, ToolTier>::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: Some(super::default_scan_tool_results(name, mode)),
-        goal_verification: super::GoalSettingsOverride::default(),
+        goal_supervision: super::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
         prompt: defensive,

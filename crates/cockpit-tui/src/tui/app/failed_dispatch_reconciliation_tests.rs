@@ -1720,16 +1720,10 @@ fn runner_failure_before_session_creation_binds_retry_to_first_runner() {
 #[test]
 fn slash_dispatch_failures_use_same_failed_user_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
-    for (label, dispatch) in [
-        (
-            "/init",
-            App::dispatch_init_turn as fn(&mut App, &str, String),
-        ),
-        (
-            "/goal",
-            App::dispatch_goal_turn as fn(&mut App, &str, String),
-        ),
-    ] {
+    for (label, dispatch) in [(
+        "/init",
+        App::dispatch_init_turn as fn(&mut App, &str, String),
+    )] {
         let mut app = App::new(Some(tmp.path()), false);
         app.agent_runner = Some(Err("model missing".to_string()));
         dispatch(&mut app, "thing", "wire".to_string());

@@ -2612,7 +2612,7 @@ mod tests {
     async fn db_async_goal_settings_override_roundtrips_through_async_api() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "Build").await.unwrap();
-        let override_json = r#"{"enabled":false,"skepticCount":2}"#;
+        let override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
 
         db.set_goal_settings_override(session.session_id, Some(override_json))
             .await

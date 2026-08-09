@@ -398,10 +398,10 @@ pub(super) enum SettingId {
     ScheduleMaxConcurrent,
     ScheduleAllowUnboundedLoops,
     DelegationMaxParallel,
-    GoalVerificationEnabled,
-    GoalVerificationSkepticCount,
-    GoalVerificationModel,
-    GoalVerificationMaxRounds,
+    GoalSupervisionEnabled,
+    GoalSupervisionSkepticCount,
+    GoalSupervisionModel,
+    GoalSupervisionMaxRounds,
     DialogLockoutMs,
     TimeInjectionInterval,
     PackagesDir,
@@ -494,10 +494,10 @@ const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::ScheduleMaxConcurrent,
     SettingId::ScheduleAllowUnboundedLoops,
     SettingId::DelegationMaxParallel,
-    SettingId::GoalVerificationEnabled,
-    SettingId::GoalVerificationSkepticCount,
-    SettingId::GoalVerificationModel,
-    SettingId::GoalVerificationMaxRounds,
+    SettingId::GoalSupervisionEnabled,
+    SettingId::GoalSupervisionSkepticCount,
+    SettingId::GoalSupervisionModel,
+    SettingId::GoalSupervisionMaxRounds,
     SettingId::DialogLockoutMs,
     SettingId::TimeInjectionInterval,
     SettingId::PackagesDir,
@@ -593,10 +593,10 @@ impl SettingId {
             SettingId::ScheduleMaxConcurrent => "max concurrent scheduled tasks",
             SettingId::ScheduleAllowUnboundedLoops => "allow unbounded schedule loops",
             SettingId::DelegationMaxParallel => "max parallel task delegations",
-            SettingId::GoalVerificationEnabled => "goal completion verification",
-            SettingId::GoalVerificationSkepticCount => "goal skeptic count",
-            SettingId::GoalVerificationModel => "goal skeptic model",
-            SettingId::GoalVerificationMaxRounds => "goal verification rounds",
+            SettingId::GoalSupervisionEnabled => "goal completion verification",
+            SettingId::GoalSupervisionSkepticCount => "goal skeptic count",
+            SettingId::GoalSupervisionModel => "goal skeptic model",
+            SettingId::GoalSupervisionMaxRounds => "goal verification rounds",
             SettingId::DialogLockoutMs => "dialog lockout (ms)",
             SettingId::TimeInjectionInterval => "time-injection interval (min)",
             SettingId::PackagesDir => "packages dir",
@@ -931,20 +931,20 @@ impl SettingId {
                  call. Larger batches are refused before any child starts. Must \
                  be at least 1."
             }
-            SettingId::GoalVerificationEnabled => {
+            SettingId::GoalSupervisionEnabled => {
                 "Verify model-claimed goal completion before closing budgeted goals. On \
                  (default) means a complete update on a token-budgeted goal runs \
                  refute-framed skeptic scouts first; off restores immediate completion."
             }
-            SettingId::GoalVerificationSkepticCount => {
+            SettingId::GoalSupervisionSkepticCount => {
                 "How many refute-framed skeptic scouts run in parallel for each \
                  completion verification round. A majority decides. Default 3."
             }
-            SettingId::GoalVerificationModel => {
+            SettingId::GoalSupervisionModel => {
                 "Optional model selector (`provider:model-id`) for completion skeptics. \
                  Blank falls back to the same model as the active session."
             }
-            SettingId::GoalVerificationMaxRounds => {
+            SettingId::GoalSupervisionMaxRounds => {
                 "How many failed or inconclusive verification rounds the driver will \
                  auto-reopen before surfacing `verification_failed`. Default 2."
             }
@@ -1116,7 +1116,7 @@ impl SettingId {
             | SettingId::SkillInjectionModel
             | SettingId::PredictNextMessageModel
             | SettingId::HarnessReportSummarizationModel
-            | SettingId::GoalVerificationModel
+            | SettingId::GoalSupervisionModel
             | SettingId::CompactModel
             | SettingId::Instructions
             | SettingId::RedactPatterns
@@ -1133,8 +1133,8 @@ impl SettingId {
             | SettingId::MaxPrimaryRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DelegationMaxParallel
-            | SettingId::GoalVerificationSkepticCount
-            | SettingId::GoalVerificationMaxRounds
+            | SettingId::GoalSupervisionSkepticCount
+            | SettingId::GoalSupervisionMaxRounds
             | SettingId::DialogLockoutMs
             | SettingId::TimeInjectionInterval
             | SettingId::CompactPrompt
@@ -1614,10 +1614,10 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::ScheduleMaxConcurrent),
             Setting(S::ScheduleAllowUnboundedLoops),
             Setting(S::DelegationMaxParallel),
-            Setting(S::GoalVerificationEnabled),
-            Setting(S::GoalVerificationSkepticCount),
-            Setting(S::GoalVerificationModel),
-            Setting(S::GoalVerificationMaxRounds),
+            Setting(S::GoalSupervisionEnabled),
+            Setting(S::GoalSupervisionSkepticCount),
+            Setting(S::GoalSupervisionModel),
+            Setting(S::GoalSupervisionMaxRounds),
             Setting(S::DialogLockoutMs),
             Setting(S::TimeInjectionInterval),
             Setting(S::PackagesDir),
@@ -1840,26 +1840,26 @@ impl SettingsCx {
                 "{} (cap on inline task parallel entries; >= 1)",
                 e.delegation.max_parallel
             ),
-            S::GoalVerificationEnabled => on_off(
-                e.goal_verification.enabled,
+            S::GoalSupervisionEnabled => on_off(
+                e.goal_supervision.enabled,
                 "on (default — budgeted goals verify completion)",
                 "off (complete immediately)",
             ),
-            S::GoalVerificationSkepticCount => format!(
+            S::GoalSupervisionSkepticCount => format!(
                 "{} (parallel skeptic scouts; default {})",
-                e.goal_verification.effective_skeptic_count(),
-                cockpit_config::extended::DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+                e.goal_supervision.effective_cold_skeptic_count(),
+                cockpit_config::extended::DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT
             ),
-            S::GoalVerificationModel => e
-                .goal_verification
-                .skeptic_model
+            S::GoalSupervisionModel => e
+                .goal_supervision
+                .cold_skeptic_model
                 .clone()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "(session model fallback)".to_string()),
-            S::GoalVerificationMaxRounds => format!(
+            S::GoalSupervisionMaxRounds => format!(
                 "{} (failed/inconclusive rounds before intervention; default {})",
-                e.goal_verification.effective_max_rounds(),
-                cockpit_config::extended::DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
+                e.goal_supervision.effective_max_verification_attempts(),
+                cockpit_config::extended::DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS
             ),
             S::DialogLockoutMs => format!(
                 "{} (answer-dialog input lockout; default 1500)",
@@ -2474,9 +2474,7 @@ impl SettingsCx {
             S::ScheduleAllowUnboundedLoops => {
                 e.schedule.allow_unbounded_loops = !e.schedule.allow_unbounded_loops
             }
-            S::GoalVerificationEnabled => {
-                e.goal_verification.enabled = !e.goal_verification.enabled
-            }
+            S::GoalSupervisionEnabled => e.goal_supervision.enabled = !e.goal_supervision.enabled,
             S::SandboxDefaultMode => {
                 e.sandbox.default_mode = cycle_sandbox_mode(e.sandbox.default_mode)
             }
@@ -2508,10 +2506,14 @@ impl SettingsCx {
             S::MaxPrimaryRounds => e.max_primary_rounds.to_string(),
             S::ScheduleMaxConcurrent => e.schedule.max_concurrent.to_string(),
             S::DelegationMaxParallel => e.delegation.max_parallel.to_string(),
-            S::GoalVerificationSkepticCount => {
-                e.goal_verification.effective_skeptic_count().to_string()
-            }
-            S::GoalVerificationMaxRounds => e.goal_verification.effective_max_rounds().to_string(),
+            S::GoalSupervisionSkepticCount => e
+                .goal_supervision
+                .effective_cold_skeptic_count()
+                .to_string(),
+            S::GoalSupervisionMaxRounds => e
+                .goal_supervision
+                .effective_max_verification_attempts()
+                .to_string(),
             S::DialogLockoutMs => e.dialog.lockout_ms.to_string(),
             S::TimeInjectionInterval => e.system_prompt.time_injection_interval_minutes.to_string(),
             S::CommandProfileWrappers => pretty_json(&e.command_resource_profiles.wrappers),
@@ -2536,9 +2538,9 @@ impl SettingsCx {
             S::PreflightModel => e.preflight.model.clone().unwrap_or_default(),
             S::PreflightPrompt => e.preflight.preflight_prompt.clone().unwrap_or_default(),
             S::CompactModel => e.compact_model.clone().unwrap_or_default(),
-            S::GoalVerificationModel => e
-                .goal_verification
-                .skeptic_model
+            S::GoalSupervisionModel => e
+                .goal_supervision
+                .cold_skeptic_model
                 .clone()
                 .unwrap_or_default(),
             S::CompactPrompt => e.compact_prompt.clone().unwrap_or_default(),
@@ -2584,13 +2586,13 @@ impl SettingsCx {
                 let v = parse_min_usize(trimmed, 1)?;
                 self.extended.delegation.max_parallel = v;
             }
-            S::GoalVerificationSkepticCount => {
+            S::GoalSupervisionSkepticCount => {
                 let v = parse_min_usize(trimmed, 1)?;
-                self.extended.goal_verification.skeptic_count = v;
+                self.extended.goal_supervision.cold_skeptic_count = v;
             }
-            S::GoalVerificationMaxRounds => {
+            S::GoalSupervisionMaxRounds => {
                 let v = parse_min_u32(trimmed, 1)?;
-                self.extended.goal_verification.max_rounds = v;
+                self.extended.goal_supervision.max_verification_attempts = v;
             }
             S::DialogLockoutMs => {
                 let v: u64 = trimmed
@@ -2663,8 +2665,8 @@ impl SettingsCx {
                     Some(trimmed.to_string())
                 };
             }
-            S::GoalVerificationModel => {
-                self.extended.goal_verification.skeptic_model = if trimmed.is_empty() {
+            S::GoalSupervisionModel => {
+                self.extended.goal_supervision.cold_skeptic_model = if trimmed.is_empty() {
                     None
                 } else {
                     Some(trimmed.to_string())
@@ -2766,7 +2768,7 @@ impl SettingsCx {
             | S::SkillInjectionModel
             | S::PredictNextMessageModel
             | S::HarnessReportSummarizationModel
-            | S::GoalVerificationModel
+            | S::GoalSupervisionModel
             | S::CompactModel => {
                 p.utility_picker = Some(Box::new(UtilityModelPicker::new(
                     &self.config,
@@ -2810,7 +2812,7 @@ impl SettingsCx {
             S::SkillInjectionModel => e.skill_injection.clone(),
             S::PredictNextMessageModel => e.predict_next_message_model.clone(),
             S::HarnessReportSummarizationModel => e.harness_report_summarization.clone(),
-            S::GoalVerificationModel => e.goal_verification.skeptic_model.clone(),
+            S::GoalSupervisionModel => e.goal_supervision.cold_skeptic_model.clone(),
             S::CompactModel => e.compact_model.clone(),
             _ => None,
         }
@@ -2830,7 +2832,7 @@ impl SettingsCx {
             S::SkillInjectionModel => e.skill_injection = value,
             S::PredictNextMessageModel => e.predict_next_message_model = value,
             S::HarnessReportSummarizationModel => e.harness_report_summarization = value,
-            S::GoalVerificationModel => e.goal_verification.skeptic_model = value,
+            S::GoalSupervisionModel => e.goal_supervision.cold_skeptic_model = value,
             S::CompactModel => e.compact_model = value,
             _ => {}
         }
@@ -2865,7 +2867,7 @@ impl SettingsCx {
                 e.max_primary_rounds = d.max_primary_rounds;
                 e.concurrency = d.concurrency;
                 e.schedule = d.schedule;
-                e.goal_verification = d.goal_verification;
+                e.goal_supervision = d.goal_supervision;
                 e.dialog = d.dialog;
                 e.system_prompt = d.system_prompt;
                 // Utility model, instructions, packages dir, and agent dirs
@@ -2972,8 +2974,8 @@ fn numeric_text_setting(id: SettingId) -> bool {
             | SettingId::MaxPrimaryRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DelegationMaxParallel
-            | SettingId::GoalVerificationSkepticCount
-            | SettingId::GoalVerificationMaxRounds
+            | SettingId::GoalSupervisionSkepticCount
+            | SettingId::GoalSupervisionMaxRounds
             | SettingId::DialogLockoutMs
             | SettingId::TimeInjectionInterval
             | SettingId::RedactMinSecretLength
@@ -3064,10 +3066,10 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::ScheduleMaxConcurrent => &["schedule", "max_concurrent"],
         S::ScheduleAllowUnboundedLoops => &["schedule", "allow_unbounded_loops"],
         S::DelegationMaxParallel => &["delegation", "max_parallel"],
-        S::GoalVerificationEnabled => &["goalVerification", "enabled"],
-        S::GoalVerificationSkepticCount => &["goalVerification", "skepticCount"],
-        S::GoalVerificationModel => &["goalVerification", "skepticModel"],
-        S::GoalVerificationMaxRounds => &["goalVerification", "maxRounds"],
+        S::GoalSupervisionEnabled => &["goalSupervision", "enabled"],
+        S::GoalSupervisionSkepticCount => &["goalSupervision", "coldSkepticCount"],
+        S::GoalSupervisionModel => &["goalSupervision", "coldSkepticModel"],
+        S::GoalSupervisionMaxRounds => &["goalSupervision", "maxVerificationAttempts"],
         S::DialogLockoutMs => &["dialog", "lockout_ms"],
         S::TimeInjectionInterval => &["system_prompt", "time_injection_interval_minutes"],
         S::PackagesDir => &["packages_directory"],

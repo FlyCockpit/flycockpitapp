@@ -1310,10 +1310,21 @@ pub struct GoalSummary {
     pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    pub status: GoalStatus,
+    pub disposition: GoalDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<i64>,
+    pub phase: Option<GoalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_phase: Option<GoalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<GoalPauseReason>,
+    pub contract_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gap_or_blocker: Option<String>,
+    pub verification_attempts: i64,
+    pub attempt_generation: i64,
+    pub token_budget: i64,
     pub tokens_used: i64,
+    pub remaining_tokens: i64,
     pub blocked_attempts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_read_at: Option<i64>,

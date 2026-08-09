@@ -1217,7 +1217,7 @@ export const knownEventKindSchema = z.enum([
   "event_stream_lagged",
   "foreground_input_target",
   "gitignore_allow",
-  "goal_verification_progress",
+  "goal_supervision_progress",
   "history_replay",
   "inference_failed",
   "inference_succeeded",

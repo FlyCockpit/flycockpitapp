@@ -987,12 +987,12 @@ async fn goal_rpc_reads_sets_and_clears() {
     };
     assert_eq!(goal.session_id, session.session_id);
     assert_eq!(goal.objective, "ship daemon goal rpc");
-    assert_eq!(goal.status, proto::GoalStatus::Active);
+    assert_eq!(goal.disposition, proto::GoalDisposition::Running);
 
     let response = handle_request(
         Request::SetGoalStatus {
             session_id: session.session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut state,
         &ctx,
@@ -1002,12 +1002,12 @@ async fn goal_rpc_reads_sets_and_clears() {
     let Response::GoalUpdated { goal } = response else {
         panic!("expected goal updated response");
     };
-    assert_eq!(goal.status, proto::GoalStatus::Paused);
+    assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
 
     let response = handle_request(
         Request::SetGoalStatus {
             session_id: session.session_id,
-            status: proto::GoalStatus::Active,
+            status: proto::GoalDisposition::Running,
         },
         &mut state,
         &ctx,
@@ -1017,7 +1017,7 @@ async fn goal_rpc_reads_sets_and_clears() {
     let Response::GoalUpdated { goal } = response else {
         panic!("expected goal updated response");
     };
-    assert_eq!(goal.status, proto::GoalStatus::Active);
+    assert_eq!(goal.disposition, proto::GoalDisposition::Running);
 
     let response = handle_request(
         Request::ClearGoal {
@@ -1069,7 +1069,7 @@ async fn goal_change_is_visible_to_live_worker() {
     let response = handle_request(
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut state,
         &ctx,
@@ -1080,7 +1080,7 @@ async fn goal_change_is_visible_to_live_worker() {
         response,
         Response::GoalUpdated {
             goal: proto::GoalSummary {
-                status: proto::GoalStatus::Paused,
+                disposition: proto::GoalDisposition::UserPaused,
                 ..
             }
         }
@@ -1102,7 +1102,7 @@ async fn goal_change_is_visible_to_live_worker() {
         .await
         .unwrap()
         .expect("goal visible through live worker session handle");
-    assert_eq!(goal.status, proto::GoalStatus::Paused);
+    assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
 }
 
 #[tokio::test]
@@ -1162,15 +1162,15 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("goal exists")
-            .status,
-        crate::db::session_goals::GoalStatus::Active
+            .disposition,
+        crate::db::session_goals::GoalDisposition::Running
     );
 
     let mut rpc_state = owner_state();
     handle_request(
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut rpc_state,
         &ctx,
@@ -1183,8 +1183,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("goal persists immediately")
-            .status,
-        crate::db::session_goals::GoalStatus::Paused
+            .disposition,
+        crate::db::session_goals::GoalDisposition::UserPaused
     );
 
     let item = proto::QueueItem {
@@ -1239,8 +1239,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("next turn reads paused goal")
-            .status,
-        crate::db::session_goals::GoalStatus::Paused
+            .disposition,
+        crate::db::session_goals::GoalDisposition::UserPaused
     );
     let item = proto::QueueItem {
         id: Uuid::new_v4(),
@@ -1274,7 +1274,7 @@ async fn new_session_state_requests_are_classified() {
         (
             Request::SetGoalStatus {
                 session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             "set_goal_status",
             Some(session_id),
@@ -1372,7 +1372,7 @@ async fn new_session_state_requests_enforce_authorization() {
         Request::GoalStatus { session_id },
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         Request::ClearGoal { session_id },
         Request::ListAssistants,
@@ -3621,7 +3621,7 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GetRunInvocationStatus,
-    GoalStatus,
+    GoalDisposition,
     GetInventoryBundle,
     DaemonStatus,
     GuidanceEstimate,
@@ -3687,7 +3687,7 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         },
         ReadonlyDispatchCase {
             kind: "goal_status",
-            case: ReadonlyDispatchCaseKind::GoalStatus,
+            case: ReadonlyDispatchCaseKind::GoalDisposition,
         },
         ReadonlyDispatchCase {
             kind: "get_inventory_bundle",
@@ -5295,7 +5295,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "goal_status" => Request::GoalStatus { session_id },
         "set_goal_status" => Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         "clear_goal" => Request::ClearGoal { session_id },
         "pin_message" => Request::PinMessage { session_id, seq: 1 },
@@ -5573,7 +5573,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
@@ -5902,7 +5902,7 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(statuses.len(), 1);
                 assert_eq!(statuses[0].session_id, session.session_id);
             }
-            Self::GoalStatus => {
+            Self::GoalDisposition => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 ctx.db
@@ -5924,11 +5924,11 @@ impl ReadonlyDispatchCaseKind {
                 .await
                 .expect("goal_status happy");
                 let Response::GoalStatus { goal: Some(goal) } = response else {
-                    panic!("expected GoalStatus with goal");
+                    panic!("expected GoalDisposition with goal");
                 };
                 assert_eq!(goal.session_id, session.session_id);
                 assert_eq!(goal.objective, "ship status rpc");
-                assert_eq!(goal.status, proto::GoalStatus::Active);
+                assert_eq!(goal.disposition, proto::GoalDisposition::Running);
             }
             Self::GetInventoryBundle => {
                 let ctx = test_ctx();
@@ -6234,7 +6234,7 @@ impl ReadonlyDispatchCaseKind {
                 };
                 assert!(statuses.is_empty());
             }
-            Self::GoalStatus => {
+            Self::GoalDisposition => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let response = dispatch_matrix_request(
@@ -7012,7 +7012,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_delegation_recursion" => Request::SetDelegationRecursion {
@@ -7204,7 +7204,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert!(
                         override_json
                             .as_deref()
-                            .is_some_and(|raw| raw.contains("\"skepticCount\":2"))
+                            .is_some_and(|raw| raw.contains("\"coldSkepticCount\":2"))
                     );
                     assert!(persist_session);
                 }
@@ -7504,7 +7504,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             monty_nudge: None,
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
@@ -7935,7 +7935,7 @@ async fn assert_goal_mutating_happy(kind: &str) {
         match kind {
             "set_goal_status" => Request::SetGoalStatus {
                 session_id: session.session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             "clear_goal" => Request::ClearGoal {
                 session_id: session.session_id,
@@ -7948,7 +7948,7 @@ async fn assert_goal_mutating_happy(kind: &str) {
     match (kind, response) {
         ("set_goal_status", Response::GoalUpdated { goal }) => {
             assert_eq!(goal.session_id, session.session_id);
-            assert_eq!(goal.status, proto::GoalStatus::Paused);
+            assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
         }
         ("clear_goal", Response::GoalCleared { cleared }) => {
             assert!(cleared);
@@ -7974,7 +7974,7 @@ async fn assert_goal_mutating_malformed(kind: &str) {
                 &ctx,
                 Request::SetGoalStatus {
                     session_id: session.session_id,
-                    status: proto::GoalStatus::Paused,
+                    status: proto::GoalDisposition::UserPaused,
                 },
             )
             .await
@@ -9632,6 +9632,17 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::CreateGoal {
+                session_id: attached_session_id,
+                objective: "ship it".into(),
+                token_budget: Some(100_000),
+            },
+            kind: "create_goal",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::GoalStatus {
                 session_id: attached_session_id,
             },
@@ -9643,7 +9654,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::SetGoalStatus {
                 session_id: attached_session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             kind: "set_goal_status",
             session_id: Some(attached_session_id),
@@ -10181,7 +10192,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SetGoalSettingsOverride {
-                override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+                override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
                 persist_session: true,
             },
             kind: "set_goal_settings_override",
@@ -10626,6 +10637,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ResumePausedWork,
         CancelPausedWork,
         RepairResume,
+        CreateGoal,
         GoalStatus,
         SetGoalStatus,
         ClearGoal,

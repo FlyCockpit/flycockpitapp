@@ -2238,8 +2238,8 @@ mod tests {
                 ),
                 (
                     "session_goals",
-                    "status",
-                    crate::db::session_goals::GoalStatus::ALL
+                    "disposition",
+                    crate::db::session_goals::GoalDisposition::ALL
                         .iter()
                         .map(|value| value.as_str())
                         .collect(),

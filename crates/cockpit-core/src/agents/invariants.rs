@@ -198,7 +198,7 @@ pub fn validate_grant(
 /// specific reason (the offending tool / agent, backticked). The
 /// offending tool is **never** silently stripped.
 pub fn validate_invariants(def: &AgentDef) -> Result<()> {
-    def.goal_verification.validate()?;
+    def.goal_supervision.validate()?;
 
     let known = known_tool_names();
 
@@ -410,7 +410,7 @@ mod grant_tests {
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),

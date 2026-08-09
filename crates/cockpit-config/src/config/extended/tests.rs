@@ -160,37 +160,37 @@ fn skills_write_approval_defaults_on() {
 }
 
 #[test]
-fn goal_verification_defaults_and_sparse_write_round_trip() {
-    let default = GoalVerificationConfig::default();
-    assert!(default.enabled_for_token_budget(Some(100)));
-    assert!(!default.enabled_for_token_budget(None));
+fn goal_supervision_defaults_and_sparse_write_round_trip() {
+    let default = GoalSupervisionConfig::default();
+    assert!(default.enabled);
+    assert_eq!(default.default_token_budget, 200_000);
     assert_eq!(
-        default.effective_skeptic_count(),
-        DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+        default.effective_cold_skeptic_count(),
+        DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT
     );
     assert_eq!(
-        default.effective_max_rounds(),
-        DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
+        default.effective_max_verification_attempts(),
+        DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS
     );
 
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     let mut doc = ExtendedConfigDoc::load(&path).unwrap();
     let mut cfg = ExtendedConfig::default();
-    cfg.goal_verification.enabled = false;
-    cfg.goal_verification.skeptic_count = 5;
-    cfg.goal_verification.skeptic_model = Some("provider:model".into());
-    cfg.goal_verification.max_rounds = 4;
+    cfg.goal_supervision.enabled = false;
+    cfg.goal_supervision.cold_skeptic_count = 5;
+    cfg.goal_supervision.cold_skeptic_model = Some("provider:model".into());
+    cfg.goal_supervision.max_verification_attempts = 4;
     doc.write(&cfg).unwrap();
 
     let reloaded = ExtendedConfigDoc::load(&path).unwrap().config();
-    assert!(!reloaded.goal_verification.enabled);
-    assert_eq!(reloaded.goal_verification.skeptic_count, 5);
+    assert!(!reloaded.goal_supervision.enabled);
+    assert_eq!(reloaded.goal_supervision.cold_skeptic_count, 5);
     assert_eq!(
-        reloaded.goal_verification.skeptic_model.as_deref(),
+        reloaded.goal_supervision.cold_skeptic_model.as_deref(),
         Some("provider:model")
     );
-    assert_eq!(reloaded.goal_verification.max_rounds, 4);
+    assert_eq!(reloaded.goal_supervision.max_verification_attempts, 4);
 }
 
 /// Consolidation (GOALS §2a): a single `config.json` holding BOTH

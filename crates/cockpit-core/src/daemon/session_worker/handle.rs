@@ -1334,6 +1334,7 @@ pub enum UserMessageProbeResult {
 
 #[derive(Debug)]
 pub enum SessionWork {
+    WakeGoal,
     ProbeUserMessage {
         client_submission_id: Uuid,
         wire_fingerprint: String,

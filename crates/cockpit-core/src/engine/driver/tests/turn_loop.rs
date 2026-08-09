@@ -159,13 +159,13 @@ fn rich_client_submission(
     (id, submission, receipt)
 }
 
-fn write_max_primary_rounds_config(root: &std::path::Path, max_rounds: u32) {
+fn write_max_primary_rounds_config(root: &std::path::Path, max_verification_attempts: u32) {
     let cockpit = root.join(".cockpit");
     std::fs::create_dir_all(&cockpit).unwrap();
     std::fs::write(
         cockpit.join("config.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "maxPrimaryRounds": max_rounds
+            "maxPrimaryRounds": max_verification_attempts
         }))
         .unwrap(),
     )
@@ -1007,7 +1007,7 @@ fn turn_loop_tool_error_becomes_tool_result_not_turn_abort() {
 }
 
 #[test]
-fn turn_loop_max_rounds_guard_terminates_turn() {
+fn turn_loop_max_verification_attempts_guard_terminates_turn() {
     crate::test_env::run_async_with_large_stack(|| async {
         let provider = ScriptedProvider::builder()
             .dialect(WireDialect::ChatCompletions)

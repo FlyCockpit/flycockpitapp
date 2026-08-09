@@ -227,7 +227,11 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }
     };
 
-    let body = budget_result(&label, &spec, &result);
+    let body = if spec.worker.is_goal_control() {
+        result.trim().to_string()
+    } else {
+        budget_result(&label, &spec, &result)
+    };
     let _ = event_tx
         .send(ScheduleEvent::Completed {
             job_id,
@@ -462,6 +466,10 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     let worker_agent = match spec.worker {
         SpawnWorkerKind::Bee => "bee",
         SpawnWorkerKind::Scout => "scout",
+        SpawnWorkerKind::GoalPlanner => "goal-planner",
+        SpawnWorkerKind::GoalEvaluator => "goal-evaluator",
+        SpawnWorkerKind::GoalGatekeeper => "goal-gatekeeper",
+        SpawnWorkerKind::GoalColdSkeptic => "goal-cold-skeptic",
     };
     let (extended, providers) = crate::engine::model_roles::load_model_role_config(&ctx.config);
     // `spawn.model` is a model-authored selector exactly like
@@ -470,7 +478,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     // Naming a trusted-custody model here is a custody error, not an escalation.
     let (model, custody) = match spec.model.as_deref() {
         Some(selector) => match spec.model_origin {
-            // Host config named this target (e.g. `goalVerification.skepticModel`):
+            // Host config named this target (e.g. `goalSupervision.coldSkepticModel`):
             // it keeps its own configured custody class.
             SpawnModelOrigin::HostConfig => {
                 crate::engine::model_roles::resolve_host_config_spawn_selector(
@@ -544,6 +552,12 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         agent: match spec.worker {
             SpawnWorkerKind::Bee => crate::engine::builtin::load("bee", &args)?,
             SpawnWorkerKind::Scout => crate::engine::builtin::load("scout", &args)?,
+            SpawnWorkerKind::GoalPlanner
+            | SpawnWorkerKind::GoalEvaluator
+            | SpawnWorkerKind::GoalGatekeeper
+            | SpawnWorkerKind::GoalColdSkeptic => {
+                crate::engine::builtin::goal_control(spec.worker, &args)
+            }
         },
         custody,
     })
@@ -576,6 +590,9 @@ fn swarm_child_brief(
 /// to persist findings to its dedicated write scope and return a compact
 /// pointer + summary (the §10 aggregation pattern).
 fn compose_child_brief(spec: &SpawnSpec) -> String {
+    if spec.worker.is_goal_control() {
+        return spec.prompt.clone();
+    }
     format!(
         "{}\n\nSave your findings under `{}` (your dedicated output location — do not write \
          elsewhere). Return a compact summary plus a pointer to what you saved; do not dump the \
@@ -939,7 +956,7 @@ mod tests {
         async fn child_origin(parent: &SpawnSpec, child_model: Option<&str>) -> SpawnModelOrigin {
             // The scenario this test describes is a goal-verification skeptic,
             // which is dispatched as a `Scout` (see the
-            // `goalVerification.skepticModel` spawn in `driver`). Use that
+            // `goalSupervision.coldSkepticModel` spawn in `driver`). Use that
             // worker kind here: a write-capable grandchild is refused by the
             // scoped-write barrier *before* dispatch, so it would never reach
             // the provenance computation this test exists to pin. Provenance

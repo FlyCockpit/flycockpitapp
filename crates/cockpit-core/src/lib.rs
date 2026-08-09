@@ -35,6 +35,7 @@ pub mod external_journal;
 pub mod external_runtime;
 pub mod git;
 pub mod gitignore;
+pub mod goal_scratch;
 pub mod harness;
 pub mod init;
 pub mod intel;

@@ -3095,16 +3095,16 @@ async fn resume_reapplies_goal_settings_override() {
     let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     created
         .set_goal_settings_override_json(Some(
-            r#"{"enabled":false,"skepticCount":2,"maxRounds":1}"#.to_string(),
+            r#"{"enabled":false,"coldSkepticCount":2,"maxVerificationAttempts":1}"#.to_string(),
         ))
         .unwrap();
 
     let resumed = Session::resume(db, created.id).unwrap().unwrap();
     let override_ = stored_goal_settings_override(&resumed).unwrap();
 
-    assert_eq!(override_.enabled, Some(false));
-    assert_eq!(override_.skeptic_count, Some(2));
-    assert_eq!(override_.max_rounds, Some(1));
+    assert_eq!(override_.enabled, None);
+    assert_eq!(override_.cold_skeptic_count, Some(2));
+    assert_eq!(override_.max_verification_attempts, Some(1));
 }
 
 #[tokio::test]
@@ -3113,7 +3113,7 @@ async fn resume_ignores_invalid_goal_settings_override() {
     let db = Db::open_in_memory().unwrap();
     let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
     created
-        .set_goal_settings_override_json(Some(r#"{"skepticCount":0}"#.to_string()))
+        .set_goal_settings_override_json(Some(r#"{"coldSkepticCount":0}"#.to_string()))
         .unwrap();
 
     let resumed = Session::resume(db, created.id).unwrap().unwrap();

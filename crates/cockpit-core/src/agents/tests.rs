@@ -281,7 +281,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
-        goal_verification: GoalSettingsOverride::default(),
+        goal_supervision: GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
         prompt: "body".into(),
@@ -292,42 +292,51 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
 
 #[test]
 fn goal_settings_effective_resolution_session_over_agent_over_global() {
-    let global = crate::config::extended::GoalVerificationConfig {
+    let global = crate::config::extended::GoalSupervisionConfig {
         enabled: true,
-        skeptic_count: 3,
-        skeptic_model: Some("global/model".to_string()),
-        max_rounds: 2,
+        cold_skeptic_count: 3,
+        cold_skeptic_model: Some("global/model".to_string()),
+        max_verification_attempts: 2,
+        ..Default::default()
     };
     let agent = GoalSettingsOverride {
         enabled: Some(false),
-        skeptic_count: Some(4),
-        skeptic_model: Some("agent/model".to_string()),
-        max_rounds: Some(5),
+        cold_skeptic_count: Some(4),
+        cold_skeptic_model: Some("agent/model".to_string()),
+        max_verification_attempts: Some(5),
+        ..Default::default()
     };
     let session = GoalSettingsOverride {
         enabled: Some(true),
-        skeptic_count: None,
-        skeptic_model: Some("session/model".to_string()),
-        max_rounds: None,
+        cold_skeptic_count: None,
+        cold_skeptic_model: Some("session/model".to_string()),
+        max_verification_attempts: None,
+        ..Default::default()
     };
 
-    let resolved = resolve_goal_verification_config(Some(&session), Some(&agent), global);
+    let resolved = resolve_goal_supervision_config(Some(&session), Some(&agent), global);
 
-    assert!(resolved.enabled, "session enabled overrides agent");
-    assert_eq!(resolved.skeptic_count, 4, "agent count overrides global");
+    assert!(resolved.enabled, "global kill switch is non-overridable");
     assert_eq!(
-        resolved.skeptic_model.as_deref(),
+        resolved.cold_skeptic_count, 4,
+        "agent count overrides global"
+    );
+    assert_eq!(
+        resolved.cold_skeptic_model.as_deref(),
         Some("session/model"),
         "session model overrides agent"
     );
-    assert_eq!(resolved.max_rounds, 5, "agent rounds override global");
+    assert_eq!(
+        resolved.max_verification_attempts, 5,
+        "agent rounds override global"
+    );
 }
 
 #[test]
 fn goal_settings_override_rejects_invalid_values() {
     assert!(
         GoalSettingsOverride {
-            skeptic_count: Some(0),
+            cold_skeptic_count: Some(0),
             ..GoalSettingsOverride::default()
         }
         .validate()
@@ -335,7 +344,7 @@ fn goal_settings_override_rejects_invalid_values() {
     );
     assert!(
         GoalSettingsOverride {
-            max_rounds: Some(0),
+            max_verification_attempts: Some(0),
             ..GoalSettingsOverride::default()
         }
         .validate()
@@ -343,7 +352,7 @@ fn goal_settings_override_rejects_invalid_values() {
     );
     assert!(
         GoalSettingsOverride {
-            skeptic_model: Some("not-a-selector".to_string()),
+            cold_skeptic_model: Some("not-a-selector".to_string()),
             ..GoalSettingsOverride::default()
         }
         .validate()

@@ -1532,10 +1532,28 @@ impl App {
             }
             _ => {
                 self.swap_primary_agent("Build");
-                let wire = build_goal_clarification_prompt(trimmed);
-                self.dispatch_goal_turn(trimmed, wire);
+                let (token_budget, objective) = Self::parse_goal_create_args(trimmed);
+                if objective.is_empty() {
+                    self.push_plain("/goal: objective must not be empty".to_string());
+                    return;
+                }
+                self.create_goal(objective, token_budget);
             }
         }
+    }
+
+    fn parse_goal_create_args(input: &str) -> (Option<i64>, String) {
+        let mut words = input.split_whitespace();
+        let mut budget = None;
+        let mut objective = Vec::new();
+        while let Some(word) = words.next() {
+            if word == "--budget" {
+                budget = words.next().and_then(|value| value.parse::<i64>().ok());
+            } else {
+                objective.push(word);
+            }
+        }
+        (budget, objective.join(" "))
     }
 
     /// `/skill <skill-name> [task]` — the universal dispatcher
@@ -3138,7 +3156,7 @@ mod tests {
         AgentRunner, AttachedRequest, ClientTasks, ControlRequest, UsageCounts,
     };
     use crate::tui::history::HistoryEntry;
-    use cockpit_core::daemon::proto::{GoalStatus, GoalSummary, Request, Response};
+    use cockpit_core::daemon::proto::{GoalDisposition, GoalSummary, Request, Response};
 
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3185,16 +3203,25 @@ mod tests {
         (app, attached_request_rx)
     }
 
-    fn goal_summary(status: GoalStatus) -> GoalSummary {
+    fn goal_summary(disposition: GoalDisposition) -> GoalSummary {
         GoalSummary {
             id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),
             project_id: "project".to_string(),
             objective: "ship it".to_string(),
             context: None,
-            status,
-            token_budget: Some(100),
+            disposition,
+            phase: (disposition == GoalDisposition::Running)
+                .then_some(cockpit_db::session_goals::GoalPhase::Executing),
+            resume_phase: None,
+            pause_reason: None,
+            contract_available: true,
+            latest_gap_or_blocker: None,
+            verification_attempts: 0,
+            attempt_generation: 1,
+            token_budget: 100,
             tokens_used: 4,
+            remaining_tokens: 96,
             blocked_attempts: 0,
             last_read_at: None,
             created_at: 0,
@@ -3243,19 +3270,19 @@ mod tests {
             (
                 "/goal status",
                 Response::GoalStatus {
-                    goal: Some(goal_summary(GoalStatus::Active)),
+                    goal: Some(goal_summary(GoalDisposition::Running)),
                 },
             ),
             (
                 "/goal pause",
                 Response::GoalUpdated {
-                    goal: goal_summary(GoalStatus::Paused),
+                    goal: goal_summary(GoalDisposition::UserPaused),
                 },
             ),
             (
                 "/goal resume",
                 Response::GoalUpdated {
-                    goal: goal_summary(GoalStatus::Active),
+                    goal: goal_summary(GoalDisposition::Running),
                 },
             ),
             ("/goal clear", Response::GoalCleared { cleared: true }),
@@ -3301,14 +3328,14 @@ mod tests {
             &mut app,
             &mut rx,
             Ok(Response::GoalUpdated {
-                goal: goal_summary(GoalStatus::Paused),
+                goal: goal_summary(GoalDisposition::UserPaused),
             }),
         )
         .await;
         assert!(matches!(
             request,
             Request::SetGoalStatus {
-                status: GoalStatus::Paused,
+                status: GoalDisposition::UserPaused,
                 ..
             }
         ));

@@ -261,6 +261,14 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Sole host ingress for creating a supervised goal.
+    CreateGoal {
+        session_id: Uuid,
+        objective: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<i64>,
+    },
+
     /// Read the current open goal for a session after refreshing token usage.
     GoalStatus {
         session_id: Uuid,
@@ -269,7 +277,7 @@ pub enum Request {
     /// Pause or resume the current open goal for a session.
     SetGoalStatus {
         session_id: Uuid,
-        status: GoalStatus,
+        status: GoalDisposition,
     },
 
     /// Mark the current open goal complete without requiring model evidence.
@@ -1197,6 +1205,7 @@ macro_rules! request_variants {
             (Request::CancelPausedWork { .. }, "cancel_paused_work");
             (Request::RepairResume { .. }, "repair_resume");
             (Request::GoalStatus { .. }, "goal_status");
+            (Request::CreateGoal { .. }, "create_goal");
             (Request::SetGoalStatus { .. }, "set_goal_status");
             (Request::ClearGoal { .. }, "clear_goal");
             (Request::PinMessage { .. }, "pin_message");
@@ -1342,6 +1351,7 @@ macro_rules! command {
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, serialized, none);
             (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, serialized, none);
+            (Request::CreateGoal { session_id, .. }, "create_goal", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, serialized, none);
             (Request::PinMessage { session_id, .. }, "pin_message", session_row_writer(session_id), field(session_id), true, serialized, none);

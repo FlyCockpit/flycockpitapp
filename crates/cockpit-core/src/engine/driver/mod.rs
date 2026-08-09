@@ -79,6 +79,7 @@ use crate::session::Session;
 /// mid-turn state (the safe-boundary rule, `plan.md` T6.e).
 #[derive(Debug)]
 pub enum DriverControl {
+    WakeGoal,
     #[cfg(test)]
     #[allow(dead_code)]
     AbortForTest,
@@ -93,7 +94,9 @@ pub enum DriverControl {
     /// and emit `CompactReady`.
     Compact,
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
-    Pin { text: String },
+    Pin {
+        text: String,
+    },
     /// Explicitly opt into synthetic resume repair for a Responses session
     /// that strict replay opened read-only. The original transcript is not
     /// mutated; only the live root history is populated with the healed replay.
@@ -117,7 +120,9 @@ pub enum DriverControl {
     /// new primary continues the same conversation with its own tool
     /// surface + system prompt. A no-op when an interactive subagent holds
     /// the foreground (stack depth > 1) or the name is already active.
-    SwapPrimary { name: String },
+    SwapPrimary {
+        name: String,
+    },
     /// Switch the active `llm_mode` live (`/llm-mode`,
     /// implementation note). Rebuilds the root-frame
     /// agent so its tool-description verbosity + per-mode prompt re-render;
@@ -161,12 +166,16 @@ pub enum DriverControl {
     /// explicitly. The driver records the override (precedence over config) and
     /// emits [`TurnEvent::PreflightState`] with the resulting state. Session-
     /// only — no config write; reverts on restart (mirrors [`Self::SetRedaction`]).
-    SetPreflight { enabled: Option<bool> },
+    SetPreflight {
+        enabled: Option<bool>,
+    },
     /// Set (or toggle) the session-only prompt-cache retention override
     /// (`/longcache`). `Some(true)` arms extended retention intent,
     /// `Some(false)` clears it, and `None` toggles. The driver re-resolves
     /// the effective wire key against curated active-model capability.
-    SetLongcache { enabled: Option<bool> },
+    SetLongcache {
+        enabled: Option<bool>,
+    },
     /// Re-read the active-model prompt-cache retention preference from the
     /// shared session config snapshot and re-resolve current frame params.
     /// Used after `RefreshConfig` so `/model-settings` edits affect the
@@ -177,11 +186,16 @@ pub enum DriverControl {
     /// Set a session-only root delegation recursion override (`/quick`).
     /// Root delegation still obeys existing allowed-target and per-agent
     /// max-depth policy; this only overrides the default enabled/depth values.
-    SetDelegationRecursion { enabled: bool, default_depth: u32 },
+    SetDelegationRecursion {
+        enabled: bool,
+        default_depth: u32,
+    },
     /// Update the per-user-message primary round ceiling from the latest
     /// layered settings. Applied at the next idle/control boundary so a
     /// `/settings` edit affects subsequent user messages in this session.
-    SetMaxPrimaryRounds { max_rounds: u32 },
+    SetMaxPrimaryRounds {
+        max_primary_rounds: u32,
+    },
     /// Switch the active model+provider live mid-session (`/model` picker,
     /// implementation note). The driver builds the new
     /// [`Model`](crate::engine::model::Model) for `(provider, model)` from the
@@ -259,30 +273,15 @@ pub enum ParkedReplayOutcome {
 /// concat-joining a hundred would bloat the next inference. If we
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
-const GOAL_IDLE_CONTINUATION: &str = "An active goal is still in progress, but recent turns did not record concrete progress.\n\nRead the current goal, decide the next concrete action, and continue working. This turn must produce visible progress: edit/write a file, run the relevant gate, update the goal with a non-empty context_delta, or provide a concrete blocker that is shown to the user. If the goal is complete, call goal with action \"update\", status \"complete\", and evidence. If truly blocked, call goal with action \"update\", status \"blocked\", and explain the blocker. Otherwise use tools to make progress.";
-const GOAL_IDLE_CONTINUATION_STRONG: &str = "An active goal is still in progress and repeated recent turns did not edit/write a file, run the gate, commit, or record progress with goal(action=\"update\", context_delta=...). You must choose one exit: call a tool that makes concrete progress, call goal(action=\"get\") then goal(action=\"update\", status=\"complete\", evidence=...), call goal(action=\"update\", status=\"active\", context_delta=...) to record real progress, or call goal(action=\"update\", status=\"blocked\", blocker=...) only for a true blocker. Do not finish this turn silently.";
-const GOAL_IDLE_CONTINUATION_STRONGEST: &str = "An active goal is still in progress and the no-progress budget is being consumed by repeated read/search/prose-only turns. Stop researching in circles: make a concrete change, run the relevant validation gate, record a non-empty goal context_delta that explains durable progress, or surface the exact blocker. Do not bypass approvals, sandboxing, or safety checks.";
-const GOAL_WATCHDOG_CONTINUATION: &str = "An active goal is still in progress, and background work has been pending for 10 minutes.\n\nCheck the status of the pending background task(s). If one is hung, decide whether to cancel, retry, inspect logs, or continue with other work. If the goal is complete, call goal(action=\"update\", status=\"complete\"). If blocked, call goal(action=\"update\", status=\"blocked\").";
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
 const GOAL_NO_PROGRESS_NUDGE_BOUND: u16 = 2;
 /// Finite continuation cap for goals created without an explicit token budget.
 /// Large enough for ordinary multi-turn runs, but not unbounded if the agent
 /// repeatedly fails to make durable progress.
-const GOAL_DEFAULT_CONTINUATION_TOKEN_CAP: i64 = 200_000;
-const GOAL_USAGE_LIMIT_AUTO_RESUME: &str = "An active goal was paused because the provider reported a usage or rate limit. The backoff window has elapsed.\n\nResume the goal from the current context. If the provider is still rate-limiting, stop after the failed turn and leave the goal usage-limited. If the goal is complete, call goal(action=\"update\", status=\"complete\"). If truly blocked for a non-usage-limit reason, call goal(action=\"update\", status=\"blocked\").";
 const GOAL_USAGE_LIMIT_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const GOAL_USAGE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS: u8 = 3;
 const GOAL_USAGE_LIMIT_INTERVENTION_CODE: &str = "usage_limit_persisted";
-const GOAL_VERIFICATION_FAILED_CODE: &str = "verification_failed";
-const GOAL_VERIFICATION_FRAMINGS: &[&str] = &[
-    "Find the strongest concrete reason this goal is NOT complete.",
-    "Assume the reported validation is misleading; verify acceptance independently.",
-    "Search for an unaddressed acceptance criterion or missing guard.",
-    "Look for late-result, race, rollback, or integration evidence that contradicts completion.",
-    "Challenge the implementation quality: missing tests, unsafe shortcuts, or scoped omissions.",
-];
-
 #[derive(Debug, PartialEq, Eq)]
 enum GoalUsageLimitWatchdogAction {
     NotUsageLimited,
@@ -291,34 +290,11 @@ enum GoalUsageLimitWatchdogAction {
 }
 
 #[derive(Debug, Clone)]
-struct GoalVerificationRound {
+struct GoalSupervisionRound {
     goal_id: uuid::Uuid,
-    round: i64,
+    attempt_generation: i64,
     total: usize,
-    jobs: HashMap<String, GoalVerificationJob>,
-    cannot_refute: usize,
-    refutations: Vec<String>,
-    inconclusive: usize,
-}
-
-#[derive(Debug, Clone)]
-struct GoalVerificationJob {
-    index: usize,
-    framing: &'static str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GoalSkepticVerdict {
-    CannotRefute,
-    Refuted(String),
-    Inconclusive,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GoalVerificationDecision {
-    Complete,
-    Refuted(Vec<String>),
-    Inconclusive,
+    jobs: HashMap<String, crate::db::session_goals::GoalControlJob>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -331,57 +307,6 @@ struct GoalProgressObservation {
 impl GoalProgressObservation {
     fn no_progress(self) -> bool {
         self.observed_turn && !self.mutating_action && !self.context_delta
-    }
-}
-
-fn parse_goal_skeptic_verdict(text: &str) -> GoalSkepticVerdict {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("goal_verification_verdict: cannot_refute")
-        || lower.contains("\"verdict\":\"cannot_refute\"")
-        || lower.contains("\"verdict\": \"cannot_refute\"")
-    {
-        return GoalSkepticVerdict::CannotRefute;
-    }
-    if let Some(idx) = lower.find("goal_verification_verdict: refuted") {
-        let finding = text[idx..]
-            .split_once('-')
-            .map(|(_, finding)| finding.trim())
-            .filter(|finding| !finding.is_empty())
-            .unwrap_or("skeptic refuted completion without a specific finding");
-        return GoalSkepticVerdict::Refuted(finding.to_string());
-    }
-    if lower.contains("\"verdict\":\"refuted\"") || lower.contains("\"verdict\": \"refuted\"") {
-        let finding = text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().contains("finding"))
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .unwrap_or("skeptic refuted completion without a specific finding");
-        return GoalSkepticVerdict::Refuted(finding.to_string());
-    }
-    GoalSkepticVerdict::Inconclusive
-}
-
-#[cfg(test)]
-mod goal_verification_tests {
-    use super::*;
-
-    #[test]
-    fn goal_skeptic_verdict_parser_accepts_cannot_refute_marker() {
-        assert_eq!(
-            parse_goal_skeptic_verdict("checked\nGOAL_VERIFICATION_VERDICT: cannot_refute"),
-            GoalSkepticVerdict::CannotRefute
-        );
-    }
-
-    #[test]
-    fn goal_skeptic_verdict_parser_extracts_refutation_marker() {
-        assert_eq!(
-            parse_goal_skeptic_verdict(
-                "issue found\nGOAL_VERIFICATION_VERDICT: refuted - missing acceptance test",
-            ),
-            GoalSkepticVerdict::Refuted("missing acceptance test".to_string())
-        );
     }
 }
 
@@ -693,7 +618,9 @@ pub struct Driver {
     goal_idle_intervention_code: Option<&'static str>,
     goal_was_active_recently: bool,
     goal_usage_limit_auto_resume_attempts: u8,
-    goal_verification_round: Option<GoalVerificationRound>,
+    goal_supervision_round: Option<GoalSupervisionRound>,
+    goal_root_turn: Option<(uuid::Uuid, i64, uuid::Uuid)>,
+    goal_scratch: Option<crate::goal_scratch::GoalScratchRoot>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
@@ -1375,7 +1302,9 @@ impl Driver {
             goal_idle_intervention_code: None,
             goal_was_active_recently: self.goal_was_active_recently,
             goal_usage_limit_auto_resume_attempts: self.goal_usage_limit_auto_resume_attempts,
-            goal_verification_round: self.goal_verification_round.clone(),
+            goal_supervision_round: self.goal_supervision_round.clone(),
+            goal_root_turn: self.goal_root_turn,
+            goal_scratch: self.goal_scratch.clone(),
             pending_idle_reason: self.pending_idle_reason.clone(),
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,
@@ -1689,7 +1618,9 @@ impl Driver {
             goal_idle_intervention_code: None,
             goal_was_active_recently: false,
             goal_usage_limit_auto_resume_attempts: 0,
-            goal_verification_round: None,
+            goal_supervision_round: None,
+            goal_root_turn: None,
+            goal_scratch: None,
             pending_idle_reason: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
@@ -2223,8 +2154,8 @@ impl Driver {
 
     /// Set the per-user-message primary round ceiling. `0` disables the
     /// guard; positive values are applied exactly as configured.
-    pub fn set_max_primary_rounds(&mut self, max_rounds: u32) {
-        self.max_primary_rounds = max_rounds;
+    pub fn set_max_primary_rounds(&mut self, max_primary_rounds: u32) {
+        self.max_primary_rounds = max_primary_rounds;
     }
 
     pub fn set_allow_unbounded_schedule_loops(&mut self, allowed: bool) {
@@ -3188,12 +3119,6 @@ impl Driver {
                                     text: "goal: usage limit backoff elapsed; auto-resuming".to_string(),
                                 })
                                 .await;
-                            self.run_user_input(
-                                UserSubmission::text(GOAL_USAGE_LIMIT_AUTO_RESUME),
-                                &input_queue,
-                                tx,
-                            )
-                            .await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
                         }
                         GoalUsageLimitWatchdogAction::Exhausted => {
@@ -3204,12 +3129,6 @@ impl Driver {
                                 .await;
                         }
                         GoalUsageLimitWatchdogAction::NotUsageLimited => {
-                            self.run_user_input(
-                                UserSubmission::text(GOAL_WATCHDOG_CONTINUATION),
-                                &input_queue,
-                                tx,
-                            )
-                            .await?;
                             self.maybe_continue_active_goal(&input_queue, tx).await?;
                         }
                     }
@@ -3256,15 +3175,15 @@ impl Driver {
             .await
             .ok()
             .flatten()
-            .map(|goal| goal.status)
+            .map(|goal| goal.disposition)
         {
-            Some(crate::db::session_goals::GoalStatus::BudgetLimited) => {
+            Some(crate::db::session_goals::GoalDisposition::BudgetLimited) => {
                 crate::engine::IdleReason::BudgetLimited
             }
-            Some(crate::db::session_goals::GoalStatus::UsageLimited) => {
+            Some(crate::db::session_goals::GoalDisposition::InfraPaused) => {
                 crate::engine::IdleReason::UsageLimited
             }
-            Some(crate::db::session_goals::GoalStatus::Active) => {
+            Some(crate::db::session_goals::GoalDisposition::Running) => {
                 self.goal_was_active_recently = true;
                 crate::engine::IdleReason::Completed
             }
@@ -3324,6 +3243,11 @@ impl Driver {
         match control {
             #[cfg(test)]
             DriverControl::AbortForTest => unreachable!("handled before run_control"),
+            DriverControl::WakeGoal => {
+                if let Err(error) = self.maybe_continue_active_goal(input_queue, tx).await {
+                    tracing::warn!(%error, "waking supervised goal failed");
+                }
+            }
             DriverControl::Prune => {
                 self.do_prune(false, tx).await;
             }
@@ -3487,8 +3411,8 @@ impl Driver {
                     })
                     .await;
             }
-            DriverControl::SetMaxPrimaryRounds { max_rounds } => {
-                self.set_max_primary_rounds(max_rounds);
+            DriverControl::SetMaxPrimaryRounds { max_primary_rounds } => {
+                self.set_max_primary_rounds(max_primary_rounds);
             }
             DriverControl::SetActiveModel {
                 selection_id,
@@ -3568,6 +3492,17 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         loop {
+            if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+                if let Some(goal) = self
+                    .session
+                    .db
+                    .finish_goal_root_turn(goal_id, generation, turn_id)
+                    .await?
+                {
+                    self.maybe_start_goal_supervision_round(&goal, tx).await?;
+                }
+                return Ok(());
+            }
             let Some(goal) = self
                 .session
                 .db
@@ -3577,27 +3512,21 @@ impl Driver {
                 if self.goal_was_active_recently {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
                 }
+                if let Some(scratch) = self.goal_scratch.take() {
+                    let _ = scratch.cleanup();
+                }
                 self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
             };
-            if goal.status == crate::db::session_goals::GoalStatus::PendingVerification {
-                self.maybe_start_goal_verification_round(&goal, tx).await?;
-                self.reset_goal_progress_tracking().await;
-                self.clear_goal_idle_intervention();
-                return Ok(());
-            }
-            if goal.status != crate::db::session_goals::GoalStatus::Active {
+            if goal.disposition != crate::db::session_goals::GoalDisposition::Running {
                 self.reset_goal_progress_tracking().await;
                 self.clear_goal_idle_intervention();
                 return Ok(());
             }
             self.goal_was_active_recently = true;
             self.goal_usage_limit_auto_resume_attempts = 0;
-            if goal
-                .token_budget
-                .is_some_and(|budget| goal.tokens_used >= budget)
-            {
+            if goal.tokens_used >= goal.token_budget {
                 if self.goal_stall_budget_context_active() {
                     self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
                     return Ok(());
@@ -3607,7 +3536,7 @@ impl Driver {
                     .db
                     .update_session_goal(
                         self.session.id,
-                        crate::db::session_goals::GoalStatus::BudgetLimited,
+                        crate::db::session_goals::GoalDisposition::BudgetLimited,
                         None,
                         None,
                         Some("token budget exhausted"),
@@ -3617,184 +3546,221 @@ impl Driver {
                 self.clear_goal_idle_intervention();
                 return Ok(());
             }
-            if self.goal_idle_intervention_pending {
-                if self
-                    .root_last_user_text()
-                    .is_some_and(|text| !is_continue_command(&text))
-                {
-                    self.reset_goal_progress_tracking().await;
-                    self.clear_goal_idle_intervention();
+            match goal.phase {
+                Some(crate::db::session_goals::GoalPhase::Planning)
+                | Some(crate::db::session_goals::GoalPhase::Evaluating)
+                | Some(crate::db::session_goals::GoalPhase::Verifying) => {
+                    self.maybe_start_goal_supervision_round(&goal, tx).await?;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            if !self.schedule.snapshot().is_empty() {
-                return Ok(());
-            }
-            let observation = self.observe_goal_progress_turn().await?;
-            if !observation.no_progress()
-                || (self.goal_turns_since_mutating_action < GOAL_NO_PROGRESS_NUDGE_BOUND
-                    && self.goal_turns_since_goal_context_delta < GOAL_NO_PROGRESS_NUDGE_BOUND)
-            {
-                if observation.mutating_action || observation.context_delta {
-                    self.goal_no_tool_idle_count = 0;
+                Some(crate::db::session_goals::GoalPhase::Executing) => {
+                    if self.schedule.snapshot().is_empty() {
+                        self.dispatch_goal_root_turn(&goal, input_rx, tx).await?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                None => return Ok(()),
             }
-            if self.goal_continuation_budget_exhausted(&goal) {
-                self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
-                return Ok(());
-            }
-            let prompt = self.goal_stall_prompt();
-            self.goal_no_tool_idle_count = self.goal_no_tool_idle_count.saturating_add(1);
-            self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
-                .await?;
         }
     }
 
-    async fn maybe_start_goal_verification_round(
+    async fn maybe_start_goal_supervision_round(
         &mut self,
         goal: &crate::db::session_goals::SessionGoal,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if let Some(round) = &self.goal_verification_round
+        if let Some(round) = &self.goal_supervision_round
             && round.goal_id == goal.id
-            && round.round == goal.verification_rounds
+            && round.attempt_generation == goal.attempt_generation
         {
-            self.emit_goal_verification_progress(tx).await;
+            self.emit_goal_supervision_progress(tx).await;
             return Ok(());
         }
-
-        let cfg = self.effective_goal_verification_config();
-        let max_rounds = i64::from(cfg.effective_max_rounds());
-        if goal.verification_rounds >= max_rounds {
-            self.goal_idle_intervention_pending = true;
-            self.goal_idle_intervention_code = Some(GOAL_VERIFICATION_FAILED_CODE);
-            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
-                code: GOAL_VERIFICATION_FAILED_CODE.to_string(),
-            });
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: "goal: completion verification failed repeatedly; run `/goal resume` after adding direction".to_string(),
-                })
-                .await;
-            return Ok(());
+        let cfg = self.effective_goal_supervision_config();
+        if self.goal_scratch.is_none() {
+            self.goal_scratch = Some(crate::goal_scratch::GoalScratchRoot::create(goal.id)?);
         }
-
-        let total = cfg.effective_skeptic_count();
-        let mut round = GoalVerificationRound {
+        // Validate every role directory before leasing durable work. Once a row
+        // is leased, no fallible filesystem setup may orphan it outside a round.
+        for role in ["planner", "evaluator", "skeptic"] {
+            self.goal_scratch
+                .as_ref()
+                .expect("created above")
+                .role(role)?;
+        }
+        self.goal_supervision_round = Some(GoalSupervisionRound {
             goal_id: goal.id,
-            round: goal.verification_rounds,
-            total,
+            attempt_generation: goal.attempt_generation,
+            total: 0,
             jobs: HashMap::new(),
-            cannot_refute: 0,
-            refutations: Vec::new(),
-            inconclusive: 0,
-        };
-        for idx in 0..total {
-            let framing = GOAL_VERIFICATION_FRAMINGS[idx % GOAL_VERIFICATION_FRAMINGS.len()];
-            let job_id = format!("goal-verif-{}", uuid::Uuid::new_v4().simple());
-            let prompt = self
-                .goal_verification_prompt(goal, idx, total, framing)
-                .await?;
-            let write_scope = std::env::temp_dir()
-                .join("cockpit-goal-verification")
-                .join(goal.id.to_string())
-                .join(format!("round-{}", goal.verification_rounds))
-                .join(format!("skeptic-{idx}"))
+        });
+        while let Some(job) = self
+            .session
+            .db
+            .lease_goal_control_job(
+                goal.id,
+                goal.attempt_generation,
+                chrono::Utc::now().timestamp(),
+                300,
+            )
+            .await?
+        {
+            let job_id = job.job_id.to_string();
+            let (worker, model) = match job.role {
+                crate::db::session_goals::GoalControlRole::Planner => (
+                    crate::engine::schedule::authority::SpawnWorkerKind::GoalPlanner,
+                    cfg.planner_model.clone(),
+                ),
+                crate::db::session_goals::GoalControlRole::Evaluator => (
+                    crate::engine::schedule::authority::SpawnWorkerKind::GoalEvaluator,
+                    cfg.evaluator_model.clone(),
+                ),
+                crate::db::session_goals::GoalControlRole::Gatekeeper => (
+                    crate::engine::schedule::authority::SpawnWorkerKind::GoalGatekeeper,
+                    cfg.gatekeeper_model.clone(),
+                ),
+                crate::db::session_goals::GoalControlRole::ColdSkeptic => (
+                    crate::engine::schedule::authority::SpawnWorkerKind::GoalColdSkeptic,
+                    cfg.cold_skeptic_model.clone(),
+                ),
+            };
+            let scratch_role = match job.role {
+                crate::db::session_goals::GoalControlRole::Planner => "planner",
+                crate::db::session_goals::GoalControlRole::Evaluator => "evaluator",
+                crate::db::session_goals::GoalControlRole::Gatekeeper
+                | crate::db::session_goals::GoalControlRole::ColdSkeptic => "skeptic",
+            };
+            let write_scope = self
+                .goal_scratch
+                .as_ref()
+                .expect("created above")
+                .role(scratch_role)?
                 .display()
                 .to_string();
             self.schedule
                 .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
                     job_id: Some(job_id.clone()),
-                    worker: crate::engine::schedule::authority::SpawnWorkerKind::Scout,
-                    prompt,
+                    worker,
+                    prompt: job.request_json.clone(),
                     write_scope,
-                    model: cfg.skeptic_model.clone(),
-                    // Host config (`goalVerification.skepticModel`): a
-                    // self-hosted skeptic keeps its trusted custody.
+                    model,
                     model_origin: crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
                     depth: 0,
-                    max_depth: self.swarm_max_depth,
+                    max_depth: 0,
                 });
-            round.jobs.insert(
-                job_id,
-                GoalVerificationJob {
-                    index: idx,
-                    framing,
-                },
-            );
+            let round = self
+                .goal_supervision_round
+                .as_mut()
+                .expect("initialized before leasing");
+            round.total = round.total.saturating_add(1);
+            round.jobs.insert(job_id, job);
         }
-        self.goal_verification_round = Some(round);
-        self.emit_goal_verification_progress(tx).await;
+        let total = self
+            .goal_supervision_round
+            .as_ref()
+            .map_or(0, |round| round.total);
+        if total == 0 {
+            self.goal_supervision_round = None;
+            return Ok(());
+        }
+        self.emit_goal_supervision_progress(tx).await;
         Ok(())
     }
 
-    fn effective_goal_verification_config(
-        &self,
-    ) -> crate::config::extended::GoalVerificationConfig {
+    fn effective_goal_supervision_config(&self) -> crate::config::extended::GoalSupervisionConfig {
         let agent_name = self
             .stack
             .first()
             .map(|frame| frame.agent.name.as_str())
             .unwrap_or("Build");
         let session_override = self.session.goal_settings_override();
-        crate::agents::effective_goal_verification_for_agent(
+        crate::agents::effective_goal_supervision_for_agent(
             &self.cwd,
             agent_name,
             session_override.as_ref(),
-            self.config.extended().goal_verification,
+            self.config.extended().goal_supervision,
         )
     }
 
-    async fn goal_verification_prompt(
-        &self,
+    fn goal_host_directive(&self, goal: &crate::db::session_goals::SessionGoal) -> String {
+        let contract = goal
+            .contract
+            .as_ref()
+            .map(|contract| serde_json::to_string(contract).unwrap_or_default())
+            .unwrap_or_else(|| "null".to_string());
+        let gaps: Vec<String> = goal
+            .unresolved_gaps
+            .iter()
+            .take(8)
+            .map(|gap| crate::db::session_goals::sanitize_goal_finding(gap))
+            .collect();
+        let next = goal
+            .evaluator_outcome_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| {
+                value
+                    .get("next_step")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                goal.contract
+                    .as_ref()
+                    .and_then(|contract| contract.implementation_checklist.first())
+                    .cloned()
+            })
+            .unwrap_or_else(|| "follow the next unmet acceptance outcome".to_string());
+        serde_json::json!({
+            "host_goal_directive": {
+                "goal_id": goal.id,
+                "attempt_generation": goal.attempt_generation,
+                "immutable_contract": contract,
+                "lifecycle": { "disposition": goal.disposition, "phase": goal.phase },
+                "usage": { "tokens_used": goal.tokens_used, "token_budget": goal.token_budget, "remaining": goal.token_budget.saturating_sub(goal.tokens_used) },
+                "unresolved_verifier_gaps": gaps,
+                "next_checklist_guidance": next,
+                "safety": "Do not bypass approvals, sandbox restrictions, usage limits, or no-progress safeguards. The host alone decides completion."
+            }
+        }).to_string()
+    }
+
+    async fn dispatch_goal_root_turn(
+        &mut self,
         goal: &crate::db::session_goals::SessionGoal,
-        idx: usize,
-        total: usize,
-        framing: &str,
-    ) -> Result<String> {
-        let recent = self.recent_goal_verification_context().await;
-        Ok(format!(
-            "Goal completion skeptic {}/{} for goal `{}`.\n\nRefute framing: {}\n\nGoal objective:\n{}\n\nGoal context / acceptance criteria:\n{}\n\nCompletion evidence claimed by primary:\n{}\n\nRecent transcript and validation signals:\n{}\n\nInspect the repository/worktree as needed. Try to refute that the goal is complete. Return a concise answer ending with exactly one of these lines:\nGOAL_VERIFICATION_VERDICT: cannot_refute\nGOAL_VERIFICATION_VERDICT: refuted - <specific finding>\nIf you cannot inspect enough evidence to decide, end with:\nGOAL_VERIFICATION_VERDICT: inconclusive",
-            idx + 1,
-            total,
-            goal.id,
-            framing,
-            goal.objective,
-            goal.context.as_deref().unwrap_or("(none)"),
-            goal.completion_evidence.as_deref().unwrap_or("(missing)"),
-            recent,
-        ))
+        input_rx: &crate::engine::message::UserSubmissionQueue,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        let turn_id = self
+            .session
+            .db
+            .begin_goal_root_turn(goal.id, goal.attempt_generation)
+            .await?;
+        self.goal_root_turn = Some((goal.id, goal.attempt_generation, turn_id));
+        let result = self
+            .run_user_input(
+                UserSubmission::text(self.goal_host_directive(goal)),
+                input_rx,
+                tx,
+            )
+            .await;
+        if let Err(error) = result {
+            self.goal_root_turn = None;
+            let _ = self
+                .session
+                .db
+                .fail_goal_root_turn(goal.id, goal.attempt_generation, turn_id)
+                .await;
+            return Err(error);
+        }
+        Ok(())
     }
 
-    async fn recent_goal_verification_context(&self) -> String {
-        let Ok(events) = self.session.db.list_session_events(self.session.id).await else {
-            return "(recent transcript unavailable)".to_string();
-        };
-        let mut out = String::new();
-        for event in events.iter().rev().take(24).rev() {
-            let snippet = event.data.to_string();
-            let snippet: String = snippet.chars().take(600).collect();
-            out.push_str(&format!(
-                "- seq {} kind {} agent {:?}: {}\n",
-                event.seq, event.kind, event.agent, snippet
-            ));
-        }
-        if out.trim().is_empty() {
-            "(no recent events recorded)".to_string()
-        } else {
-            out
-        }
-    }
-
-    async fn emit_goal_verification_progress(&self, tx: &mpsc::Sender<TurnEvent>) {
-        if let Some(round) = &self.goal_verification_round {
-            let done = round
-                .cannot_refute
-                .saturating_add(round.refutations.len())
-                .saturating_add(round.inconclusive);
+    async fn emit_goal_supervision_progress(&self, tx: &mpsc::Sender<TurnEvent>) {
+        if let Some(round) = &self.goal_supervision_round {
+            let done = round.total.saturating_sub(round.jobs.len());
             let _ = tx
-                .send(TurnEvent::GoalVerificationProgress {
+                .send(TurnEvent::GoalSupervisionProgress {
                     done,
                     total: round.total,
                 })
@@ -3802,7 +3768,7 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) async fn handle_goal_verification_completion(
+    pub(in crate::engine::driver) async fn handle_goal_supervision_completion(
         &mut self,
         job_id: &str,
         result: &str,
@@ -3810,133 +3776,54 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<bool> {
-        let Some(mut round) = self.goal_verification_round.take() else {
+        let Some(mut round) = self.goal_supervision_round.take() else {
             return Ok(false);
         };
         let Some(job) = round.jobs.remove(job_id) else {
-            self.goal_verification_round = Some(round);
+            self.goal_supervision_round = Some(round);
             return Ok(false);
         };
 
-        match if failed {
-            GoalSkepticVerdict::Inconclusive
-        } else {
-            parse_goal_skeptic_verdict(result)
-        } {
-            GoalSkepticVerdict::CannotRefute => round.cannot_refute += 1,
-            GoalSkepticVerdict::Refuted(finding) => round.refutations.push(format!(
-                "skeptic {} ({}): {}",
-                job.index + 1,
-                job.framing,
-                finding
-            )),
-            GoalSkepticVerdict::Inconclusive => round.inconclusive += 1,
-        }
-
-        let done = round
-            .cannot_refute
-            .saturating_add(round.refutations.len())
-            .saturating_add(round.inconclusive);
-        let majority = round.total / 2 + 1;
-        let decision = if round.cannot_refute >= majority {
-            Some(GoalVerificationDecision::Complete)
-        } else if round.refutations.len() >= majority {
-            Some(GoalVerificationDecision::Refuted(round.refutations.clone()))
-        } else if done >= round.total {
-            Some(GoalVerificationDecision::Inconclusive)
-        } else {
-            None
-        };
-        let goal_id = round.goal_id;
+        let updated = self
+            .session
+            .db
+            .finish_goal_control_job(
+                job,
+                if failed {
+                    Err("scheduler job failed")
+                } else {
+                    Ok(result)
+                },
+            )
+            .await?;
+        let done = round.total.saturating_sub(round.jobs.len());
         let total = round.total;
-        if decision.is_none() {
-            self.goal_verification_round = Some(round);
+        if !round.jobs.is_empty() {
+            self.goal_supervision_round = Some(round);
         }
         let _ = tx
-            .send(TurnEvent::GoalVerificationProgress { done, total })
+            .send(TurnEvent::GoalSupervisionProgress { done, total })
             .await;
 
-        let Some(decision) = decision else {
-            return Ok(true);
-        };
-
-        match decision {
-            GoalVerificationDecision::Complete => {
-                if self
-                    .session
-                    .db
-                    .complete_pending_session_goal_verification(self.session.id, goal_id)
-                    .await?
-                    .is_some()
-                {
+        if let Some(goal) = updated {
+            match (goal.disposition, goal.phase) {
+                (crate::db::session_goals::GoalDisposition::Complete, None) => {
+                    if let Some(scratch) = self.goal_scratch.take() {
+                        let _ = scratch.cleanup();
+                    }
                     self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
                     self.goal_was_active_recently = false;
                 }
-            }
-            GoalVerificationDecision::Refuted(findings) => {
-                self.reopen_goal_after_verification_failure(
-                    goal_id,
-                    findings.join("\n"),
-                    input_rx,
-                    tx,
-                )
-                .await?;
-            }
-            GoalVerificationDecision::Inconclusive => {
-                self.reopen_goal_after_verification_failure(
-                    goal_id,
-                    "verification could not form a majority; continue, gather stronger evidence, and re-attempt completion".to_string(),
-                    input_rx,
-                    tx,
-                )
-                .await?;
+                (
+                    crate::db::session_goals::GoalDisposition::Running,
+                    Some(crate::db::session_goals::GoalPhase::Executing),
+                ) => {
+                    self.dispatch_goal_root_turn(&goal, input_rx, tx).await?;
+                }
+                _ => {}
             }
         }
         Ok(true)
-    }
-
-    async fn reopen_goal_after_verification_failure(
-        &mut self,
-        goal_id: uuid::Uuid,
-        findings: String,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<()> {
-        let context_delta = format!("Completion verification did not pass:\n{findings}");
-        let Some(goal) = self
-            .session
-            .db
-            .reopen_pending_session_goal_verification(self.session.id, goal_id, &context_delta)
-            .await?
-        else {
-            return Ok(());
-        };
-        let max_rounds = i64::from(
-            self.effective_goal_verification_config()
-                .effective_max_rounds(),
-        );
-        if goal.verification_rounds >= max_rounds {
-            self.goal_idle_intervention_pending = true;
-            self.goal_idle_intervention_code = Some(GOAL_VERIFICATION_FAILED_CODE);
-            self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
-                code: GOAL_VERIFICATION_FAILED_CODE.to_string(),
-            });
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: "goal: verification failed after the configured round cap; run `/goal resume` after adding direction".to_string(),
-                })
-                .await;
-            return Ok(());
-        }
-
-        let prompt = format!(
-            "Goal completion was refuted by skeptic verification. Continue the active goal and address these findings before trying to complete it again:\n\n{findings}"
-        );
-        self.reset_goal_progress_tracking().await;
-        self.clear_goal_idle_intervention();
-        self.run_user_input(UserSubmission::text(prompt), input_rx, tx)
-            .await?;
-        Ok(())
     }
 
     async fn reset_goal_progress_tracking(&mut self) {
@@ -3949,24 +3836,6 @@ impl Driver {
     fn clear_goal_idle_intervention(&mut self) {
         self.goal_idle_intervention_pending = false;
         self.goal_idle_intervention_code = None;
-    }
-
-    fn goal_stall_prompt(&self) -> &'static str {
-        match self.goal_no_tool_idle_count {
-            0 => GOAL_IDLE_CONTINUATION,
-            1 => GOAL_IDLE_CONTINUATION_STRONG,
-            _ => GOAL_IDLE_CONTINUATION_STRONGEST,
-        }
-    }
-
-    fn goal_continuation_budget_exhausted(
-        &self,
-        goal: &crate::db::session_goals::SessionGoal,
-    ) -> bool {
-        let cap = goal
-            .token_budget
-            .unwrap_or(GOAL_DEFAULT_CONTINUATION_TOKEN_CAP);
-        goal.tokens_used >= cap
     }
 
     fn goal_stall_budget_context_active(&self) -> bool {
@@ -3988,11 +3857,6 @@ impl Driver {
             "turns_since_goal_context_delta": self.goal_turns_since_goal_context_delta,
             "tokens_used": goal.tokens_used,
             "token_budget": goal.token_budget,
-            "default_token_cap": if goal.token_budget.is_none() {
-                Some(GOAL_DEFAULT_CONTINUATION_TOKEN_CAP)
-            } else {
-                None
-            },
         });
         if let Err(e) = self
             .session
@@ -4042,7 +3906,7 @@ impl Driver {
         else {
             return false;
         };
-        if goal.status != crate::db::session_goals::GoalStatus::Active {
+        if goal.disposition != crate::db::session_goals::GoalDisposition::Running {
             return false;
         }
         if let Err(e) = self
@@ -4050,7 +3914,7 @@ impl Driver {
             .db
             .update_session_goal(
                 self.session.id,
-                crate::db::session_goals::GoalStatus::UsageLimited,
+                crate::db::session_goals::GoalDisposition::InfraPaused,
                 None,
                 None,
                 Some("provider usage or rate limit reached"),
@@ -4103,7 +3967,11 @@ impl Driver {
         else {
             return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
         };
-        if goal.status != crate::db::session_goals::GoalStatus::UsageLimited {
+        if goal.disposition != crate::db::session_goals::GoalDisposition::InfraPaused {
+            return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
+        }
+        if goal.pause_reason != Some(crate::db::session_goals::GoalPauseReason::ProviderUsageLimit)
+        {
             return Ok(GoalUsageLimitWatchdogAction::NotUsageLimited);
         }
         if self.goal_usage_limit_auto_resume_attempts >= GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS {
@@ -4118,7 +3986,7 @@ impl Driver {
             .db
             .update_session_goal(
                 self.session.id,
-                crate::db::session_goals::GoalStatus::Active,
+                crate::db::session_goals::GoalDisposition::Running,
                 None,
                 None,
                 Some("auto-resuming after provider usage-limit backoff"),
@@ -4129,6 +3997,7 @@ impl Driver {
         Ok(GoalUsageLimitWatchdogAction::AutoResume)
     }
 
+    #[cfg(test)]
     async fn observe_goal_progress_turn(&mut self) -> Result<GoalProgressObservation> {
         let latest_seq = self.latest_session_event_seq().await;
         if self.goal_progress_last_seq < 0 {
@@ -4159,6 +4028,7 @@ impl Driver {
         Ok(observation)
     }
 
+    #[cfg(test)]
     async fn goal_progress_observation_since(
         &self,
         anchor_seq: i64,
@@ -4278,7 +4148,9 @@ impl Driver {
             .await
             .ok()
             .flatten()
-            .is_some_and(|goal| goal.status == crate::db::session_goals::GoalStatus::Active)
+            .is_some_and(|goal| {
+                goal.disposition == crate::db::session_goals::GoalDisposition::Running
+            })
     }
 
     async fn latest_session_event_seq(&self) -> i64 {
@@ -4385,7 +4257,7 @@ impl Driver {
                 serde_json::json!({
                     "id": goal.id.to_string(),
                     "objective": goal.objective,
-                    "status": goal.status.as_str(),
+                    "status": goal.disposition.as_str(),
                     "token_budget": goal.token_budget,
                     "tokens_used": goal.tokens_used,
                     "blocked_attempts": goal.blocked_attempts,
@@ -4487,7 +4359,9 @@ impl Driver {
                 .await
                 .ok()
                 .flatten()
-                .is_none_or(|goal| goal.status != crate::db::session_goals::GoalStatus::Active)
+                .is_none_or(|goal| {
+                    goal.disposition != crate::db::session_goals::GoalDisposition::Running
+                })
     }
 
     async fn emit_goal_continue_no_progress(
@@ -4942,17 +4816,19 @@ impl Driver {
             .await
             .ok()
             .flatten()
-            .map(|g| g.status);
+            .map(|g| (g.disposition, g.pause_reason));
         let delay = match status {
-            Some(crate::db::session_goals::GoalStatus::Active)
+            Some((crate::db::session_goals::GoalDisposition::Running, _))
                 if self.root_last_assistant_was_prose_without_tools()
                     && !self.schedule.snapshot().is_empty() =>
             {
                 Some(GOAL_WATCHDOG_DELAY)
             }
-            Some(crate::db::session_goals::GoalStatus::UsageLimited)
-                if self.goal_usage_limit_auto_resume_attempts
-                    < GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS =>
+            Some((
+                crate::db::session_goals::GoalDisposition::InfraPaused,
+                Some(crate::db::session_goals::GoalPauseReason::ProviderUsageLimit),
+            )) if self.goal_usage_limit_auto_resume_attempts
+                < GOAL_USAGE_LIMIT_MAX_AUTO_RESUME_ATTEMPTS =>
             {
                 Some(self.goal_usage_limit_backoff())
             }

@@ -92,11 +92,11 @@ pub struct AgentDef {
     /// Per-agent goal verification overrides. Empty fields inherit from the
     /// session override (when present) and then global `ExtendedConfig`.
     #[serde(
-        rename = "goalVerification",
+        rename = "goalSupervision",
         default,
         skip_serializing_if = "GoalSettingsOverride::is_empty"
     )]
-    pub goal_verification: GoalSettingsOverride,
+    pub goal_supervision: GoalSettingsOverride,
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
     /// Opt-in guard for `task.context="fork"`. False by default so embedded
@@ -219,46 +219,90 @@ pub fn apply_tool_surface_override(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GoalSettingsOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Retained only as an in-memory UI sentinel while the old pane is being
+    /// replaced; never serialized and never applied to the global kill switch.
+    #[serde(skip)]
     pub enabled: Option<bool>,
     #[serde(
-        rename = "skepticCount",
+        rename = "defaultTokenBudget",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub skeptic_count: Option<usize>,
+    pub default_token_budget: Option<i64>,
     #[serde(
-        rename = "skepticModel",
+        rename = "plannerModel",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub skeptic_model: Option<String>,
-    #[serde(rename = "maxRounds", default, skip_serializing_if = "Option::is_none")]
-    pub max_rounds: Option<u32>,
+    pub planner_model: Option<String>,
+    #[serde(
+        rename = "evaluatorModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub evaluator_model: Option<String>,
+    #[serde(
+        rename = "gatekeeperModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gatekeeper_model: Option<String>,
+    #[serde(
+        rename = "coldSkepticCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cold_skeptic_count: Option<usize>,
+    #[serde(
+        rename = "coldSkepticModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cold_skeptic_model: Option<String>,
+    #[serde(
+        rename = "maxVerificationAttempts",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_verification_attempts: Option<u32>,
 }
 
 impl GoalSettingsOverride {
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_none()
-            && self.skeptic_count.is_none()
-            && self.skeptic_model.is_none()
-            && self.max_rounds.is_none()
+        self.default_token_budget.is_none()
+            && self.planner_model.is_none()
+            && self.evaluator_model.is_none()
+            && self.gatekeeper_model.is_none()
+            && self.cold_skeptic_count.is_none()
+            && self.cold_skeptic_model.is_none()
+            && self.max_verification_attempts.is_none()
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.skeptic_count == Some(0) {
-            bail!("goalVerification.skepticCount must be at least 1");
+        if self.default_token_budget.is_some_and(|budget| budget <= 0) {
+            bail!("goalSupervision.defaultTokenBudget must be positive");
         }
-        if self.max_rounds == Some(0) {
-            bail!("goalVerification.maxRounds must be at least 1");
+        if self.cold_skeptic_count == Some(0) {
+            bail!("goalSupervision.coldSkepticCount must be at least 1");
         }
-        if let Some(model) = self.skeptic_model.as_deref() {
+        if self.max_verification_attempts == Some(0) {
+            bail!("goalSupervision.maxVerificationAttempts must be at least 1");
+        }
+        for model in [
+            self.planner_model.as_deref(),
+            self.evaluator_model.as_deref(),
+            self.gatekeeper_model.as_deref(),
+            self.cold_skeptic_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let trimmed = model.trim();
             if trimmed.is_empty()
                 || crate::config::provider::split_provider_model(trimmed).is_none()
             {
                 bail!(
-                    "goalVerification.skepticModel must use provider/model form with non-empty provider and model"
+                    "goalSupervision model selectors must use provider/model form with non-empty provider and model"
                 );
             }
         }
@@ -266,11 +310,11 @@ impl GoalSettingsOverride {
     }
 }
 
-pub fn resolve_goal_verification_config(
+pub fn resolve_goal_supervision_config(
     session: Option<&GoalSettingsOverride>,
     agent: Option<&GoalSettingsOverride>,
-    global: crate::config::extended::GoalVerificationConfig,
-) -> crate::config::extended::GoalVerificationConfig {
+    global: crate::config::extended::GoalSupervisionConfig,
+) -> crate::config::extended::GoalSupervisionConfig {
     let mut resolved = global;
     if let Some(agent) = agent {
         apply_goal_settings_override(&mut resolved, agent);
@@ -281,17 +325,17 @@ pub fn resolve_goal_verification_config(
     resolved
 }
 
-pub fn effective_goal_verification_for_agent(
+pub fn effective_goal_supervision_for_agent(
     cwd: &Path,
     agent_name: &str,
     session: Option<&GoalSettingsOverride>,
-    global: crate::config::extended::GoalVerificationConfig,
-) -> crate::config::extended::GoalVerificationConfig {
+    global: crate::config::extended::GoalSupervisionConfig,
+) -> crate::config::extended::GoalSupervisionConfig {
     let agent_override = resolve(cwd, agent_name)
         .ok()
         .flatten()
-        .map(|def| def.goal_verification);
-    resolve_goal_verification_config(session, agent_override.as_ref(), global)
+        .map(|def| def.goal_supervision);
+    resolve_goal_supervision_config(session, agent_override.as_ref(), global)
 }
 
 pub fn parse_goal_settings_override_json(raw: &str) -> Result<GoalSettingsOverride> {
@@ -301,20 +345,29 @@ pub fn parse_goal_settings_override_json(raw: &str) -> Result<GoalSettingsOverri
 }
 
 fn apply_goal_settings_override(
-    resolved: &mut crate::config::extended::GoalVerificationConfig,
+    resolved: &mut crate::config::extended::GoalSupervisionConfig,
     override_: &GoalSettingsOverride,
 ) {
-    if let Some(enabled) = override_.enabled {
-        resolved.enabled = enabled;
+    if let Some(default_token_budget) = override_.default_token_budget {
+        resolved.default_token_budget = default_token_budget;
     }
-    if let Some(skeptic_count) = override_.skeptic_count {
-        resolved.skeptic_count = skeptic_count;
+    if let Some(model) = &override_.planner_model {
+        resolved.planner_model = Some(model.trim().to_string());
     }
-    if let Some(skeptic_model) = &override_.skeptic_model {
-        resolved.skeptic_model = Some(skeptic_model.trim().to_string());
+    if let Some(model) = &override_.evaluator_model {
+        resolved.evaluator_model = Some(model.trim().to_string());
     }
-    if let Some(max_rounds) = override_.max_rounds {
-        resolved.max_rounds = max_rounds;
+    if let Some(model) = &override_.gatekeeper_model {
+        resolved.gatekeeper_model = Some(model.trim().to_string());
+    }
+    if let Some(cold_skeptic_count) = override_.cold_skeptic_count {
+        resolved.cold_skeptic_count = cold_skeptic_count;
+    }
+    if let Some(cold_skeptic_model) = &override_.cold_skeptic_model {
+        resolved.cold_skeptic_model = Some(cold_skeptic_model.trim().to_string());
+    }
+    if let Some(max_verification_attempts) = override_.max_verification_attempts {
+        resolved.max_verification_attempts = max_verification_attempts;
     }
 }
 
@@ -658,10 +711,10 @@ impl AgentDef {
         if let Some(scan) = self.scan_tool_results {
             fm.insert("scanToolResults".into(), scan.into());
         }
-        if !self.goal_verification.is_empty() {
+        if !self.goal_supervision.is_empty() {
             fm.insert(
-                "goalVerification".into(),
-                serde_yaml::to_value(&self.goal_verification)?,
+                "goalSupervision".into(),
+                serde_yaml::to_value(&self.goal_supervision)?,
             );
         }
         if let Some(perm) = &self.permission {
@@ -729,8 +782,8 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         tool_descriptions: BTreeMap<String, ToolDescriptionSpec>,
         #[serde(rename = "scanToolResults", default)]
         scan_tool_results: Option<bool>,
-        #[serde(rename = "goalVerification", default)]
-        goal_verification: GoalSettingsOverride,
+        #[serde(rename = "goalSupervision", default)]
+        goal_supervision: GoalSettingsOverride,
         #[serde(default)]
         permission: Option<serde_json::Value>,
         #[serde(rename = "forkEligible", default)]
@@ -766,7 +819,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         tool_tiers: fm.tool_tiers,
         tool_descriptions: fm.tool_descriptions,
         scan_tool_results: fm.scan_tool_results,
-        goal_verification: fm.goal_verification,
+        goal_supervision: fm.goal_supervision,
         permission: fm.permission,
         fork_eligible: fm.fork_eligible,
         // Trim the blank line(s) the frontmatter fence leaves before the

@@ -678,8 +678,22 @@ impl App {
             return;
         };
         self.start_goal_request(
-            "goal.status",
+            "goal.disposition",
             cockpit_core::daemon::proto::Request::GoalStatus { session_id },
+        );
+    }
+
+    pub(super) fn create_goal(&mut self, objective: String, token_budget: Option<i64>) {
+        let Some(session_id) = self.goal_session_id("/goal") else {
+            return;
+        };
+        self.start_goal_request(
+            "goal.create",
+            cockpit_core::daemon::proto::Request::CreateGoal {
+                session_id,
+                objective,
+                token_budget,
+            },
         );
     }
 
@@ -736,16 +750,18 @@ impl App {
                 let response = attached_request.request(request).await?;
                 match response {
                     cockpit_core::daemon::proto::Response::GoalStatus { goal: Some(goal) } => {
-                        let budget = goal
-                            .token_budget
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| "none".to_string());
+                        let phase = goal.phase.map(|phase| format!("/{phase:?}")).unwrap_or_default();
+                        let detail = goal.latest_gap_or_blocker.as_deref().unwrap_or("no actionable gap");
                         Ok(AsyncActionPayload::Text(format!(
-                            "/goal: {} · {} · tokens {}/{} · subcommands: status, pause, resume, clear, edit",
-                            goal.status.as_str(),
+                            "/goal: {}{} · {} · contract {} · tokens {}/{} ({} remaining) · {} · subcommands: status, pause, resume, clear, edit",
+                            goal.disposition.as_str(),
+                            phase.to_ascii_lowercase(),
                             goal.objective,
+                            if goal.contract_available { "ready" } else { "planning" },
                             goal.tokens_used,
-                            budget
+                            goal.token_budget,
+                            goal.remaining_tokens,
+                            detail,
                         )))
                     }
                     cockpit_core::daemon::proto::Response::GoalStatus { goal: None } => Ok(
@@ -757,7 +773,7 @@ impl App {
                     cockpit_core::daemon::proto::Response::GoalUpdated { goal } => {
                         Ok(AsyncActionPayload::Text(format!(
                             "/goal: goal is now {}.",
-                            goal.status.as_str()
+                            goal.disposition.as_str()
                         )))
                     }
                     cockpit_core::daemon::proto::Response::GoalCleared { cleared: true } => Ok(
@@ -769,19 +785,6 @@ impl App {
                     other => Err(format!("unexpected goal response: {other:?}")),
                 }
             },
-        );
-    }
-
-    pub(super) fn dispatch_goal_turn(&mut self, display: &str, wire: String) {
-        self.pin_chat_to_tail();
-        self.begin_working_span();
-        let submission = cockpit_core::engine::message::UserSubmission::text(wire);
-        self.dispatch_optimistic_user_submission(
-            format!("/goal {display}"),
-            submission,
-            "/goal",
-            true,
-            &[],
         );
     }
 

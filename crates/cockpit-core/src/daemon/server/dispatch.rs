@@ -561,6 +561,85 @@ pub(super) async fn handle_serialized_request(
             }
         }
 
+        Request::CreateGoal {
+            session_id,
+            objective,
+            token_budget,
+        } => {
+            let session = ctx
+                .db
+                .get_session(session_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::UnknownSession,
+                    message: format!("unknown session {session_id}"),
+                })?;
+            let (_, extended) = ctx
+                .config_source
+                .load(std::path::Path::new(&session.project_root))
+                .map_err(internal)?;
+            let policy = extended.goal_supervision;
+            if !policy.enabled {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "goal supervision is disabled by operator configuration".to_string(),
+                });
+            }
+            policy.validate().map_err(|error| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: error.to_string(),
+            })?;
+            let budget = token_budget.unwrap_or(policy.default_token_budget);
+            if budget <= 0 {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "goal budget must be positive".to_string(),
+                });
+            }
+            let goal = ctx
+                .db
+                .create_session_goal(
+                    session_id,
+                    &session.project_id,
+                    &objective,
+                    None,
+                    Some(budget),
+                )
+                .await
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: error.to_string(),
+                })?;
+            ctx.db
+                .persist_goal_policy(goal.id, &serde_json::to_string(&policy).map_err(internal)?)
+                .await
+                .map_err(internal)?;
+            let goal = ctx
+                .db
+                .current_session_goal(session_id, false)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "created goal disappeared".to_string(),
+                })?;
+            if let Some(attached) = state
+                .attached
+                .as_ref()
+                .filter(|attached| attached.handle.session().id == session_id)
+            {
+                attached
+                    .handle
+                    .send_work(SessionWork::WakeGoal)
+                    .await
+                    .map_err(internal)?;
+            }
+            Ok(Response::GoalUpdated {
+                goal: goal_to_proto(goal),
+            })
+        }
+
         Request::GoalStatus { session_id } => {
             ctx.db
                 .refresh_session_goal_usage(session_id)
@@ -576,6 +655,28 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::SetGoalStatus { session_id, status } => {
+            if status == proto::GoalDisposition::Running {
+                let session = ctx
+                    .db
+                    .get_session(session_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: format!("unknown session {session_id}"),
+                    })?;
+                let (_, extended) = ctx
+                    .config_source
+                    .load(std::path::Path::new(&session.project_root))
+                    .map_err(internal)?;
+                if !extended.goal_supervision.enabled {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "goal supervision is disabled by operator configuration"
+                            .to_string(),
+                    });
+                }
+            }
             let goal = ctx
                 .db
                 .set_session_goal_status(session_id, status)
@@ -584,6 +685,18 @@ pub(super) async fn handle_serialized_request(
                     code: ErrorCode::BadRequest,
                     message: error.to_string(),
                 })?;
+            if status == proto::GoalDisposition::Running
+                && let Some(attached) = state
+                    .attached
+                    .as_ref()
+                    .filter(|attached| attached.handle.session().id == session_id)
+            {
+                attached
+                    .handle
+                    .send_work(SessionWork::WakeGoal)
+                    .await
+                    .map_err(internal)?;
+            }
             Ok(Response::GoalUpdated {
                 goal: goal_to_proto(goal),
             })
@@ -3337,9 +3450,21 @@ pub(super) fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> prot
         project_id: goal.project_id,
         objective: goal.objective,
         context: goal.context,
-        status: goal.status,
+        disposition: goal.disposition,
+        phase: goal.phase,
+        resume_phase: goal.resume_phase,
+        pause_reason: goal.pause_reason,
+        contract_available: goal.contract.is_some(),
+        latest_gap_or_blocker: goal
+            .unresolved_gaps
+            .first()
+            .cloned()
+            .or(goal.blocker_key.clone()),
+        verification_attempts: goal.verification_rounds,
+        attempt_generation: goal.attempt_generation,
         token_budget: goal.token_budget,
         tokens_used: goal.tokens_used,
+        remaining_tokens: goal.token_budget.saturating_sub(goal.tokens_used),
         blocked_attempts: goal.blocked_attempts,
         last_read_at: goal.last_read_at,
         created_at: goal.created_at,

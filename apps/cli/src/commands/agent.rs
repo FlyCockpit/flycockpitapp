@@ -59,7 +59,7 @@ fn create(
         tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
-        goal_verification: cockpit_core::agents::GoalSettingsOverride::default(),
+        goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
         prompt: format!("You are the `{name}` Cockpit agent."),

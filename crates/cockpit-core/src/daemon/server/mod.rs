@@ -550,7 +550,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             turn_id: _,
             reason: _,
         }
-        | proto::Event::GoalVerificationProgress {
+        | proto::Event::GoalSupervisionProgress {
             session_id: _,
             done: _,
             total: _,
@@ -1211,9 +1211,17 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
         project_id,
         objective,
         context,
-        status: _,
+        disposition: _,
+        phase: _,
+        resume_phase: _,
+        pause_reason: _,
+        contract_available: _,
+        latest_gap_or_blocker,
+        verification_attempts: _,
+        attempt_generation: _,
         token_budget: _,
         tokens_used: _,
+        remaining_tokens: _,
         blocked_attempts: _,
         last_read_at: _,
         created_at: _,
@@ -1222,6 +1230,7 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
     scrub_string(project_id, redact);
     scrub_string(objective, redact);
     scrub_option_string(context, redact);
+    scrub_option_string(latest_gap_or_blocker, redact);
 }
 
 fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {

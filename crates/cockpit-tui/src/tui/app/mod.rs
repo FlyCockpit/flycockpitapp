@@ -1577,17 +1577,6 @@ fn mcp_load_call_count() -> usize {
     MCP_LOAD_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn build_goal_clarification_prompt(objective: &str) -> String {
-    format!(
-        "The user started `/goal` with this rough objective:\n\n{objective}\n\n\
-         Act as Build. First investigate the working directory read-only using normal tools and identify relevant repo facts. \
-         Then propose a clarified goal for user review with exactly these parts: `goal` (terse, stable, acceptance-oriented), \
-         `context` (repo findings, constraints, relevant files, user preferences), acceptance criteria, and an initial task/todo breakdown when useful. \
-         Continue the clarification loop until the user confirms. Only after confirmation call goal(action=\"create\", objective, context, token_budget if specified). \
-         After goal creation, continue normal Build execution toward the active goal using goal(action=\"get\"), goal(action=\"update\"), and durable todos."
-    )
-}
-
 /// Where an embedded pane (`/editor`, `/lazygit`) sits in the chat-body
 /// region (GOALS §1i). `Full` fills the body; the others split it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

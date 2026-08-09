@@ -1888,7 +1888,7 @@ mod tests {
             .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
-        let goal_override_json = r#"{"enabled":false,"skepticCount":2}"#;
+        let goal_override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
         s.set_goal_settings_override_json(Some(goal_override_json.to_string()))
             .unwrap();
         assert!(db.get_session(s.id).await.unwrap().is_none());

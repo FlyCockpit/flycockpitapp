@@ -1184,14 +1184,16 @@ impl Driver {
             .ok()
             .flatten()
             .map(|g| {
+                let snapshot = g.compaction_snapshot();
                 format!(
-                    "- status: {}\n- objective: {}\n- tokens: {}/{}",
-                    g.status.as_str(),
-                    g.objective,
-                    g.tokens_used,
-                    g.token_budget
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "none".to_string())
+                    "- lifecycle: {} / {:?}\n- objective: {}\n- tokens: {}/{}\n- contract: {}\n- latest gap: {}",
+                    snapshot.disposition.as_str(),
+                    snapshot.phase,
+                    snapshot.objective,
+                    snapshot.tokens_used,
+                    snapshot.token_budget,
+                    snapshot.contract_reference.map(|id| id.to_string()).unwrap_or_else(|| "planning".to_string()),
+                    snapshot.latest_gap_or_blocker.as_deref().unwrap_or("none")
                 )
             });
         let mut appendix = compact::build_appendix(&calls, &self.cwd, &pins, &[], active_goal);

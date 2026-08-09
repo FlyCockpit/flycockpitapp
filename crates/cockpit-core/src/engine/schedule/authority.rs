@@ -196,6 +196,10 @@ impl ScheduleContext {
 pub enum SpawnWorkerKind {
     Bee,
     Scout,
+    GoalPlanner,
+    GoalEvaluator,
+    GoalGatekeeper,
+    GoalColdSkeptic,
 }
 
 impl SpawnWorkerKind {
@@ -215,6 +219,13 @@ impl SpawnWorkerKind {
     /// tracked as follow-up work; it predates this write-scope subsystem.
     pub fn is_write_capable(self) -> bool {
         matches!(self, Self::Bee)
+    }
+
+    pub fn is_goal_control(self) -> bool {
+        matches!(
+            self,
+            Self::GoalPlanner | Self::GoalEvaluator | Self::GoalGatekeeper | Self::GoalColdSkeptic
+        )
     }
 }
 
@@ -236,7 +247,7 @@ pub enum SpawnModelOrigin {
     /// Routed under the forced redacted-untrusted custody filter.
     #[default]
     ModelDirected,
-    /// Written by the host in a config file (`goalVerification.skepticModel`
+    /// Written by the host in a config file (`goalSupervision.coldSkepticModel`
     /// and friends). The host named the target, so it keeps its own configured
     /// custody class — a self-hosted skeptic stays trusted.
     HostConfig,

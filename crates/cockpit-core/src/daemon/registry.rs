@@ -446,6 +446,7 @@ impl SessionRegistry {
                 }
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
+                    self.inner.db.restore_supervised_goals(id).await?;
                     let result = self
                         .start_resumed_worker(
                             id,

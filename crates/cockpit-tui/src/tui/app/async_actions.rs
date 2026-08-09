@@ -720,15 +720,15 @@ impl App {
                     pane.apply_rpc_result(payload);
                 }
             }
-            AsyncActionKind::DaemonRpc("goal.status" | "goal.set" | "goal.clear") => {
-                match result.payload {
-                    Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
-                    Ok(_) => self.push_plain("/goal: unexpected daemon response".to_string()),
-                    Err(error) => self.history.push(HistoryEntry::CommandError {
-                        line: format!("/goal: {error}"),
-                    }),
-                }
-            }
+            AsyncActionKind::DaemonRpc(
+                "goal.create" | "goal.disposition" | "goal.set" | "goal.clear",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
+                Ok(_) => self.push_plain("/goal: unexpected daemon response".to_string()),
+                Err(error) => self.history.push(HistoryEntry::CommandError {
+                    line: format!("/goal: {error}"),
+                }),
+            },
             AsyncActionKind::Internal("curator.command") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),

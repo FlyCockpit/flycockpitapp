@@ -1495,7 +1495,7 @@ impl App {
                 // accounts for it.
                 self.estimate_at_last_usage = self.estimate_context_tokens();
             }
-            TurnEvent::GoalVerificationProgress { done, total } => {
+            TurnEvent::GoalSupervisionProgress { done, total } => {
                 self.idle_reason_status = Some(super::IdleReasonStatus {
                     text: format!("verifying completion ({done}/{total})..."),
                     kind: super::ToastKind::Info,

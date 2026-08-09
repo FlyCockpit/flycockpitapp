@@ -325,7 +325,7 @@
         "class": "bounded_event",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "goal_verification_progress"
+        "tag": "goal_supervision_progress"
       },
       {
         "class": "bounded_event",
@@ -610,6 +610,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "repair_resume"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "create_goal"
       },
       {
         "class": "bounded_request_response",

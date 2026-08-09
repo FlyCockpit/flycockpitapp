@@ -282,6 +282,32 @@ impl MediaReservationLedger {
         }).await.map_err(classify_storage_error)
     }
 
+    pub async fn complete_downstream_invocation(
+        &self,
+        invocation_id: &str,
+        wall_ms: u64,
+    ) -> Result<u64, LedgerError> {
+        let invocation = invocation_id.to_owned();
+        let rows=self.db.read(move|conn| {
+            let mut statement=conn.prepare("SELECT o.reservation_id,r.version FROM media_downstream_ownership o JOIN media_reservations r ON r.reservation_id=o.reservation_id WHERE o.invocation_id=?1 AND o.released_wall_ms IS NULL")?;
+            Ok(statement.query_map([invocation],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await.map_err(LedgerError::Storage)?;
+        let mut released = 0_u64;
+        for (id, version) in rows {
+            self.destroy_local_artifacts(
+                &id,
+                version,
+                &format!("downstream-invocation-destroyed:{invocation_id}:{id}"),
+                wall_ms,
+            )
+            .await?;
+            let id_for_update = id.clone();
+            self.db.transaction(move|conn|{conn.execute("UPDATE media_downstream_ownership SET released_wall_ms=?1 WHERE reservation_id=?2 AND released_wall_ms IS NULL",params![sqlite_i64(wall_ms)?,id_for_update])?;Ok(())}).await.map_err(LedgerError::Storage)?;
+            released = released.checked_add(1).ok_or(LedgerError::Overflow)?;
+        }
+        Ok(released)
+    }
+
     /// Releases abandoned daemon uploads whose only storage was process
     /// memory. The operation discriminator and queued state are durable proof
     /// that no ready/published artifact existed; all other operation kinds and
@@ -1806,22 +1832,38 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let destroyed = ledger
-            .destroy_local_artifacts(
-                &completed.reservation_id,
-                completed.version,
-                "verified-buffer-drop",
-                4,
-            )
+        assert_eq!(
+            ledger
+                .complete_downstream_invocation("invocation-1", 4)
+                .await
+                .unwrap(),
+            1
+        );
+        let destroyed_state = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT state FROM media_reservations WHERE reservation_id=?1",
+                    [&completed.reservation_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
             .await
             .unwrap();
-        assert_eq!(destroyed.state, ReservationState::Released);
+        assert_eq!(destroyed_state, "released");
         assert!(
             !ledger
-                .publication_allowed(&destroyed.reservation_id)
+                .publication_allowed(&completed.reservation_id)
                 .await
                 .unwrap(),
             "released artifacts are no longer publishable"
+        );
+        assert_eq!(
+            ledger
+                .complete_downstream_invocation("invocation-1", 5)
+                .await
+                .unwrap(),
+            0,
+            "terminal cleanup replays without double release"
         );
     }
 

@@ -6260,6 +6260,11 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         let queue_item_ids = submission.queue_item_ids.clone();
+        let media_invocations: Vec<_> = submission
+            .client_submissions
+            .iter()
+            .map(|receipt| receipt.id.to_string())
+            .collect();
         let result = self
             .run_user_input_with_leading_history_inner(
                 submission,
@@ -6270,6 +6275,28 @@ impl Driver {
             )
             .await;
         input_rx.finish(&queue_item_ids).await;
+        struct CompletionClock;
+        impl crate::media_reservation::MonotonicClock for CompletionClock {
+            fn now_ms(&self) -> u64 {
+                0
+            }
+        }
+        let media_ledger = crate::media_reservation::MediaReservationLedger::new(
+            self.session.db.clone(),
+            std::sync::Arc::new(CompletionClock),
+        );
+        let completion_wall_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .try_into()
+            .unwrap_or(0);
+        for invocation in media_invocations {
+            if let Err(error) = media_ledger
+                .complete_downstream_invocation(&invocation, completion_wall_ms)
+                .await
+            {
+                tracing::warn!(%error,%invocation,"downstream media cleanup did not settle; durable ownership remains retryable");
+            }
+        }
         if result.is_ok() {
             self.acknowledge_interrupted_turns_after_progress().await;
         }

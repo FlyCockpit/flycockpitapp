@@ -72,6 +72,7 @@ pub struct NoiseChild {
     receive_rekey: DirectionalRekey,
     pending_control_action: Option<RekeyAction>,
     last_control_ciphertext: Option<(RekeyAction, Vec<u8>)>,
+    closed_due_to_failure: bool,
 }
 
 impl NoiseChild {
@@ -126,6 +127,7 @@ impl NoiseChild {
             })?,
             pending_control_action: None,
             last_control_ciphertext: None,
+            closed_due_to_failure: false,
         })
     }
 
@@ -133,7 +135,7 @@ impl NoiseChild {
         let index = match self.phase {
             HandshakePhase::WriteOne => 1,
             HandshakePhase::WriteTwo => 2,
-            _ => return self.fail(NoiseError::InvalidState),
+            _ => return self.invalid_state(),
         };
         let state = self.handshake.as_mut().ok_or(NoiseError::InvalidState)?;
         let mut output = vec![0_u8; MAX_HANDSHAKE_MESSAGE];
@@ -162,7 +164,7 @@ impl NoiseChild {
         let expected = match self.phase {
             HandshakePhase::ReadOne => 1,
             HandshakePhase::ReadTwo => 2,
-            _ => return self.fail(NoiseError::InvalidState),
+            _ => return self.invalid_state(),
         };
         let frame = match HandshakeFrame::decode(framed, expected) {
             Ok(frame) => frame,
@@ -228,7 +230,7 @@ impl NoiseChild {
         }
         let state = self.handshake.as_ref().ok_or(NoiseError::InvalidState)?;
         if !state.is_handshake_finished() {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         let handshake_hash: [u8; 32] = state
             .get_handshake_hash()
@@ -260,7 +262,7 @@ impl NoiseChild {
 
     pub fn encrypt_record(&mut self, kind: RecordKind, payload: &[u8]) -> Result<Vec<u8>> {
         if self.phase != HandshakePhase::Transport {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         let actions = match self.send_rekey.reduce(RekeyEvent::LocalRecordRequest {
             kind,
@@ -308,7 +310,7 @@ impl NoiseChild {
         ciphertext: &[u8],
     ) -> Result<RemoteNoiseRecordV1> {
         if self.phase != HandshakePhase::Transport {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         if ciphertext.len() > MAX_CIPHERTEXT {
             return self.fail(NoiseError::RecordTooLarge);
@@ -353,7 +355,7 @@ impl NoiseChild {
     /// advancing Snow or the absolute sequence a second time.
     pub fn encrypt_rekey_action(&mut self, action: &RekeyAction) -> Result<Vec<u8>> {
         if self.phase != HandshakePhase::Transport {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         if let Some((prior, ciphertext)) = &self.last_control_ciphertext
             && prior == action
@@ -422,7 +424,7 @@ impl NoiseChild {
 
     pub fn handle_send_rekey_event(&mut self, event: RekeyEvent) -> Result<Vec<RekeyAction>> {
         if self.phase != HandshakePhase::Transport {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         let actions = match self.send_rekey.reduce(event) {
             Ok(actions) => actions,
@@ -437,7 +439,7 @@ impl NoiseChild {
                     .ok_or(NoiseError::InvalidState)?
                     .rekey_outgoing(),
                 RekeyAction::ApplyReceiveRekey { .. } => {
-                    return self.fail(NoiseError::InvalidState);
+                    return self.invalid_state();
                 }
                 _ => {}
             }
@@ -447,7 +449,7 @@ impl NoiseChild {
 
     pub fn handle_receive_rekey_event(&mut self, event: RekeyEvent) -> Result<Vec<RekeyAction>> {
         if self.phase != HandshakePhase::Transport {
-            return self.fail(NoiseError::InvalidState);
+            return self.invalid_state();
         }
         let actions = match self.receive_rekey.reduce(event) {
             Ok(actions) => actions,
@@ -463,7 +465,7 @@ impl NoiseChild {
                     .as_mut()
                     .ok_or(NoiseError::InvalidState)?
                     .rekey_incoming(),
-                RekeyAction::ApplySendRekey { .. } => return self.fail(NoiseError::InvalidState),
+                RekeyAction::ApplySendRekey { .. } => return self.invalid_state(),
                 _ => {}
             }
         }
@@ -492,8 +494,18 @@ impl NoiseChild {
     }
 
     fn fail<T>(&mut self, error: NoiseError) -> Result<T> {
+        let closed_due_to_failure = self.phase == HandshakePhase::Transport;
         self.close();
+        self.closed_due_to_failure = closed_due_to_failure;
         Err(error)
+    }
+
+    fn invalid_state<T>(&mut self) -> Result<T> {
+        if self.phase == HandshakePhase::Closed && self.closed_due_to_failure {
+            Err(NoiseError::Closed)
+        } else {
+            self.fail(NoiseError::InvalidState)
+        }
     }
 }
 

@@ -133,6 +133,28 @@ fn strip_optional_duplicate_marker<'a>(row: &'a str, context: &str) -> (&'a str,
     (without_marker, true)
 }
 
+fn validate_package_source_suffix(subject: &str, canonical: &str, context: &str, row: &str) {
+    let suffix = subject
+        .strip_prefix(canonical)
+        .unwrap_or_else(|| panic!("malformed {context} with trailing tokens: {row}"));
+    if suffix.is_empty() {
+        return;
+    }
+    assert!(
+        suffix.starts_with(" ("),
+        "malformed {context} with trailing tokens: {row}"
+    );
+    let source = suffix
+        .strip_prefix(" (")
+        .and_then(|suffix| suffix.strip_suffix(')'))
+        .filter(|source| !source.is_empty() && !source.contains('(') && !source.contains(')'))
+        .unwrap_or_else(|| panic!("malformed {context} source-location suffix: {row}"));
+    assert!(
+        !source.chars().any(char::is_control),
+        "malformed {context} source-location suffix: {row}"
+    );
+}
+
 fn tree_package_key(row: &str) -> String {
     let (package, _) = strip_optional_duplicate_marker(row, "cargo tree package row");
     let (name, version) = package
@@ -146,10 +168,11 @@ fn tree_package_key(row: &str) -> String {
         .split_whitespace()
         .next()
         .unwrap_or_else(|| panic!("malformed cargo tree package row with empty version: {row}"));
-    assert_eq!(
+    validate_package_source_suffix(
         package,
-        format!("{name} v{version}"),
-        "malformed cargo tree package row with trailing tokens: {row}"
+        &format!("{name} v{version}"),
+        "cargo tree package row",
+        row,
     );
     format!("{name}@{version}")
 }
@@ -176,6 +199,20 @@ fn tree_package_key_rejects_trailing_tokens() {
 #[should_panic(expected = "package row contains repeated duplicate markers")]
 fn tree_package_key_rejects_repeated_duplicate_markers() {
     tree_package_key("image v0.25.10 (*) (*)");
+}
+
+#[test]
+fn tree_package_key_accepts_a_terminal_workspace_source_location() {
+    assert_eq!(
+        tree_package_key("cockpit-tui v0.1.0 (/workspace/crates/cockpit-tui)"),
+        "cockpit-tui@0.1.0"
+    );
+}
+
+#[test]
+#[should_panic(expected = "package row source-location suffix")]
+fn tree_package_key_rejects_nested_source_locations() {
+    tree_package_key("cockpit-tui v0.1.0 ((/workspace/crates/cockpit-tui))");
 }
 
 fn target_package_features(
@@ -246,10 +283,11 @@ fn target_package_features(
             if name.is_empty() {
                 panic!("malformed cargo feature-tree package row with empty name: {row}");
             }
-            assert_eq!(
+            validate_package_source_suffix(
                 subject,
-                format!("{name} v{version}"),
-                "malformed cargo feature-tree package row with trailing tokens: {row}"
+                &format!("{name} v{version}"),
+                "cargo feature-tree package row",
+                row,
             );
             let key = format!("{name}@{version}");
             if depth == 0 {

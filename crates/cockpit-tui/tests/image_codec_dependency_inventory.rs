@@ -193,9 +193,40 @@ fn target_package_features(
         .collect::<BTreeMap<_, _>>();
     let mut reported_packages = BTreeSet::new();
     let mut feature_activations = Vec::new();
+    let mut feature_ancestors = Vec::new();
 
     for line in feature_tree.lines() {
-        let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
+        let depth_end = line
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or_else(|| panic!("cargo feature-tree row contains only a depth: {line}"));
+        assert!(
+            depth_end > 0,
+            "cargo feature-tree row is missing a depth: {line}"
+        );
+        let depth = line[..depth_end].parse::<usize>().unwrap();
+        assert_eq!(
+            line[..depth_end],
+            depth.to_string(),
+            "cargo feature-tree row has a noncanonical depth: {line}"
+        );
+        if feature_ancestors.is_empty() {
+            assert_eq!(
+                depth, 0,
+                "cargo feature-tree first row must have depth zero: {line}"
+            );
+        } else {
+            assert!(
+                depth > 0,
+                "cargo feature-tree contains multiple roots: {line}"
+            );
+            assert!(
+                depth <= feature_ancestors.len(),
+                "cargo feature-tree depth jumps past its parent: {line}"
+            );
+        }
+        feature_ancestors.truncate(depth);
+        feature_ancestors.push(());
+        let row = &line[depth_end..];
         let row = strip_optional_duplicate_marker(row, "cargo feature-tree row");
         if let Some((subject, features)) = row.split_once('|') {
             let Some((name, version)) = subject.rsplit_once(" v") else {
@@ -281,6 +312,11 @@ fn target_package_features(
             ),
         }
     }
+
+    assert!(
+        !feature_ancestors.is_empty(),
+        "cargo feature-tree graph is empty"
+    );
 
     package_features
 }
@@ -370,6 +406,24 @@ fn target_package_feature_inventory_rejects_package_trailing_tokens() {
     );
 }
 
+#[test]
+#[should_panic(expected = "feature-tree row is missing a depth: image v0.25.10|png")]
+fn target_package_feature_inventory_requires_package_depths() {
+    target_package_features(
+        "image v0.25.10|png\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "feature-tree row is missing a depth: png feature \"default\"")]
+fn target_package_feature_inventory_requires_activation_depths() {
+    target_package_features(
+        "0image v0.25.10|png\npng feature \"default\"\n",
+        &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+    );
+}
+
 fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
@@ -384,6 +438,11 @@ fn dependency_tree_graph(
             .unwrap_or_else(|| panic!("cargo tree row contains only a depth: {line}"));
         assert!(depth_end > 0, "cargo tree row is missing a depth: {line}");
         let depth = line[..depth_end].parse::<usize>().unwrap();
+        assert_eq!(
+            line[..depth_end],
+            depth.to_string(),
+            "cargo tree row has a noncanonical depth: {line}"
+        );
         if ancestors.is_empty() {
             assert_eq!(depth, 0, "cargo tree first row must have depth zero: {line}");
         } else {

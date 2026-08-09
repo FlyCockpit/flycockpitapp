@@ -334,29 +334,38 @@ canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
 canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
 canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
 canonical_struct!(
-    crate::RunInvocationOptions,
-    self,
-    out,
-    [max_turns, timeout_ms, approval_mode]
-);
-canonical_struct!(
     cockpit_config::config::providers::ActiveReasoningEffort,
     self,
     out,
     [value]
 );
-canonical_struct!(
-    cockpit_config::config::providers::ActiveModelRef,
-    self,
-    out,
-    [
-        provider,
-        model,
-        reasoning_effort,
-        thinking_mode,
-        prompt_cache_retention,
-    ]
-);
+impl CanonicalFcorValueV1 for crate::RunInvocationOptions {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        ensure!(self.max_turns != Some(0), "run_options_zero_max_turns");
+        ensure!(self.timeout_ms != Some(0), "run_options_zero_timeout_ms");
+        let mut nested = CanonicalParamsV1::new();
+        self.max_turns.encode_fcor_value_v1(&mut nested)?;
+        self.timeout_ms.encode_fcor_value_v1(&mut nested)?;
+        self.approval_mode.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for cockpit_config::config::providers::ActiveModelRef {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        let mut nested = CanonicalParamsV1::new();
+        self.provider.encode_fcor_value_v1(&mut nested)?;
+        self.model.encode_fcor_value_v1(&mut nested)?;
+        self.reasoning_effort.encode_fcor_value_v1(&mut nested)?;
+        self.thinking_mode.encode_fcor_value_v1(&mut nested)?;
+        self.prompt_cache_retention
+            .encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
 
 impl CanonicalFcorValueV1 for crate::AttachmentPurpose {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
@@ -375,6 +384,20 @@ impl CanonicalFcorValueV1 for crate::AttachmentPurpose {
 
 impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        fn count(value: &cockpit_db::wire::ResolveResponse, depth: u16) -> Result<u32> {
+            ensure!(depth <= 32, "resolve_response_depth_exceeded");
+            let mut nodes = 1_u32;
+            if let cockpit_db::wire::ResolveResponse::Batch { responses } = value {
+                for child in responses {
+                    nodes = nodes
+                        .checked_add(count(child, depth + 1)?)
+                        .ok_or_else(|| anyhow::anyhow!("resolve_response_nodes_exceeded"))?;
+                    ensure!(nodes <= 4096, "resolve_response_nodes_exceeded");
+                }
+            }
+            Ok(nodes)
+        }
+        count(self, 1)?;
         let mut nested = CanonicalParamsV1::new();
         match self {
             Self::Single { selected_id } => {
@@ -634,6 +657,42 @@ pub fn validate_fcor_v1(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_codec_validation_is_rollback_safe_and_resolve_is_bounded() {
+        let mut out = CanonicalParamsV1::new();
+        out.push_u8(9);
+        let invalid = crate::RunInvocationOptions {
+            max_turns: Some(0),
+            timeout_ms: None,
+            approval_mode: None,
+        };
+        assert_eq!(
+            invalid
+                .encode_fcor_value_v1(&mut out)
+                .unwrap_err()
+                .to_string(),
+            "run_options_zero_max_turns"
+        );
+        assert_eq!(out.into_bytes(), vec![9]);
+
+        let mut response = cockpit_db::wire::ResolveResponse::Cancel;
+        for _ in 0..32 {
+            response = cockpit_db::wire::ResolveResponse::Batch {
+                responses: vec![response],
+            };
+        }
+        let mut out = CanonicalParamsV1::new();
+        out.push_u8(7);
+        assert_eq!(
+            response
+                .encode_fcor_value_v1(&mut out)
+                .unwrap_err()
+                .to_string(),
+            "resolve_response_depth_exceeded"
+        );
+        assert_eq!(out.into_bytes(), vec![7]);
+    }
 
     #[test]
     fn bulk_reference_value_bytes_are_exact_and_revalidate_class_limit() {

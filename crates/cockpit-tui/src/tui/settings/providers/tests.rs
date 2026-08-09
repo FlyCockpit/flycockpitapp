@@ -1448,7 +1448,14 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
-    use super::super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
+    use super::super::pointer_actions::{
+        OAuthCopyKind, ProviderId, ProvidersAction, SettingsPointerAction,
+    };
+
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
 
     fn edit_fixture() -> (tempfile::TempDir, SettingsDialog) {
         let config = oauth_provider_config("codex-oauth", "oauth:test");
@@ -1466,7 +1473,10 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
     fn oauth_fixture(kind: u8) -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) =
             dialog_with_config(oauth_provider_config("codex-oauth", "oauth:test"));
-        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+        let mut state = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+            OAuthProvider::Codex,
+            fake_oauth_effects(),
+        );
         match kind {
             0 => {}
             1 => state.set_device_login_for_test(
@@ -1481,6 +1491,61 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
         dialog.page =
             super::super::providers_page(standalone_oauth_page(OAuthProvider::Codex, state));
         (tmp, dialog)
+    }
+
+    fn copy_visible_device_code(dialog: &mut SettingsDialog) {
+        reset_oauth_effects(false);
+        let _ = render_provider_rows(dialog, 110, 60);
+        let actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+                            _,
+                            OAuthCopyKind::DeviceCode,
+                        )),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions.len(),
+            1,
+            "each active Codex fixture must own exactly one device-code copy source"
+        );
+        let action = actions.into_iter().next().unwrap();
+        let flow_id = match action {
+            SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(flow_id, _)) => flow_id,
+            _ => unreachable!(),
+        };
+        click_rendered_provider_action(
+            dialog,
+            &SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+                flow_id,
+                OAuthCopyKind::DeviceCode,
+            )),
+        );
+        assert_eq!(
+            oauth_effects_log(),
+            vec![
+                "copy:CODE-123".to_string(),
+                "open:https://example.test/device".to_string(),
+            ]
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+                if state.flow_id == flow_id
+                    && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
+                        "copied device code (unverified — also reachable via the Open link above)"
+                    ))
+        ));
     }
 
     replay_special_provider_edit_actions("codex-oauth", edit_fixture);
@@ -1506,6 +1571,9 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
             option,
         ));
         let (_tmp, mut fresh) = oauth_fixture(kind);
+        if kind == 1 {
+            copy_visible_device_code(&mut fresh);
+        }
         click_rendered_provider_action(&mut fresh, &action);
         match option {
             OAuthOption::Login => assert!(
@@ -6318,6 +6386,47 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
                 && state.status.as_ref().is_some_and(|status| {
                     status.as_ref().is_ok_and(|message| message.contains("copied OAuth URL"))
                 })
+    ));
+    drop(tmp);
+
+    reset_oauth_effects(false);
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config("codex-oauth", "oauth:test"));
+    let mut visible = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+        OAuthProvider::Codex,
+        fake_oauth_effects(),
+    );
+    visible.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+        "https://example.test/device",
+        "CODE-123",
+    ));
+    let visible_flow_id = visible.flow_id;
+    dialog.page =
+        super::super::providers_page(standalone_oauth_page(OAuthProvider::Codex, visible));
+    let action = SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+        visible_flow_id,
+        OAuthCopyKind::DeviceCode,
+    ));
+    assert_eq!(
+        super::super::pointer_action_fixtures::key_for(&action),
+        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+            super::super::pointer_action_fixtures::ProvidersFixture::CopyDeviceCode,
+        )
+    );
+    click_rendered_provider_action(&mut dialog, &action);
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "copy:CODE-123".to_string(),
+            "open:https://example.test/device".to_string(),
+        ]
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+            if state.flow_id == visible_flow_id
+                && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
+                    "copied device code (unverified — also reachable via the Open link above)"
+                ))
     ));
     drop(tmp);
 

@@ -3056,6 +3056,18 @@ impl SettingsCx {
             ));
             lines.push(Line::from("[copy authorization URL]"));
         }
+        if s.device_login().is_some() {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::CopyOAuth(
+                        s.flow_id,
+                        super::pointer_actions::OAuthCopyKind::DeviceCode,
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[copy device code]"));
+        }
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,

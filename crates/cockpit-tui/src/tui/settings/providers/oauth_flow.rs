@@ -497,18 +497,31 @@ impl OAuthFlowState {
         if self.flow_id != flow_id {
             return false;
         }
-        let value = match kind {
+        let (value, open_after_copy) = match kind {
             super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
-                self.authorize_url().map(ToOwned::to_owned)
+                (self.authorize_url().map(ToOwned::to_owned), None)
             }
             super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
-                self.device_login().map(|login| login.user_code.clone())
+                let login = self.device_login();
+                (
+                    login.map(|login| login.user_code.clone()),
+                    (!self.ssh)
+                        .then(|| login.map(|login| login.verification_uri.clone()))
+                        .flatten(),
+                )
             }
         };
         let Some(value) = value else {
             return false;
         };
-        self.submit_copy(Some(&value), None, self.effects);
+        match kind {
+            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
+                self.submit_copy(Some(&value), open_after_copy.as_deref(), self.effects);
+            }
+            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
+                self.submit_device_code(Some(&value), open_after_copy.as_deref(), self.effects);
+            }
+        }
         true
     }
 
@@ -546,6 +559,18 @@ impl OAuthFlowState {
             operation_id,
             result.unwrap_or_else(|| Err("OAuth copy effect returned no result".into())),
         );
+    }
+
+    fn submit_device_code(
+        &mut self,
+        value: Option<&str>,
+        open_after_copy: Option<&str>,
+        effects: OAuthEffects,
+    ) {
+        self.submit_copy(value, open_after_copy, effects);
+        if let Some(Ok(message)) = &mut self.status {
+            *message = message.replacen("copied OAuth URL", "copied device code", 1);
+        }
     }
 
     pub(super) fn cancel_copy_effect(&mut self) {
@@ -872,13 +897,13 @@ pub(super) fn handle_oauth_flow_key_with(
                     ),
                     None => (None, None),
                 };
-                s.submit_copy(code.as_deref(), url.as_deref(), effects);
+                s.submit_device_code(code.as_deref(), url.as_deref(), effects);
             }
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
             let code = s.device_login().map(|login| login.user_code.clone());
-            s.submit_copy(code.as_deref(), None, effects);
+            s.submit_device_code(code.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
         _ => {}

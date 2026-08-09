@@ -261,6 +261,11 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
             prompt_cache_retention: Some(PromptCacheRetention::Default),
         });
         let (tmp, mut dialog) = dialog_with_config(config.clone());
+        // `active_model` is daemon-owned and therefore absent after the
+        // file-backed dialog reload. Reattach the live runtime selection that
+        // supplied this active-model page; leave `original_config` untouched
+        // so save stages the verified daemon update instead of writing it.
+        dialog.config.active_model = config.active_model.clone();
         dialog.page = super::super::providers_page(active_model_settings_page(&config));
         let Some(ProvidersPage::ModelSettings { editor, .. }) =
             dialog.page.downcast_mut::<ProvidersPage>()

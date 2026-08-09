@@ -12,9 +12,22 @@ const POLICY_BUNDLE_VERSION: u32 = 1;
 
 pub async fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
+        ConfigCommand::ImageSpend => image_spend_status(),
         ConfigCommand::ExportPolicy(args) => export_policy(args).await,
         ConfigCommand::ImportPolicy(args) => import_policy(args).await,
     }
+}
+
+fn image_spend_status() -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let settings = crate::config::extended::load_for_cwd(&cwd).image_spend;
+    println!("{}", serde_json::to_string_pretty(&settings)?);
+    if let Err(reason) = settings.validate() {
+        println!(
+            "paid image dispatch blocked: {reason:?}; review and save request, session, project, and project-window settings"
+        );
+    }
+    Ok(())
 }
 
 async fn export_policy(args: ConfigExportPolicyArgs) -> Result<()> {

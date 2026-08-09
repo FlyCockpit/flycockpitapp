@@ -42,6 +42,7 @@ mod dependencies_page;
 mod descriptor;
 mod grab;
 mod harnesses_page;
+mod image_spend;
 mod lsp_page;
 mod mcp_page;
 mod multimodal_capability_editor;

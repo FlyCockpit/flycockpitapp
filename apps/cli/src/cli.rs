@@ -412,6 +412,9 @@ pub struct SkillCuratorRollbackArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
+    /// Show explicit image-generation spend policy and remediation state.
+    #[command(name = "image-spend")]
+    ImageSpend,
     /// Export portable provider/model policy JSON without credentials.
     #[command(name = "export-policy")]
     ExportPolicy(ConfigExportPolicyArgs),

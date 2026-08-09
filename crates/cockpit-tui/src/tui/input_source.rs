@@ -346,6 +346,39 @@ mod tests {
         }));
         assert_eq!((input.clock)(), Duration::from_millis(4));
         assert_eq!((input.clock)(), Duration::from_millis(5));
+
+        let mut classifier = crate::tui::structured_paste::TerminalPasteClassifier::default();
+        for (index, ch) in "12345678".chars().enumerate() {
+            classifier.observe(
+                Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(ch),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                Duration::from_millis(index as u64 * 5),
+            );
+        }
+        // Arbitrary reducer delay cannot rewrite the already observed gaps.
+        assert!(matches!(
+            classifier.flush_idle(Duration::from_millis(47)),
+            crate::tui::structured_paste::ClassifierDecision::Paste { .. }
+        ));
+
+        let mut shortcut = crate::tui::structured_paste::TerminalPasteClassifier::default();
+        shortcut.observe(
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+            Duration::from_millis(1_000),
+        );
+        assert!(matches!(
+            shortcut.flush_due(Duration::from_millis(1_249)),
+            crate::tui::structured_paste::ClassifierDecision::Pending
+        ));
+        assert!(matches!(
+            shortcut.flush_due(Duration::from_millis(1_250)),
+            crate::tui::structured_paste::ClassifierDecision::PasteUnavailable
+        ));
     }
 
     #[tokio::test]

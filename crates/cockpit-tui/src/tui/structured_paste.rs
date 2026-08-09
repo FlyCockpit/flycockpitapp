@@ -780,6 +780,34 @@ mod tests {
         ];
         assert_eq!(sources.len(), 3);
         assert_ne!(PasteSource::BracketedPty, PasteSource::RapidPty);
+        let mut classifier = TerminalPasteClassifier::default();
+        assert!(matches!(
+            classifier.observe(Event::Paste("browser text".into()), Duration::ZERO),
+            ClassifierDecision::Paste {
+                source: PasteSource::BracketedPty,
+                text,
+            } if text == "browser text"
+        ));
+        let mut rapid = TerminalPasteClassifier::default();
+        for ch in "12345678".chars() {
+            rapid.observe(key(ch), Duration::ZERO);
+        }
+        assert!(matches!(
+            rapid.flush_idle(RAPID_IDLE_FLUSH),
+            ClassifierDecision::Paste {
+                source: PasteSource::RapidPty,
+                ..
+            }
+        ));
+        let source_tag = |source| match source {
+            PasteSource::BracketedPty => "bracketed_pty",
+            PasteSource::NativePaste => "native_paste",
+            PasteSource::RapidPty => "rapid_pty",
+        };
+        assert_eq!(
+            sources.map(source_tag),
+            ["bracketed_pty", "native_paste", "rapid_pty"]
+        );
     }
 
     #[test]

@@ -302,17 +302,35 @@ mod tests {
         let generation = root.path().join("a234567a234567a234567a2345");
         let binding = generation.join("b234567b234567b234567b2345");
         std::fs::create_dir_all(&binding).unwrap();
-        let path = binding.join("c234567c234567c234567c2345.png");
         let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
-        image::DynamicImage::ImageRgba8(image)
-            .save_with_format(&path, ImageFormat::Png)
-            .unwrap();
-        let normalized = normalize_private_image(&path).unwrap();
-        assert!(normalized.starts_with(b"\x89PNG\r\n\x1a\n"));
-        let literal = format!("'{}'", path.display());
-        assert_eq!(
-            crate::tui::structured_paste::parse_private_image_path_literal(&literal),
-            Some(path)
-        );
+        for (extension, format) in [
+            ("png", ImageFormat::Png),
+            ("jpg", ImageFormat::Jpeg),
+            ("gif", ImageFormat::Gif),
+            ("webp", ImageFormat::WebP),
+        ] {
+            let path = binding.join(format!("c234567c234567c234567c2345.{extension}"));
+            image::DynamicImage::ImageRgba8(image.clone())
+                .save_with_format(&path, format)
+                .unwrap();
+            let normalized = normalize_private_image(&path).unwrap();
+            assert!(normalized.starts_with(b"\x89PNG\r\n\x1a\n"));
+            for literal in [
+                format!("'{}'", path.display()),
+                format!("\"{}\"", path.display()),
+            ] {
+                assert_eq!(
+                    crate::tui::structured_paste::parse_private_image_path_literal(&literal),
+                    Some(path.clone())
+                );
+            }
+        }
+
+        let mismatch = binding.join("c234567c234567c234567c2345.jpg");
+        std::fs::write(&mismatch, b"\x89PNG\r\n\x1a\ninvalid").unwrap();
+        assert!(normalize_private_image(&mismatch).is_err());
+        let oversized = binding.join("d234567d234567d234567d2345.png");
+        std::fs::write(&oversized, vec![0; MAX_INPUT_BYTES as usize + 1]).unwrap();
+        assert!(normalize_private_image(&oversized).is_err());
     }
 }

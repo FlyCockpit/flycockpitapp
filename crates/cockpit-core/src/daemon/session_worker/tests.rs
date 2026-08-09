@@ -9,6 +9,33 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+#[test]
+fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() {
+    let selection = cockpit_config::providers::ActiveModelRef {
+        provider: "provider-a".to_string(),
+        model: "model-a".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let current = proto::ActiveModelState {
+        selection: selection.clone(),
+        default_selection: None,
+        diverged: false,
+        generation: 7,
+    };
+    assert!(model_expectation_matches(Some(&current), 7, &selection));
+
+    let mut changed = current.clone();
+    changed.generation = 8;
+    assert!(!model_expectation_matches(Some(&changed), 7, &selection));
+    assert!(!model_expectation_matches(None, 7, &selection));
+
+    // Once accepted, the queue's idempotent receipt wins over a later model
+    // generation; the actor checks `already_accepted` before this predicate.
+    assert!(model_expectation_matches(Some(&current), 7, &selection));
+}
+
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
     crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::TrustRoot {

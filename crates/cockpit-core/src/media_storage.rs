@@ -10,10 +10,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_db::media_attachments::{
-    LocalMediaOwnerReceiptV1, MediaSecurityRecoveryDisposition, RecoverSecurityBlockedMediaV1,
-    SecurityRecoverySnapshot, SecurityRecoverySnapshotResult, SecurityRecoveryVerification,
+    LocalMediaOwnerReceiptV1, MediaAvailability, MediaSecurityRecoveryComponentTransitionV1,
+    MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
+    RecoverSecurityBlockedMediaV1, SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
 };
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::external_journal::fsguard::DirGuard;
 
@@ -67,10 +70,8 @@ impl MediaStorageRecovery {
                     snapshot.attachment.source_kind,
                 )?;
                 let mut held_proof = None;
-                let verification = match request.disposition {
-                    MediaSecurityRecoveryDisposition::RetainBlocked => {
-                        SecurityRecoveryVerification::NotRequired
-                    }
+                let verified = match request.disposition {
+                    MediaSecurityRecoveryDisposition::RetainBlocked => false,
                     MediaSecurityRecoveryDisposition::ResumeVerifiedCleanup => {
                         match verify_all_handles(
                             &root,
@@ -80,24 +81,142 @@ impl MediaStorageRecovery {
                         ) {
                             Ok(proof) => {
                                 held_proof = Some(proof);
-                                SecurityRecoveryVerification::Verified
+                                true
                             }
-                            Err(_) => SecurityRecoveryVerification::Unverifiable,
+                            Err(_) => false,
                         }
                     }
                 };
-                let receipt = cockpit_db::Db::commit_security_recovery_conn(
-                    conn,
-                    &request,
-                    &snapshot,
-                    verification,
-                    now_unix_ms,
-                )?;
+                let receipt =
+                    commit_security_recovery(conn, &request, &snapshot, verified, now_unix_ms)?;
                 drop(held_proof);
                 Ok(receipt)
             })
             .await
     }
+}
+
+fn commit_security_recovery(
+    conn: &Connection,
+    request: &RecoverSecurityBlockedMediaV1,
+    snapshot: &SecurityRecoverySnapshot,
+    held_handles_verified: bool,
+    now_unix_ms: i64,
+) -> Result<LocalMediaOwnerReceiptV1> {
+    let current = match cockpit_db::Db::security_recovery_snapshot_conn(conn, request)? {
+        SecurityRecoverySnapshotResult::Replay(receipt) => return Ok(receipt),
+        SecurityRecoverySnapshotResult::Current(current) => current,
+    };
+    ensure!(&current == snapshot, "security recovery snapshot changed");
+    let exact_set = snapshot.components.len() == request.affected_components.len()
+        && snapshot
+            .components
+            .iter()
+            .zip(&request.affected_components)
+            .all(|(stored, requested)| {
+                stored.component.component_id == requested.component_id
+                    && stored.component.component_kind == requested.component_kind
+                    && stored.component.component_generation == requested.component_generation
+                    && recorded_component_digest(&stored.component)
+                        == requested.recorded_evidence_digest
+            });
+    let stale = snapshot.attachment.attachment_version != request.attachment_version
+        || snapshot.attachment.availability_generation != request.expected_availability_generation
+        || snapshot.attachment.availability != MediaAvailability::SecurityBlocked
+        || !exact_set;
+    let outcome = if stale {
+        MediaSecurityRecoveryOutcome::RejectedStale
+    } else if snapshot.live_reference_count != 0 {
+        MediaSecurityRecoveryOutcome::RejectedInUse
+    } else if request.disposition == MediaSecurityRecoveryDisposition::RetainBlocked {
+        MediaSecurityRecoveryOutcome::RetainedBlocked
+    } else if held_handles_verified {
+        MediaSecurityRecoveryOutcome::CleanupResumed
+    } else {
+        MediaSecurityRecoveryOutcome::RejectedUnverifiable
+    };
+    let mut components = Vec::with_capacity(snapshot.components.len());
+    for stored in &snapshot.components {
+        let before = stored.component.component_generation;
+        let after = if outcome == MediaSecurityRecoveryOutcome::CleanupResumed {
+            before
+                .checked_add(1)
+                .context("media component generation overflow")?
+        } else {
+            before
+        };
+        components.push(MediaSecurityRecoveryComponentTransitionV1 {
+            component_id: stored.component.component_id,
+            component_kind: stored.component.component_kind.clone(),
+            generation_before: before,
+            generation_after: after,
+        });
+        if outcome == MediaSecurityRecoveryOutcome::CleanupResumed {
+            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4", params![after.to_string(),now_unix_ms,stored.component.component_id.to_string(),before.to_string()])? == 1, "security recovery component CAS failed");
+        }
+    }
+    let generation_before = snapshot.attachment.availability_generation;
+    let generation_after = if outcome == MediaSecurityRecoveryOutcome::CleanupResumed {
+        generation_before
+            .checked_add(1)
+            .context("media availability generation overflow")?
+    } else {
+        generation_before
+    };
+    if outcome == MediaSecurityRecoveryOutcome::CleanupResumed {
+        let next_state = if snapshot.attachment.source_kind == MediaSourceKind::LocalPath {
+            "borrowed_cleanup_pending"
+        } else {
+            "owned_cleanup_pending"
+        };
+        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state,generation_after.to_string(),now_unix_ms,request.attachment_id.to_string(),request.attachment_version.to_string(),generation_before.to_string()])? == 1, "security recovery aggregate CAS failed");
+        conn.execute("INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,'security_recovery',?7)", params![Uuid::now_v7().to_string(),request.attachment_id.to_string(),request.attachment_version.to_string(),generation_after.to_string(),snapshot.attachment.reference_generation.to_string(),snapshot.affected_set_digest,now_unix_ms])?;
+    }
+    let receipt = LocalMediaOwnerReceiptV1 {
+        schema_version: 1,
+        kind: "localMediaOwnerRecovery".into(),
+        receipt_id: Uuid::now_v7(),
+        local_request_id: request.local_request_id,
+        owner_principal_digest: request.owner_principal_digest.clone(),
+        attachment_id: request.attachment_id,
+        attachment_version: request.attachment_version,
+        disposition: request.disposition,
+        request_digest: snapshot.request_digest.clone(),
+        affected_set_digest: snapshot.affected_set_digest.clone(),
+        outcome,
+        availability_generation_before: generation_before,
+        availability_generation_after: generation_after,
+        components,
+        committed_at_unix_ms: now_unix_ms,
+    };
+    conn.execute("INSERT INTO media_security_recovery_operations (local_request_id,owner_principal_digest,attachment_id,attachment_version,request_digest,affected_set_digest,receipt_json,committed_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![request.local_request_id.to_string(),request.owner_principal_digest,request.attachment_id.to_string(),request.attachment_version.to_string(),snapshot.request_digest,snapshot.affected_set_digest,serde_json::to_string(&receipt)?,now_unix_ms])?;
+    Ok(receipt)
+}
+
+fn recorded_component_digest(
+    component: &cockpit_db::media_attachments::VerifiedBlockedComponent,
+) -> String {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, component.component_id.as_bytes());
+    field(&mut hasher, component.component_kind.as_bytes());
+    field(&mut hasher, &component.component_generation.to_be_bytes());
+    field(&mut hasher, component.stable_identity_digest.as_bytes());
+    field(&mut hasher, &component.byte_length.to_be_bytes());
+    field(&mut hasher, component.sha256.as_bytes());
+    field(&mut hasher, component.reservation_id.as_bytes());
+    field(
+        &mut hasher,
+        component
+            .deletion_evidence_digest
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    hex_lower(&hasher.finalize())
 }
 
 fn verify_all_handles(

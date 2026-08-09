@@ -1559,24 +1559,6 @@ macro_rules! remote_class_value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnknownRemoteOperationClass;
 
-macro_rules! remote_request_class_value {
-    (read_only) => {
-        Ok(RemoteOperationClass::ReadOnly)
-    };
-    (transactional_mutation) => {
-        Ok(RemoteOperationClass::TransactionalMutation)
-    };
-    (idempotent_adapter_mutation) => {
-        Ok(RemoteOperationClass::IdempotentAdapterMutation)
-    };
-    (nonrepeatable_mutation) => {
-        Ok(RemoteOperationClass::NonrepeatableMutation)
-    };
-    (rejected) => {
-        Err(UnknownRemoteOperationClass)
-    };
-}
-
 macro_rules! recovery_contract_value {
     (none) => {
         None
@@ -1638,11 +1620,6 @@ impl RemoteAdapterRecoveryContractV1 {
     }
 }
 
-macro_rules! command_remote_class_match {
-    (($request:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
-        match $request { $($pattern => remote_request_class_value!($remote_class),)+ }
-    }};
-}
 macro_rules! command_remote_class_tag {
     (($tag_value:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
         match $tag_value { $($tag => remote_class_value!($remote_class),)+ _ => None }
@@ -1658,7 +1635,7 @@ impl Request {
     pub fn remote_operation_class(
         &self,
     ) -> std::result::Result<RemoteOperationClass, UnknownRemoteOperationClass> {
-        crate::command!(command_remote_class_match, self)
+        remote_operation_class_for_tag(self.wire_tag()).ok_or(UnknownRemoteOperationClass)
     }
 }
 pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass> {

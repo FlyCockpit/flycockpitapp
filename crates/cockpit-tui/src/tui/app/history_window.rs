@@ -112,8 +112,10 @@ impl HistoryWindow {
     }
 
     pub(super) fn retain_terminal_notices_since(&mut self, start: usize) {
-        let terminal_notices = self.log[start..]
+        let terminal_notices = self
+            .log
             .iter()
+            .skip(start)
             .filter(|entry| {
                 matches!(
                     entry,

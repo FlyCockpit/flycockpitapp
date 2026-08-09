@@ -3448,7 +3448,8 @@ impl App {
             return;
         }
 
-        if let Some(request) = identified_request.take() {
+        if let Some(probe) = identified_probe.take() {
+            let request = probe.request;
             let _ = self.paste_correlations.commit(
                 request.paste_correlation_id,
                 request.paste_generation,

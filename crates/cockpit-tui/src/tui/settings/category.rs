@@ -50,6 +50,7 @@ use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingSto
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
+    SettingsControlId, SettingsPointerAction, SettingsPointerSurface, SettingsPointerTarget,
     TextColumnLayout, heading_style, muted_style, push_label_text_field_row, push_label_value_row,
     push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
@@ -1308,7 +1309,7 @@ impl CategoryPathEditor {
         self.refresh(cwd);
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, surface: &SettingsPointerSurface) {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("editing {}", self.id.descriptor().label),
@@ -1316,6 +1317,7 @@ impl CategoryPathEditor {
             )),
             Line::default(),
         ];
+        let field_line = lines.len();
         super::shell::push_text_field_at_cursor(
             &mut lines,
             area.width,
@@ -1325,6 +1327,19 @@ impl CategoryPathEditor {
             true,
             None,
         );
+        let field_x = self.id.descriptor().label.chars().count().saturating_add(2);
+        surface.register(SettingsPointerTarget {
+            rect: Rect::new(
+                area.x.saturating_add(field_x.min(u16::MAX as usize) as u16),
+                area.y.saturating_add(field_line as u16),
+                area.width
+                    .saturating_sub(field_x.min(u16::MAX as usize) as u16),
+                1,
+            ),
+            action: SettingsPointerAction::Page(SettingsControlId(1100)),
+            enabled: true,
+            disabled_reason: None,
+        });
         if let Some(ghost) = self.suggest.ghost_for(self.text())
             && let Some(last) = lines.last_mut()
         {
@@ -1342,6 +1357,7 @@ impl CategoryPathEditor {
                 .skip(self.suggest.scroll)
                 .take(DIR_SUGGEST_WINDOW)
             {
+                let suggestion_line = lines.len();
                 let active = i == self.suggest.selected;
                 let suffix = if entry.is_dir { "/" } else { "" };
                 lines.push(Line::from(vec![
@@ -1355,6 +1371,17 @@ impl CategoryPathEditor {
                         },
                     ),
                 ]));
+                surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x,
+                        area.y.saturating_add(suggestion_line as u16),
+                        area.width,
+                        1,
+                    ),
+                    action: SettingsPointerAction::Page(SettingsControlId(1200 + i as u64)),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
             if self.suggest.entries.len() > DIR_SUGGEST_WINDOW {
                 lines.push(Line::from(Span::styled(
@@ -1367,10 +1394,26 @@ impl CategoryPathEditor {
             }
         }
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "tab: accept  right: complete  enter: save  esc: cancel".to_string(),
-            muted_style(),
-        )));
+        let action_line = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled("[Save]", selected_style()),
+            Span::raw("  "),
+            Span::styled("[Cancel]", selected_style()),
+            Span::styled("  tab: accept  right: complete", muted_style()),
+        ]));
+        for (id, x, width) in [(1300, 0, 6), (1301, 8, 8)] {
+            surface.register(SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x + x,
+                    area.y.saturating_add(action_line as u16),
+                    width,
+                    1,
+                ),
+                action: SettingsPointerAction::Page(SettingsControlId(id)),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 }
@@ -3120,12 +3163,29 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 impl SettingsCx {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
         if let Some(editor) = &p.path_editor {
-            editor.render(frame, area);
+            editor.render(frame, area, &self.pointer_surface);
             return;
         }
 
         if let Some(editor) = &p.text_editor {
             editor.render(frame, area);
+            let action_y = area.bottom().saturating_sub(1);
+            for (id, x, width) in [(1400, 0, 6), (1401, 8, 8)] {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(area.x + x, action_y, width, 1),
+                    action: SettingsPointerAction::Page(SettingsControlId(id)),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+            frame.render_widget(
+                Line::from(vec![
+                    Span::styled("[Save]", selected_style()),
+                    Span::raw("  "),
+                    Span::styled("[Cancel]", selected_style()),
+                ]),
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
 
@@ -3355,6 +3415,50 @@ impl SettingsPage for CategoryPage {
         control: super::shell::SettingsControlId,
     ) -> Nav {
         let index = control.0 as usize;
+        if self.path_editor.is_some() {
+            match index {
+                1100 => return Nav::Stay,
+                1200..=1299 => {
+                    let suggestion = index - 1200;
+                    if let Some(editor) = self.path_editor.as_mut()
+                        && suggestion < editor.suggest.entries.len()
+                    {
+                        editor.suggest.selected = suggestion;
+                        return cx.handle_category_page_key(
+                            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                            self,
+                        );
+                    }
+                    return Nav::Stay;
+                }
+                1300 => {
+                    return cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                1301 => {
+                    return cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => return Nav::Stay,
+            }
+        }
+        if self.text_editor.is_some() {
+            return match index {
+                1400 => cx.handle_category_page_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    self,
+                ),
+                1401 => cx.handle_category_page_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    self,
+                ),
+                _ => Nav::Stay,
+            };
+        }
         if let Some(picker) = self.utility_picker.as_mut() {
             use super::ui_page::{PICKER_ACTION_ROWS, PickerMode};
             match &mut picker.mode {
@@ -3397,6 +3501,21 @@ impl SettingsPage for CategoryPage {
         column: u16,
         _row: u16,
     ) -> Nav {
+        if control.0 == 1100
+            && let Some(editor) = self.path_editor.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| target.action == super::shell::SettingsPointerAction::Page(control))
+                .map_or(column, |target| target.rect.x);
+            editor
+                .buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
+        }
         if control.0 == 1000
             && let Some(picker) = self.utility_picker.as_mut()
             && let super::ui_page::PickerMode::Custom { buf } = &mut picker.mode

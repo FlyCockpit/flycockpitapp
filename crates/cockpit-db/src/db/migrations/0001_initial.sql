@@ -2555,9 +2555,18 @@ CREATE TABLE media_reservations (
     created_wall_ms INTEGER NOT NULL,
     external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id),
     quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
-    published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1))
+    published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
+    cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancellation_requested IN (0,1))
 );
 CREATE INDEX idx_media_reservation_owner_purpose ON media_reservations(project_id, owner_session_key, purpose, state);
+CREATE TABLE media_reservation_plan_facts (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    dimension TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    PRIMARY KEY(reservation_id, dimension)
+);
+CREATE TRIGGER media_plan_fact_immutable_update BEFORE UPDATE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
+CREATE TRIGGER media_plan_fact_immutable_delete BEFORE DELETE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
 CREATE TABLE media_reservation_versions (
     reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
     version INTEGER NOT NULL CHECK(version >= 1),
@@ -2642,6 +2651,17 @@ CREATE TABLE media_cleanup_attestations (
 );
 CREATE TRIGGER media_cleanup_attestation_immutable_update BEFORE UPDATE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
 CREATE TRIGGER media_cleanup_attestation_immutable_delete BEFORE DELETE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
+CREATE TABLE media_accounting_corruption_facts (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+    dimension TEXT NOT NULL,
+    unrepresentable_actual TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_wall_ms INTEGER NOT NULL,
+    PRIMARY KEY(reservation_id, reservation_version, dimension)
+);
+CREATE TRIGGER media_corruption_fact_immutable_update BEFORE UPDATE ON media_accounting_corruption_facts BEGIN SELECT RAISE(ABORT,'media corruption facts are immutable'); END;
+CREATE TRIGGER media_corruption_fact_immutable_delete BEFORE DELETE ON media_accounting_corruption_facts BEGIN SELECT RAISE(ABORT,'media corruption facts are immutable'); END;
 CREATE TABLE media_repair_attempts (
     attempt_id TEXT PRIMARY KEY,
     scope_kind TEXT NOT NULL,

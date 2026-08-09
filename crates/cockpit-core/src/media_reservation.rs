@@ -276,6 +276,12 @@ impl MediaReservationLedger {
                 "INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved_queued',1,?8,?9,?10)",
                 params![request.reservation_id, sqlite_i64(policy_version)?, request.owner.project_id, request.owner.session_id, request.operation, request.purpose, request.recovery_id, sqlite_i64(queue_sequence)?, sqlite_i64(deadline)?, sqlite_i64(request.wall_ms)?],
             )?;
+            for plan in &request.plans {
+                conn.execute(
+                    "INSERT INTO media_reservation_plan_facts(reservation_id,dimension,plan_json) VALUES(?1,?2,?3)",
+                    params![request.reservation_id, dimension_name(plan.dimension), serde_json::to_string(plan)?],
+                )?;
+            }
             for plan in request.plans.iter().filter(|plan| reserves_at_enqueue(plan)) {
                 acquire(conn, &request, plan, 1, request.wall_ms)?;
             }
@@ -299,12 +305,25 @@ impl MediaReservationLedger {
             let current = ReservationState::parse(&row.0)?;
             if row.1 != expected_version { return Err(anyhow!("stale_version")); }
             if !current.allows(next) { return Err(anyhow!("invalid_transition")); }
-            if next==ReservationState::Released{return Err(anyhow!("verified_settlement_required"));}
-            if next == ReservationState::DispatchingExternal && row.6.is_none() { return Err(anyhow!("external_journal_required")); }
+            if matches!(next, ReservationState::ExecutingLocal | ReservationState::DispatchingExternal | ReservationState::OverageQuarantined | ReservationState::Settling | ReservationState::Released) {
+                return Err(anyhow!("side_effect_transition_requires_typed_operation"));
+            }
+            if matches!(next, ReservationState::ExternalPending | ReservationState::ReconcilingExternal) {
+                let operation_id=row.6.as_deref().ok_or_else(||anyhow!("external_journal_required"))?;
+                let journal_state:String=conn.query_row("SELECT state FROM external_journal_operations WHERE operation_id=?1",[operation_id],|result|result.get(0))?;
+                let compatible=match next {
+                    ReservationState::ExternalPending=>matches!(journal_state.as_str(),"dispatching"|"accepted"|"submission_unknown"|"cancellation_requested"),
+                    ReservationState::ReconcilingExternal=>matches!(journal_state.as_str(),"submission_unknown"|"reconciling"|"cancellation_requested"),
+                    _=>false,
+                };
+                if !compatible{return Err(anyhow!("external_journal_state_mismatch"));}
+            }
             let version = expected_version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
-            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND version=?4", params![next.as_str(),sqlite_i64(version)?,id,sqlite_i64(expected_version)?])?;
+            conn.execute("UPDATE media_reservations SET state=?1,version=?2,cancellation_requested=cancellation_requested OR ?3 WHERE reservation_id=?4 AND version=?5", params![next.as_str(),sqlite_i64(version)?,next==ReservationState::CancellationRequested,id,sqlite_i64(expected_version)?])?;
             conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'state_transition','operation',?1,0,0,0,'actual',?3)", params![id,sqlite_i64(version)?,sqlite_i64(wall_ms)?])?;
-            if next == ReservationState::AccountingCorrupt { conn.execute("INSERT INTO media_accounting_blocks(scope_kind,scope_id,generation,reason) VALUES('session',?1,1,'accounting_corrupt') ON CONFLICT(scope_kind,scope_id) DO UPDATE SET generation=generation+1,reason='accounting_corrupt'",[row.5.as_str()])?; }
+            if next == ReservationState::AccountingCorrupt {
+                block_corrupt_scopes(conn,&id,&row.4,&row.5)?;
+            }
             Ok(ReservationReceipt { reservation_id:id,state:next,version,queue_sequence:row.2,deadline_monotonic_ms:row.3 })
         }).await.map_err(classify_storage_error)
     }
@@ -322,11 +341,12 @@ impl MediaReservationLedger {
         let now = self.clock.now_ms();
         self.db.transaction(move |conn| {
             let(state,version,sequence,deadline,project,session)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?;
-            ensure_unblocked(conn,&session)?;if now>=deadline{return Err(anyhow!("deadline_expired"));}if version!=expected_version{return Err(anyhow!("stale_version"));}
+            ensure_unblocked(conn,&project,&session)?;if now>=deadline{return Err(anyhow!("deadline_expired"));}if version!=expected_version{return Err(anyhow!("stale_version"));}
             if !ReservationState::parse(&state)?.allows(ReservationState::DispatchingExternal){return Err(anyhow!("invalid_transition"));}
             let(journal_owner,journal_state):(String,String)=conn.query_row("SELECT owner_session_id,state FROM external_journal_operations WHERE operation_id=?1",[&journal],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?.ok_or_else(||anyhow!("external_journal_required"))?;
-            if journal_owner!=session{return Err(anyhow!("external_journal_owner_mismatch"));}if journal_state!="prepared"{return Err(anyhow!("external_journal_not_prepared"));}
+            if journal_owner!=session{return Err(anyhow!("external_journal_owner_mismatch"));}if journal_state!="dispatching"{return Err(anyhow!("external_journal_not_dispatching"));}
             let owner=MediaOwner{project_id:project,session_id:session};release_queued(conn,&id,&owner,version+1,wall_ms)?;
+            release_dimension_balance(conn,&id,version+1,&dimension_name(MediaDimension::LocalCpuJobsGlobal),wall_ms)?;
             for plan in &handoff_plans{if !matches!(plan.scope_policy.charge,MediaCharge::AcceptedOrPossiblyAccepted|MediaCharge::AtHandoff){return Err(anyhow!("invalid_handoff_plan"));}acquire_plan(conn,&id,&owner,plan,version+1,wall_ms)?;}
             conn.execute("UPDATE media_reservations SET external_operation_id=?1,state='dispatching_external',version=version+1 WHERE reservation_id=?2 AND version=?3",params![journal,id,sqlite_i64(expected_version)?])?;
             Ok(ReservationReceipt{reservation_id:id,state:ReservationState::DispatchingExternal,version:version+1,queue_sequence:sequence,deadline_monotonic_ms:deadline})
@@ -350,7 +370,7 @@ impl MediaReservationLedger {
             if version != expected_version { return Err(anyhow!("stale_version")); }
             if ReservationState::parse(&state)? != ReservationState::ReservedQueued { return Err(anyhow!("invalid_transition")); }
             if now >= deadline { return Err(anyhow!("deadline_expired")); }
-            let owner = MediaOwner { project_id: project, session_id: session }; ensure_unblocked(conn, &owner.session_id)?;
+            let owner = MediaOwner { project_id: project, session_id: session }; ensure_unblocked(conn, &owner.project_id, &owner.session_id)?;
             validate_mutation_policy(conn,&id,&execution_plan)?;
             acquire_plan(conn, &id, &owner, &execution_plan, version + 1, wall_ms)?;
             release_queued(conn, &id, &owner, version + 1, wall_ms)?;
@@ -369,7 +389,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let now = self.clock.now_ms();
         let cancellation_id = id.clone();
-        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;conn.execute("UPDATE media_reservations SET state='cancellation_requested',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
+        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;conn.execute("UPDATE media_reservations SET state='cancellation_requested',cancellation_requested=1,version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
         let cleanup_checksum = cleanup
             .kill_reap_and_cleanup(&id)
             .map_err(LedgerError::Storage)?;
@@ -404,6 +424,12 @@ impl MediaReservationLedger {
             let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
             let mut next=ReservationState::parse(&state)?;
             if matches!(next,ReservationState::Released|ReservationState::AccountingCorrupt){return Err(anyhow!("invalid_transition"));}
+            if actual > i64::MAX as u64 {
+                conn.execute("INSERT INTO media_accounting_corruption_facts(reservation_id,reservation_version,dimension,unrepresentable_actual,reason,created_wall_ms) VALUES(?1,?2,?3,?4,'actual_out_of_sqlite_range',?5)",params![id,sqlite_i64(next_version)?,dimension_name,actual.to_string(),sqlite_i64(wall_ms)?])?;
+                block_corrupt_scopes(conn,&id,&owner.project_id,&owner.session_id)?;
+                conn.execute("UPDATE media_reservations SET state='accounting_corrupt',quarantined=1,published=0,version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,id])?;
+                return Ok(ReservationReceipt{reservation_id:id,state:ReservationState::AccountingCorrupt,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline});
+            }
             if actual > estimated {
                 if !next.allows(ReservationState::OverageQuarantined){return Err(anyhow!("invalid_transition"));}
                 let extra=actual.checked_sub(estimated).ok_or_else(||anyhow!("accounting_overflow"))?;
@@ -424,19 +450,72 @@ impl MediaReservationLedger {
         }).await.map_err(classify_storage_error)
     }
 
-    pub async fn recover_after_restart(&self, wall_ms: u64) -> Result<u64, LedgerError> {
-        self.db.transaction(move |conn| {
+    pub async fn recover_after_restart(
+        &self,
+        wall_ms: u64,
+        cleanup: &dyn LocalExpiryCleanup,
+    ) -> Result<u64, LedgerError> {
+        let rows = self.db.read(|conn| {
             let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE state IN ('reserved_queued','executing_local','settling') OR (state='cancellation_requested' AND external_operation_id IS NULL)")?;
             let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            for (id,version,_) in &rows {
+            Ok(rows)
+        }).await.map_err(LedgerError::Storage)?;
+        let mut cleanup_proofs = BTreeMap::new();
+        for (id, _, _) in &rows {
+            let proof = cleanup
+                .kill_reap_and_cleanup(id)
+                .map_err(LedgerError::Storage)?;
+            if proof.is_empty() {
+                return Err(LedgerError::Storage(anyhow!(
+                    "cleanup attestation checksum required"
+                )));
+            }
+            cleanup_proofs.insert(id.clone(), proof);
+        }
+        let local_count = rows.len() as u64;
+        let recovered_local = self.db.transaction(move |conn| {
+            for (id,version,state) in &rows {
+                let current:(u64,String)=conn.query_row("SELECT version,state FROM media_reservations WHERE reservation_id=?1",[id],|r|Ok((row_u64(r,0)?,r.get(1)?)))?;
+                if current!=( *version,state.clone()) { return Err(anyhow!("stale_version")); }
+                let proof=cleanup_proofs.get(id).ok_or_else(||anyhow!("cleanup attestation missing"))?;
+                for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession] {
+                    conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,dimension_name(dimension),proof,sqlite_i64(wall_ms)?])?;
+                }
                 release_restart_dimensions(conn,id,version+1,wall_ms)?;
                 let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
                 conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,id])?;
                 conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'restart_expiry','operation',?1,0,0,0,'cleanup',?3)",params![id,sqlite_i64(next_version)?,sqlite_i64(wall_ms)?])?;
             }
-            Ok(rows.len() as u64)
-        }).await.map_err(classify_storage_error)
+            Ok(local_count)
+        }).await.map_err(classify_storage_error)?;
+        let recovered_external = self.db.transaction(move |conn| {
+            let mut statement=conn.prepare("SELECT r.reservation_id,r.version,r.state,j.state FROM media_reservations r JOIN external_journal_operations j ON j.operation_id=r.external_operation_id WHERE r.state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested')")?;
+            let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let mut changed=0_u64;
+            for (id,version,state,journal_state) in rows {
+                let current=ReservationState::parse(&state)?;
+                let terminal=matches!(journal_state.as_str(),"rejected"|"cancelled"|"expired"|"completed_after_cancel"|"succeeded"|"failed");
+                let next=match (current,journal_state.as_str()) {
+                    (ReservationState::DispatchingExternal, _) if terminal=>ReservationState::Settling,
+                    (ReservationState::DispatchingExternal,"dispatching"|"accepted"|"submission_unknown"|"reconciling"|"cancellation_requested")=>ReservationState::ExternalPending,
+                    (ReservationState::ExternalPending, _) if terminal=>ReservationState::Settling,
+                    (ReservationState::ExternalPending,"reconciling")=>ReservationState::ReconcilingExternal,
+                    (ReservationState::ReconcilingExternal, _) if terminal=>ReservationState::Settling,
+                    (ReservationState::ReconcilingExternal,"accepted"|"submission_unknown"|"cancellation_requested")=>ReservationState::ExternalPending,
+                    (ReservationState::CancellationRequested, _) if terminal=>ReservationState::Settling,
+                    _=>continue,
+                };
+                let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+                conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND version=?4",params![next.as_str(),sqlite_i64(next_version)?,id,sqlite_i64(version)?])?;
+                conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'restart_external_reconciliation','operation',?1,0,0,0,'actual',?3)",params![id,sqlite_i64(next_version)?,sqlite_i64(wall_ms)?])?;
+                changed=changed.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+            }
+            Ok(changed)
+        }).await.map_err(classify_storage_error)?;
+        recovered_local
+            .checked_add(recovered_external)
+            .ok_or(LedgerError::Overflow)
     }
 
     /// Releases only dimensions whose cleanup/reconciliation has been
@@ -519,12 +598,12 @@ impl MediaReservationLedger {
 
     pub async fn publication_allowed(&self, reservation_id: &str) -> Result<bool, LedgerError> {
         let id = reservation_id.to_owned();
-        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND state NOT IN ('overage_quarantined','accounting_corrupt') FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
+        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('overage_quarantined','accounting_corrupt') FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
     }
 
     pub async fn authorize_publication(&self, reservation_id: &str) -> Result<(), LedgerError> {
         let id = reservation_id.to_owned();
-        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND state NOT IN ('overage_quarantined','accounting_corrupt','cancellation_requested')",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
+        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_reservations SET published=1 WHERE reservation_id=?1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('overage_quarantined','accounting_corrupt','cancellation_requested')",[id])?;if changed!=1{return Err(anyhow!("publication_denied"));}Ok(())}).await.map_err(LedgerError::Storage)
     }
 
     pub async fn repair_accounting(
@@ -533,7 +612,7 @@ impl MediaReservationLedger {
         principal: &crate::daemon::principal::ClientPrincipal,
     ) -> Result<AccountingRepairOutcome, LedgerError> {
         if !principal.is_owner() {
-            return Ok(AccountingRepairOutcome::Unauthorized);
+            return self.record_unauthorized_repair(request).await;
         }
         validate_repair_scope(&request.scope_kind)?;
         self.db.transaction(move |conn| {
@@ -544,8 +623,8 @@ impl MediaReservationLedger {
             }
             let diagnosis=diagnose_connection(conn,&request.scope_kind,&request.scope_id)?;
             conn.execute("INSERT INTO media_repair_attempts(attempt_id,scope_kind,scope_id,idempotency_key,request_digest,plan_digest,expected_block_generation,state,current_counter_digest,created_wall_ms,updated_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8,?9,?9)",params![request.attempt_id,request.scope_kind,request.scope_id,request.idempotency_key,request_digest,request.repair_plan_digest,sqlite_i64(request.expected_block_generation)?,diagnosis.current_counter_digest,sqlite_i64(request.wall_ms)?])?;
-            if request.scope_kind=="project"{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::NotProvable,None,request.wall_ms);}
             if diagnosis.block_generation!=request.expected_block_generation||diagnosis.repair_plan_digest!=request.repair_plan_digest{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::SourceChanged,None,request.wall_ms);}
+            if diagnosis.corruption_blockers>0{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::Overflow,None,request.wall_ms);}
             if diagnosis.journal_blockers>0||diagnosis.manifest_blockers>0{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::NotProvable,None,request.wall_ms);}
             conn.execute("UPDATE media_repair_attempts SET state='rebuilding',updated_wall_ms=?2 WHERE attempt_id=?1",params![request.attempt_id,sqlite_i64(request.wall_ms)?])?;
             let rebuilt=match rebuild_counters(conn,&request.scope_kind,&request.scope_id){Ok(value)=>value,Err(error)=>{let outcome=if error.to_string().contains("overflow")||error.to_string().contains("out of range"){AccountingRepairOutcome::Overflow}else{AccountingRepairOutcome::NotProvable};return finish_repair(conn,&request.attempt_id,outcome,None,request.wall_ms);}};
@@ -560,6 +639,22 @@ impl MediaReservationLedger {
             conn.execute("DELETE FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2 AND generation=?3",params![request.scope_kind,request.scope_id,sqlite_i64(diagnosis.block_generation)?])?;
             finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::Committed,Some(stable_counter_digest(&rebuilt)),request.wall_ms)
         }).await.map_err(|error| if error.to_string().contains("overflow"){LedgerError::Overflow}else{LedgerError::Storage(error)})
+    }
+
+    async fn record_unauthorized_repair(
+        &self,
+        request: AccountingRepairRequest,
+    ) -> Result<AccountingRepairOutcome, LedgerError> {
+        validate_repair_scope(&request.scope_kind)?;
+        self.db.transaction(move |conn| {
+            let request_digest=repair_request_digest(&request);
+            if let Some((stored,result))=conn.query_row("SELECT request_digest,outcome FROM media_repair_attempts WHERE idempotency_key=?1",[&request.idempotency_key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?))).optional()? {
+                if stored!=request_digest{return Ok(AccountingRepairOutcome::Conflict);}
+                return Ok(parse_repair_outcome(result.as_deref().unwrap_or("accounting_repair_unauthorized")));
+            }
+            conn.execute("INSERT INTO media_repair_attempts(attempt_id,scope_kind,scope_id,idempotency_key,request_digest,plan_digest,expected_block_generation,state,current_counter_digest,created_wall_ms,updated_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned','unauthorized',?8,?8)",params![request.attempt_id,request.scope_kind,request.scope_id,request.idempotency_key,request_digest,request.repair_plan_digest,sqlite_i64(request.expected_block_generation)?,sqlite_i64(request.wall_ms)?])?;
+            finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::Unauthorized,None,request.wall_ms)
+        }).await.map_err(LedgerError::Storage)
     }
 
     pub async fn next_fair_candidate(&self) -> Result<Option<String>, LedgerError> {
@@ -623,17 +718,47 @@ fn scope_identity(
         }
     }
 }
-fn ensure_unblocked(conn: &rusqlite::Connection, session_id: &str) -> Result<()> {
-    if conn
-        .query_row(
-            "SELECT 1 FROM media_accounting_blocks WHERE scope_kind='session' AND scope_id=?1",
-            [session_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
-    {
-        bail!("accounting_blocked");
+fn ensure_unblocked(conn: &rusqlite::Connection, project_id: &str, session_id: &str) -> Result<()> {
+    for (kind, id) in [
+        ("global", "global"),
+        ("project", project_id),
+        ("session", session_id),
+    ] {
+        if conn
+            .query_row(
+                "SELECT 1 FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2",
+                params![kind, id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            bail!("accounting_blocked");
+        }
+    }
+    Ok(())
+}
+fn block_corrupt_scopes(
+    conn: &rusqlite::Connection,
+    reservation_id: &str,
+    project_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let mut affected = BTreeSet::from([
+        ("project".to_owned(), project_id.to_owned()),
+        ("session".to_owned(), session_id.to_owned()),
+    ]);
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT scope_kind,scope_id FROM media_reservation_deltas WHERE reservation_id=?1 AND scope_kind IN ('global','project','session')",
+    )?;
+    for scope in statement.query_map([reservation_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        affected.insert(scope?);
+    }
+    drop(statement);
+    for (kind, scope_id) in affected {
+        conn.execute("INSERT INTO media_accounting_blocks(scope_kind,scope_id,generation,reason) VALUES(?1,?2,1,'accounting_corrupt') ON CONFLICT(scope_kind,scope_id) DO UPDATE SET generation=generation+1,reason='accounting_corrupt'",params![kind,scope_id])?;
     }
     Ok(())
 }
@@ -649,6 +774,20 @@ fn validate_mutation_policy(
     )?;
     if version != plan.policy_version {
         bail!("stale_policy_version");
+    }
+    if plan.scope_policy != plan.dimension.scope_policy() {
+        bail!("invalid evaluated plan");
+    }
+    let stored: String = conn
+        .query_row(
+            "SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",
+            params![id, dimension_name(plan.dimension)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("evaluated plan not reserved"))?;
+    if stored != serde_json::to_string(plan)? {
+        bail!("evaluated plan mismatch");
     }
     Ok(())
 }
@@ -905,7 +1044,10 @@ fn classify_storage_error(error: anyhow::Error) -> LedgerError {
         LedgerError::AccountingBlocked
     } else if text.contains("stale_version") {
         LedgerError::StaleVersion
-    } else if text.contains("invalid_transition") || text.contains("deadline_expired") {
+    } else if text.contains("invalid_transition")
+        || text.contains("deadline_expired")
+        || text.contains("side_effect_transition_requires_typed_operation")
+    {
         LedgerError::InvalidTransition
     } else if text.contains("overflow") || text.contains("out of range") {
         LedgerError::Overflow
@@ -945,6 +1087,7 @@ pub struct AccountingDiagnosis {
     pub rebuilt_counter_digest: String,
     pub journal_blockers: u64,
     pub manifest_blockers: u64,
+    pub corruption_blockers: u64,
     pub block_generation: u64,
     pub repair_plan_digest: String,
 }
@@ -996,8 +1139,10 @@ fn diagnose_connection(
         |r| row_u64(r, 0),
     )?;
     let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|row_u64(r,0))?;
-    let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
-    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE external_operation_id IS NOT NULL AND state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE ((r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id)) OR NOT EXISTS(SELECT 1 FROM media_reservation_plan_facts p WHERE p.reservation_id=r.reservation_id) OR NOT EXISTS(SELECT 1 FROM media_reservation_deltas d WHERE d.reservation_id=r.reservation_id)) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    let corruption_blockers=conn.query_row("SELECT COUNT(*) FROM media_accounting_corruption_facts c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|row|row_u64(row,0))?;
+    let evidence_digest = immutable_evidence_digest(conn, kind, id)?;
     let block_generation = conn
         .query_row(
             "SELECT generation FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2",
@@ -1015,6 +1160,10 @@ fn diagnose_connection(
     hasher.update(block_generation.to_be_bytes());
     hasher.update(source_delta_rows.to_be_bytes());
     hasher.update(artifact_rows.to_be_bytes());
+    hasher.update(journal_blockers.to_be_bytes());
+    hasher.update(manifest_blockers.to_be_bytes());
+    hasher.update(corruption_blockers.to_be_bytes());
+    hasher.update(evidence_digest.as_bytes());
     hasher.update(rebuilt_counter_digest.as_bytes());
     let repair_plan_digest = lowercase_hex(&hasher.finalize());
     Ok(AccountingDiagnosis {
@@ -1027,9 +1176,46 @@ fn diagnose_connection(
         rebuilt_counter_digest,
         journal_blockers,
         manifest_blockers,
+        corruption_blockers,
         block_generation,
         repair_plan_digest,
     })
+}
+
+fn immutable_evidence_digest(conn: &rusqlite::Connection, kind: &str, id: &str) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let owner_filter = "((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))";
+    for query in [
+        format!(
+            "SELECT printf('%s|%s|%s',p.reservation_id,p.dimension,p.plan_json) FROM media_reservation_plan_facts p JOIN media_reservations r ON r.reservation_id=p.reservation_id WHERE {owner_filter} ORDER BY p.reservation_id,p.dimension"
+        ),
+        format!(
+            "SELECT printf('%s|%d|%s|%d',v.reservation_id,v.version,v.state,v.recorded_wall_ms) FROM media_reservation_versions v JOIN media_reservations r ON r.reservation_id=v.reservation_id WHERE {owner_filter} ORDER BY v.reservation_id,v.version"
+        ),
+        format!(
+            "SELECT printf('%d|%s|%d|%s|%s|%s|%d|%d|%d|%s|%d',d.delta_id,d.reservation_id,d.reservation_version,d.dimension,d.scope_kind,d.scope_id,d.estimated,d.delta,d.charged_after,d.fact_kind,d.created_wall_ms) FROM media_reservation_deltas d JOIN media_reservations r ON r.reservation_id=d.reservation_id WHERE {owner_filter} ORDER BY d.delta_id"
+        ),
+        format!(
+            "SELECT printf('%s|%s|%s|%d|%s|%d|%s',a.artifact_id,a.reservation_id,a.dimension,a.byte_count,a.checksum,a.quarantined,COALESCE(a.deletion_tombstone_checksum,'')) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE {owner_filter} ORDER BY a.artifact_id"
+        ),
+        format!(
+            "SELECT printf('%s|%s|%s|%s|%d',c.reservation_id,c.dimension,c.attestation_kind,c.checksum,c.created_wall_ms) FROM media_cleanup_attestations c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE {owner_filter} ORDER BY c.reservation_id,c.dimension"
+        ),
+        format!(
+            "SELECT printf('%s|%d|%s|%s|%s|%d',c.reservation_id,c.reservation_version,c.dimension,c.unrepresentable_actual,c.reason,c.created_wall_ms) FROM media_accounting_corruption_facts c JOIN media_reservations r ON r.reservation_id=c.reservation_id WHERE {owner_filter} ORDER BY c.reservation_id,c.reservation_version,c.dimension"
+        ),
+        format!(
+            "SELECT printf('%s|%s|%d|%s|%s|%d',j.operation_id,j.payload_digest,j.payload_len,j.state,COALESCE(j.provider_idempotency_contract,''),j.version) FROM media_reservations r JOIN external_journal_operations j ON j.operation_id=r.external_operation_id WHERE {owner_filter} ORDER BY j.operation_id"
+        ),
+    ] {
+        let mut statement = conn.prepare(&query)?;
+        for row in statement.query_map(params![kind, id], |result| result.get::<_, String>(0))? {
+            let value = row?;
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
 }
 fn repair_request_digest(request: &AccountingRepairRequest) -> String {
     let mut h = Sha256::new();
@@ -1202,12 +1388,7 @@ mod tests {
             .await
             .unwrap();
         let settling = ledger
-            .transition(
-                &receipt.reservation_id,
-                receipt.version,
-                ReservationState::Settling,
-                2,
-            )
+            .settle_verified(&receipt.reservation_id, receipt.version, Vec::new(), 2)
             .await
             .unwrap();
         let over = ledger
@@ -1246,7 +1427,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(ledger.recover_after_restart(2).await.unwrap(), 1);
+        assert_eq!(ledger.recover_after_restart(2, &Cleanup).await.unwrap(), 1);
         let values: Vec<(String, u64)> = db
             .read(|conn| {
                 let mut s = conn.prepare(

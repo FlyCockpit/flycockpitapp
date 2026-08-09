@@ -2049,6 +2049,8 @@ pub(crate) async fn boot_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<DaemonContext> {
+    #[cfg(not(test))]
+    let mut containment_recovered = false;
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(
         LockManager::from_db(db.clone())
@@ -2139,6 +2141,7 @@ pub(crate) async fn boot_with_db(
         ctx.attach_process_containment_actor(actor);
         match handle.recover().await {
             Ok(outcomes) => {
+                containment_recovered = true;
                 tracing::info!(
                     recovered = outcomes.len(),
                     "process containment recovery finished"
@@ -2239,6 +2242,49 @@ pub(crate) async fn boot_with_db(
     #[cfg(test)]
     {
         timer.phase("external_journal_skipped");
+    }
+    #[cfg(not(test))]
+    if containment_recovered {
+        struct DaemonClock(Instant);
+        impl crate::media_reservation::MonotonicClock for DaemonClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        struct RecoveredContainmentCleanup;
+        impl crate::media_reservation::LocalExpiryCleanup for RecoveredContainmentCleanup {
+            fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
+                use sha2::Digest as _;
+                let mut digest = sha2::Sha256::new();
+                digest.update(b"daemon-startup-containment-recovered");
+                digest.update([0]);
+                digest.update(reservation_id.as_bytes());
+                Ok(crate::intel::hex_lower(&digest.finalize()))
+            }
+        }
+        let ledger = crate::media_reservation::MediaReservationLedger::new(
+            db.clone(),
+            Arc::new(DaemonClock(ctx.started_at)),
+        );
+        match ledger
+            .recover_after_restart(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .unwrap_or(0),
+                &RecoveredContainmentCleanup,
+            )
+            .await
+        {
+            Ok(recovered) => {
+                tracing::info!(recovered, "media reservation recovery finished");
+                timer.phase("media_reservation_recovery");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "media reservation recovery failed; media admission remains blocked by retained charges");
+                timer.phase("media_reservation_recovery_blocked");
+            }
+        }
     }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await

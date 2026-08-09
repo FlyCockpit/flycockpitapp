@@ -51,7 +51,7 @@ describe("RedisAuthorityObservationStore", () => {
     const store = new RedisAuthorityObservationStore(redis);
 
     await store.publishLease(lease("10"), 30);
-    await expect(store.publishLease(lease("9"))).rejects.toThrow(
+    await expect(store.publishLease(lease("9"), 30)).rejects.toThrow(
       "stale observation lease generation",
     );
     await store.publishLease(lease("10"), 30);

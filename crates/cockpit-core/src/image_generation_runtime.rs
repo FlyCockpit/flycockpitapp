@@ -410,6 +410,7 @@ impl CapabilitySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageHealthSnapshot {
     pub endpoint_id: String,
+    pub target_id: String,
     pub config_generation: u64,
     pub refresh_epoch: u64,
     pub request_id: u64,
@@ -442,6 +443,7 @@ impl ImageHealthSnapshot {
 #[derive(Clone)]
 pub struct ProbeRequest {
     pub endpoint: ImageEndpoint,
+    pub target_id: String,
     pub config_generation: u64,
     pub refresh_epoch: u64,
     pub request_id: u64,
@@ -455,6 +457,7 @@ impl fmt::Debug for ProbeRequest {
         formatter
             .debug_struct("ProbeRequest")
             .field("endpoint_id", &self.endpoint.id)
+            .field("target_id", &self.target_id)
             .field("adapter", &self.endpoint.adapter)
             .field("config_generation", &self.config_generation)
             .field("refresh_epoch", &self.refresh_epoch)
@@ -491,10 +494,16 @@ pub trait ImageRuntimeAdapter: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RefreshKey {
     endpoint: String,
+    target: String,
     generation: u64,
     epoch: u64,
     kind: RefreshKind,
     credential_identity_digest: CredentialIdentityDigest,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    endpoint: String,
+    target: String,
 }
 #[derive(Clone)]
 struct CurrentIdentity {
@@ -511,7 +520,7 @@ struct Flight {
 }
 struct Inner {
     adapters: Vec<Arc<dyn ImageRuntimeAdapter>>,
-    cache: Mutex<HashMap<String, ImageHealthSnapshot>>,
+    cache: Mutex<HashMap<CacheKey, ImageHealthSnapshot>>,
     current: Mutex<HashMap<String, CurrentIdentity>>,
     inflight: Mutex<HashMap<RefreshKey, Arc<Flight>>>,
 }
@@ -524,6 +533,12 @@ pub struct ImageRuntimeRegistry {
 }
 
 impl ImageRuntimeRegistry {
+    fn invalidate_target_cache(&self, endpoint_id: &str, target_id: &str) {
+        self.inner.cache.lock().unwrap().remove(&CacheKey {
+            endpoint: endpoint_id.to_owned(),
+            target: target_id.to_owned(),
+        });
+    }
     pub fn new(
         clock: Arc<dyn RuntimeClock>,
         dns: Arc<dyn DnsResolver>,
@@ -584,25 +599,36 @@ impl ImageRuntimeRegistry {
         current.insert(endpoint.id.clone(), identity);
         drop(current);
         if invalidate {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.inner
+                .cache
+                .lock()
+                .unwrap()
+                .retain(|key, _| key.endpoint != endpoint.id);
         }
     }
     pub fn remove_endpoint(&self, endpoint_id: &str) {
         self.inner.current.lock().unwrap().remove(endpoint_id);
-        self.inner.cache.lock().unwrap().remove(endpoint_id);
+        self.inner
+            .cache
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.endpoint != endpoint_id);
         self.inner
             .inflight
             .lock()
             .unwrap()
             .retain(|key, _| key.endpoint != endpoint_id);
     }
-    pub fn snapshot(&self, endpoint_id: &str) -> Option<ImageHealthSnapshot> {
+    pub fn snapshot(&self, endpoint_id: &str, target_id: &str) -> Option<ImageHealthSnapshot> {
         let now = self.clock.now_millis();
         self.inner
             .cache
             .lock()
             .unwrap()
-            .get(endpoint_id)
+            .get(&CacheKey {
+                endpoint: endpoint_id.to_owned(),
+                target: target_id.to_owned(),
+            })
             .cloned()
             .and_then(|mut value| {
                 let age = now.saturating_sub(value.retrieved_at);
@@ -619,6 +645,7 @@ impl ImageRuntimeRegistry {
     pub async fn refresh(
         &self,
         endpoint: ImageEndpoint,
+        target_id: String,
         generation: u64,
         epoch: u64,
         request_id: u64,
@@ -633,12 +660,13 @@ impl ImageRuntimeRegistry {
         }
         let key = RefreshKey {
             endpoint: endpoint.id.clone(),
+            target: target_id.clone(),
             generation,
             epoch,
             kind,
             credential_identity_digest: credential_identity_digest.clone(),
         };
-        if let Some(cached) = self.snapshot(&key.endpoint)
+        if let Some(cached) = self.snapshot(&key.endpoint, &key.target)
             && cached.config_generation == generation
             && cached.refresh_epoch == epoch
             && cached.credential_identity_digest.as_ref() == Some(&credential_identity_digest)
@@ -680,6 +708,7 @@ impl ImageRuntimeRegistry {
             tokio::spawn(async move {
                 let outcome = AssertUnwindSafe(registry.run_refresh(
                     endpoint,
+                    target_id,
                     generation,
                     epoch,
                     request_id,
@@ -720,6 +749,7 @@ impl ImageRuntimeRegistry {
     async fn run_refresh(
         &self,
         endpoint: ImageEndpoint,
+        target_id: String,
         generation: u64,
         epoch: u64,
         request_id: u64,
@@ -758,6 +788,7 @@ impl ImageRuntimeRegistry {
                 let state = health_state_for_error(error.code);
                 self.commit_failure(
                     &endpoint,
+                    &target_id,
                     generation,
                     epoch,
                     request_id,
@@ -772,6 +803,7 @@ impl ImageRuntimeRegistry {
         if resolved.is_empty() || resolved.iter().any(|ip| classify_address(*ip) != wanted) {
             self.commit_failure(
                 &endpoint,
+                &target_id,
                 generation,
                 epoch,
                 request_id,
@@ -809,6 +841,7 @@ impl ImageRuntimeRegistry {
                 let state = health_state_for_error(error.code);
                 self.commit_failure(
                     &endpoint,
+                    &target_id,
                     generation,
                     epoch,
                     request_id,
@@ -825,6 +858,7 @@ impl ImageRuntimeRegistry {
         {
             self.commit_failure(
                 &endpoint,
+                &target_id,
                 generation,
                 epoch,
                 request_id,
@@ -843,6 +877,7 @@ impl ImageRuntimeRegistry {
         {
             self.commit_failure(
                 &endpoint,
+                &target_id,
                 generation,
                 epoch,
                 request_id,
@@ -856,6 +891,7 @@ impl ImageRuntimeRegistry {
             header_deadline,
             adapter.probe(ProbeRequest {
                 endpoint: endpoint.clone(),
+                target_id: target_id.clone(),
                 config_generation: generation,
                 refresh_epoch: epoch,
                 request_id,
@@ -879,6 +915,7 @@ impl ImageRuntimeRegistry {
                 let state = health_state_for_error(error.code);
                 self.commit_failure(
                     &endpoint,
+                    &target_id,
                     generation,
                     epoch,
                     request_id,
@@ -896,6 +933,7 @@ impl ImageRuntimeRegistry {
             );
             self.commit_failure(
                 &endpoint,
+                &target_id,
                 generation,
                 epoch,
                 request_id,
@@ -929,7 +967,10 @@ impl ImageRuntimeRegistry {
                 .cache
                 .lock()
                 .unwrap()
-                .get(&endpoint.id)
+                .get(&CacheKey {
+                    endpoint: endpoint.id.clone(),
+                    target: target_id.clone(),
+                })
                 .and_then(|snapshot| {
                     (snapshot.credential_identity_digest.as_ref()
                         == Some(&credential_identity_digest)
@@ -951,6 +992,27 @@ impl ImageRuntimeRegistry {
             );
             self.commit_failure(
                 &endpoint,
+                &target_id,
+                generation,
+                epoch,
+                request_id,
+                ImageHealthState::Incompatible,
+                error.code,
+                &credential_identity_digest,
+            )?;
+            return Err(error);
+        }
+        if capability
+            .as_ref()
+            .is_some_and(|capability| capability.target_id != target_id)
+        {
+            let error = RuntimeError::new(
+                RuntimeErrorCode::Incompatible,
+                "Refresh capabilities for the configured target identity.",
+            );
+            self.commit_failure(
+                &endpoint,
+                &target_id,
                 generation,
                 epoch,
                 request_id,
@@ -962,6 +1024,7 @@ impl ImageRuntimeRegistry {
         }
         let snapshot = ImageHealthSnapshot {
             endpoint_id: endpoint.id.clone(),
+            target_id,
             config_generation: generation,
             refresh_epoch: epoch,
             request_id,
@@ -1046,6 +1109,7 @@ impl ImageRuntimeRegistry {
     fn commit_failure(
         &self,
         endpoint: &ImageEndpoint,
+        target_id: &str,
         generation: u64,
         epoch: u64,
         request_id: u64,
@@ -1058,6 +1122,7 @@ impl ImageRuntimeRegistry {
             endpoint.id.clone(),
             ImageHealthSnapshot {
                 endpoint_id: endpoint.id.clone(),
+                target_id: target_id.to_owned(),
                 config_generation: generation,
                 refresh_epoch: epoch,
                 request_id,
@@ -1100,9 +1165,13 @@ impl ImageRuntimeRegistry {
             ));
         }
         let mut cache = self.inner.cache.lock().unwrap();
+        let cache_key = CacheKey {
+            endpoint: id,
+            target: snapshot.target_id.clone(),
+        };
         let mut snapshot = snapshot;
         if let Some(newer_capability) = cache
-            .get(&id)
+            .get(&cache_key)
             .filter(|current| {
                 snapshot.state == ImageHealthState::Healthy
                     && current.credential_identity_digest == snapshot.credential_identity_digest
@@ -1124,19 +1193,22 @@ impl ImageRuntimeRegistry {
         {
             snapshot.capability = Some(newer_capability);
         }
-        cache.insert(id, snapshot.clone());
+        cache.insert(cache_key, snapshot.clone());
         drop(current);
         Ok(snapshot)
     }
     pub async fn revalidate_dispatch(
         &self,
         endpoint: &ImageEndpoint,
+        target_id: &str,
         credential_identity_digest: &CredentialIdentityDigest,
     ) -> Result<ConnectionProof, RuntimeError> {
-        let snap = self.snapshot(&endpoint.id).ok_or(RuntimeError::new(
-            RuntimeErrorCode::Obsolete,
-            "Refresh health before dispatch.",
-        ))?;
+        let snap = self
+            .snapshot(&endpoint.id, target_id)
+            .ok_or(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh health before dispatch.",
+            ))?;
         let identity_current = self
             .inner
             .current
@@ -1149,7 +1221,7 @@ impl ImageRuntimeRegistry {
                     && identity.location == endpoint.location
             });
         if !identity_current || snap.endpoint_origin != endpoint.origin {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Obsolete,
                 "Refresh after endpoint configuration changes.",
@@ -1162,7 +1234,7 @@ impl ImageRuntimeRegistry {
             ));
         }
         if snap.credential_identity_digest.as_ref() != Some(credential_identity_digest) {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Obsolete,
                 "Refresh after credential rotation.",
@@ -1189,14 +1261,14 @@ impl ImageRuntimeRegistry {
             .as_ref()
             .is_none_or(|proof| proof.location != class)
         {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::DnsDenied,
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
         if ips.is_empty() || ips.iter().any(|ip| classify_address(*ip) != class) {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::DnsDenied,
                 ImageHealthState::DnsDenied.remediation(),
@@ -1211,14 +1283,14 @@ impl ImageRuntimeRegistry {
             || proof.location != class
             || proof.authority != authority
         {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::DnsDenied,
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
         if let Err(error) = self.validate_connection_hops(&proof, class, &allowed).await {
-            self.inner.cache.lock().unwrap().remove(&endpoint.id);
+            self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(error);
         }
         Ok(proof)

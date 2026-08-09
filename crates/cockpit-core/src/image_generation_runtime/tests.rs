@@ -272,11 +272,11 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
         registry.apply_endpoint(&endpoint, 1, 1);
         assert!(matches!(
             registry
-                .refresh(endpoint.clone(), 1, 1, 1, RefreshKind::Health, credential_digest(1))
+                .refresh(endpoint.clone(), "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(1))
                 .await,
             Err(error) if error.code == code
         ));
-        let snapshot = registry.snapshot(&endpoint.id).unwrap();
+        let snapshot = registry.snapshot(&endpoint.id, "target").unwrap();
         assert_eq!(snapshot.unavailable_reason, Some(code));
         assert_eq!(
             snapshot.expires_at - snapshot.retrieved_at,
@@ -285,6 +285,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
         let reused = registry
             .refresh(
                 endpoint.clone(),
+                "target".into(),
                 1,
                 1,
                 2,
@@ -313,7 +314,15 @@ async fn image_generation_runtime_enforces_connect_timeout_around_connector() {
     registry.apply_endpoint(&endpoint, 1, 1);
     let refresh = tokio::spawn(async move {
         registry
-            .refresh(endpoint, 1, 1, 1, RefreshKind::Health, credential_digest(7))
+            .refresh(
+                endpoint,
+                "target".into(),
+                1,
+                1,
+                1,
+                RefreshKind::Health,
+                credential_digest(7),
+            )
             .await
     });
     tokio::task::yield_now().await;
@@ -360,6 +369,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
     let (a, b) = tokio::join!(
         registry.refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             10,
@@ -368,6 +378,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
         ),
         registry.refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             11,
@@ -398,6 +409,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     let snapshot = registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             1,
@@ -412,7 +424,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     );
     assert!(
         registry
-            .revalidate_dispatch(&endpoint, &credential_digest(3))
+            .revalidate_dispatch(&endpoint, "target", &credential_digest(3))
             .await
             .is_ok()
     );
@@ -422,6 +434,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             2,
@@ -436,7 +449,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     );
     assert!(
         registry
-            .revalidate_dispatch(&endpoint, &credential_digest(3))
+            .revalidate_dispatch(&endpoint, "target", &credential_digest(3))
             .await
             .is_err()
     );
@@ -455,6 +468,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
     registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             1,
@@ -467,6 +481,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
     registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             2,
@@ -480,6 +495,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
     registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             3,
@@ -490,26 +506,27 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
         .unwrap();
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
 
-    let mut failure = registry.snapshot(&endpoint.id).unwrap();
+    let mut failure = registry.snapshot(&endpoint.id, "target").unwrap();
     failure.state = ImageHealthState::AuthFailed;
     failure.retrieved_at = 0;
     failure.expires_at = FAILURE_TTL.as_millis() as u64;
     failure.unavailable_reason = Some(RuntimeErrorCode::Authentication);
-    registry
-        .inner
-        .cache
-        .lock()
-        .unwrap()
-        .insert(endpoint.id.clone(), failure);
+    registry.inner.cache.lock().unwrap().insert(
+        CacheKey {
+            endpoint: endpoint.id.clone(),
+            target: "target".into(),
+        },
+        failure,
+    );
     clock.0.store(5_001, Ordering::SeqCst);
-    let stale = registry.snapshot(&endpoint.id).unwrap();
+    let stale = registry.snapshot(&endpoint.id, "target").unwrap();
     assert_eq!(stale.state, ImageHealthState::Stale);
     assert_eq!(stale.provenance, SnapshotProvenance::Stale);
     assert!(!stale.dispatchable_at(clock.now_millis()));
     clock
         .0
         .store(DISPLAY_STALE_TTL.as_millis() as u64 + 1, Ordering::SeqCst);
-    assert!(registry.snapshot(&endpoint.id).is_none());
+    assert!(registry.snapshot(&endpoint.id, "target").is_none());
 }
 
 #[tokio::test]
@@ -525,6 +542,7 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
     let first = registry
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             41,
@@ -538,6 +556,7 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
     let cached = registry
         .refresh(
             endpoint,
+            "target".into(),
             1,
             1,
             42,
@@ -548,6 +567,47 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
         .unwrap();
     assert_eq!(cached.request_id, 42);
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn image_generation_runtime_binds_capability_to_endpoint_and_target() {
+    let clock = Arc::new(Clock(AtomicU64::new(0)));
+    let adapter = Arc::new(Adapter {
+        kind: ImageAdapterKind::OpenaiImages,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = registry(clock, adapter);
+    let endpoint = endpoint();
+    registry.apply_endpoint(&endpoint, 1, 1);
+    let accepted = registry
+        .refresh(
+            endpoint.clone(),
+            "target".into(),
+            1,
+            1,
+            1,
+            RefreshKind::Capabilities,
+            credential_digest(9),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.target_id, "target");
+    assert!(matches!(
+        registry
+            .refresh(
+                endpoint.clone(),
+                "other-target".into(),
+                1,
+                1,
+                2,
+                RefreshKind::Capabilities,
+                credential_digest(9),
+            )
+            .await,
+        Err(error) if error.code == RuntimeErrorCode::Incompatible
+    ));
+    assert!(registry.snapshot(&endpoint.id, "target").is_some());
+    assert!(registry.snapshot(&endpoint.id, "other-target").is_some());
 }
 
 #[test]
@@ -631,6 +691,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
     rebinding
         .refresh(
             endpoint.clone(),
+            "target".into(),
             1,
             1,
             1,
@@ -641,11 +702,11 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
         .unwrap();
     assert!(matches!(
         rebinding
-            .revalidate_dispatch(&endpoint, &credential_digest(5))
+            .revalidate_dispatch(&endpoint, "target", &credential_digest(5))
             .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
-    assert!(rebinding.snapshot(&endpoint.id).is_none());
+    assert!(rebinding.snapshot(&endpoint.id, "target").is_none());
 
     let mismatch = ImageRuntimeRegistry::new(
         Arc::new(Clock(AtomicU64::new(0))),
@@ -657,7 +718,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
     mismatch.apply_endpoint(&endpoint, 1, 1);
     assert!(matches!(
         mismatch
-            .refresh(endpoint, 1, 1, 1, RefreshKind::Health, credential_digest(5))
+            .refresh(endpoint, "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(5))
             .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
@@ -685,6 +746,7 @@ async fn image_generation_runtime_rejects_mixed_dns_location_classes() {
         registry
             .refresh(
                 endpoint,
+                "target".into(),
                 1,
                 1,
                 1,

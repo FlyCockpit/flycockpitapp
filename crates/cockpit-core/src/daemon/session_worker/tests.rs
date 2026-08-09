@@ -48,12 +48,20 @@ async fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() 
             crate::engine::message::QueueTarget::root("Build"),
         )
         .await;
-    assert!(queue.has_accepted(id).await);
-    assert!(!model_expectation_matches(Some(&changed), 7, &selection));
-    assert!(
-        queue.has_accepted(id).await || model_expectation_matches(Some(&changed), 7, &selection),
-        "lost-ack replay bypasses the fresh-insert model fence"
-    );
+    let accepted = queue.has_accepted(id).await;
+    assert!(accepted);
+    assert!(model_fence_allows_insert(
+        accepted,
+        Some(&changed),
+        7,
+        &selection
+    ));
+    assert!(!model_fence_allows_insert(
+        false,
+        Some(&changed),
+        7,
+        &selection
+    ));
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {

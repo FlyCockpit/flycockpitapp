@@ -1178,6 +1178,49 @@ impl SettingsPage for McpPage {
         self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     }
 
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: SettingsControlId,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        let index = control.0 as usize;
+        if let McpPage::Add(state) = self {
+            if index >= ADD_FIELDS {
+                return Nav::Stay;
+            }
+            state.cursor = index;
+            let label = match index {
+                FIELD_NAME => Some("name"),
+                FIELD_ENDPOINT => Some("endpoint"),
+                FIELD_COMMAND => Some("command"),
+                FIELD_ARGS => Some("args"),
+                FIELD_BASE_ENV => Some("base env"),
+                FIELD_HEADER_NAME => Some("header name"),
+                FIELD_HEADER_VALUE => Some("header value"),
+                FIELD_AUTH_ENV => Some("auth env"),
+                FIELD_OAUTH_AUTHORIZE => Some("oauth authorize"),
+                FIELD_OAUTH_TOKEN => Some("oauth token"),
+                FIELD_OAUTH_CLIENT => Some("oauth client id"),
+                FIELD_OAUTH_SCOPES => Some("oauth scopes"),
+                FIELD_CACHE_TTL => Some("cache ttl"),
+                FIELD_CONNECT_TIMEOUT => Some("connect timeout"),
+                FIELD_REQUEST_TIMEOUT => Some("request timeout"),
+                _ => None,
+            };
+            if let Some(label) = label {
+                let area_x = cx.pointer_surface.area.get().map_or(0, |area| area.x);
+                let value_x = area_x.saturating_add(label.len() as u16 + 2);
+                if let Some(field) = active_text_field_mut(state) {
+                    field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+                }
+                return Nav::Stay;
+            }
+        }
+        self.handle_pointer_control(cx, control)
+    }
+
     fn handle_pointer_scroll(
         &mut self,
         cx: &mut SettingsCx,

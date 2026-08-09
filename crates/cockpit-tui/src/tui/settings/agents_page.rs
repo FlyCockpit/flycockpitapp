@@ -94,6 +94,8 @@ pub(super) struct AgentExternalEdit {
     /// Same-directory staging file. The real path is replaced only after a
     /// matching typed `Saved` completion.
     staging: tempfile::TempPath,
+    original_contents: Vec<u8>,
+    original_permissions: std::fs::Permissions,
     /// Buffer write owned by the injected host effect.
     pub(super) text_before_launch: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
@@ -111,16 +113,45 @@ pub(crate) struct AgentExternalEditEffect {
     pub(crate) text_before_launch: String,
 }
 
-fn agent_external_edit_staging(target: &std::path::Path) -> Result<tempfile::TempPath, String> {
+struct AgentExternalEditStaging {
+    path: tempfile::TempPath,
+    original_contents: Vec<u8>,
+    original_permissions: std::fs::Permissions,
+}
+
+fn agent_external_edit_staging(
+    target: &std::path::Path,
+) -> Result<AgentExternalEditStaging, String> {
+    let metadata = std::fs::symlink_metadata(target)
+        .map_err(|error| format!("failed to inspect external-edit target: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to externally edit symbolic link {}",
+            target.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to externally edit non-file {}",
+            target.display()
+        ));
+    }
+    let original_contents = std::fs::read(target)
+        .map_err(|error| format!("failed to read external-edit target: {error}"))?;
     let parent = target
         .parent()
         .ok_or_else(|| format!("external edit target has no parent: {}", target.display()))?;
-    tempfile::Builder::new()
+    let path = tempfile::Builder::new()
         .prefix(".cockpit-agent-edit-")
         .suffix(".stage")
         .tempfile_in(parent)
         .map(|file| file.into_temp_path())
-        .map_err(|error| format!("failed to create external-edit staging file: {error}"))
+        .map_err(|error| format!("failed to create external-edit staging file: {error}"))?;
+    Ok(AgentExternalEditStaging {
+        path,
+        original_contents,
+        original_permissions: metadata.permissions(),
+    })
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -276,7 +307,37 @@ impl AgentsPage {
         };
         match outcome {
             super::pointer_actions::ExternalEditOutcome::Saved => {
-                match pending.staging.persist(&pending.path) {
+                let draft = pending.draft.take();
+                let commit = (|| -> Result<(), String> {
+                    let current_metadata = std::fs::symlink_metadata(&pending.path)
+                        .map_err(|error| format!("failed to revalidate agent path: {error}"))?;
+                    if current_metadata.file_type().is_symlink() {
+                        return Err("agent path became a symbolic link during external edit".into());
+                    }
+                    if !current_metadata.is_file() {
+                        return Err("agent path is no longer a regular file".into());
+                    }
+                    let current = std::fs::read(&pending.path)
+                        .map_err(|error| format!("failed to re-read agent path: {error}"))?;
+                    if current != pending.original_contents {
+                        return Err(
+                            "agent file changed during external edit; refusing overwrite".into(),
+                        );
+                    }
+                    std::fs::set_permissions(
+                        pending.staging.as_ref(),
+                        pending.original_permissions.clone(),
+                    )
+                    .map_err(|error| {
+                        format!("failed to preserve agent-file permissions: {error}")
+                    })?;
+                    pending
+                        .staging
+                        .persist(&pending.path)
+                        .map(|_| ())
+                        .map_err(|error| format!("atomic replacement failed: {error}"))
+                })();
+                match commit {
                     Ok(_) => {
                         self.refresh_after_edit(cwd, Some(&agent.0));
                         if let Some(detail) = detail {
@@ -284,7 +345,7 @@ impl AgentsPage {
                         }
                     }
                     Err(error) => {
-                        self.editing = pending.draft.take();
+                        self.editing = draft;
                         self.status = Some(format!(
                             "failed to atomically commit external edit: {error}"
                         ));
@@ -589,7 +650,9 @@ impl SettingsCx {
             id,
             agent: expected,
             path,
-            staging,
+            original_contents: staging.original_contents,
+            original_permissions: staging.original_permissions,
+            staging: staging.path,
             text_before_launch: text,
             draft,
             servicing: false,
@@ -816,7 +879,9 @@ impl SettingsCx {
                 id,
                 agent: super::pointer_actions::AgentId(name.clone()),
                 path,
-                staging,
+                original_contents: staging.original_contents,
+                original_permissions: staging.original_permissions,
+                staging: staging.path,
                 text_before_launch: text,
                 draft: None,
                 servicing: false,
@@ -2327,6 +2392,15 @@ pub(super) mod tests {
             "---\ndescription: pointer fixture\n---\nbody\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                agents_dir.join("pointer-agent.md"),
+                fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+        }
         let mut dialog = agents_dialog(&tmp);
         focus(&mut dialog, "pointer-agent");
         dialog.handle_key(press(KeyCode::Enter));
@@ -2497,6 +2571,19 @@ pub(super) mod tests {
                 .contains("\nXbody"),
             "Saved atomically commits the staged edit"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(agents_dir.join("pointer-agent.md"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640,
+                "atomic replacement preserves the original mode"
+            );
+        }
         let status = page(&dialog).status.clone();
         dialog.finish_agent_external_edit(
             operation,
@@ -2560,6 +2647,63 @@ pub(super) mod tests {
                 "{outcome:?} never mutates the real agent path"
             );
         }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let mut swapped = agents_dialog(&tmp);
+            focus(&mut swapped, "pointer-agent");
+            swapped.handle_key(press(KeyCode::Enter));
+            swapped.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            swapped
+                .page
+                .handle_pointer_control(&mut swapped.cx, action.clone());
+            swapped.page.handle_pointer_control(&mut swapped.cx, action);
+            let effect = page_mut(&mut swapped)
+                .take_external_edit_request()
+                .expect("symlink-swap effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            let target = agents_dir.join("pointer-agent.md");
+            let victim = tmp.path().join("symlink-victim.md");
+            fs::write(&victim, "victim stays unchanged").unwrap();
+            fs::remove_file(&target).unwrap();
+            symlink(&victim, &target).unwrap();
+            swapped.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "victim stays unchanged"
+            );
+            assert!(page(&swapped).editing.is_some(), "draft restored on swap");
+            assert!(
+                page(&swapped)
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("symbolic link"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_rejects_initial_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        let link = tmp.path().join("link.md");
+        fs::write(&real, "real").unwrap();
+        symlink(&real, &link).unwrap();
+        let error = agent_external_edit_staging(&link)
+            .err()
+            .expect("symlink target must be rejected");
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "real");
     }
 
     #[test]

@@ -1865,6 +1865,31 @@ mod tests {
                 .await
                 .unwrap()
         );
+        db.transaction(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_media_ownership_release BEFORE UPDATE OF released_wall_ms ON media_downstream_ownership BEGIN SELECT RAISE(ABORT,'injected ownership marker failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            ledger
+                .complete_downstream_invocation("invocation-1", 4)
+                .await
+                .is_err()
+        );
+        let after_fault=db.read(|conn|Ok((
+            conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[&completed.reservation_id],|row|row.get::<_,String>(0))?,
+            conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='session' AND dimension='retained_bytes_per_session'",[],|row|row_u64(row,0))?,
+        ))).await.unwrap();
+        assert_eq!(
+            after_fault,
+            ("settling".into(), 7),
+            "release rolls back with its ownership marker"
+        );
+        db.transaction(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_media_ownership_release")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert_eq!(
             ledger
                 .complete_downstream_invocation("invocation-1", 4)

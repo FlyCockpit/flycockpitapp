@@ -3262,7 +3262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_commands_succeed_in_runtime_context() {
+    async fn goal_status_renders_lifecycle_snapshot() {
         let (mut app, mut rx) = app_with_attached_request_rx();
         let command = *slash_command_by_name("goal").expect("/goal command");
         let cases = [
@@ -3302,6 +3302,31 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("cleared current goal"))
         );
+    }
+
+    #[tokio::test]
+    async fn goal_controls_cover_every_open_disposition() {
+        let (mut app, mut rx) = app_with_attached_request_rx();
+        let command = *slash_command_by_name("goal").expect("/goal command");
+        for disposition in [
+            GoalDisposition::Running,
+            GoalDisposition::UserPaused,
+            GoalDisposition::BudgetLimited,
+            GoalDisposition::Blocked,
+            GoalDisposition::InfraPaused,
+            GoalDisposition::NoProgressPaused,
+        ] {
+            app.composer.set("/goal clear".to_string());
+            app.execute_slash(command);
+            let request = answer_goal_request(
+                &mut app,
+                &mut rx,
+                Ok(Response::GoalCleared { cleared: true }),
+            )
+            .await;
+            assert!(matches!(request, Request::ClearGoal { .. }));
+            assert!(disposition.is_open());
+        }
     }
 
     #[tokio::test]

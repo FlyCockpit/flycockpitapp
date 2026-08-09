@@ -219,10 +219,6 @@ pub fn apply_tool_surface_override(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GoalSettingsOverride {
-    /// Retained only as an in-memory UI sentinel while the old pane is being
-    /// replaced; never serialized and never applied to the global kill switch.
-    #[serde(skip)]
-    pub enabled: Option<bool>,
     #[serde(
         rename = "defaultTokenBudget",
         default,

@@ -3102,7 +3102,6 @@ async fn resume_reapplies_goal_settings_override() {
     let resumed = Session::resume(db, created.id).unwrap().unwrap();
     let override_ = stored_goal_settings_override(&resumed).unwrap();
 
-    assert_eq!(override_.enabled, None);
     assert_eq!(override_.cold_skeptic_count, Some(2));
     assert_eq!(override_.max_verification_attempts, Some(1));
 }

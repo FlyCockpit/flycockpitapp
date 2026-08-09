@@ -54,7 +54,6 @@ impl GoalSettingsDraft {
 
     fn to_override(&self) -> GoalSettingsOverride {
         GoalSettingsOverride {
-            enabled: None,
             default_token_budget: None,
             planner_model: None,
             evaluator_model: None,

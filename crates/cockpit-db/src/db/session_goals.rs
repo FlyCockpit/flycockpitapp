@@ -319,7 +319,7 @@ impl GoalLifecycle {
             disposition: GoalDisposition::Running,
             phase: Some(GoalPhase::Planning),
             resume_phase: None,
-            attempt_generation: 0,
+            attempt_generation: 1,
         }
     }
 
@@ -657,7 +657,7 @@ impl Db {
         let evidence = evidence.map(str::to_owned);
         let blocker = blocker.map(str::to_owned);
         let context_delta = context_delta.map(str::to_owned);
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let mut goal = current_goal_required(conn, session_id)?;
             if disposition == GoalDisposition::Running {
                 return Ok(GoalUpdateOutcome::Updated(Db::set_session_goal_status_conn(
@@ -742,7 +742,7 @@ impl Db {
     }
 
     pub async fn clear_session_goal(&self, session_id: Uuid) -> Result<bool> {
-        self.write(move |conn| Db::clear_session_goal_conn(conn, session_id))
+        self.transaction(move |conn| Db::clear_session_goal_conn(conn, session_id))
             .await
     }
 
@@ -857,8 +857,10 @@ impl Db {
         ) {
             anyhow::bail!("set_session_goal_status supports active or paused");
         }
-        self.write(move |conn| Db::set_session_goal_status_conn(conn, session_id, disposition))
-            .await
+        self.transaction(move |conn| {
+            Db::set_session_goal_status_conn(conn, session_id, disposition)
+        })
+        .await
     }
 
     pub async fn refresh_session_goal_usage(&self, session_id: Uuid) -> Result<()> {
@@ -1002,7 +1004,7 @@ impl Db {
     /// Crash recovery is intentionally fail-closed: pre-crash work is never
     /// redispatched, and the interrupted phase is retained for explicit resume.
     pub async fn restore_supervised_goals(&self, session_id: Uuid) -> Result<Option<SessionGoal>> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let Some(goal) = Db::current_session_goal_conn(conn, session_id, false)? else { return Ok(None); };
             if goal.disposition != GoalDisposition::Running { return Ok(Some(goal)); }
             let now = Utc::now().timestamp();
@@ -1029,7 +1031,7 @@ impl Db {
         &self,
         session_id: Uuid,
     ) -> Result<Option<SessionGoal>> {
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let Some(goal) = Db::current_session_goal_conn(conn, session_id, false)? else { return Ok(None); };
             if goal.disposition != GoalDisposition::Running { return Ok(Some(goal)); }
             let now = Utc::now().timestamp();
@@ -1042,7 +1044,7 @@ impl Db {
 
     pub async fn purge_cleared_goal_tombstones(&self, now: i64) -> Result<usize> {
         const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let cutoff = now.saturating_sub(RETENTION_SECONDS);
             let mut statement = conn.prepare(
                 "SELECT id FROM session_goals g WHERE disposition = 'cleared' AND cleared_at <= ?1
@@ -1067,7 +1069,7 @@ impl Db {
         output: Result<&str, &str>,
     ) -> Result<Option<SessionGoal>> {
         let output = output.map(str::to_owned).map_err(str::to_owned);
-        self.write(move |conn| {
+        self.transaction(move |conn| {
             let Some(goal) = conn.query_row(
                 &format!("SELECT {GOAL_SELECT} FROM session_goals WHERE id = ?1"),
                 params![job.goal_id.to_string()], decode_goal,
@@ -1211,19 +1213,21 @@ impl Db {
         }
         let now = Utc::now().timestamp();
         let goal = current_goal_required(conn, session_id)?;
-        let (phase, resume_phase, generation) = match disposition {
-            GoalDisposition::UserPaused => (
-                None,
-                goal.phase.or(goal.resume_phase),
-                goal.attempt_generation,
-            ),
-            GoalDisposition::Running => (
-                goal.resume_phase.or(Some(GoalPhase::Executing)),
-                None,
-                goal.attempt_generation + 1,
-            ),
-            _ => unreachable!(),
-        };
+        if goal.disposition == disposition {
+            return Ok(goal);
+        }
+        let lifecycle = GoalLifecycle {
+            disposition: goal.disposition,
+            phase: goal.phase,
+            resume_phase: goal.resume_phase,
+            attempt_generation: goal.attempt_generation,
+        }
+        .apply(if disposition == GoalDisposition::UserPaused {
+            GoalLifecycleEvent::UserPause
+        } else {
+            GoalLifecycleEvent::UserResume
+        })?
+        .lifecycle;
         if disposition == GoalDisposition::UserPaused {
             conn.execute(
                 "UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'user', updated_at = ?1
@@ -1242,9 +1246,9 @@ impl Db {
                     attempt_generation = ?4, updated_at = ?5 WHERE id = ?6",
             params![
                 disposition.as_str(),
-                phase.map(GoalPhase::as_str),
-                resume_phase.map(GoalPhase::as_str),
-                generation,
+                lifecycle.phase.map(GoalPhase::as_str),
+                lifecycle.resume_phase.map(GoalPhase::as_str),
+                lifecycle.attempt_generation,
                 now,
                 goal.id.to_string()
             ],
@@ -1971,5 +1975,132 @@ mod tests {
         let snapshot = goal.compaction_snapshot();
         assert!(snapshot.objective.len() <= 512);
         assert_eq!(goal, before);
+    }
+
+    async fn evaluator_fixture() -> (Db, SessionGoal, GoalControlJob) {
+        let (db, _, planner) = planning_fixture().await;
+        let raw = serde_json::to_string(&contract()).unwrap();
+        let executing = db
+            .finish_goal_control_job(planner, Ok(&raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        let evaluating = db
+            .finish_goal_root_turn(executing.id, executing.attempt_generation, turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = db
+            .lease_goal_control_job(
+                evaluating.id,
+                evaluating.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (db, evaluating, job)
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_drives_turn_outcomes() {
+        let (db, _, job) = evaluator_fixture().await;
+        let updated = db
+            .finish_goal_control_job(
+                job,
+                Ok(r#"{"decision":"continue","next_step":"inspect output"}"#),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.phase, Some(GoalPhase::Executing));
+        assert!(
+            updated
+                .evaluator_outcome_json
+                .as_deref()
+                .is_some_and(|json| json.contains("inspect output"))
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_evaluator_failure_never_falls_back_to_model_completion() {
+        let (db, _, job) = evaluator_fixture().await;
+        let updated = db
+            .finish_goal_control_job(job, Ok("malformed"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.disposition, GoalDisposition::InfraPaused);
+        assert_eq!(
+            updated.pause_reason,
+            Some(GoalPauseReason::EvaluatorFailure)
+        );
+        assert_eq!(updated.resume_phase, Some(GoalPhase::Evaluating));
+    }
+
+    #[tokio::test]
+    async fn goal_late_control_result_is_ignored_for_non_running_goal() {
+        let (db, evaluating, job) = evaluator_fixture().await;
+        db.set_session_goal_status(evaluating.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        assert!(
+            db.finish_goal_control_job(
+                job,
+                Ok(r#"{"decision":"candidate_complete","evidence":"stale"}"#),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_root_failure_infra_pauses_without_continuation() {
+        let (db, _, planner) = planning_fixture().await;
+        let raw = serde_json::to_string(&contract()).unwrap();
+        let executing = db
+            .finish_goal_control_job(planner, Ok(&raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        assert!(
+            db.fail_goal_root_turn(executing.id, executing.attempt_generation, turn)
+                .await
+                .unwrap()
+        );
+        let paused = db
+            .current_session_goal(executing.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.disposition, GoalDisposition::InfraPaused);
+        assert_eq!(paused.pause_reason, Some(GoalPauseReason::RootTurnFailure));
+    }
+
+    #[tokio::test]
+    async fn goal_cleared_tombstone_retains_for_30_days_then_purges_without_jobs() {
+        let (db, goal, _) = planning_fixture().await;
+        assert!(db.clear_session_goal(goal.session_id).await.unwrap());
+        let now = Utc::now().timestamp();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE session_goals SET cleared_at = ?1 WHERE id = ?2",
+                params![now - 31 * 86_400, goal.id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.purge_cleared_goal_tombstones(now).await.unwrap(), 1);
     }
 }

@@ -300,14 +300,12 @@ fn goal_settings_effective_resolution_session_over_agent_over_global() {
         ..Default::default()
     };
     let agent = GoalSettingsOverride {
-        enabled: Some(false),
         cold_skeptic_count: Some(4),
         cold_skeptic_model: Some("agent/model".to_string()),
         max_verification_attempts: Some(5),
         ..Default::default()
     };
     let session = GoalSettingsOverride {
-        enabled: Some(true),
         cold_skeptic_count: None,
         cold_skeptic_model: Some("session/model".to_string()),
         max_verification_attempts: None,

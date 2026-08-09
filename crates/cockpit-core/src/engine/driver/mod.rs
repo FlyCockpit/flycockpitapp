@@ -1304,7 +1304,8 @@ impl Driver {
             goal_usage_limit_auto_resume_attempts: self.goal_usage_limit_auto_resume_attempts,
             goal_supervision_round: self.goal_supervision_round.clone(),
             goal_root_turn: self.goal_root_turn,
-            goal_scratch: self.goal_scratch.clone(),
+            // Forks never own or clean the root driver's supervised-goal scratch.
+            goal_scratch: None,
             pending_idle_reason: self.pending_idle_reason.clone(),
             interrupts: self.interrupts.clone(),
             skills_no_utility_model_logged: self.skills_no_utility_model_logged,

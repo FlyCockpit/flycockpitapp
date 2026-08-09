@@ -5,21 +5,29 @@ use uuid::Uuid;
 
 const ROLES: [&str; 4] = ["planner", "worker", "evaluator", "skeptic"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GoalScratchRoot {
+    parent: PathBuf,
     root: PathBuf,
 }
 
 impl GoalScratchRoot {
     pub fn create(goal_id: Uuid) -> Result<Self> {
         let parent = std::env::temp_dir().join("cockpit-goals");
+        Self::create_in(&parent, goal_id)
+    }
+
+    pub fn create_in(parent: &Path, goal_id: Uuid) -> Result<Self> {
         create_checked_dir(&parent)?;
         let root = parent.join(goal_id.to_string());
         create_checked_dir(&root)?;
         for role in ROLES {
             create_checked_dir(&root.join(role))?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            parent: parent.to_path_buf(),
+            root,
+        })
     }
 
     pub fn role(&self, role: &str) -> Result<PathBuf> {
@@ -33,10 +41,44 @@ impl GoalScratchRoot {
 
     pub fn cleanup(self) -> Result<()> {
         verify_checked_dir(&self.root)?;
-        if self.root.parent() != Some(std::env::temp_dir().join("cockpit-goals").as_path()) {
+        verify_checked_dir(&self.parent)?;
+        if self.root.parent() != Some(self.parent.as_path()) {
             bail!("refusing to remove goal scratch outside the private root");
         }
         std::fs::remove_dir_all(&self.root).context("removing terminal goal scratch root")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_scratch_root_rejects_symlink_and_cleans_terminal_root() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("goals");
+        let scratch = GoalScratchRoot::create_in(&parent, Uuid::nil()).unwrap();
+        let root = scratch.root.clone();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::remove_dir(root.join("planner")).unwrap();
+        symlink(&target, root.join("planner")).unwrap();
+        assert!(scratch.role("planner").is_err());
+        std::fs::remove_file(root.join("planner")).unwrap();
+        std::fs::create_dir(root.join("planner")).unwrap();
+        set_private(&root.join("planner")).unwrap();
+        scratch.cleanup().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn goal_scratch_root_rejects_windows_reparse_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = GoalScratchRoot::create_in(&temp.path().join("goals"), Uuid::nil()).unwrap();
+        assert!(scratch.role("planner").is_ok());
     }
 }
 

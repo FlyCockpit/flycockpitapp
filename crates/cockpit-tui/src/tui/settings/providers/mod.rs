@@ -2923,7 +2923,7 @@ impl SettingsCx {
                 }
                 if s.is_step("headers") {
                     lines.push(Line::default());
-                    render_header_editor(&mut lines, &s.headers);
+                    let _ = render_header_editor(&mut lines, &s.headers);
                 }
                 if s.is_step("url")
                     && let Some(hint) = t.hint
@@ -3275,7 +3275,10 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
-        render_header_editor(&mut lines, editor);
+        let mut bindings = render_header_editor(&mut lines, editor);
+        if editor.is_editing() {
+            bindings.clear();
+        }
         if let Some(status) = &editor.status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -3284,8 +3287,16 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:headers", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:headers",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:headers"),
+        );
         if editor.is_editing() {
             render_header_edit_popup(frame, area, editor);
         }
@@ -3312,7 +3323,10 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
-        render_model_editor(&mut lines, editor);
+        let mut bindings = render_model_editor(&mut lines, editor);
+        if editor.is_editing() {
+            bindings.clear();
+        }
         render_model_fetch_status_block(&mut lines, &parent.entry, Utc::now());
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -3330,8 +3344,16 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:models", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:models",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:models"),
+        );
         if editor.is_editing() {
             render_model_edit_popup(frame, area, editor);
         }
@@ -3696,9 +3718,13 @@ fn spinner_glyph(tick: usize) -> &'static str {
 /// Render a [`HeaderEditor`] as rows + `[+ add header]` + (optional)
 /// `[continue →]`. The active cursor row is highlighted in yellow; the
 /// in-flight name/value buffer (when editing) replaces the row's value.
-fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
+fn render_header_editor(
+    lines: &mut Vec<Line<'static>>,
+    h: &HeaderEditor,
+) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
+    let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Headers:".to_string(),
         Style::default().add_modifier(Modifier::BOLD),
@@ -3719,6 +3745,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((lines.len(), SettingsControlId(i as u64)));
         lines.push(Line::from(vec![
             Span::raw(marker.to_string()),
             Span::styled(format!("{:<width$}", row.name, width = name_w), name_style),
@@ -3735,6 +3762,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
     } else {
         muted
     };
+    bindings.push((lines.len(), SettingsControlId(add_idx as u64)));
     lines.push(Line::from(vec![
         Span::raw(add_marker.to_string()),
         Span::styled("[+ add header]".to_string(), add_style),
@@ -3748,6 +3776,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
         } else {
             muted
         };
+        bindings.push((lines.len(), SettingsControlId(cont_idx as u64)));
         lines.push(Line::from(vec![
             Span::raw(marker.to_string()),
             Span::styled("[continue → save & fetch /models]".to_string(), style),
@@ -3757,8 +3786,10 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
     // `[save changes]` row on the Edit-page sub-page (mutually exclusive
     // with `[continue →]`). Styled like MCP Add's button.
     if let Some(save_idx) = h.save_idx() {
+        bindings.push((lines.len(), SettingsControlId(save_idx as u64)));
         lines.push(save_button_line("[save changes]", h.cursor == save_idx));
     }
+    bindings
 }
 
 /// Centered name/value popup for adding or editing a header. Drawn on
@@ -3854,10 +3885,14 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
 /// Render a [`ModelEditor`] as rows + `[+ add model]`. Each row shows the
 /// model id, an `M` tag for manual entries, the display name, and the
 /// context length when set. The active cursor row is highlighted.
-fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
+fn render_model_editor(
+    lines: &mut Vec<Line<'static>>,
+    m: &ModelEditor,
+) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
+    let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Provider models:".to_string(),
         Style::default().add_modifier(Modifier::BOLD),
@@ -3891,6 +3926,7 @@ fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
                 }
                 detail.push_str(&format!("ctx {ctx}"));
             }
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker.to_string()),
                 Span::styled(format!("{tag} "), green),
@@ -3909,13 +3945,16 @@ fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
     } else {
         muted
     };
+    bindings.push((lines.len(), SettingsControlId(add_idx as u64)));
     lines.push(Line::from(vec![
         Span::raw(add_marker.to_string()),
         Span::styled("[+ add model]".to_string(), add_style),
     ]));
 
     // `[save changes]` row, styled like MCP Add's button.
+    bindings.push((lines.len(), SettingsControlId(m.save_idx() as u64)));
     lines.push(save_button_line("[save changes]", m.cursor == m.save_idx()));
+    bindings
 }
 
 fn render_model_fetch_status_block(
@@ -4231,6 +4270,21 @@ impl SettingsPage for ProvidersPage {
             {
                 editor.cursor = index;
             }
+            ProvidersPage::Headers { editor, .. }
+                if !editor.is_editing()
+                    && index
+                        <= editor
+                            .save_idx()
+                            .or_else(|| editor.continue_idx())
+                            .unwrap_or_else(|| editor.add_row_idx()) =>
+            {
+                editor.cursor = index;
+            }
+            ProvidersPage::Models { editor, .. }
+                if !editor.is_editing() && index <= editor.save_idx() =>
+            {
+                editor.cursor = index;
+            }
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4275,6 +4329,23 @@ impl SettingsPage for ProvidersPage {
                 }
                 _ => {}
             }
+        } else if region == SettingsScrollRegionId("providers:headers")
+            && let ProvidersPage::Headers { editor, .. } = self
+            && !editor.is_editing()
+        {
+            let last = editor
+                .save_idx()
+                .or_else(|| editor.continue_idx())
+                .unwrap_or_else(|| editor.add_row_idx());
+            editor.cursor = editor.cursor.saturating_add_signed(delta).min(last);
+        } else if region == SettingsScrollRegionId("providers:models")
+            && let ProvidersPage::Models { editor, .. } = self
+            && !editor.is_editing()
+        {
+            editor.cursor = editor
+                .cursor
+                .saturating_add_signed(delta)
+                .min(editor.save_idx());
         }
         Nav::Stay
     }

@@ -228,6 +228,7 @@ async fn run_iteration(
             // Loop-fork iterations are out of the tandem-shadow scope.
             None,
             None,
+            None,
             turn_tx,
         )
         .await?;

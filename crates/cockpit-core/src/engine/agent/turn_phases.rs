@@ -975,6 +975,7 @@ pub(crate) async fn run_turn(
                     wire_api: model.wire_api_label(),
                     routing_metadata: model.routing_metadata_json(None),
                     emit_inference_error_ui,
+                    goal_provenance,
                     tx,
                 },
                 &e,

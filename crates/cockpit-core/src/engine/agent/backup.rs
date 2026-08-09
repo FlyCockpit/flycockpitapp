@@ -326,6 +326,7 @@ pub(super) struct InferenceOutcomeRecord<'a> {
     pub(super) wire_api: &'a str,
     pub(super) routing_metadata: Value,
     pub(super) emit_inference_error_ui: bool,
+    pub(super) goal_provenance: Option<(Uuid, i64)>,
     pub(super) tx: &'a mpsc::Sender<TurnEvent>,
 }
 
@@ -341,6 +342,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
         wire_api,
         routing_metadata,
         emit_inference_error_ui,
+        goal_provenance,
         tx,
     } = ctx;
 
@@ -356,6 +358,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
             call_id,
             cancelled,
             InferenceRequestStatus::Cancelled,
+            goal_provenance,
         )
         .await
         {
@@ -376,6 +379,7 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
             call_id,
             errored,
             InferenceRequestStatus::Errored,
+            goal_provenance,
         )
         .await
         {
@@ -396,7 +400,9 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
             "failed_ms": failure.elapsed_ms,
         }),
     );
-    if let Err(e) = record_inference_request_async(session.clone(), call_id, terminal, status).await
+    if let Err(e) =
+        record_inference_request_async(session.clone(), call_id, terminal, status, goal_provenance)
+            .await
     {
         tracing::warn!(error = %e, "record_inference_request (terminal failure) failed");
     }
@@ -529,6 +535,7 @@ mod inference_outcome_tests {
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
                 emit_inference_error_ui: true,
+                goal_provenance: None,
                 tx: &tx,
             },
             &err,
@@ -603,6 +610,7 @@ mod inference_outcome_tests {
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
                 emit_inference_error_ui: true,
+                goal_provenance: None,
                 tx: &tx,
             },
             &err,
@@ -692,6 +700,7 @@ mod inference_outcome_tests {
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
                 emit_inference_error_ui: false,
+                goal_provenance: None,
                 tx: &tx,
             },
             &err,
@@ -732,6 +741,7 @@ mod inference_outcome_tests {
                 wire_api: "responses",
                 routing_metadata: serde_json::json!({}),
                 emit_inference_error_ui: true,
+                goal_provenance: None,
                 tx: &tx,
             },
             &err,

@@ -1011,7 +1011,9 @@ async fn goal_rpc_reads_sets_and_clears() {
     assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
     assert!(goal.lifecycle_history.len() >= 2);
     assert_eq!(
-        goal.lifecycle_history.last().and_then(|entry| entry.reason),
+        goal.lifecycle_history
+            .last()
+            .and_then(|entry| entry.reason.clone()),
         Some(proto::GoalPauseReason::User)
     );
 

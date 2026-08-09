@@ -297,6 +297,7 @@ struct GoalSupervisionRound {
     jobs: HashMap<String, crate::db::session_goals::GoalControlJob>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct GoalProgressObservation {
     observed_turn: bool,
@@ -304,6 +305,7 @@ struct GoalProgressObservation {
     context_delta: bool,
 }
 
+#[cfg(test)]
 impl GoalProgressObservation {
     fn no_progress(self) -> bool {
         self.observed_turn && !self.mutating_action && !self.context_delta
@@ -4094,6 +4096,7 @@ impl Driver {
         Ok(observation)
     }
 
+    #[cfg(test)]
     fn goal_event_is_mutating_action(data: &serde_json::Value) -> bool {
         let Some(tool) = data.get("tool").and_then(serde_json::Value::as_str) else {
             return false;
@@ -4110,6 +4113,7 @@ impl Driver {
         }
     }
 
+    #[cfg(test)]
     fn goal_event_has_context_delta(data: &serde_json::Value) -> bool {
         data.get("tool")
             .and_then(serde_json::Value::as_str)
@@ -4126,6 +4130,7 @@ impl Driver {
                 .is_some_and(|delta| !delta.trim().is_empty())
     }
 
+    #[cfg(test)]
     fn goal_bash_command_is_mutating(command: &str) -> bool {
         let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
         normalized == "git commit"
@@ -4149,15 +4154,6 @@ impl Driver {
             }
         }
         !extract_text(content).trim().is_empty()
-    }
-
-    fn root_last_user_text(&self) -> Option<String> {
-        use crate::engine::message::{Message, extract_user_text};
-        let root = self.stack.first()?;
-        let Message::User { content } = root.history.last()? else {
-            return None;
-        };
-        Some(extract_user_text(content))
     }
 
     async fn is_goal_intervention_continue(&self, text: &str) -> bool {

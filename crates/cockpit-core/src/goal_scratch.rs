@@ -7,6 +7,7 @@ const ROLES: [&str; 4] = ["planner", "worker", "evaluator", "skeptic"];
 
 #[derive(Debug)]
 pub struct GoalScratchRoot {
+    #[cfg(not(unix))]
     parent: PathBuf,
     root: PathBuf,
     #[cfg(unix)]
@@ -95,7 +96,6 @@ fn create_in_unix(parent: &Path, goal_id: Uuid) -> Result<GoalScratchRoot> {
         openat_private_dir(&root_handle, role)?;
     }
     Ok(GoalScratchRoot {
-        parent: parent.to_path_buf(),
         root: parent.join(&root_name),
         parent_handle,
         root_handle,

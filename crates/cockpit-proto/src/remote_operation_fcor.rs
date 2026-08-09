@@ -195,6 +195,94 @@ impl CanonicalFcorValueV1 for std::collections::HashMap<String, String> {
     }
 }
 
+impl CanonicalFcorValueV1 for crate::remote_protocol_id::RemoteTransferId {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.0.extend_from_slice(self.as_bytes());
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::remote_transport::bulk::RemoteBulkTransferRef {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        self.transfer_id.encode_fcor_value_v1(&mut nested)?;
+        nested.push_u64(self.total_length.value());
+        nested.0.extend_from_slice(&self.sha256);
+        nested.push_u8(self.mime_class.code());
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+macro_rules! canonical_unit_enum16 {
+    ($ty:ty, { $($variant:ident = $code:literal),+ $(,)? }) => {
+        impl CanonicalFcorValueV1 for $ty {
+            fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+                let code: u16 = match self { $(Self::$variant => $code),+ };
+                out.push_u16(code);
+                Ok(())
+            }
+        }
+    };
+}
+
+canonical_unit_enum16!(crate::EnvDriftPolicy, {
+    Daemon = 1,
+    Client = 2,
+    UpdateDaemon = 3,
+    ErrorOnDrift = 4,
+});
+canonical_unit_enum16!(crate::CaffeinateMode, {
+    Toggle = 1,
+    On = 2,
+    Off = 3,
+    UntilIdle = 4,
+});
+canonical_unit_enum16!(crate::WorkspaceTrustMode, {
+    Trust = 1,
+    IgnoreConfig = 2,
+    Untrusted = 3,
+});
+canonical_unit_enum16!(crate::AppFlagKey, { DaemonAutostartNotice = 1 });
+canonical_unit_enum16!(crate::AssistantSessionResolutionMode, {
+    MostRecentOrCreate = 1
+});
+canonical_unit_enum16!(crate::ExportSessionKind, {
+    TranscriptJson = 1,
+    DebugBundle = 2,
+});
+canonical_unit_enum16!(crate::StatsRange, {
+    Last7Days = 1,
+    AllTime = 2,
+});
+canonical_unit_enum16!(crate::UsageKind, {
+    Model = 1,
+    Slash = 2,
+    Tag = 3,
+});
+canonical_unit_enum16!(crate::LspControlAction, {
+    Check = 1,
+    Install = 2,
+    Uninstall = 3,
+    Restart = 4,
+});
+canonical_unit_enum16!(crate::ActiveModelSwitchTrigger, {
+    Picker = 1,
+    Quick = 2,
+    Cycle = 3,
+    Daemon = 4,
+});
+canonical_unit_enum16!(cockpit_config::config::providers::PromptCacheRetention, {
+    Default = 1,
+    Extended = 2,
+});
+canonical_unit_enum16!(cockpit_config::config::providers::ThinkingMode, {
+    Off = 1,
+    Low = 2,
+    Medium = 3,
+    High = 4,
+});
+
 impl CanonicalParamsV1 {
     pub fn new() -> Self {
         Self::default()

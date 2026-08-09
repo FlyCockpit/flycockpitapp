@@ -75,6 +75,16 @@ impl TargetTriple {
             Self::Windows => "x86_64-pc-windows-msvc",
         }
     }
+
+    const fn arboard_image_target(self) -> &'static str {
+        match self {
+            Self::Linux => {
+                "cfg(all(unix, not(any(target_os = \"macos\", target_os = \"android\", target_os = \"emscripten\"))))"
+            }
+            Self::Macos => "cfg(target_os = \"macos\")",
+            Self::Windows => "cfg(windows)",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -92,6 +102,56 @@ struct EdgeFixture {
     to: String,
     target: TargetTriple,
     provenance: Provenance,
+}
+
+fn exact_target_dependency<'a>(
+    dependencies: &'a [serde_json::Value],
+    name: &str,
+    target: TargetTriple,
+) -> &'a serde_json::Value {
+    let matches = dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency["name"] == name
+                && dependency["target"].as_str() == Some(target.arboard_image_target())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one {name} dependency for {} with condition {}",
+        target.as_str(),
+        target.arboard_image_target()
+    );
+    matches[0]
+}
+
+#[test]
+fn arboard_target_dependency_selection_is_exact_and_order_independent() {
+    let dependencies = serde_json::json!([
+        {
+            "name": "image",
+            "target": "cfg(all(unix, not(any(target_os = \"macos\", target_os = \"android\", target_os = \"emscripten\"))))",
+            "features": ["png"]
+        },
+        {
+            "name": "image",
+            "target": "cfg(target_os = \"macos\")",
+            "features": ["tiff"]
+        }
+    ]);
+    let dependencies = dependencies.as_array().unwrap();
+    assert_eq!(
+        exact_target_dependency(dependencies, "image", TargetTriple::Macos)["features"],
+        serde_json::json!(["tiff"])
+    );
+
+    let mut reversed = dependencies.clone();
+    reversed.reverse();
+    assert_eq!(
+        exact_target_dependency(&reversed, "image", TargetTriple::Macos)["features"],
+        serde_json::json!(["tiff"])
+    );
 }
 
 fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format: &str) -> String {
@@ -316,10 +376,7 @@ fn target_package_features(
             );
             let key = format!("{name}@{version}");
             if depth == 0 {
-                assert_eq!(
-                    key, expected_root,
-                    "cargo feature-tree root package drift"
-                );
+                assert_eq!(key, expected_root, "cargo feature-tree root package drift");
             }
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
@@ -372,7 +429,10 @@ fn target_package_features(
                 .any(|package| package.starts_with(&package_prefix)),
             "cargo feature tree contains activation for package outside normal/build graph: {subject}"
         );
-        assert!(depth > 0, "cargo feature-tree root must be a package row: {line}");
+        assert!(
+            depth > 0,
+            "cargo feature-tree root must be a package row: {line}"
+        );
         feature_nodes.push((
             depth,
             package_name.to_owned(),
@@ -386,7 +446,10 @@ fn target_package_features(
         let Some(feature) = feature else { continue };
         let identity = (package_name.clone(), feature.clone());
         if *duplicate {
-            let matches = resolved_activations.get(&identity).cloned().unwrap_or_default();
+            let matches = resolved_activations
+                .get(&identity)
+                .cloned()
+                .unwrap_or_default();
             assert_eq!(
                 matches.len(),
                 1,
@@ -396,7 +459,9 @@ fn target_package_features(
             continue;
         }
         let Some((child_depth, child_key, child_feature, _)) = feature_nodes.get(index + 1) else {
-            panic!("cargo feature activation has no package child: {package_name} feature \"{feature}\"");
+            panic!(
+                "cargo feature activation has no package child: {package_name} feature \"{feature}\""
+            );
         };
         assert!(
             child_feature.is_none() && *child_depth == depth + 1,
@@ -466,8 +531,8 @@ fn target_package_feature_inventory_rejects_unobserved_packages() {
 }
 
 #[test]
-#[should_panic(expected =
-    "feature activation is absent from child resolved feature set: png feature \"fake\""
+#[should_panic(
+    expected = "feature activation is absent from child resolved feature set: png feature \"fake\""
 )]
 fn target_package_feature_inventory_rejects_unreported_activations() {
     target_package_features(
@@ -619,7 +684,10 @@ fn dependency_tree_graph(
             "cargo tree row has a noncanonical depth: {line}"
         );
         if ancestors.is_empty() {
-            assert_eq!(depth, 0, "cargo tree first row must have depth zero: {line}");
+            assert_eq!(
+                depth, 0,
+                "cargo tree first row must have depth zero: {line}"
+            );
         } else {
             assert!(depth > 0, "cargo tree contains multiple roots: {line}");
             assert!(
@@ -708,7 +776,7 @@ fn dependency_tree_graph_rejects_depth_jumps() {
 #[should_panic(expected = "cargo tree duplicate marker node has a child")]
 fn dependency_tree_graph_requires_duplicate_markers_to_be_leaves() {
     dependency_tree_graph(
-        "0image v0.25.10\n1png v0.18.0 (*)\n2miniz_oxide v0.8.0\n",
+        "0image v0.25.10\n1png v0.18.0\n1jpeg v0.1.0\n2png v0.18.0 (*)\n3miniz_oxide v0.8.0\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
         "image@0.25.10",
@@ -970,13 +1038,12 @@ fn tui_image_codec_dependency_inventory() {
         // build edge; a normal-only view silently drops both that edge and its
         // package even though Cargo resolves and executes it for this graph.
         let dependency_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal,build", "{p}");
-        let (graph_packages, graph_edges) =
-            dependency_tree_graph(
-                &dependency_tree,
-                target,
-                Provenance::ImageDescendant,
-                "image@0.25.10",
-            );
+        let (graph_packages, graph_edges) = dependency_tree_graph(
+            &dependency_tree,
+            target,
+            Provenance::ImageDescendant,
+            "image@0.25.10",
+        );
         let feature_tree = cargo_tree(workspace, triple, "image@0.25.10", "features", "{p}|{f}");
         let target_package_features =
             target_package_features(&feature_tree, &graph_packages, "image@0.25.10");
@@ -1177,23 +1244,8 @@ fn tui_image_codec_dependency_inventory() {
             .iter()
             .find(|package| package["name"] == "arboard")
             .unwrap();
-        let target_marker = match triple {
-            "x86_64-unknown-linux-gnu" => "all(unix",
-            "aarch64-apple-darwin" => "target_os = \"macos\"",
-            "x86_64-pc-windows-msvc" => "windows",
-            _ => unreachable!(),
-        };
-        let arboard_image = arboard["dependencies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|dependency| {
-                dependency["name"] == "image"
-                    && dependency["target"]
-                        .as_str()
-                        .is_some_and(|target| target.contains(target_marker))
-            })
-            .unwrap();
+        let arboard_image =
+            exact_target_dependency(arboard["dependencies"].as_array().unwrap(), "image", target);
         let mut arboard_features = arboard_image["features"].as_array().unwrap().clone();
         arboard_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
         let mut expected_arboard = expected
@@ -1221,8 +1273,8 @@ fn tui_image_codec_dependency_inventory() {
                 "macOS image root must retain the independently resolved TIFF feature"
             );
             assert!(
-                !arboard_feature_names.contains("tiff"),
-                "macOS TIFF activation must not be conflated with arboard requester provenance"
+                arboard_feature_names.contains("tiff"),
+                "macOS TIFF activation must be attributed to arboard requester provenance"
             );
         }
     }

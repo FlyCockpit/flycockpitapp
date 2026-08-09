@@ -533,9 +533,8 @@ impl ActionFixtureKey {
             Self::Providers(ProvidersFixture::WizardCopilotNoControl) => {
                 ExpectedReducerOutcome::NoPointerControl
             }
-            Self::List(ListFixture::MoveUp | ListFixture::MoveDown) => {
-                ExpectedReducerOutcome::Contextual
-            }
+            Self::List(ListFixture::MoveUp | ListFixture::MoveDown)
+            | Self::DefaultModel(DefaultModelFixture::Clear) => ExpectedReducerOutcome::Contextual,
             Self::Root(_)
             | Self::Category(_)
             | Self::Agents(_)
@@ -547,7 +546,7 @@ impl ActionFixtureKey {
             | Self::Lsp(_)
             | Self::List(_)
             | Self::Utility(_)
-            | Self::DefaultModel(_) => ExpectedReducerOutcome::Enabled,
+            | Self::DefaultModel(DefaultModelFixture::Choose) => ExpectedReducerOutcome::Enabled,
         }
     }
 }

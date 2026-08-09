@@ -1490,13 +1490,26 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
         match kind {
-            StringListKind::AgentDirs => dialog.extended.agent_dirs.push("界🙂".into()),
+            StringListKind::AgentDirs => {
+                dialog.extended.agent_dirs.clear();
+                dialog.extended.agent_dirs.push("界🙂".into());
+            }
             StringListKind::ExtraDotenvPaths => {
+                dialog.extended.redact.extra_dotenv_paths.clear();
                 dialog.extended.redact.extra_dotenv_paths.push("one".into())
             }
-            StringListKind::RedactDenylist => dialog.extended.redact.denylist.push("one".into()),
-            StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.push("ONE".into()),
-            StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.push("one".into()),
+            StringListKind::RedactDenylist => {
+                dialog.extended.redact.denylist.clear();
+                dialog.extended.redact.denylist.push("one".into());
+            }
+            StringListKind::RedactAllowlist => {
+                dialog.extended.redact.allowlist.clear();
+                dialog.extended.redact.allowlist.push("ONE".into());
+            }
+            StringListKind::GitignoreAllow => {
+                dialog.extended.gitignore_allow.clear();
+                dialog.extended.gitignore_allow.push("one".into());
+            }
         }
         dialog.page = super::string_list_page(match kind {
             StringListKind::AgentDirs => StringListPage::agent_dirs(),
@@ -1528,7 +1541,7 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
 
         let rows = render_settings_rows(&dialog, 90, 30).join("\n");
         let name = if kind == StringListKind::RedactDenylist {
-            "replacement #1"
+            "******** #1"
         } else if kind == StringListKind::RedactAllowlist {
             "ONE"
         } else if kind == StringListKind::AgentDirs {
@@ -1613,9 +1626,11 @@ fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
         if redact {
+            dialog.extended.redact.dotenv_patterns.clear();
             dialog.extended.redact.dotenv_patterns.push("*.env".into());
             dialog.page = Box::new(super::ui_page::RedactPatternsPage::new());
         } else {
+            dialog.extended.agent_guidance_files.clear();
             dialog
                 .extended
                 .agent_guidance_files

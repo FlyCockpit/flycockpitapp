@@ -4,6 +4,13 @@ import {
   type TerminalDaemonPayload,
   terminalDaemonPayloadSchema,
 } from "@flycockpit/relay-protocol/terminal";
+import {
+  TerminalFileIngressController,
+  type TerminalIngressIdentity,
+  type TerminalIngressReceipt,
+  type TerminalIngressRequest,
+  type TerminalIngressTransport,
+} from "./terminal-file-ingress";
 
 export type TerminalClientStatus = "idle" | "connecting" | "open" | "reattachable" | "closed";
 
@@ -33,8 +40,6 @@ type TerminalClientOptions = {
   terminalId?: string;
 };
 
-const CHUNK_BYTES = 48 * 1024;
-
 export class TerminalClient {
   private ws: WebSocket | null = null;
   private listeners = new Map<keyof TerminalClientEvents, Set<AnyListener>>();
@@ -43,23 +48,30 @@ export class TerminalClient {
   private ingressWaiters = new Map<
     string,
     {
-      resolve: (state: { state: "prepared" | "committed"; nextOffset: number }) => void;
+      resolve: (state: TerminalIngressReceipt) => void;
       reject: (error: Error) => void;
-      timer: number;
+      removeAbort: () => void;
     }
   >();
   private terminalGeneration: number | null = null;
-  private pendingIngress: {
-    operationId: string;
-    mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-    size: number;
-    sha256: string;
-    terminalGeneration: number;
-  } | null = null;
+  private readonly ingress: TerminalFileIngressController;
   private closedByUser = false;
 
   constructor(private readonly options: TerminalClientOptions) {
     this.terminalId = options.terminalId ?? null;
+    this.ingress = new TerminalFileIngressController(
+      this.ingressTransport(),
+      () => this.ingressIdentity(),
+      undefined,
+      (snapshot) => {
+        if (!snapshot || snapshot.phase === "Queued") return;
+        this.emit("attachmentProgress", {
+          operationId: snapshot.operationId,
+          receivedBytes: snapshot.nextOffset,
+          totalBytes: snapshot.size,
+        });
+      },
+    );
   }
 
   on<K extends keyof TerminalClientEvents>(event: K, listener: Listener<K>): () => void {
@@ -102,10 +114,19 @@ export class TerminalClient {
 
     ws.addEventListener("close", () => {
       this.ws = null;
-      this.emit(
-        "status",
-        this.closedByUser ? "closed" : this.terminalId ? "reattachable" : "closed",
-      );
+      if (this.closedByUser) {
+        this.emit("status", "closed");
+        return;
+      }
+      if (!this.terminalId) {
+        this.emit("status", "closed");
+        this.ingress.updateIdentity(null);
+        return;
+      }
+      this.emit("status", "connecting");
+      queueMicrotask(() => {
+        if (!this.closedByUser && !this.ws) this.connect();
+      });
     });
 
     ws.addEventListener("error", () => {
@@ -138,6 +159,7 @@ export class TerminalClient {
 
   close() {
     this.closedByUser = true;
+    this.ingress.cancelAll();
     if (this.binding)
       this.sendPayload({
         type: "terminal.close",
@@ -151,69 +173,15 @@ export class TerminalClient {
   }
 
   async uploadImage(file: File, onProgress?: (sentBytes: number, totalBytes: number) => void) {
-    if (!this.binding) throw new Error("terminal binding is unavailable");
-    if (!this.terminalGeneration) throw new Error("terminal generation is unavailable");
-    if (
-      !(
-        file.type === "image/png" ||
-        file.type === "image/jpeg" ||
-        file.type === "image/gif" ||
-        file.type === "image/webp"
-      )
-    ) {
-      throw new Error("unsupported terminal image type");
+    const remove = this.on("attachmentProgress", (progress) =>
+      onProgress?.(progress.receivedBytes, progress.totalBytes),
+    );
+    try {
+      const outcome = await this.ingress.enqueue(file);
+      if (outcome.kind !== "committed") throw new Error(outcome.code);
+    } finally {
+      remove();
     }
-    const operationId = crypto.randomUUID();
-    const buffer = new Uint8Array(await file.arrayBuffer());
-    if (buffer.byteLength < 1 || buffer.byteLength > 10 * 1024 * 1024) {
-      throw new Error("terminal image size is outside the allowed range");
-    }
-    const sha256 = bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)));
-    const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-    this.pendingIngress = {
-      operationId,
-      mediaType,
-      size: buffer.byteLength,
-      sha256,
-      terminalGeneration: this.terminalGeneration,
-    };
-    const identity = () => {
-      if (!this.binding) throw new Error("terminal binding is unavailable");
-      return { operationId, bindingId: this.binding.id, bindingEpoch: this.binding.epoch };
-    };
-    let acknowledgement = this.waitForIngress(operationId);
-    this.sendPayload({
-      type: "terminal.ingress_begin",
-      v: TERMINAL_PROTOCOL_VERSION,
-      ...identity(),
-      mediaType,
-      size: buffer.byteLength,
-      sha256,
-    });
-    let offset = (await acknowledgement).nextOffset;
-    while (offset < buffer.byteLength) {
-      const end = Math.min(offset + CHUNK_BYTES, buffer.byteLength);
-      const chunk = buffer.slice(offset, end);
-      acknowledgement = this.waitForIngress(operationId);
-      this.sendPayload({
-        type: "terminal.ingress_chunk",
-        v: TERMINAL_PROTOCOL_VERSION,
-        ...identity(),
-        offset,
-        dataBase64: uint8ToBase64(chunk),
-      });
-      offset = (await acknowledgement).nextOffset;
-      onProgress?.(offset, buffer.byteLength);
-    }
-    acknowledgement = this.waitForIngress(operationId);
-    this.sendPayload({
-      type: "terminal.ingress_finish",
-      v: TERMINAL_PROTOCOL_VERSION,
-      ...identity(),
-    });
-    const receipt = await acknowledgement;
-    if (receipt.state !== "committed") throw new Error("terminal ingress did not commit");
-    this.pendingIngress = null;
   }
 
   private sendPayload(payload: TerminalClientPayload) {
@@ -245,28 +213,7 @@ export class TerminalClient {
       this.terminalId = payload.terminalId;
       this.binding = { id: payload.bindingId, epoch: payload.bindingEpoch };
       this.terminalGeneration = payload.terminalGeneration;
-      if (this.pendingIngress) {
-        if (this.pendingIngress.terminalGeneration === payload.terminalGeneration) {
-          this.sendPayload({
-            type: "terminal.ingress_begin",
-            v: TERMINAL_PROTOCOL_VERSION,
-            operationId: this.pendingIngress.operationId,
-            bindingId: this.binding.id,
-            bindingEpoch: this.binding.epoch,
-            mediaType: this.pendingIngress.mediaType,
-            size: this.pendingIngress.size,
-            sha256: this.pendingIngress.sha256,
-          });
-        } else {
-          const waiter = this.ingressWaiters.get(this.pendingIngress.operationId);
-          if (waiter) {
-            window.clearTimeout(waiter.timer);
-            waiter.reject(new Error("terminal generation is gone"));
-            this.ingressWaiters.delete(this.pendingIngress.operationId);
-          }
-          this.pendingIngress = null;
-        }
-      }
+      this.ingress.updateIdentity(this.ingressIdentity());
       this.emit("status", "open");
       this.emit("opened", {
         terminalId: payload.terminalId,
@@ -280,20 +227,19 @@ export class TerminalClient {
     if (payload.type === "terminal.ingress_state") {
       const waiter = this.ingressWaiters.get(payload.operationId);
       if (waiter) {
-        window.clearTimeout(waiter.timer);
+        waiter.removeAbort();
         waiter.resolve(payload);
       }
       this.ingressWaiters.delete(payload.operationId);
-      this.emit("attachmentProgress", {
-        operationId: payload.operationId,
-        receivedBytes: payload.nextOffset,
-        totalBytes:
-          this.pendingIngress?.operationId === payload.operationId
-            ? this.pendingIngress.size
-            : payload.nextOffset,
-      });
     }
-    if (payload.type === "terminal.error") this.emit("error", payload);
+    if (payload.type === "terminal.error") {
+      for (const [operationId, waiter] of this.ingressWaiters) {
+        waiter.removeAbort();
+        waiter.reject(new Error(mapIngressHostError(payload.code)));
+        this.ingressWaiters.delete(operationId);
+      }
+      this.emit("error", payload);
+    }
   }
 
   private emit<K extends keyof TerminalClientEvents>(
@@ -304,21 +250,92 @@ export class TerminalClient {
     for (const listener of set ?? []) listener(...args);
   }
 
-  private waitForIngress(operationId: string) {
-    return new Promise<{ state: "prepared" | "committed"; nextOffset: number }>(
-      (resolve, reject) => {
-        const timer = window.setTimeout(() => {
-          this.ingressWaiters.delete(operationId);
-          reject(new Error("terminal ingress acknowledgement timed out"));
-        }, 30_000);
-        this.ingressWaiters.set(operationId, { resolve, reject, timer });
-      },
-    );
+  private waitForIngress(operationId: string, signal: AbortSignal) {
+    return new Promise<TerminalIngressReceipt>((resolve, reject) => {
+      const abort = () => {
+        if (this.ingressWaiters.get(operationId)?.reject !== reject) return;
+        this.ingressWaiters.delete(operationId);
+        reject(new DOMException("terminal ingress request cancelled", "AbortError"));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      this.ingressWaiters.set(operationId, {
+        resolve,
+        reject,
+        removeAbort: () => signal.removeEventListener("abort", abort),
+      });
+      if (signal.aborted) abort();
+    });
+  }
+
+  private ingressIdentity(): TerminalIngressIdentity | null {
+    if (!this.binding || !this.terminalId || !this.terminalGeneration) return null;
+    return {
+      clientInstanceId: this.options.channelId,
+      sessionId: this.options.channelId,
+      terminalId: this.terminalId,
+      terminalGeneration: this.terminalGeneration,
+      bindingId: this.binding.id,
+      bindingEpoch: this.binding.epoch,
+    };
+  }
+
+  private ingressTransport(): TerminalIngressTransport {
+    const request = (
+      request: TerminalIngressRequest,
+      signal: AbortSignal,
+      payload: TerminalClientPayload,
+    ) => this.requestIngress(request.operationId, signal, payload);
+    return {
+      begin: (value, signal) =>
+        request(value, signal, {
+          type: "terminal.ingress_begin",
+          v: TERMINAL_PROTOCOL_VERSION,
+          operationId: value.operationId,
+          bindingId: value.bindingId,
+          bindingEpoch: value.bindingEpoch,
+          mediaType: value.mediaType,
+          size: value.size,
+          sha256: value.sha256,
+        }),
+      chunk: (value, signal) =>
+        request(value, signal, {
+          type: "terminal.ingress_chunk",
+          v: TERMINAL_PROTOCOL_VERSION,
+          operationId: value.operationId,
+          bindingId: value.bindingId,
+          bindingEpoch: value.bindingEpoch,
+          offset: value.offset,
+          dataBase64: value.dataBase64,
+        }),
+      finish: (value, signal) => request(value, signal, ingressIdentityPayload("finish", value)),
+      status: (value, signal) => request(value, signal, ingressIdentityPayload("status", value)),
+      abort: (value, signal) => request(value, signal, ingressIdentityPayload("abort", value)),
+    };
+  }
+
+  private requestIngress(
+    operationId: string,
+    signal: AbortSignal,
+    payload: TerminalClientPayload,
+  ): Promise<TerminalIngressReceipt> {
+    const acknowledgement = this.waitForIngress(operationId, signal);
+    this.sendPayload(payload);
+    return acknowledgement;
   }
 }
 
-function bytesToHex(bytes: Uint8Array) {
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+function ingressIdentityPayload(
+  action: "finish" | "status" | "abort",
+  value: TerminalIngressRequest,
+): TerminalClientPayload {
+  const payload = {
+    type: `terminal.ingress_${action}`,
+    v: TERMINAL_PROTOCOL_VERSION,
+    operationId: value.operationId,
+    bindingId: value.bindingId,
+    bindingEpoch: value.bindingEpoch,
+  };
+  return payload as TerminalClientPayload;
 }
 
 function clientRelayUrl(relayUrl: string, token: string) {
@@ -343,8 +360,9 @@ function isSystemFrame(value: unknown): value is { type: "system"; code: string 
   );
 }
 
-function uint8ToBase64(bytes: Uint8Array) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
+function mapIngressHostError(code: string) {
+  if (code === "offline" || code === "revoked" || code === "scope_denied") {
+    return "TerminalUnavailable";
+  }
+  return "UploadFailed";
 }

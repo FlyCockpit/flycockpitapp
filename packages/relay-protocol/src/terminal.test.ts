@@ -66,6 +66,18 @@ describe("terminal frame codec", () => {
         path: "/private/secret.png",
       }),
     ).toThrow();
+    expect(
+      terminalClientPayloadSchema.parse({ type: "terminal.ingress_abort", v: 1, ...identity }),
+    ).toMatchObject({ type: "terminal.ingress_abort", operationId: identity.operationId });
+    expect(
+      terminalDaemonPayloadSchema.parse({
+        type: "terminal.ingress_state",
+        v: 1,
+        operationId: identity.operationId,
+        state: "no_operation",
+        nextOffset: 0,
+      }),
+    ).toMatchObject({ state: "no_operation" });
   });
 });
 
@@ -110,6 +122,21 @@ describe("terminal paste router", () => {
       code: "image_too_large",
       maxBytes: TERMINAL_IMAGE_MAX_BYTES,
     });
+  });
+
+  it("accepts only the exact terminal image contract and inclusive size bounds", () => {
+    for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      expect(planTerminalPaste({ files: [{ type, size: 1 }] }).kind).toBe("image");
+      expect(planTerminalPaste({ files: [{ type, size: TERMINAL_IMAGE_MAX_BYTES }] }).kind).toBe(
+        "image",
+      );
+    }
+    for (const file of [
+      { type: "image/svg+xml", size: 1 },
+      { type: "image/png", size: 0 },
+    ]) {
+      expect(planTerminalPaste({ files: [file] }).kind).toBe("error");
+    }
   });
 });
 

@@ -11,15 +11,24 @@ fn blocking_operation_manifest_is_complete() {
         ("slash:/export", BlockingOperationKind::ExportWrite),
         ("key:queue-edit", BlockingOperationKind::QueueMutation),
         ("composer:/btw-end", BlockingOperationKind::BtwTeardown),
-        ("composer:@suggestions", BlockingOperationKind::FileAutocomplete),
+        (
+            "composer:@suggestions",
+            BlockingOperationKind::FileAutocomplete,
+        ),
     ];
     assert_eq!(BLOCKING_OPERATION_MANIFEST, expected);
 
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
     for (site, kind) in BLOCKING_OPERATION_MANIFEST {
-        assert!(sites.insert(*site), "duplicate blocking-operation site: {site}");
-        assert!(kinds.insert(*kind), "duplicate blocking-operation kind: {kind:?}");
+        assert!(
+            sites.insert(*site),
+            "duplicate blocking-operation site: {site}"
+        );
+        assert!(
+            kinds.insert(*kind),
+            "duplicate blocking-operation kind: {kind:?}"
+        );
     }
 }
 

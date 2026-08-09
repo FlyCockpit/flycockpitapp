@@ -924,17 +924,9 @@ impl App {
         {
             return cached.clone();
         }
-        // The read-allowlist re-includes gitignored-but-allowlisted entries
-        // (implementation note); resolve the persisted
-        // per-layer list for the cwd, then union the daemon-pushed session set
-        // ("Approve for this session" approvals,
-        // implementation note) so session-only
-        // entries render exactly like persisted ones (dimmed, `gitignored`).
-        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
-        allow.extend(self.gitignore_session_allow.clone());
-        let walked = cockpit_core::tags::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
-        *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
-        walked
+        // A cache miss is a deterministic loading state. Composer reduction
+        // schedules the filesystem walk; rendering never performs it.
+        Vec::new()
     }
 
     pub(super) fn suggestion_box_lines(&self) -> u16 {

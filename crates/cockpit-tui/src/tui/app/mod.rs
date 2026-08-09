@@ -14,6 +14,7 @@ mod agent_inventory;
 mod async_actions;
 mod attach_lifecycle;
 mod attention;
+mod blocking_operations;
 mod btw_pane;
 mod config_reload;
 mod copy_actions;
@@ -4103,9 +4104,9 @@ fn spawn_git_refresh(
 #[cfg(test)]
 mod async_action_app_tests;
 #[cfg(test)]
-mod blocking_operation_tests;
-#[cfg(test)]
 mod attention_interrupt_surface_tests;
+#[cfg(test)]
+mod blocking_operation_tests;
 #[cfg(test)]
 mod caffeinate_toast_tests;
 #[cfg(test)]

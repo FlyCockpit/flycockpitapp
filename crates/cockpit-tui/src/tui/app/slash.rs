@@ -1494,8 +1494,9 @@ impl App {
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             action,
         };
-        self.async_actions.start_blocking(
-            AsyncActionKind::Internal("curator.command"),
+        self.push_plain("/curator: pending".to_string());
+        self.start_owned_blocking_action(
+            blocking_operations::BlockingOperationKind::CuratorMaintenance,
             AsyncActionPolicy::AllowConcurrent,
             move || {
                 let response = agent_runner::daemon_request_at_blocking(&socket, request)?;
@@ -1940,7 +1941,8 @@ impl App {
     }
 
     pub(super) fn handle_doctor_command(&mut self) {
-        let input = cockpit_core::diagnostics::DiagnosticsInput {
+        type DoctorSnapshotInput = cockpit_core::diagnostics::DiagnosticsInput;
+        let input = DoctorSnapshotInput {
             cwd: self.launch.cwd.clone(),
             session_id: self.launch.session_id,
             session_short_id: self.launch.session_short_id.clone(),
@@ -1954,22 +1956,24 @@ impl App {
             }),
             sandbox_enabled: Some(!self.no_sandbox),
         };
-        let mut rendered = match cockpit_core::diagnostics::tui_snapshot(input) {
-            Ok(snapshot) => cockpit_core::diagnostics::render(&snapshot),
-            Err(error) => format!("/doctor: {error}"),
-        };
-        // Clipboard recovery lives entirely in `crates/cockpit-tui`, which
-        // sits *above* `cockpit-core` in the crate graph — `diagnostics.rs`
-        // cannot depend on it — so its section is appended here instead of
-        // inside `cockpit_core::diagnostics::render`. Metadata only — see
-        // `crate::clipboard::recovery::doctor_lines`.
-        if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
-            let (lines, _) =
-                crate::clipboard::recovery::doctor_lines(self.clipboard_recovery, &dir);
-            rendered.push('\n');
-            rendered.push_str(&lines.join("\n"));
-        }
-        self.push_plain(rendered);
+        let clipboard_recovery = self.clipboard_recovery;
+        self.push_plain("/doctor: collecting diagnostics…".to_string());
+        self.start_owned_blocking_action(
+            blocking_operations::BlockingOperationKind::DoctorSnapshot,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("doctor.snapshot")),
+            move || {
+                let snapshot = cockpit_core::diagnostics::tui_snapshot(input)
+                    .map_err(|error| format!("/doctor: {error}"))?;
+                let mut rendered = cockpit_core::diagnostics::render(&snapshot);
+                if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
+                    let (lines, _) =
+                        crate::clipboard::recovery::doctor_lines(clipboard_recovery, &dir);
+                    rendered.push('\n');
+                    rendered.push_str(&lines.join("\n"));
+                }
+                Ok(AsyncActionPayload::DoctorSnapshot(rendered))
+            },
+        );
     }
 
     /// `/preflight [on|off]`: flip request preflight for the running session

@@ -215,6 +215,11 @@ pub enum AsyncActionPayload {
         bytes_written: u64,
         durability_confirmed: bool,
     },
+    DoctorSnapshot(String),
+    FileSuggestions {
+        query: String,
+        suggestions: Vec<cockpit_core::tags::Suggestion>,
+    },
 }
 
 #[derive(Debug)]

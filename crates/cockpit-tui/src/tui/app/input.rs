@@ -1633,6 +1633,30 @@ impl App {
     pub(super) fn reset_at_window(&mut self) {
         self.at_selected = 0;
         self.at_scroll = 0;
+        let Some(query) = self.composer.at_query().map(str::to_string) else {
+            self.at_cache.borrow_mut().take();
+            self.async_actions
+                .abort_key(&AsyncActionKey::new("autocomplete.files"));
+            return;
+        };
+        let cwd = self.launch.cwd.clone();
+        let usage_tags = self.usage_tags.clone();
+        let session_allow = self.gitignore_session_allow.clone();
+        let result_query = query.clone();
+        self.start_owned_blocking_action(
+            blocking_operations::BlockingOperationKind::FileAutocomplete,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),
+            move || {
+                let mut allow = cockpit_config::extended::resolve_gitignore_allow(&cwd);
+                allow.extend(session_allow);
+                let suggestions =
+                    cockpit_core::tags::suggestions(&cwd, &query, &usage_tags, &allow);
+                Ok(AsyncActionPayload::FileSuggestions {
+                    query: result_query,
+                    suggestions,
+                })
+            },
+        );
     }
 
     /// Reset the slash-popup highlight + scroll window to the top (the
@@ -3029,7 +3053,7 @@ impl App {
     }
 }
 
-enum QueueEditOutcome {
+pub(super) enum QueueEditOutcome {
     Edited { text: String, partial: bool },
     AlreadyStarted,
     Fallthrough,
@@ -3039,11 +3063,28 @@ enum QueueEditOutcome {
 
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
-        let outcome = self.remove_editable_queued_messages();
-        self.apply_queue_edit_outcome(outcome)
+        let attached_request = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.attached_request_binding(),
+            _ => {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+        };
+        self.push_queue_edit_notice("retrieving queued messages…");
+        self.async_actions.start(
+            blocking_operations::BlockingOperationKind::QueueMutation.action_kind(),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("queue.edit")),
+            async move {
+                attached_request
+                    .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
+                    .await
+                    .map(|response| AsyncActionPayload::DaemonResponse(Box::new(response)))
+            },
+        );
+        true
     }
 
-    fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+    pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
@@ -3073,20 +3114,7 @@ impl App {
         self.show_toast(text, super::ToastKind::Info);
     }
 
-    fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => return QueueEditOutcome::NotConnected,
-        };
-        self.remove_editable_queued_messages_with(|| {
-            crate::tui::agent_runner::attached_request_tx_blocking(
-                attached_request,
-                Request::RemoveEditableQueuedUserMessages { target_id: None },
-            )
-        })
-    }
-
-    fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
+    pub(super) fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
     where
         F: FnOnce() -> Result<Response, String>,
     {

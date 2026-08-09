@@ -739,7 +739,7 @@ impl App {
                     line: format!("/goal: {error}"),
                 }),
             },
-            AsyncActionKind::Internal("curator.command") => match result.payload {
+            AsyncActionKind::Blocking("curator.command") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("/curator: {e}")),
@@ -754,6 +754,28 @@ impl App {
                 Ok(_) => self.push_plain("/export debug: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
             },
+            AsyncActionKind::Blocking("doctor.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::DoctorSnapshot(rendered)) => self.push_plain(rendered),
+                Ok(_) => self.push_plain("/doctor: unexpected async response".to_string()),
+                Err(error) => self.push_plain(error),
+            },
+            AsyncActionKind::Blocking("autocomplete.files") => {
+                if let Ok(AsyncActionPayload::FileSuggestions { query, suggestions }) =
+                    result.payload
+                    && self.composer.at_query() == Some(query.as_str())
+                {
+                    *self.at_cache.borrow_mut() = Some((query, suggestions));
+                }
+            }
+            AsyncActionKind::Blocking("queue.edit") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                        self.remove_editable_queued_messages_with(|| Ok(*response))
+                    }
+                    _ => input::QueueEditOutcome::TransportError,
+                };
+                self.apply_queue_edit_outcome(outcome);
+            }
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
                     self.push_plain(format!("Renamed session to `{title}`"));

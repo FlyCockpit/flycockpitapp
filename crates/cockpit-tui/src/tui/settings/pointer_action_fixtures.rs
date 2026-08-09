@@ -7,7 +7,7 @@
 //! it contains no debug strings, numeric variant counts, or surface tokens.
 
 use super::pointer_actions::*;
-use super::providers::{OAuthOption, OAuthProvider};
+use super::providers::{CodexOAuthOption, OAuthOption, OAuthProvider};
 use cockpit_core::wizard::ProviderWizardStep;
 
 macro_rules! fixture_enum {
@@ -205,7 +205,6 @@ fixture_enum!(ProvidersFixture {
     WizardGrokContinue,
     WizardGrokAcknowledge,
     WizardCodexLogin,
-    WizardCodexManualPaste,
     WizardCodexPoll,
     WizardCodexSkipContinue,
     WizardCodexContinue,
@@ -595,20 +594,26 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
     all
 }
 
-fn oauth_fixture(option: OAuthOption, grok: bool) -> ProvidersFixture {
-    match (grok, option) {
-        (true, OAuthOption::Login) => ProvidersFixture::WizardGrokLogin,
-        (true, OAuthOption::ManualPaste) => ProvidersFixture::WizardGrokManualPaste,
-        (true, OAuthOption::Poll) => ProvidersFixture::WizardGrokPoll,
-        (true, OAuthOption::SkipContinue) => ProvidersFixture::WizardGrokSkipContinue,
-        (true, OAuthOption::Continue) => ProvidersFixture::WizardGrokContinue,
-        (true, OAuthOption::Acknowledge) => ProvidersFixture::WizardGrokAcknowledge,
-        (false, OAuthOption::Login) => ProvidersFixture::WizardCodexLogin,
-        (false, OAuthOption::ManualPaste) => ProvidersFixture::WizardCodexManualPaste,
-        (false, OAuthOption::Poll) => ProvidersFixture::WizardCodexPoll,
-        (false, OAuthOption::SkipContinue) => ProvidersFixture::WizardCodexSkipContinue,
-        (false, OAuthOption::Continue) => ProvidersFixture::WizardCodexContinue,
-        (false, OAuthOption::Acknowledge) => ProvidersFixture::WizardCodexAcknowledge,
+fn grok_oauth_fixture(option: OAuthOption) -> ProvidersFixture {
+    match option {
+        OAuthOption::Login => ProvidersFixture::WizardGrokLogin,
+        OAuthOption::ManualPaste => ProvidersFixture::WizardGrokManualPaste,
+        OAuthOption::Poll => ProvidersFixture::WizardGrokPoll,
+        OAuthOption::SkipContinue => ProvidersFixture::WizardGrokSkipContinue,
+        OAuthOption::Continue => ProvidersFixture::WizardGrokContinue,
+        OAuthOption::Acknowledge => ProvidersFixture::WizardGrokAcknowledge,
+    }
+}
+
+fn codex_oauth_fixture(option: OAuthOption) -> ProvidersFixture {
+    let option = CodexOAuthOption::try_from(option)
+        .expect("Codex wizard controls come from the sealed device-authorization inventory");
+    match option {
+        CodexOAuthOption::Login => ProvidersFixture::WizardCodexLogin,
+        CodexOAuthOption::Poll => ProvidersFixture::WizardCodexPoll,
+        CodexOAuthOption::SkipContinue => ProvidersFixture::WizardCodexSkipContinue,
+        CodexOAuthOption::Continue => ProvidersFixture::WizardCodexContinue,
+        CodexOAuthOption::Acknowledge => ProvidersFixture::WizardCodexAcknowledge,
     }
 }
 
@@ -893,13 +898,13 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
             let WizardControlKind::OAuth(option) = control else {
                 unreachable!("wizard control does not belong to Grok OAuth")
             };
-            oauth_fixture(option, true)
+            grok_oauth_fixture(option)
         }
         ProviderWizardStep::CodexOAuth => {
             let WizardControlKind::OAuth(option) = control else {
                 unreachable!("wizard control does not belong to Codex OAuth")
             };
-            oauth_fixture(option, false)
+            codex_oauth_fixture(option)
         }
         ProviderWizardStep::CopilotAuth
         | ProviderWizardStep::Saving

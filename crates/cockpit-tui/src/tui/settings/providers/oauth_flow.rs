@@ -286,6 +286,42 @@ pub(crate) enum OAuthOption {
     Acknowledge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CodexOAuthOption {
+    Login,
+    Poll,
+    SkipContinue,
+    Continue,
+    Acknowledge,
+}
+
+impl From<CodexOAuthOption> for OAuthOption {
+    fn from(option: CodexOAuthOption) -> Self {
+        match option {
+            CodexOAuthOption::Login => Self::Login,
+            CodexOAuthOption::Poll => Self::Poll,
+            CodexOAuthOption::SkipContinue => Self::SkipContinue,
+            CodexOAuthOption::Continue => Self::Continue,
+            CodexOAuthOption::Acknowledge => Self::Acknowledge,
+        }
+    }
+}
+
+impl TryFrom<OAuthOption> for CodexOAuthOption {
+    type Error = ();
+
+    fn try_from(option: OAuthOption) -> Result<Self, Self::Error> {
+        match option {
+            OAuthOption::Login => Ok(Self::Login),
+            OAuthOption::Poll => Ok(Self::Poll),
+            OAuthOption::SkipContinue => Ok(Self::SkipContinue),
+            OAuthOption::Continue => Ok(Self::Continue),
+            OAuthOption::Acknowledge => Ok(Self::Acknowledge),
+            OAuthOption::ManualPaste => Err(()),
+        }
+    }
+}
+
 impl OAuthOption {
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -965,6 +1001,12 @@ fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAut
 }
 
 pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOption> {
+    if s.provider == OAuthProvider::Codex {
+        return codex_oauth_options(s, host)
+            .into_iter()
+            .map(OAuthOption::from)
+            .collect();
+    }
     if s.acknowledgement_required {
         return vec![OAuthOption::Acknowledge];
     }
@@ -984,13 +1026,7 @@ pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOpt
                 opts.push(OAuthOption::ManualPaste);
             }
         }
-        OAuthProvider::Codex => {
-            if s.device_login().is_some() {
-                opts.push(OAuthOption::Poll);
-            } else {
-                opts.push(OAuthOption::Login);
-            }
-        }
+        OAuthProvider::Codex => unreachable!("Codex options use their sealed inventory"),
     }
     if host == OAuthHost::AddWizard
         || (host == OAuthHost::Standalone && (s.pending || s.device_login().is_some()))
@@ -998,6 +1034,27 @@ pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOpt
         opts.push(OAuthOption::SkipContinue);
     }
     opts
+}
+
+fn codex_oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<CodexOAuthOption> {
+    if s.acknowledgement_required {
+        return vec![CodexOAuthOption::Acknowledge];
+    }
+    if s.confirming() {
+        return vec![CodexOAuthOption::Continue];
+    }
+
+    let mut options = vec![if s.device_login().is_some() {
+        CodexOAuthOption::Poll
+    } else {
+        CodexOAuthOption::Login
+    }];
+    if host == OAuthHost::AddWizard
+        || (host == OAuthHost::Standalone && (s.pending || s.device_login().is_some()))
+    {
+        options.push(CodexOAuthOption::SkipContinue);
+    }
+    options
 }
 
 fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {

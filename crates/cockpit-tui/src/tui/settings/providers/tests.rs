@@ -197,6 +197,98 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_enabled_list_and_edit_actions_dispatch_through_dialog();
     pointer_headers_surface_dispatches_every_enabled_control();
     pointer_reachable_nested_surfaces_render_and_dispatch();
+    pointer_prompt_surfaces_render_and_dispatch();
+}
+
+#[derive(Clone, Copy)]
+enum PromptFixture {
+    FetchAll,
+    FetchOne,
+    FetchFallback,
+    Copilot,
+}
+
+fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
+    let config = one_provider_config(Some(OnUnlistedModelsFetch::Ask));
+    let (tmp, mut dialog) = dialog_with_config(config);
+    let entry = dialog.config.providers["p"].clone();
+    dialog.page = super::super::providers_page(match kind {
+        PromptFixture::FetchAll => ProvidersPage::FetchAll(FetchAllState {
+            providers: vec!["p".into()],
+            in_flight: Vec::new(),
+            finished: Vec::new(),
+            pre_fetch_models: [("p".into(), entry.models.clone())].into_iter().collect(),
+            policy_resolved: false,
+            cursor: 0,
+            dont_ask_again: false,
+            unlisted: vec![("p".into(), "stale".into())],
+        }),
+        PromptFixture::FetchOne => ProvidersPage::FetchOnePrompt(FetchOnePromptState {
+            provider_id: "p".into(),
+            remote: vec![model("current", false)],
+            catalog: ProviderModelCatalog::Live,
+            pre_fetch_models: entry.models.clone(),
+            unlisted: vec!["stale".into()],
+            cursor: 0,
+            dont_ask_again: false,
+        }),
+        PromptFixture::FetchFallback => {
+            ProvidersPage::FetchFallbackPrompt(FetchFallbackPromptState {
+                provider_id: "p".into(),
+                models: vec![model("fallback", false)],
+                catalog: ProviderModelCatalog::CodexFallback,
+                reason: "live catalog unavailable".into(),
+                cursor: 0,
+            })
+        }
+        PromptFixture::Copilot => ProvidersPage::CopilotSetup {
+            state: CopilotSetupState {
+                shell: None,
+                rc_path: None,
+                already_configured: false,
+                outcome: Some(Ok("fixture complete".into())),
+                operation: super::super::shell::PointerOperationGate::default(),
+            },
+            parent: Box::new(EditState::new("p".into(), entry)),
+        },
+    });
+    (tmp, dialog)
+}
+
+#[test]
+fn pointer_prompt_surfaces_render_and_dispatch() {
+    for kind in [
+        PromptFixture::FetchAll,
+        PromptFixture::FetchOne,
+        PromptFixture::FetchFallback,
+        PromptFixture::Copilot,
+    ] {
+        let (_tmp, source) = prompt_fixture(kind);
+        let _ = render_provider_rows(&source, 110, 60);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ super::super::pointer_actions::SettingsPointerAction::Providers(_),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.is_empty(),
+            "prompt fixture must render enabled controls"
+        );
+        for action in actions {
+            let (_tmp, mut dialog) = prompt_fixture(kind);
+            click_rendered_provider_action(&mut dialog, &action);
+        }
+    }
 }
 
 fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {

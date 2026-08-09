@@ -31,6 +31,86 @@ impl App {
         });
     }
 
+    fn mark_delivery_unconfirmed(&mut self, ids: &[uuid::Uuid]) -> Result<(), ()> {
+        let records = ids
+            .iter()
+            .map(|id| {
+                let fence = self.submission_fences.get(id)?;
+                Some(super::DeliveryUnconfirmedRecord {
+                    client_submission_id: *id,
+                    session_id: fence.host.session_id,
+                    text: fence.captured_composer.clone(),
+                    wire_digest: fence.assembled_wire_digest?,
+                    fence_sequence: fence.fence_sequence,
+                    surfaced: false,
+                    probe_in_flight: false,
+                    next_probe_at: self.event_loop_monotonic_now,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(())?;
+        for (id, record) in ids.iter().copied().zip(records) {
+            if let Some(fence) = self.submission_fences.get_mut(&id) {
+                fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::Reconciling;
+                self.delivery_unconfirmed_records
+                    .entry(id)
+                    .or_insert(record);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn service_delivery_unconfirmed_reconciliation(&mut self) -> bool {
+        let Some(socket) = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.socket.clone())
+        else {
+            return false;
+        };
+        let now = self.event_loop_monotonic_now;
+        let pending = self
+            .delivery_unconfirmed_records
+            .values_mut()
+            .filter(|record| !record.probe_in_flight && now >= record.next_probe_at)
+            .map(|record| {
+                record.probe_in_flight = true;
+                (
+                    record.client_submission_id,
+                    record.session_id,
+                    socket.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (client_submission_id, session_id, socket) in &pending {
+            let client_submission_id = *client_submission_id;
+            let session_id = *session_id;
+            let socket = socket.clone();
+            self.async_actions.start(
+                AsyncActionKind::Blocking("paste.delivery_receipt"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        agent_runner::read_client_submission_receipt_blocking(
+                            &socket,
+                            session_id,
+                            client_submission_id,
+                        )
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Ok(AsyncActionPayload::ClientSubmissionReceipt {
+                        client_submission_id,
+                        result,
+                    })
+                },
+            );
+        }
+        !pending.is_empty()
+    }
+
     pub(super) fn reset_session_live_state(&mut self) {
         // Session reset begins a new runner epoch. Cancel model controls
         // before clearing general request bookkeeping so a held exact wire
@@ -112,38 +192,6 @@ impl App {
                 (sequence, switch_id)
             }
         };
-        let cancelled = self
-            .submission_fences
-            .iter()
-            .filter_map(|(id, fence)| {
-                (fence.fence_sequence < switch_sequence
-                    && matches!(
-                        fence.lifecycle,
-                        crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
-                            | crate::tui::structured_paste::FenceLifecycle::Ready
-                    ))
-                .then_some((*id, fence.fence_sequence))
-            })
-            .collect::<Vec<_>>();
-        let cancelled_any = !cancelled.is_empty();
-        for (id, sequence) in cancelled {
-            self.submission_fences.remove(&id);
-            self.deferred_fence_dispatches.remove(&id);
-            self.pending_paste_probes
-                .retain(|_, probe| probe.owner_fence != Some(id));
-            self.submission_order.cancel(sequence);
-        }
-        if cancelled_any {
-            self.show_toast("Paste unavailable", super::ToastKind::Error);
-        }
-        if !matches!(
-            self.submission_order.front(),
-            Some((sequence, crate::tui::structured_paste::OrderedIntent::SessionSwitch(id)))
-                if sequence == switch_sequence && id == switch_id
-        ) {
-            return Ok(changed);
-        }
-
         let possibly_sent = self
             .submission_fences
             .iter()
@@ -153,7 +201,8 @@ impl App {
                         fence.lifecycle,
                         crate::tui::structured_paste::FenceLifecycle::PossiblySent
                             | crate::tui::structured_paste::FenceLifecycle::Reconciling
-                    ))
+                    )
+                    && !self.delivery_unconfirmed_records.contains_key(id))
                 .then_some(*id)
             })
             .collect::<Vec<_>>();
@@ -163,7 +212,7 @@ impl App {
                     .as_ref()
                     .is_ok_and(|runner| runner.can_switch_session())
             });
-            let now = self.monotonic_origin.elapsed();
+            let now = self.event_loop_monotonic_now;
             let started = *self
                 .pending_session_switch_reconcile_started_at
                 .get_or_insert(now);
@@ -173,6 +222,12 @@ impl App {
                 now.saturating_sub(started),
             ) {
                 crate::tui::structured_paste::SessionSwitchReconciliationGate::DaemonLinkLost => {
+                    if self.mark_delivery_unconfirmed(&possibly_sent).is_err() {
+                        self.history.push(HistoryEntry::CommandError {
+                            line: "/new: an earlier submission lacks a reconciliation digest; old session preserved"
+                                .to_string(),
+                        });
+                    }
                     self.pending_new_session = false;
                     self.pending_session_switch_order = None;
                     self.pending_session_switch_reconcile_started_at = None;
@@ -195,19 +250,7 @@ impl App {
                     unreachable!("possibly-sent fences were supplied to the reconciliation gate")
                 }
             }
-            let records = possibly_sent
-                .iter()
-                .map(|id| {
-                    let fence = self.submission_fences.get(id)?;
-                    Some(super::DeliveryUnconfirmedRecord {
-                        client_submission_id: *id,
-                        session_id: fence.host.session_id,
-                        text: fence.captured_composer.clone(),
-                        wire_digest: fence.assembled_wire_digest?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(records) = records else {
+            if self.mark_delivery_unconfirmed(&possibly_sent).is_err() {
                 self.pending_new_session = false;
                 self.pending_session_switch_order = None;
                 self.pending_session_switch_reconcile_started_at = None;
@@ -218,15 +261,40 @@ impl App {
                 });
                 self.dispatch_next_ready_paste_fence();
                 return Ok(true);
-            };
-            for (id, record) in possibly_sent.into_iter().zip(records) {
-                if let Some(fence) = self.submission_fences.get_mut(&id) {
-                    fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::Reconciling;
-                    self.delivery_unconfirmed_records
-                        .entry(id)
-                        .or_insert(record);
-                }
             }
+        }
+        let cancelled = self
+            .submission_fences
+            .iter()
+            .filter_map(|(id, fence)| {
+                (fence.fence_sequence < switch_sequence
+                    && matches!(
+                        fence.lifecycle,
+                        crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
+                            | crate::tui::structured_paste::FenceLifecycle::Ready
+                    ))
+                .then_some((*id, fence.fence_sequence))
+            })
+            .collect::<Vec<_>>();
+        let cancelled_any = !cancelled.is_empty();
+        for (id, sequence) in cancelled {
+            self.submission_fences.remove(&id);
+            self.deferred_fence_dispatches.remove(&id);
+            self.pending_paste_probes
+                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.retained_pre_dispatch_submissions
+                .retain(|retained| retained.pending.optimistic_submission_id != id);
+            self.submission_order.cancel(sequence);
+        }
+        if cancelled_any {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
+        }
+        if !matches!(
+            self.submission_order.front(),
+            Some((sequence, crate::tui::structured_paste::OrderedIntent::SessionSwitch(id)))
+                if sequence == switch_sequence && id == switch_id
+        ) {
+            return Ok(changed);
         }
         self.pending_session_switch_reconcile_started_at = None;
         self.pending_new_session = false;
@@ -314,19 +382,30 @@ impl App {
         self.estimate_at_last_usage = 0;
         self.current_session_persisted = false;
         self.new_session_terminal_clear_pending = true;
-        for record in self.delivery_unconfirmed_records.values() {
-            let wire_digest = record
-                .wire_digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            self.history.push(HistoryEntry::CommandError {
-                line: format!(
-                    "Delivery unconfirmed for message {} in session {} (wire {}): {}",
-                    record.client_submission_id, record.session_id, wire_digest, record.text
-                ),
-            });
-        }
+        let mut records = self
+            .delivery_unconfirmed_records
+            .values_mut()
+            .filter(|record| !record.surfaced)
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.fence_sequence);
+        let notices = records
+            .into_iter()
+            .map(|record| {
+                record.surfaced = true;
+                let wire_digest = record
+                    .wire_digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                HistoryEntry::CommandError {
+                    line: format!(
+                        "Delivery unconfirmed for message {} in session {} (wire {}): {}",
+                        record.client_submission_id, record.session_id, wire_digest, record.text
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.history.extend(notices);
     }
 
     fn commit_new_session_without_swappable_runner(&mut self) {

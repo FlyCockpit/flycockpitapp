@@ -130,6 +130,12 @@ pub enum Response {
         has_more: bool,
     },
 
+    ClientSubmissionReceipt {
+        session_id: Uuid,
+        client_submission_id: Uuid,
+        status: ClientSubmissionReceiptStatus,
+    },
+
     HistoryPage {
         session_id: Uuid,
         entries: Vec<HistoryEntry>,
@@ -508,6 +514,20 @@ pub enum Response {
     Unknown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ClientSubmissionReceiptStatus {
+    Pending,
+    Accepted {
+        seq: i64,
+        wire_fingerprint: String,
+    },
+    Terminal {
+        disposition: String,
+        wire_fingerprint: String,
+    },
+}
+
 /// Closed content-free lifecycle state for a durable run invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -686,6 +706,7 @@ macro_rules! response_variants {
             (Response::SubagentTranscript { .. }, "subagent_transcript");
             (Response::Sessions { .. }, "sessions");
             (Response::SessionMessages { .. }, "session_messages");
+            (Response::ClientSubmissionReceipt { .. }, "client_submission_receipt");
             (Response::HistoryPage { .. }, "history_page");
             (Response::SubagentHistoryPage { .. }, "subagent_history_page");
             (Response::NoteRecorded { .. }, "note_recorded");

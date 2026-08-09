@@ -553,6 +553,13 @@ pub enum Request {
         limit: u32,
     },
 
+    /// Probe the durable terminal state of one idempotent user submission
+    /// without changing the daemon's current attachment.
+    ReadClientSubmissionReceipt {
+        session_id: Uuid,
+        client_submission_id: Uuid,
+    },
+
     /// Read a paginated page of full transcript history for a session.
     /// `before_seq = None` reads the newest page; `Some(seq)` reads older
     /// events with `seq < before_seq`. The daemon clamps `limit`.
@@ -1239,6 +1246,7 @@ macro_rules! request_variants {
             (Request::ResolveInterrupt { .. }, "resolve_interrupt");
             (Request::ListSessions { .. }, "list_sessions");
             (Request::ReadSessionMessages { .. }, "read_session_messages");
+            (Request::ReadClientSubmissionReceipt { .. }, "read_client_submission_receipt");
             (Request::ReadHistoryPage { .. }, "read_history_page");
             (Request::ReadSubagentHistoryPage { .. }, "read_subagent_history_page");
             (Request::SessionLiveStatus { .. }, "session_live_status");
@@ -1383,6 +1391,7 @@ macro_rules! command {
             (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, serialized, none);
             (Request::ListSessions { .. }, "list_sessions", public_read, none, false, concurrent, none);
             (Request::ReadSessionMessages { session_id, .. }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, concurrent, none);
+            (Request::ReadClientSubmissionReceipt { session_id, .. }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, serialized, none);
             (Request::ReadHistoryPage { session_id, .. }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, concurrent, none);
             (Request::ReadSubagentHistoryPage { session_id, .. }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, concurrent, none);
             (Request::SessionLiveStatus { .. }, "session_live_status", public_read, none, false, concurrent, none);

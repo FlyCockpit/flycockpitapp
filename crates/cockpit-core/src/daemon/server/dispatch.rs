@@ -1156,6 +1156,40 @@ pub(super) async fn handle_serialized_request(
             })
         }
 
+        Request::ReadClientSubmissionReceipt {
+            session_id,
+            client_submission_id,
+        } => {
+            let durable = ctx
+                .db
+                .client_submission_receipt(session_id, client_submission_id)
+                .await
+                .map_err(internal)?;
+            let status = if let Some(receipt) = durable {
+                proto::ClientSubmissionReceiptStatus::Accepted {
+                    seq: receipt.seq,
+                    wire_fingerprint: receipt.wire_fingerprint,
+                }
+            } else if let Some(receipt) = ctx
+                .db
+                .client_submission_terminal_receipt(session_id, client_submission_id)
+                .await
+                .map_err(internal)?
+            {
+                proto::ClientSubmissionReceiptStatus::Terminal {
+                    disposition: receipt.disposition.as_str().to_string(),
+                    wire_fingerprint: receipt.wire_fingerprint,
+                }
+            } else {
+                proto::ClientSubmissionReceiptStatus::Pending
+            };
+            Ok(Response::ClientSubmissionReceipt {
+                session_id,
+                client_submission_id,
+                status,
+            })
+        }
+
         Request::ReadHistoryPage {
             session_id,
             before_seq,

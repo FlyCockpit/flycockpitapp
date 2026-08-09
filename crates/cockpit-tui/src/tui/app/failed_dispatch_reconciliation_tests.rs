@@ -733,6 +733,86 @@ fn new_session_success_invokes_terminal_clear_and_requests_redraw() {
     assert_eq!(clear_count, 1);
 }
 
+#[test]
+fn paste_fence_session_switch_ordering_bounds_unconfirmed_and_recovers_after_link_loss() {
+    use crate::tui::structured_paste::{
+        CapturedModel, FenceLifecycle, HostIdentity, OrderedIntent, SubmissionFenceV1,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    let session_id = uuid::Uuid::new_v4();
+    let host = HostIdentity {
+        client_instance_id: app.paste_client_instance_id,
+        connection_epoch: 1,
+        session_id,
+        terminal_generation: 1,
+    };
+    let sent_id = uuid::Uuid::new_v4();
+    let sent_sequence = app
+        .submission_order
+        .enqueue(OrderedIntent::Fence(sent_id))
+        .unwrap();
+    assert!(app.submission_order.complete(sent_sequence));
+    let ready_id = uuid::Uuid::new_v4();
+    let ready_sequence = app
+        .submission_order
+        .enqueue(OrderedIntent::Fence(ready_id))
+        .unwrap();
+    let fence = |id, sequence, lifecycle, digest| SubmissionFenceV1 {
+        client_submission_id: id,
+        fence_sequence: sequence,
+        host,
+        view_generation: 1,
+        source_draft_generation: 1,
+        created_at: std::time::Duration::ZERO,
+        captured_composer: format!("message-{id}"),
+        accepted_tags: Vec::new(),
+        pending_git_blocks: Vec::new(),
+        model: CapturedModel {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            active_model_state_generation: 1,
+            image_capability_generation: 1,
+            supports_images: false,
+        },
+        assembled_wire_digest: digest,
+        slots: Vec::new(),
+        lifecycle,
+    };
+    app.submission_fences.insert(
+        sent_id,
+        fence(
+            sent_id,
+            sent_sequence,
+            FenceLifecycle::PossiblySent,
+            Some([7; 32]),
+        ),
+    );
+    app.submission_fences.insert(
+        ready_id,
+        fence(ready_id, ready_sequence, FenceLifecycle::Ready, None),
+    );
+
+    app.pending_new_session = true;
+    assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
+    assert!(app.submission_fences.contains_key(&ready_id));
+    assert_eq!(
+        app.submission_fences[&sent_id].lifecycle,
+        FenceLifecycle::Reconciling
+    );
+    assert!(app.delivery_unconfirmed_records.contains_key(&sent_id));
+
+    app.pending_new_session = true;
+    assert!(app.maybe_service_new_session_with_clear(|| Ok(())).unwrap());
+    assert!(!app.submission_fences.contains_key(&ready_id));
+    assert!(app.delivery_unconfirmed_records[&sent_id].surfaced);
+    assert!(app.history.iter().any(|entry| matches!(
+        entry,
+        HistoryEntry::CommandError { line } if line.contains("Delivery unconfirmed")
+    )));
+}
+
 #[tokio::test]
 async fn new_session_from_side_conversation_discards_side_before_resetting() {
     let tmp = tempfile::tempdir().unwrap();

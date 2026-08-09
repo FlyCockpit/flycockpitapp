@@ -336,9 +336,19 @@ pub fn user_submission_wire_digest(
 ) -> [u8; 32] {
     use sha2::Digest as _;
 
-    let bytes = serde_json::to_vec(submission)
+    let mut metadata = submission.clone();
+    let images = std::mem::take(&mut metadata.images);
+    let bytes = serde_json::to_vec(&metadata)
         .expect("UserSubmission contains only infallibly serializable wire fields");
-    sha2::Sha256::digest(bytes).into()
+    let mut digest = sha2::Sha256::new();
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+    digest.update((images.len() as u64).to_le_bytes());
+    for image in images {
+        digest.update((image.len() as u64).to_le_bytes());
+        digest.update(image);
+    }
+    digest.finalize().into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

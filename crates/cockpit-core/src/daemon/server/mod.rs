@@ -290,6 +290,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_session_message(message, redact);
             }
         }
+        proto::Response::ClientSubmissionReceipt { .. } => {}
         proto::Response::HistoryPage {
             session_id: _,
             entries,

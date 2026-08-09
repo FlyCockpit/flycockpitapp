@@ -741,7 +741,7 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
     click_rendered_provider_action(&mut poll_source, &poll);
     assert!(matches!(
         poll_source.test_page(),
-        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.pending
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.polling
     ));
 }
 

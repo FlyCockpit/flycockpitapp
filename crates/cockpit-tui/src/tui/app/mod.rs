@@ -104,8 +104,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
-    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
-    AsyncActionRunner, AsyncActionStart,
+    AsyncActionCancellation, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
+    AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;

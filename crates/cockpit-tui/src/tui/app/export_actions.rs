@@ -80,10 +80,10 @@ impl App {
         });
         let file_stem = file_stem.to_string();
         let exports_dir = exports_dir.to_path_buf();
-        self.async_actions.start(
+        self.async_actions.start_export(
             AsyncActionKind::Blocking(action),
             AsyncActionPolicy::Dedupe(export_key),
-            async move {
+            move |shutdown| async move {
                 export_via_attached_daemon(
                     attached_request,
                     session_id,
@@ -91,6 +91,7 @@ impl App {
                     file_stem,
                     exports_dir,
                     command,
+                    shutdown,
                 )
                 .await
                 .map(AsyncActionPayload::Text)
@@ -106,16 +107,19 @@ async fn export_via_attached_daemon(
     file_stem: String,
     exports_dir: std::path::PathBuf,
     command: &'static str,
+    shutdown: std::sync::Arc<crate::tui::async_action::AsyncActionCancellation>,
 ) -> Result<String, String> {
-    let response = attached_request
-        .request(Request::ExportSessionData {
+    let response = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
+        response = attached_request.request(Request::ExportSessionData {
             session_id,
             kind,
             include_generated_artifacts: false,
             include_sensitive: false,
-        })
-        .await
-        .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
+        }) => response,
+    }
+    .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
         return Err(format!(
             "{command}: daemon request failed: unexpected daemon response"
@@ -123,12 +127,12 @@ async fn export_via_attached_daemon(
     };
     // The export bytes never rode the response frame: pull them as bounded
     // bulk chunks, then verify the transfer's length and digest before writing.
-    let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command).await?;
+    let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command, &shutdown).await?;
     let out_path = exports_dir.join(format!("{file_stem}.{}", data.filename_extension));
     tokio::fs::create_dir_all(&exports_dir)
         .await
         .map_err(|error| format!("{command}: creating export directory failed: {error}"))?;
-    write_export_no_clobber(&out_path, &bytes, command).await?;
+    write_export_no_clobber(&out_path, &bytes, command, &shutdown).await?;
     let sessions = data.session_count.unwrap_or(1);
     Ok(match kind {
         ExportSessionKind::TranscriptJson => format!(
@@ -153,6 +157,7 @@ async fn write_export_no_clobber(
     out_path: &std::path::Path,
     bytes: &[u8],
     command: &'static str,
+    shutdown: &AsyncActionCancellation,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt as _;
 
@@ -171,6 +176,9 @@ async fn write_export_no_clobber(
         file.write_all(bytes)
             .await
             .map_err(|error| format!("{command}: writing export failed: {error}"))?;
+        if shutdown.is_cancelled() {
+            return Err(format!("{command}: export cancelled by shutdown"));
+        }
         file.sync_all()
             .await
             .map_err(|error| format!("{command}: syncing export failed: {error}"))?;
@@ -207,6 +215,7 @@ async fn pull_bulk_transfer(
     attached_request: &AttachedRequestBinding,
     transfer: &cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef,
     command: &'static str,
+    shutdown: &AsyncActionCancellation,
 ) -> Result<Vec<u8>, String> {
     use sha2::{Digest as _, Sha256};
 
@@ -220,12 +229,14 @@ async fn pull_bulk_transfer(
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk_index: u32 = 0;
     loop {
-        let response = attached_request
-            .request(Request::ReadBulkTransferChunk {
+        let response = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
+            response = attached_request.request(Request::ReadBulkTransferChunk {
                 transfer_id: transfer.transfer_id,
                 chunk_index,
-            })
-            .await
+            }) => response,
+        }
             .map_err(|error| format!("{command}: reading export data failed: {error}"))?;
         let Response::BulkTransferChunk {
             chunk_index: got,
@@ -492,6 +503,7 @@ mod tests {
             "x".to_string(),
             tmp.path().join("exports"),
             "/export",
+            std::sync::Arc::new(AsyncActionCancellation::default()),
         ));
         let request = rx.recv().await.unwrap();
         request
@@ -520,7 +532,8 @@ mod tests {
         let target = tmp.path().join("existing.json");
         tokio::fs::write(&target, b"original").await.unwrap();
 
-        let error = write_export_no_clobber(&target, b"replacement", "/export")
+        let cancellation = AsyncActionCancellation::default();
+        let error = write_export_no_clobber(&target, b"replacement", "/export", &cancellation)
             .await
             .unwrap_err();
 

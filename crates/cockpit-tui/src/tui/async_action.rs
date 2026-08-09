@@ -279,6 +279,42 @@ struct PendingAction {
     view_generation: u64,
     key: Option<AsyncActionKey>,
     handle: JoinHandle<()>,
+    shutdown: Option<Arc<AsyncActionCancellation>>,
+}
+
+#[derive(Debug, Default)]
+pub struct AsyncActionCancellation {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl AsyncActionCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AsyncActionShutdownReport {
+    pub export_reaped: usize,
+    pub export_reap_timed_out: usize,
+    pub export_join_failed: usize,
 }
 
 #[derive(Debug)]
@@ -475,7 +511,7 @@ impl AsyncActionRunner {
     where
         F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
     {
-        self.start_with(kind, policy, |tx, notify, id, generation, kind| {
+        self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
             tokio::spawn(async move {
                 let payload = future.await;
                 let _ = tx.send(CompletedAction {
@@ -487,6 +523,39 @@ impl AsyncActionRunner {
                 notify.notify_one();
             })
         })
+    }
+
+    /// Starts an export whose daemon RPC can be cancelled promptly at shutdown
+    /// while its owned temporary-file cleanup is given a bounded chance to run.
+    pub fn start_export<F, Fut>(
+        &mut self,
+        kind: AsyncActionKind,
+        policy: AsyncActionPolicy,
+        work: F,
+    ) -> AsyncActionStart
+    where
+        F: FnOnce(Arc<AsyncActionCancellation>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
+    {
+        let cancellation = Arc::new(AsyncActionCancellation::default());
+        let worker_cancellation = Arc::clone(&cancellation);
+        self.start_with(
+            kind,
+            policy,
+            Some(cancellation),
+            move |tx, notify, id, generation, kind| {
+                tokio::spawn(async move {
+                    let payload = work(worker_cancellation).await;
+                    let _ = tx.send(CompletedAction {
+                        id,
+                        generation,
+                        kind,
+                        payload,
+                    });
+                    notify.notify_one();
+                })
+            },
+        )
     }
 
     /// Start a distinct action in the key's FIFO ordering domain. Unlike
@@ -509,6 +578,7 @@ impl AsyncActionRunner {
         self.start_with(
             kind,
             AsyncActionPolicy::AllowConcurrent,
+            None,
             move |tx, notify, id, generation, kind| {
                 tokio::spawn(async move {
                     if let Some(predecessor) = predecessor {
@@ -537,7 +607,7 @@ impl AsyncActionRunner {
     where
         F: FnOnce() -> Result<AsyncActionPayload, String> + Send + 'static,
     {
-        self.start_with(kind, policy, |tx, notify, id, generation, kind| {
+        self.start_with(kind, policy, None, |tx, notify, id, generation, kind| {
             tokio::task::spawn_blocking(move || {
                 let payload = work();
                 let _ = tx.send(CompletedAction {
@@ -555,6 +625,7 @@ impl AsyncActionRunner {
         &mut self,
         kind: AsyncActionKind,
         policy: AsyncActionPolicy,
+        shutdown: Option<Arc<AsyncActionCancellation>>,
         spawn: F,
     ) -> AsyncActionStart
     where
@@ -605,6 +676,7 @@ impl AsyncActionRunner {
                 view_generation: self.view_generation,
                 key,
                 handle,
+                shutdown,
             },
         );
         AsyncActionStart::Started(id)
@@ -666,7 +738,15 @@ impl AsyncActionRunner {
     /// Event-loop shutdown path. Export actions are allowed to finish their
     /// owned atomic publish/temporary-file cleanup before the runtime exits;
     /// unrelated work is cancelled immediately.
-    pub async fn shutdown_and_reap(&mut self) {
+    pub async fn shutdown_and_reap(&mut self) -> AsyncActionShutdownReport {
+        self.shutdown_and_reap_with_timeout(Duration::from_secs(2))
+            .await
+    }
+
+    async fn shutdown_and_reap_with_timeout(
+        &mut self,
+        export_reap_timeout: Duration,
+    ) -> AsyncActionShutdownReport {
         let mut export_handles = Vec::new();
         for (id, pending) in self.pending.drain() {
             let is_export = matches!(
@@ -674,6 +754,9 @@ impl AsyncActionRunner {
                 AsyncActionKind::Blocking("export.transcript" | "export.debug")
             );
             if is_export {
+                if let Some(shutdown) = &pending.shutdown {
+                    shutdown.cancel();
+                }
                 export_handles.push(pending.handle);
             } else {
                 pending.handle.abort();
@@ -686,10 +769,20 @@ impl AsyncActionRunner {
         }
         self.keyed.clear();
         self.serialized.clear();
-        for handle in export_handles {
-            let _ = handle.await;
+        let mut report = AsyncActionShutdownReport::default();
+        for mut handle in export_handles {
+            match tokio::time::timeout(export_reap_timeout, &mut handle).await {
+                Ok(Ok(())) => report.export_reaped += 1,
+                Ok(Err(_)) => report.export_join_failed += 1,
+                Err(_) => {
+                    report.export_reap_timed_out += 1;
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
         }
         while self.rx.try_recv().is_ok() {}
+        report
     }
 
     pub fn abort_key(&mut self, key: &AsyncActionKey) -> bool {
@@ -909,10 +1002,10 @@ mod tests {
         let cleaned_by_action = Arc::clone(&cleaned);
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
-        runner.start(
+        runner.start_export(
             AsyncActionKind::Blocking("export.transcript"),
             AsyncActionPolicy::AllowConcurrent,
-            async move {
+            move |_shutdown| async move {
                 entered_tx.send(()).unwrap();
                 let _ = release_rx.await;
                 cleaned_by_action.store(true, Ordering::SeqCst);
@@ -920,15 +1013,63 @@ mod tests {
             },
         );
         let shutdown = tokio::spawn(async move {
-            runner.shutdown_and_reap().await;
-            runner
+            let report = runner.shutdown_and_reap().await;
+            (runner, report)
         });
         entered_rx.await.unwrap();
         assert!(!cleaned.load(Ordering::SeqCst));
         release_tx.send(()).unwrap();
-        let mut runner = shutdown.await.unwrap();
+        let (mut runner, report) = shutdown.await.unwrap();
         assert!(cleaned.load(Ordering::SeqCst));
+        assert_eq!(report.export_reaped, 1);
         assert_eq!(runner.drain_cancelled().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_export_rpc_promptly() {
+        let mut runner = AsyncActionRunner::default();
+        let (rpc_started_tx, rpc_started_rx) = oneshot::channel();
+        let (rpc_dropped_tx, rpc_dropped_rx) = oneshot::channel();
+        runner.start_export(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::AllowConcurrent,
+            move |shutdown| async move {
+                rpc_started_tx.send(()).unwrap();
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        rpc_dropped_tx.send(()).unwrap();
+                        Err("cancelled before daemon replied".to_string())
+                    }
+                    () = std::future::pending() => unreachable!(),
+                }
+            },
+        );
+        rpc_started_rx.await.unwrap();
+
+        let report = runner.shutdown_and_reap().await;
+
+        rpc_dropped_rx.await.unwrap();
+        assert_eq!(report.export_reap_timed_out, 0);
+        assert_eq!(report.export_reaped, 1);
+        assert_eq!(runner.drain_cancelled().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_and_aborts_export_that_exceeds_cleanup_bound() {
+        let mut runner = AsyncActionRunner::default();
+        runner.start_export(
+            AsyncActionKind::Blocking("export.debug"),
+            AsyncActionPolicy::AllowConcurrent,
+            |_shutdown| async {
+                std::future::pending::<Result<AsyncActionPayload, String>>().await
+            },
+        );
+
+        let report = runner.shutdown_and_reap_with_timeout(Duration::ZERO).await;
+
+        assert_eq!(report.export_reap_timed_out, 1);
+        assert_eq!(report.export_reaped, 0);
+        assert_eq!(runner.pending_count(), 0);
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

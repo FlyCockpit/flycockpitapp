@@ -2503,6 +2503,77 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .status,
         crate::db::paused_work::PausedWorkStatus::Cancelled,
     );
+    let archive_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-999999999999").unwrap(),
+    )
+    .unwrap();
+    for label in ["first session archive", "session archive replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                archive_operation,
+                Request::ArchiveSession {
+                    session_id: second_session.session_id,
+                    cascade: false,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response }
+                if response_id == id && matches!(*response, Response::Ack)));
+    }
+    let archive_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            archive_conflict_id,
+            archive_operation,
+            Request::ArchiveSession {
+                session_id: first_session.session_id,
+                cascade: false,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "session archive conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == archive_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert!(
+        ctx.db
+            .get_session(second_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some()
+    );
+    assert!(
+        ctx.db
+            .get_session(first_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none()
+    );
     assert_eq!(
         ctx.db
             .paused_session_work(second_session.session_id)

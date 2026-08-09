@@ -1690,36 +1690,47 @@ impl Db {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin archive_session tx")?;
-            let targets = if cascade {
-                collect_subtree(&tx, session_id)?
-            } else {
-                vec![session_id]
-            };
-            for id in targets {
-                tx.execute(
-                    "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
-                    params![now, id.to_string()],
-                )
-                .context("archiving session")?;
-            }
-            tx.commit().context("commit archive_session tx")?;
-            Ok(())
+            Self::archive_session_conn(&tx, session_id, cascade, now)?;
+            tx.commit().context("commit archive_session tx")
         })
         .await
+    }
+
+    pub fn archive_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        cascade: bool,
+        now: i64,
+    ) -> Result<()> {
+        let targets = if cascade {
+            collect_subtree(conn, session_id)?
+        } else {
+            vec![session_id]
+        };
+        for id in targets {
+            conn.execute(
+                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
+                params![now, id.to_string()],
+            )
+            .context("archiving session")?;
+        }
+        Ok(())
     }
 
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
     pub async fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
-                [session_id.to_string()],
-            )
-            .context("unarchiving session")?;
-            Ok(())
-        })
-        .await
+        self.write(move |conn| Self::unarchive_session_conn(conn, session_id))
+            .await
+    }
+
+    pub fn unarchive_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+            [session_id.to_string()],
+        )
+        .context("unarchiving session")?;
+        Ok(())
     }
 
     /// Count the descendant forks of a session (depth-unbounded, not

@@ -50,27 +50,84 @@
   "malformed_fcm2": [
     {
       "name": "trailing_bytes",
+      "error": "trailing FCM2 bytes",
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0200"
     },
     {
       "name": "unknown_kind",
+      "error": "unknown attachment kind",
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff"
     },
     {
       "name": "zero_attachment_version",
+      "error": "invalid attachment version",
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "nil_client_submission_uuid",
+      "error": "invalid nonnil UUID",
       "fcm2_hex": "46434d32020000000000000000000000000000000022222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "invalid_utf8",
+      "error": "invalid UTF-8",
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000001ff0000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
     },
     {
       "name": "duplicate_attachment_id",
+      "error": "duplicate attachment id",
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000002333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+    }
+  ],
+  "mutation_cases": [
+    {
+      "name": "invalid_display_presence",
+      "source": 0,
+      "offset": 113,
+      "bytes_hex": "02",
+      "error": "invalid display presence"
+    },
+    {
+      "name": "tag_count_one_over",
+      "source": 0,
+      "offset": 114,
+      "bytes_hex": "0041",
+      "error": "too many tags"
+    },
+    {
+      "name": "invalid_forced_skill_presence",
+      "source": 0,
+      "offset": 116,
+      "bytes_hex": "02",
+      "error": "invalid forced skill presence"
+    },
+    {
+      "name": "attachment_count_one_over",
+      "source": 0,
+      "offset": 117,
+      "bytes_hex": "11",
+      "error": "too many attachments"
+    },
+    {
+      "name": "zero_session_uuid",
+      "source": 0,
+      "offset": 21,
+      "bytes_hex": "00000000000000000000000000000000",
+      "error": "invalid nonnil UUID"
+    },
+    {
+      "name": "zero_attachment_uuid",
+      "source": 0,
+      "offset": 118,
+      "bytes_hex": "00000000000000000000000000000000",
+      "error": "invalid nonnil UUID"
+    },
+    {
+      "name": "invalid_tag_boolean",
+      "source": 1,
+      "offset": 149,
+      "bytes_hex": "02",
+      "error": "invalid boolean"
     }
   ]
 }

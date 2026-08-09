@@ -41,7 +41,14 @@ describe("send_user_message_v2_canonical_vectors", () => {
       expect(
         () => decodeCanonicalSendUserMessageV2(fromHex(malformed.fcm2_hex)),
         malformed.name,
-      ).toThrow();
+      ).toThrow(malformed.error);
+    for (const malformed of fixture.mutation_cases) {
+      const bytes = fromHex(fixture.vectors[malformed.source].fcm2_hex);
+      bytes.set(fromHex(malformed.bytes_hex), malformed.offset);
+      expect(() => decodeCanonicalSendUserMessageV2(bytes), malformed.name).toThrow(
+        malformed.error,
+      );
+    }
   });
 
   it("uses the exact scalar predicate and rejects unpaired surrogates", () => {
@@ -89,6 +96,33 @@ describe("send_user_message_v2_canonical_vectors", () => {
       },
     };
     expect(encodeCanonicalSendUserMessageV2(maximum)).toHaveLength(FCM2_MAX_BYTES);
+    expect(() => decodeCanonicalSendUserMessageV2(new Uint8Array(FCM2_MAX_BYTES + 1))).toThrow(
+      "FCM2 exceeds maximum size",
+    );
+    maximum.request.text += "😀";
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds byte limit");
+    maximum.request.text = "a".repeat(262_145);
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds scalar limit");
+    maximum.request.text = "x";
+    maximum.request.display_text = `${scalarMax}😀`;
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow(
+      "display text exceeds byte limit",
+    );
+    maximum.request.display_text = null;
+    maximum.request.tag_expansions.push(maximum.request.tag_expansions[0]!);
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many tags");
+    maximum.request.tag_expansions.pop();
+    maximum.request.attachments.push(maximum.request.attachments[0]!);
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many attachments");
+    maximum.request.attachments.pop();
+    maximum.request.tag_expansions[0]!.tool += "t";
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("tag tool");
+    maximum.request.tag_expansions[0]!.tool = "t";
+    maximum.request.tag_expansions[0]!.path += "p";
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("tag path exceeds byte limit");
+    maximum.request.tag_expansions[0]!.path = "p";
+    maximum.request.forced_skill += "s";
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("forced skill");
     expect(() => validateFcm2Length(FCM2_MAX_BYTES + 1)).toThrow(/maximum/);
   });
 });

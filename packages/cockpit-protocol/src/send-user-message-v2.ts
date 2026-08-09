@@ -241,7 +241,11 @@ class Reader {
     return v;
   }
   text(n: number) {
-    return decoder.decode(this.raw(n));
+    try {
+      return decoder.decode(this.raw(n));
+    } catch {
+      throw new Error("invalid UTF-8");
+    }
   }
   text16() {
     return this.text(this.u16());

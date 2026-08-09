@@ -36,9 +36,9 @@ callback interface BindingAuthorizationGate {
 
 [Error]
 enum NoiseBindingError {
-  "invalid_input",
-  "invalid_state",
-  "authentication_failed",
-  "closed",
-  "internal",
+  "InvalidInput",
+  "InvalidState",
+  "AuthenticationFailed",
+  "Closed",
+  "Internal",
 };

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{
     AuthorizationCapability, NoiseChild, RecordKind, TranscriptAuthorizationGate,
@@ -15,7 +15,6 @@ fn handles() -> &'static Mutex<HashMap<u64, NoiseChild>> {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(feature = "native-bindings", derive(uniffi::Error))]
 pub enum NoiseBindingError {
     #[error("invalid_input")]
     InvalidInput,
@@ -46,7 +45,7 @@ pub trait BindingAuthorizationGate: Send + Sync {
     fn authorize(&self, request: BindingAuthorizationRequest) -> bool;
 }
 
-struct GateAdapter(Arc<dyn BindingAuthorizationGate>);
+struct GateAdapter(Box<dyn BindingAuthorizationGate>);
 
 impl TranscriptAuthorizationGate for GateAdapter {
     fn authorize(
@@ -133,7 +132,7 @@ pub fn noise_authorize(
     handle: u64,
     client_final_proof: Vec<u8>,
     daemon_final_proof: Vec<u8>,
-    gate: Arc<dyn BindingAuthorizationGate>,
+    gate: Box<dyn BindingAuthorizationGate>,
 ) -> Result<(), NoiseBindingError> {
     with_handle(handle, |child| {
         child.authorize(&GateAdapter(gate), &client_final_proof, &daemon_final_proof)
@@ -278,6 +277,3 @@ mod wasm {
         super::noise_close(handle);
     }
 }
-
-#[cfg(feature = "native-bindings")]
-uniffi::include_scaffolding!("cockpit_noise");

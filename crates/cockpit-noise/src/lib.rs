@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "native-bindings"), forbid(unsafe_code))]
 
 mod bindings;
 mod core;
@@ -36,6 +36,9 @@ pub use rekey::{
 };
 
 pub type Result<T> = std::result::Result<T, NoiseError>;
+
+#[cfg(feature = "native-bindings")]
+uniffi::include_scaffolding!("cockpit_noise");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum NoiseError {

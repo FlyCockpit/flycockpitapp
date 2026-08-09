@@ -224,6 +224,18 @@ impl App {
     ) {
         let mut cancelled_sequences = Vec::new();
         let mut cancelled_fences = Vec::new();
+        let reconciling_fences = self
+            .submission_fences
+            .iter()
+            .filter_map(|(id, fence)| {
+                matches!(
+                    fence.lifecycle,
+                    crate::tui::structured_paste::FenceLifecycle::PossiblySent
+                        | crate::tui::structured_paste::FenceLifecycle::Reconciling
+                )
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
         self.submission_fences
             .retain(|id, fence| match fence.lifecycle {
                 crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
@@ -247,7 +259,10 @@ impl App {
             self.deferred_fence_dispatches.remove(&id);
             self.pending_paste_probes
                 .retain(|_, probe| probe.owner_fence != Some(id));
+            self.retained_pre_dispatch_submissions
+                .retain(|retained| retained.pending.optimistic_submission_id != id);
         }
+        let _ = self.mark_delivery_unconfirmed(&reconciling_fences);
         if cancelled_any_fence {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
         }

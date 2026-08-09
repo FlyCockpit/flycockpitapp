@@ -21,6 +21,18 @@
     },
     "response": "assistant_session_created"
   },
+  "client_submission_receipt": {
+    "data": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "status": {
+        "seq": 7,
+        "status": "accepted",
+        "wire_fingerprint": "wire_fingerprint-fixture"
+      }
+    },
+    "response": "client_submission_receipt"
+  },
   "assistant_upserted": {
     "data": {
       "assistant": {

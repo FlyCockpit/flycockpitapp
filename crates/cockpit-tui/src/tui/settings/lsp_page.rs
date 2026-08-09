@@ -65,6 +65,10 @@ fn lsp_row_for_cursor(cursor: usize) -> LspRow {
         .unwrap_or_else(|| LspRow::Server(cursor - LSP_SERVER_ROW_START))
 }
 impl SettingsPage for LspPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Lsp
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         let row_count = LSP_SERVER_ROW_START
             + cx.project_context()

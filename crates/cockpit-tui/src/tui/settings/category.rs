@@ -3321,6 +3321,10 @@ impl CategoryPage {
 }
 
 impl SettingsPage for CategoryPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Category
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_category_page_key(key, self)
     }

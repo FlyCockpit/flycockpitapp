@@ -891,6 +891,10 @@ impl AgentsPage {
 }
 
 impl SettingsPage for AgentsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Agents
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_agents_page_key(key, self)
     }

@@ -1094,6 +1094,10 @@ fn format_pairs_for_edit(
 }
 
 impl SettingsPage for McpPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Mcp
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match self {
             McpPage::List(s) => cx.handle_mcp_list_key(key, s),

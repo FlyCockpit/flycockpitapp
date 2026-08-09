@@ -964,6 +964,10 @@ fn push_tool_value_row(
 }
 
 impl SettingsPage for ToolsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Tools
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_tools_page_key(key, self)
     }

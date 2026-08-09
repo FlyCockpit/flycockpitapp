@@ -703,6 +703,10 @@ fn synthetic_row(label: &str, selected: bool) -> Line<'static> {
 }
 
 impl SettingsPage for HarnessesPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Harnesses
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_harnesses_page_key(key, self)
     }

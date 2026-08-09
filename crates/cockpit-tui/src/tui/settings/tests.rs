@@ -628,6 +628,10 @@ struct ProbePage {
 }
 
 impl SettingsPage for ProbePage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Root
+    }
+
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc => Nav::Back,

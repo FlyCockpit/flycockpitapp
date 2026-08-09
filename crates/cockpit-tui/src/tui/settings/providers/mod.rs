@@ -4186,6 +4186,10 @@ fn valid_id(s: &str) -> bool {
 mod tests;
 
 impl SettingsPage for ProvidersPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Providers
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_providers_page_key(key, self)
     }

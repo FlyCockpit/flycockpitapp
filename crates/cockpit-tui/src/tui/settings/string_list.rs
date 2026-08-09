@@ -538,6 +538,10 @@ impl SettingsCx {
 }
 
 impl SettingsPage for StringListPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::StringList
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_string_list_page_key(key, self)
     }

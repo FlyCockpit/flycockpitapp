@@ -149,6 +149,23 @@ pub(crate) enum SettingsPointerOutcome {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsPointerSurfaceKind {
+    Root,
+    DefaultModel,
+    Agents,
+    Tools,
+    Harnesses,
+    Providers,
+    Category,
+    Instructions,
+    RedactPatterns,
+    StringList,
+    Skills,
+    Mcp,
+    Lsp,
+}
+
 pub struct SetupWizardDialog {
     run: cockpit_core::wizard::WizardRun,
     cursor: usize,
@@ -240,6 +257,7 @@ pub(super) struct RootPage {
 /// preserves the live concrete page state without adding central render,
 /// title, help, or key-dispatch arms.
 pub(super) trait SettingsPage: Any {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind;
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
     fn render_with_links(
@@ -506,6 +524,10 @@ pub(super) struct DefaultModelPage {
 }
 
 impl SettingsPage for DefaultModelPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        SettingsPointerSurfaceKind::DefaultModel
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc
@@ -2113,6 +2135,7 @@ impl SettingsDialog {
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
+        let _surface_kind = self.page.pointer_surface_kind();
         self.pointer_surface.clear_for(area);
         let title = self.title();
         let block = Block::default()
@@ -2172,6 +2195,10 @@ impl SettingsDialog {
 }
 
 impl SettingsPage for RootPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        SettingsPointerSurfaceKind::Root
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         let children = root_nodes();
         match key.code {

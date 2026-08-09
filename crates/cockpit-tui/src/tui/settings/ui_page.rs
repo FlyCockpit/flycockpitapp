@@ -787,6 +787,10 @@ fn render_grab_list(
 }
 
 impl SettingsPage for InstructionsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Instructions
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_instructions_page_key(key, self)
     }
@@ -847,6 +851,10 @@ impl SettingsPage for InstructionsPage {
 }
 
 impl SettingsPage for RedactPatternsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::RedactPatterns
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_redact_patterns_page_key(key, self)
     }

@@ -371,6 +371,10 @@ fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
 }
 
 impl SettingsPage for SkillsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Skills
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_skills_page_key(key, self)
     }

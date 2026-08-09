@@ -4,7 +4,7 @@ import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./re
 export * from "./remote-identity-protocol";
 export * from "./remote-wire-magic-registry";
 
-export const PROTOCOL_VERSION = 8 as const;
+export const PROTOCOL_VERSION = 9 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust

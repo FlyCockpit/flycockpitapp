@@ -4,14 +4,14 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag",
-    "v": 8
+    "v": 9
   },
   "app_flag_seen": {
     "data": { "changed": true, "key": "daemon_autostart_notice", "version": 8 },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag_seen",
-    "v": 8
+    "v": 9
   },
   "assistant_session_resolved": {
     "data": {
@@ -38,7 +38,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_session_resolved",
-    "v": 8
+    "v": 9
   },
   "startup_disclosures": {
     "data": {
@@ -49,20 +49,20 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "startup_disclosures",
-    "v": 8
+    "v": 9
   },
   "workspace_trust_set": {
     "data": { "config_generation": 8 },
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_trust_set",
-    "v": 8
+    "v": 9
   },
   "ack": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 8
+    "v": 9
   },
   "attached": {
     "data": {
@@ -167,7 +167,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 8
+    "v": 9
   },
   "bulk_transfer_chunk": {
     "data": {
@@ -178,7 +178,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk",
-    "v": 8
+    "v": 9
   },
   "bulk_transfer_chunk_accepted": {
     "data": {
@@ -190,7 +190,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk_accepted",
-    "v": 8
+    "v": 9
   },
   "config_refreshed": {
     "data": {
@@ -200,7 +200,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "config_refreshed",
-    "v": 8
+    "v": 9
   },
   "export_session_data": {
     "data": {
@@ -222,7 +222,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "export_session_data",
-    "v": 8
+    "v": 9
   },
   "forked": {
     "data": {
@@ -234,7 +234,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 8
+    "v": 9
   },
   "fs_list": {
     "data": {
@@ -255,7 +255,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 8
+    "v": 9
   },
   "fs_read": {
     "data": {
@@ -267,7 +267,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 8
+    "v": 9
   },
   "fs_stat": {
     "data": {
@@ -285,7 +285,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 8
+    "v": 9
   },
   "fs_write": {
     "data": {
@@ -294,7 +294,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 8
+    "v": 9
   },
   "git_diff_file": {
     "data": {
@@ -304,7 +304,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 8
+    "v": 9
   },
   "git_status": {
     "data": {
@@ -317,7 +317,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 8
+    "v": 9
   },
   "history_page": {
     "data": {
@@ -336,7 +336,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 8
+    "v": 9
   },
   "inventory_bundle": {
     "data": {
@@ -385,7 +385,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "inventory_bundle",
-    "v": 8
+    "v": 9
   },
   "restart_decision": {
     "data": {
@@ -395,7 +395,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 8
+    "v": 9
   },
   "run_invocation_cancel_result": {
     "data": {
@@ -410,7 +410,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_cancel_result",
-    "v": 8
+    "v": 9
   },
   "run_invocation_status": {
     "data": {
@@ -429,7 +429,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_status",
-    "v": 8
+    "v": 9
   },
   "session_messages": {
     "data": {
@@ -447,7 +447,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 8
+    "v": 9
   },
   "sessions": {
     "data": {
@@ -479,7 +479,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 8
+    "v": 9
   },
   "stats_rollup": {
     "data": {
@@ -585,7 +585,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 8
+    "v": 9
   },
   "subagent_history_page": {
     "data": {
@@ -606,7 +606,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 8
+    "v": 9
   },
   "user_message_queued": {
     "data": {
@@ -640,6 +640,6 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "user_message_queued",
-    "v": 8
+    "v": 9
   }
 }

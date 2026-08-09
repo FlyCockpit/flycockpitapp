@@ -220,6 +220,15 @@ export const enterpriseRouter = {
     });
     const registry = ceremony?.EnterpriseOrg?.RemoteAdminRegistry;
     if (!ceremony?.challengeBytes || !registry) return null;
+    if (ceremony.sessionId === null) {
+      const claimed = await prisma.remoteAdminCeremony.updateMany({
+        where: { id: ceremony.id, sessionId: null, consumedAt: null, expiresAt: { gte: now } },
+        data: { sessionId: context.session.session.id },
+      });
+      if (claimed.count !== 1) return null;
+    } else if (ceremony.sessionId !== context.session.session.id) {
+      return null;
+    }
     return {
       challengeId: ceremony.id,
       challenge: Buffer.from(ceremony.challengeBytes).toString("base64url"),
@@ -248,7 +257,7 @@ export const enterpriseRouter = {
         securityApprovalId: z.string().uuid(),
       }),
     )
-    .handler(async ({ input }) => {
+    .handler(async ({ input, context }) => {
       const now = new Date(),
         digest = base64urlBytes(input.canonicalRequestDigest, 32);
       const epoch = BigInt(input.operationEpoch),
@@ -287,6 +296,23 @@ export const enterpriseRouter = {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Dual role approvals are required.",
             });
+          const initiatorApproval = approvals.find(
+            (approval) => approval.principalId === context.session.user.id,
+          );
+          const initiatorMembership = await tx.enterpriseOrgMember.findUnique({
+            where: {
+              orgId_userId: { orgId: input.orgId, userId: context.session.user.id },
+            },
+          });
+          if (
+            !initiatorApproval ||
+            !initiatorMembership ||
+            initiatorMembership.role !== initiatorApproval.role ||
+            !["OWNER", "SECURITY_ADMIN"].includes(initiatorMembership.role)
+          )
+            throw new ORPCError("FORBIDDEN", {
+              message: "An approving administrator must initiate registration.",
+            });
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -302,6 +328,7 @@ export const enterpriseRouter = {
               orgId: input.orgId,
               principalId: input.nomineeId,
               nomineeId: input.nomineeId,
+              nominatorId: context.session.user.id,
               kind: "REGISTRATION",
               action: "security_role_change",
               requestDigest: Buffer.from(digest),
@@ -1595,6 +1622,7 @@ export const enterpriseRouter = {
           assertCeremonyRetryScope(ceremony, {
             kinds: ["SECURITY_ADMIN_BOOTSTRAP", "REGISTRATION"],
             principalId: context.session.user.id,
+            sessionId: context.session.session.id,
           });
           if (ceremony.nomineeId !== context.session.user.id) throw new Error("wrong_nominee");
         } catch {

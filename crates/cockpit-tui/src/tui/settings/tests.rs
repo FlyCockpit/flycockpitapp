@@ -659,6 +659,18 @@ fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     dialog
 }
 
+fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.command_installed = |_| true;
+    let mut presets = cockpit_config::extended::builtin_harness_presets().into_iter();
+    let (_, alpha) = presets.next().expect("first populated harness fixture");
+    let (_, beta) = presets.next().expect("second populated harness fixture");
+    dialog.extended.harnesses.insert("alpha".into(), alpha);
+    dialog.extended.harnesses.insert("beta".into(), beta);
+    enter_harnesses_from_root(&mut dialog);
+    dialog
+}
+
 fn click_settings_action(
     dialog: &mut SettingsDialog,
     action: &pointer_actions::SettingsPointerAction,
@@ -749,6 +761,124 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             | HarnessesAction::Save
             | HarnessesAction::Cancel => {
                 panic!("empty Harnesses list rendered unexpected action {harness_action:?}")
+            }
+        }
+    }
+
+    let populated_tmp = TempDir::new().unwrap();
+    let populated = populated_harness_list_pointer_fixture(&populated_tmp);
+    let _ = render_settings_rows(&populated, 100, 40);
+    let populated_actions = populated
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Harnesses(
+                        HarnessesAction::Open(_) | HarnessesAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        populated_actions.len(),
+        2,
+        "selected populated Harnesses row exposes Open and Delete"
+    );
+    for action in populated_actions {
+        match &action {
+            SettingsPointerAction::Harnesses(HarnessesAction::Open(id)) => {
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.name == id.0
+                ));
+            }
+            SettingsPointerAction::Harnesses(HarnessesAction::Delete(id)) => {
+                // First press only arms; the explicit Cancel target clears it.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                assert!(dialog.extended.harnesses.contains_key(&id.0));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
+                ));
+                click_settings_action(
+                    &mut dialog,
+                    &SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+                );
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if !state.delete_pending
+                            && state.status.as_deref() == Some("delete cancelled")
+                ));
+
+                // A second press on the same stable row identity applies.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.contains_key(&id.0));
+                assert!(dialog.extended.harnesses.contains_key("beta"));
+
+                // A target captured before its row disappears must be inert.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                let _ = render_settings_rows(&dialog, 100, 40);
+                let stale = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action == shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("populated delete target");
+                dialog.extended.harnesses.remove(&id.0);
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    dialog.handle_pointer(settings_mouse(kind, stale.rect.x, stale.rect.y));
+                }
+                assert!(dialog.extended.harnesses.contains_key("beta"));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if !state.delete_pending
+                ));
+            }
+            SettingsPointerAction::Harnesses(
+                HarnessesAction::Add
+                | HarnessesAction::SeedInstalledPresets
+                | HarnessesAction::ResetAndSeedPresets
+                | HarnessesAction::EditField(_)
+                | HarnessesAction::Save
+                | HarnessesAction::Cancel,
+            )
+            | SettingsPointerAction::Root(_)
+            | SettingsPointerAction::Category(_)
+            | SettingsPointerAction::Agents(_)
+            | SettingsPointerAction::Tools(_)
+            | SettingsPointerAction::Skills(_)
+            | SettingsPointerAction::Mcp(_)
+            | SettingsPointerAction::Providers(_)
+            | SettingsPointerAction::Lsp(_)
+            | SettingsPointerAction::List(_)
+            | SettingsPointerAction::UtilityModel(_)
+            | SettingsPointerAction::DefaultModel(_) => {
+                panic!("populated Harnesses fixture harvested unexpected action {action:?}")
             }
         }
     }

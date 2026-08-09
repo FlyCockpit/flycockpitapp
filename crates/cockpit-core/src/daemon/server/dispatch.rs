@@ -3484,6 +3484,16 @@ pub(super) fn goal_to_proto(goal: crate::db::session_goals::SessionGoal) -> prot
             .cloned()
             .or(goal.blocker_key.clone()),
         verification_attempts: goal.verification_rounds,
+        max_verification_attempts: serde_json::from_str::<serde_json::Value>(
+            &goal.resolved_policy_json,
+        )
+        .ok()
+        .and_then(|value| {
+            value
+                .get("maxVerificationAttempts")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(4),
         attempt_generation: goal.attempt_generation,
         token_budget: goal.token_budget,
         tokens_used: goal.tokens_used,

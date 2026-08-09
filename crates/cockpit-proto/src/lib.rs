@@ -1323,6 +1323,8 @@ pub struct GoalSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_gap_or_blocker: Option<String>,
     pub verification_attempts: i64,
+    /// Inclusive configured cap for started verification panels.
+    pub max_verification_attempts: u64,
     pub attempt_generation: i64,
     pub token_budget: i64,
     pub tokens_used: i64,
@@ -3449,6 +3451,7 @@ mod tests {
             contract_available: true,
             latest_gap_or_blocker: None,
             verification_attempts: 2,
+            max_verification_attempts: 4,
             attempt_generation: 4,
             token_budget: 100,
             tokens_used: 25,

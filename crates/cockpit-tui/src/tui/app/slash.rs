@@ -3235,10 +3235,12 @@ mod tests {
             phase: (disposition == GoalDisposition::Running)
                 .then_some(cockpit_db::session_goals::GoalPhase::Executing),
             resume_phase: None,
-            pause_reason: None,
+            pause_reason: (disposition == GoalDisposition::UserPaused)
+                .then_some(cockpit_db::session_goals::GoalPauseReason::User),
             contract_available: true,
             latest_gap_or_blocker: None,
-            verification_attempts: 0,
+            verification_attempts: 2,
+            max_verification_attempts: 4,
             attempt_generation: 1,
             token_budget: 100,
             tokens_used: 4,
@@ -3319,6 +3321,12 @@ mod tests {
                 },
             ),
             (
+                "/goal status",
+                Response::GoalStatus {
+                    goal: Some(goal_summary(GoalDisposition::UserPaused)),
+                },
+            ),
+            (
                 "/goal pause",
                 Response::GoalUpdated {
                     goal: goal_summary(GoalDisposition::UserPaused),
@@ -3342,6 +3350,9 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("tokens 4/100")));
         assert!(lines.iter().any(|line| line.contains("active 1250ms")));
         assert!(lines.iter().any(|line| line.contains("1 transitions")));
+        assert!(lines.iter().any(|line| line.contains("pause none")));
+        assert!(lines.iter().any(|line| line.contains("pause user")));
+        assert!(lines.iter().any(|line| line.contains("verification 2/4")));
         assert!(lines.iter().any(|line| line.contains("goal is now paused")));
         assert!(lines.iter().any(|line| line.contains("goal is now active")));
         assert!(

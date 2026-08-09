@@ -123,6 +123,20 @@ pub enum GoalPauseReason {
 }
 
 impl GoalPauseReason {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::OperatorDisabled => "operator_disabled",
+            Self::Restart => "restart",
+            Self::PlannerFailure => "planner_failure",
+            Self::EvaluatorFailure => "evaluator_failure",
+            Self::RootTurnFailure => "root_turn_failure",
+            Self::ProviderUsageLimit => "provider_usage_limit",
+            Self::RepeatedGapSet => "repeated_gap_set",
+            Self::VerificationAttemptCap => "verification_attempt_cap",
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "user" => Ok(Self::User),
@@ -1020,22 +1034,7 @@ impl Db {
             let transition = current.transition(GoalLifecycleEvent::RootSucceeded)?;
             let next_generation = transition.lifecycle.attempt_generation;
             let job_id = Uuid::new_v4();
-            let request = serde_json::json!({
-                "goal_id": goal_id,
-                "attempt_generation": next_generation,
-                "role": "evaluator",
-                "tool_policy": "none",
-                "objective": current.objective,
-                "immutable_contract": current.contract,
-                "root_turn": {"turn_id": turn_id, "result": "successful", "evidence": worker_evidence},
-                "unresolved_gaps": current.unresolved_gaps,
-                "instructions": "Return only one JSON object matching one response variant.",
-                "response_schema": [
-                    {"decision":"continue", "next_step":"non-empty string"},
-                    {"decision":"candidate_complete", "evidence":"non-empty string"},
-                    {"decision":"blocked", "blocker_key":"stable non-empty key", "explanation":"non-empty string"}
-                ]
-            });
+            let request = evaluator_request(&current, next_generation, turn_id, &worker_evidence);
             conn.execute(
                 "INSERT INTO goal_control_jobs (job_id, goal_id, attempt_generation, role, slot, request_json, state, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'evaluator', 0, ?4, 'pending', ?5, ?5)",
@@ -1576,37 +1575,74 @@ impl Db {
                             }),
                         )
                     } else {
+                        let (turn_id, evidence) = conn
+                            .query_row(
+                                "SELECT turn_id, audit_excerpt FROM goal_root_turns
+                             WHERE goal_id = ?1 AND state = 'finished'
+                             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                                params![updated.id.to_string()],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .context(
+                                "resuming evaluator without durable successful root-turn evidence",
+                            )?;
                         (
                             GoalControlRole::Evaluator,
-                            serde_json::json!({
-                                "goal_id": updated.id,
-                                "attempt_generation": updated.attempt_generation,
-                                "role": "evaluator",
-                                "tool_policy": "none",
-                                "objective": updated.objective,
-                                "immutable_contract": updated.contract,
-                                "unresolved_gaps": updated.unresolved_gaps,
-                                "instructions": "Return only one JSON object matching one response variant.",
-                                "response_schema": [
-                                    {"decision":"continue", "next_step":"non-empty string"},
-                                    {"decision":"candidate_complete", "evidence":"non-empty string"},
-                                    {"decision":"blocked", "blocker_key":"stable non-empty key", "explanation":"non-empty string"}
-                                ]
-                            }),
+                            evaluator_request(
+                                &updated,
+                                updated.attempt_generation,
+                                Uuid::parse_str(&turn_id)?,
+                                &sanitize_goal_evidence(&evidence),
+                            ),
                         )
                     };
                     conn.execute("INSERT INTO goal_control_jobs (job_id, goal_id, attempt_generation, role, slot, request_json, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'pending', ?6, ?6)", params![Uuid::new_v4().to_string(), updated.id.to_string(), updated.attempt_generation, role.as_str(), request.to_string(), now])?;
                 }
-                Some(GoalPhase::Verifying) => register_verification_jobs(
-                    conn,
-                    &updated,
-                    updated.evaluator_outcome_json.as_deref().unwrap_or("{}"),
-                    now,
-                )?,
+                Some(GoalPhase::Verifying) => {
+                    let max_attempts = goal_max_verification_attempts(&updated);
+                    if u64::try_from(updated.verification_rounds).unwrap_or(u64::MAX)
+                        >= max_attempts
+                    {
+                        conn.execute(
+                            "UPDATE session_goals SET disposition = 'no_progress_paused', phase = NULL,
+                                    resume_phase = 'executing', pause_reason = 'verification_attempt_cap',
+                                    elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000,
+                                    active_since = NULL, updated_at = ?1 WHERE id = ?2 AND attempt_generation = ?3",
+                            params![now, updated.id.to_string(), updated.attempt_generation],
+                        )?;
+                        record_lifecycle_history(
+                            conn,
+                            updated.id,
+                            GoalLifecycleHistoryEntry {
+                                at: now,
+                                disposition: GoalDisposition::NoProgressPaused,
+                                phase: None,
+                                reason: Some(GoalPauseReason::VerificationAttemptCap),
+                            },
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE session_goals SET verification_rounds = verification_rounds + 1,
+                                    updated_at = ?1 WHERE id = ?2 AND attempt_generation = ?3
+                                    AND disposition = 'running' AND phase = 'verifying'",
+                            params![now, updated.id.to_string(), updated.attempt_generation],
+                        )?;
+                        let replacement = load_goal(conn, updated.session_id, updated.id)?;
+                        register_verification_jobs(
+                            conn,
+                            &replacement,
+                            replacement
+                                .evaluator_outcome_json
+                                .as_deref()
+                                .unwrap_or("{}"),
+                            now,
+                        )?;
+                    }
+                }
                 Some(GoalPhase::Executing) | None => {}
             }
         }
-        Ok(updated)
+        load_goal(conn, session_id, goal.id)
     }
 
     pub fn refresh_session_goal_usage_conn(
@@ -1740,6 +1776,41 @@ fn register_verification_jobs(
     Ok(())
 }
 
+fn evaluator_request(
+    goal: &SessionGoal,
+    attempt_generation: i64,
+    turn_id: Uuid,
+    evidence: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "goal_id": goal.id,
+        "attempt_generation": attempt_generation,
+        "role": "evaluator",
+        "tool_policy": "none",
+        "objective": goal.objective,
+        "immutable_contract": goal.contract,
+        "root_turn": {"turn_id": turn_id, "result": "successful", "evidence": evidence},
+        "unresolved_gaps": goal.unresolved_gaps,
+        "instructions": "Return only one JSON object matching one response variant.",
+        "response_schema": [
+            {"decision":"continue", "next_step":"non-empty string"},
+            {"decision":"candidate_complete", "evidence":"non-empty string"},
+            {"decision":"blocked", "blocker_key":"stable non-empty key", "explanation":"non-empty string"}
+        ]
+    })
+}
+
+fn goal_max_verification_attempts(goal: &SessionGoal) -> u64 {
+    serde_json::from_str::<serde_json::Value>(&goal.resolved_policy_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("maxVerificationAttempts")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(4)
+}
+
 fn apply_verification_if_terminal(
     conn: &rusqlite::Connection,
     goal: &SessionGoal,
@@ -1840,14 +1911,7 @@ fn apply_verification_if_terminal(
     fingerprints.sort();
     let set_hash = goal_gap_fingerprint(&fingerprints.join("\n"));
     let repeated = !goal.gap_fingerprints.is_empty() && goal.gap_fingerprints == fingerprints;
-    let max_attempts = serde_json::from_str::<serde_json::Value>(&goal.resolved_policy_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("maxVerificationAttempts")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(4);
+    let max_attempts = goal_max_verification_attempts(goal);
     let pause_reason = if repeated {
         Some("repeated_gap_set")
     } else if u64::try_from(goal.verification_rounds).unwrap_or(u64::MAX) >= max_attempts {
@@ -2596,6 +2660,100 @@ mod tests {
                 .evaluator_outcome_json
                 .as_deref()
                 .is_some_and(|json| json.contains("inspect output"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_evaluator_replays_durable_root_turn_evidence() {
+        let (db, evaluating, _) = evaluator_fixture().await;
+        db.set_session_goal_status(evaluating.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        let resumed = db
+            .set_session_goal_status(evaluating.session_id, GoalDisposition::Running)
+            .await
+            .unwrap();
+        let job = db
+            .lease_goal_control_job(
+                resumed.id,
+                resumed.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&job.request_json).unwrap();
+        assert_eq!(request["root_turn"]["result"], "successful");
+        assert_eq!(
+            request["root_turn"]["evidence"],
+            "host-observed successful root turn"
+        );
+        assert!(request["root_turn"]["turn_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn resumed_verification_replacement_counts_as_a_started_panel() {
+        let (db, verifying, _) = verification_fixture().await;
+        assert_eq!(verifying.verification_rounds, 1);
+        db.set_session_goal_status(verifying.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        let resumed = db
+            .set_session_goal_status(verifying.session_id, GoalDisposition::Running)
+            .await
+            .unwrap();
+        assert_eq!(resumed.phase, Some(GoalPhase::Verifying));
+        assert_eq!(resumed.verification_rounds, 2);
+        assert!(
+            db.lease_goal_control_job(
+                resumed.id,
+                resumed.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_verification_does_not_start_a_panel_past_the_inclusive_cap() {
+        let (db, verifying, _) = verification_fixture().await;
+        let goal_id = verifying.id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE session_goals SET verification_rounds = 4 WHERE id = ?1",
+                params![goal_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.set_session_goal_status(verifying.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        let capped = db
+            .set_session_goal_status(verifying.session_id, GoalDisposition::Running)
+            .await
+            .unwrap();
+        assert_eq!(capped.disposition, GoalDisposition::NoProgressPaused);
+        assert_eq!(capped.verification_rounds, 4);
+        assert_eq!(
+            capped.pause_reason,
+            Some(GoalPauseReason::VerificationAttemptCap)
+        );
+        assert!(
+            db.lease_goal_control_job(
+                capped.id,
+                capped.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 

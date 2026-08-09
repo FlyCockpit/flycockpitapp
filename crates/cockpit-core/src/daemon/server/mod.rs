@@ -1218,6 +1218,7 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
         contract_available: _,
         latest_gap_or_blocker,
         verification_attempts: _,
+        max_verification_attempts: _,
         attempt_generation: _,
         token_budget: _,
         tokens_used: _,

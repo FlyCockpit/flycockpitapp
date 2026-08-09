@@ -753,11 +753,16 @@ impl App {
                         let phase = goal.phase.map(|phase| format!("/{phase:?}")).unwrap_or_default();
                         let detail = goal.latest_gap_or_blocker.as_deref().unwrap_or("no actionable gap");
                         Ok(AsyncActionPayload::Text(format!(
-                            "/goal: {}{} · {} · contract {} · tokens {}/{} ({} remaining) · active {}ms · {} transitions · {} · subcommands: status, pause, resume, clear, edit",
+                            "/goal: {}{} · {} · contract {} · pause {} · verification {}/{} · tokens {}/{} ({} remaining) · active {}ms · {} transitions · {} · subcommands: status, pause, resume, clear, edit",
                             goal.disposition.as_str(),
                             phase.to_ascii_lowercase(),
                             goal.objective,
                             if goal.contract_available { "ready" } else { "planning" },
+                            goal.pause_reason
+                                .map(|reason| reason.as_str())
+                                .unwrap_or("none"),
+                            goal.verification_attempts,
+                            goal.max_verification_attempts,
                             goal.tokens_used,
                             goal.token_budget,
                             goal.remaining_tokens,

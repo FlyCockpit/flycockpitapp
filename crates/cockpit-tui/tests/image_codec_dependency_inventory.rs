@@ -261,6 +261,10 @@ fn target_package_features(
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
             };
+            assert!(
+                !duplicate || reported_packages.contains(&key),
+                "cargo feature-tree duplicate package marker has no prior package row: {key}"
+            );
             let mut observed = BTreeSet::new();
             if !features.is_empty() {
                 for feature in features.split(',') {
@@ -340,8 +344,9 @@ fn target_package_features(
             child_key.starts_with(&package_prefix),
             "cargo feature activation child package mismatch: {package_name} feature \"{feature}\" -> {child_key}"
         );
+        let child_features = &package_features[child_key];
         assert!(
-            package_features[child_key].contains(feature),
+            child_features.contains(feature) || (feature == "default" && child_features.is_empty()),
             "cargo feature activation is absent from child resolved feature set: {package_name} feature \"{feature}\" -> {child_key}"
         );
         resolved_activations
@@ -489,6 +494,30 @@ fn target_package_feature_inventory_requires_duplicate_markers_to_be_leaves() {
     );
 }
 
+#[test]
+fn target_package_feature_inventory_accepts_vacuous_default_requests() {
+    let features = target_package_features(
+        concat!(
+            "0image v0.25.10|png\n",
+            "1autocfg feature \"default\"\n",
+            "2autocfg v1.5.1|\n",
+        ),
+        &BTreeSet::from(["autocfg@1.5.1".to_owned(), "image@0.25.10".to_owned()]),
+        "image@0.25.10",
+    );
+    assert!(features["autocfg@1.5.1"].is_empty());
+}
+
+#[test]
+#[should_panic(expected = "duplicate package marker has no prior package row: png@0.18.0")]
+fn target_package_feature_inventory_rejects_unseen_duplicate_packages() {
+    target_package_features(
+        "0image v0.25.10|png\n1png v0.18.0|default (*)\n",
+        &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+        "image@0.25.10",
+    );
+}
+
 fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
@@ -531,6 +560,10 @@ fn dependency_tree_graph(
         if depth == 0 {
             assert_eq!(package, expected_root, "cargo tree root package drift");
         }
+        assert!(
+            !duplicate || packages.contains(&package),
+            "cargo tree duplicate package marker has no prior package row: {package}"
+        );
         packages.insert(package.clone());
         ancestors.truncate(depth);
         if let Some((parent, _)) = ancestors.last() {
@@ -607,6 +640,17 @@ fn dependency_tree_graph_requires_duplicate_markers_to_be_leaves() {
 fn dependency_tree_graph_requires_the_requested_root() {
     dependency_tree_graph(
         "0png v0.18.0\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+        "image@0.25.10",
+    );
+}
+
+#[test]
+#[should_panic(expected = "duplicate package marker has no prior package row: png@0.18.0")]
+fn dependency_tree_graph_rejects_unseen_duplicate_packages() {
+    dependency_tree_graph(
+        "0image v0.25.10\n1png v0.18.0 (*)\n",
         TargetTriple::Linux,
         Provenance::ImageDescendant,
         "image@0.25.10",

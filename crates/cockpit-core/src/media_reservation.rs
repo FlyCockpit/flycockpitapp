@@ -440,6 +440,39 @@ impl MediaReservationLedger {
         }).await.map_err(classify_storage_error)
     }
 
+    /// Records caller-supplied destruction evidence and atomically releases
+    /// all local byte/derivative balances. This is the only local-media path
+    /// that can turn a materialized allocation into `released`.
+    pub async fn destroy_local_artifacts(
+        &self,
+        id: &str,
+        expected_version: u64,
+        cleanup_checksum: &str,
+        wall_ms: u64,
+    ) -> Result<ReservationReceipt, LedgerError> {
+        if cleanup_checksum.is_empty() {
+            return Err(LedgerError::Storage(anyhow!(
+                "cleanup attestation checksum required"
+            )));
+        }
+        let id = id.to_owned();
+        let checksum = cleanup_checksum.to_owned();
+        self.db.transaction(move|conn| {
+            let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row_u64(row,2)?,row_u64(row,3)?)))?;
+            if version!=expected_version{return Err(anyhow!("stale_version"));}
+            if !matches!(ReservationState::parse(&state)?,ReservationState::Settling|ReservationState::CancellationRequested|ReservationState::OverageQuarantined){return Err(anyhow!("invalid_transition"));}
+            let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+            for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels] {
+                let name=dimension_name(dimension);
+                conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
+                release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;
+            }
+            let next=if has_releasable_balance(conn,&id)?{ReservationState::Settling}else{ReservationState::Released};
+            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),sqlite_i64(next_version)?,id])?;
+            Ok(ReservationReceipt{reservation_id:id,state:next,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
+        }).await.map_err(classify_storage_error)
+    }
+
     pub async fn handoff_external(
         &self,
         id: &str,
@@ -772,7 +805,7 @@ impl MediaReservationLedger {
 
     pub async fn publication_allowed(&self, reservation_id: &str) -> Result<bool, LedgerError> {
         let id = reservation_id.to_owned();
-        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('overage_quarantined','accounting_corrupt') FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
+        self.db.read(move|conn|Ok(conn.query_row("SELECT published=1 AND quarantined=0 AND cancellation_requested=0 AND state NOT IN ('released','overage_quarantined','accounting_corrupt') FROM media_reservations WHERE reservation_id=?1",[id],|r|r.get(0))?)).await.map_err(LedgerError::Storage)
     }
 
     pub async fn authorize_publication(&self, reservation_id: &str) -> Result<(), LedgerError> {
@@ -1672,6 +1705,33 @@ mod tests {
         assert!(counters.contains(&("queued_operations_per_session".into(), 0)));
         assert!(counters.contains(&("encoded_bytes_per_object".into(), 7)));
         assert!(counters.contains(&("retained_bytes_per_session".into(), 7)));
+        ledger
+            .authorize_publication(&completed.reservation_id)
+            .await
+            .unwrap();
+        assert!(
+            ledger
+                .publication_allowed(&completed.reservation_id)
+                .await
+                .unwrap()
+        );
+        let destroyed = ledger
+            .destroy_local_artifacts(
+                &completed.reservation_id,
+                completed.version,
+                "verified-buffer-drop",
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(destroyed.state, ReservationState::Released);
+        assert!(
+            !ledger
+                .publication_allowed(&destroyed.reservation_id)
+                .await
+                .unwrap(),
+            "released artifacts are no longer publishable"
+        );
     }
 
     #[tokio::test]

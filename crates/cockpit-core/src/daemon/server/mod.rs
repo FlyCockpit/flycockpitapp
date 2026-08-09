@@ -2848,6 +2848,7 @@ struct PendingAttachmentUpload {
 
 #[derive(Debug)]
 struct ReadyAttachment {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Uuid,
     mime: String,
     bytes: Vec<u8>,

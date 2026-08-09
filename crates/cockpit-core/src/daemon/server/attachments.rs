@@ -1,9 +1,13 @@
 use super::sessions::*;
 use super::*;
 
-pub(super) fn prune_expired_attachments(
-    state: &mut MutableClientState,
-) -> Vec<crate::media_reservation::ReservationReceipt> {
+#[derive(Default)]
+pub(super) struct PrunedMediaReservations {
+    pub cancelled: Vec<crate::media_reservation::ReservationReceipt>,
+    pub destroyed: Vec<crate::media_reservation::ReservationReceipt>,
+}
+
+pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> PrunedMediaReservations {
     let ttl = Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
     let now = Instant::now();
     let expired: Vec<_> = state
@@ -13,19 +17,42 @@ pub(super) fn prune_expired_attachments(
             (now.duration_since(upload.created_at) > ttl).then_some(*upload_id)
         })
         .collect();
-    let reservations = expired
+    let cancelled = expired
         .iter()
         .filter_map(|upload_id| state.pending_uploads.remove(upload_id))
         .filter_map(|upload| upload.media_reservation)
         .collect();
     release_uploads(&state.upload_accounting, expired);
-    state
+    let expired_ready: Vec<_> = state
         .ready_attachments
-        .retain(|_, attachment| now.duration_since(attachment.created_at) <= ttl);
-    crate::sync::lock_or_recover(&state.upload_accounting)
+        .iter()
+        .filter_map(|(id, attachment)| {
+            (now.duration_since(attachment.created_at) > ttl).then_some(*id)
+        })
+        .collect();
+    let mut destroyed: Vec<_> = expired_ready
+        .into_iter()
+        .filter_map(|id| state.ready_attachments.remove(&id))
+        .filter_map(|attachment| attachment.media_reservation)
+        .collect();
+    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    let expired_consumed: Vec<_> = accounting
         .consumed_message_attachments
-        .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
-    reservations
+        .iter()
+        .filter_map(|(id, consumed)| {
+            (now.duration_since(consumed.consumed_at) > ttl).then_some(*id)
+        })
+        .collect();
+    destroyed.extend(
+        expired_consumed
+            .into_iter()
+            .filter_map(|id| accounting.consumed_message_attachments.remove(&id))
+            .filter_map(|consumed| consumed.attachment.media_reservation),
+    );
+    PrunedMediaReservations {
+        cancelled,
+        destroyed,
+    }
 }
 
 pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
@@ -359,6 +386,7 @@ pub(super) async fn finish_attachment_upload(
             state.ready_attachments.insert(
                 image_ref.id,
                 ReadyAttachment {
+                    media_reservation: upload.media_reservation,
                     session_id,
                     mime: upload.mime,
                     bytes,
@@ -379,28 +407,99 @@ pub(super) async fn finish_attachment_upload_admitted(
     state: &mut MutableClientState,
     upload_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let reservation = state
-        .pending_uploads
-        .get(&upload_id)
-        .and_then(|upload| upload.media_reservation.clone());
-    let result = finish_attachment_upload(state, upload_id).await;
-    if let Some(receipt) = reservation {
-        let wall_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .try_into()
-            .unwrap_or(0);
-        let ledger_result = if result.is_ok() {
-            ctx.media_ledger
-                .complete_local_allocation(&receipt.reservation_id, receipt.version, wall_ms)
-                .await
-        } else {
+    let Some(mut upload) = state.pending_uploads.remove(&upload_id) else {
+        return Err(bad_request("unknown or expired attachment upload id"));
+    };
+    release_uploads(&state.upload_accounting, [upload_id]);
+    let receipt = upload
+        .media_reservation
+        .take()
+        .ok_or_else(|| internal("attachment upload is missing its durable media reservation"))?;
+    let wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    let validation = async {
+        if upload.bytes.len() != upload.byte_len {
+            return Err(bad_request(format!(
+                "attachment length mismatch: got {} bytes, expected {}",
+                upload.bytes.len(),
+                upload.byte_len
+            )));
+        }
+        if sha256_hex(&upload.bytes) != upload.sha256 {
+            return Err(bad_request("attachment SHA-256 mismatch"));
+        }
+        validate_png_attachment(upload.bytes).await
+    }
+    .await;
+    let bytes = match validation {
+        Ok(bytes) => bytes,
+        Err(error) => {
             ctx.media_ledger
                 .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
                 .await
-        };
-        ledger_result.map_err(internal)?;
+                .map_err(internal)?;
+            return Err(error);
+        }
+    };
+    // This commit releases queue permits and makes retained byte charges
+    // authoritative before the bytes become visible to another subsystem.
+    let completed = ctx
+        .media_ledger
+        .complete_local_allocation(&receipt.reservation_id, receipt.version, wall_ms)
+        .await
+        .map_err(internal)?;
+    match upload.purpose {
+        proto::AttachmentPurpose::UserMessageImage => {
+            let session_id = upload
+                .session_id
+                .ok_or_else(|| bad_request("user-message image upload is missing its session"))?;
+            let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
+            if let Err(error) = ctx
+                .media_ledger
+                .authorize_publication(&completed.reservation_id)
+                .await
+            {
+                ctx.media_ledger
+                    .destroy_local_artifacts(
+                        &completed.reservation_id,
+                        completed.version,
+                        &format!("attachment-unpublished-destroyed:{upload_id}"),
+                        wall_ms,
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Err(internal(error));
+            }
+            state.ready_attachments.insert(
+                image_ref.id,
+                ReadyAttachment {
+                    media_reservation: Some(completed),
+                    session_id,
+                    mime: upload.mime,
+                    bytes,
+                    purpose: upload.purpose,
+                    created_at: Instant::now(),
+                },
+            );
+            Ok(Response::AttachmentUploaded { image_ref })
+        }
+        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
+            let response = state.terminal_host.paste_image(terminal_id, &bytes);
+            let checksum = format!("terminal-paste-buffer-destroyed:{upload_id}");
+            ctx.media_ledger
+                .destroy_local_artifacts(
+                    &completed.reservation_id,
+                    completed.version,
+                    &checksum,
+                    wall_ms,
+                )
+                .await
+                .map_err(internal)?;
+            response
+        }
     }
-    result
 }
 
 #[cfg(test)]

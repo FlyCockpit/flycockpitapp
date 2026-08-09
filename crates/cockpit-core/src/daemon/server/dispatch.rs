@@ -223,11 +223,26 @@ pub(super) async fn handle_serialized_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     validate_request_semantics(&request)?;
     debug_assert_eq!(shared.principal, state.principal);
-    for receipt in prune_expired_attachments(state) {
+    let pruned = prune_expired_attachments(state);
+    for receipt in pruned.cancelled {
         ctx.media_ledger
             .request_cancellation(
                 &receipt.reservation_id,
                 receipt.version,
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .unwrap_or(0),
+            )
+            .await
+            .map_err(internal)?;
+    }
+    for receipt in pruned.destroyed {
+        ctx.media_ledger
+            .destroy_local_artifacts(
+                &receipt.reservation_id,
+                receipt.version,
+                &format!("attachment-ttl-destroyed:{}", receipt.reservation_id),
                 chrono::Utc::now()
                     .timestamp_millis()
                     .try_into()

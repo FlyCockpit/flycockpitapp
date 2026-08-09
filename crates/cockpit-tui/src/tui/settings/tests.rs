@@ -690,10 +690,15 @@ fn click_settings_action(
         pointer_actions::HarnessesAction::Open(id) | pointer_actions::HarnessesAction::Delete(id),
     ) = action
     {
-        let index = dialog
+        let mut names = dialog
             .extended
             .harnesses
             .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        let index = names
+            .iter()
             .position(|name| name == &id.0)
             .unwrap_or_else(|| panic!("harness action names a missing source row: {}", id.0));
         let TestPageMut::Harnesses(HarnessesPage::List(state)) = dialog.test_page_mut() else {

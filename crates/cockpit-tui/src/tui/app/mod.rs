@@ -3589,6 +3589,7 @@ impl App {
             }
             self.close_btw_pane();
         }
+        self.async_actions.shutdown_and_reap().await;
 
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous

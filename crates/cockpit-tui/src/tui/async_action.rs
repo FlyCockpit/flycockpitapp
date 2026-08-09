@@ -363,7 +363,7 @@ impl AsyncActionRunner {
         expired
             .into_iter()
             .filter_map(|(id, kind)| {
-                self.abort_id(id).then_some(AsyncActionResult {
+                self.abort_id_inner(id, false).then_some(AsyncActionResult {
                     id,
                     kind,
                     payload: Err("operation timed out".to_string()),
@@ -577,10 +577,8 @@ impl AsyncActionRunner {
                 Some(key)
             }
             AsyncActionPolicy::Replace(key) => {
-                if let Some(id) = self.keyed.remove(&key)
-                    && let Some(pending) = self.pending.remove(&id)
-                {
-                    pending.handle.abort();
+                if let Some(id) = self.keyed.get(&key).copied() {
+                    self.abort_id(id);
                 }
                 Some(key)
             }
@@ -661,18 +659,47 @@ impl AsyncActionRunner {
         while self.rx.try_recv().is_ok() {}
     }
 
+    /// Event-loop shutdown path. Export actions are allowed to finish their
+    /// owned atomic publish/temporary-file cleanup before the runtime exits;
+    /// unrelated work is cancelled immediately.
+    pub async fn shutdown_and_reap(&mut self) {
+        let mut export_handles = Vec::new();
+        for (id, pending) in self.pending.drain() {
+            let is_export = matches!(
+                &pending.kind,
+                AsyncActionKind::Blocking("export.transcript" | "export.debug")
+            );
+            if is_export {
+                export_handles.push(pending.handle);
+            } else {
+                pending.handle.abort();
+            }
+            self.cancelled.push(AsyncActionResult {
+                id,
+                kind: pending.kind,
+                payload: Err("operation cancelled by shutdown".to_string()),
+            });
+        }
+        self.keyed.clear();
+        self.serialized.clear();
+        for handle in export_handles {
+            let _ = handle.await;
+        }
+        while self.rx.try_recv().is_ok() {}
+    }
+
     pub fn abort_key(&mut self, key: &AsyncActionKey) -> bool {
-        let Some(id) = self.keyed.remove(key) else {
+        let Some(id) = self.keyed.get(key).copied() else {
             return false;
         };
-        let Some(pending) = self.pending.remove(&id) else {
-            return false;
-        };
-        pending.handle.abort();
-        true
+        self.abort_id(id)
     }
 
     pub fn abort_id(&mut self, id: AsyncActionId) -> bool {
+        self.abort_id_inner(id, true)
+    }
+
+    fn abort_id_inner(&mut self, id: AsyncActionId, record_cancelled: bool) -> bool {
         let Some(pending) = self.pending.remove(&id) else {
             return false;
         };
@@ -682,11 +709,13 @@ impl AsyncActionRunner {
             self.keyed.remove(&key);
         }
         pending.handle.abort();
-        self.cancelled.push(AsyncActionResult {
-            id,
-            kind: pending.kind,
-            payload: Err("operation cancelled".to_string()),
-        });
+        if record_cancelled {
+            self.cancelled.push(AsyncActionResult {
+                id,
+                kind: pending.kind,
+                payload: Err("operation cancelled".to_string()),
+            });
+        }
         true
     }
 }
@@ -833,6 +862,7 @@ mod tests {
         let expired = runner.expire_blocking(Instant::now(), Duration::from_secs(30));
         assert_eq!(expired.len(), 1);
         assert!(matches!(&expired[0].payload, Err(error) if error.contains("timed out")));
+        assert!(runner.drain_cancelled().is_empty());
         let _ = release.send(());
         tokio::task::yield_now().await;
         assert!(runner.drain_completed().is_empty());
@@ -856,6 +886,57 @@ mod tests {
         assert_eq!(cancelled.len(), 1);
         assert!(matches!(&cancelled[0].payload, Err(error) if error.contains("cancelled")));
         assert!(runner.drain_cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_records_exactly_one_cancelled_terminal() {
+        let mut runner = AsyncActionRunner::default();
+        let key = AsyncActionKey::new("autocomplete.files");
+        let (_release, barrier) = oneshot::channel::<()>();
+        runner.start(
+            AsyncActionKind::Blocking("autocomplete.files"),
+            AsyncActionPolicy::Replace(key.clone()),
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        runner.start(
+            AsyncActionKind::Blocking("autocomplete.files"),
+            AsyncActionPolicy::Replace(key),
+            async { Ok(AsyncActionPayload::Unit) },
+        );
+        assert_eq!(runner.drain_cancelled().len(), 1);
+        assert!(runner.drain_cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_export_owned_cleanup_barrier() {
+        let mut runner = AsyncActionRunner::default();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleaned_by_action = Arc::clone(&cleaned);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        runner.start(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.await;
+                cleaned_by_action.store(true, Ordering::SeqCst);
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        let shutdown = tokio::spawn(async move {
+            runner.shutdown_and_reap().await;
+            runner
+        });
+        entered_rx.await.unwrap();
+        assert!(!cleaned.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        let mut runner = shutdown.await.unwrap();
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert_eq!(runner.drain_cancelled().len(), 1);
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

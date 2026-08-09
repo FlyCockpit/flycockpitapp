@@ -27,6 +27,25 @@ impl std::fmt::Display for PinMutationRejected {
 
 impl std::error::Error for PinMutationRejected {}
 
+#[derive(Debug)]
+struct GoalMutationRejected(String);
+impl std::fmt::Display for GoalMutationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for GoalMutationRejected {}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteGoalOutcomeV1 {
+    schema_version: u8,
+    session_id: Uuid,
+    goal_id: Uuid,
+    attempt_generation: i64,
+    disposition: proto::GoalDisposition,
+}
+
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
@@ -907,6 +926,72 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                             .to_string(),
                     });
                 }
+            }
+            if let Some(operation) = remote_operation {
+                let request = Request::SetGoalStatus { session_id, status };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let goal = crate::db::Db::set_session_goal_status_conn(conn, session_id, status)
+                            .map_err(|error| GoalMutationRejected(error.to_string()))?;
+                        let receipt = RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
+                        let safe_response = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: "set_goal_status".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<GoalMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                let receipt = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if receipt.schema_version != 1
+                    || receipt.session_id != session_id
+                    || receipt.disposition != status
+                {
+                    return Err(internal(anyhow::anyhow!(
+                        "invalid remote goal replay receipt"
+                    )));
+                }
+                let goal = ctx
+                    .db
+                    .session_goal_by_id(session_id, receipt.goal_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        internal(anyhow::anyhow!("remote goal replay target disappeared"))
+                    })?;
+                if status == proto::GoalDisposition::Running
+                    && let Some(attached) = state
+                        .attached
+                        .as_ref()
+                        .filter(|attached| attached.handle.session().id == session_id)
+                {
+                    attached
+                        .handle
+                        .send_work(SessionWork::WakeGoal)
+                        .await
+                        .map_err(internal)?;
+                }
+                return Ok(Response::GoalUpdated {
+                    goal: goal_to_proto(goal),
+                });
             }
             let goal = ctx
                 .db

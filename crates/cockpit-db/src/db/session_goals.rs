@@ -804,6 +804,25 @@ impl Db {
             .await
     }
 
+    pub async fn session_goal_by_id(
+        &self,
+        session_id: Uuid,
+        goal_id: Uuid,
+    ) -> Result<Option<SessionGoal>> {
+        self.read(move |conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {GOAL_SELECT} FROM session_goals WHERE session_id = ?1 AND id = ?2"
+                ),
+                params![session_id.to_string(), goal_id.to_string()],
+                decode_goal,
+            )
+            .optional()
+            .context("loading session goal by id")
+        })
+        .await
+    }
+
     pub async fn update_session_goal(
         &self,
         session_id: Uuid,

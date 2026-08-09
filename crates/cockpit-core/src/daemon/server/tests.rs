@@ -2004,6 +2004,125 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let mut concurrent = ConcurrentRequestRuntime::new();
 
+    let status_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-bbbbbbbbbbbb").unwrap(),
+    )
+    .unwrap();
+    let status_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let status_applied = match recv_writer_body(&mut writer_rx, "first goal status").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_id);
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected goal status: {other:?}"),
+    };
+    let status_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_replay_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal status replay").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), status_applied);
+        }
+        other => panic!("unexpected goal status replay: {other:?}"),
+    }
+    let status_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_conflict_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: second_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "goal status conflict").await, Body::Error { id: Some(id), error } if id == status_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert_eq!(
+        ctx.db
+            .current_session_goal(first_session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .disposition,
+        proto::GoalDisposition::UserPaused
+    );
+    assert_eq!(
+        ctx.db
+            .current_session_goal(second_session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .disposition,
+        proto::GoalDisposition::Running
+    );
+    let goal_outbox: Vec<u8> = ctx
+        .db
+        .read(|conn| {
+            conn.query_row(
+            "SELECT canonical_payload FROM remote_attachment_outbox WHERE kind = 'set_goal_status'",
+            [],
+            |row| row.get(0),
+        ).context("loading safe goal outbox payload")
+        })
+        .await
+        .unwrap();
+    assert!(
+        !goal_outbox
+            .windows(b"finish safely".len())
+            .any(|bytes| bytes == b"finish safely")
+    );
+    assert!(
+        !goal_outbox
+            .windows(b"resolved_policy".len())
+            .any(|bytes| bytes == b"resolved_policy")
+    );
+
     let first_id = Uuid::new_v4();
     handle_envelope(
         Envelope::remote_request(

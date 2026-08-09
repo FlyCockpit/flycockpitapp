@@ -122,8 +122,19 @@ fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn strip_optional_duplicate_marker<'a>(row: &'a str, context: &str) -> &'a str {
+    let Some(without_marker) = row.strip_suffix(" (*)") else {
+        return row;
+    };
+    assert!(
+        !without_marker.ends_with(" (*)"),
+        "{context} contains repeated duplicate markers: {row}"
+    );
+    without_marker
+}
+
 fn tree_package_key(row: &str) -> String {
-    let package = row.trim_end_matches(" (*)");
+    let package = strip_optional_duplicate_marker(row, "cargo tree package row");
     let (name, version) = package
         .rsplit_once(" v")
         .unwrap_or_else(|| panic!("unexpected cargo tree package row: {row}"));
@@ -135,6 +146,11 @@ fn tree_package_key(row: &str) -> String {
         .split_whitespace()
         .next()
         .unwrap_or_else(|| panic!("malformed cargo tree package row with empty version: {row}"));
+    assert_eq!(
+        package,
+        format!("{name} v{version}"),
+        "malformed cargo tree package row with trailing tokens: {row}"
+    );
     format!("{name}@{version}")
 }
 
@@ -148,6 +164,18 @@ fn tree_package_key_rejects_empty_versions_precisely() {
 #[should_panic(expected = "cargo tree package row with empty name:  v1.0.0")]
 fn tree_package_key_rejects_empty_names_precisely() {
     tree_package_key(" v1.0.0");
+}
+
+#[test]
+#[should_panic(expected = "package row with trailing tokens: image v0.25.10 unexpected")]
+fn tree_package_key_rejects_trailing_tokens() {
+    tree_package_key("image v0.25.10 unexpected");
+}
+
+#[test]
+#[should_panic(expected = "package row contains repeated duplicate markers")]
+fn tree_package_key_rejects_repeated_duplicate_markers() {
+    tree_package_key("image v0.25.10 (*) (*)");
 }
 
 fn target_package_features(
@@ -168,8 +196,8 @@ fn target_package_features(
 
     for line in feature_tree.lines() {
         let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
+        let row = strip_optional_duplicate_marker(row, "cargo feature-tree row");
         if let Some((subject, features)) = row.split_once('|') {
-            let subject = subject.trim_end_matches(" (*)");
             let Some((name, version)) = subject.rsplit_once(" v") else {
                 panic!("unexpected cargo feature-tree package row: {row}");
             };
@@ -179,11 +207,15 @@ fn target_package_features(
             if name.is_empty() {
                 panic!("malformed cargo feature-tree package row with empty name: {row}");
             }
+            assert_eq!(
+                subject,
+                format!("{name} v{version}"),
+                "malformed cargo feature-tree package row with trailing tokens: {row}"
+            );
             let key = format!("{name}@{version}");
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
             };
-            let features = features.trim_end_matches(" (*)");
             let mut observed = BTreeSet::new();
             if !features.is_empty() {
                 for feature in features.split(',') {
@@ -209,7 +241,7 @@ fn target_package_features(
 
         // Cargo's synthetic feature-activation nodes do not honor the custom
         // package format, so validate their native spelling separately.
-        let subject = row.trim_end_matches(" (*)");
+        let subject = row;
         let Some((package_name, feature)) = subject.split_once(" feature \"") else {
             panic!("unexpected cargo feature-tree subject: {subject}");
         };
@@ -329,6 +361,15 @@ fn target_package_feature_inventory_rejects_duplicate_feature_tokens() {
     );
 }
 
+#[test]
+#[should_panic(expected = "feature-tree package row with trailing tokens")]
+fn target_package_feature_inventory_rejects_package_trailing_tokens() {
+    target_package_features(
+        "0image v0.25.10 unexpected|png\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
 fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
@@ -340,8 +381,18 @@ fn dependency_tree_graph(
     for line in tree.lines() {
         let depth_end = line
             .find(|character: char| !character.is_ascii_digit())
-            .unwrap();
+            .unwrap_or_else(|| panic!("cargo tree row contains only a depth: {line}"));
+        assert!(depth_end > 0, "cargo tree row is missing a depth: {line}");
         let depth = line[..depth_end].parse::<usize>().unwrap();
+        if ancestors.is_empty() {
+            assert_eq!(depth, 0, "cargo tree first row must have depth zero: {line}");
+        } else {
+            assert!(depth > 0, "cargo tree contains multiple roots: {line}");
+            assert!(
+                depth <= ancestors.len(),
+                "cargo tree depth jumps past its parent: {line}"
+            );
+        }
         let package = tree_package_key(&line[depth_end..]);
         packages.insert(package.clone());
         ancestors.truncate(depth);
@@ -355,7 +406,44 @@ fn dependency_tree_graph(
         }
         ancestors.push(package);
     }
+    assert!(!packages.is_empty(), "cargo tree graph is empty");
     (packages, edges)
+}
+
+#[test]
+#[should_panic(expected = "cargo tree graph is empty")]
+fn dependency_tree_graph_rejects_empty_graphs() {
+    dependency_tree_graph("", TargetTriple::Linux, Provenance::ImageDescendant);
+}
+
+#[test]
+#[should_panic(expected = "cargo tree first row must have depth zero")]
+fn dependency_tree_graph_rejects_nonzero_first_depth() {
+    dependency_tree_graph(
+        "1image v0.25.10\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cargo tree contains multiple roots")]
+fn dependency_tree_graph_rejects_multiple_roots() {
+    dependency_tree_graph(
+        "0image v0.25.10\n0png v0.18.0\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cargo tree depth jumps past its parent")]
+fn dependency_tree_graph_rejects_depth_jumps() {
+    dependency_tree_graph(
+        "0image v0.25.10\n2png v0.18.0\n",
+        TargetTriple::Linux,
+        Provenance::ImageDescendant,
+    );
 }
 
 fn image_requester_subgraph(edges: &BTreeSet<EdgeFixture>) -> BTreeSet<EdgeFixture> {

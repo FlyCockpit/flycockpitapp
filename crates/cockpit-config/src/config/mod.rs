@@ -66,8 +66,17 @@ pub fn hold_config_mutation_lock(
 pub fn write_terminal_ingress_private_file(
     path: &std::path::Path,
     bytes: &[u8],
-) -> anyhow::Result<()> {
-    files::create_private_file_nofollow(path, bytes)
+) -> anyhow::Result<TerminalIngressFileIdentity> {
+    files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
+    let (_, identity) = files::read_file_nofollow_with_identity(path)?
+        .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
+    Ok(identity)
+}
+
+/// Create/open every terminal-ingress directory component without following
+/// symlinks or reparse points and enforce the platform private-directory mode.
+pub fn ensure_terminal_ingress_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    files::ensure_parent_dir_private(&path.join("ingress-leaf"))
 }
 
 /// Read a terminal-ingress file through the same retained-parent no-follow
@@ -76,6 +85,19 @@ pub fn read_terminal_ingress_file_nofollow(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     files::read_file_nofollow(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalIngressFileIdentity {
+    pub volume: u64,
+    pub file: u64,
+    pub links: u32,
+}
+
+pub fn read_terminal_ingress_file_verified(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
+    files::read_file_nofollow_with_identity(path)
 }
 
 /// Remove the exact no-follow terminal-ingress entry through the audited

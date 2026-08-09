@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::daemon::proto::{self, ErrorCode, ErrorPayload, Response};
+use crate::daemon::terminal::AuthenticatedTerminalContext;
 use crate::daemon::{EventSender, SharedRedactionTable, send_current_event};
 #[cfg(test)]
 use crate::redact::RedactionTable;
@@ -42,6 +44,7 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const INGRESS_JOURNAL_CAP: usize = 64;
 const INGRESS_TTL: Duration = Duration::from_secs(10 * 60);
+static NEXT_LOCAL_TERMINAL_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct IngressOperation {
@@ -53,7 +56,16 @@ struct IngressOperation {
     created_at: Instant,
     committed_at: Option<Instant>,
     path: Option<PathBuf>,
-    file_identity: Option<(u64, u64)>,
+    file_identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
+    owner: AuthenticatedTerminalContext,
+    session_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct BindingRecord {
+    epoch: u64,
+    owner: AuthenticatedTerminalContext,
+    session_id: Uuid,
 }
 
 /// Content-free terminal close outcome for one generation.
@@ -103,13 +115,35 @@ struct TerminalContainmentBinding {
     force_timeout: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TerminalHost {
     inner: Arc<Mutex<TerminalHostInner>>,
     event_tx: EventSender,
     redaction: SharedRedactionTable,
     temp_root: PathBuf,
     idle_ttl: Duration,
+    #[cfg(test)]
+    ingress_barrier: Arc<Mutex<Option<Arc<dyn Fn(IngressMutationEdge, &Path) + Send + Sync>>>>,
+}
+
+impl std::fmt::Debug for TerminalHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalHost")
+            .field("temp_root", &self.temp_root)
+            .field("idle_ttl", &self.idle_ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressMutationEdge {
+    BeforePublish,
+    AfterPublish,
+    AfterFinalVerification,
+    BeforeReserve,
+    AfterReserve,
 }
 
 #[derive(Debug, Default)]
@@ -128,7 +162,7 @@ struct TerminalState {
     filter: TerminalOutputFilter,
     viewer_count: usize,
     temp_dir: PathBuf,
-    bindings: HashMap<Uuid, u64>,
+    bindings: HashMap<Uuid, BindingRecord>,
     binding_dirs: HashMap<Uuid, PathBuf>,
     next_binding_epoch: u64,
     ingress: HashMap<Uuid, IngressOperation>,
@@ -598,6 +632,8 @@ impl TerminalHost {
             redaction,
             temp_root,
             idle_ttl: TERMINAL_IDLE_TTL,
+            #[cfg(test)]
+            ingress_barrier: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -609,6 +645,17 @@ impl TerminalHost {
 
     pub fn open(
         &self,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        self.open_with_context(test_local_terminal_context(), Uuid::nil(), cwd, cols, rows)
+    }
+
+    fn open_with_context(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
         cwd: Option<String>,
         cols: u16,
         rows: u16,
@@ -636,8 +683,11 @@ impl TerminalHost {
         crate::sync::lock_or_recover(&self.inner)
             .terminals
             .insert(id, terminal.clone());
-        let (binding, terminal_generation) =
-            issue_binding(&mut crate::sync::lock_or_recover(&terminal));
+        let (binding, terminal_generation) = issue_binding(
+            &mut crate::sync::lock_or_recover(&terminal),
+            context,
+            session_id,
+        );
         Ok(Response::TerminalOpened {
             terminal_id: id,
             viewer_count: 1,
@@ -653,6 +703,23 @@ impl TerminalHost {
         cols: u16,
         rows: u16,
     ) -> std::result::Result<Response, ErrorPayload> {
+        self.attach_with_context(
+            test_local_terminal_context(),
+            Uuid::nil(),
+            terminal_id,
+            cols,
+            rows,
+        )
+    }
+
+    fn attach_with_context(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
+        terminal_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> std::result::Result<Response, ErrorPayload> {
         let terminal = self.get_terminal(terminal_id)?;
         let (viewer_count, replay, binding, terminal_generation) = {
             let mut state = crate::sync::lock_or_recover(&terminal);
@@ -662,7 +729,7 @@ impl TerminalHost {
             state.viewer_count = state.viewer_count.saturating_add(1);
             state.last_detached = None;
             resize_locked(&mut state, cols, rows);
-            let (binding, generation) = issue_binding(&mut state);
+            let (binding, generation) = issue_binding(&mut state, context, session_id);
             (
                 state.viewer_count,
                 state.buffer.bytes(),
@@ -836,17 +903,30 @@ impl TerminalHost {
             }
             if operation.binding != binding {
                 let old_binding = operation.binding;
+                let new_owner = state
+                    .bindings
+                    .get(&binding.binding_id)
+                    .cloned()
+                    .ok_or_else(invalid_ingress)?;
+                if new_owner.owner.principal_id != operation.owner.principal_id
+                    || new_owner.owner.client_instance_id != operation.owner.client_instance_id
+                    || new_owner.session_id != operation.session_id
+                    || new_owner.owner.connection_epoch <= operation.owner.connection_epoch
+                {
+                    return Err(invalid_ingress());
+                }
                 let original_dir = state
                     .binding_dirs
                     .get(&old_binding.binding_id)
                     .cloned()
                     .ok_or_else(invalid_ingress)?;
                 state.binding_dirs.insert(binding.binding_id, original_dir);
-                state
+                let operation = state
                     .ingress
                     .get_mut(&metadata.operation_id)
-                    .expect("operation exists")
-                    .binding = binding;
+                    .expect("operation exists");
+                operation.binding = binding;
+                operation.owner = new_owner.owner;
             }
             return Ok(ingress_response(
                 state
@@ -862,6 +942,11 @@ impl TerminalHost {
         {
             return Err(invalid_ingress());
         }
+        let binding_record = state
+            .bindings
+            .get(&binding.binding_id)
+            .cloned()
+            .ok_or_else(invalid_ingress)?;
         state.ingress.insert(
             metadata.operation_id,
             IngressOperation {
@@ -874,6 +959,8 @@ impl TerminalHost {
                 committed_at: None,
                 path: None,
                 file_identity: None,
+                owner: binding_record.owner,
+                session_id: binding_record.session_id,
             },
         );
         Ok(ingress_response(
@@ -969,56 +1056,35 @@ impl TerminalHost {
         let final_path = binding_dir.join(name);
         let path_text = final_path.to_str().ok_or_else(ingress_path_unavailable)?;
         validate_path_text(path_text)?;
-        std::fs::create_dir_all(&binding_dir).map_err(internal)?;
-        set_private_dir_permissions(&binding_dir).map_err(internal)?;
-        #[cfg(not(windows))]
-        let temporary = binding_dir.join(format!(".{}.tmp", random_base32()));
-        #[cfg(not(windows))]
-        {
-            use std::fs::OpenOptions;
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            }
-            let mut file = options.open(&temporary).map_err(internal)?;
-            set_private_open_file_permissions(&file).map_err(internal)?;
-            file.write_all(&bytes).map_err(internal)?;
-            file.sync_all().map_err(internal)?;
-        }
-        #[cfg(windows)]
-        {
-            if cockpit_config::config::read_terminal_ingress_file_nofollow(&final_path)
-                .map_err(internal)?
-                .is_some()
-            {
-                return Err(invalid_ingress());
-            }
+        cockpit_config::config::ensure_terminal_ingress_private_dir(&binding_dir)
+            .map_err(internal)?;
+        #[cfg(test)]
+        self.hit_ingress_barrier(IngressMutationEdge::BeforePublish, &final_path);
+        let published_identity =
             cockpit_config::config::write_terminal_ingress_private_file(&final_path, &bytes)
                 .map_err(internal)?;
-        }
-        #[cfg(not(windows))]
-        {
-            if std::fs::symlink_metadata(&final_path).is_ok() {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(invalid_ingress());
+        #[cfg(test)]
+        self.hit_ingress_barrier(IngressMutationEdge::AfterPublish, &final_path);
+        let (verified, file_identity) = match read_verified_final(&final_path, metadata.size) {
+            Ok(verified) => verified,
+            Err(error) => {
+                remove_if_same_identity(&final_path, Some(published_identity));
+                return Err(error);
             }
-            std::fs::rename(&temporary, &final_path).map_err(internal)?;
-        }
-        let (verified, file_identity) = read_verified_final(&final_path, metadata.size)?;
+        };
         if let Err(error) = validate_image(&metadata, &verified) {
             remove_if_same_identity(&final_path, file_identity);
             return Err(error);
         }
+        #[cfg(test)]
+        self.hit_ingress_barrier(IngressMutationEdge::AfterFinalVerification, &final_path);
         if let Err(error) = authorize_binding(&state, binding) {
             remove_if_same_identity(&final_path, file_identity);
             return Err(error);
         }
         let frame = bracketed_paste_bytes(&shell_path_literal(path_text, host_shell_dialect())?);
+        #[cfg(test)]
+        self.hit_ingress_barrier(IngressMutationEdge::BeforeReserve, &final_path);
         let writer = state
             .writer
             .as_mut()
@@ -1037,7 +1103,20 @@ impl TerminalHost {
         operation.path = Some(final_path);
         operation.file_identity = file_identity;
         operation.bytes.clear();
+        #[cfg(test)]
+        self.hit_ingress_barrier(
+            IngressMutationEdge::AfterReserve,
+            operation.path.as_deref().expect("committed path"),
+        );
         Ok(ingress_response(operation))
+    }
+
+    #[cfg(test)]
+    fn hit_ingress_barrier(&self, edge: IngressMutationEdge, path: &Path) {
+        let hook = crate::sync::lock_or_recover(&self.ingress_barrier).clone();
+        if let Some(hook) = hook {
+            hook(edge, path);
+        }
     }
 
     pub fn contains(&self, terminal_id: Uuid) -> bool {
@@ -1342,20 +1421,24 @@ pub(crate) fn factory() -> crate::daemon::terminal::TerminalHostFactory {
 impl crate::daemon::terminal::TerminalHost for TerminalHost {
     fn open(
         &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
         cwd: Option<String>,
         cols: u16,
         rows: u16,
     ) -> crate::daemon::terminal::TerminalResult {
-        TerminalHost::open(self, cwd, cols, rows)
+        TerminalHost::open_with_context(self, context, session_id, cwd, cols, rows)
     }
 
     fn attach(
         &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
         terminal_id: Uuid,
         cols: u16,
         rows: u16,
     ) -> crate::daemon::terminal::TerminalResult {
-        TerminalHost::attach(self, terminal_id, cols, rows)
+        TerminalHost::attach_with_context(self, context, session_id, terminal_id, cols, rows)
     }
 
     fn release_viewer(&self, terminal_id: Uuid, binding: TerminalBinding) {
@@ -1590,15 +1673,32 @@ fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
     out
 }
 
-fn issue_binding(state: &mut TerminalState) -> (TerminalBinding, u64) {
+fn test_local_terminal_context() -> AuthenticatedTerminalContext {
+    AuthenticatedTerminalContext {
+        principal_id: "local-owner".to_string(),
+        client_instance_id: Uuid::nil(),
+        connection_epoch: NEXT_LOCAL_TERMINAL_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed),
+    }
+}
+
+fn issue_binding(
+    state: &mut TerminalState,
+    owner: AuthenticatedTerminalContext,
+    session_id: Uuid,
+) -> (TerminalBinding, u64) {
     state.next_binding_epoch = state.next_binding_epoch.saturating_add(1);
     let binding = TerminalBinding {
         binding_id: Uuid::new_v4(),
         binding_epoch: state.next_binding_epoch,
     };
-    state
-        .bindings
-        .insert(binding.binding_id, binding.binding_epoch);
+    state.bindings.insert(
+        binding.binding_id,
+        BindingRecord {
+            epoch: binding.binding_epoch,
+            owner,
+            session_id,
+        },
+    );
     let binding_dir = state.temp_dir.join(random_base32());
     state.binding_dirs.insert(binding.binding_id, binding_dir);
     (binding, state.generation)
@@ -1609,7 +1709,11 @@ fn authorize_binding(
     binding: TerminalBinding,
 ) -> std::result::Result<(), ErrorPayload> {
     ensure_open(state, state.id).map_err(|_| invalid_ingress())?;
-    if state.bindings.get(&binding.binding_id) == Some(&binding.binding_epoch) {
+    if state
+        .bindings
+        .get(&binding.binding_id)
+        .is_some_and(|record| record.epoch == binding.binding_epoch)
+    {
         Ok(())
     } else {
         Err(invalid_ingress())
@@ -1845,87 +1949,44 @@ fn set_private_open_file_permissions(_file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn read_verified_final(
     path: &Path,
     expected_len: u64,
-) -> std::result::Result<(Vec<u8>, Option<(u64, u64)>), ErrorPayload> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path).map_err(internal)?;
-    let before = file.metadata().map_err(internal)?;
-    if !before.is_file() || before.len() != expected_len {
-        return Err(invalid_ingress());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.uid() != unsafe { libc::geteuid() }
-            || before.nlink() != 1
-            || before.mode() & 0o777 != 0o600
-        {
-            return Err(invalid_ingress());
-        }
-    }
-    let mut bytes = Vec::with_capacity(expected_len as usize);
-    file.read_to_end(&mut bytes).map_err(internal)?;
-    let after = file.metadata().map_err(internal)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len()
-        {
-            return Err(invalid_ingress());
-        }
-    }
-    #[cfg(unix)]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        Some((after.dev(), after.ino()))
-    };
-    #[cfg(not(unix))]
-    let identity = None;
-    Ok((bytes, identity))
-}
-
-#[cfg(windows)]
-fn read_verified_final(
-    path: &Path,
-    expected_len: u64,
-) -> std::result::Result<(Vec<u8>, Option<(u64, u64)>), ErrorPayload> {
-    let bytes = cockpit_config::config::read_terminal_ingress_file_nofollow(path)
+) -> std::result::Result<
+    (
+        Vec<u8>,
+        Option<cockpit_config::config::TerminalIngressFileIdentity>,
+    ),
+    ErrorPayload,
+> {
+    let (bytes, identity) = cockpit_config::config::read_terminal_ingress_file_verified(path)
         .map_err(internal)?
         .ok_or_else(invalid_ingress)?;
-    if bytes.len() as u64 != expected_len {
+    if bytes.len() as u64 != expected_len || identity.links != 1 {
         return Err(invalid_ingress());
     }
-    Ok((bytes, None))
+    let (post_bytes, post_identity) =
+        cockpit_config::config::read_terminal_ingress_file_verified(path)
+            .map_err(internal)?
+            .ok_or_else(invalid_ingress)?;
+    if post_identity != identity || post_bytes != bytes {
+        return Err(invalid_ingress());
+    }
+    Ok((bytes, Some(identity)))
 }
 
-fn remove_if_same_identity(path: &Path, expected: Option<(u64, u64)>) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if Some((metadata.dev(), metadata.ino())) != expected || !metadata.is_file() {
-            return;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = expected;
-        let _ = cockpit_config::config::remove_terminal_ingress_file_nofollow(path);
+fn remove_if_same_identity(
+    path: &Path,
+    expected: Option<cockpit_config::config::TerminalIngressFileIdentity>,
+) {
+    let Ok(Some((_, current))) = cockpit_config::config::read_terminal_ingress_file_verified(path)
+    else {
+        return;
+    };
+    if Some(current) != expected {
         return;
     }
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(path);
+    let _ = cockpit_config::config::remove_terminal_ingress_file_nofollow(path);
 }
 
 // ---- Tests ----------------------------------------------------------------
@@ -2775,9 +2836,61 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_ingress_general_agent_integration() {
-        // Exercise the same real portable-pty foreground receiver path as the
-        // corrected legacy fixture. The receiver requires no Cockpit API.
-        terminal_ingress_tests_corrected_first();
+        let (tx, _rx) = broadcast::channel(32);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+        let Response::TerminalOpened {
+            terminal_id,
+            binding,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let fixtures: &[(TerminalImageType, &[u8])] = &[
+            (TerminalImageType::Png, b"\x89PNG\r\n\x1a\nreal-png"),
+            (TerminalImageType::Jpeg, b"\xff\xd8\xff\xe0real-jpeg"),
+            (TerminalImageType::Gif, b"GIF89areal-gif"),
+            (TerminalImageType::Webp, b"RIFF0000WEBPreal-webp"),
+        ];
+        for (index, (media_type, bytes)) in fixtures.iter().enumerate() {
+            let operation_id = Uuid::new_v4();
+            let metadata = TerminalIngressMetadata {
+                operation_id,
+                size: bytes.len() as u64,
+                media_type: *media_type,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            };
+            host.ingress_begin(terminal_id, binding, metadata).unwrap();
+            host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
+                .unwrap();
+            let Response::TerminalIngress { receipt } = host
+                .ingress_finish(terminal_id, binding, operation_id)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(receipt.input_sequence, Some((index + 1) as u64));
+            let terminal = host.get_terminal(terminal_id).unwrap();
+            let path = crate::sync::lock_or_recover(&terminal).ingress[&operation_id]
+                .path
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+            std::fs::write(&path, b"foreground mutation").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let Response::TerminalIngress { receipt: replay } = host
+                .ingress_status(terminal_id, binding, operation_id)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(replay, receipt);
+        }
+        let _ = host.close(terminal_id);
     }
 
     #[test]
@@ -2799,6 +2912,17 @@ mod tests {
             shell_path_literal(path, IngressShellDialect::Cmd).unwrap(),
             format!("\"{path}\"")
         );
+        for dialect in [
+            IngressShellDialect::Posix,
+            IngressShellDialect::PowerShell,
+            IngressShellDialect::Cmd,
+        ] {
+            let literal = shell_path_literal(path, dialect).unwrap();
+            assert_eq!(
+                cockpit_tui::tui::structured_paste::parse_private_image_path_literal(&literal),
+                Some(PathBuf::from(path))
+            );
+        }
         for rejected in [
             "/tmp/a\nb",
             "/tmp/a\rb",
@@ -2877,7 +3001,7 @@ mod tests {
                 "missing hardened Windows primitive {required}"
             );
         }
-        assert!(source.contains("create_private_file_nofollow"));
+        assert!(source.contains("commit_noreplace"));
     }
 
     #[test]
@@ -2990,9 +3114,35 @@ mod tests {
         };
         host.ingress_begin(terminal_id, reauthenticated, metadata)
             .unwrap();
+        host.release_viewer(terminal_id, reauthenticated);
+        let foreign_context = AuthenticatedTerminalContext {
+            principal_id: "different-principal".into(),
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: u64::MAX,
+        };
+        let Response::TerminalOpened {
+            binding: foreign, ..
+        } = host
+            .attach_with_context(foreign_context, Uuid::nil(), terminal_id, 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let operation = host.get_terminal(terminal_id).unwrap();
+        let original_metadata = crate::sync::lock_or_recover(&operation)
+            .ingress
+            .values()
+            .next()
+            .unwrap()
+            .metadata
+            .clone();
+        assert!(
+            host.ingress_begin(terminal_id, foreign, original_metadata)
+                .is_err()
+        );
         host.release_viewer(terminal_id, first);
         host.release_viewer(terminal_id, other_viewer);
-        host.release_viewer(terminal_id, reauthenticated);
+        host.release_viewer(terminal_id, foreign);
         let _ = host.close(terminal_id);
     }
 
@@ -3053,6 +3203,85 @@ mod tests {
                 .code,
             ErrorCode::IngressConflict
         );
+        let _ = host.close(terminal_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ingress_injected_mutation_barriers() {
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+        let Response::TerminalOpened {
+            terminal_id,
+            binding,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let bytes = b"GIF89a-barrier";
+        let operation_id = Uuid::new_v4();
+        let metadata = TerminalIngressMetadata {
+            operation_id,
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Gif,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        host.ingress_begin(terminal_id, binding, metadata).unwrap();
+        host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
+            .unwrap();
+        *crate::sync::lock_or_recover(&host.ingress_barrier) = Some(Arc::new(|edge, path| {
+            if edge == IngressMutationEdge::AfterPublish {
+                std::fs::write(path, b"mutated-before-verification").unwrap();
+            }
+        }));
+        assert!(
+            host.ingress_finish(terminal_id, binding, operation_id)
+                .is_err()
+        );
+        assert_eq!(
+            crate::sync::lock_or_recover(&host.get_terminal(terminal_id).unwrap()).input_sequence,
+            0
+        );
+
+        *crate::sync::lock_or_recover(&host.ingress_barrier) = None;
+        let second_id = Uuid::new_v4();
+        let second = TerminalIngressMetadata {
+            operation_id: second_id,
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Gif,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        };
+        // The failed Prepared operation still owns the binding budget. A fresh
+        // authenticated binding gets an independent bounded operation.
+        let Response::TerminalOpened {
+            binding: second_binding,
+            ..
+        } = host.attach(terminal_id, 80, 24).unwrap()
+        else {
+            panic!()
+        };
+        host.ingress_begin(terminal_id, second_binding, second)
+            .unwrap();
+        host.ingress_chunk(terminal_id, second_binding, second_id, 0, bytes.to_vec())
+            .unwrap();
+        *crate::sync::lock_or_recover(&host.ingress_barrier) = Some(Arc::new(|edge, path| {
+            if edge == IngressMutationEdge::AfterFinalVerification {
+                std::fs::write(path, b"ordinary-postverify-mutation").unwrap();
+            }
+        }));
+        let Response::TerminalIngress { receipt } = host
+            .ingress_finish(terminal_id, second_binding, second_id)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(receipt.state, TerminalIngressState::Committed);
+        assert_eq!(receipt.input_sequence, Some(1));
+        *crate::sync::lock_or_recover(&host.ingress_barrier) = None;
         let _ = host.close(terminal_id);
     }
 

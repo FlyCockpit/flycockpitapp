@@ -22,8 +22,22 @@ pub struct AuthenticatedTerminalContext {
 }
 
 pub trait TerminalHost: std::fmt::Debug + Send + Sync {
-    fn open(&self, cwd: Option<String>, cols: u16, rows: u16) -> TerminalResult;
-    fn attach(&self, terminal_id: Uuid, cols: u16, rows: u16) -> TerminalResult;
+    fn open(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> TerminalResult;
+    fn attach(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
+        terminal_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> TerminalResult;
     fn release_viewer(
         &self,
         terminal_id: Uuid,
@@ -126,11 +140,25 @@ fn unsupported_host_factory() -> TerminalHostFactory {
 struct UnsupportedTerminalHost;
 
 impl TerminalHost for UnsupportedTerminalHost {
-    fn open(&self, _cwd: Option<String>, _cols: u16, _rows: u16) -> TerminalResult {
+    fn open(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _cwd: Option<String>,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn attach(&self, _terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn attach(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _terminal_id: Uuid,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
@@ -259,7 +287,14 @@ impl TestTerminalHost {
 
 #[cfg(test)]
 impl TerminalHost for TestTerminalHost {
-    fn open(&self, cwd: Option<String>, _cols: u16, _rows: u16) -> TerminalResult {
+    fn open(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        cwd: Option<String>,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         // Same cwd validation as the real host's `resolve_cwd`, without
         // consulting the home directory for the `None` default.
         if let Some(cwd) = cwd
@@ -284,7 +319,14 @@ impl TerminalHost for TestTerminalHost {
         })
     }
 
-    fn attach(&self, terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn attach(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        terminal_id: Uuid,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         self.require_open(terminal_id)?;
         Ok(Response::TerminalOpened {
             terminal_id,

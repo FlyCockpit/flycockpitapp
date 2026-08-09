@@ -137,6 +137,14 @@ const FIELD_CONNECT_TIMEOUT: usize = 16;
 const FIELD_REQUEST_TIMEOUT: usize = 17;
 const FIELD_SAVE: usize = 18;
 const ADD_FIELDS: usize = 19;
+
+macro_rules! push_pointer_text_field {
+    ($bindings:expr, $id:expr, $($args:expr),+ $(,)?) => {{
+        let range = push_text_field_at_cursor($($args),+);
+        $bindings.extend(range.map(|line| (line, SettingsControlId($id as u64))));
+    }};
+}
+
 type EnvMaps = (BTreeMap<String, String>, BTreeMap<String, String>);
 
 enum ServerLifecycle {
@@ -499,7 +507,10 @@ impl SettingsCx {
             Line::from(""),
             Line::from(Span::styled("Server", muted_style())),
         ];
-        push_text_field_at_cursor(
+        let mut bindings = Vec::new();
+        push_pointer_text_field!(
+            bindings,
+            FIELD_NAME,
             &mut lines,
             area.width,
             "name",
@@ -508,6 +519,7 @@ impl SettingsCx {
             s.cursor == FIELD_NAME,
             None,
         );
+        bindings.push((lines.len(), SettingsControlId(FIELD_ENABLED as u64)));
         lines.push(Line::from(vec![
             Span::raw("enabled: "),
             Span::styled(
@@ -519,6 +531,7 @@ impl SettingsCx {
                 },
             ),
         ]));
+        bindings.push((lines.len(), SettingsControlId(FIELD_TRANSPORT as u64)));
         lines.push(Line::from(vec![
             Span::raw("transport: "),
             Span::styled(
@@ -532,7 +545,9 @@ impl SettingsCx {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Connection", muted_style())));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_ENDPOINT,
             &mut lines,
             area.width,
             "endpoint",
@@ -541,7 +556,9 @@ impl SettingsCx {
             s.cursor == FIELD_ENDPOINT,
             Some("remote transports"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_COMMAND,
             &mut lines,
             area.width,
             "command",
@@ -550,7 +567,9 @@ impl SettingsCx {
             s.cursor == FIELD_COMMAND,
             Some("stdio"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_ARGS,
             &mut lines,
             area.width,
             "args",
@@ -559,7 +578,9 @@ impl SettingsCx {
             s.cursor == FIELD_ARGS,
             Some("stdio, space separated"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_BASE_ENV,
             &mut lines,
             area.width,
             "base env",
@@ -570,6 +591,7 @@ impl SettingsCx {
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Auth", muted_style())));
+        bindings.push((lines.len(), SettingsControlId(FIELD_AUTH as u64)));
         lines.push(Line::from(vec![
             Span::raw("auth: "),
             Span::styled(
@@ -581,7 +603,9 @@ impl SettingsCx {
                 },
             ),
         ]));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_HEADER_NAME,
             &mut lines,
             area.width,
             "header name",
@@ -590,7 +614,9 @@ impl SettingsCx {
             s.cursor == FIELD_HEADER_NAME,
             Some("remote header auth"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_HEADER_VALUE,
             &mut lines,
             area.width,
             "header value",
@@ -599,7 +625,9 @@ impl SettingsCx {
             s.cursor == FIELD_HEADER_VALUE,
             Some("literal stored in credentials, or $ENV"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_AUTH_ENV,
             &mut lines,
             area.width,
             "auth env",
@@ -608,7 +636,9 @@ impl SettingsCx {
             s.cursor == FIELD_AUTH_ENV,
             Some("stdio env auth, one KEY=VALUE per row"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_AUTHORIZE,
             &mut lines,
             area.width,
             "oauth authorize",
@@ -617,7 +647,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_AUTHORIZE,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_TOKEN,
             &mut lines,
             area.width,
             "oauth token",
@@ -626,7 +658,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_TOKEN,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_CLIENT,
             &mut lines,
             area.width,
             "oauth client id",
@@ -635,7 +669,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_CLIENT,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_SCOPES,
             &mut lines,
             area.width,
             "oauth scopes",
@@ -646,7 +682,9 @@ impl SettingsCx {
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Behavior", muted_style())));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_CACHE_TTL,
             &mut lines,
             area.width,
             "cache ttl",
@@ -655,7 +693,9 @@ impl SettingsCx {
             s.cursor == FIELD_CACHE_TTL,
             Some("seconds"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_CONNECT_TIMEOUT,
             &mut lines,
             area.width,
             "connect timeout",
@@ -664,7 +704,9 @@ impl SettingsCx {
             s.cursor == FIELD_CONNECT_TIMEOUT,
             Some("seconds, remote"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_REQUEST_TIMEOUT,
             &mut lines,
             area.width,
             "request timeout",
@@ -673,6 +715,7 @@ impl SettingsCx {
             s.cursor == FIELD_REQUEST_TIMEOUT,
             Some("seconds, remote"),
         );
+        bindings.push((lines.len(), SettingsControlId(FIELD_SAVE as u64)));
         lines.push(save_button_line("[ save ]", s.cursor == FIELD_SAVE));
         if !s.auth.is_compatible(s.transport) {
             lines.push(Line::from(""));
@@ -704,7 +747,7 @@ impl SettingsCx {
             "mcp:add",
             lines,
             selected_line,
-            std::iter::empty(),
+            bindings,
             &self.pointer_surface,
             SettingsScrollRegionId("mcp:add"),
         );

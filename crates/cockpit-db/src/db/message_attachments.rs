@@ -488,13 +488,27 @@ mod tests {
             .await
             .is_err()
         );
-        let (events, state): (i64, String) = db.read(move |conn| {
+        let accepted_outcome = MessageSafeOutcome::Accepted {
+            queue_item_id: input.queue_item_id,
+        }
+        .encode();
+        let (events, operation, submission, queue) = db.read(move |conn| {
             let events = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session_id=?1 AND type='user_message'", [session.session_id.to_string()], |row| row.get(0))?;
-            let state = conn.query_row("SELECT state FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2", params![session.session_id.to_string(), input.client_submission_id.as_slice()], |row| row.get(0))?;
-            Ok((events, state))
+            let operation = conn.query_row("SELECT state,safe_outcome,created_at,updated_at FROM message_operation_receipts WHERE session_id=?1 AND operation_id=?2", params![session.session_id.to_string(),input.operation_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?)))?;
+            let submission = conn.query_row("SELECT state,safe_outcome,message_seq,fold_ordinal,created_at,updated_at FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2", params![session.session_id.to_string(),input.client_submission_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,Option<i64>>(3)?,row.get::<_,i64>(4)?,row.get::<_,i64>(5)?)))?;
+            let queue = conn.query_row("SELECT state,created_at,updated_at FROM message_queue_items WHERE session_id=?1 AND queue_item_id=?2", params![session.session_id.to_string(),input.queue_item_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))?;
+            Ok((events, operation, submission, queue))
         }).await.unwrap();
         assert_eq!(events, 0);
-        assert_eq!(state, "accepted");
+        assert_eq!(
+            operation,
+            ("accepted".into(), accepted_outcome.clone(), 10, 10)
+        );
+        assert_eq!(
+            submission,
+            ("accepted".into(), accepted_outcome, None, None, 10, 10)
+        );
+        assert_eq!(queue, ("accepted".into(), 10, 10));
     }
 
     #[tokio::test]

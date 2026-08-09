@@ -718,8 +718,11 @@ pub enum Body {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
-    UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, RemoteAdapterEvidenceV1,
+    RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy, RemoteOperationClass, Request,
+    RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    remote_adapter_recovery_contract_for_tag, remote_adapter_recovery_strategy_for_tag,
+    remote_operation_class_for_tag,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

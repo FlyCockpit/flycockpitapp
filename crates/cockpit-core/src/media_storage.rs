@@ -1771,8 +1771,77 @@ mod tests {
         })
         .await
         .unwrap();
+        for (trigger, table) in [
+            (
+                "fail_upload_component_insert",
+                "media_attachment_components",
+            ),
+            (
+                "fail_upload_origin_insert",
+                "media_attachment_upload_origins",
+            ),
+            ("fail_upload_operation_insert", "local_media_operations"),
+            ("fail_upload_audit_insert", "local_media_operation_audit"),
+        ] {
+            let create = format!(
+                "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected finalize tranche failure'); END;"
+            );
+            db.transaction(move |conn| {
+                conn.execute_batch(&create)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(
+                recovery
+                    .finalize_media_upload(finalize.clone(), 43)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected finalize tranche failure")
+            );
+            let graph_counts = db
+                .read(|conn| {
+                    Ok((
+                        conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_attachment_components",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_attachment_upload_origins",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM local_media_operations WHERE action='finalize'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                    ))
+                })
+                .await
+                .unwrap();
+            assert_eq!(graph_counts, (0, 0, 0, 0));
+            assert_eq!(
+                std::fs::read_dir(temp.path().join("media"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let drop_trigger = format!("DROP TRIGGER {trigger}");
+            db.transaction(move |conn| {
+                conn.execute_batch(&drop_trigger)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
         let finalized = recovery
-            .finalize_media_upload(finalize.clone(), 43)
+            .finalize_media_upload(finalize.clone(), 44)
             .await
             .unwrap();
         assert!(matches!(
@@ -1786,7 +1855,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            recovery.finalize_media_upload(finalize, 44).await.unwrap(),
+            recovery.finalize_media_upload(finalize, 45).await.unwrap(),
             finalized
         );
         let finalized_status = db

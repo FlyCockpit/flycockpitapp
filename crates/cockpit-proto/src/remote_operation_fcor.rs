@@ -695,6 +695,82 @@ mod tests {
     }
 
     #[test]
+    fn named_codec_field_order_and_data_enum_bytes_are_exact() {
+        fn exact(value: &impl CanonicalFcorValueV1, expected: &str) {
+            let mut out = CanonicalParamsV1::new();
+            value.encode_fcor_value_v1(&mut out).unwrap();
+            assert_eq!(hex(&out.into_bytes()), expected);
+        }
+        exact(
+            &crate::EnvSnapshotWire {
+                source: crate::EnvSnapshotSource::DaemonStart,
+                digest: "d".into(),
+                vars: std::collections::HashMap::new(),
+            },
+            "0001000000016400000000",
+        );
+        exact(
+            &crate::ImageAttachmentRef {
+                id: Uuid::from_bytes([1; 16]),
+            },
+            "01010101010101010101010101010101",
+        );
+        exact(
+            &crate::TagExpansionMeta {
+                tool: "t".into(),
+                path: "p".into(),
+                detail: "d".into(),
+                ok: true,
+            },
+            "00000001740000000170000000016401",
+        );
+        exact(&crate::RunInvocationOptions::default(), "000000");
+        exact(
+            &cockpit_config::config::providers::ActiveReasoningEffort { value: "r".into() },
+            "0000000172",
+        );
+        exact(
+            &cockpit_config::config::providers::ActiveModelRef {
+                provider: "p".into(),
+                model: "m".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            "0000000170000000016d000000",
+        );
+        exact(
+            &crate::AttachmentPurpose::TerminalPasteImage {
+                terminal_id: Uuid::from_bytes([2; 16]),
+            },
+            "000202020202020202020202020202020202",
+        );
+        exact(
+            &cockpit_db::wire::ResolveResponse::Single {
+                selected_id: "a".into(),
+            },
+            "00010000000161",
+        );
+        exact(
+            &cockpit_db::wire::ResolveResponse::Multi {
+                selected_ids: vec!["a".into(), "b".into()],
+            },
+            "00020000000200000001610000000162",
+        );
+        exact(
+            &cockpit_db::wire::ResolveResponse::Freetext { text: "x".into() },
+            "00030000000178",
+        );
+        exact(
+            &cockpit_db::wire::ResolveResponse::Batch {
+                responses: vec![cockpit_db::wire::ResolveResponse::Cancel],
+            },
+            "0004000000010005",
+        );
+        exact(&cockpit_db::wire::ResolveResponse::Cancel, "0005");
+    }
+
+    #[test]
     fn bulk_reference_value_bytes_are_exact_and_revalidate_class_limit() {
         use crate::remote_protocol_id::{kind, tag_protocol_id_bytes};
         use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
@@ -846,6 +922,98 @@ mod tests {
         check!(
             "thinking_mode.high",
             cockpit_config::config::providers::ThinkingMode::High
+        );
+        check!(
+            "env_snapshot_source.daemon_start",
+            crate::EnvSnapshotSource::DaemonStart
+        );
+        check!(
+            "env_snapshot_source.tui_shell",
+            crate::EnvSnapshotSource::TuiShell
+        );
+        check!(
+            "env_snapshot_source.tui_process_fallback",
+            crate::EnvSnapshotSource::TuiProcessFallback
+        );
+        check!(
+            "env_snapshot_source.explicit_cli",
+            crate::EnvSnapshotSource::ExplicitCli
+        );
+        check!(
+            "approval_mode.manual",
+            cockpit_config::config::extended::ApprovalMode::Manual
+        );
+        check!(
+            "approval_mode.auto",
+            cockpit_config::config::extended::ApprovalMode::Auto
+        );
+        check!(
+            "approval_mode.yolo",
+            cockpit_config::config::extended::ApprovalMode::Yolo
+        );
+        check!(
+            "llm_mode.defensive",
+            cockpit_config::config::extended::LlmMode::Defensive
+        );
+        check!(
+            "llm_mode.normal",
+            cockpit_config::config::extended::LlmMode::Normal
+        );
+        check!(
+            "llm_mode.frontier",
+            cockpit_config::config::extended::LlmMode::Frontier
+        );
+        check!(
+            "sandbox_mode.off",
+            cockpit_config::config::sandbox_mode::SandboxMode::Off
+        );
+        check!(
+            "sandbox_mode.sandbox",
+            cockpit_config::config::sandbox_mode::SandboxMode::Sandbox
+        );
+        check!(
+            "sandbox_mode.container",
+            cockpit_config::config::sandbox_mode::SandboxMode::Container
+        );
+        check!(
+            "sandbox_mode.container_readonly",
+            cockpit_config::config::sandbox_mode::SandboxMode::ContainerReadonly
+        );
+        check!(
+            "goal_disposition.running",
+            cockpit_db::db::session_goals::GoalDisposition::Running
+        );
+        check!(
+            "goal_disposition.user_paused",
+            cockpit_db::db::session_goals::GoalDisposition::UserPaused
+        );
+        check!(
+            "goal_disposition.infra_paused",
+            cockpit_db::db::session_goals::GoalDisposition::InfraPaused
+        );
+        check!(
+            "goal_disposition.blocked",
+            cockpit_db::db::session_goals::GoalDisposition::Blocked
+        );
+        check!(
+            "goal_disposition.no_progress_paused",
+            cockpit_db::db::session_goals::GoalDisposition::NoProgressPaused
+        );
+        check!(
+            "goal_disposition.budget_limited",
+            cockpit_db::db::session_goals::GoalDisposition::BudgetLimited
+        );
+        check!(
+            "goal_disposition.complete",
+            cockpit_db::db::session_goals::GoalDisposition::Complete
+        );
+        check!(
+            "goal_disposition.cleared",
+            cockpit_db::db::session_goals::GoalDisposition::Cleared
+        );
+        check!(
+            "attachment_purpose.user_message_image",
+            crate::AttachmentPurpose::UserMessageImage
         );
     }
 

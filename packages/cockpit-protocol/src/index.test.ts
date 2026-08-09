@@ -13,11 +13,13 @@ import {
   errorEnvelopeSchema,
   eventEnvelopeSchema,
   grantKindSchema,
+  historyEntrySchema,
   interruptQuestionSchema,
   knownEventEnvelopeSchema,
   modelSelectionOutcomeSchema,
   modelSelectionResultDataSchema,
   PROTOCOL_VERSION,
+  pausedWorkSummarySchema,
   resolveResponseSchema,
   responseEnvelopeSchema,
   sandboxEscalationSchema,
@@ -447,6 +449,31 @@ describe("cockpit-proto daemon wire schemas", () => {
       ).toBe(false);
     }
 
+    for (const request of [
+      requestsFixture.attach,
+      requestsFixture.read_history_page,
+      requestsFixture.read_session_messages,
+      requestsFixture.read_subagent_history_page,
+    ]) {
+      const cursor = request.request === "attach" ? "since_seq" : "before_seq";
+      for (const value of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+        expect(
+          clientEnvelopeSchema.safeParse({
+            ...request,
+            params: { ...request.params, [cursor]: value },
+          }).success,
+        ).toBe(true);
+      }
+      for (const value of [Number.MIN_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(
+          clientEnvelopeSchema.safeParse({
+            ...request,
+            params: { ...request.params, [cursor]: value },
+          }).success,
+        ).toBe(false);
+      }
+    }
+
     const disclosures = responsesFixture.startup_disclosures;
     for (const cursor_seq of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
       expect(
@@ -508,5 +535,55 @@ describe("cockpit-proto daemon wire schemas", () => {
         }).success,
       ).toBe(false);
     }
+
+    const toolCall = {
+      role: "tool_call",
+      agent: "Build",
+      call_id: "call-1",
+      parent_child_index: Number.MIN_SAFE_INTEGER,
+      tool: "read",
+      original_input: {},
+      wire_input: {},
+      output: "ok",
+      hard_fail: false,
+      truncated: false,
+    };
+    expect(historyEntrySchema.safeParse(toolCall).success).toBe(true);
+    expect(
+      historyEntrySchema.safeParse({
+        ...toolCall,
+        parent_child_index: Number.MIN_SAFE_INTEGER - 1,
+      }).success,
+    ).toBe(false);
+
+    const compactBoundary = {
+      role: "compact_boundary",
+      predecessor_short_id: "abc123",
+      seed_tool_count: 1,
+      seed_tool_tokens: Number.MAX_SAFE_INTEGER,
+      tokens_before: Number.MAX_SAFE_INTEGER,
+      tokens_after: Number.MAX_SAFE_INTEGER,
+    };
+    expect(historyEntrySchema.safeParse(compactBoundary).success).toBe(true);
+    expect(
+      historyEntrySchema.safeParse({
+        ...compactBoundary,
+        seed_tool_tokens: Number.MAX_SAFE_INTEGER + 1,
+      }).success,
+    ).toBe(false);
+
+    const pausedWork = responsesFixture.attached.data.paused_work[0];
+    expect(
+      pausedWorkSummarySchema.safeParse({
+        ...pausedWork,
+        pending_tool_count: Number.MIN_SAFE_INTEGER,
+      }).success,
+    ).toBe(true);
+    expect(
+      pausedWorkSummarySchema.safeParse({
+        ...pausedWork,
+        pending_tool_count: Number.MIN_SAFE_INTEGER - 1,
+      }).success,
+    ).toBe(false);
   });
 });

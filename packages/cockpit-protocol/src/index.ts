@@ -272,7 +272,7 @@ const requestParamSchemas = {
   attach: z
     .object({
       session_id: optionalUuidSchema,
-      since_seq: safeU64NumberSchema.optional(),
+      since_seq: safeI64NumberSchema.optional(),
       project_root: z.string().optional(),
       no_sandbox: z.boolean().optional(),
       interactive: z.boolean().optional(),
@@ -331,7 +331,7 @@ const requestParamSchemas = {
   read_history_page: z
     .object({
       session_id: uuidSchema,
-      before_seq: safeU64NumberSchema.nullable().optional(),
+      before_seq: safeI64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
@@ -340,14 +340,14 @@ const requestParamSchemas = {
       session_id: uuidSchema,
       task_call_id: z.string().min(1),
       label: z.string().min(1),
-      before_seq: safeU64NumberSchema.nullable().optional(),
+      before_seq: safeI64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
   read_session_messages: z
     .object({
       session_id: uuidSchema,
-      before_seq: safeU64NumberSchema.nullable().optional(),
+      before_seq: safeI64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
@@ -714,7 +714,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       agent: z.string(),
       call_id: z.string(),
       parent_call_id: z.string().nullable().optional(),
-      parent_child_index: z.number().int().nullable().optional(),
+      parent_child_index: safeI64NumberSchema.nullable().optional(),
       tool: z.string(),
       mcp_server: z.string().nullable().optional(),
       mcp_builtin: z.boolean().nullable().optional(),
@@ -743,11 +743,11 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       seq: safeI64NumberSchema.optional(),
       predecessor_short_id: z.string(),
       seed_tool_count: z.number().int().nonnegative(),
-      seed_tool_tokens: z.number().int().nonnegative(),
+      seed_tool_tokens: safeU64NumberSchema,
       source: z.string().optional(),
       trigger_ctx_pct: z.number().nullable().optional(),
-      tokens_before: z.number().int().nonnegative().optional(),
-      tokens_after: z.number().int().nonnegative().optional(),
+      tokens_before: safeU64NumberSchema.optional(),
+      tokens_after: safeU64NumberSchema.optional(),
       turns_summarized: z.number().int().nonnegative().optional(),
       tail_kept: z.number().int().nonnegative().optional(),
       tail_trimmed: z.number().int().nonnegative().optional(),
@@ -842,7 +842,7 @@ export const pausedWorkSummarySchema = z
     active_agent: z.string(),
     project_root: projectRootSchema,
     reason: z.string(),
-    pending_tool_count: z.number().int(),
+    pending_tool_count: safeI64NumberSchema,
     daemon_version: z.string(),
     client_version: z.string().optional(),
     updated_at: safeI64NumberSchema,

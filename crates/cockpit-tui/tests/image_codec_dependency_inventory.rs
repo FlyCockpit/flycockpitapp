@@ -109,12 +109,60 @@ fn exact_target_dependency<'a>(
     name: &str,
     target: TargetTriple,
 ) -> &'a serde_json::Value {
-    let matches = dependencies
+    let declared = dependencies
         .iter()
-        .filter(|dependency| {
-            dependency["name"] == name
-                && dependency["target"].as_str() == Some(target.arboard_image_target())
-        })
+        .filter(|dependency| dependency["name"] == name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declared.len(),
+        3,
+        "arboard must declare exactly three target-specific {name} dependencies"
+    );
+    let mut expected = BTreeMap::from([
+        (
+            TargetTriple::Linux.arboard_image_target(),
+            BTreeSet::from(["png"]),
+        ),
+        (
+            TargetTriple::Macos.arboard_image_target(),
+            BTreeSet::from(["tiff"]),
+        ),
+        (
+            TargetTriple::Windows.arboard_image_target(),
+            BTreeSet::from(["bmp", "png"]),
+        ),
+    ]);
+    for dependency in &declared {
+        assert_eq!(dependency["req"], "^0.25", "arboard {name} version request");
+        assert_eq!(dependency["kind"], serde_json::Value::Null);
+        assert_eq!(dependency["rename"], serde_json::Value::Null);
+        assert_eq!(dependency["optional"], true);
+        assert_eq!(dependency["uses_default_features"], false);
+        let condition = dependency["target"]
+            .as_str()
+            .unwrap_or_else(|| panic!("arboard {name} dependency must be target-specific"));
+        let actual_features = dependency["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|feature| feature.as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        let expected_features = expected
+            .remove(condition)
+            .unwrap_or_else(|| panic!("unexpected arboard {name} target condition: {condition}"));
+        assert_eq!(
+            actual_features, expected_features,
+            "arboard {name} declaration features for {condition}"
+        );
+    }
+    assert!(
+        expected.is_empty(),
+        "arboard {name} declaration matrix incomplete"
+    );
+
+    let matches = declared
+        .into_iter()
+        .filter(|dependency| dependency["target"].as_str() == Some(target.arboard_image_target()))
         .collect::<Vec<_>>();
     assert_eq!(
         matches.len(),
@@ -131,13 +179,33 @@ fn arboard_target_dependency_selection_is_exact_and_order_independent() {
     let dependencies = serde_json::json!([
         {
             "name": "image",
+            "req": "^0.25",
+            "kind": null,
+            "rename": null,
+            "optional": true,
+            "uses_default_features": false,
             "target": "cfg(all(unix, not(any(target_os = \"macos\", target_os = \"android\", target_os = \"emscripten\"))))",
             "features": ["png"]
         },
         {
             "name": "image",
+            "req": "^0.25",
+            "kind": null,
+            "rename": null,
+            "optional": true,
+            "uses_default_features": false,
             "target": "cfg(target_os = \"macos\")",
             "features": ["tiff"]
+        },
+        {
+            "name": "image",
+            "req": "^0.25",
+            "kind": null,
+            "rename": null,
+            "optional": true,
+            "uses_default_features": false,
+            "target": "cfg(windows)",
+            "features": ["png", "bmp"]
         }
     ]);
     let dependencies = dependencies.as_array().unwrap();
@@ -151,6 +219,22 @@ fn arboard_target_dependency_selection_is_exact_and_order_independent() {
     assert_eq!(
         exact_target_dependency(&reversed, "image", TargetTriple::Macos)["features"],
         serde_json::json!(["tiff"])
+    );
+}
+
+#[test]
+#[should_panic(expected = "arboard must declare exactly three target-specific image dependencies")]
+fn arboard_target_dependency_rejects_extra_declarations() {
+    let dependencies = serde_json::json!([
+        { "name": "image" },
+        { "name": "image" },
+        { "name": "image" },
+        { "name": "image" }
+    ]);
+    exact_target_dependency(
+        dependencies.as_array().unwrap(),
+        "image",
+        TargetTriple::Macos,
     );
 }
 

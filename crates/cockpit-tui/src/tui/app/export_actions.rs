@@ -157,9 +157,7 @@ async fn export_via_attached_daemon(
     let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command, &shutdown).await?;
     let out_path = exports_dir.join(format!("{file_stem}.{}", data.filename_extension));
     recover_deferred_export_cleanup(&exports_dir).await;
-    tokio::fs::create_dir_all(&exports_dir)
-        .await
-        .map_err(|error| format!("{command}: creating export directory failed: {error}"))?;
+    prepare_export_directory(&exports_dir, command).await?;
     write_export_no_clobber(&out_path, &bytes, command, &shutdown).await?;
     let sessions = data.session_count.unwrap_or(1);
     Ok(match kind {
@@ -178,6 +176,29 @@ async fn export_via_attached_daemon(
     })
 }
 
+async fn prepare_export_directory(
+    exports_dir: &std::path::Path,
+    command: &'static str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exports_dir = exports_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::clipboard::recovery::windows::DirHandle::open_or_create(&exports_dir)
+        })
+        .await
+        .map_err(|error| format!("{command}: export directory worker failed: {error}"))?
+        .map(|_| ())
+        .map_err(|error| format!("{command}: securing export directory failed: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::fs::create_dir_all(exports_dir)
+            .await
+            .map_err(|error| format!("{command}: creating export directory failed: {error}"))
+    }
+}
+
 pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Path) {
     let records = exports_dir.join(".cockpit-export-recovery");
     let records_secure = std::fs::symlink_metadata(&records).is_ok_and(|metadata| {
@@ -190,7 +211,11 @@ pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Pat
             metadata.uid() == unsafe { libc::geteuid() }
                 && metadata.permissions().mode() & 0o077 == 0
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            crate::clipboard::recovery::windows::DirHandle::open_or_create(&records).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -262,6 +287,9 @@ pub(super) async fn write_export_no_clobber(
     command: &'static str,
     shutdown: &std::sync::Arc<AsyncActionCancellation>,
 ) -> Result<(), String> {
+    if !crate::tui::async_action::secure_export_cleanup_supported() {
+        return Err(format!("{command}: secure export cleanup is unavailable"));
+    }
     let file_name = out_path
         .file_name()
         .and_then(|name| name.to_str())

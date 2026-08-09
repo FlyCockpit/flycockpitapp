@@ -805,8 +805,9 @@ impl App {
         }
 
         let existing_mode = self.btw_pane.as_ref().map(BtwPane::mode);
+        let operation = self.btw_blocking_operation();
         #[cfg(test)]
-        let barrier = self.take_owned_test_barrier(self.btw_blocking_operation());
+        let barrier = self.take_owned_test_barrier(operation);
         #[cfg(test)]
         let has_test_gate = barrier.is_some();
         #[cfg(not(test))]
@@ -849,7 +850,7 @@ impl App {
             BtwCommand::End | BtwCommand::NotYetAvailable(_) => None,
         };
         self.push_plain("/btw: pending".to_string());
-        let action_kind = self.btw_blocking_operation().action_kind();
+        let action_kind = operation.action_kind();
         self.async_actions.start(
             action_kind,
             crate::tui::async_action::AsyncActionPolicy::Replace(

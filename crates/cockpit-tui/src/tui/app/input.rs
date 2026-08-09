@@ -3072,8 +3072,9 @@ const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
 
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
+        let operation = self.queue_blocking_operation();
         #[cfg(test)]
-        let barrier = self.take_owned_test_barrier(self.queue_blocking_operation());
+        let barrier = self.take_owned_test_barrier(operation);
         let attached_request = self
             .agent_runner
             .as_ref()
@@ -3094,7 +3095,7 @@ impl App {
             }
         }
         self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
-        let action_kind = self.queue_blocking_operation().action_kind();
+        let action_kind = operation.action_kind();
         let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
         self.async_actions.start_serialized(
             action_kind,

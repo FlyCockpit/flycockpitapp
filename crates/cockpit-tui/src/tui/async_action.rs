@@ -368,6 +368,7 @@ fn persist_export_recovery_record(path: &std::path::Path) -> std::io::Result<std
         return Err(std::io::Error::other("refusing non-owned export temp"));
     }
     let dir = root.join(".cockpit-export-recovery");
+    #[cfg(not(windows))]
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -375,6 +376,16 @@ fn persist_export_recovery_record(path: &std::path::Path) -> std::io::Result<std
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let record = dir.join(format!("{}.record", uuid::Uuid::now_v7()));
+    #[cfg(windows)]
+    let directory = crate::clipboard::recovery::windows::DirHandle::open_or_create(&dir)?;
+    #[cfg(windows)]
+    let mut file = directory.create_file_exclusive(
+        record
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("invalid recovery record name"))?,
+    )?;
+    #[cfg(not(windows))]
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -382,6 +393,9 @@ fn persist_export_recovery_record(path: &std::path::Path) -> std::io::Result<std
     use std::io::Write as _;
     file.write_all(format!("v1\n{name}\n").as_bytes())?;
     file.sync_all()?;
+    #[cfg(windows)]
+    directory.sync()?;
+    #[cfg(not(windows))]
     std::fs::File::open(&dir)?.sync_all()?;
     Ok(record)
 }
@@ -469,12 +483,37 @@ pub(crate) fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Resul
     parent.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
+    use crate::clipboard::recovery::windows::{CheckedEntry, DirHandle};
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing export parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid export temp name"))?;
+    let directory = DirHandle::open_or_create(parent)?;
+    match directory.open_file_verified(name)? {
+        CheckedEntry::Missing => Err(std::io::ErrorKind::NotFound.into()),
+        CheckedEntry::Unsafe => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "export temp failed held-handle security verification",
+        )),
+        CheckedEntry::Ok(file) => directory.remove_verified(name, file).map(|_| ()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn secure_unlink_owned_temp(_path: &std::path::Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "secure export cleanup is unavailable on this platform",
     ))
+}
+
+pub(crate) const fn secure_export_cleanup_supported() -> bool {
+    cfg!(any(unix, windows))
 }
 
 pub(crate) fn drain_export_temp_reaper() {

@@ -1,4 +1,3 @@
-use super::blocking_operations::BlockingOperationKind;
 use super::*;
 
 struct BarrierRelease(Option<std::sync::Arc<blocking_operations::OwnedTestGate>>);
@@ -37,6 +36,8 @@ fn blocking_operation_manifest_is_complete() {
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
     let mut actions = std::collections::HashSet::new();
+    let mut handlers = std::collections::HashSet::new();
+    let mut wrappers = std::collections::HashSet::new();
     for registration in BLOCKING_OPERATION_MANIFEST {
         assert!(
             sites.insert(registration.site),
@@ -49,6 +50,8 @@ fn blocking_operation_manifest_is_complete() {
             registration.kind,
         );
         assert!(!registration.actions.is_empty());
+        assert!(handlers.insert(registration.handler), "duplicate handler");
+        assert!(wrappers.insert(registration.wrapper), "duplicate wrapper");
         for action in registration.actions {
             assert!(actions.insert(*action), "duplicate action: {action}");
             let index = registration
@@ -58,7 +61,117 @@ fn blocking_operation_manifest_is_complete() {
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
         }
+        let calls = analyze_handler_source(
+            registration.source,
+            registration.handler,
+            registration.wrapper,
+        )
+        .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
+        assert_eq!(
+            calls, 1,
+            "{:?} must call its typed wrapper once",
+            registration.site
+        );
     }
+}
+
+fn analyze_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<usize, String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| error.to_string())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    let mut handlers = Vec::new();
+    collect_named_functions(tree.root_node(), source.as_bytes(), handler, &mut handlers);
+    if handlers.len() != 1 {
+        return Err(format!(
+            "expected one `{handler}` function, found {}",
+            handlers.len()
+        ));
+    }
+    let mut wrapper_calls = 0;
+    inspect_handler_calls(handlers[0], source.as_bytes(), wrapper, &mut wrapper_calls)?;
+    Ok(wrapper_calls)
+}
+
+fn collect_named_functions<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &[u8],
+    handler: &str,
+    found: &mut Vec<tree_sitter::Node<'tree>>,
+) {
+    if node.kind() == "function_item"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            == Some(handler)
+    {
+        found.push(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_named_functions(child, source, handler, found);
+    }
+}
+
+fn inspect_handler_calls(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper: &str,
+    wrapper_calls: &mut usize,
+) -> Result<(), String> {
+    if node.kind() == "call_expression"
+        && let Some(function) = node.child_by_field_name("function")
+    {
+        let callable = function
+            .utf8_text(source)
+            .map_err(|error| error.to_string())?;
+        if callable.rsplit('.').next() == Some(wrapper) {
+            *wrapper_calls += 1;
+        }
+        const FORBIDDEN: &[&str] = &[
+            "std::fs::read",
+            "std::fs::write",
+            "std::fs::remove_file",
+            "std::thread::sleep",
+            "daemon_request_blocking",
+            "Command::new",
+        ];
+        if FORBIDDEN.iter().any(|blocked| callable.contains(blocked)) {
+            return Err(format!("inline blocking call `{callable}`"));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        inspect_handler_calls(child, source, wrapper, wrapper_calls)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn handler_source_gate_rejects_bypasses() {
+    assert!(analyze_handler_source("fn h() {}", "h", "dispatch").is_ok_and(|n| n == 0));
+    assert!(
+        analyze_handler_source(
+            "fn h(){ self.dispatch(); self.dispatch(); }",
+            "h",
+            "dispatch"
+        )
+        .is_ok_and(|n| n == 2)
+    );
+    assert!(
+        analyze_handler_source("fn h(){ self.wrong(); }", "h", "dispatch").is_ok_and(|n| n == 0)
+    );
+    assert!(
+        analyze_handler_source(
+            "fn h(){ self.dispatch(); std::fs::read(\"x\"); }",
+            "h",
+            "dispatch"
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]

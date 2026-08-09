@@ -131,6 +131,112 @@ fn tree_package_key(row: &str) -> String {
     format!("{name}@{version}")
 }
 
+fn target_package_features(
+    feature_tree: &str,
+    graph_packages: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    // `cargo tree -e features` does not print a package row when the package has
+    // no activated features. Seed the inventory from the independently observed
+    // normal/build graph so those packages still receive an authoritative empty
+    // feature set.
+    let mut package_features = graph_packages
+        .iter()
+        .cloned()
+        .map(|package| (package, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut reported_packages = BTreeSet::new();
+
+    for line in feature_tree.lines() {
+        let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
+        if let Some((subject, features)) = row.split_once('|') {
+            let subject = subject.trim_end_matches(" (*)");
+            let Some((name, version)) = subject.rsplit_once(" v") else {
+                panic!("unexpected cargo feature-tree package row: {row}");
+            };
+            let version = version.split_whitespace().next().unwrap();
+            let key = format!("{name}@{version}");
+            let Some(actual) = package_features.get_mut(&key) else {
+                panic!("cargo feature tree contains package outside normal/build graph: {key}");
+            };
+            let observed = features
+                .trim_end_matches(" (*)")
+                .split(',')
+                .filter(|feature| !feature.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>();
+            if !reported_packages.insert(key.clone()) && *actual != observed {
+                panic!(
+                    "cargo feature tree reported conflicting feature sets for {key}: \
+                     {actual:?} and {observed:?}"
+                );
+            }
+            *actual = observed;
+            continue;
+        }
+
+        // Cargo's synthetic feature-activation nodes do not honor the custom
+        // package format, so validate their native spelling separately.
+        let subject = row.trim_end_matches(" (*)");
+        let Some((package_name, feature)) = subject.split_once(" feature \"") else {
+            panic!("unexpected cargo feature-tree subject: {subject}");
+        };
+        if package_name.is_empty()
+            || feature.is_empty()
+            || !feature.ends_with('"')
+            || feature[..feature.len() - 1].contains('"')
+        {
+            panic!("malformed cargo feature activation row: {subject}");
+        }
+        let package_prefix = format!("{package_name}@");
+        assert!(
+            graph_packages
+                .iter()
+                .any(|package| package.starts_with(&package_prefix)),
+            "cargo feature tree contains activation for package outside normal/build graph: {subject}"
+        );
+    }
+
+    package_features
+}
+
+#[test]
+fn target_package_feature_inventory_is_total_for_featureless_graph_packages() {
+    let graph_packages = BTreeSet::from([
+        "autocfg@1.5.1".to_owned(),
+        "image@0.25.10".to_owned(),
+        "png@0.18.0".to_owned(),
+    ]);
+    let feature_tree = concat!(
+        "0image v0.25.10|png\n",
+        "1png feature \"default\"\n",
+        "2png v0.18.0|default,std\n",
+    );
+
+    assert_eq!(
+        target_package_features(feature_tree, &graph_packages),
+        BTreeMap::from([
+            ("autocfg@1.5.1".to_owned(), BTreeSet::new()),
+            (
+                "image@0.25.10".to_owned(),
+                BTreeSet::from(["png".to_owned()]),
+            ),
+            (
+                "png@0.18.0".to_owned(),
+                BTreeSet::from(["default".to_owned(), "std".to_owned()]),
+            ),
+        ])
+    );
+}
+
+#[test]
+#[should_panic(expected = "package outside normal/build graph: surprise@1.0.0")]
+fn target_package_feature_inventory_rejects_unobserved_packages() {
+    target_package_features(
+        "0image v0.25.10|png\n1surprise v1.0.0|default\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
 fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
@@ -385,26 +491,18 @@ fn tui_image_codec_dependency_inventory() {
         // image (notably arboard's BMP/TIFF requests). `cargo tree --target` uses
         // Cargo's target-aware feature resolver and is the authoritative source for
         // packages whose feature set differs by target.
-        let tree = cargo_tree(workspace, triple, "image@0.25.10", "features", "{p}|{f}");
-        let mut target_package_features = BTreeMap::new();
-        for line in tree.lines() {
-            let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
-            let Some((package, features)) = row.split_once('|') else {
-                continue;
-            };
-            let Some((name, version)) = package.rsplit_once(" v") else {
-                continue;
-            };
-            let key = format!("{name}@{version}");
-            target_package_features.entry(key).or_insert_with(|| {
-                features
-                    .trim_end_matches(" (*)")
-                    .split(',')
-                    .filter(|feature| !feature.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<BTreeSet<_>>()
-            });
-        }
+        // This target-resolved graph is observed without consulting the fixture.
+        // Consequently a newly activated direct image dependency cannot be hidden
+        // by a fixture-derived allowlist.
+        // AC17 inventories the complete graph rooted at image, including build
+        // dependencies.  In particular, num-traits selects autocfg through a
+        // build edge; a normal-only view silently drops both that edge and its
+        // package even though Cargo resolves and executes it for this graph.
+        let dependency_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal,build", "{p}");
+        let (graph_packages, graph_edges) =
+            dependency_tree_graph(&dependency_tree, target, Provenance::ImageDescendant);
+        let feature_tree = cargo_tree(workspace, triple, "image@0.25.10", "features", "{p}|{f}");
+        let target_package_features = target_package_features(&feature_tree, &graph_packages);
         let image_tree_features = &target_package_features["image@0.25.10"];
 
         let resolved_features = expected
@@ -426,17 +524,6 @@ fn tui_image_codec_dependency_inventory() {
                 other => panic!("unaccounted image feature {other} for {triple}"),
             }
         }
-
-        // This target-resolved graph is observed without consulting the fixture.
-        // Consequently a newly activated direct image dependency cannot be hidden
-        // by a fixture-derived allowlist.
-        // AC17 inventories the complete graph rooted at image, including build
-        // dependencies.  In particular, num-traits selects autocfg through a
-        // build edge; a normal-only view silently drops both that edge and its
-        // package even though Cargo resolves and executes it for this graph.
-        let dependency_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal,build", "{p}");
-        let (graph_packages, graph_edges) =
-            dependency_tree_graph(&dependency_tree, target, Provenance::ImageDescendant);
         let expected_packages = expected.packages.iter().cloned().collect::<BTreeSet<_>>();
         let expected_edges = expected.edges.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(graph_packages, expected_packages, "{triple} package drift");

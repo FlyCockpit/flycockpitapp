@@ -229,7 +229,7 @@ pub(super) enum DeepFetchChoice {
     Fetch,
     Cancel,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ModelLifecycleAction {
     Refresh(ProviderId, ModelId),
     Discard,

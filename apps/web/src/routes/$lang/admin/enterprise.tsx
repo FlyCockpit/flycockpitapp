@@ -15,6 +15,10 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { useHaptics } from "@/hooks/use-haptics";
+import {
+  remoteAdminAssertionOptions,
+  remoteAdminRegistrationOptions,
+} from "@/lib/remote-admin-passkey";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/admin/enterprise")({
@@ -23,13 +27,6 @@ export const Route = createFileRoute("/$lang/admin/enterprise")({
 
 type EnterpriseOverview = Awaited<ReturnType<typeof orpc.enterprise.overview.call>>;
 
-const fromBase64Url = (value: string) => {
-  const padded = value
-    .replace(/-/g, "+")
-    .replace(/_/g, "/")
-    .padEnd(Math.ceil(value.length / 4) * 4, "=");
-  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-};
 const toBase64Url = (value: ArrayBuffer) => {
   let binary = "";
   for (const byte of new Uint8Array(value)) binary += String.fromCharCode(byte);
@@ -38,19 +35,11 @@ const toBase64Url = (value: ArrayBuffer) => {
 async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId: string }) {
   if (!window.PublicKeyCredential) throw new Error("WebAuthn is required.");
   const created = (await navigator.credentials.create({
-    publicKey: {
-      challenge: fromBase64Url(ceremony.challenge),
-      rp: { id: ceremony.rpId, name: "FlyCockpit" },
-      user: {
-        id: new TextEncoder().encode(crypto.randomUUID()),
-        name: "remote-security-admin",
-        displayName: "Remote security administrator",
-      },
-      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-      timeout: 300_000,
-      authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
-      attestation: "none",
-    },
+    publicKey: remoteAdminRegistrationOptions({
+      challenge: ceremony.challenge,
+      rpId: ceremony.rpId,
+      userId: new TextEncoder().encode(crypto.randomUUID()),
+    }),
   })) as PublicKeyCredential | null;
   if (!created || !(created.response instanceof AuthenticatorAttestationResponse))
     throw new Error("Passkey registration was cancelled.");
@@ -59,13 +48,11 @@ async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId
     throw new Error("An ES256 passkey is required.");
   const credentialIdHash = await crypto.subtle.digest("SHA-256", created.rawId);
   const asserted = (await navigator.credentials.get({
-    publicKey: {
-      challenge: fromBase64Url(ceremony.challenge),
+    publicKey: remoteAdminAssertionOptions({
+      challenge: ceremony.challenge,
       rpId: ceremony.rpId,
-      allowCredentials: [{ type: "public-key", id: created.rawId }],
-      timeout: 300_000,
-      userVerification: "required",
-    },
+      credentialId: created.rawId,
+    }),
   })) as PublicKeyCredential | null;
   if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
     throw new Error("Passkey verification was cancelled.");
@@ -80,12 +67,7 @@ async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId
 }
 async function assertRemoteAdminCredential(ceremony: { challenge: string; rpId: string }) {
   const asserted = (await navigator.credentials.get({
-    publicKey: {
-      challenge: fromBase64Url(ceremony.challenge),
-      rpId: ceremony.rpId,
-      timeout: 300_000,
-      userVerification: "required",
-    },
+    publicKey: remoteAdminAssertionOptions(ceremony),
   })) as PublicKeyCredential | null;
   if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
     throw new Error("Passkey verification was cancelled.");

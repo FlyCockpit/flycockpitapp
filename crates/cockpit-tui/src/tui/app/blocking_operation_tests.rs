@@ -85,6 +85,9 @@ fn queue_edits_apply_in_user_order() {
 fn btw_teardown_does_not_block_during_session() {
     let source = include_str!("btw_pane.rs");
     assert!(source.contains("BtwRpcPlan::End"));
+    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    assert!(!production.contains("attached_request_tx_blocking"));
+    assert!(production.contains("BtwTransition"));
 }
 
 #[test]

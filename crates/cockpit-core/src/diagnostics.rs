@@ -1010,14 +1010,15 @@ fn doctor_integration_input(
 ) -> crate::external_runtime::IntegrationHealthComposeInput {
     // Resolve mutable layered configuration once at this diagnostics boundary;
     // the worker receives an invocation-owned, frozen view.
-    let extended = crate::config::extended::load_for_cwd(cwd);
+    let (extended, computer_use_mode) =
+        crate::config::extended::load_for_cwd_with_computer_use_policy(cwd);
     let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
         harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
         lsp_servers: Vec::new(),
         stdio_mcp: Vec::new(),
         sandbox_enabled: Some(sandbox_enabled),
         sandbox_mode: extended.sandbox.default_mode,
-        computer_use_mode: crate::config::extended::resolve_computer_use_policy_for_cwd(cwd),
+        computer_use_mode,
         selected_features: harnesses
             .iter()
             .filter(|(name, config)| {

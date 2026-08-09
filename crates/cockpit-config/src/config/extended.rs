@@ -1777,10 +1777,19 @@ pub fn config_layer_read_count() -> usize {
 /// on-disk config whose `scan_dirs` is absent/empty (clean break: scan
 /// nothing).
 pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
+    load_for_cwd_with_computer_use_policy(cwd).0
+}
+
+/// Load the effective config and the most-restrictive computer-use policy
+/// from one captured set of layered documents.
+pub fn load_for_cwd_with_computer_use_policy(
+    cwd: &Path,
+) -> (ExtendedConfig, Option<ComputerUseMode>) {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
     let docs = load_existing_docs_from_paths(&paths);
-    resolve_loaded_docs(&docs)
+    let computer_use = resolve_computer_use_policy_from_docs(&docs);
+    (resolve_loaded_docs(&docs), computer_use)
 }
 
 fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
@@ -1942,6 +1951,24 @@ pub fn resolve_computer_use_policy_from_paths(paths: &[PathBuf]) -> Option<Compu
         }
     }
     ComputerUseMode::most_restrictive(tiers)
+}
+
+fn resolve_computer_use_policy_from_docs(docs: &[ExtendedConfigDoc]) -> Option<ComputerUseMode> {
+    ComputerUseMode::most_restrictive(docs.iter().filter_map(|doc| {
+        let value = doc.raw_field("computer_use")?;
+        match serde_json::from_value::<ComputerUseMode>(value.clone()) {
+            Ok(tier) => Some(tier),
+            Err(error) => {
+                tracing::warn!(
+                    path = %doc.path.display(),
+                    key = "computer_use",
+                    %error,
+                    "skipping malformed computer_use policy"
+                );
+                None
+            }
+        }
+    }))
 }
 
 /// Round-trip loader/saver for the cockpit-only keys in `config.json` that

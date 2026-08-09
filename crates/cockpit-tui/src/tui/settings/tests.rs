@@ -638,6 +638,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_default_model_actions_dispatch_from_fresh_sources();
     pointer_lsp_save_actions_dispatch_from_fresh_sources();
     pointer_skills_action_family_dispatches_from_fresh_sources();
     pointer_mcp_action_family_dispatches_from_fresh_sources();
@@ -1163,6 +1164,142 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
             };
             assert!(semantic_outcome, "{action:?} produced no semantic outcome");
         }
+    }
+}
+
+fn pointer_default_model_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{DefaultModelAction, SettingsPointerAction};
+
+    fn selected() -> cockpit_config::providers::ActiveModelRef {
+        cockpit_config::providers::ActiveModelRef {
+            provider: "vendor".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }
+    }
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        let selected = selected();
+        dialog.config.active_model = Some(selected.clone());
+        dialog.original_config.active_model = Some(selected);
+        enter_root_node(&mut dialog, DEFAULT_MODEL_TITLE);
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let rendered = render_settings_rows(&source, 100, 24).join("\n");
+    assert!(
+        rendered.contains("Effective default: vendor/m1"),
+        "fixture renders its exact effective selection: {rendered}"
+    );
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::DefaultModel(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        actions,
+        [
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Choose),
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Clear),
+        ]
+        .into_iter()
+        .collect(),
+        "configured default-model page exposes its complete action family"
+    );
+
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let persisted_before = std::fs::read(tmp.path().join("config.json")).unwrap();
+        let _ = render_settings_rows(&dialog, 100, 24);
+        let targets = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter(|target| {
+                target.enabled
+                    && target.action == shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets.len(),
+            1,
+            "default-model action has one exact source"
+        );
+        let target = &targets[0];
+        let down = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        match action {
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Choose) => {
+                assert_eq!(down, SettingsPointerOutcome::Close);
+                assert!(dialog.pending_default_model_picker);
+                assert!(dialog.pending_daemon_request.is_none());
+            }
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Clear) => {
+                assert_eq!(down, SettingsPointerOutcome::Consumed);
+                let staged = dialog.pending_default_model_update_id;
+                assert!(matches!(
+                    dialog.pending_daemon_request.as_ref(),
+                    Some(Request::SetDefaultModel {
+                        default_update_id,
+                        provider: None,
+                        model: None,
+                        clear: true,
+                        ..
+                    }) if Some(*default_update_id) == staged
+                ));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::DefaultModel(page)
+                        if page.effective_default.as_ref() == Some(&selected())
+                            && page.status.as_deref().is_some_and(|status| {
+                            status.starts_with("Clearing the default for new sessions")
+                        })
+                ));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::DefaultModel(page)
+                if page.effective_default.as_ref() == Some(&selected())
+        ));
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+        assert_eq!(
+            dialog.config.active_model.as_ref(),
+            Some(&selected()),
+            "pointer action does not claim daemon persistence before completion"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.json")).unwrap(),
+            persisted_before,
+            "default-model actions leave persistence to the selected workflow"
+        );
     }
 }
 

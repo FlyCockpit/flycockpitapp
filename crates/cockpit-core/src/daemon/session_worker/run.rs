@@ -323,6 +323,28 @@ pub(super) async fn persist_staged_terminal_removal(
         });
     }
     let snapshot = queue.commit_staged_removal(staged).await;
+    struct TerminalCleanupClock;
+    impl crate::media_reservation::MonotonicClock for TerminalCleanupClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
+    let ledger = crate::media_reservation::MediaReservationLedger::new(
+        session.db.clone(),
+        std::sync::Arc::new(TerminalCleanupClock),
+    );
+    let wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    for receipt in &receipts {
+        if let Err(error) = ledger
+            .complete_downstream_invocation(&receipt.id.to_string(), wall_ms)
+            .await
+        {
+            tracing::warn!(%error,invocation=%receipt.id,"terminal queue removal left downstream media ownership retryable");
+        }
+    }
     Ok((removed, snapshot, receipts))
 }
 

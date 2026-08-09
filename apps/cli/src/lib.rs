@@ -27,9 +27,9 @@ pub mod test_env {
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     daemon, diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
-    knowledge, locks, mcp, model_system_prompt, packages, private_fs, process, providers, redact,
-    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools, user_agent, welcome,
-    wizard,
+    knowledge, locks, mcp, media_reservation, model_system_prompt, packages, private_fs, process,
+    providers, redact, secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
+    user_agent, welcome, wizard,
 };
 pub use cockpit_db as db;
 mod terminal_host;

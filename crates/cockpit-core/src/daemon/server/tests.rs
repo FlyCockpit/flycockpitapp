@@ -2812,7 +2812,7 @@ fn remote_state_with_grants(
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     }
@@ -2840,7 +2840,7 @@ fn owner_state() -> MutableClientState {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     }
@@ -3448,7 +3448,7 @@ async fn attached_state_with_worker_receiver(
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashSet::new(),
             terminal_host: test_terminal_host(),
         },
@@ -11521,19 +11521,28 @@ async fn png_validation_uses_strict_limits() {
     assert!(err.message.contains("decode limit"));
 }
 
+#[test]
+fn png_validation_reports_decoded_dimensions_for_ledger_reconciliation() {
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        7,
+        11,
+        image::Rgba([1, 2, 3, 255]),
+    ));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let validated = validate_png_attachment_blocking(png.clone()).unwrap();
+    assert_eq!(validated.bytes, png);
+    assert_eq!((validated.width, validated.height), (7, 11));
+}
+
 #[tokio::test]
 async fn attachment_upload_default_limits_match_config_defaults() {
-    let limits = AttachmentUploadLimits::default();
-    assert_eq!(limits.per_client_uploads, 4);
-    assert_eq!(limits.global_uploads, 32);
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
-    assert_eq!(limits.global_bytes, 256 * 1024 * 1024);
-
+    let limits = AttachmentUploadLimits;
     let cfg_limits: AttachmentUploadLimits = ExtendedConfig::default().daemon.uploads.into();
-    assert_eq!(cfg_limits.per_client_uploads, limits.per_client_uploads);
-    assert_eq!(cfg_limits.global_uploads, limits.global_uploads);
-    assert_eq!(cfg_limits.per_upload_bytes, limits.per_upload_bytes);
-    assert_eq!(cfg_limits.global_bytes, limits.global_bytes);
+    assert_eq!(cfg_limits, limits);
 }
 
 #[tokio::test]
@@ -11543,7 +11552,7 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
             per_upload_bytes: 64 * 1024 * 1024,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 64 MiB exceeds protocol cap 4 MiB; clamping")
@@ -11563,28 +11572,24 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
     )
     .expect_err("upload above protocol cap is rejected by clamped per-upload limit");
     assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    assert!(err.message.contains("byte limit"), "{}", err.message);
 }
 
 #[tokio::test]
-async fn attachment_upload_config_below_protocol_cap_binds() {
+async fn attachment_upload_config_cap_is_subordinate_to_durable_policy() {
     let configured = MIN_ATTACHMENT_UPLOAD_BYTES + 1;
     let (limits, warning) =
         AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
             per_upload_bytes: configured,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, configured);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert!(warning.is_none());
 
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         configured + 1,
@@ -11592,13 +11597,7 @@ async fn attachment_upload_config_below_protocol_cap_binds() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("upload above configured cap is rejected even below protocol cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    .expect("process-local configured cap is subordinate to durable admission");
 }
 
 #[tokio::test]
@@ -11608,7 +11607,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
             per_upload_bytes: 0,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, MIN_ATTACHMENT_UPLOAD_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 0 bytes is below minimum 64 KiB; clamping")
@@ -11616,7 +11615,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
 }
 
 #[tokio::test]
-async fn attachment_upload_default_limits_enforce_per_client_count() {
+async fn attachment_upload_process_local_per_client_count_is_not_admission() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
@@ -11633,20 +11632,18 @@ async fn attachment_upload_default_limits_enforce_per_client_count() {
         .unwrap();
     }
 
-    let err = begin_attachment_upload(
+    begin_attachment_upload(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
     )
-    .expect_err("fifth pending upload exceeds default per-client cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("limit 4"), "{}", err.message);
+    .expect("process-local per-client cap is not an admission authority");
 }
 
 #[tokio::test]
-async fn attachment_upload_default_limits_enforce_global_count() {
+async fn attachment_upload_process_local_global_count_is_not_admission() {
     let ctx = test_ctx();
     let accounting = Arc::new(StdMutex::new(UploadAccounting::default()));
     let png = sample_png();
@@ -11672,31 +11669,24 @@ async fn attachment_upload_default_limits_enforce_global_count() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut overflow, _) = attached_state(&ctx, tmp.path()).await;
     overflow.upload_accounting = accounting;
-    let err = begin_attachment_upload(
+    begin_attachment_upload(
         &mut overflow,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
     )
-    .expect_err("thirty-third pending upload exceeds default daemon cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("limit 32"), "{}", err.message);
+    .expect("process-local global count is not an admission authority");
     drop((states, tempdirs, tmp));
 }
 
 #[tokio::test]
-async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
+async fn attachment_upload_process_local_limits_only_track_ownership() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 2,
-        global_uploads: 32,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     begin_attachment_upload_with_limits(
         &mut state,
@@ -11716,7 +11706,7 @@ async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes(
         limits,
     )
     .unwrap();
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11724,33 +11714,22 @@ async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes(
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("third pending upload exceeds per-client cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("this client"), "{}", err.message);
+    .expect("process-local count is ownership bookkeeping only");
 
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
-        AttachmentUploadLimits {
-            per_upload_bytes: png.len() - 1,
-            ..limits
-        },
+        limits,
     )
-    .expect_err("declared upload exceeds per-upload cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    .expect("process-local byte cap is subordinate to the durable ledger");
 }
 
 #[tokio::test]
-async fn attachment_upload_limits_enforce_global_count_and_bytes() {
+async fn attachment_upload_process_local_global_limits_are_subordinate() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
@@ -11758,15 +11737,10 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
     let (mut b, _) = attached_state(&ctx, tmp_b.path()).await;
     b.upload_accounting = a.upload_accounting.clone();
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 4,
-        global_uploads: 1,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     let upload_id = begin_upload_for(&mut a, &png);
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut b,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11774,17 +11748,11 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("second client exceeds daemon-global count cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("daemon has"), "{}", err.message);
+    .expect("process-local global count is not an admission authority");
 
     assert!(a.pending_uploads.remove(&upload_id).is_some());
     release_uploads(&a.upload_accounting, [upload_id]);
-    let limits = AttachmentUploadLimits {
-        global_uploads: 32,
-        global_bytes: png.len(),
-        ..limits
-    };
+    let limits = AttachmentUploadLimits;
     begin_attachment_upload_with_limits(
         &mut a,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -11794,7 +11762,7 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         limits,
     )
     .unwrap();
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut b,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11802,9 +11770,7 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("second client exceeds daemon-global byte cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("byte limit"), "{}", err.message);
+    .expect("process-local global bytes are not an admission authority");
 }
 
 #[tokio::test]
@@ -11828,6 +11794,85 @@ async fn expired_pending_upload_prune_releases_global_accounting() {
             .pending
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn attachment_ledger_uses_authenticated_attached_project_identity() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let expected_project = state.attached.as_ref().unwrap().handle.project_id();
+    let png = sample_png();
+    let response = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await
+    .unwrap();
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        panic!("wrong response")
+    };
+    let (project, decoded_plan_count) = ctx
+        .db
+        .read(move |conn| {
+            let reservation_id = format!("attachment:{upload_id}");
+            let project = conn.query_row(
+                "SELECT project_id FROM media_reservations WHERE reservation_id=?1",
+                [&reservation_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let decoded_plan_count = conn.query_row(
+                "SELECT COUNT(*) FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension IN ('decoded_edge_pixels','decoded_image_pixels','aggregate_decoded_pixels_per_request')",
+                [&reservation_id],
+                |row| u64::try_from(row.get::<_, i64>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))),
+            )?;
+            Ok((project, decoded_plan_count))
+        })
+        .await
+        .unwrap();
+    assert_eq!(project, expected_project);
+    assert_eq!(decoded_plan_count, 3);
+}
+
+#[tokio::test]
+async fn attachment_config_failure_leaves_no_pending_or_accounting_state() {
+    let saw_trust_policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_trust_policy_in_load = saw_trust_policy.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            saw_trust_policy_in_load.store(
+                crate::config::trust::current_workspace_trust_policy().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Err(anyhow::anyhow!("injected attachment config failure"))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let png = sample_png();
+
+    let result = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(saw_trust_policy.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(state.pending_uploads.is_empty());
+    let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    assert!(accounting.pending.is_empty());
 }
 
 async fn recv_body<S>(proto: &mut ProtoStream<S>) -> Body
@@ -14174,6 +14219,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        media_ledger: base.media_ledger.clone(),
+        media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
         started_at: base.started_at,
@@ -14240,6 +14287,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        media_ledger: base.media_ledger.clone(),
+        media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
         started_at: base.started_at,
@@ -14483,7 +14532,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     };
@@ -14537,7 +14586,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     };

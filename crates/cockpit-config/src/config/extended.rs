@@ -263,6 +263,10 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
 
+    /// Authoritative evaluated-plan source for every media reservation.
+    #[serde(rename = "mediaResources", default)]
+    pub media_resources: Box<crate::config::media_budget::MediaResourcePolicy>,
+
     /// Session-payload retention knobs.
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -1578,6 +1582,7 @@ impl Default for ExtendedConfig {
             resource_scheduler: ResourceSchedulerConfig::default(),
             sandbox: SandboxConfig::default(),
             daemon: DaemonConfig::default(),
+            media_resources: Box::new(crate::config::media_budget::MediaResourcePolicy::default()),
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
             deepthink: DeepthinkConfig::default(),

@@ -1709,6 +1709,10 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// Shared durable media authority. Production media entry points consult
+    /// `media_admission_open` before accepting work.
+    pub media_ledger: crate::media_reservation::MediaReservationLedger,
+    pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
     pub started_at: Instant,
@@ -1845,11 +1849,24 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
+        struct DaemonMediaClock(Instant);
+        impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        let started_at = Instant::now();
+        let media_ledger = crate::media_reservation::MediaReservationLedger::new(
+            db.clone(),
+            Arc::new(DaemonMediaClock(started_at)),
+        );
         Self {
             db,
+            media_ledger,
+            media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
-            started_at: Instant::now(),
+            started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
@@ -2049,6 +2066,8 @@ pub(crate) async fn boot_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<DaemonContext> {
+    #[cfg(not(test))]
+    let mut containment_recovered = false;
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(
         LockManager::from_db(db.clone())
@@ -2139,6 +2158,7 @@ pub(crate) async fn boot_with_db(
         ctx.attach_process_containment_actor(actor);
         match handle.recover().await {
             Ok(outcomes) => {
+                containment_recovered = true;
                 tracing::info!(
                     recovered = outcomes.len(),
                     "process containment recovery finished"
@@ -2240,6 +2260,55 @@ pub(crate) async fn boot_with_db(
     {
         timer.phase("external_journal_skipped");
     }
+    let recovery_wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    #[cfg(not(test))]
+    if containment_recovered {
+        // The only production local media owner is currently the attachment
+        // path, whose collected and decoded bytes are process memory. Reaped
+        // daemon containment is therefore positive cleanup evidence for every
+        // local reservation this binary can create. This contract must grow an
+        // owner-specific deleter before any file-backed producer is added.
+        match ctx
+            .media_ledger
+            .recover_after_restart(recovery_wall_ms, &RestartEphemeralMediaCleanup)
+            .await
+        {
+            Ok(recovered) => {
+                tracing::info!(recovered, "media reservation restart recovery finished");
+                timer.phase("media_reservation_recovered");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "media reservation restart recovery failed");
+                timer.phase("media_reservation_recovery_blocked");
+            }
+        }
+    }
+    if let Err(error) = ctx
+        .media_ledger
+        .recover_ephemeral_attachment_uploads(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "ephemeral attachment reservation recovery failed");
+    }
+    if let Err(error) = ctx
+        .media_ledger
+        .reconcile_terminal_downstream_ownership(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "terminal downstream media ownership reconciliation failed");
+    }
+    let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
+    ctx.media_admission_open
+        .store(recovery_complete, std::sync::atomic::Ordering::Release);
+    if recovery_complete {
+        timer.phase("media_reservation_admission_open");
+    } else {
+        tracing::warn!("media admission is closed until durable reservations are recovered");
+        timer.phase("media_reservation_admission_blocked");
+    }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
     {
@@ -2249,6 +2318,18 @@ pub(crate) async fn boot_with_db(
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
+
+#[cfg(not(test))]
+struct RestartEphemeralMediaCleanup;
+
+#[cfg(not(test))]
+impl crate::media_reservation::LocalExpiryCleanup for RestartEphemeralMediaCleanup {
+    fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
+        Ok(format!(
+            "daemon-restart-ephemeral-media-destroyed:{reservation_id}"
+        ))
+    }
+}
 
 fn spawn_terminal_reaper(
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
@@ -2598,7 +2679,7 @@ impl MutableClientState {
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting,
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashSet::new(),
             terminal_host,
         }
@@ -2652,19 +2733,8 @@ impl Drop for MutableClientState {
 
 const MIN_ATTACHMENT_UPLOAD_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy)]
-struct AttachmentUploadLimits {
-    per_client_uploads: usize,
-    global_uploads: usize,
-    per_upload_bytes: usize,
-    global_bytes: usize,
-}
-
-impl Default for AttachmentUploadLimits {
-    fn default() -> Self {
-        DaemonUploadLimitsConfig::default().into()
-    }
-}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachmentUploadLimits;
 
 impl AttachmentUploadLimits {
     fn from_config(config: DaemonUploadLimitsConfig) -> Self {
@@ -2676,16 +2746,8 @@ impl AttachmentUploadLimits {
     }
 
     fn from_config_with_warning(config: DaemonUploadLimitsConfig) -> (Self, Option<String>) {
-        let (per_upload_bytes, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
-        (
-            Self {
-                per_client_uploads: config.per_client_uploads,
-                global_uploads: config.global_uploads,
-                per_upload_bytes,
-                global_bytes: config.global_bytes,
-            },
-            warning,
-        )
+        let (_, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
+        (Self, warning)
     }
 }
 
@@ -2738,46 +2800,10 @@ struct UploadAccounting {
 }
 
 impl UploadAccounting {
-    fn pending_bytes(&self) -> usize {
-        self.pending.values().sum()
-    }
-
-    fn consumed_bytes(&self) -> usize {
-        self.consumed_message_attachments
-            .values()
-            .map(|consumed| consumed.attachment.bytes.len())
-            .sum()
-    }
-
-    fn reserve(
-        &mut self,
-        upload_id: Uuid,
-        byte_len: usize,
-        limits: AttachmentUploadLimits,
-    ) -> std::result::Result<(), ErrorPayload> {
-        let retained_count = self.consumed_message_attachments.len();
-        if self.pending.len() + retained_count >= limits.global_uploads {
-            return Err(bad_request(format!(
-                "too many retained or pending attachment uploads: daemon has {} retained and {} pending, limit {}",
-                retained_count,
-                self.pending.len(),
-                limits.global_uploads
-            )));
-        }
-        let pending_bytes = self.pending_bytes();
-        let consumed_bytes = self.consumed_bytes();
-        if pending_bytes
-            .saturating_add(consumed_bytes)
-            .saturating_add(byte_len)
-            > limits.global_bytes
-        {
-            return Err(bad_request(format!(
-                "retained and pending attachment uploads exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
-                consumed_bytes, pending_bytes, byte_len, limits.global_bytes
-            )));
-        }
+    /// Track which in-memory upload owns bytes. Durable evaluated ledger plans
+    /// are the sole capacity/admission authority.
+    fn track_pending(&mut self, upload_id: Uuid, byte_len: usize) {
         self.pending.insert(upload_id, byte_len);
-        Ok(())
     }
 
     fn release(&mut self, upload_id: &Uuid) {
@@ -2796,6 +2822,7 @@ where
 }
 
 struct PendingAttachmentUpload {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Option<Uuid>,
     mime: String,
     byte_len: usize,
@@ -2807,6 +2834,7 @@ struct PendingAttachmentUpload {
 
 #[derive(Debug)]
 struct ReadyAttachment {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Uuid,
     mime: String,
     bytes: Vec<u8>,
@@ -2876,7 +2904,7 @@ async fn run_in_process_client(
         Err(mpsc::error::TrySendError::Closed(_)) => return,
     }
 
-    loop {
+    'client: loop {
         let event_branch = async {
             match session_event_rx.as_mut() {
                 Some(rx) => Some(rx.recv().await),
@@ -2893,7 +2921,7 @@ async fn run_in_process_client(
                             permit.send(event);
                         }
                     }
-                    Err(_) => return,
+                    Err(_) => break 'client,
                 }
             }
             Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
@@ -2905,19 +2933,19 @@ async fn run_in_process_client(
                 match global {
                     Ok(envelope) => {
                         if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "in-process client global event stream lagged");
                         pending_lag.record_many(n, None);
                         if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                         {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {}
@@ -2936,7 +2964,7 @@ async fn run_in_process_client(
                             session_id,
                             &mut pending_lag,
                         ) {
-                            return;
+                            break 'client;
                         }
                     }
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
@@ -2957,11 +2985,11 @@ async fn run_in_process_client(
             }
             cmd = request_rx.recv() => {
                 let Some(InProcessRequest { request, reply }) = cmd else {
-                    return;
+                    break 'client;
                 };
                 if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                     let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
-                        return;
+                        break 'client;
                     };
                     let shared = shared.clone();
                     let ctx = ctx.clone();
@@ -2994,13 +3022,13 @@ async fn run_in_process_client(
                         .map(|attached| attached.handle.session_id);
                     for event in std::mem::take(&mut state.pending_replay) {
                         if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     if let Some(event) = ctx.drain_state_event()
                         && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                     {
-                        return;
+                        break 'client;
                     }
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
@@ -3010,6 +3038,11 @@ async fn run_in_process_client(
                 }
             }
         }
+    }
+    if let Err(error) =
+        attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await
+    {
+        tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
     }
 }
 
@@ -3455,6 +3488,9 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
+                    if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+                        tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
+                    }
                     return;
                 };
                 match input {

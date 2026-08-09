@@ -146,12 +146,15 @@ async fn handle_send_user_message(
             UserMessageProbeResult::ContentCheckRequired => requires_content_check = true,
         }
     }
-    let images = match claim_message_image_refs(
+    let images = match claim_message_image_refs_admitted(
+        ctx,
         state,
         session_id,
         client_submission_id,
         &image_refs,
-    ) {
+    )
+    .await
+    {
         Ok(images) => images,
         Err(_) if requires_content_check => {
             return Err(ErrorPayload {
@@ -205,8 +208,18 @@ async fn handle_send_user_message(
     let (item, queue) = match actor_result {
         Ok(result) => result,
         Err(error) => {
-            if error.code == ErrorCode::ModelGenerationStale {
-                release_message_image_refs(state, client_submission_id, &image_refs);
+            match ctx
+                .media_ledger
+                .return_downstream_ownership(&client_submission_id.to_string())
+                .await
+            {
+                Ok(_) => release_message_image_refs(state, client_submission_id, &image_refs),
+                Err(cleanup_error) => {
+                    // Keep refs in the consumed/quarantined map. Re-exposing
+                    // them while durable ownership still names the rejected
+                    // invocation would permit two owners for one reservation.
+                    tracing::warn!(%cleanup_error,invocation=%client_submission_id,"rejected user submission could not return media ownership; refs remain quarantined");
+                }
             }
             return Err(error);
         }
@@ -223,7 +236,34 @@ pub(super) async fn handle_serialized_request(
 ) -> std::result::Result<Response, ErrorPayload> {
     validate_request_semantics(&request)?;
     debug_assert_eq!(shared.principal, state.principal);
-    prune_expired_attachments(state);
+    let pruned = prune_expired_attachments(state);
+    for receipt in pruned.cancelled {
+        ctx.media_ledger
+            .request_cancellation(
+                &receipt.reservation_id,
+                receipt.version,
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .unwrap_or(0),
+            )
+            .await
+            .map_err(internal)?;
+    }
+    for receipt in pruned.destroyed {
+        ctx.media_ledger
+            .destroy_local_artifacts(
+                &receipt.reservation_id,
+                receipt.version,
+                &format!("attachment-ttl-destroyed:{}", receipt.reservation_id),
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .try_into()
+                    .unwrap_or(0),
+            )
+            .await
+            .map_err(internal)?;
+    }
     let request_kind = principal::request_kind(&request);
     let audit_session_id = request_session_id(&request, state);
     let audit_path = request_audit_path(&request);
@@ -426,7 +466,7 @@ pub(super) async fn handle_serialized_request(
             byte_len,
             sha256,
             purpose,
-        } => begin_attachment_upload(state, mime, byte_len, sha256, purpose),
+        } => begin_attachment_upload_admitted(ctx, state, mime, byte_len, sha256, purpose).await,
 
         Request::UploadAttachmentChunk {
             upload_id,
@@ -435,12 +475,25 @@ pub(super) async fn handle_serialized_request(
         } => upload_attachment_chunk(state, upload_id, offset, data_base64),
 
         Request::FinishAttachmentUpload { upload_id } => {
-            finish_attachment_upload(state, upload_id).await
+            finish_attachment_upload_admitted(ctx, state, upload_id).await
         }
 
         Request::CancelAttachmentUpload { upload_id } => {
-            if state.pending_uploads.remove(&upload_id).is_some() {
+            if let Some(upload) = state.pending_uploads.remove(&upload_id) {
                 release_uploads(&state.upload_accounting, [upload_id]);
+                if let Some(receipt) = upload.media_reservation {
+                    ctx.media_ledger
+                        .request_cancellation(
+                            &receipt.reservation_id,
+                            receipt.version,
+                            chrono::Utc::now()
+                                .timestamp_millis()
+                                .try_into()
+                                .unwrap_or(0),
+                        )
+                        .await
+                        .map_err(internal)?;
+                }
             }
             Ok(Response::Ack)
         }
@@ -3228,8 +3281,7 @@ pub(super) async fn attach(
         state
     });
 
-    state.pending_uploads.clear();
-    state.ready_attachments.clear();
+    drain_client_attachment_ownership(state, ctx, "reattach").await?;
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
         handle,

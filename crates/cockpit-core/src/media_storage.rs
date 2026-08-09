@@ -22,7 +22,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::external_journal::ExternalJournalError;
 use crate::external_journal::fsguard::DirGuard;
+
+fn open_optional_verified(root: &DirGuard, name: &str) -> Result<Option<File>> {
+    match root.open_file_verified(name) {
+        Ok(file) => Ok(Some(file)),
+        Err(ExternalJournalError::CapsuleMissing(_)) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context("storage_security_violation while reopening publication object")),
+    }
+}
 
 /// A borrowed source already opened by the local-path authority boundary.
 /// Recovery never derives or reopens a caller path.
@@ -58,7 +68,7 @@ impl MediaStorageRecovery {
         for (upload_id, temporary, quarantine, derivative_json) in publication_intents {
             let derivatives: Vec<String> = serde_json::from_str(&derivative_json)?;
             for derivative in derivatives {
-                if let Ok(file) = self.owned_root.open_file_verified(&derivative) {
+                if let Some(file) = open_optional_verified(&self.owned_root, &derivative)? {
                     self.owned_root
                         .remove_file(&derivative)
                         .map_err(anyhow::Error::new)?;
@@ -72,8 +82,8 @@ impl MediaStorageRecovery {
                     }
                 }
             }
-            let temporary_exists = self.owned_root.open_file_verified(&temporary).is_ok();
-            if self.owned_root.open_file_verified(&quarantine).is_ok() {
+            let temporary_exists = open_optional_verified(&self.owned_root, &temporary)?.is_some();
+            if open_optional_verified(&self.owned_root, &quarantine)?.is_some() {
                 ensure!(
                     !temporary_exists,
                     "publication intent has both temporary and quarantine objects"
@@ -118,7 +128,7 @@ impl MediaStorageRecovery {
                     Some("draft_expired") => "expired",
                     _ => anyhow::bail!("invalid upload cleanup intent"),
                 };
-                if let Ok(file) = self.owned_root.open_file_verified(&storage_id) {
+                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
                     self.owned_root
                         .remove_file(&storage_id)
                         .map_err(anyhow::Error::new)?;
@@ -378,9 +388,13 @@ impl MediaStorageRecovery {
                 .collect::<Vec<_>>(),
         )?;
         self.db.transaction(move|conn|{conn.execute("INSERT INTO media_storage_publication_intents(upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",params![intent_upload,intent_temporary,intent_target,intent_derivatives,now_unix_ms])?;Ok(())}).await?;
-        self.owned_root
-            .rename_into_noreplace(&snapshot.0, &self.owned_root, &target)
-            .map_err(anyhow::Error::new)?;
+        if let Err(error) =
+            self.owned_root
+                .rename_into_noreplace(&snapshot.0, &self.owned_root, &target)
+        {
+            self.reconcile_media_uploads(now_unix_ms).await?;
+            return Err(anyhow::Error::new(error));
+        }
         self.owned_root.sync().map_err(anyhow::Error::new)?;
         let reopened = self
             .owned_root
@@ -2075,6 +2089,49 @@ mod tests {
         assert!(temp.path().join("media").join(&temporary).exists());
         assert!(!temp.path().join("media").join(&quarantine).exists());
         assert!(!temp.path().join("media").join(&orphan).exists());
+        let insecure = Uuid::now_v7().to_string();
+        std::fs::write(temp.path().join("media").join(&insecure), b"insecure").unwrap();
+        std::fs::set_permissions(
+            temp.path().join("media").join(&insecure),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let blocked_upload = upload_id.to_string();
+        let blocked_temporary = temporary.clone();
+        let blocked_quarantine = Uuid::now_v7().to_string();
+        let blocked_derivatives = serde_json::to_string(&vec![insecure.clone()]).unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO media_storage_publication_intents(upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4,16)",params![blocked_upload,blocked_temporary,blocked_quarantine,blocked_derivatives])?;Ok(())}).await.unwrap();
+        assert!(
+            recovery
+                .reconcile_media_uploads(17)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("storage_security_violation")
+        );
+        let live_intent: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM media_storage_publication_intents",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(live_intent, 1);
+        std::fs::set_permissions(
+            temp.path().join("media").join(&insecure),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::remove_file(temp.path().join("media").join(&insecure)).unwrap();
+        db.transaction(|conn| {
+            conn.execute("DELETE FROM media_storage_publication_intents", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         let append = cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
             mutation: LocalMediaMutationV1 {
                 schema_version: 1,

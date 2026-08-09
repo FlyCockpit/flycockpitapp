@@ -1716,6 +1716,150 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
     );
 }
 
+#[tokio::test]
+async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let root_text = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let first_session = ctx
+        .db
+        .create_session("p", &root_text, "Build")
+        .await
+        .unwrap();
+    let second_session = ctx
+        .db
+        .create_session("p", &root_text, "Build")
+        .await
+        .unwrap();
+    for session_id in [first_session.session_id, second_session.session_id] {
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+        ctx.db
+            .create_session_goal(session_id, "p", "finish safely", None, Some(100))
+            .await
+            .unwrap();
+    }
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "goal-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(root_text),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-666666666666").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let first_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            first_id,
+            operation,
+            Request::ClearGoal {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first goal clear").await,
+        Body::Response { id, response }
+            if id == first_id && matches!(*response, Response::GoalCleared { cleared: true })
+    ));
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::ClearGoal {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "goal clear replay").await,
+        Body::Response { id, response }
+            if id == replay_id && matches!(*response, Response::GoalCleared { cleared: true })
+    ));
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::ClearGoal {
+                session_id: second_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "goal clear conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(
+        ctx.db
+            .current_session_goal(first_session.session_id, false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.db
+            .current_session_goal(second_session.session_id, false)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn table_for(secret: &str) -> Arc<RedactionTable> {
     let cfg = crate::config::extended::RedactConfig {
         enabled: true,

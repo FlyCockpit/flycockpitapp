@@ -382,8 +382,7 @@ impl ScheduleAuthority {
         self.ctx.config = config;
     }
 
-    #[cfg(test)]
-    pub fn redaction_table(&self) -> Arc<RedactionTable> {
+    pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
         self.ctx.redact.clone()
     }
 

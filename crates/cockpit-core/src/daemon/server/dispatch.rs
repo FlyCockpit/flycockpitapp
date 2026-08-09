@@ -611,8 +611,7 @@ pub(super) async fn handle_serialized_request(
                     message: "goal budget must be positive".to_string(),
                 });
             }
-            let goal = ctx
-                .db
+            ctx.db
                 .create_session_goal_with_policy(
                     session_id,
                     &session.project_id,

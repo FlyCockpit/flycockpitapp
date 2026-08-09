@@ -2182,7 +2182,7 @@ pub(super) async fn run_worker(
                 } => {
                     let result = replace_config_snapshot(&config_snapshot, *snapshot);
                     let changed = result.changed;
-                    let generation = send_config_snapshot_event_if_changed(
+                    send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,
                         &config_snapshot,
@@ -2203,7 +2203,7 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
-                    let _ = respond_to.send(generation);
+                    let _ = respond_to.send(result);
                 }
                 SessionWork::SetAgent { name } => {
                     // Persist the active-agent choice so a resume restarts on it,

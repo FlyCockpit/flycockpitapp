@@ -340,7 +340,7 @@ pub(super) enum Row {
 /// on this to render the value, describe it, and mutate `self.extended`.
 /// One enum (rather than per-category enums) keeps the read/write/help
 /// logic in a single exhaustive `match` per concern.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) enum SettingId {
     // ── Interface ────────────────────────────────────────────────────
     VimMode,

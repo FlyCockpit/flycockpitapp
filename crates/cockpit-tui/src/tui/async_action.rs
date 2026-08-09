@@ -474,10 +474,23 @@ impl AsyncActionRunner {
                 .entry(key)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         );
-        self.start(kind, AsyncActionPolicy::AllowConcurrent, async move {
-            let _order = lock.lock().await;
-            future.await
-        })
+        self.start_with(
+            kind,
+            AsyncActionPolicy::AllowConcurrent,
+            move |tx, notify, id, generation, kind| {
+                tokio::spawn(async move {
+                    let _order = lock.lock().await;
+                    let payload = future.await;
+                    let _ = tx.send(CompletedAction {
+                        id,
+                        generation,
+                        kind,
+                        payload,
+                    });
+                    notify.notify_one();
+                })
+            },
+        )
     }
 
     pub fn start_blocking<F>(

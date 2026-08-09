@@ -1497,6 +1497,10 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         )));
         click_settings_action(&mut dialog, &open);
         let before = config(&dialog);
+        let editor_enabled_before = match dialog.test_page() {
+            TestPageRef::Mcp(McpPage::Add(state)) => state.enabled,
+            other => panic!("MCP open did not produce an editor source: {other:?}"),
+        };
         click_settings_action(&mut dialog, &action);
         match action {
             SettingsPointerAction::Mcp(McpAction::ToggleEditorEnabled) => {
@@ -1522,11 +1526,13 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                     dialog.test_page(),
                     TestPageRef::Mcp(McpPage::List(_))
                 ));
-                assert_eq!(
-                    snapshot(&config(&dialog)),
-                    snapshot(&before),
-                    "unchanged editor save persists exactly"
-                );
+                let mut expected = before.clone();
+                expected
+                    .servers
+                    .get_mut("docs")
+                    .expect("editor source server remains in expected config")
+                    .enabled = editor_enabled_before;
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&expected));
             }
             SettingsPointerAction::Mcp(
                 McpAction::EditName

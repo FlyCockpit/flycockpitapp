@@ -638,8 +638,14 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_tool_credential_family_dispatches_from_fresh_sources();
+    pointer_tool_custom_command_family_dispatches_from_fresh_sources();
+    pointer_user_tool_action_family_dispatches_from_fresh_sources();
+    pointer_tool_field_reset_family_dispatches_from_fresh_sources();
     pointer_read_only_tool_sources_render_disabled();
     pointer_harness_list_actions_dispatch_from_fresh_sources();
+    pointer_harness_field_actions_dispatch_from_fresh_sources();
+    pointer_harness_editor_lifecycle_dispatches_from_fresh_sources();
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
@@ -655,6 +661,231 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn pointer_tool_credential_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{CredentialKind, SettingsPointerAction, ToolsAction};
+    for credential in CredentialKind::ALL {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.provider = match credential {
+            CredentialKind::Firecrawl => cockpit_config::extended::WebProvider::Firecrawl,
+            CredentialKind::TinyFish => cockpit_config::extended::WebProvider::Tinyfish,
+        };
+        let action = SettingsPointerAction::Tools(ToolsAction::EditCredential(credential));
+        click_settings_action(&mut dialog, &action);
+        let expected = match credential {
+            CredentialKind::Firecrawl => tools_page::WebKeyProvider::Firecrawl,
+            CredentialKind::TinyFish => tools_page::WebKeyProvider::TinyFish,
+        };
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Tools(page)
+                if page.editing == Some(tools_page::ToolField::WebKey(expected))
+        ));
+    }
+}
+
+fn pointer_tool_custom_command_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{SettingsPointerAction, ToolsAction};
+    for (action, expected) in [
+        (
+            ToolsAction::EditWebFetchCommand,
+            tools_page::ToolField::WebFetchCommand,
+        ),
+        (
+            ToolsAction::EditWebSearchCommand,
+            tools_page::ToolField::WebSearchCommand,
+        ),
+    ] {
+        let source_tmp = TempDir::new().unwrap();
+        let mut source = standalone_pointer_dialog(&source_tmp, "Tools");
+        enter_root_node(&mut source, "Tools");
+        source.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+        let _ = render_settings_rows(&source, 100, 80);
+        let expected_action = SettingsPointerAction::Tools(action.clone());
+        assert!(source.pointer_surface.targets.borrow().iter().any(|target| {
+            target.enabled
+                && matches!(
+                    &target.action,
+                    shell::SettingsPointerAction::Page(rendered) if rendered == &expected_action
+                )
+        }));
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&dispatch_tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+        click_settings_action(&mut dialog, &expected_action);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Tools(page) if page.editing.as_ref() == Some(&expected)
+        ));
+    }
+}
+
+fn pointer_user_tool_action_family_dispatches_from_fresh_sources() {
+    use cockpit_config::extended::ToolCommandTemplate;
+    use pointer_actions::{SettingsPointerAction, ToolsAction, UserToolId};
+
+    fn dialog_with_user_tool(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = standalone_pointer_dialog(tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.tools.insert(
+            "pointer-tool".into(),
+            ToolCommandTemplate {
+                enabled: true,
+                command: "printf pointer".into(),
+                description: Some("pointer acceptance fixture".into()),
+            },
+        );
+        set_tools_cursor_to_label(&mut dialog, "pointer-tool");
+        dialog
+    }
+
+    let id = UserToolId("pointer-tool".into());
+    let actions = [
+        ToolsAction::EditUserToolCommand(id.clone()),
+        ToolsAction::ToggleUserTool(id.clone()),
+        ToolsAction::DeleteUserTool(id.clone()),
+    ];
+    let source_tmp = TempDir::new().unwrap();
+    let source = dialog_with_user_tool(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for action in &actions {
+        let expected = SettingsPointerAction::Tools(action.clone());
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &expected
+                        )
+                })
+        );
+    }
+
+    for action in actions {
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_user_tool(&dispatch_tmp);
+        click_settings_action(&mut dialog, &SettingsPointerAction::Tools(action.clone()));
+        match action {
+            ToolsAction::EditUserToolCommand(_) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Tools(page)
+                    if page.editing
+                        == Some(tools_page::ToolField::UserToolCommand("pointer-tool".into()))
+            )),
+            ToolsAction::ToggleUserTool(_) => assert!(
+                !dialog
+                    .extended
+                    .tools
+                    .get("pointer-tool")
+                    .expect("pointer tool remains present")
+                    .enabled
+            ),
+            ToolsAction::DeleteUserTool(_) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Tools(page) if page.delete_pending.as_deref() == Some("pointer-tool")
+            )),
+            _ => unreachable!("sealed user-tool action family"),
+        }
+    }
+}
+
+fn pointer_tool_field_reset_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{SettingsPointerAction, ToolFieldId, ToolsAction};
+
+    fn dialog_for_field(tmp: &TempDir, field: ToolFieldId) -> SettingsDialog {
+        let mut dialog = standalone_pointer_dialog(tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.firecrawl_base_url = Some("https://pointer.invalid".into());
+        dialog.extended.web.custom.fetch_command = Some("pointer-fetch {url}".into());
+        dialog.extended.web.custom.search_command = Some("pointer-search {query}".into());
+        let label = match field {
+            ToolFieldId::FirecrawlBaseUrl => "base url",
+            ToolFieldId::WebFetchCommand => {
+                dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+                "webfetch"
+            }
+            ToolFieldId::WebSearchCommand => {
+                dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+                "websearch"
+            }
+        };
+        set_tools_cursor_to_label(&mut dialog, label);
+        dialog
+    }
+
+    for field in [
+        ToolFieldId::FirecrawlBaseUrl,
+        ToolFieldId::WebFetchCommand,
+        ToolFieldId::WebSearchCommand,
+    ] {
+        let action = SettingsPointerAction::Tools(ToolsAction::ResetToolField(field));
+        let source_tmp = TempDir::new().unwrap();
+        let source = dialog_for_field(&source_tmp, field);
+        let _ = render_settings_rows(&source, 100, 80);
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &action
+                        )
+                })
+        );
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_for_field(&dispatch_tmp, field);
+        click_settings_action(&mut dialog, &action);
+        match field {
+            ToolFieldId::FirecrawlBaseUrl => {
+                assert_eq!(dialog.extended.web.firecrawl_base_url, None);
+                assert_eq!(
+                    dialog.extended.web.custom.fetch_command.as_deref(),
+                    Some("pointer-fetch {url}")
+                );
+                assert_eq!(
+                    dialog.extended.web.custom.search_command.as_deref(),
+                    Some("pointer-search {query}")
+                );
+            }
+            ToolFieldId::WebFetchCommand => {
+                assert_eq!(dialog.extended.web.custom.fetch_command, None);
+                assert_eq!(
+                    dialog.extended.web.custom.search_command.as_deref(),
+                    Some("pointer-search {query}")
+                );
+                assert_eq!(
+                    dialog.extended.web.firecrawl_base_url.as_deref(),
+                    Some("https://pointer.invalid")
+                );
+            }
+            ToolFieldId::WebSearchCommand => {
+                assert_eq!(dialog.extended.web.custom.search_command, None);
+                assert_eq!(
+                    dialog.extended.web.custom.fetch_command.as_deref(),
+                    Some("pointer-fetch {url}")
+                );
+                assert_eq!(
+                    dialog.extended.web.firecrawl_base_url.as_deref(),
+                    Some("https://pointer.invalid")
+                );
+            }
+        }
+    }
 }
 
 fn pointer_read_only_tool_sources_render_disabled() {
@@ -1238,6 +1469,194 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
         ));
     }
+}
+
+fn pointer_harness_field_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{HarnessField, HarnessId, HarnessesAction, SettingsPointerAction};
+
+    fn detail_dialog(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = populated_harness_list_pointer_fixture(tmp);
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::Open(HarnessId("custom".into()))),
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.name == "custom"
+        ));
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = detail_dialog(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for field in HarnessField::ALL {
+        let action = SettingsPointerAction::Harnesses(HarnessesAction::EditField(field));
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &action
+                        )
+                })
+        );
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = detail_dialog(&dispatch_tmp);
+        let before = dialog
+            .extended
+            .harnesses
+            .get("custom")
+            .expect("custom harness source")
+            .clone();
+        let before_json = serde_json::to_value(&before).expect("serialize harness source");
+        click_settings_action(&mut dialog, &action);
+        let TestPageRef::Harnesses(HarnessesPage::Edit(state)) = dialog.test_page() else {
+            panic!("field dispatch preserves harness detail");
+        };
+        let after = dialog
+            .extended
+            .harnesses
+            .get("custom")
+            .expect("custom harness remains present");
+        match field {
+            HarnessField::PromptInput => {
+                assert!(state.editing.is_none());
+                assert_ne!(after.prompt_input, before.prompt_input);
+            }
+            HarnessField::ArgvOverflow => {
+                assert!(state.editing.is_none());
+                assert_ne!(after.argv_overflow, before.argv_overflow);
+            }
+            HarnessField::SupportsJson => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.supports_json_output, !before.supports_json_output);
+            }
+            HarnessField::SupportsAgentFile => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.supports_agent_file, !before.supports_agent_file);
+            }
+            HarnessField::AlwaysAllow => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.always_allow, !before.always_allow);
+            }
+            HarnessField::Command
+            | HarnessField::Args
+            | HarnessField::ModelArgs
+            | HarnessField::DefaultModel
+            | HarnessField::Models
+            | HarnessField::ModelListArgs
+            | HarnessField::JsonOutputArgs
+            | HarnessField::AgentFileArgs
+            | HarnessField::AgentFileEnv
+            | HarnessField::AuthEnvVars
+            | HarnessField::AuthProbeArgs
+            | HarnessField::Timeout => {
+                assert!(state.editing.is_some());
+                assert_eq!(
+                    serde_json::to_value(after).expect("serialize harness after editor open"),
+                    before_json,
+                    "opening a field editor does not commit"
+                );
+            }
+        }
+    }
+}
+
+fn pointer_harness_editor_lifecycle_dispatches_from_fresh_sources() {
+    use pointer_actions::{HarnessField, HarnessId, HarnessesAction, SettingsPointerAction};
+
+    fn command_editor(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = populated_harness_list_pointer_fixture(tmp);
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::Open(HarnessId("custom".into()))),
+        );
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::EditField(HarnessField::Command)),
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_some()
+        ));
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = command_editor(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for action in [HarnessesAction::Save, HarnessesAction::Cancel] {
+        let expected = SettingsPointerAction::Harnesses(action);
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &expected
+                        )
+                })
+        );
+    }
+
+    let save_tmp = TempDir::new().unwrap();
+    let mut save_dialog = command_editor(&save_tmp);
+    let original = save_dialog.extended.harnesses["custom"].command.clone();
+    let TestPageMut::Harnesses(HarnessesPage::Edit(state)) = save_dialog.test_page_mut() else {
+        panic!("command editor remains open");
+    };
+    state.editing = Some(crate::tui::textfield::TextField::new("pointer-command"));
+    click_settings_action(
+        &mut save_dialog,
+        &SettingsPointerAction::Harnesses(HarnessesAction::Save),
+    );
+    assert_ne!(original, "pointer-command");
+    assert_eq!(
+        save_dialog.extended.harnesses["custom"].command,
+        "pointer-command"
+    );
+    assert!(matches!(
+        save_dialog.test_page(),
+        TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_none()
+    ));
+    let persisted = ExtendedConfigDoc::load(&save_dialog.extended_path)
+        .expect("saved harness config")
+        .config();
+    assert_eq!(persisted.harnesses["custom"].command, "pointer-command");
+
+    let cancel_tmp = TempDir::new().unwrap();
+    let mut cancel_dialog = command_editor(&cancel_tmp);
+    let original = cancel_dialog.extended.harnesses["custom"].command.clone();
+    let disk_before = std::fs::read(&cancel_dialog.extended_path).ok();
+    let TestPageMut::Harnesses(HarnessesPage::Edit(state)) = cancel_dialog.test_page_mut() else {
+        panic!("command editor remains open");
+    };
+    state.editing = Some(crate::tui::textfield::TextField::new("discarded-command"));
+    click_settings_action(
+        &mut cancel_dialog,
+        &SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+    );
+    assert_eq!(cancel_dialog.extended.harnesses["custom"].command, original);
+    assert!(matches!(
+        cancel_dialog.test_page(),
+        TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_none()
+    ));
+    assert_eq!(
+        std::fs::read(&cancel_dialog.extended_path).ok(),
+        disk_before,
+        "Cancel must not persist the edited buffer"
+    );
 }
 
 /// Render the concrete nested states whose discriminants form the strict

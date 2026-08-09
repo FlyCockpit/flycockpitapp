@@ -434,8 +434,10 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::tests::run_pointer_picker_suggestion_matrix();
     super::tests::run_pointer_category_confirmation_and_effect_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
+    super::agents_page::tests::run_pointer_agent_open_regression();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
     super::agents_page::tests::run_pointer_raw_editor_terminal_actions_regression();
+    dispatch_all_category_descriptor_actions();
     dispatch_enabled_category_descriptor_actions();
     dispatch_all_rendered_numeric_inline_begin_actions();
     dispatch_inline_numeric_terminal_actions();
@@ -587,34 +589,13 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     });
 }
 
-fn dispatch_inline_numeric_terminal_actions() {
-    use super::category::{Category, SettingId};
-    for terminal_action in [
-        CategoryAction::InlineEditCommit(SettingId::ExitTailLines),
-        CategoryAction::InlineEditCancel(SettingId::ExitTailLines),
-    ] {
+fn dispatch_all_category_descriptor_actions() {
+    for (category, setting) in super::category::pointer_descriptor_sources() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
-        let original = dialog.extended.tui.exit_tail_lines;
-        super::tests::open_category_on(&mut dialog, Category::Interface, SettingId::ExitTailLines);
-        dialog.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        for _ in 0..original.to_string().len() {
-            dialog.handle_key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Backspace,
-                crossterm::event::KeyModifiers::NONE,
-            ));
-        }
-        for ch in "123".chars() {
-            dialog.handle_key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(ch),
-                crossterm::event::KeyModifiers::NONE,
-            ));
-        }
+        super::tests::open_category_on(&mut dialog, category, setting);
         let _ = render_settings_rows(&dialog, 100, 50);
-        let action = SettingsPointerAction::Category(terminal_action.clone());
+        let action = SettingsPointerAction::Category(CategoryAction::DescriptorActivate(setting));
         let target = dialog
             .pointer_surface
             .targets
@@ -622,38 +603,78 @@ fn dispatch_inline_numeric_terminal_actions() {
             .iter()
             .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
             .cloned()
-            .expect("numeric terminal action renders from active inline editor");
+            .expect("every source-derived category descriptor publishes its activation");
         click_target(&mut dialog, &target);
-        assert!(matches!(
-            dialog.test_page(),
-            TestPageRef::Category(page) if !page.is_editing()
-        ));
-        match terminal_action {
-            CategoryAction::InlineEditCommit(_) => {
-                assert_eq!(dialog.extended.tui.exit_tail_lines, 123)
+        if matches!(
+            setting,
+            super::category::SettingId::TranslationUserLanguage
+                | super::category::SettingId::TranslationModelLanguage
+        ) {
+            assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.editing == Some(setting)
+            ));
+        }
+    }
+}
+
+fn dispatch_inline_numeric_terminal_actions() {
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
+    for (category, setting) in super::category::pointer_inline_editor_sources() {
+        for terminal_action in [
+            CategoryAction::InlineEditCommit(setting),
+            CategoryAction::InlineEditCancel(setting),
+            CategoryAction::ExternalEditBegin(setting, CategoryExternalSource::Inline),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fresh_dialog(&tmp);
+            super::tests::open_category_on(&mut dialog, category, setting);
+            dialog.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            let target = {
+                let _ = render_settings_rows(&dialog, 100, 50);
+                let action = SettingsPointerAction::Category(terminal_action.clone());
+                dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled && target.action == RenderAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("numeric terminal action renders from its fresh inline source")
+            };
+            click_target(&mut dialog, &target);
+            match terminal_action {
+                CategoryAction::InlineEditCommit(_) | CategoryAction::InlineEditCancel(_) => {
+                    assert!(matches!(
+                        dialog.test_page(),
+                        TestPageRef::Category(page) if !page.is_editing()
+                    ));
+                }
+                CategoryAction::ExternalEditBegin(id, CategoryExternalSource::Inline) => {
+                    assert_category_external_request(
+                        &mut dialog,
+                        id,
+                        CategoryExternalSource::Inline,
+                    );
+                    assert!(matches!(
+                        dialog.test_page(),
+                        TestPageRef::Category(page) if page.is_editing()
+                    ));
+                }
+                _ => unreachable!(),
             }
-            CategoryAction::InlineEditCancel(_) => {
-                assert_eq!(dialog.extended.tui.exit_tail_lines, original)
-            }
-            _ => unreachable!(),
         }
     }
 }
 
 fn dispatch_all_rendered_numeric_inline_begin_actions() {
-    use super::category::{Category, SettingId};
-    for (category, setting) in [
-        (Category::Interface, SettingId::ExitTailLines),
-        (Category::Behavior, SettingId::LoopGuardThreshold),
-        (Category::Behavior, SettingId::MaxPrimaryRounds),
-        (Category::Behavior, SettingId::ScheduleMaxConcurrent),
-        (Category::Behavior, SettingId::DelegationMaxParallel),
-        (Category::Behavior, SettingId::GoalVerificationSkepticCount),
-        (Category::Behavior, SettingId::GoalVerificationMaxRounds),
-        (Category::Behavior, SettingId::DialogLockoutMs),
-        (Category::Behavior, SettingId::TimeInjectionInterval),
-        (Category::Privacy, SettingId::RedactMinSecretLength),
-    ] {
+    for (category, setting) in super::category::pointer_inline_editor_sources() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
         super::tests::open_category_on(&mut dialog, category, setting);
@@ -877,11 +898,8 @@ fn dispatch_category_nested_editor_actions() {
         }
     }
 
-    for setting in [
-        SettingId::CommandProfileWrappers,
-        SettingId::CommandProfileCustomProfiles,
-    ] {
-        dispatch_text_editor_actions(setting);
+    for (category, setting) in super::category::pointer_text_editor_sources() {
+        dispatch_text_editor_actions(category, setting);
     }
 }
 
@@ -967,11 +985,13 @@ fn dispatch_path_editor_actions(
     }
 }
 
-fn dispatch_text_editor_actions(setting: super::category::SettingId) {
-    use super::category::Category;
+fn dispatch_text_editor_actions(
+    category: super::category::Category,
+    setting: super::category::SettingId,
+) {
     let source_tmp = TempDir::new().unwrap();
     let mut source = fresh_dialog(&source_tmp);
-    super::tests::open_category_on(&mut source, Category::Behavior, setting);
+    super::tests::open_category_on(&mut source, category, setting);
     source.handle_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
         crossterm::event::KeyModifiers::NONE,
@@ -1000,7 +1020,7 @@ fn dispatch_text_editor_actions(setting: super::category::SettingId) {
     for action in actions {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
-        super::tests::open_category_on(&mut dialog, Category::Behavior, setting);
+        super::tests::open_category_on(&mut dialog, category, setting);
         dialog.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
@@ -1061,41 +1081,34 @@ fn assert_category_external_request(
 }
 
 fn dispatch_category_cursor_external_action() {
-    use super::category::{Category, SettingId};
     let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
     guard.set_var("EDITOR", "true");
-    let tmp = TempDir::new().unwrap();
-    let mut dialog = fresh_dialog(&tmp);
-    super::tests::open_category_on(&mut dialog, Category::Interface, SettingId::ExitTailLines);
-    let action = SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
-        SettingId::ExitTailLines,
-        CategoryExternalSource::Cursor,
-    ));
-    let target = {
-        let _ = render_settings_rows(&dialog, 100, 50);
-        dialog
-            .pointer_surface
-            .targets
-            .borrow()
-            .iter()
-            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
-            .cloned()
-            .expect("selected external-editable descriptor publishes its cursor action")
-    };
-    click_target(&mut dialog, &target);
-    let (operation, path) = dialog
-        .take_pending_category_external_edit()
-        .expect("cursor action emits its typed external-edit request");
-    assert!(path.exists());
-    assert!(dialog.take_pending_category_external_edit().is_none());
-    assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Category(page)
-            if page.pending_external_edit.as_ref().is_some_and(|pending|
-                pending.operation_id == operation
-                    && pending.id == SettingId::ExitTailLines
-                    && pending.source() == super::category::CategoryExternalSource::Cursor)
-    ));
+    for (category, setting) in super::category::pointer_cursor_external_sources() {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, category, setting);
+        let action = SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+            setting,
+            CategoryExternalSource::Cursor,
+        ));
+        let target = {
+            // This deliberately constrained body proves viewport correction
+            // keeps every selected source row's adjacent action reachable.
+            let _ = render_settings_rows(&dialog, 80, 10);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled && target.action == RenderAction::Page(action.clone())
+                })
+                .cloned()
+                .expect("selected external-editable descriptor publishes its cursor action")
+        };
+        click_target(&mut dialog, &target);
+        assert_category_external_request(&mut dialog, setting, CategoryExternalSource::Cursor);
+    }
 }
 
 fn dispatch_profile_name_inline_actions() {

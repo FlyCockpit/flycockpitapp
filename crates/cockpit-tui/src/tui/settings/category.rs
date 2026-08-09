@@ -262,6 +262,26 @@ pub(super) enum Category {
 }
 
 impl Category {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 5] = [
+        Self::Interface,
+        Self::Behavior,
+        Self::Privacy,
+        Self::Translation,
+        Self::Profile,
+    ];
+
+    #[cfg(test)]
+    const fn fixture_ordinal(self) -> usize {
+        match self {
+            Self::Interface => 0,
+            Self::Behavior => 1,
+            Self::Privacy => 2,
+            Self::Translation => 3,
+            Self::Profile => 4,
+        }
+    }
+
     /// The page heading shown bold at the top of the body.
     pub(super) fn heading(self) -> &'static str {
         match self {
@@ -2564,7 +2584,12 @@ impl SettingsCx {
         // Inline text/number edit owns input until Enter/Esc.
         if let Some(id) = p.editing {
             match key.code {
-                KeyCode::Char('g') if is_ctrl_g(key) && category_external_editable(id) => {
+                // Every active inline text field publishes this explicit
+                // action, including validated numeric fields. The external
+                // round trip feeds the same commit validator and restores the
+                // inline draft on invalid content, so do not apply the
+                // cursor-only long-text/path eligibility filter here.
+                KeyCode::Char('g') if is_ctrl_g(key) => {
                     match CategoryExternalEdit::new(
                         p.external_edit_ops.begin(),
                         id,
@@ -3263,6 +3288,57 @@ fn category_external_editable(id: SettingId) -> bool {
     matches!(id.descriptor().kind, FieldKind::EditText) && !numeric_text_setting(id)
 }
 
+#[cfg(test)]
+pub(super) fn pointer_inline_editor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(|id| {
+        matches!(
+            id.descriptor().kind,
+            FieldKind::EditText | FieldKind::Numeric
+        ) && path_setting_mode(id).is_none()
+            && !long_text_setting(id)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn pointer_text_editor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(long_text_setting)
+}
+
+#[cfg(test)]
+pub(super) fn pointer_cursor_external_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(category_external_editable)
+}
+
+#[cfg(test)]
+pub(super) fn pointer_descriptor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(|_| true)
+}
+
+#[cfg(test)]
+fn pointer_setting_sources(predicate: impl Fn(SettingId) -> bool) -> Vec<(Category, SettingId)> {
+    let predicate = &predicate;
+    Category::ALL
+        .into_iter()
+        .enumerate()
+        .inspect(|(index, category)| {
+            assert_eq!(
+                *index,
+                category.fixture_ordinal(),
+                "sealed category inventory"
+            );
+        })
+        .map(|(_, category)| category)
+        .flat_map(|category| {
+            category_rows(category)
+                .into_iter()
+                .filter_map(move |row| match row {
+                    Row::Setting(id) if predicate(id) => Some((category, id)),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
 /// Parse a `>= min` `u32`, rejecting blank/non-numeric/below-floor input.
 fn parse_min_u32(raw: &str, min: u32) -> Result<u32, String> {
     if raw.is_empty() {
@@ -3540,6 +3616,8 @@ impl SettingsCx {
 
         let mut selected_line = 0usize;
         let mut sel = 0usize;
+        let mut inline_actions = None;
+        let mut cursor_external_action = None;
         for row in &p.rows {
             match row {
                 Row::Heading(heading) => {
@@ -3604,42 +3682,40 @@ impl SettingsCx {
                             None,
                         )),
                     );
+                    if on_cursor && p.editing == Some(*id) {
+                        let line = lines.len();
+                        lines.push(Line::from(vec![
+                            Span::styled("[Save]", selected_style()),
+                            Span::raw("  "),
+                            Span::styled("[Cancel]", selected_style()),
+                            Span::raw("  "),
+                            Span::styled("[Open in $EDITOR]", selected_style()),
+                        ]));
+                        controls.push(None);
+                        inline_actions = Some((line, *id));
+                        selected_line = line;
+                    }
+                    // Keep the selected row's explicit external-editor action
+                    // adjacent to its source control. Appending it after the
+                    // entire category made normal focus scrolling clip the
+                    // action even while the owning setting was visible.
+                    if on_cursor && p.editing.is_none() && category_external_editable(*id) {
+                        let line = lines.len();
+                        lines.push(Line::from("[Open selected in $EDITOR]"));
+                        controls.push(None);
+                        cursor_external_action = Some((line, *id));
+                        // The action is part of the selected control's focus
+                        // footprint. Anchor viewport correction here so the
+                        // source row immediately above and its action remain
+                        // visible together instead of clipping the action at
+                        // the lower edge.
+                        selected_line = line;
+                    }
                     debug_assert!(lines.len() > before);
                     sel += 1;
                 }
             }
         }
-
-        let inline_actions = p.editing.map(|id| {
-            lines.push(Line::default());
-            controls.push(None);
-            let line = lines.len();
-            lines.push(Line::from(vec![
-                Span::styled("[Save]", selected_style()),
-                Span::raw("  "),
-                Span::styled("[Cancel]", selected_style()),
-                Span::raw("  "),
-                Span::styled("[Open in $EDITOR]", selected_style()),
-            ]));
-            controls.push(None);
-            (line, id)
-        });
-
-        let cursor_external_action = if p.editing.is_none() {
-            ids.get(p.cursor)
-                .copied()
-                .filter(|id| category_external_editable(*id))
-                .map(|id| {
-                    lines.push(Line::default());
-                    controls.push(None);
-                    let line = lines.len();
-                    lines.push(Line::from("[Open selected in $EDITOR]"));
-                    controls.push(None);
-                    (line, id)
-                })
-        } else {
-            None
-        };
 
         if let Some(label) = p.category.reset_label() {
             lines.push(Line::default());

@@ -117,6 +117,27 @@ pub(super) enum HarnessField {
     Timeout,
     AlwaysAllow,
 }
+impl HarnessField {
+    pub(super) const ALL: [Self; 17] = [
+        Self::Command,
+        Self::Args,
+        Self::PromptInput,
+        Self::ArgvOverflow,
+        Self::ModelArgs,
+        Self::DefaultModel,
+        Self::Models,
+        Self::ModelListArgs,
+        Self::SupportsJson,
+        Self::JsonOutputArgs,
+        Self::SupportsAgentFile,
+        Self::AgentFileArgs,
+        Self::AgentFileEnv,
+        Self::AuthEnvVars,
+        Self::AuthProbeArgs,
+        Self::Timeout,
+        Self::AlwaysAllow,
+    ];
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ToolFieldId {
     FirecrawlBaseUrl,
@@ -173,6 +194,9 @@ pub(super) enum CategoryExternalSource {
 pub(super) enum CredentialKind {
     Firecrawl,
     TinyFish,
+}
+impl CredentialKind {
+    pub(super) const ALL: [Self; 2] = [Self::Firecrawl, Self::TinyFish];
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum LspEdit {

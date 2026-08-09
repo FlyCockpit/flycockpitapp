@@ -1206,8 +1206,9 @@ impl SettingsCx {
             return;
         }
         if let Some(detail) = &p.detail {
-            self.render_agent_detail(frame, area, detail);
             let action_y = area.bottom().saturating_sub(1);
+            let detail_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+            self.render_agent_detail(frame, detail_area, detail);
             let agent = super::pointer_actions::AgentId(detail.name.clone());
             for (action, x, width) in [
                 (
@@ -1269,6 +1270,7 @@ impl SettingsCx {
         lines.push(Line::default());
         controls.push(None);
 
+        let mut selected_action_line = None;
         for (i, row) in p.rows.iter().enumerate() {
             let on_cursor = i == p.cursor;
             let marker = if on_cursor { "▸ " } else { "  " };
@@ -1313,6 +1315,53 @@ impl SettingsCx {
                 ]));
                 controls.push(Some((open, true, None)));
             }
+            if on_cursor && !p.confirm_reset && !p.delete.is_pending() && !p.reset_one.is_pending()
+            {
+                let id = super::pointer_actions::AgentId(row.name.clone());
+                lines.push(Line::from("[Open]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::Open(id.clone()),
+                    ),
+                    true,
+                    None,
+                )));
+                lines.push(Line::from("[Edit raw file]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::Edit(id.clone()),
+                    ),
+                    true,
+                    None,
+                )));
+                selected_action_line = Some(lines.len() - 1);
+                let row_action = match &row.kind {
+                    AgentKind::Custom => Some((
+                        "[Delete]",
+                        super::pointer_actions::AgentsAction::Delete(id.clone()),
+                    )),
+                    AgentKind::Builtin { overridden: true } => {
+                        Some(("[Reset]", super::pointer_actions::AgentsAction::Reset(id)))
+                    }
+                    AgentKind::Builtin { overridden: false } => None,
+                };
+                if let Some((label, action)) = row_action {
+                    lines.push(Line::from(label));
+                    controls.push(Some((
+                        super::pointer_actions::SettingsPointerAction::Agents(action),
+                        true,
+                        None,
+                    )));
+                }
+                lines.push(Line::from("[Reset all]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::ResetAll,
+                    ),
+                    true,
+                    None,
+                )));
+            }
         }
 
         if p.confirm_reset {
@@ -1333,6 +1382,7 @@ impl SettingsCx {
                 true,
                 None,
             )));
+            selected_action_line = Some(lines.len() - 1);
             lines.push(Line::from("[Cancel]"));
             controls.push(Some((
                 super::pointer_actions::SettingsPointerAction::Agents(
@@ -1369,66 +1419,13 @@ impl SettingsCx {
                 true,
                 None,
             )));
+            selected_action_line = Some(lines.len() - 1);
             lines.push(Line::from("[Cancel]"));
             controls.push(Some((
                 super::pointer_actions::SettingsPointerAction::Agents(
                     super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
                         name.to_string(),
                     )),
-                ),
-                true,
-                None,
-            )));
-        } else {
-            lines.push(Line::default());
-            controls.push(None);
-            lines.push(Line::from("[Open]"));
-            let id = super::pointer_actions::AgentId(
-                p.rows
-                    .get(p.cursor)
-                    .map_or("", |r| r.name.as_str())
-                    .to_string(),
-            );
-            controls.push(Some((
-                super::pointer_actions::SettingsPointerAction::Agents(
-                    super::pointer_actions::AgentsAction::Open(id.clone()),
-                ),
-                true,
-                None,
-            )));
-            lines.push(Line::from("[Edit raw file]"));
-            controls.push(Some((
-                super::pointer_actions::SettingsPointerAction::Agents(
-                    super::pointer_actions::AgentsAction::Edit(id.clone()),
-                ),
-                true,
-                None,
-            )));
-            if let Some(kind) = p.rows.get(p.cursor).map(|row| &row.kind) {
-                let (label, action) = match kind {
-                    AgentKind::Custom => (
-                        "[Delete]",
-                        Some(super::pointer_actions::AgentsAction::Delete(id.clone())),
-                    ),
-                    AgentKind::Builtin { overridden: true } => (
-                        "[Reset]",
-                        Some(super::pointer_actions::AgentsAction::Reset(id.clone())),
-                    ),
-                    AgentKind::Builtin { overridden: false } => ("", None),
-                };
-                if let Some(action) = action {
-                    lines.push(Line::from(label));
-                    controls.push(Some((
-                        super::pointer_actions::SettingsPointerAction::Agents(action),
-                        true,
-                        None,
-                    )));
-                }
-            }
-            lines.push(Line::from("[Reset all]"));
-            controls.push(Some((
-                super::pointer_actions::SettingsPointerAction::Agents(
-                    super::pointer_actions::AgentsAction::ResetAll,
                 ),
                 true,
                 None,
@@ -1442,7 +1439,7 @@ impl SettingsCx {
             controls.push(None);
         }
 
-        let selected_line = selected_line_from_marker(&lines);
+        let selected_line = selected_action_line.or_else(|| selected_line_from_marker(&lines));
         self.scroll_states.render_control_lines(
             frame,
             area,
@@ -1474,16 +1471,16 @@ impl SettingsCx {
             lines,
             selected_line,
             semantic_rows
-                .into_iter()
+                .iter()
                 .filter(|(_, _, enabled)| *enabled)
                 .map(|(line, index, _)| {
                     (
-                        line,
+                        *line,
                         super::pointer_actions::SettingsPointerAction::Agents(
                             super::pointer_actions::AgentsAction::ToggleTool(
                                 super::pointer_actions::AgentId(detail.name.clone()),
                                 super::pointer_actions::AgentToolId(
-                                    cockpit_core::agents::tool_surface_catalog()[index]
+                                    cockpit_core::agents::tool_surface_catalog()[*index]
                                         .name
                                         .into(),
                                 ),
@@ -1494,6 +1491,36 @@ impl SettingsCx {
             &self.pointer_surface,
             SettingsScrollRegionId("agents:detail"),
         );
+        let offset = self.scroll_states.offset_for("agent-detail");
+        let tier_width = area.width.min(12);
+        for (line, index, enabled) in semantic_rows {
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if !enabled || screen_row >= usize::from(area.height) || tier_width == 0 {
+                continue;
+            }
+            let tool = cockpit_core::agents::tool_surface_catalog()[index].name;
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.right().saturating_sub(tier_width),
+                        area.y.saturating_add(screen_row as u16),
+                        tier_width,
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Agents(
+                            super::pointer_actions::AgentsAction::CycleTier(
+                                super::pointer_actions::AgentId(detail.name.clone()),
+                                super::pointer_actions::AgentToolId(tool.into()),
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+        }
     }
 }
 
@@ -1622,10 +1649,14 @@ impl SettingsPage for AgentsPage {
             );
         }
         if let Some(detail) = self.detail.as_mut() {
-            let (super::pointer_actions::AgentsAction::ToggleTool(_, row)
-            | super::pointer_actions::AgentsAction::CycleTier(_, row)) = action
-            else {
-                return Nav::Stay;
+            let (row, key) = match action {
+                super::pointer_actions::AgentsAction::ToggleTool(_, row) => {
+                    (row, KeyCode::Char(' '))
+                }
+                super::pointer_actions::AgentsAction::CycleTier(_, row) => {
+                    (row, KeyCode::Char('t'))
+                }
+                _ => return Nav::Stay,
             };
             let Some(index) = cockpit_core::agents::tool_surface_catalog()
                 .iter()
@@ -1637,8 +1668,7 @@ impl SettingsPage for AgentsPage {
                 return Nav::Stay;
             }
             detail.picker.set_cursor(index);
-            return cx
-                .handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self);
+            return cx.handle_agents_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
         let row_identity = match &action {
             super::pointer_actions::AgentsAction::Open(id)
@@ -2984,6 +3014,282 @@ pub(super) mod tests {
                     persisted, "---\ndescription: pointer fixture\n---\nbody\n",
                     "Cancel discards the raw editor draft"
                 );
+            }
+        }
+    }
+
+    fn populated_pointer_agents_dialog(tmp: &TempDir) -> TrustedAgentsDialog {
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("pointer-agent.md"),
+            "---\ndescription: pointer fixture\ntools: [read, search, mcp]\n---\nbody\n",
+        )
+        .unwrap();
+        agents_dialog(tmp)
+    }
+
+    fn click_agent_action(
+        dialog: &mut SettingsDialog,
+        action: &super::super::pointer_actions::SettingsPointerAction,
+    ) {
+        let target = {
+            let _ = super::super::tests::render_settings_rows(dialog, 90, 28);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled
+                        && target.action
+                            == super::super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                .cloned()
+                .expect("stable agent action rerenders from its fresh selected source")
+        };
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        ] {
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                kind,
+                target.rect.x,
+                target.rect.y,
+            ));
+        }
+    }
+
+    fn overridden_pointer_agent_dialog(tmp: &TempDir, name: &str) -> TrustedAgentsDialog {
+        let _editor = EditorEnv::unset();
+        let mut dialog = populated_pointer_agents_dialog(tmp);
+        focus(&mut dialog, name);
+        dialog.handle_key(press(KeyCode::Char('e')));
+        dialog.handle_key(press(KeyCode::Esc));
+        if let TestPageMut::Agents(page) = dialog.test_page_mut() {
+            *page = AgentsPage::new(tmp.path());
+        }
+        focus(&mut dialog, name);
+        assert!(
+            tmp.path()
+                .join(format!(".cockpit/agents/{name}.md"))
+                .exists()
+        );
+        dialog
+    }
+
+    pub(crate) fn run_pointer_agent_open_regression() {
+        let source_tmp = TempDir::new().unwrap();
+        let source = populated_pointer_agents_dialog(&source_tmp);
+        let identities = page(&source)
+            .rows
+            .iter()
+            .map(|row| super::super::pointer_actions::AgentId(row.name.clone()))
+            .collect::<Vec<_>>();
+        assert!(!identities.is_empty(), "populated Agents source has rows");
+
+        for agent in &identities {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, &agent.0);
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Open(agent.clone()),
+            );
+            click_agent_action(&mut dialog, &action);
+            assert!(
+                page(&dialog)
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.name == agent.0),
+                "Open reaches the real detail reducer for {agent:?}"
+            );
+        }
+
+        for agent in &identities {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, &agent.0);
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(agent.clone()),
+            );
+            click_agent_action(&mut dialog, &action);
+            assert!(
+                page(&dialog)
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.name == agent.0),
+                "Edit reaches the real raw-editor transition for {agent:?}"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        focus(&mut dialog, "pointer-agent");
+        let custom = super::super::pointer_actions::AgentId("pointer-agent".into());
+        let delete = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Delete(custom.clone()),
+        );
+        click_agent_action(&mut dialog, &delete);
+        assert!(page(&dialog).delete.is_pending());
+        assert!(tmp.path().join(".cockpit/agents/pointer-agent.md").exists());
+        click_agent_action(&mut dialog, &delete);
+        assert!(!tmp.path().join(".cockpit/agents/pointer-agent.md").exists());
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        let reset_all = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::ResetAll,
+        );
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(page(&dialog).confirm_reset);
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(!page(&dialog).confirm_reset);
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(page(&dialog).confirm_reset);
+        let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Cancel(
+                super::super::pointer_actions::AgentId("reset-all".into()),
+            ),
+        );
+        click_agent_action(&mut dialog, &cancel);
+        assert!(!page(&dialog).confirm_reset);
+        assert!(
+            tmp.path().join(".cockpit/agents/pointer-agent.md").exists(),
+            "cancelling ResetAll preserves configured agents"
+        );
+
+        let builtin = super::super::pointer_actions::AgentId("Build".into());
+        let reset = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Reset(builtin.clone()),
+        );
+        let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Cancel(builtin),
+        );
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        click_agent_action(&mut dialog, &reset);
+        assert!(page(&dialog).reset_one.is_pending());
+        assert!(tmp.path().join(".cockpit/agents/Build.md").exists());
+        click_agent_action(&mut dialog, &cancel);
+        assert!(!page(&dialog).reset_one.is_pending());
+        assert!(
+            tmp.path().join(".cockpit/agents/Build.md").exists(),
+            "cancelling one-agent reset preserves its override"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        click_agent_action(&mut dialog, &reset);
+        assert!(page(&dialog).reset_one.is_pending());
+        click_agent_action(&mut dialog, &reset);
+        assert!(!page(&dialog).reset_one.is_pending());
+        assert!(
+            !tmp.path().join(".cockpit/agents/Build.md").exists(),
+            "the matching second Reset removes exactly the stable override"
+        );
+
+        for descriptor in cockpit_core::agents::tool_surface_catalog() {
+            let tool = descriptor.name;
+            for cycle_tier in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_pointer_agents_dialog(&tmp);
+                focus(&mut dialog, "pointer-agent");
+                dialog.handle_key(press(KeyCode::Enter));
+                focus_tool(&mut dialog, tool);
+                let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+                let row = super::super::pointer_actions::AgentToolId(tool.into());
+                let (action, granted_before, tier_before) = {
+                    let detail = page(&dialog).detail.as_ref().expect("agent detail");
+                    let action = if cycle_tier {
+                        super::super::pointer_actions::AgentsAction::CycleTier(agent, row)
+                    } else {
+                        super::super::pointer_actions::AgentsAction::ToggleTool(agent, row)
+                    };
+                    (
+                        super::super::pointer_actions::SettingsPointerAction::Agents(action),
+                        detail.draft.granted(tool),
+                        detail.draft.tier(tool),
+                    )
+                };
+                let target = {
+                    let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+                    dialog
+                        .pointer_surface
+                        .targets
+                        .borrow()
+                        .iter()
+                        .find(|target| {
+                            target.enabled
+                                && target.action
+                                    == super::super::shell::SettingsPointerAction::Page(
+                                        action.clone(),
+                                    )
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| panic!("{action:?} rerenders from selected tool {tool}"))
+                };
+                dialog.handle_pointer(super::super::tests::settings_mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    target.rect.x,
+                    target.rect.y,
+                ));
+                assert!(
+                    page(&dialog).detail.is_some(),
+                    "detail remains after Down for {action:?}"
+                );
+                dialog.handle_pointer(super::super::tests::settings_mouse(
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    target.rect.x,
+                    target.rect.y,
+                ));
+                let detail = page(&dialog)
+                    .detail
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("detail remains after Up for {action:?}"));
+                if cycle_tier {
+                    let tier_after = detail.draft.tier(tool);
+                    if cockpit_core::agents::legal_tool_tiers(tool).len() > 1 {
+                        assert_ne!(tier_after, tier_before, "tier cycles for {tool}");
+                    } else {
+                        assert_eq!(
+                            tier_after, tier_before,
+                            "fixed tier remains stable for {tool}"
+                        );
+                    }
+                } else {
+                    assert_ne!(
+                        detail.draft.granted(tool),
+                        granted_before,
+                        "grant toggles for {tool}"
+                    );
+                }
+            }
+        }
+
+        for raw_editor in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, "pointer-agent");
+            dialog.handle_key(press(KeyCode::Enter));
+            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+            let action =
+                super::super::pointer_actions::SettingsPointerAction::Agents(if raw_editor {
+                    super::super::pointer_actions::AgentsAction::OpenRawEditor(agent)
+                } else {
+                    super::super::pointer_actions::AgentsAction::Save(agent)
+                });
+            click_agent_action(&mut dialog, &action);
+            if raw_editor {
+                assert!(page(&dialog).editing.is_some());
+            } else {
+                assert!(page(&dialog).detail.is_some());
+                let persisted =
+                    fs::read_to_string(tmp.path().join(".cockpit/agents/pointer-agent.md"))
+                        .unwrap();
+                assert!(persisted.contains("tools:"));
             }
         }
     }

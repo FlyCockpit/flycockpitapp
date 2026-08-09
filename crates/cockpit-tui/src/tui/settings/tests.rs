@@ -686,6 +686,21 @@ fn click_settings_action(
     dialog: &mut SettingsDialog,
     action: &pointer_actions::SettingsPointerAction,
 ) {
+    if let pointer_actions::SettingsPointerAction::Harnesses(
+        pointer_actions::HarnessesAction::Open(id) | pointer_actions::HarnessesAction::Delete(id),
+    ) = action
+    {
+        let index = dialog
+            .extended
+            .harnesses
+            .keys()
+            .position(|name| name == &id.0)
+            .unwrap_or_else(|| panic!("harness action names a missing source row: {}", id.0));
+        let TestPageMut::Harnesses(HarnessesPage::List(state)) = dialog.test_page_mut() else {
+            panic!("harness row action requires a list source: {action:?}");
+        };
+        state.cursor = index;
+    }
     let _ = render_settings_rows(dialog, 100, 80);
     let target = dialog
         .pointer_surface

@@ -2205,14 +2205,6 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     }
 }
 
-pub(super) async fn handle_concurrent_request(
-    request: Request,
-    shared: Arc<SharedClientState>,
-    ctx: Arc<DaemonContext>,
-) -> std::result::Result<Response, ErrorPayload> {
-    handle_concurrent_request_with_remote_operation(request, shared, ctx, None).await
-}
-
 pub(super) async fn handle_concurrent_request_with_remote_operation(
     request: Request,
     shared: Arc<SharedClientState>,

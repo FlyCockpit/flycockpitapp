@@ -882,6 +882,173 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
     assert_eq!(reached_dispatch, 3);
 }
 
+#[tokio::test]
+async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
+    let ctx = test_ctx();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+        device_generation: 9,
+        logical_attachment_id,
+    };
+    let remote = |actor_binding| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "remote-user".into(),
+            grants: Vec::new(),
+            actor_binding,
+        })
+    };
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+
+    // A malformed concurrent descriptor is rejected before permit acquisition
+    // or task creation, and the denial remains correlated to its request.
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote(Some(actor.clone())),
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let mut concurrent = ConcurrentRequestRuntime::with_permits_for_test(0);
+    let denied_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            denied_id,
+            proto::RemoteOperationIdentityV1 {
+                operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-7f55-111111111111").unwrap(),
+                ..operation
+            },
+            Request::DaemonStatus,
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(concurrent.is_empty(), "denied request must not spawn");
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "correlated gate denial").await,
+        Body::Error { id: Some(id), error }
+            if id == denied_id && error.code == ErrorCode::Authorization
+    ));
+
+    // Legacy actorless v1 reads remain accepted and execute concurrently.
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote(None),
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let read_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(read_id, Request::DaemonStatus),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    concurrent.join_next().await.unwrap().unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "legacy read response").await,
+        Body::Response { id, response }
+            if id == read_id && matches!(*response, Response::DaemonStatus { .. })
+    ));
+
+    // A valid actor-bound descriptor follows the same concurrent handler path.
+    state.principal = remote(Some(actor));
+    shared = state.shared_snapshot();
+    let actor_read_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(actor_read_id, operation, Request::DaemonStatus),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    concurrent.join_next().await.unwrap().unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "actor-bound read response").await,
+        Body::Response { id, response }
+            if id == actor_read_id && matches!(*response, Response::DaemonStatus { .. })
+    ));
+
+    let actor_mutation_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            actor_mutation_id,
+            operation,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "actor-bound serialized result").await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(actor_mutation_id));
+            assert_ne!(error.message, remote_operation_denied().message);
+        }
+        Body::Response { id, .. } => assert_eq!(id, actor_mutation_id),
+        other => panic!("unexpected actor-bound mutation result: {other:?}"),
+    }
+
+    // Local owner mutations bypass remote identity requirements and enter the
+    // serialized dispatcher (the exact domain result is not a gate denial).
+    state.principal = ClientPrincipal::owner();
+    shared = state.shared_snapshot();
+    let local_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            local_id,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "local mutation result").await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(local_id));
+            assert_ne!(error.message, remote_operation_denied().message);
+        }
+        Body::Response { id, .. } => assert_eq!(id, local_id),
+        other => panic!("unexpected local mutation result: {other:?}"),
+    }
+}
+
 fn table_for(secret: &str) -> Arc<RedactionTable> {
     let cfg = crate::config::extended::RedactConfig {
         enabled: true,
@@ -3629,7 +3796,7 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
         base64: false,
     };
 
-    let err = handle_concurrent_request(request, shared, ctx)
+    let err = handle_concurrent_request_with_remote_operation(request, shared, ctx, None)
         .await
         .expect_err("unauthorized request should fail before handler work");
     assert_eq!(err.code, ErrorCode::Authorization);

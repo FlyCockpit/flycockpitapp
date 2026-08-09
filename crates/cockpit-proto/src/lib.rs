@@ -775,8 +775,8 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Wire {
             schema_version: u8,
-            logical_attachment_id: Uuid,
-            operation_id: Uuid,
+            logical_attachment_id: String,
+            operation_id: String,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -785,7 +785,20 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
                 "remote operation identity schemaVersion must be 1",
             ));
         }
-        Self::new(wire.logical_attachment_id, wire.operation_id).map_err(serde::de::Error::custom)
+        let parse_canonical = |text: String| {
+            let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+            if value.hyphenated().to_string() != text {
+                return Err(serde::de::Error::custom(
+                    "UUID must use canonical lowercase hyphenated spelling",
+                ));
+            }
+            Ok(value)
+        };
+        Self::new(
+            parse_canonical(wire.logical_attachment_id)?,
+            parse_canonical(wire.operation_id)?,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -3508,20 +3521,17 @@ mod tests {
 
     #[test]
     fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
-        let valid = json!({
-            "schemaVersion": 1,
-            "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
-            "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
-        });
-        assert!(serde_json::from_value::<RemoteOperationIdentityV1>(valid).is_ok());
-        for malformed in [
-            json!({ "schemaVersion": 2, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111" }),
-            json!({ "schemaVersion": 1, "logicalAttachmentId": "00000000-0000-0000-0000-000000000000", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111" }),
-            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-4cc2-8f55-111111111111" }),
-            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-7f55-111111111111" }),
-            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111", "extra": true }),
-        ] {
-            assert!(serde_json::from_value::<RemoteOperationIdentityV1>(malformed).is_err());
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-operation-identity-v1.json"
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_value::<RemoteOperationIdentityV1>(fixture["valid"].clone()).is_ok()
+        );
+        for malformed in fixture["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<RemoteOperationIdentityV1>(malformed.clone()).is_err()
+            );
         }
     }
     use serde_json::json;
@@ -4393,6 +4403,7 @@ mod tests {
             Body::Request {
                 id: got_id,
                 request: Request::DaemonStatus,
+                ..
             } => assert_eq!(got_id, id),
             other => panic!("unexpected: {other:?}"),
         }

@@ -4,6 +4,7 @@ import errorsFixture from "../fixtures/daemon-wire/errors.json" with { type: "js
 import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "json" };
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
+import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
 import {
   activeModelStateSchema,
@@ -38,16 +39,9 @@ const interruptRaisedDataSchema = z.object({ question: interruptQuestionSchema }
 
 describe("cockpit-proto daemon wire schemas", () => {
   it("enforces canonical UUIDv7 remote operation identities", () => {
-    const valid = requestsFixture.mark_app_flag_seen.operation;
+    const valid = remoteOperationIdentityFixture.valid;
     expect(remoteOperationIdentityV1Schema.safeParse(valid).success).toBe(true);
-    for (const malformed of [
-      { ...valid, schemaVersion: 2 },
-      { ...valid, extra: true },
-      { ...valid, logicalAttachmentId: "00000000-0000-0000-0000-000000000000" },
-      { ...valid, logicalAttachmentId: valid.logicalAttachmentId.toUpperCase() },
-      { ...valid, operationId: "018f3f24-7a10-4cc2-8f55-111111111111" },
-      { ...valid, operationId: "018f3f24-7a10-7cc2-7f55-111111111111" },
-    ]) {
+    for (const malformed of remoteOperationIdentityFixture.invalid) {
       expect(remoteOperationIdentityV1Schema.safeParse(malformed).success).toBe(false);
     }
   });

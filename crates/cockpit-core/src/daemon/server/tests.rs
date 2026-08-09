@@ -4639,7 +4639,7 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
     )
 }
 
-fn test_ctx() -> Arc<DaemonContext> {
+pub(crate) fn test_ctx() -> Arc<DaemonContext> {
     test_ctx_with_config_source(stub_config_source())
 }
 

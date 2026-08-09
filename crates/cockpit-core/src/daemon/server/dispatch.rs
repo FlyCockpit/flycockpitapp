@@ -875,9 +875,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         )?;
                         let response = Response::Ack;
                         let bytes = serde_json::to_vec(&response)?;
+                        let effect = serde_json::to_vec(&crate::daemon::remote_outbox_worker::RemoteSessionEffectV1 { schema_version: 1, session_id })?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
                             value: (response, changed), safe_response: bytes.clone(),
-                            outbox_kind: "cancel_paused_work".into(), outbox_payload: bytes,
+                            outbox_kind: "cancel_paused_work".into(), outbox_payload: effect,
                         })
                     },
                 ).await.map_err(internal)?;
@@ -1239,11 +1240,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                             let cleared = crate::db::Db::clear_session_goal_conn(conn, session_id)?;
                             let response = Response::GoalCleared { cleared };
                             let safe_response = serde_json::to_vec(&response)?;
+                            let effect = serde_json::to_vec(&crate::daemon::remote_outbox_worker::RemoteSessionEffectV1 { schema_version: 1, session_id })?;
                             Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
                                 value: response,
                                 safe_response: safe_response.clone(),
                                 outbox_kind: "clear_goal".into(),
-                                outbox_payload: safe_response,
+                                outbox_payload: effect,
                             })
                         },
                     )

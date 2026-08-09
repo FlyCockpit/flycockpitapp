@@ -32,7 +32,7 @@ vi.mock("@flycockpit/env/server", () => ({
 }));
 
 vi.mock("@flycockpit/queue", () => ({
-  redisConnection: {},
+  getRedisConnection: () => ({}),
 }));
 
 const mockGetConnInfo = vi.fn(() => ({ remote: { address: "10.0.0.1" } }));

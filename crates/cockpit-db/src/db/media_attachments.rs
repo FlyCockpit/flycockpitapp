@@ -261,6 +261,69 @@ pub struct GetMediaUploadStatusV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum LocalMediaMutationTransitionV1 {
+    Upload {
+        generation_before: u64,
+        generation_after: u64,
+    },
+    UploadToAttachment {
+        upload_generation_before: u64,
+        upload_generation_after: u64,
+        attachment_version: u64,
+        availability_generation: u64,
+        reference_generation: u64,
+    },
+    Attachment {
+        generation_before: u64,
+        generation_after: u64,
+        reference_generation_before: u64,
+        reference_generation_after: u64,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMediaMutationOutcomeV1 {
+    Applied,
+    Rejected,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMediaSubjectKindV1 {
+    Upload,
+    Attachment,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMediaMutationReceiptV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub receipt_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub actor_principal_digest: String,
+    pub action: String,
+    pub subject_kind: LocalMediaSubjectKindV1,
+    #[serde(with = "strict_uuid_v7")]
+    pub subject_id: Uuid,
+    pub operation_request_digest: String,
+    pub semantic_command_digest: String,
+    pub outcome: LocalMediaMutationOutcomeV1,
+    pub transition: LocalMediaMutationTransitionV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discard_result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discard_result_digest: Option<String>,
+    pub committed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterLocalPathMediaV1 {
     pub schema_version: u8,

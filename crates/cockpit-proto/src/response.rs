@@ -19,6 +19,8 @@ pub enum Response {
 
     MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
 
+    LocalMediaMutation(cockpit_db::media_attachments::LocalMediaMutationReceiptV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,

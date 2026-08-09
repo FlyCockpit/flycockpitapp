@@ -1049,6 +1049,8 @@ pub enum Request {
 
     GetMediaAttachmentStatus(cockpit_db::media_attachments::GetMediaAttachmentStatusV1),
 
+    BeginMediaUpload(cockpit_db::media_attachments::BeginMediaUploadV1),
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon {
@@ -1318,6 +1320,7 @@ macro_rules! request_variants {
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
+            (Request::BeginMediaUpload(..), "begin_media_upload");
             (Request::StopDaemon { .. }, "stop_daemon");
             (Request::RestartIfIdle, "restart_if_idle");
             (Request::Unknown, "__unknown");
@@ -1467,6 +1470,7 @@ macro_rules! command {
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, serialized, none);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, serialized, none);
+            (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, serialized, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, serialized, none);
             (Request::Unknown, "unknown", owner_only, none, false, serialized, none);

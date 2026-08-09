@@ -44,6 +44,81 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn begin_media_upload(
+        &self,
+        request: cockpit_db::media_attachments::BeginMediaUploadV1,
+        policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+        monotonic_now_ms: u64,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use cockpit_db::media_attachments::{
+            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaUploadActionV1,
+            MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
+        };
+        cockpit_db::Db::validate_local_media_mutation_v1(&request)?;
+        let LocalMediaMutationPayloadV1::Begin {
+            session_id,
+            canonical_project_digest,
+            client_draft_id,
+            media_kind,
+            declared_total_bytes,
+            reservation_digest,
+        } = &request.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let session_id = *session_id;
+        let canonical_project_digest = canonical_project_digest.clone();
+        let client_draft_id = *client_draft_id;
+        let media_kind = *media_kind;
+        let declared_total_bytes = *declared_total_bytes;
+        let reservation_digest = reservation_digest.clone();
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&request)?;
+        let operation_id = request.local_operation_id.to_string();
+        let binding = request_digest.clone();
+        let semantic_preflight = semantic_digest.clone();
+        let domain_preflight =
+            format!("begin:{session_id}:{canonical_project_digest}:{client_draft_id}");
+        let alias_id = request.local_operation_id;
+        if let Some(receipt)=self.db.transaction(move|conn|{if let Some((stored,json))=conn.query_row("SELECT operation_request_digest,receipt_json FROM local_media_operations WHERE local_operation_id=?1",[operation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?{ensure!(stored==binding,"local_operation_conflict");return Ok(Some(serde_json::from_str(&json)?))}if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM local_media_operations WHERE action='begin' AND domain_key=?1 AND is_alias=0",[&domain_preflight],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?{ensure!(stored_semantic==semantic_preflight,"local_domain_conflict");conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?2,'begin',?3,?4,?5,?6,1,?7)",params![alias_id.to_string(),authoritative,domain_preflight,binding,semantic_preflight,json,now_unix_ms])?;return Ok(Some(serde_json::from_str(&json)?))}Ok(None)}).await?{return Ok(receipt)}
+        let upload_id = Uuid::now_v7();
+        let storage_id = Uuid::now_v7();
+        let reservation_id = format!("media-upload:{upload_id}");
+        let plans = local_path_plans(policy, declared_total_bytes)?;
+        let evaluated_digest = digest_json(b"media-upload-reservation-v1", &plans)?;
+        ensure!(evaluated_digest == reservation_digest, "resource_limit");
+        let file_name = storage_id.to_string();
+        let file = self
+            .owned_root
+            .create_file_exclusive(&file_name)
+            .map_err(anyhow::Error::new)?;
+        file.sync_all()?;
+        drop(file);
+        let request_for_tx = request.clone();
+        let semantic_for_tx = semantic_digest.clone();
+        let request_for_digest = request_digest.clone();
+        let result=self.db.transaction(move|conn|{
+            if let Some((stored,json))=conn.query_row("SELECT operation_request_digest,receipt_json FROM local_media_operations WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?{ensure!(stored==request_for_digest,"local_operation_conflict");return Ok(serde_json::from_str(&json)?)}
+            let domain_key=format!("begin:{session_id}:{canonical_project_digest}:{client_draft_id}");
+            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM local_media_operations WHERE action='begin' AND domain_key=?1 AND is_alias=0",[&domain_key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?{ensure!(stored_semantic==semantic_for_tx,"local_domain_conflict");conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?2,'begin',?3,?4,?5,?6,1,?7)",params![request_for_tx.local_operation_id.to_string(),authoritative,domain_key,request_for_digest,semantic_for_tx,json,now_unix_ms])?;return Ok(serde_json::from_str(&json)?)}
+            crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:canonical_project_digest.clone(),session_id:session_id.to_string()},operation:"media_upload".into(),purpose:"authenticated_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
+            let sequence:i64=conn.query_row("UPDATE media_creation_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1",[],|r|r.get(0))?;let expires=now_unix_ms.checked_add(86_400_000).context("upload expiry overflow")?;
+            let transition=MediaUploadLastTransitionV1::Local{action:MediaUploadActionV1::Begin,local_operation_id:request_for_tx.local_operation_id,outcome:RemoteMediaOperationOutcomeV1::Applied};
+            conn.execute("INSERT INTO media_uploads(upload_id,session_id,canonical_project_digest,client_draft_id,media_kind,state,upload_generation,declared_total_bytes,acknowledged_chunks,acknowledged_bytes,next_chunk_index,expires_at_unix_ms,reservation_id,reservation_digest,temporary_storage_id,last_transition_json,creation_sequence,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'open','1',?6,0,'0',0,?7,?8,?9,?10,?11,?12,?13,?13)",params![upload_id.to_string(),session_id.to_string(),canonical_project_digest,client_draft_id.to_string(),serde_json::to_value(media_kind)?.as_str().context("media kind")?,declared_total_bytes.to_string(),expires,reservation_id,evaluated_digest,storage_id.to_string(),serde_json::to_string(&transition)?,sequence,now_unix_ms])?;
+            let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:request_for_tx.local_operation_id,actor_principal_digest:request_for_tx.actor_principal_digest.clone(),action:"begin".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload_id,operation_request_digest:request_for_digest.clone(),semantic_command_digest:semantic_for_tx.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:0,generation_after:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};let json=serde_json::to_string(&receipt)?;
+            conn.execute("INSERT INTO local_media_operations(local_operation_id,authoritative_operation_id,action,domain_key,operation_request_digest,semantic_command_digest,receipt_json,is_alias,committed_at_unix_ms) VALUES(?1,?1,'begin',?2,?3,?4,?5,0,?6)",params![request_for_tx.local_operation_id.to_string(),domain_key,request_for_digest,semantic_for_tx,json,now_unix_ms])?;conn.execute("INSERT INTO local_media_operation_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'applied',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?;Ok(receipt)
+        }).await;
+        if result.as_ref().is_err()
+            || result
+                .as_ref()
+                .is_ok_and(|receipt| receipt.subject_id != upload_id)
+        {
+            let _ = self.owned_root.remove_file(&file_name);
+        }
+        result
+    }
     pub(crate) async fn register_local_path(
         &self,
         request: RegisterLocalPathMediaV1,
@@ -874,6 +949,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn media_upload_begin_is_atomic_replayable_and_domain_unique() {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationTransitionV1,
+            LocalMediaMutationV1,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        let recovery =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let plans = local_path_plans(&policy, 7).unwrap();
+        let reservation_digest = digest_json(b"media-upload-reservation-v1", &plans).unwrap();
+        let request = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "11".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: 7,
+                reservation_digest,
+            },
+        };
+        let first = recovery
+            .begin_media_upload(request.clone(), &policy, 1, 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.transition,
+            LocalMediaMutationTransitionV1::Upload {
+                generation_before: 0,
+                generation_after: 1
+            }
+        ));
+        assert_eq!(
+            recovery
+                .begin_media_upload(request.clone(), &policy, 2, 11)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut alias = request.clone();
+        alias.local_operation_id = Uuid::now_v7();
+        assert_eq!(
+            recovery
+                .begin_media_upload(alias, &policy, 3, 12)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut conflict = request;
+        let LocalMediaMutationPayloadV1::Begin {
+            declared_total_bytes,
+            ..
+        } = &mut conflict.payload
+        else {
+            unreachable!()
+        };
+        *declared_total_bytes = 6;
+        assert!(
+            recovery
+                .begin_media_upload(conflict, &policy, 4, 13)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conflict")
+        );
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM media_uploads", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM local_media_operations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (1, 1, 2));
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("media"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     struct Fixture {

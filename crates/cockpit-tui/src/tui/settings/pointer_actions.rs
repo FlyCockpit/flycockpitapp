@@ -430,7 +430,6 @@ pub(super) enum ProvidersAction {
 pub(super) enum ProviderRowEditorAction {
     HeaderOpen(HeaderName),
     HeaderAdd,
-    HeaderContinue,
     HeaderSave,
     ModelOpen(ModelId),
     ModelAdd,

@@ -217,7 +217,6 @@ fixture_enum!(ProvidersFixture {
     WizardDoneNoControl,
     RowHeaderOpen,
     RowHeaderAdd,
-    RowHeaderContinue,
     RowHeaderSave,
     RowModelOpen,
     RowModelAdd,
@@ -807,7 +806,6 @@ fn row_key(action: &ProviderRowEditorAction) -> ProvidersFixture {
     match action {
         ProviderRowEditorAction::HeaderOpen(_) => ProvidersFixture::RowHeaderOpen,
         ProviderRowEditorAction::HeaderAdd => ProvidersFixture::RowHeaderAdd,
-        ProviderRowEditorAction::HeaderContinue => ProvidersFixture::RowHeaderContinue,
         ProviderRowEditorAction::HeaderSave => ProvidersFixture::RowHeaderSave,
         ProviderRowEditorAction::ModelOpen(_) => ProvidersFixture::RowModelOpen,
         ProviderRowEditorAction::ModelAdd => ProvidersFixture::RowModelAdd,

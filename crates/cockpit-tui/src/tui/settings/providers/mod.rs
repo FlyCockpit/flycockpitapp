@@ -4268,8 +4268,6 @@ fn provider_header_pointer_action(
         ProviderRowEditorAction::HeaderOpen(HeaderName(row.name.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::HeaderAdd
-    } else if editor.continue_idx() == Some(index) {
-        ProviderRowEditorAction::HeaderContinue
     } else if editor.save_idx() == Some(index) {
         ProviderRowEditorAction::HeaderSave
     } else {
@@ -5064,12 +5062,6 @@ impl SettingsPage for ProvidersPage {
                     index
                 }
                 super::pointer_actions::ProviderRowEditorAction::HeaderAdd => editor.add_row_idx(),
-                super::pointer_actions::ProviderRowEditorAction::HeaderContinue => {
-                    let Some(index) = editor.continue_idx() else {
-                        return Nav::Stay;
-                    };
-                    index
-                }
                 super::pointer_actions::ProviderRowEditorAction::HeaderSave => {
                     let Some(index) = editor.save_idx() else {
                         return Nav::Stay;

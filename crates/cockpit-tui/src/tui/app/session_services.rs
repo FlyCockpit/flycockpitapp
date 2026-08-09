@@ -89,6 +89,10 @@ impl App {
             return Ok(changed);
         }
         if self.has_pending_session_switch_action() {
+            if let Some((sequence, _)) = self.pending_session_switch_order.take() {
+                self.submission_order.cancel(sequence);
+                self.dispatch_next_ready_paste_fence();
+            }
             self.pending_new_session = false;
             self.report_session_switch_busy("/new");
             return Ok(true);

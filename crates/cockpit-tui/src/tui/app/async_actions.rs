@@ -938,6 +938,11 @@ impl App {
         {
             return;
         }
+        let _ = self.paste_correlations.commit(
+            request_id,
+            probe.request.host,
+            self.monotonic_origin.elapsed(),
+        );
         let Some(fence_id) = probe.owner_fence else {
             if source_draft_generation != self.draft_generation {
                 return;

@@ -3636,6 +3636,50 @@ impl SettingsCx {
                     .map(|action| (line, action))
             })
             .collect::<Vec<_>>();
+        if !editor.is_editing() {
+            let provider = super::pointer_actions::ProviderId(parent.provider_id.clone());
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::AddModel(provider.clone()),
+                ),
+            ));
+            lines.push(Line::from("[Add model]"));
+            if let Some(model) = editor.rows().get(editor.cursor) {
+                let model_id = super::pointer_actions::ModelId(model.id.clone());
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelSettings(
+                            provider.clone(),
+                            model_id.clone(),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[Model settings]"));
+                if model.manual {
+                    bindings.push((
+                        lines.len(),
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::RenameModel(
+                                provider.clone(),
+                                model_id.clone(),
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Rename model]"));
+                    bindings.push((
+                        lines.len(),
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::DeleteModel(
+                                provider, model_id,
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Delete model]"));
+                }
+            }
+        }
         if editor.is_editing() {
             bindings.clear();
         }
@@ -4019,6 +4063,16 @@ impl SettingsCx {
                 Span::styled(label.to_string(), style),
             ]));
         }
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                    super::pointer_actions::ProviderId(s.provider_id.clone()),
+                    super::pointer_actions::FetchOneChoice::Cancel,
+                ),
+            ),
+        ));
+        lines.push(Line::from("[Cancel]"));
         let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
@@ -4871,6 +4925,71 @@ impl SettingsPage for ProvidersPage {
                 }
             }
         }
+        // Copilot setup controls are commands, not cursor positions.  Reduce
+        // them directly from their rendered identity so a fresh dispatch does
+        // not depend on the number or ordering of lines in the prompt.
+        if let ProvidersPage::CopilotSetup { parent, .. } = self {
+            match provider_action {
+                super::pointer_actions::ProvidersAction::CopilotConfirm(id, choice)
+                    if parent.provider_id == id.0 =>
+                {
+                    let code = match choice {
+                        super::pointer_actions::ConfirmationChoice::Confirm => KeyCode::Enter,
+                        super::pointer_actions::ConfirmationChoice::Cancel => KeyCode::Esc,
+                    };
+                    return cx
+                        .handle_providers_page_key(KeyEvent::new(code, KeyModifiers::NONE), self);
+                }
+                super::pointer_actions::ProvidersAction::LocalBack => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => return Nav::Stay,
+            }
+        }
+        if let ProvidersPage::Models { editor, parent } = self {
+            let legacy = match &provider_action {
+                super::pointer_actions::ProvidersAction::AddModel(provider) => {
+                    Some((provider, None, KeyCode::Char('a')))
+                }
+                super::pointer_actions::ProvidersAction::RenameModel(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Char('r')))
+                }
+                super::pointer_actions::ProvidersAction::DeleteModel(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Char('d')))
+                }
+                super::pointer_actions::ProvidersAction::ModelSettings(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Enter))
+                }
+                _ => None,
+            };
+            if let Some((provider, model, key)) = legacy {
+                if parent.provider_id != provider.0 || editor.is_editing() {
+                    return Nav::Stay;
+                }
+                if let Some(model) = model {
+                    let Some(index) = editor.rows().iter().position(|row| row.id == model.0) else {
+                        return Nav::Stay;
+                    };
+                    editor.cursor = index;
+                }
+                return cx.handle_providers_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+            }
+        }
+        if let (
+            ProvidersPage::FetchOnePrompt(state),
+            super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                id,
+                super::pointer_actions::FetchOneChoice::Cancel,
+            ),
+        ) = (&*self, &provider_action)
+            && state.provider_id == id.0
+        {
+            return cx
+                .handle_providers_page_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), self);
+        }
         if matches!(&*self, ProvidersPage::List { .. }) {
             match &provider_action {
                 super::pointer_actions::ProvidersAction::Add => {
@@ -5016,17 +5135,6 @@ impl SettingsPage for ProvidersPage {
                 };
                 index
             }
-            (
-                ProvidersPage::CopilotSetup { parent, .. },
-                super::pointer_actions::ProvidersAction::CopilotConfirm(id, choice),
-            ) if parent.provider_id == id.0 => match choice {
-                super::pointer_actions::ConfirmationChoice::Confirm => 0,
-                super::pointer_actions::ConfirmationChoice::Cancel => 1,
-            },
-            (
-                ProvidersPage::CopilotSetup { .. },
-                super::pointer_actions::ProvidersAction::LocalBack,
-            ) => 1,
             (
                 ProvidersPage::FetchAll(_),
                 super::pointer_actions::ProvidersAction::FetchAllConfirm(choice),

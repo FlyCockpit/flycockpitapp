@@ -210,6 +210,21 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_headers_surface_dispatches_every_enabled_control();
     pointer_reachable_nested_surfaces_render_and_dispatch();
     pointer_prompt_surfaces_render_and_dispatch();
+    pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state();
+    pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state();
+    pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state();
+    pointer_add_oauth_skip_continue_sources_save_from_fresh_state();
+    pointer_model_lifecycle_sources_dispatch_by_stable_identity();
+    pointer_add_provider_id_field_renders_and_dispatches_from_fresh_state();
+    pointer_add_url_field_renders_and_dispatches_from_fresh_state();
+    pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state();
+    pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state();
+    pointer_add_api_key_field_renders_and_dispatches_from_fresh_state();
+    pointer_add_env_var_field_renders_and_dispatches_from_fresh_state();
+    pointer_add_test_key_choices_render_and_dispatch_from_fresh_state();
+    pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
+    pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
+    pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
 }
 
 fn pointer_provider_list_action_family_dispatches_from_fresh_sources() {
@@ -430,8 +445,1221 @@ fn pointer_prompt_surfaces_render_and_dispatch() {
         for action in actions {
             let (_tmp, mut dialog) = prompt_fixture(kind);
             click_rendered_provider_action(&mut dialog, &action);
+            if matches!(
+                action,
+                super::super::pointer_actions::SettingsPointerAction::Providers(
+                    super::super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                        _,
+                        super::super::pointer_actions::FetchOneChoice::Cancel,
+                    ),
+                )
+            ) {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Providers(ProvidersPage::List { status, .. })
+                        if status.as_deref() == Some("refetch cancelled")
+                ));
+            }
         }
     }
+}
+
+fn replay_special_provider_edit_actions(
+    provider_id: &str,
+    fixture: impl Fn() -> (tempfile::TempDir, SettingsDialog),
+) {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (super::super::shell::SettingsPointerAction::Page(action), true) => {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !actions.is_empty(),
+        "special provider edit source has controls"
+    );
+    for action in actions {
+        let (_tmp, mut fresh) = fixture();
+        let expected_deep_fetch = matches!(
+            &action,
+            SettingsPointerAction::Providers(ProvidersAction::DeepFetchConfirm(_))
+        )
+        .then(|| DeepFetchState::prepare(&fresh.config_path, provider_id).map(|_| ()));
+        click_rendered_provider_action(&mut fresh, &action);
+        let parent_matches = |candidate: &EditState| candidate.provider_id == provider_id;
+        match action {
+            SettingsPointerAction::Providers(ProvidersAction::EditField(_, EditField::Url)) => {
+                assert!(
+                    matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.editing_field == Some(EditField::Url))
+                );
+            }
+            SettingsPointerAction::Providers(ProvidersAction::EditHeaders(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Headers { parent, .. }) if parent_matches(parent))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::CopilotSetup(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::CopilotSetup { parent, .. }) if parent_matches(parent))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::BeginOAuth(_, provider)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::OAuthSetup { state, parent }) if state.provider == provider && parent_matches(parent))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::ManageModels(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Models { parent, .. }) if parent_matches(parent))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::ProviderSettings(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::ProviderSettings { parent, .. }) if parent_matches(parent))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::Favorite(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.entry.favorite == Some(true))
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::Refetch(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.fetch.is_some())
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::DeepFetchConfirm(_)) => {
+                match expected_deep_fetch.expect("deep-fetch expectation") {
+                    Ok(()) => assert!(
+                        matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::DeepFetch { parent, .. }) if parent_matches(parent))
+                    ),
+                    Err(expected) => assert!(
+                        matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.status.as_deref() == Some(expected.as_str()))
+                    ),
+                }
+            }
+            SettingsPointerAction::Providers(ProvidersAction::BeginDelete(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.delete_pending)
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::SaveProvider(_)) => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if parent_matches(state) && state.status.is_some())
+            ),
+            SettingsPointerAction::Providers(ProvidersAction::LocalBack) => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::List { .. })
+            )),
+            other => panic!("unexpected special-provider edit action: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{
+        ConfirmationChoice, ProviderId, ProvidersAction, SettingsPointerAction,
+    };
+
+    fn copilot_edit_fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let mut config = one_provider_config(None);
+        let entry = config.providers.remove("p").unwrap();
+        config.providers.insert("copilot".into(), entry);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let entry = dialog.config.providers["copilot"].clone();
+        dialog.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
+            "copilot".into(),
+            entry,
+        )));
+        let ProvidersPage::Edit(state) = dialog.page.downcast_mut::<ProvidersPage>().unwrap()
+        else {
+            unreachable!("edit fixture")
+        };
+        state.cursor = edit_menu_actions(&state.provider_id, &state.entry)
+            .iter()
+            .position(|action| *action == EditAction::CopilotAuth)
+            .expect("Copilot provider exposes its auth setup source");
+        (tmp, dialog)
+    }
+
+    fn setup_fixture(kind: u8) -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = copilot_edit_fixture();
+        let entry = dialog.config.providers["copilot"].clone();
+        let (shell, rc_path, already_configured, outcome) = match kind {
+            0 => (
+                Some(CopilotShell::Bash),
+                Some(tmp.path().join("copilot-test.bashrc")),
+                false,
+                None,
+            ),
+            1 => (None, None, false, None),
+            2 => (
+                Some(CopilotShell::Bash),
+                Some(tmp.path().join("unused")),
+                true,
+                None,
+            ),
+            3 => (None, None, false, Some(Ok("fixture complete".into()))),
+            _ => unreachable!(),
+        };
+        dialog.page = super::super::providers_page(ProvidersPage::CopilotSetup {
+            state: CopilotSetupState {
+                shell,
+                rc_path,
+                already_configured,
+                outcome,
+                operation: super::super::shell::PointerOperationGate::default(),
+            },
+            parent: Box::new(EditState::new("copilot".into(), entry)),
+        });
+        (tmp, dialog)
+    }
+
+    fn rendered_actions(
+        dialog: &SettingsDialog,
+    ) -> std::collections::HashSet<SettingsPointerAction> {
+        let _ = render_provider_rows(dialog, 110, 60);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (super::super::shell::SettingsPointerAction::Page(action), true) => {
+                    Some(action.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    replay_special_provider_edit_actions("copilot", copilot_edit_fixture);
+
+    let expected = [
+        (
+            0,
+            SettingsPointerAction::Providers(ProvidersAction::CopilotConfirm(
+                ProviderId("copilot".into()),
+                ConfirmationChoice::Cancel,
+            )),
+        ),
+        (
+            1,
+            SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+        ),
+        (
+            2,
+            SettingsPointerAction::Providers(ProvidersAction::LocalBack),
+        ),
+        (
+            3,
+            SettingsPointerAction::Providers(ProvidersAction::CopilotConfirm(
+                ProviderId("copilot".into()),
+                ConfirmationChoice::Confirm,
+            )),
+        ),
+    ];
+    for (kind, action) in expected {
+        let (_tmp, mut fresh) = setup_fixture(kind);
+        click_rendered_provider_action(&mut fresh, &action);
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::Edit(state)) if state.provider_id == "copilot"
+        ));
+    }
+
+    // The actionable source publishes both commands. Dispatch Cancel on a
+    // separate fresh instance so it proves that cancellation performs no
+    // setup work and preserves the parent edit state.
+    let (_tmp, source) = setup_fixture(0);
+    let rendered = rendered_actions(&source);
+    assert!(rendered.contains(&SettingsPointerAction::Providers(
+        ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Confirm,)
+    )));
+    assert!(rendered.contains(&SettingsPointerAction::Providers(
+        ProvidersAction::CopilotConfirm(ProviderId("copilot".into()), ConfirmationChoice::Cancel,)
+    )));
+}
+
+#[test]
+fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
+
+    fn edit_fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let config = oauth_provider_config("grok-oauth", "oauth:test");
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let entry = dialog.config.providers["grok-oauth"].clone();
+        let mut state = EditState::new("grok-oauth".into(), entry);
+        state.cursor = edit_menu_actions(&state.provider_id, &state.entry)
+            .iter()
+            .position(|action| *action == EditAction::OAuthAuth(OAuthProvider::Grok))
+            .expect("Grok provider exposes its OAuth source");
+        dialog.page = super::super::providers_page(ProvidersPage::Edit(state));
+        (tmp, dialog)
+    }
+
+    fn oauth_fixture(kind: u8) -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) =
+            dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
+        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        match kind {
+            0 => {}
+            1 => {
+                state.set_browser_session_for_test("https://example.test/oauth");
+                state.pending = true;
+            }
+            2 => state.logged_in = true,
+            _ => unreachable!(),
+        }
+        dialog.page =
+            super::super::providers_page(standalone_oauth_page(OAuthProvider::Grok, state));
+        (tmp, dialog)
+    }
+
+    fn actions(dialog: &SettingsDialog) -> std::collections::HashSet<SettingsPointerAction> {
+        let _ = render_provider_rows(dialog, 110, 60);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (super::super::shell::SettingsPointerAction::Page(action), true) => {
+                    Some(action.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    replay_special_provider_edit_actions("grok-oauth", edit_fixture);
+    let begin = SettingsPointerAction::Providers(ProvidersAction::BeginOAuth(
+        ProviderId("grok-oauth".into()),
+        OAuthProvider::Grok,
+    ));
+    let (_tmp, source) = edit_fixture();
+    assert!(actions(&source).contains(&begin));
+    let (_tmp, mut fresh) = edit_fixture();
+    click_rendered_provider_action(&mut fresh, &begin);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, parent })
+            if state.provider == OAuthProvider::Grok && parent.provider_id == "grok-oauth"
+    ));
+
+    let initial = [OAuthOption::Login, OAuthOption::ManualPaste]
+        .into_iter()
+        .map(|option| {
+            SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+                ProviderId("grok-oauth".into()),
+                option,
+            ))
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let (_tmp, source) = oauth_fixture(0);
+    assert_eq!(actions(&source), initial);
+    for action in initial {
+        let (_tmp, mut fresh) = oauth_fixture(0);
+        click_rendered_provider_action(&mut fresh, &action);
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+                if state.provider == OAuthProvider::Grok
+                    && (state.pending || state.paste_focused)
+        ));
+    }
+
+    let paste = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+        ProviderId("grok-oauth".into()),
+        OAuthOption::ManualPaste,
+    ));
+    let (_tmp, mut fresh) = oauth_fixture(1);
+    click_rendered_provider_action(&mut fresh, &paste);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+            if state.paste_focused
+    ));
+
+    let poll = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+        ProviderId("grok-oauth".into()),
+        OAuthOption::Poll,
+    ));
+    let (_tmp, mut fresh) = oauth_fixture(1);
+    click_rendered_provider_action(&mut fresh, &poll);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+            if state.pending
+                && !state.paste_focused
+                && state.status.as_ref().is_some_and(|status| {
+                    status.as_ref().is_ok_and(|message| message.contains("Checking"))
+                })
+    ));
+
+    let skip = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+        ProviderId("grok-oauth".into()),
+        OAuthOption::SkipContinue,
+    ));
+    let (_tmp, mut fresh) = oauth_fixture(1);
+    click_rendered_provider_action(&mut fresh, &skip);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Edit(state))
+            if state.provider_id == "grok-oauth"
+    ));
+
+    let (_tmp, mut acknowledge) =
+        dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
+    acknowledge.page = super::super::providers_page(standalone_oauth_page(
+        OAuthProvider::Grok,
+        OAuthFlowState::new_with_acknowledgement_for_test(OAuthProvider::Grok),
+    ));
+    let acknowledge_action = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+        ProviderId("grok-oauth".into()),
+        OAuthOption::Acknowledge,
+    ));
+    click_rendered_provider_action(&mut acknowledge, &acknowledge_action);
+    assert!(!actions(&acknowledge).contains(&acknowledge_action));
+
+    let continue_action = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+        ProviderId("grok-oauth".into()),
+        OAuthOption::Continue,
+    ));
+    let (_tmp, mut fresh) = oauth_fixture(2);
+    click_rendered_provider_action(&mut fresh, &continue_action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Edit(state))
+            if state.provider_id == "grok-oauth"
+    ));
+}
+
+#[test]
+fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
+
+    fn edit_fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let config = oauth_provider_config("codex-oauth", "oauth:test");
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let entry = dialog.config.providers["codex-oauth"].clone();
+        let mut state = EditState::new("codex-oauth".into(), entry);
+        state.cursor = edit_menu_actions(&state.provider_id, &state.entry)
+            .iter()
+            .position(|action| *action == EditAction::OAuthAuth(OAuthProvider::Codex))
+            .expect("Codex provider exposes its OAuth source");
+        dialog.page = super::super::providers_page(ProvidersPage::Edit(state));
+        (tmp, dialog)
+    }
+
+    fn oauth_fixture(kind: u8) -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) =
+            dialog_with_config(oauth_provider_config("codex-oauth", "oauth:test"));
+        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+        match kind {
+            0 => {}
+            1 => state.set_device_login_for_test(
+                cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                    "https://example.test/device",
+                    "CODE-123",
+                ),
+            ),
+            2 => state.logged_in = true,
+            _ => unreachable!(),
+        }
+        dialog.page =
+            super::super::providers_page(standalone_oauth_page(OAuthProvider::Codex, state));
+        (tmp, dialog)
+    }
+
+    replay_special_provider_edit_actions("codex-oauth", edit_fixture);
+
+    let begin = SettingsPointerAction::Providers(ProvidersAction::BeginOAuth(
+        ProviderId("codex-oauth".into()),
+        OAuthProvider::Codex,
+    ));
+    let (_tmp, mut fresh) = edit_fixture();
+    click_rendered_provider_action(&mut fresh, &begin);
+    assert!(
+        matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::OAuthSetup { state, parent }) if state.provider == OAuthProvider::Codex && parent.provider_id == "codex-oauth")
+    );
+
+    for (kind, option) in [
+        (0, OAuthOption::Login),
+        (1, OAuthOption::Poll),
+        (1, OAuthOption::SkipContinue),
+        (2, OAuthOption::Continue),
+    ] {
+        let action = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
+            ProviderId("codex-oauth".into()),
+            option,
+        ));
+        let (_tmp, mut fresh) = oauth_fixture(kind);
+        click_rendered_provider_action(&mut fresh, &action);
+        match option {
+            OAuthOption::Login => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.polling)
+            ),
+            OAuthOption::Poll => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.polling)
+            ),
+            OAuthOption::Continue | OAuthOption::SkipContinue => assert!(
+                matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if state.provider_id == "codex-oauth")
+            ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture(provider: OAuthProvider) -> (tempfile::TempDir, SettingsDialog) {
+        let template_id = match provider {
+            OAuthProvider::Grok => "grok-oauth",
+            OAuthProvider::Codex => "codex-oauth",
+        };
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(provider);
+        match provider {
+            OAuthProvider::Grok => {
+                oauth.set_browser_session_for_test("https://example.test/oauth");
+                oauth.pending = true;
+            }
+            OAuthProvider::Codex => oauth.set_device_login_for_test(
+                cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+                    "https://example.test/device",
+                    "CODE-123",
+                ),
+            ),
+        }
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            template_id,
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    for provider in [OAuthProvider::Grok, OAuthProvider::Codex] {
+        let template_id = match provider {
+            OAuthProvider::Grok => "grok-oauth",
+            OAuthProvider::Codex => "codex-oauth",
+        };
+        let (_tmp, source) = fixture(provider);
+        let _ = render_provider_rows(&source, 110, 60);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                            _,
+                            WizardControlId::OAuth(_),
+                        )),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected_count = if provider == OAuthProvider::Grok {
+            3
+        } else {
+            2
+        };
+        assert_eq!(actions.len(), expected_count, "pending Add OAuth controls");
+
+        for action in actions {
+            let option = match &action {
+                SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                    _,
+                    WizardControlId::OAuth(option),
+                )) => *option,
+                _ => unreachable!(),
+            };
+            let (_tmp, mut fresh) = fixture(provider);
+            click_rendered_provider_action(&mut fresh, &action);
+            match (provider, option) {
+                (OAuthProvider::Grok, OAuthOption::ManualPaste) => assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::Add(state))
+                        if state.oauth_auth.as_deref().is_some_and(|oauth| oauth.paste_focused)
+                )),
+                (OAuthProvider::Grok, OAuthOption::Poll) => assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::Add(state))
+                        if state.oauth_auth.as_deref().is_some_and(|oauth| {
+                            oauth.pending
+                                && !oauth.paste_focused
+                                && oauth.status.as_ref().is_some_and(|status| {
+                                    status.as_ref().is_ok_and(|message| message.contains("Checking"))
+                                })
+                        })
+                )),
+                (OAuthProvider::Codex, OAuthOption::Poll) => assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::Add(state))
+                        if state.oauth_auth.as_deref().is_some_and(|oauth| oauth.polling)
+                )),
+                (_, OAuthOption::SkipContinue) => {
+                    assert!(fresh.config.providers.contains_key(template_id));
+                    assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::Add(state))
+                            if state.saved_provider_id.as_deref() == Some(template_id)
+                                && state.error.as_deref().is_some_and(|message| message.starts_with("saved."))
+                    ));
+                }
+                other => panic!("unexpected pending Add OAuth control: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn pointer_model_lifecycle_sources_dispatch_by_stable_identity() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let config = one_provider_config(None);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let mut entry = dialog.config.providers["p"].clone();
+        entry.models = vec![model("stable-manual", true)];
+        dialog.page = super::super::providers_page(ProvidersPage::Models {
+            editor: Box::new(ModelEditor::new(None, entry.models.clone())),
+            parent: Box::new(EditState::new("p".into(), entry)),
+        });
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(
+                        ProvidersAction::AddModel(_)
+                        | ProvidersAction::RenameModel(_, _)
+                        | ProvidersAction::DeleteModel(_, _)
+                        | ProvidersAction::ModelSettings(_, _)
+                        | ProvidersAction::RowEditor(
+                            ProviderRowEditorAction::ModelOpen(_)
+                            | ProviderRowEditorAction::ModelAdd
+                            | ProviderRowEditorAction::ModelSave,
+                        ),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 7, "complete model lifecycle is rendered");
+    for action in actions {
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        match action {
+            SettingsPointerAction::Providers(
+                ProvidersAction::AddModel(_)
+                | ProvidersAction::RenameModel(_, _)
+                | ProvidersAction::RowEditor(ProviderRowEditorAction::ModelAdd),
+            ) => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Models { editor, .. })
+                    if editor.is_editing()
+            )),
+            SettingsPointerAction::Providers(ProvidersAction::ModelSettings(_, ref model_id)) => {
+                assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::ModelSettings { models, parent, .. })
+                        if parent.provider_id == "p"
+                            && models.rows().iter().any(|row| row.id == model_id.0)
+                ));
+            }
+            SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                ProviderRowEditorAction::ModelOpen(ref model_id),
+            )) => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::ModelSettings { models, parent, .. })
+                    if parent.provider_id == "p"
+                        && models.rows().iter().any(|row| row.id == model_id.0)
+            )),
+            SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                ProviderRowEditorAction::ModelSave,
+            )) => {
+                assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::Models { parent, .. })
+                        if parent.status.as_deref().is_some_and(|status| status.starts_with("saved"))
+                ));
+                assert_eq!(
+                    load_provider(&fresh.config_path, "p").models[0].id,
+                    "stable-manual"
+                );
+            }
+            SettingsPointerAction::Providers(ProvidersAction::DeleteModel(_, _)) => {
+                assert!(
+                    matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Models { editor, .. }) if editor.rows().len() == 1)
+                );
+                click_rendered_provider_action(&mut fresh, &action);
+                assert!(
+                    matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Models { editor, .. }) if editor.rows().is_empty())
+                );
+            }
+            other => panic!("unexpected model lifecycle action: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn pointer_add_provider_id_field_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut state = AddState::new();
+        state.enter_template_for_test(template_cursor("anthropic"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("id"));
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        step,
+                        WizardControlId::EditText,
+                    )),
+                ),
+                true,
+            ) if step.source_id() == "id" => Some(action.clone()),
+            _ => None,
+        })
+        .expect("provider ID field publishes its wizard edit identity");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("id") && state.id_field.text() == "anthropic"
+    ));
+}
+
+#[test]
+fn pointer_add_url_field_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut state = AddState::new();
+        state.enter_template_for_test(template_cursor("anthropic"));
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("url"));
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        step,
+                        WizardControlId::EditText,
+                    )),
+                ),
+                true,
+            ) if step.source_id() == "url" => Some(action.clone()),
+            _ => None,
+        })
+        .expect("provider URL field publishes its wizard edit identity");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("url") && !state.url_field.text().is_empty()
+    ));
+}
+
+#[test]
+fn pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let template = templates::template_by_id("anthropic").unwrap();
+        let mut state = AddState::new();
+        state.template = Some(template);
+        state.id_field.set(template.id);
+        state.url_field.set(template.url);
+        state.headers = Box::new(HeaderEditor::new(
+            vec![HeaderSpec {
+                name: "X-Stable".into(),
+                value: "stable-value".into(),
+            }],
+            true,
+        ));
+        state.run.return_to("headers").unwrap();
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        control @ (WizardControlId::Header(_)
+                        | WizardControlId::AddHeader
+                        | WizardControlId::ContinueHeaders),
+                    )),
+                ),
+                true,
+            ) if matches!(control, WizardControlId::Header(name) if name.0 == "X-Stable")
+                || matches!(
+                    control,
+                    WizardControlId::AddHeader | WizardControlId::ContinueHeaders
+                ) =>
+            {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 3, "Headers publishes row, Add, and Continue");
+    for action in actions {
+        let control = match &action {
+            SettingsPointerAction::Providers(ProvidersAction::WizardControl(_, control)) => control,
+            _ => unreachable!(),
+        };
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        match control {
+            WizardControlId::Header(_) | WizardControlId::AddHeader => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step("headers") && state.headers.is_editing()
+            )),
+            WizardControlId::ContinueHeaders => {
+                assert!(fresh.config.providers.contains_key("anthropic"));
+                assert!(matches!(
+                    fresh.test_page(),
+                    TestPageRef::Providers(ProvidersPage::Add(state))
+                        if state.saved_provider_id.as_deref() == Some("anthropic")
+                            && state.headers.rows().iter().any(|row| row.name == "X-Stable")
+                ));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn pointer_add_auth_method_choices_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{
+        ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
+    };
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let template = templates::template_by_id("anthropic").unwrap();
+        let mut state = AddState::new();
+        state.template = Some(template);
+        state.id_field.set(template.id);
+        state.url_field.set(template.url);
+        state.run.return_to("auth-method").unwrap();
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::AuthMethod(_),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 3, "all auth methods are rendered");
+    for action in actions {
+        let method = match &action {
+            SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                _,
+                WizardControlId::AuthMethod(method),
+            )) => *method,
+            _ => unreachable!(),
+        };
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        let expected_step = match method {
+            WizardAuthMethod::PasteKey => "api-key",
+            WizardAuthMethod::EnvVar => "env-var",
+            WizardAuthMethod::AdvancedHeaders => "headers",
+        };
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::Add(state))
+                if state.is_step(expected_step)
+        ));
+    }
+}
+
+#[test]
+fn pointer_add_api_key_field_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let template = templates::template_by_id("anthropic").unwrap();
+        let mut state = AddState::new();
+        state.template = Some(template);
+        state.id_field.set(template.id);
+        state.url_field.set(template.url);
+        state.run.return_to("auth-method").unwrap();
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("api-key"));
+        state.api_key_field.set("sk-stable-secret");
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        step,
+                        WizardControlId::EditText,
+                    )),
+                ),
+                true,
+            ) if step.source_id() == "api-key" => Some(action.clone()),
+            _ => None,
+        })
+        .expect("API key field publishes its wizard edit identity");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("api-key") && state.api_key_field.text() == "sk-stable-secret"
+    ));
+}
+
+#[test]
+fn pointer_add_env_var_field_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let template = templates::template_by_id("anthropic").unwrap();
+        let mut state = AddState::new();
+        state.template = Some(template);
+        state.id_field.set(template.id);
+        state.url_field.set(template.url);
+        state.run.return_to("auth-method").unwrap();
+        state.auth_method_cursor = 1;
+        dialog.handle_add_key(press(KeyCode::Enter), &mut state);
+        assert!(state.is_step("env-var"));
+        state.env_var_field.set("ANTHROPIC_API_KEY_STABLE");
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        step,
+                        WizardControlId::EditText,
+                    )),
+                ),
+                true,
+            ) if step.source_id() == "env-var" => Some(action.clone()),
+            _ => None,
+        })
+        .expect("environment variable field publishes its wizard edit identity");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("env-var")
+                && state.env_var_field.text() == "ANTHROPIC_API_KEY_STABLE"
+    ));
+}
+
+#[test]
+fn pointer_add_test_key_choices_render_and_dispatch_from_fresh_state() {
+    use super::super::pointer_actions::{
+        ProvidersAction, SettingsPointerAction, WizardControlId, WizardTestChoice,
+    };
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let template = templates::template_by_id("anthropic").unwrap();
+        let mut config = ProvidersConfig::default();
+        config
+            .providers
+            .insert("anthropic".into(), ProviderEntry::default());
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let mut state = AddState::new();
+        state.template = Some(template);
+        state.id_field.set(template.id);
+        state.url_field.set(template.url);
+        state.saved_provider_id = Some("anthropic".into());
+        state.run.return_to("test-key-choice").unwrap();
+        dialog.page = super::super::providers_page(ProvidersPage::Add(state));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::TestChoice(_),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 2, "both test-key choices are rendered");
+    for action in actions {
+        let choice = match &action {
+            SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                _,
+                WizardControlId::TestChoice(choice),
+            )) => *choice,
+            _ => unreachable!(),
+        };
+        let (_tmp, mut fresh) = fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        match choice {
+            WizardTestChoice::TestKey => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.fetch.is_some()
+                        && state.error.as_deref() == Some("Testing key via /models…")
+                        && !state.is_step("test-key-choice")
+            )),
+            WizardTestChoice::SkipTest => assert!(matches!(
+                fresh.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(state))
+                    if state.is_step("test-skipped")
+                        && state.error.as_deref().is_some_and(|message| message.contains("unverified"))
+            )),
+        }
+    }
+}
+
+#[test]
+fn pointer_add_grok_login_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "grok-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let login = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::OAuth(OAuthOption::Login),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("logged-out Grok wizard renders Login");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &login);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.oauth_auth.as_deref().is_some_and(|oauth| {
+                oauth.pending
+                    && !oauth.paste_focused
+                    && oauth.status.as_ref().is_some_and(|status| {
+                        status.as_ref().is_ok_and(|message| message.contains("Preparing"))
+                    })
+            })
+    ));
+}
+
+#[test]
+fn pointer_add_grok_continue_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        oauth.logged_in = true;
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "grok-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::OAuth(OAuthOption::Continue),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("logged-in Grok wizard renders Continue");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(fresh.config.providers.contains_key("grok-oauth"));
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.saved_provider_id.as_deref() == Some("grok-oauth")
+                && state.error.as_deref().is_some_and(|message| message.starts_with("saved."))
+    ));
+}
+
+#[test]
+fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let oauth = OAuthFlowState::new_with_acknowledgement_for_test(OAuthProvider::Grok);
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "grok-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        _,
+                        WizardControlId::OAuth(OAuthOption::Acknowledge),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("Grok wizard renders acknowledgement gate");
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("grok-oauth")
+                && state.oauth_auth.as_deref().is_some_and(|oauth| {
+                    oauth.status.as_ref().is_some_and(|status| {
+                        status.as_ref().is_ok_and(|message| message.contains("acknowledged"))
+                    })
+                })
+    ));
+    let _ = render_provider_rows(&fresh, 110, 60);
+    assert!(
+        !fresh.pointer_surface.targets.borrow().iter().any(|target| {
+            target.enabled
+                && target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
+        })
+    );
 }
 
 fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
@@ -3612,7 +4840,7 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
 }
 
 #[test]
-fn standalone_oauth_body_hides_skip_continue_row() {
+fn standalone_oauth_body_exposes_skip_only_while_active() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
         let mut logged_out = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         logged_out.logged_in = false;
@@ -3637,8 +4865,8 @@ fn standalone_oauth_body_hides_skip_continue_row() {
             }
         }
         assert!(
-            !oauth_body_text(&active, OAuthHost::Standalone).contains("skip / continue"),
-            "{provider:?} active standalone body should hide skip"
+            oauth_body_text(&active, OAuthHost::Standalone).contains("skip / continue"),
+            "{provider:?} active standalone body should expose skip"
         );
 
         let mut confirming = OAuthFlowState::new_without_acknowledgement_for_test(provider);
@@ -3783,32 +5011,33 @@ fn every_visible_oauth_row_acts_on_enter() {
             );
         }
 
+        let pending_grok = || {
+            let mut state =
+                OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+            state.set_browser_session_for_test("https://example.test/oauth");
+            state.pending = true;
+            state
+        };
+        let manual_index = oauth_options(&pending_grok(), host)
+            .iter()
+            .position(|option| *option == OAuthOption::ManualPaste)
+            .expect("pending Grok renders manual paste");
+        let poll_index = oauth_options(&pending_grok(), host)
+            .iter()
+            .position(|option| *option == OAuthOption::Poll)
+            .expect("pending Grok renders poll");
+        assert_enter_effect(pending_grok(), host, poll_index, ExpectedEnter::Action);
         assert_enter_effect(
-            {
-                let mut s =
-                    OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
-                s.set_browser_session_for_test("https://example.test/oauth");
-                s.pending = true;
-                s
-            },
+            pending_grok(),
             host,
-            0,
+            manual_index,
             ExpectedEnter::PasteFocus,
         );
-        if host == OAuthHost::AddWizard {
-            assert_enter_effect(
-                {
-                    let mut s =
-                        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
-                    s.set_browser_session_for_test("https://example.test/oauth");
-                    s.pending = true;
-                    s
-                },
-                host,
-                1,
-                ExpectedEnter::Confirm,
-            );
-        }
+        let skip_index = oauth_options(&pending_grok(), host)
+            .iter()
+            .position(|option| *option == OAuthOption::SkipContinue)
+            .expect("pending Grok renders skip / continue");
+        assert_enter_effect(pending_grok(), host, skip_index, ExpectedEnter::Confirm);
 
         assert_enter_effect(
             {

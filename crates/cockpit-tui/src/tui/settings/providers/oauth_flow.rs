@@ -903,6 +903,15 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
                 op: OAuthFlowOp::Begin,
             }))
         }
+        (OAuthProvider::Grok, OAuthOption::Poll) => {
+            s.pending = true;
+            s.paste_focused = false;
+            s.status = Some(Ok("Checking xAI OAuth callback...".to_string()));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: OAuthProvider::Grok,
+                op: OAuthFlowOp::Begin,
+            }))
+        }
         (OAuthProvider::Codex, OAuthOption::Login) => {
             s.polling = true;
             s.status = Some(Ok("Requesting Codex device code...".to_string()));
@@ -968,6 +977,7 @@ pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOpt
     match s.provider {
         OAuthProvider::Grok => {
             if s.pending {
+                opts.push(OAuthOption::Poll);
                 opts.push(OAuthOption::ManualPaste);
             } else {
                 opts.push(OAuthOption::Login);
@@ -982,7 +992,9 @@ pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOpt
             }
         }
     }
-    if host == OAuthHost::AddWizard {
+    if host == OAuthHost::AddWizard
+        || (host == OAuthHost::Standalone && (s.pending || s.device_login().is_some()))
+    {
         opts.push(OAuthOption::SkipContinue);
     }
     opts

@@ -641,7 +641,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     nav_stack_restores_privacy_and_string_list_parents();
     root_children_restore_their_own_root_cursor();
     instructions_enter_grabs_existing_row_then_arrow_swaps();
-    string_list_delete_requires_second_press_and_first_press_does_not_persist();
+    string_list_keyboard_delete_remains_immediate();
     tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools();
     tools_reset_pending_cancelled_by_navigation();
     lsp_reset_r_once_arms_without_wiping();

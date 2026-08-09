@@ -10,7 +10,9 @@
     "serve": "vite preview",
     "start": "vite",
     "check-types": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests",
+    "test:node": "vitest run --config vitest.node.config.ts",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "test": "pnpm run test:node && pnpm run test:browser",
     "generate-pwa-assets": "pwa-assets-generator"
   },
   "dependencies": {
@@ -63,9 +65,11 @@
     "@types/node": "catalog:",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
+    "@vitest/browser-playwright": "catalog:",
     "@vite-pwa/assets-generator": "^1.0.2",
     "@vitejs/plugin-react": "catalog:",
     "postcss": "catalog:",
+    "playwright": "catalog:",
     "tailwindcss": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",

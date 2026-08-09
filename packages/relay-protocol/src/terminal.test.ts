@@ -37,20 +37,34 @@ describe("terminal frame codec", () => {
 });
 
 describe("terminal paste router", () => {
-  it("prefers images over text when files are present", () => {
+  it("plans one structural image without a text route", () => {
     const plan = planTerminalPaste({
-      text: "ignored",
       files: [{ name: "screen.png", type: "image/png", size: 123 }],
     });
 
     expect(plan).toMatchObject({
-      kind: "images",
-      images: [{ kind: "image", name: "screen.png" }],
+      kind: "image",
+      image: { kind: "image", name: "screen.png" },
     });
   });
 
-  it("routes plain text when no file is present", () => {
-    expect(planTerminalPaste({ text: "hello" })).toEqual({ kind: "text", text: "hello" });
+  it("returns empty when no file is present", () => {
+    expect(planTerminalPaste({})).toEqual({ kind: "empty" });
+  });
+
+  it("rejects a multi-file gesture as a whole", () => {
+    expect(
+      planTerminalPaste({
+        files: [
+          { name: "one.png", type: "image/png", size: 1 },
+          { name: "two.png", type: "image/png", size: 1 },
+        ],
+      }),
+    ).toEqual({
+      kind: "error",
+      code: "too_many_files",
+      maxBytes: TERMINAL_IMAGE_MAX_BYTES,
+    });
   });
 
   it("rejects oversized images before upload", () => {

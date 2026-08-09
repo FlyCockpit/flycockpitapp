@@ -299,7 +299,6 @@ function TerminalSession({
       <div
         ref={terminal.containerRef}
         className="min-h-0 flex-1 overflow-hidden bg-black p-2"
-        onPaste={terminal.handlePaste}
         onDrop={terminal.handleDrop}
         onDragOver={(event) => event.preventDefault()}
       />

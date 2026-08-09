@@ -165,6 +165,9 @@ jobs:
             packages/db/prisma/generated
           key: workspace-${{ github.sha }}
 
+      - name: Install pinned Chromium
+        run: pnpm --filter web exec playwright install --with-deps chromium
+
       - name: Test
         run: pnpm test
 

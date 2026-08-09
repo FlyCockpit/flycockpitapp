@@ -3389,6 +3389,28 @@ impl SettingsPage for CategoryPage {
         cx.handle_category_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }
 
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: super::shell::SettingsControlId,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if control.0 == 1000
+            && let Some(picker) = self.utility_picker.as_mut()
+            && let super::ui_page::PickerMode::Custom { buf } = &mut picker.mode
+        {
+            let value_x = cx
+                .pointer_surface
+                .area
+                .get()
+                .map_or(2, |area| area.x.saturating_add(2));
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, control)
+    }
+
     fn handle_pointer_scroll(
         &mut self,
         _cx: &mut SettingsCx,

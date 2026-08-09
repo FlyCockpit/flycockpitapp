@@ -284,6 +284,121 @@ canonical_unit_enum16!(cockpit_config::config::providers::ThinkingMode, {
     Medium = 3,
     High = 4,
 });
+canonical_unit_enum16!(crate::EnvSnapshotSource, {
+    DaemonStart = 1,
+    TuiShell = 2,
+    TuiProcessFallback = 3,
+    ExplicitCli = 4,
+});
+canonical_unit_enum16!(cockpit_config::config::extended::ApprovalMode, {
+    Manual = 1,
+    Auto = 2,
+    Yolo = 3,
+});
+canonical_unit_enum16!(cockpit_config::config::extended::LlmMode, {
+    Defensive = 1,
+    Normal = 2,
+    Frontier = 3,
+});
+canonical_unit_enum16!(cockpit_config::config::sandbox_mode::SandboxMode, {
+    Off = 1,
+    Sandbox = 2,
+    Container = 3,
+    ContainerReadonly = 4,
+});
+canonical_unit_enum16!(cockpit_db::db::session_goals::GoalDisposition, {
+    Running = 1,
+    UserPaused = 2,
+    InfraPaused = 3,
+    Blocked = 4,
+    NoProgressPaused = 5,
+    BudgetLimited = 6,
+    Complete = 7,
+    Cleared = 8,
+});
+
+macro_rules! canonical_struct {
+    ($ty:ty, $value:ident, $out:ident, [$($field:ident),+ $(,)?]) => {
+        impl CanonicalFcorValueV1 for $ty {
+            fn encode_fcor_value_v1(&$value, $out: &mut CanonicalParamsV1) -> Result<()> {
+                let mut nested = CanonicalParamsV1::new();
+                $($value.$field.encode_fcor_value_v1(&mut nested)?;)+
+                $out.0.extend(nested.0);
+                Ok(())
+            }
+        }
+    };
+}
+
+canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
+canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
+canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
+canonical_struct!(
+    crate::RunInvocationOptions,
+    self,
+    out,
+    [max_turns, timeout_ms, approval_mode]
+);
+canonical_struct!(
+    cockpit_config::config::providers::ActiveReasoningEffort,
+    self,
+    out,
+    [value]
+);
+canonical_struct!(
+    cockpit_config::config::providers::ActiveModelRef,
+    self,
+    out,
+    [
+        provider,
+        model,
+        reasoning_effort,
+        thinking_mode,
+        prompt_cache_retention,
+    ]
+);
+
+impl CanonicalFcorValueV1 for crate::AttachmentPurpose {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::UserMessageImage => nested.push_u16(1),
+            Self::TerminalPasteImage { terminal_id } => {
+                nested.push_u16(2);
+                nested.push_uuid(*terminal_id);
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Single { selected_id } => {
+                nested.push_u16(1);
+                selected_id.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Multi { selected_ids } => {
+                nested.push_u16(2);
+                selected_ids.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Freetext { text } => {
+                nested.push_u16(3);
+                text.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Batch { responses } => {
+                nested.push_u16(4);
+                responses.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Cancel => nested.push_u16(5),
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
 
 impl CanonicalParamsV1 {
     pub fn new() -> Self {

@@ -636,6 +636,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// as the keyboard contract instead of rebuilding synthetic registries.
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
+    pointer_harness_list_actions_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -649,6 +650,108 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.command_installed = |_| true;
+    enter_harnesses_from_root(&mut dialog);
+    dialog
+}
+
+fn click_settings_action(
+    dialog: &mut SettingsDialog,
+    action: &pointer_actions::SettingsPointerAction,
+) {
+    let _ = render_settings_rows(dialog, 100, 40);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled && target.action == shell::SettingsPointerAction::Page(action.clone())
+        })
+        .cloned()
+        .expect("source action must render on fresh harness fixture");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+    }
+}
+
+fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{HarnessesAction, SettingsPointerAction};
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = harness_list_pointer_fixture(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Harnesses(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 3, "empty Harnesses list has three actions");
+
+    for action in actions {
+        let SettingsPointerAction::Harnesses(harness_action) = &action else {
+            unreachable!();
+        };
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = harness_list_pointer_fixture(&tmp);
+        match harness_action {
+            HarnessesAction::Add => {
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if state.adding.is_some()
+                ));
+            }
+            HarnessesAction::SeedInstalledPresets => {
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.is_empty());
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if state.status.as_deref() == Some("saved")
+                ));
+            }
+            HarnessesAction::ResetAndSeedPresets => {
+                let (_, custom) = cockpit_config::extended::builtin_harness_presets()
+                    .into_iter()
+                    .next()
+                    .expect("harness reset fixture");
+                dialog.extended.harnesses.insert("custom".into(), custom);
+                click_settings_action(&mut dialog, &action);
+                assert!(dialog.extended.harnesses.contains_key("custom"));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state)) if state.reset.is_pending()
+                ));
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.contains_key("custom"));
+                assert!(!dialog.extended.harnesses.is_empty());
+            }
+            HarnessesAction::Open(_)
+            | HarnessesAction::Delete(_)
+            | HarnessesAction::EditField(_)
+            | HarnessesAction::Save
+            | HarnessesAction::Cancel => {
+                panic!("empty Harnesses list rendered unexpected action {harness_action:?}")
+            }
+        }
+    }
 }
 
 /// Render the concrete nested states whose discriminants form the strict

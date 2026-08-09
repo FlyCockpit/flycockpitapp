@@ -1492,10 +1492,11 @@ pub(super) async fn run_worker(
                         let current = authoritative_active_model_state
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let matches = current.as_ref().is_some_and(|current| {
-                            current.generation == expected_generation
-                                && &current.selection == expected_model
-                        });
+                        let matches = model_expectation_matches(
+                            current.as_ref(),
+                            expected_generation,
+                            expected_model,
+                        );
                         if !matches {
                             let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::ModelGenerationStale,
@@ -2794,6 +2795,16 @@ pub(super) async fn run_worker(
         },
     );
     tracing::info!(session_id = %session_id, "session worker exited");
+}
+
+pub(super) fn model_expectation_matches(
+    current: Option<&proto::ActiveModelState>,
+    expected_generation: u64,
+    expected_model: &cockpit_config::providers::ActiveModelRef,
+) -> bool {
+    current.is_some_and(|current| {
+        current.generation == expected_generation && &current.selection == expected_model
+    })
 }
 
 fn update_authoritative_active_model_state(

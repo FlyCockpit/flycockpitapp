@@ -2795,8 +2795,13 @@ END;
 
 CREATE TRIGGER remote_attachment_outbox_delete_forbidden
 BEFORE DELETE ON remote_attachment_outbox
+WHEN NOT EXISTS (
+    SELECT 1 FROM remote_attachment_outbox_snapshots
+    WHERE logical_attachment_id = OLD.logical_attachment_id
+      AND compacted_through_event_seq >= OLD.event_seq
+)
 BEGIN
-    SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
+    SELECT RAISE(ABORT, 'remote attachment outbox deletion lacks snapshot authority');
 END;
 
 CREATE TABLE remote_attachment_outbox_snapshots (

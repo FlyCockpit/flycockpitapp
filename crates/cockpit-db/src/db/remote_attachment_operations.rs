@@ -848,6 +848,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbox_compaction_requires_snapshot_cursor_and_releases_operation_fk() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000040";
+        db.reserve_remote_attachment_operation(reserve(operation, [5; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"committed",
+            outbox_delivery_id: "00000000-0000-4000-8000-000000000041",
+            outbox_kind: "committed",
+            outbox_payload: b"event",
+            now_ms: 30,
+        })
+        .await
+        .unwrap();
+        let attachment = ATTACHMENT.to_owned();
+        assert!(
+            db.write(move |conn| {
+                conn.execute(
+                    "DELETE FROM remote_attachment_outbox
+                     WHERE logical_attachment_id = ?1 AND event_seq = 1",
+                    [&attachment],
+                )?;
+                Ok(())
+            })
+            .await
+            .is_err(),
+            "an event without snapshot authority must not compact"
+        );
+        let attachment = ATTACHMENT.to_owned();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_snapshots
+                 (logical_attachment_id, compacted_through_event_seq,
+                  snapshot_high_water_mark, updated_at_ms) VALUES (?1, 0, 1, 31)",
+                [&attachment],
+            )?;
+            assert!(
+                conn.execute(
+                    "DELETE FROM remote_attachment_outbox
+                     WHERE logical_attachment_id = ?1 AND event_seq = 1",
+                    [&attachment],
+                )
+                .is_err(),
+                "an event above the cursor must not compact"
+            );
+            conn.execute(
+                "UPDATE remote_attachment_outbox_snapshots
+                 SET compacted_through_event_seq = 1, updated_at_ms = 32
+                 WHERE logical_attachment_id = ?1",
+                [&attachment],
+            )?;
+            conn.execute(
+                "DELETE FROM remote_attachment_outbox
+                 WHERE logical_attachment_id = ?1 AND event_seq = 1",
+                [&attachment],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let attachment = ATTACHMENT.to_owned();
+        let operation = operation.to_owned();
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM remote_attachment_operations
+                 WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                params![attachment, operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("snapshot-authorized event deletion must release the operation FK");
+    }
+
+    #[tokio::test]
     async fn terminal_first_write_is_rejected_and_atomic_commit_is_final() {
         let db = Db::open_in_memory().unwrap();
         let operation = "01890f3e-4c00-7000-8000-000000000020";

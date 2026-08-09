@@ -5313,6 +5313,19 @@ mod slash_popup_full_list_tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     #[test]
     fn slash_suggestions_returns_full_match_list() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5395,8 +5408,8 @@ mod slash_popup_full_list_tests {
         );
     }
 
-    #[test]
-    fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
         let tmp = tempfile::tempdir().unwrap();
         for name in [
             "alpha.rs",
@@ -5414,6 +5427,7 @@ mod slash_popup_full_list_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.composer.set("@".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let total = app.at_suggestions().len();
         assert!(total > AUTOCOMPLETE_ROWS as usize);
 
@@ -5503,6 +5517,19 @@ mod render_history_spacing_tests {
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
         HistoryLog, PendingRenderCacheEntry, SandboxDownNotice, SideConversation,
     };
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
@@ -6116,8 +6143,8 @@ mod render_history_spacing_tests {
         app
     }
 
-    #[test]
-    fn banner_row_stable_across_transient_chrome() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn banner_row_stable_across_transient_chrome() {
         const WIDTH: u16 = 100;
         const HEIGHT: u16 = 40;
         let tmp = tempfile::tempdir().unwrap();
@@ -6155,6 +6182,7 @@ mod render_history_spacing_tests {
         let mut at_popup = empty_banner_app(tmp.path());
         at_popup.composer.set("@");
         at_popup.reset_at_window();
+        await_at_suggestions(&mut at_popup).await;
         assert_eq!(
             banner_top_row(
                 &render_app_buffer(&mut at_popup, WIDTH, HEIGHT),

@@ -6311,15 +6311,30 @@ mod shift_enter_keyboard_protocol_tests {
         app
     }
 
-    fn at_popup_app(tmp: &tempfile::TempDir) -> App {
+    async fn at_popup_app(tmp: &tempfile::TempDir) -> App {
         let mut app = app(tmp);
         let cwd = app.launch.cwd.clone();
         fs::create_dir(cwd.join(".git")).unwrap();
         fs::write(cwd.join("kept.rs"), "").unwrap();
         app.composer.insert_str("@kept");
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         assert!(app.at_popup_active());
         assert_eq!(app.at_suggestions().len(), 1);
         app
+    }
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
     }
 
     #[test]
@@ -6346,10 +6361,10 @@ mod shift_enter_keyboard_protocol_tests {
         assert_eq!(app.composer.text(), "");
     }
 
-    #[test]
-    fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = at_popup_app(&tmp);
+        let mut app = at_popup_app(&tmp).await;
 
         let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
 

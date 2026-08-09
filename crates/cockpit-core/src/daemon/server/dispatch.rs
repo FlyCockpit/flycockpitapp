@@ -290,28 +290,30 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     let audit_session_id = request_session_id(&request, state);
     let audit_path = request_audit_path(&request);
     let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
-    if let Err(error) = authorize_request(&request, state, ctx).await {
-        if audit_remote {
-            audit_remote_request(
-                ctx,
-                &state.principal,
-                request_kind,
-                audit_session_id,
-                audit_path.as_deref(),
-                "denied",
-            )
-            .await;
-        }
-        // `SetDefaultModel` is terminal-by-event: a bare authorization error
-        // would leave a remote/shared client waiting for a correlated result
-        // that never arrives. Emit the typed rejection instead — no scope
-        // label, no path, no configuration content, and no mutation.
-        if let Request::SetDefaultModel {
-            default_update_id, ..
-        } = &request
-            && let Some(att) = state.attached.as_ref()
-        {
-            att.handle.broadcast_default_model_update_result(
+    let authorized_request = match authorize_request_context(&request, state, ctx).await {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            if audit_remote {
+                audit_remote_request(
+                    ctx,
+                    &state.principal,
+                    request_kind,
+                    audit_session_id,
+                    audit_path.as_deref(),
+                    "denied",
+                )
+                .await;
+            }
+            // `SetDefaultModel` is terminal-by-event: a bare authorization error
+            // would leave a remote/shared client waiting for a correlated result
+            // that never arrives. Emit the typed rejection instead — no scope
+            // label, no path, no configuration content, and no mutation.
+            if let Request::SetDefaultModel {
+                default_update_id, ..
+            } = &request
+                && let Some(att) = state.attached.as_ref()
+            {
+                att.handle.broadcast_default_model_update_result(
                 *default_update_id,
                 proto::DefaultModelStandaloneOutcome::Rejected {
                     user_message: "Changing the default model for new sessions requires the                                    local owner of this workspace."
@@ -319,8 +321,20 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     diagnostic_code: "effective_default_local_owner_only".to_string(),
                 },
             );
+            }
+            return Err(error);
         }
-        return Err(error);
+    };
+    if remote_operation.is_some() {
+        tracing::debug!(
+            fcor_resource_count = authorized_request.fcor_resources.len(),
+            fcor_resource_bytes = authorized_request
+                .fcor_resources
+                .iter()
+                .map(|resource| resource.value.len())
+                .sum::<usize>(),
+            "consumed post-authorization FCOR resources"
+        );
     }
     if audit_remote {
         audit_remote_request(

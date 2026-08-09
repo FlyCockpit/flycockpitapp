@@ -1715,6 +1715,9 @@ pub struct DaemonContext {
     pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
+    /// Canonical process cwd captured once at daemon construction. Remote
+    /// operation resources never trust a caller-supplied fallback cwd.
+    pub canonical_cwd: PathBuf,
     pub started_at: Instant,
     /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
     /// Holds the OS sleep assertion **in the daemon process** so it
@@ -1798,6 +1801,8 @@ impl DaemonContext {
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
         // authority. Built here and shared into the registry (which installs
@@ -1866,6 +1871,7 @@ impl DaemonContext {
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
+            canonical_cwd,
             started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,

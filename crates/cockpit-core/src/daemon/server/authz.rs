@@ -7,6 +7,11 @@ pub(super) struct AuthorizedFcorResource {
     pub(super) value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AuthorizedRequestContext {
+    pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
+}
+
 fn canonical_project_root_bytes(
     path: &std::path::Path,
 ) -> std::result::Result<Vec<u8>, ErrorPayload> {
@@ -19,7 +24,7 @@ fn canonical_project_root_bytes(
 
 /// Resolve path-bearing FCOR resources only after request authorization.
 /// Raw client path text never leaves this boundary.
-pub(super) fn resolve_authorized_fcor_resources(
+fn resolve_authorized_fcor_resources(
     request: &Request,
     daemon_cwd: &std::path::Path,
 ) -> std::result::Result<Vec<AuthorizedFcorResource>, ErrorPayload> {
@@ -69,6 +74,23 @@ pub(super) fn resolve_authorized_fcor_resources(
     }
     Ok(resources)
 }
+
+pub(super) async fn authorize_request_context(
+    request: &Request,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<AuthorizedRequestContext, ErrorPayload> {
+    authorize_request(request, state, ctx).await?;
+    #[cfg(test)]
+    AUTHORIZED_FCOR_RESOLVER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(AuthorizedRequestContext {
+        fcor_resources: resolve_authorized_fcor_resources(request, &ctx.canonical_cwd)?,
+    })
+}
+
+#[cfg(test)]
+static AUTHORIZED_FCOR_RESOLVER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,

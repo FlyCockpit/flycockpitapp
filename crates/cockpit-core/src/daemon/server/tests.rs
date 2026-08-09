@@ -882,13 +882,15 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
     assert_eq!(reached_dispatch, 3);
 }
 
-#[test]
-fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
+#[tokio::test]
+async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
     use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
     let root = tempfile::tempdir().unwrap();
-    let alias = root.path().join(".").to_string_lossy().into_owned();
-    let attach = |project_root| Request::Attach {
-        session_id: None,
+    let session_id = Uuid::new_v4();
+    let attach = |session_id, project_root| Request::Attach {
+        session_id,
         since_seq: None,
         project_root,
         initial_model: None,
@@ -899,19 +901,40 @@ fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
         env_snapshot: None,
         env_policy: EnvDriftPolicy::Daemon,
     };
-    let explicit = resolve_authorized_fcor_resources(&attach(Some(alias)), root.path()).unwrap();
-    let effective = resolve_authorized_fcor_resources(&attach(None), root.path()).unwrap();
+    let cwd_alias = ctx.canonical_cwd.join(".").to_string_lossy().into_owned();
+    let explicit = authorize_request_context(&attach(None, Some(cwd_alias)), &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    let effective = authorize_request_context(&attach(None, None), &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
     assert_eq!(explicit, effective);
     assert_eq!(explicit[0].kind, Kind::ProjectRoot);
     assert_eq!(
         explicit[0].value,
-        root.path()
-            .canonicalize()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .as_bytes()
+        ctx.canonical_cwd.to_str().unwrap().as_bytes()
     );
+    let with_session = authorize_request_context(
+        &attach(
+            Some(session_id),
+            Some(ctx.canonical_cwd.to_string_lossy().into_owned()),
+        ),
+        &state,
+        &ctx,
+    )
+    .await
+    .unwrap()
+    .fcor_resources;
+    assert_eq!(
+        with_session
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SessionUuid, Kind::ProjectRoot]
+    );
+    assert_eq!(with_session[0].value, session_id.as_bytes());
 
     let scheduled = Request::CreateScheduledJob {
         job: proto::ScheduledJobCreate {
@@ -927,7 +950,10 @@ fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
             missed_run_policy: proto::MissedRunPolicy::Skip,
         },
     };
-    let resources = resolve_authorized_fcor_resources(&scheduled, root.path()).unwrap();
+    let resources = authorize_request_context(&scheduled, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
     assert_eq!(
         resources
             .iter()
@@ -936,7 +962,55 @@ fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
         vec![Kind::SchedulerId, Kind::ProjectRoot]
     );
     assert_eq!(resources[0].value, b"job-1");
-    assert_eq!(resources[1].value, explicit[0].value);
+    assert_eq!(
+        resources[1].value,
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .as_bytes()
+    );
+
+    let callback = Request::CreateScheduledJob {
+        job: proto::ScheduledJobCreate {
+            id: "callback-1".into(),
+            owner: "system:test".into(),
+            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+            payload: proto::ScheduledJobPayload::Callback {
+                subsystem: "test".into(),
+            },
+            enabled: true,
+            missed_run_policy: proto::MissedRunPolicy::Skip,
+        },
+    };
+    let callback_resources = authorize_request_context(&callback, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        callback_resources
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SchedulerId]
+    );
+
+    AUTHORIZED_FCOR_RESOLVER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let denied = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+    );
+    assert!(
+        authorize_request_context(&scheduled, &denied, &ctx)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        AUTHORIZED_FCOR_RESOLVER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 #[tokio::test]

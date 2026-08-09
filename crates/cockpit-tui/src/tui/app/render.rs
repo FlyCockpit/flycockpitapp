@@ -924,17 +924,9 @@ impl App {
         {
             return cached.clone();
         }
-        // The read-allowlist re-includes gitignored-but-allowlisted entries
-        // (implementation note); resolve the persisted
-        // per-layer list for the cwd, then union the daemon-pushed session set
-        // ("Approve for this session" approvals,
-        // implementation note) so session-only
-        // entries render exactly like persisted ones (dimmed, `gitignored`).
-        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
-        allow.extend(self.gitignore_session_allow.clone());
-        let walked = cockpit_core::tags::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
-        *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
-        walked
+        // A cache miss is a deterministic loading state. Composer reduction
+        // schedules the filesystem walk; rendering never performs it.
+        Vec::new()
     }
 
     pub(super) fn suggestion_box_lines(&self) -> u16 {
@@ -942,6 +934,11 @@ impl App {
             let rows = self.at_suggestions().len().min(AUTOCOMPLETE_ROWS as usize);
             if rows > 0 {
                 return rows as u16 + 2;
+            }
+            if self.at_suggestions_loading
+                || self.at_suggestions_loaded_query.as_deref() == self.composer.at_query()
+            {
+                return 3;
             }
         }
         if self.slash_query().is_some() {
@@ -3671,6 +3668,17 @@ impl App {
     ) {
         let suggestions = self.at_suggestions();
         if suggestions.is_empty() {
+            let text = if self.at_suggestions_loading {
+                "loading files…"
+            } else if self.at_suggestions_error.is_some() {
+                "file suggestions unavailable"
+            } else {
+                "no matching files"
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
+                content_area,
+            );
             return;
         }
         let window = content_area.height.min(AUTOCOMPLETE_ROWS) as usize;
@@ -5305,6 +5313,19 @@ mod slash_popup_full_list_tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     #[test]
     fn slash_suggestions_returns_full_match_list() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5387,8 +5408,8 @@ mod slash_popup_full_list_tests {
         );
     }
 
-    #[test]
-    fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
         let tmp = tempfile::tempdir().unwrap();
         for name in [
             "alpha.rs",
@@ -5406,6 +5427,7 @@ mod slash_popup_full_list_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.composer.set("@".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let total = app.at_suggestions().len();
         assert!(total > AUTOCOMPLETE_ROWS as usize);
 
@@ -5441,6 +5463,8 @@ mod slash_popup_full_list_tests {
         );
 
         app.composer.set("@alpha".to_string());
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         terminal
             .draw(|frame| {
                 app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
@@ -5495,6 +5519,19 @@ mod render_history_spacing_tests {
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
         HistoryLog, PendingRenderCacheEntry, SandboxDownNotice, SideConversation,
     };
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
@@ -6108,8 +6145,8 @@ mod render_history_spacing_tests {
         app
     }
 
-    #[test]
-    fn banner_row_stable_across_transient_chrome() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn banner_row_stable_across_transient_chrome() {
         const WIDTH: u16 = 100;
         const HEIGHT: u16 = 40;
         let tmp = tempfile::tempdir().unwrap();
@@ -6147,6 +6184,7 @@ mod render_history_spacing_tests {
         let mut at_popup = empty_banner_app(tmp.path());
         at_popup.composer.set("@");
         at_popup.reset_at_window();
+        await_at_suggestions(&mut at_popup).await;
         assert_eq!(
             banner_top_row(
                 &render_app_buffer(&mut at_popup, WIDTH, HEIGHT),

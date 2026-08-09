@@ -75,7 +75,14 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
-        let results = self.async_actions.drain_completed();
+        // Cancellation is a terminal runner outcome, but ownership ended, so
+        // it is intentionally acknowledged without applying UI mutations.
+        let _cancelled = self.async_actions.drain_cancelled();
+        let mut results = self.async_actions.expire_blocking(
+            self.async_action_clock_origin + self.event_loop_monotonic_now,
+            std::time::Duration::from_secs(30),
+        );
+        results.extend(self.async_actions.drain_completed());
         let changed = !results.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
@@ -739,20 +746,83 @@ impl App {
                     line: format!("/goal: {error}"),
                 }),
             },
-            AsyncActionKind::Internal("curator.command") => match result.payload {
+            AsyncActionKind::Blocking("curator.command") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("/curator: {e}")),
             },
-            AsyncActionKind::Internal("export.transcript") => match result.payload {
+            AsyncActionKind::Blocking("export.transcript") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
             },
-            AsyncActionKind::Internal("export.debug") => match result.payload {
+            AsyncActionKind::Blocking("export.debug") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export debug: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
+            },
+            AsyncActionKind::Blocking("doctor.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::DoctorSnapshot(rendered)) => self.push_plain(rendered),
+                Ok(_) => self.push_plain("/doctor: unexpected async response".to_string()),
+                Err(error) => self.push_plain(error),
+            },
+            AsyncActionKind::Blocking("autocomplete.files") => match result.payload {
+                Ok(AsyncActionPayload::FileSuggestions { query, suggestions })
+                    if self.composer.at_query() == Some(query.as_str()) =>
+                {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = Some(query.clone());
+                    self.at_suggestions_error = None;
+                    *self.at_cache.borrow_mut() = Some((query, suggestions));
+                }
+                Err(error) => {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = self.composer.at_query().map(str::to_string);
+                    self.at_suggestions_error = Some(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::Blocking("queue.edit") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                        self.remove_editable_queued_messages_with(|| Ok(*response))
+                    }
+                    _ => input::QueueEditOutcome::TransportError,
+                };
+                self.apply_queue_edit_outcome(outcome);
+            }
+            AsyncActionKind::Blocking("btw.teardown") => match result.payload {
+                Ok(AsyncActionPayload::BtwTransition {
+                    created,
+                    ended,
+                    question,
+                    error,
+                }) => {
+                    if ended {
+                        self.close_btw_pane();
+                    }
+                    if let Some(info) = created {
+                        self.open_btw_pane_from_info(info, true);
+                    }
+                    if let Some(error) = error {
+                        self.push_plain(format!("/btw: {error}"));
+                    } else if let Some(pane) = self.btw_pane.as_mut() {
+                        pane.focused = true;
+                        if let Some(question) = question
+                            && let Err(error) = pane.send_text(question)
+                        {
+                            pane.history.push(HistoryEntry::InferenceError {
+                                summary: error.clone(),
+                                detail: error,
+                                expanded: false,
+                            });
+                        }
+                    } else if !ended {
+                        self.push_plain("/btw: no live fork".to_string());
+                    }
+                }
+                Ok(_) => self.push_plain("/btw: unexpected async response".to_string()),
+                Err(error) => self.push_plain(format!("/btw: {error}")),
             },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {

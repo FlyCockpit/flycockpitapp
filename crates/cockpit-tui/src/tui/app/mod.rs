@@ -14,6 +14,7 @@ mod agent_inventory;
 mod async_actions;
 mod attach_lifecycle;
 mod attention;
+mod blocking_operations;
 mod btw_pane;
 mod config_reload;
 mod copy_actions;
@@ -103,8 +104,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
-    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
-    AsyncActionRunner, AsyncActionStart,
+    AsyncActionCancellation, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
+    AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
@@ -1883,6 +1884,9 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    // Declared after `async_actions`: Rust drops fields in declaration order,
+    // so every export owner is released before the process reaper drains.
+    pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
@@ -1992,6 +1996,11 @@ pub struct App {
     /// `@`-query string; recomputed when the query changes. `RefCell`
     /// because `at_suggestions` is called from `&self` render paths.
     pub(super) at_cache: std::cell::RefCell<Option<(String, Vec<cockpit_core::tags::Suggestion>)>>,
+    /// Distinguishes an in-flight filesystem query from a completed query
+    /// with zero matches; rendering must never infer loading from emptiness.
+    pub(super) at_suggestions_loading: bool,
+    pub(super) at_suggestions_loaded_query: Option<String>,
+    pub(super) at_suggestions_error: Option<String>,
     /// Accepted `@`-tag paths that contain a space / shell-special char.
     /// Tracked so the submit-time pass can wrap them in quotes (the
     /// composer shows them unquoted; the wire payload needs the quotes
@@ -2022,6 +2031,7 @@ pub struct App {
     /// Latest injected TerminalInput clock sample used by App-owned deadline
     /// reducers. Tests advance this without sleeping.
     pub(super) event_loop_monotonic_now: std::time::Duration,
+    pub(super) async_action_clock_origin: std::time::Instant,
     pub(super) delivery_unconfirmed_records:
         std::collections::HashMap<uuid::Uuid, DeliveryUnconfirmedRecord>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
@@ -3261,6 +3271,7 @@ impl App {
             agent_runner: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             startup_background: StartupBackground {
@@ -3299,6 +3310,9 @@ impl App {
             at_selected: 0,
             at_scroll: 0,
             at_cache: std::cell::RefCell::new(None),
+            at_suggestions_loading: false,
+            at_suggestions_loaded_query: None,
+            at_suggestions_error: None,
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
             terminal_paste_classifier:
@@ -3313,6 +3327,7 @@ impl App {
             pending_session_switch_order: None,
             pending_session_switch_reconcile_started_at: None,
             event_loop_monotonic_now: std::time::Duration::ZERO,
+            async_action_clock_origin: std::time::Instant::now(),
             delivery_unconfirmed_records: Default::default(),
             pending_text_object: None,
             at_dismissed: false,
@@ -3475,6 +3490,10 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        export_actions::recover_deferred_export_cleanup(
+            &self.launch.cwd.join(".cockpit").join("exports"),
+        )
+        .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
             let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
             let state = crate::tui::agent_runner::daemon_request_blocking(
@@ -3569,7 +3588,7 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
-        if self.btw_pane.is_some() {
+        if run_post_loop_btw_teardown(self.btw_pane.is_some(), || {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let _ = agent_runner::attached_request_tx_blocking(
                     runner.attached_request_binding(),
@@ -3578,9 +3597,18 @@ impl App {
                     },
                 );
             }
+        }) {
             self.close_btw_pane();
         }
-
+        let async_shutdown = self.async_actions.shutdown_and_reap().await;
+        if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
+            eprintln!(
+                "cockpit: export cleanup needed recovery (failed={}, timed_out={}, retry_scheduled={})",
+                async_shutdown.export_cleanup_failed,
+                async_shutdown.export_cleanup_timed_out,
+                async_shutdown.export_cleanup_retry_scheduled,
+            );
+        }
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous
         // `StopDaemon` through the daemon's single graceful drain path, so
@@ -4056,6 +4084,13 @@ impl App {
     }
 }
 
+fn run_post_loop_btw_teardown(open: bool, teardown: impl FnOnce()) -> bool {
+    if open {
+        teardown();
+    }
+    open
+}
+
 fn editor_argv_for_cwd(editor: &std::ffi::OsStr, cwd: &std::path::Path) -> Vec<String> {
     let mut argv = crate::tui::pty::shell_split(&editor.to_string_lossy());
     if !argv.is_empty() {
@@ -4104,6 +4139,8 @@ fn spawn_git_refresh(
 mod async_action_app_tests;
 #[cfg(test)]
 mod attention_interrupt_surface_tests;
+#[cfg(test)]
+mod blocking_operation_tests;
 #[cfg(test)]
 mod caffeinate_toast_tests;
 #[cfg(test)]

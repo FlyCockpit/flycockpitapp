@@ -16,6 +16,7 @@ use super::{
     TranscriptFind,
 };
 use crate::tui::agent_runner;
+use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
@@ -1633,6 +1634,37 @@ impl App {
     pub(super) fn reset_at_window(&mut self) {
         self.at_selected = 0;
         self.at_scroll = 0;
+        let Some(query) = self.composer.at_query().map(str::to_string) else {
+            self.at_cache.borrow_mut().take();
+            self.at_suggestions_loading = false;
+            self.at_suggestions_loaded_query = None;
+            self.at_suggestions_error = None;
+            self.async_actions
+                .abort_key(&AsyncActionKey::new("autocomplete.files"));
+            return;
+        };
+        let cwd = self.launch.cwd.clone();
+        let usage_tags = self.usage_tags.clone();
+        let session_allow = self.gitignore_session_allow.clone();
+        let result_query = query.clone();
+        self.at_suggestions_loading = true;
+        self.at_suggestions_loaded_query = None;
+        self.at_suggestions_error = None;
+        let operation = self.autocomplete_blocking_operation();
+        self.start_owned_blocking_action(
+            operation,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),
+            move || {
+                let mut allow = cockpit_config::extended::resolve_gitignore_allow(&cwd);
+                allow.extend(session_allow);
+                let suggestions =
+                    cockpit_core::tags::suggestions(&cwd, &query, &usage_tags, &allow);
+                Ok(AsyncActionPayload::FileSuggestions {
+                    query: result_query,
+                    suggestions,
+                })
+            },
+        );
     }
 
     /// Reset the slash-popup highlight + scroll window to the top (the
@@ -3029,27 +3061,74 @@ impl App {
     }
 }
 
-enum QueueEditOutcome {
+pub(super) enum QueueEditOutcome {
     Edited { text: String, partial: bool },
     AlreadyStarted,
     Fallthrough,
-    NotConnected,
     TransportError,
 }
 
+const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
+
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
-        let outcome = self.remove_editable_queued_messages();
-        self.apply_queue_edit_outcome(outcome)
+        let operation = self.queue_blocking_operation();
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
+        let attached_request = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.attached_request_binding());
+        if attached_request.is_none() {
+            #[cfg(test)]
+            if barrier.is_some() {
+                // The injected callable is the external-work boundary.
+            } else {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+            #[cfg(not(test))]
+            {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+        }
+        self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+        let action_kind = operation.action_kind();
+        let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
+        self.async_actions.start_serialized(
+            action_kind,
+            AsyncActionKey::new("queue.edit"),
+            async move {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
+                attached_request
+                    .expect("queue dispatch checked attached request")
+                    .request(request)
+                    .await
+                    .map(|response| AsyncActionPayload::DaemonResponse(Box::new(response)))
+            },
+        );
+        true
     }
 
-    fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+    pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
                 self.paste_registry.clear();
                 if partial {
-                    self.push_queue_edit_notice("some queued messages already started");
+                    if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
+                        self.push_queue_edit_notice("some queued messages already started");
+                    }
+                } else if self.has_owned_queue_edit_pending_notice() {
+                    self.toast = None;
                 }
                 true
             }
@@ -3058,10 +3137,6 @@ impl App {
                 true
             }
             QueueEditOutcome::Fallthrough => false,
-            QueueEditOutcome::NotConnected => {
-                self.push_queue_edit_notice("not connected to the session");
-                true
-            }
             QueueEditOutcome::TransportError => {
                 self.push_queue_edit_notice("could not reach the session");
                 true
@@ -3073,20 +3148,15 @@ impl App {
         self.show_toast(text, super::ToastKind::Info);
     }
 
-    fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => return QueueEditOutcome::NotConnected,
-        };
-        self.remove_editable_queued_messages_with(|| {
-            crate::tui::agent_runner::attached_request_tx_blocking(
-                attached_request,
-                Request::RemoveEditableQueuedUserMessages { target_id: None },
-            )
+    fn has_owned_queue_edit_pending_notice(&self) -> bool {
+        self.toast.as_ref().is_some_and(|toast| {
+            toast.kind == super::ToastKind::Info
+                && !toast.persistent
+                && toast.text == QUEUE_EDIT_PENDING_NOTICE
         })
     }
 
-    fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
+    pub(super) fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
     where
         F: FnOnce() -> Result<Response, String>,
     {
@@ -4591,7 +4661,9 @@ mod tag_delete_tests {
 
 #[cfg(test)]
 mod queued_message_edit_tests {
-    use super::{optimistic_queue_item, queue_item_from_proto};
+    use super::{
+        QUEUE_EDIT_PENDING_NOTICE, QueueEditOutcome, optimistic_queue_item, queue_item_from_proto,
+    };
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
     use cockpit_core::daemon::proto::{
@@ -4903,11 +4975,43 @@ mod queued_message_edit_tests {
 
         app.history_up();
         responder.await.unwrap();
+        let kind = app.queue_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
 
         assert_eq!(app.composer.text(), "queued");
         assert_eq!(app.prompt_history_cursor, 0);
         assert!(app.queue.is_empty());
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn queue_edit_success_does_not_clear_or_replace_a_newer_toast() {
+        for partial in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new(Some(tmp.path()), false);
+            app.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+            app.show_toast("newer notice", crate::tui::app::ToastKind::Warning);
+
+            app.apply_queue_edit_outcome(QueueEditOutcome::Edited {
+                text: "queued".to_string(),
+                partial,
+            });
+
+            assert!(matches!(
+                &app.toast,
+                Some(toast)
+                    if toast.text == "newer notice"
+                        && toast.kind == crate::tui::app::ToastKind::Warning
+            ));
+        }
     }
 
     #[test]
@@ -6208,15 +6312,30 @@ mod shift_enter_keyboard_protocol_tests {
         app
     }
 
-    fn at_popup_app(tmp: &tempfile::TempDir) -> App {
+    async fn at_popup_app(tmp: &tempfile::TempDir) -> App {
         let mut app = app(tmp);
         let cwd = app.launch.cwd.clone();
         fs::create_dir(cwd.join(".git")).unwrap();
         fs::write(cwd.join("kept.rs"), "").unwrap();
         app.composer.insert_str("@kept");
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         assert!(app.at_popup_active());
         assert_eq!(app.at_suggestions().len(), 1);
         app
+    }
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
     }
 
     #[test]
@@ -6243,10 +6362,10 @@ mod shift_enter_keyboard_protocol_tests {
         assert_eq!(app.composer.text(), "");
     }
 
-    #[test]
-    fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = at_popup_app(&tmp);
+        let mut app = at_popup_app(&tmp).await;
 
         let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
 

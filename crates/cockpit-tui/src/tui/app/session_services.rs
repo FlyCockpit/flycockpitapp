@@ -568,6 +568,12 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         resume_chrome: bool,
     ) {
+        // Session navigation changes the owner view before any authoritative
+        // replacement state is installed. Blocking results from the previous
+        // view are cancelled and cannot mutate the new transcript or chrome.
+        self.async_actions.advance_view_generation();
+        self.at_suggestions_loading = false;
+        self.at_suggestions_error = None;
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })

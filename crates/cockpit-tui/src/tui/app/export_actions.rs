@@ -1,4 +1,21 @@
 use super::*;
+
+#[cfg(test)]
+static EXPORT_WRITE_THREAD_OBSERVER: std::sync::Mutex<
+    Option<(
+        std::path::PathBuf,
+        tokio::sync::oneshot::Sender<std::thread::ThreadId>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn observe_export_write_thread(
+    target: std::path::PathBuf,
+) -> tokio::sync::oneshot::Receiver<std::thread::ThreadId> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    *EXPORT_WRITE_THREAD_OBSERVER.lock().unwrap() = Some((target, sender));
+    receiver
+}
 #[cfg(test)]
 use crate::tui::agent_runner::AttachedRequest;
 use crate::tui::agent_runner::AttachedRequestBinding;
@@ -8,9 +25,6 @@ use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response};
 use tokio::sync::mpsc;
 
 const EXPORT_ACTION_KEY: &str = "export";
-const EXPORT_TRANSCRIPT_ACTION: &str = "export.transcript";
-const EXPORT_DEBUG_ACTION: &str = "export.debug";
-
 impl App {
     /// `/export` (default) — ask the attached daemon for a redacted
     /// transcript and write it asynchronously, overwriting any prior file.
@@ -19,8 +33,9 @@ impl App {
             self.push_plain("/export: no active session to export".to_string());
             return;
         };
+        let action = self.export_transcript_action_name();
         self.start_export_action(
-            EXPORT_TRANSCRIPT_ACTION,
+            action,
             "/export",
             session_id,
             file_stem,
@@ -37,8 +52,9 @@ impl App {
         file_stem: &str,
         exports_dir: &Path,
     ) {
+        let action = self.export_debug_action_name();
         self.start_export_action(
-            EXPORT_DEBUG_ACTION,
+            action,
             "/export debug",
             session_id,
             file_stem,
@@ -56,35 +72,58 @@ impl App {
         exports_dir: &Path,
         kind: ExportSessionKind,
     ) {
-        let Some(attached_request) = self
+        let operation = self.export_blocking_operation();
+        debug_assert!(operation.registration().actions.contains(&action));
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
+        #[cfg(test)]
+        let has_test_gate = barrier.is_some();
+        #[cfg(not(test))]
+        let has_test_gate = false;
+        let attached_request = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
-            .map(|runner| runner.attached_request_binding())
-        else {
+            .map(|runner| runner.attached_request_binding());
+        if attached_request.is_none() && !has_test_gate {
             self.push_plain(format!(
                 "{command}: an attached daemon is required for export"
             ));
             return;
-        };
+        }
 
+        let export_key = AsyncActionKey::new(EXPORT_ACTION_KEY);
         self.push_plain(match kind {
             ExportSessionKind::TranscriptJson => "/export: writing transcript…".to_string(),
             ExportSessionKind::DebugBundle => "/export debug: writing bundle…".to_string(),
         });
         let file_stem = file_stem.to_string();
         let exports_dir = exports_dir.to_path_buf();
-        self.async_actions.start(
-            AsyncActionKind::Internal(action),
-            AsyncActionPolicy::Replace(AsyncActionKey::new(EXPORT_ACTION_KEY)),
-            async move {
+        let request = Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        };
+        self.async_actions.start_export(
+            AsyncActionKind::Blocking(action),
+            AsyncActionPolicy::Replace(export_key),
+            move |shutdown| async move {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
                 export_via_attached_daemon(
-                    attached_request,
-                    session_id,
+                    attached_request.expect("export dispatch checked attached request"),
+                    request,
                     kind,
                     file_stem,
                     exports_dir,
                     command,
+                    shutdown,
                 )
                 .await
                 .map(AsyncActionPayload::Text)
@@ -95,21 +134,19 @@ impl App {
 
 async fn export_via_attached_daemon(
     attached_request: AttachedRequestBinding,
-    session_id: uuid::Uuid,
+    request: Request,
     kind: ExportSessionKind,
     file_stem: String,
     exports_dir: std::path::PathBuf,
     command: &'static str,
+    shutdown: std::sync::Arc<crate::tui::async_action::AsyncActionCancellation>,
 ) -> Result<String, String> {
-    let response = attached_request
-        .request(Request::ExportSessionData {
-            session_id,
-            kind,
-            include_generated_artifacts: false,
-            include_sensitive: false,
-        })
-        .await
-        .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
+    let response = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
+        response = attached_request.request(request) => response,
+    }
+    .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
         return Err(format!(
             "{command}: daemon request failed: unexpected daemon response"
@@ -117,14 +154,11 @@ async fn export_via_attached_daemon(
     };
     // The export bytes never rode the response frame: pull them as bounded
     // bulk chunks, then verify the transfer's length and digest before writing.
-    let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command).await?;
+    let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command, &shutdown).await?;
     let out_path = exports_dir.join(format!("{file_stem}.{}", data.filename_extension));
-    tokio::fs::create_dir_all(&exports_dir)
-        .await
-        .map_err(|error| format!("{command}: creating export directory failed: {error}"))?;
-    tokio::fs::write(&out_path, bytes)
-        .await
-        .map_err(|error| format!("{command}: writing export failed: {error}"))?;
+    recover_deferred_export_cleanup(&exports_dir).await;
+    prepare_export_directory(&exports_dir, command).await?;
+    write_export_no_clobber(&out_path, &bytes, command, &shutdown).await?;
     let sessions = data.session_count.unwrap_or(1);
     Ok(match kind {
         ExportSessionKind::TranscriptJson => format!(
@@ -142,6 +176,146 @@ async fn export_via_attached_daemon(
     })
 }
 
+async fn prepare_export_directory(
+    exports_dir: &std::path::Path,
+    command: &'static str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exports_dir = exports_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::clipboard::recovery::windows::DirHandle::open_or_create(&exports_dir)
+        })
+        .await
+        .map_err(|error| format!("{command}: export directory worker failed: {error}"))?
+        .map(|_| ())
+        .map_err(|error| format!("{command}: securing export directory failed: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::fs::create_dir_all(exports_dir)
+            .await
+            .map_err(|error| format!("{command}: creating export directory failed: {error}"))
+    }
+}
+
+pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Path) {
+    let records = exports_dir.join(".cockpit-export-recovery");
+    let records_secure = std::fs::symlink_metadata(&records).is_ok_and(|metadata| {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0
+        }
+        #[cfg(windows)]
+        {
+            crate::clipboard::recovery::windows::DirHandle::open_or_create(&records).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    });
+    if !records_secure {
+        return;
+    }
+    if let Ok(mut entries) = tokio::fs::read_dir(&records).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let record_name = entry.file_name();
+            let Some(record_text) = record_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".record"))
+            else {
+                continue;
+            };
+            let Ok(record_id) = uuid::Uuid::parse_str(record_text) else {
+                continue;
+            };
+            if record_id.get_version_num() != 7 || record_id.to_string() != record_text {
+                continue;
+            }
+            let Ok(record) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            let mut lines = record.lines();
+            let (Some("v1"), Some(name), None) = (lines.next(), lines.next(), lines.next()) else {
+                continue;
+            };
+            let owned = name
+                .strip_suffix(".partial")
+                .and_then(|stem| stem.rsplit_once('.'))
+                .is_some_and(|(target, id_text)| {
+                    uuid::Uuid::parse_str(id_text).is_ok_and(|id| {
+                        target.starts_with('.')
+                            && target.len() > 1
+                            && id.get_version_num() == 7
+                            && id.to_string() == id_text
+                    })
+                });
+            let candidate = exports_dir.join(name);
+            if !owned {
+                continue;
+            }
+            let cleanup = tokio::task::spawn_blocking(move || {
+                crate::tui::async_action::secure_unlink_owned_temp(&candidate)
+            })
+            .await;
+            let cleaned = match cleanup {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+                Err(_) => false,
+            };
+            if cleaned {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+        let records = records.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::File::open(records)?.sync_all()).await;
+    }
+}
+
+/// Publish through the shared platform-held atomic no-clobber implementation.
+/// Its blocking callable owns its relative temporary handle through cleanup.
+pub(super) async fn write_export_no_clobber(
+    out_path: &std::path::Path,
+    bytes: &[u8],
+    command: &'static str,
+    shutdown: &std::sync::Arc<AsyncActionCancellation>,
+) -> Result<(), String> {
+    if !crate::tui::async_action::secure_export_cleanup_supported() {
+        return Err(format!("{command}: secure export cleanup is unavailable"));
+    }
+    let worker_out = out_path.to_path_buf();
+    let worker_bytes = bytes.to_vec();
+    let worker_shutdown = std::sync::Arc::clone(shutdown);
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            let mut observer = EXPORT_WRITE_THREAD_OBSERVER.lock().unwrap();
+            if observer
+                .as_ref()
+                .is_some_and(|(target, _)| target == &worker_out)
+                && let Some((_, sender)) = observer.take()
+            {
+                let _ = sender.send(std::thread::current().id());
+            }
+        }
+        crate::clipboard::file_publish::publish_no_clobber_bounded_elsewhere(
+            &worker_out,
+            &worker_bytes,
+            &|| worker_shutdown.is_cancelled(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{command}: publishing export failed: {error}"))
+    })
+    .await
+    .map_err(|error| format!("{command}: export worker failed: {error}"))?
+}
+
 /// Pull a staged bulk transfer chunk by chunk and verify it end to end.
 ///
 /// The reference carries the authoritative length and SHA-256; a transfer that
@@ -150,6 +324,7 @@ async fn pull_bulk_transfer(
     attached_request: &AttachedRequestBinding,
     transfer: &cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef,
     command: &'static str,
+    shutdown: &AsyncActionCancellation,
 ) -> Result<Vec<u8>, String> {
     use sha2::{Digest as _, Sha256};
 
@@ -163,12 +338,14 @@ async fn pull_bulk_transfer(
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk_index: u32 = 0;
     loop {
-        let response = attached_request
-            .request(Request::ReadBulkTransferChunk {
+        let response = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
+            response = attached_request.request(Request::ReadBulkTransferChunk {
                 transfer_id: transfer.transfer_id,
                 chunk_index,
-            })
-            .await
+            }) => response,
+        }
             .map_err(|error| format!("{command}: reading export data failed: {error}"))?;
         let Response::BulkTransferChunk {
             chunk_index: got,
@@ -327,15 +504,16 @@ mod tests {
     }
 
     async fn drain_until_idle(app: &mut App) {
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
+        while app.async_actions.pending_count() != 0 {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            notified.await;
         }
-        panic!("export action did not finish");
+        app.drain_async_actions();
     }
 
     #[test]
@@ -424,6 +602,53 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_writes_off_the_loop_thread() {
+        let event_loop_thread = std::thread::current().id();
+        let tmp = tempfile::tempdir().unwrap();
+        let exports = tmp.path().join("exports");
+        let target = exports.join("threaded.json");
+        let write_thread = observe_export_write_thread(target.clone());
+        let session_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut app = App::new(Some(tmp.path()), false);
+        app.agent_runner = Some(Ok(runner(session_id, tx)));
+
+        app.export_transcript_json("threaded", &exports);
+        let request = rx.recv().await.unwrap();
+        assert!(matches!(
+            request.request,
+            Request::ExportSessionData {
+                session_id: requested,
+                kind: ExportSessionKind::TranscriptJson,
+                include_sensitive: false,
+                ..
+            } if requested == session_id
+        ));
+        request
+            .response_tx
+            .send(Ok(response(
+                session_id,
+                ExportSessionKind::TranscriptJson,
+                "json",
+                b"complete",
+            )))
+            .unwrap();
+        serve_bulk_chunk(&mut rx, b"complete").await;
+
+        assert_ne!(write_thread.await.unwrap(), event_loop_thread);
+        drain_until_idle(&mut app).await;
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"complete");
+        assert_eq!(
+            std::fs::read_dir(&exports)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
+                .count(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn malformed_export_data_is_a_decode_failure_without_a_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -431,11 +656,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let task = tokio::spawn(export_via_attached_daemon(
             AttachedRequestBinding::new(tx, session_id, 0),
-            session_id,
+            Request::ExportSessionData {
+                session_id,
+                kind: ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
             ExportSessionKind::TranscriptJson,
             "x".to_string(),
             tmp.path().join("exports"),
             "/export",
+            std::sync::Arc::new(AsyncActionCancellation::default()),
         ));
         let request = rx.recv().await.unwrap();
         request
@@ -456,6 +687,74 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(!tmp.path().join("exports/x.json").exists());
+    }
+
+    #[tokio::test]
+    async fn export_publish_is_no_clobber_and_cleans_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing.json");
+        tokio::fs::write(&target, b"original").await.unwrap();
+
+        let cancellation = std::sync::Arc::new(AsyncActionCancellation::default());
+        let error = write_export_no_clobber(&target, b"replacement", "/export", &cancellation)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn next_export_start_clears_deferred_cleanup_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let name = format!(".old.json.{}.partial", uuid::Uuid::now_v7());
+        let deferred = tmp.path().join(&name);
+        tokio::fs::write(&deferred, b"partial").await.unwrap();
+        let records = tmp.path().join(".cockpit-export-recovery");
+        tokio::fs::create_dir(&records).await.unwrap();
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = records.join(format!("{}.record", uuid::Uuid::now_v7()));
+        tokio::fs::write(&record, format!("v1\n{name}\n"))
+            .await
+            .unwrap();
+        recover_deferred_export_cleanup(tmp.path()).await;
+        assert!(!deferred.exists());
+        assert!(!record.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_planted_partial_names_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notes = tmp.path().join("notes.partial");
+        tokio::fs::write(&notes, b"keep").await.unwrap();
+        let planted = tmp.path().join(".notes.not-a-uuid.partial");
+        tokio::fs::write(&planted, b"keep").await.unwrap();
+        #[cfg(unix)]
+        let symlink = {
+            let target = tmp.path().join("valuable");
+            tokio::fs::write(&target, b"keep").await.unwrap();
+            let link = tmp
+                .path()
+                .join(format!(".x.{}.partial", uuid::Uuid::new_v4()));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            Some((link, target))
+        };
+        recover_deferred_export_cleanup(tmp.path()).await;
+        assert!(notes.exists());
+        assert!(planted.exists());
+        #[cfg(unix)]
+        if let Some((link, target)) = symlink {
+            assert!(link.exists());
+            assert_eq!(tokio::fs::read(target).await.unwrap(), b"keep");
+        }
     }
 
     #[tokio::test]
@@ -514,27 +813,23 @@ mod tests {
     async fn export_handlers_report_unexpected_payloads() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
+        let transcript_action = app.export_transcript_action_name();
+        let debug_action = app.export_debug_action_name();
         for (action, expected) in [
-            (
-                EXPORT_TRANSCRIPT_ACTION,
-                "/export: unexpected async response",
-            ),
-            (
-                EXPORT_DEBUG_ACTION,
-                "/export debug: unexpected async response",
-            ),
+            (transcript_action, "/export: unexpected async response"),
+            (debug_action, "/export debug: unexpected async response"),
         ] {
             let id = app
                 .async_actions
                 .start(
-                    AsyncActionKind::Internal(action),
+                    AsyncActionKind::Blocking(action),
                     AsyncActionPolicy::AllowConcurrent,
                     std::future::pending::<Result<AsyncActionPayload, String>>(),
                 )
                 .id();
             app.apply_async_action_result(AsyncActionResult {
                 id,
-                kind: AsyncActionKind::Internal(action),
+                kind: AsyncActionKind::Blocking(action),
                 payload: Ok(AsyncActionPayload::Unit),
             });
             assert_eq!(last_plain(&app), expected);

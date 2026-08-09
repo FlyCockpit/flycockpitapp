@@ -1181,6 +1181,19 @@ mod affordance_hover_tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     fn meta(
         chip_target: Option<usize>,
         tool_box_target: Option<usize>,
@@ -1419,8 +1432,8 @@ mod affordance_hover_tests {
         assert_eq!(app.slash_scroll, 1);
     }
 
-    #[test]
-    fn wheel_over_at_suggestions_scrolls_window_not_selection() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn wheel_over_at_suggestions_scrolls_window_not_selection() {
         let tmp = tempfile::tempdir().unwrap();
         for name in [
             "alpha.rs",
@@ -1439,6 +1452,7 @@ mod affordance_hover_tests {
         app.mouse_capture = true;
         app.composer.set("@".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         assert!(app.at_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
         app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
 
@@ -1473,8 +1487,8 @@ mod affordance_hover_tests {
         assert!(app.history.is_empty());
     }
 
-    #[test]
-    fn click_at_file_finalizes_and_click_at_dir_descends() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_at_file_finalizes_and_click_at_dir_descends() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         std::fs::create_dir(tmp.path().join("beta")).unwrap();
@@ -1482,6 +1496,7 @@ mod affordance_hover_tests {
         app.mouse_capture = true;
         app.composer.set("@alpha".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let file_index = app
             .at_suggestions()
             .iter()
@@ -1500,6 +1515,7 @@ mod affordance_hover_tests {
         app.composer.set("@beta".to_string());
         app.at_dismissed = false;
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let dir_index = app
             .at_suggestions()
             .iter()

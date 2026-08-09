@@ -491,6 +491,46 @@ pub(super) enum ProvidersPage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvidersPointerSurface {
+    List,
+    Add,
+    Edit,
+    Headers,
+    Models,
+    ModelSettings,
+    ProviderSettings,
+    FetchAll,
+    FetchOnePrompt,
+    FetchFallbackPrompt,
+    DeepFetch,
+    CopilotSetup,
+    OAuthSetup,
+}
+
+impl ProvidersPage {
+    /// Sealed compile-time inventory for provider pointer fixtures. There is
+    /// intentionally no wildcard: a new provider state cannot compile until
+    /// it declares which semantic pointer surface it renders.
+    fn pointer_surface_kind(&self) -> ProvidersPointerSurface {
+        match self {
+            Self::List { .. } => ProvidersPointerSurface::List,
+            Self::Add(_) => ProvidersPointerSurface::Add,
+            Self::Edit(_) => ProvidersPointerSurface::Edit,
+            Self::Headers { .. } => ProvidersPointerSurface::Headers,
+            Self::Models { .. } => ProvidersPointerSurface::Models,
+            Self::ModelSettings { .. } => ProvidersPointerSurface::ModelSettings,
+            Self::ProviderSettings { .. } => ProvidersPointerSurface::ProviderSettings,
+            Self::FetchAll(_) => ProvidersPointerSurface::FetchAll,
+            Self::FetchOnePrompt(_) => ProvidersPointerSurface::FetchOnePrompt,
+            Self::FetchFallbackPrompt(_) => ProvidersPointerSurface::FetchFallbackPrompt,
+            Self::DeepFetch { .. } => ProvidersPointerSurface::DeepFetch,
+            Self::CopilotSetup { .. } => ProvidersPointerSurface::CopilotSetup,
+            Self::OAuthSetup { .. } => ProvidersPointerSurface::OAuthSetup,
+        }
+    }
+}
+
 impl ProvidersPage {
     pub(super) fn paste_oauth(&mut self, text: &str) -> bool {
         let state = match self {
@@ -4117,6 +4157,7 @@ impl SettingsPage for ProvidersPage {
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        let _surface = self.pointer_surface_kind();
         cx.render_providers_page(frame, area, self, None);
     }
 
@@ -4127,6 +4168,7 @@ impl SettingsPage for ProvidersPage {
         area: Rect,
         links: &mut crate::tui::links::LinkRegistry,
     ) {
+        let _surface = self.pointer_surface_kind();
         cx.render_providers_page(frame, area, self, Some(links));
     }
 

@@ -57,6 +57,20 @@
     "goal_disposition.budget_limited": 6,
     "goal_disposition.complete": 7,
     "goal_disposition.cleared": 8,
-    "attachment_purpose.user_message_image": 1
+    "attachment_purpose.user_message_image": 1,
+    "missed_run_policy.skip": 1,
+    "missed_run_policy.run_once_on_start": 2,
+    "scheduled_job_schedule.cron": 1,
+    "scheduled_job_schedule.every": 2,
+    "scheduled_job_schedule.once": 3,
+    "scheduled_job_schedule.idle": 4,
+    "scheduled_job_payload.run_prompt": 1,
+    "scheduled_job_payload.callback": 2,
+    "curator_action.status": 1,
+    "curator_action.run": 2,
+    "curator_action.pin": 3,
+    "curator_action.unpin": 4,
+    "curator_action.restore": 5,
+    "curator_action.rollback": 6
   }
 }

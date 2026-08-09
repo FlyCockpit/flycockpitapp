@@ -892,6 +892,39 @@ mod tests {
             "active reasoning effort must not be empty"
         );
         assert_eq!(out.into_bytes(), vec![5]);
+
+        let invalid_account = crate::AccountInfo {
+            user_id: String::new(),
+            email: "e".into(),
+        };
+        let invalid_relay = crate::RelayChoice {
+            relay_id: String::new(),
+            region: None,
+            ws_url: "w".into(),
+            rtt_ms: None,
+            chosen_at: 0,
+        };
+        let invalid_credential = crate::StoredFlycockpitCredential {
+            server_url: "http://example.test".into(),
+            instance_id: "i".into(),
+            instance_token: "secret".into(),
+            account: crate::AccountInfo {
+                user_id: "u".into(),
+                email: "e".into(),
+            },
+            display_name: None,
+            relay_choice: None,
+        };
+        for invalid in [
+            (&invalid_account as &dyn CanonicalFcorValueV1),
+            (&invalid_relay as &dyn CanonicalFcorValueV1),
+            (&invalid_credential as &dyn CanonicalFcorValueV1),
+        ] {
+            let mut out = CanonicalParamsV1::new();
+            out.push_u8(4);
+            assert!(invalid.encode_fcor_value_v1(&mut out).is_err());
+            assert_eq!(out.into_bytes(), vec![4]);
+        }
     }
 
     #[test]
@@ -968,6 +1001,98 @@ mod tests {
             "0004000000010005",
         );
         exact(&cockpit_db::wire::ResolveResponse::Cancel, "0005");
+
+        exact(
+            &crate::ScheduledJobSchedule::Cron { expr: "x".into() },
+            "00010000000178",
+        );
+        exact(
+            &crate::ScheduledJobSchedule::Every { seconds: 1 },
+            "00020000000000000001",
+        );
+        exact(
+            &crate::ScheduledJobSchedule::Once { at: -1 },
+            "0003ffffffffffffffff",
+        );
+        exact(
+            &crate::ScheduledJobSchedule::Idle {
+                min_idle_seconds: 1,
+                max_age_seconds: 2,
+            },
+            "000400000000000000010000000000000002",
+        );
+        exact(
+            &crate::ScheduledJobPayload::RunPrompt {
+                assistant: "a".into(),
+                prompt: "p".into(),
+                project_root: "/not-in-params".into(),
+            },
+            "000100000001610000000170",
+        );
+        exact(
+            &crate::ScheduledJobPayload::Callback {
+                subsystem: "s".into(),
+            },
+            "00020000000173",
+        );
+        exact(&crate::CuratorAction::Status, "0001");
+        exact(
+            &crate::CuratorAction::Run {
+                dry_run: false,
+                consolidate: true,
+            },
+            "00020001",
+        );
+        exact(
+            &crate::CuratorAction::Pin { name: "n".into() },
+            "0003000000016e",
+        );
+        exact(
+            &crate::CuratorAction::Unpin { name: "n".into() },
+            "0004000000016e",
+        );
+        exact(
+            &crate::CuratorAction::Restore { name: "n".into() },
+            "0005000000016e",
+        );
+        exact(
+            &crate::CuratorAction::Rollback {
+                list: true,
+                id: None,
+            },
+            "00060100",
+        );
+        exact(
+            &crate::AccountInfo {
+                user_id: "u".into(),
+                email: "e".into(),
+            },
+            "00000001750000000165",
+        );
+        exact(
+            &crate::RelayChoice {
+                relay_id: "r".into(),
+                region: None,
+                ws_url: "w".into(),
+                rtt_ms: None,
+                chosen_at: 1,
+            },
+            "0000000172000000000177000000000000000001",
+        );
+        exact(
+            &crate::StoredFlycockpitCredential {
+                server_url: "https://x.test".into(),
+                instance_id: "i".into(),
+                instance_token: "t".into(),
+                account: crate::AccountInfo {
+                    user_id: "u".into(),
+                    email: "e".into(),
+                },
+                display_name: None,
+                relay_choice: None,
+            },
+            "0000000e68747470733a2f2f782e7465737400000001690000000174000000017500000001650000",
+        );
     }
 
     #[test]
@@ -1019,6 +1144,16 @@ mod tests {
             ($key:literal, $value:expr) => {
                 assert_eq!(ordinal(&$value), expected[$key].as_u64().unwrap() as u16)
             };
+        }
+        macro_rules! check_prefix {
+            ($key:literal, $value:expr) => {{
+                let mut bytes = CanonicalParamsV1::new();
+                $value.encode_fcor_value_v1(&mut bytes).unwrap();
+                assert_eq!(
+                    u16::from_be_bytes(bytes.into_bytes()[..2].try_into().unwrap()),
+                    expected[$key].as_u64().unwrap() as u16
+                );
+            }};
         }
         check!("env_drift_policy.daemon", crate::EnvDriftPolicy::Daemon);
         check!("env_drift_policy.client", crate::EnvDriftPolicy::Client);
@@ -1214,6 +1349,71 @@ mod tests {
         check!(
             "attachment_purpose.user_message_image",
             crate::AttachmentPurpose::UserMessageImage
+        );
+        check!("missed_run_policy.skip", crate::MissedRunPolicy::Skip);
+        check!(
+            "missed_run_policy.run_once_on_start",
+            crate::MissedRunPolicy::RunOnceOnStart
+        );
+        check_prefix!(
+            "scheduled_job_schedule.cron",
+            crate::ScheduledJobSchedule::Cron { expr: "x".into() }
+        );
+        check_prefix!(
+            "scheduled_job_schedule.every",
+            crate::ScheduledJobSchedule::Every { seconds: 1 }
+        );
+        check_prefix!(
+            "scheduled_job_schedule.once",
+            crate::ScheduledJobSchedule::Once { at: 1 }
+        );
+        check_prefix!(
+            "scheduled_job_schedule.idle",
+            crate::ScheduledJobSchedule::Idle {
+                min_idle_seconds: 1,
+                max_age_seconds: 2
+            }
+        );
+        check_prefix!(
+            "scheduled_job_payload.run_prompt",
+            crate::ScheduledJobPayload::RunPrompt {
+                assistant: "a".into(),
+                prompt: "p".into(),
+                project_root: "/ignored".into()
+            }
+        );
+        check_prefix!(
+            "scheduled_job_payload.callback",
+            crate::ScheduledJobPayload::Callback {
+                subsystem: "s".into()
+            }
+        );
+        check_prefix!("curator_action.status", crate::CuratorAction::Status);
+        check_prefix!(
+            "curator_action.run",
+            crate::CuratorAction::Run {
+                dry_run: false,
+                consolidate: true
+            }
+        );
+        check_prefix!(
+            "curator_action.pin",
+            crate::CuratorAction::Pin { name: "n".into() }
+        );
+        check_prefix!(
+            "curator_action.unpin",
+            crate::CuratorAction::Unpin { name: "n".into() }
+        );
+        check_prefix!(
+            "curator_action.restore",
+            crate::CuratorAction::Restore { name: "n".into() }
+        );
+        check_prefix!(
+            "curator_action.rollback",
+            crate::CuratorAction::Rollback {
+                list: true,
+                id: None
+            }
         );
     }
 

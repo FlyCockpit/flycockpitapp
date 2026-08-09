@@ -415,7 +415,12 @@ fn find_match_arm(
     matched: &mut bool,
 ) {
     if node.kind() == "match_arm" {
-        let mut has_pattern = pattern.is_none();
+        let mut has_pattern = pattern.is_none()
+            || node
+                .child_by_field_name("pattern")
+                .and_then(|pattern_node| pattern_node.named_child(0))
+                .and_then(|pattern_node| pattern_node.utf8_text(source).ok())
+                == pattern;
         let mut has_call = false;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -634,6 +639,14 @@ fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
     );
     let wrong_arm = "fn key(){ match code { KeyCode::Down => self.reset_at_window(), _ => {} } }";
     assert!(!match_arm_calls(wrong_arm, "KeyCode::Char(ch)", "self.reset_at_window").unwrap());
+    assert!(
+        graph_reaches(
+            &std::collections::HashMap::new(),
+            "reset_at_window",
+            "reset_at_window"
+        )
+        .unwrap()
+    );
 }
 
 #[test]

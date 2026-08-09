@@ -2807,6 +2807,11 @@ fn remote_state_with_grants(
             user_id: "user-1".into(),
             grants,
         }),
+        terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+            principal_id: "flycockpit:user-1".into(),
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: 1,
+        },
         attached: None,
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -2835,6 +2840,11 @@ fn terminal_grant() -> crate::daemon::principal::PrincipalGrant {
 fn owner_state() -> MutableClientState {
     MutableClientState {
         principal: ClientPrincipal::owner(),
+        terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+            principal_id: "local-owner".into(),
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: 1,
+        },
         attached: None,
         pending_replay: Vec::new(),
         pending_uploads: HashMap::new(),
@@ -3440,6 +3450,11 @@ async fn attached_state_with_worker_receiver(
     (
         MutableClientState {
             principal: ClientPrincipal::owner(),
+            terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+                principal_id: "local-owner".into(),
+                client_instance_id: Uuid::new_v4(),
+                connection_epoch: 1,
+            },
             attached: Some(AttachedSession {
                 handle,
                 _interactive_guard: None,
@@ -14604,6 +14619,11 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
     let mut parent_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+            principal_id: "local-owner".into(),
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: 1,
+        },
         attached: Some(AttachedSession {
             handle: parent_handle,
             _interactive_guard: None,
@@ -14658,6 +14678,11 @@ async fn btw_concurrent_with_parent_turn() {
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
     let mut btw_state = MutableClientState {
         principal: ClientPrincipal::owner(),
+        terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+            principal_id: "local-owner".into(),
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: 1,
+        },
         attached: Some(AttachedSession {
             handle: btw_handle,
             _interactive_guard: None,

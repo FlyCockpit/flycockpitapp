@@ -1265,7 +1265,17 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::OpenTerminal { cwd, cols, rows } => {
-            let response = state.terminal_host.open(cwd, cols, rows)?;
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.open(
+                state.terminal_context.clone(),
+                session_id,
+                cwd,
+                cols,
+                rows,
+            )?;
             if let Response::TerminalOpened {
                 terminal_id,
                 binding,
@@ -1284,7 +1294,17 @@ pub(super) async fn handle_serialized_request(
             cols,
             rows,
         } => {
-            let response = state.terminal_host.attach(terminal_id, cols, rows)?;
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.attach(
+                state.terminal_context.clone(),
+                session_id,
+                terminal_id,
+                cols,
+                rows,
+            )?;
             if let Response::TerminalOpened { binding, .. } = &response {
                 state.terminal_views.insert(terminal_id, *binding);
             }

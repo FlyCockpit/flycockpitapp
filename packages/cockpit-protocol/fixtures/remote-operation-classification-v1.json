@@ -1,0 +1,737 @@
+{
+  "schemaVersion": 1,
+  "rows": [
+    {
+      "tag": "attach",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "domain_transaction",
+      "evidence": "domain_result_tuple"
+    },
+    {
+      "tag": "subagent_transcript",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "send_user_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "get_run_invocation_status",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "cancel_run_invocation",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "steer_delegation",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "begin_attachment_upload",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "domain_transaction",
+      "evidence": "domain_result_tuple"
+    },
+    {
+      "tag": "upload_attachment_chunk",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "domain_transaction",
+      "evidence": "domain_result_tuple"
+    },
+    {
+      "tag": "finish_attachment_upload",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "domain_transaction",
+      "evidence": "domain_result_tuple"
+    },
+    {
+      "tag": "cancel_attachment_upload",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "domain_transaction",
+      "evidence": "domain_result_tuple"
+    },
+    {
+      "tag": "remove_queued_user_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "remove_newest_queued_user_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "remove_editable_queued_user_messages",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "resume_paused_work",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "cancel_paused_work",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "repair_resume",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "goal_status",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "create_goal",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "set_goal_status",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "clear_goal",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "pin_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "unpin_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "toggle_pinned_message",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "count_pinned_messages",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "list_pinned_message_seqs",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "list_pinned_messages_with_text",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "pinned_message_state",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "list_sealed_values",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "delete_sealed_value",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "list_project_notes",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "create_project_note",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "set_project_note_content",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "rename_project_note",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "delete_project_note",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "set_workspace_trust",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "get_startup_disclosures",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "get_app_flag",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "mark_app_flag_seen",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "resolve_assistant_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "list_assistants",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "upsert_assistant",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "create_assistant_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "auto_title",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "export_session_data",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "import_session_archive",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "write_bulk_transfer_chunk",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "read_bulk_transfer_chunk",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "curator",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "cancel_turn",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "fs_list",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "fs_stat",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "fs_read",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "fs_write",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "fs_create_dir",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "fs_rename",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "fs_delete",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "git_status",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "git_diff_file",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "open_terminal",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "attach_terminal",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "terminal_input",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "terminal_resize",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "close_terminal",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "lsp_control",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "resolve_interrupt",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "list_sessions",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "read_session_messages",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "read_client_submission_receipt",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "read_history_page",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "read_subagent_history_page",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "session_live_status",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "archive_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "unarchive_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "fork_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "discard_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "btw_create",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "btw_end",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "rename_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "share_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "record_session_note",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "delete_session",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "get_inventory_bundle",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "resource_snapshot",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "promote_resource",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "create_scheduled_job",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "list_scheduled_jobs",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "delete_scheduled_job",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "set_scheduled_job_enabled",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "run_scheduled_job",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "set_model_favorite",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "set_default_model",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "set_active_model",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_agent",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_llm_mode",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_session_llm_mode",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_tool_surface_override",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_goal_settings_override",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_approval_mode",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_delegation_recursion",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_sandbox",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_sandbox_escalation",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_preflight",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_longcache",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_redaction",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_tandem_models",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "set_caffeinate",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "cancel_schedule",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_dispatch_key",
+      "evidence": "dispatch_key_and_generation"
+    },
+    {
+      "tag": "prune",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "compact",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "pin",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "store_flycockpit_credential",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "clear_flycockpit_credential",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "staged_filesystem_commit",
+      "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
+    },
+    {
+      "tag": "daemon_status",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "refresh_env",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "refresh_config",
+      "class": "idempotent_adapter_mutation",
+      "strategy": "durable_desired_state",
+      "evidence": "desired_state_generation_and_observed_digest"
+    },
+    {
+      "tag": "record_usage",
+      "class": "transactional_mutation",
+      "strategy": "sql_transaction",
+      "evidence": null
+    },
+    {
+      "tag": "get_usage_counts",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "stats_rollup",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "guidance_estimate",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null
+    },
+    {
+      "tag": "stop_daemon",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "restart_if_idle",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null
+    },
+    {
+      "tag": "unknown",
+      "class": "rejected",
+      "strategy": "rejected_before_dispatch",
+      "evidence": null
+    }
+  ]
+}

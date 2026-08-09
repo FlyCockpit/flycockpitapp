@@ -1462,7 +1462,7 @@ macro_rules! command {
             (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, concurrent, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
-            (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, attached, true, serialized, none);
+            (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, serialized, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, serialized, none);
             (Request::Unknown, "unknown", owner_only, none, false, serialized, none);

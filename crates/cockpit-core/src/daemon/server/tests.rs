@@ -1503,6 +1503,98 @@ async fn media_security_recovery_denial_precedes_operation_table() {
 }
 
 #[tokio::test]
+async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_authority() {
+    use cockpit_db::media_attachments::{
+        LocalPathRegistrationResultV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
+    };
+    use sha2::{Digest as _, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("source.bin"), b"daemon held source").unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(db, &temp.path().join("media"))
+            .unwrap(),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_text = state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .project_root
+        .to_str()
+        .unwrap();
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+    let request = RegisterLocalPathMediaV1 {
+        schema_version: 1,
+        kind: "registerLocalPathMedia".into(),
+        local_operation_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        session_id,
+        canonical_project_digest: project_digest,
+        client_draft_id: Uuid::now_v7(),
+        requested_media_kind: RequestedLocalPathMediaKind::Image,
+        path: "source.bin".into(),
+    };
+    let first = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::LocalPathMediaRegistration(first_receipt) = first else {
+        panic!("unexpected registration response")
+    };
+    assert!(matches!(
+        first_receipt.result,
+        LocalPathRegistrationResultV1::Registered { .. }
+    ));
+    std::fs::remove_file(project.join("source.bin")).unwrap();
+    let replay = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::LocalPathMediaRegistration(replay_receipt) = replay else {
+        panic!("unexpected replay response")
+    };
+    assert_eq!(replay_receipt, first_receipt);
+    let mut changed = request.clone();
+    changed.requested_media_kind = RequestedLocalPathMediaKind::Audio;
+    assert_eq!(
+        handle_request(Request::RegisterLocalPathMedia(changed), &mut state, &ctx)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let mut detached = MutableClientState::detached_for_test();
+    let detached_error = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut detached,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let mut wrong = request;
+    wrong.session_id = Uuid::now_v7();
+    let wrong_error = handle_request(Request::RegisterLocalPathMedia(wrong), &mut state, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (detached_error.code, detached_error.message),
+        (wrong_error.code, wrong_error.message)
+    );
+    assert_eq!(wrong_error.message, "media_attachment_unavailable");
+}
+
+#[tokio::test]
 async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
     for live in [false, true] {
         let tmp = tempfile::tempdir().unwrap();

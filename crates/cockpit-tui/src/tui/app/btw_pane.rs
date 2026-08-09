@@ -824,6 +824,26 @@ impl App {
         };
 
         let plan = plan_btw_rpcs(&command, existing_mode);
+        if plan.as_slice() == [BtwRpcPlan::End] {
+            self.push_plain("/btw end: pending".to_string());
+            self.async_actions.start(
+                super::blocking_operations::BlockingOperationKind::BtwTeardown.action_kind(),
+                crate::tui::async_action::AsyncActionPolicy::Replace(
+                    crate::tui::async_action::AsyncActionKey::new("btw.teardown"),
+                ),
+                async move {
+                    attached_request
+                        .request(Request::EndBtwFork { parent_session_id })
+                        .await
+                        .map(|response| {
+                            crate::tui::async_action::AsyncActionPayload::DaemonResponse(Box::new(
+                                response,
+                            ))
+                        })
+                },
+            );
+            return;
+        }
         let mut created_info = None;
         for rpc in plan {
             let request = match rpc {

@@ -776,6 +776,20 @@ impl App {
                 };
                 self.apply_queue_edit_outcome(outcome);
             }
+            AsyncActionKind::Blocking("btw.teardown") => match result.payload {
+                Ok(AsyncActionPayload::DaemonResponse(response))
+                    if matches!(*response, cockpit_core::daemon::proto::Response::Ack) =>
+                {
+                    self.close_btw_pane();
+                }
+                Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                    self.push_plain(format!(
+                        "/btw end: unexpected daemon response: {response:?}"
+                    ));
+                }
+                Ok(_) => self.push_plain("/btw end: unexpected async response".to_string()),
+                Err(error) => self.push_plain(format!("/btw end: {error}")),
+            },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
                     self.push_plain(format!("Renamed session to `{title}`"));

@@ -1857,6 +1857,11 @@ fn apply_verification_if_terminal(
                 findings: row_findings,
             } => {
                 if role == "gatekeeper" {
+                    // A syntactically valid gatekeeper refutation is
+                    // authoritative even when it raises a novel finding. The
+                    // prior-gap filter below governs what may be replayed into
+                    // the next worker prompt; it does not govern the verdict.
+                    gatekeeper_refuted = true;
                     let replayed: Vec<String> = row_findings
                         .into_iter()
                         .map(|finding| sanitize_goal_finding(&finding))
@@ -1865,7 +1870,6 @@ fn apply_verification_if_terminal(
                                 || prior_gap_fingerprints.contains(&goal_gap_fingerprint(finding))
                         })
                         .collect();
-                    gatekeeper_refuted = !replayed.is_empty();
                     findings.extend(replayed);
                     continue;
                 }
@@ -3152,6 +3156,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_gatekeeper_refute_overrides_cold_majority_approval() {
+        let (db, _, jobs) = verification_fixture().await;
+        let mut last = None;
+        for job in jobs {
+            let verdict = if job.role == GoalControlRole::Gatekeeper {
+                r#"{"verdict":"refute","findings":["novel gatekeeper finding"]}"#
+            } else {
+                r#"{"verdict":"approve","evidence":"cold review passed"}"#
+            };
+            last = db.finish_goal_control_job(job, Ok(verdict)).await.unwrap();
+        }
+        let rejected = last.expect("the terminal panel job returns the updated goal");
+        assert_ne!(rejected.disposition, GoalDisposition::Complete);
+        assert_eq!(rejected.phase, Some(GoalPhase::Executing));
+        assert!(
+            rejected.unresolved_gaps.is_empty(),
+            "a novel authoritative gatekeeper refutation rejects completion but is not replayed as a prior verifier gap"
+        );
+    }
+
+    #[tokio::test]
     async fn goal_verification_attempt_cap_is_inclusive_and_pauses() {
         let (db, _, jobs) = verification_fixture().await;
         let mut goal = finish_verification_with_refutation(&db, jobs, "gap one").await;
@@ -3348,5 +3373,26 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        let goal_id = current.id.to_string();
+        let generation = current.attempt_generation;
+        let (evaluators, root_turns): (i64, i64) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM goal_control_jobs WHERE goal_id = ?1 AND attempt_generation = ?2 AND role = 'evaluator'",
+                        params![goal_id, generation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM goal_root_turns WHERE goal_id = ?1 AND attempt_generation = ?2 AND state IN ('pending', 'leased')",
+                        params![goal_id, generation],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(evaluators, 0, "approval deferral must not evaluate");
+        assert_eq!(root_turns, 0, "approval deferral must not auto-continue");
     }
 }

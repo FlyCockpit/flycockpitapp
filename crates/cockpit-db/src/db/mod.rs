@@ -1267,44 +1267,44 @@ mod tests {
         assert_eq!(names, vec!["0001_test.sql", "0002_test.sql"]);
     }
 
-    #[test]
-    fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
-        conn.execute(
-            "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
-             VALUES ('session-v1', 'project-v1', '/tmp/v1', 10, 20)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session_goals
-               (id, session_id, project_id, objective, context, status, token_budget,
-                tokens_used, blocked_attempts, completion_evidence, verification_rounds,
-                last_read_at, created_at, updated_at)
-             VALUES ('goal-v1', 'session-v1', 'project-v1', 'preserve me', 'legacy context',
-                     'paused', NULL, 37, 2, NULL, 1, 19, 10, 20)",
-            [],
-        )
-        .unwrap();
-
-        migrate_with(&conn, MIGRATIONS).unwrap();
-        let migrated: (String, String, String, i64, i64, i64) = conn
-            .query_row(
-                "SELECT objective, context, disposition, token_budget, tokens_used, blocked_attempts
-                   FROM session_goals WHERE id = 'goal-v1'",
+    #[tokio::test]
+    async fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("v1-goal.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'project-v1', '/tmp/v1', 10, 20)",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
             )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_goals
+                   (id, session_id, project_id, objective, context, status, token_budget,
+                    tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                    last_read_at, created_at, updated_at)
+                 VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'project-v1', 'preserve me', 'legacy context',
+                         'active', NULL, 37, 2, NULL, 1, 19, 10, 20)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let session_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+            .unwrap_or_else(|_| unreachable!());
+        let migrated: (String, String, String, String, String, i64, i64, i64) = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT objective, context, disposition, resume_phase, pause_reason, token_budget, tokens_used, blocked_attempts
+                       FROM session_goals WHERE id = '00000000-0000-0000-0000-000000000002'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                )?)
+            })
+            .await
             .unwrap();
         assert_eq!(
             migrated,
@@ -1312,27 +1312,60 @@ mod tests {
                 "preserve me".into(),
                 "legacy context".into(),
                 "user_paused".into(),
+                "planning".into(),
+                "restart".into(),
                 200_000,
                 37,
                 2,
             )
         );
-        assert_eq!(
-            current_schema_version(&conn).unwrap(),
-            MIGRATIONS.len() as i64
-        );
-        assert_eq!(
-            sqlite_schema_version(&conn).unwrap(),
-            MIGRATIONS.len() as i64
-        );
-        foreign_key_check(&conn).unwrap();
+        let (schema, mirror) = db
+            .read(|conn| Ok((current_schema_version(conn)?, sqlite_schema_version(conn)?)))
+            .await
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
+        assert_eq!(mirror, MIGRATIONS.len() as i64);
+        db.read(foreign_key_check).await.unwrap();
         // Re-opening against the same immutable ledger validates both stored
         // checksums instead of silently accepting a rewritten v1 migration.
-        migrate_with(&conn, MIGRATIONS).unwrap();
-        let ledger_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+        db.read(|conn| migrate_with(conn, MIGRATIONS))
+            .await
+            .unwrap();
+        let ledger_rows: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?)
+            })
+            .await
             .unwrap();
         assert_eq!(ledger_rows, MIGRATIONS.len() as i64);
+
+        let resumed = db
+            .set_session_goal_status(
+                session_id,
+                crate::db::session_goals::GoalDisposition::Running,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.phase,
+            Some(crate::db::session_goals::GoalPhase::Planning)
+        );
+        assert!(resumed.contract.is_none());
+        let planner = db
+            .lease_goal_control_job(resumed.id, resumed.attempt_generation, 30, 60)
+            .await
+            .unwrap()
+            .expect("resuming a legacy goal must register a planner");
+        assert_eq!(
+            planner.role,
+            crate::db::session_goals::GoalControlRole::Planner
+        );
+        assert!(
+            db.begin_goal_root_turn(resumed.id, resumed.attempt_generation)
+                .await
+                .is_err(),
+            "a migrated goal cannot dispatch root work before planner acceptance"
+        );
     }
 
     #[tokio::test]

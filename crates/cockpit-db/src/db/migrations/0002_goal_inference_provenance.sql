@@ -50,26 +50,11 @@ INSERT INTO session_goals (
     verification_rounds, last_read_at, created_at, updated_at
 )
 SELECT id, session_id, project_id, objective, context,
-       CASE status
-         WHEN 'active' THEN 'running'
-         WHEN 'pending_verification' THEN 'running'
-         WHEN 'paused' THEN 'user_paused'
-         WHEN 'blocked' THEN 'blocked'
-         WHEN 'budget_limited' THEN 'budget_limited'
-         WHEN 'usage_limited' THEN 'infra_paused'
-         WHEN 'complete' THEN 'complete'
-       END,
-       CASE status
-         WHEN 'active' THEN 'executing'
-         WHEN 'pending_verification' THEN 'verifying'
-       END,
-       CASE WHEN status IN ('paused', 'blocked', 'budget_limited', 'usage_limited')
-            THEN 'executing' END,
-       CASE status
-         WHEN 'paused' THEN 'user'
-         WHEN 'usage_limited' THEN 'provider_usage_limit'
-       END,
-       CASE WHEN status IN ('active', 'pending_verification') THEN 1 ELSE 0 END,
+       CASE WHEN status = 'complete' THEN 'complete' ELSE 'user_paused' END,
+       NULL,
+       CASE WHEN status = 'complete' THEN NULL ELSE 'planning' END,
+       CASE WHEN status = 'complete' THEN NULL ELSE 'restart' END,
+       0,
        '{}',
        MAX(COALESCE(token_budget, 200000), 1),
        MAX(tokens_used, 0), blocked_attempts, completion_evidence,

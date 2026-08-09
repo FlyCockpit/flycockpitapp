@@ -117,13 +117,14 @@ pub(super) struct AgentDetail {
 impl AgentsPage {
     /// Build the page by discovering agents at `cwd`.
     pub(super) fn new(cwd: &std::path::Path) -> Self {
+        let (rows, status) = rows_for(cwd);
         Self {
             cursor: 0,
             confirm_reset: false,
             delete: ResetButton::default(),
             reset_one: ResetButton::default(),
-            status: None,
-            rows: rows_for(cwd),
+            status,
+            rows,
             editing: None,
             detail: None,
             pending_external_edit: None,
@@ -180,7 +181,7 @@ impl AgentsPage {
 }
 
 /// Build the per-row view models for `cwd`, including the effective model.
-fn rows_for(cwd: &std::path::Path) -> Vec<AgentRow> {
+fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
     let mut rows: Vec<AgentRow> = list_all(cwd)
         .into_iter()
         .map(|l: AgentListing| {
@@ -197,29 +198,35 @@ fn rows_for(cwd: &std::path::Path) -> Vec<AgentRow> {
             }
         })
         .collect();
-    rows.extend(assistant_rows());
-    rows
+    match assistant_rows() {
+        Ok(assistants) => {
+            rows.extend(assistants);
+            (rows, None)
+        }
+        Err(error) => (
+            rows,
+            Some(format!(
+                "Assistants Unavailable — {error}; Retry by reopening Agents"
+            )),
+        ),
+    }
 }
 
-fn assistant_rows() -> Vec<AgentRow> {
-    let Ok(path) = cockpit_core::db::Db::default_path() else {
-        return Vec::new();
+fn assistant_rows() -> Result<Vec<AgentRow>, String> {
+    let response = crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::ListAssistants,
+    )?;
+    let cockpit_core::daemon::proto::Response::Assistants { assistants } = response else {
+        return Err(format!("unexpected assistants response: {response:?}"));
     };
-    if !path.exists() {
-        return Vec::new();
-    }
-    let Ok(db) = cockpit_core::db::Db::open(&path) else {
-        return Vec::new();
-    };
-    let Ok(rows) = db.blocking_read_for_sync_ui(cockpit_core::db::Db::list_assistants_conn) else {
-        return Vec::new();
-    };
-    rows.into_iter()
+    Ok(assistants
+        .into_iter()
         .map(|row| {
             let home_dir = PathBuf::from(&row.home_dir);
-            let (detail, model) = match cockpit_core::assistants::load_from_row(&row) {
+            let definition = cockpit_core::assistants::load_from_home(&row.name, &home_dir);
+            let (detail, model) = match definition {
                 Ok(def) => (Ok(def.description), normalize_model(def.agent.model)),
-                Err(e) => (Err(format!("{e}")), None),
+                Err(error) => (Err(error.to_string()), None),
             };
             AgentRow {
                 name: row.name,
@@ -232,7 +239,7 @@ fn assistant_rows() -> Vec<AgentRow> {
                 },
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Present the effective-model display value in canonical `provider/model`
@@ -383,7 +390,7 @@ impl SettingsCx {
                         }
                         Err(e) => p.status = Some(format!("reset failed: {e}")),
                     }
-                    p.rows = rows_for(&cwd);
+                    p.rows = rows_for(&cwd).0;
                     p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -513,7 +520,7 @@ impl SettingsCx {
                 return;
             }
         };
-        p.rows = rows_for(&cwd);
+        p.rows = rows_for(&cwd).0;
         if let Some(idx) = p.rows.iter().position(|r| r.name == name) {
             p.cursor = idx;
         }
@@ -580,23 +587,17 @@ impl SettingsCx {
             home_dir,
             config_json,
         } = &detail.source
-            && let Ok(path) = cockpit_core::db::Db::default_path()
-            && path.exists()
-            && let Ok(db) = cockpit_core::db::Db::open(&path)
         {
-            let name = detail.name.clone();
-            let home_dir = home_dir.to_string_lossy().into_owned();
-            let config_json = config_json.clone();
-            let content_hash = cockpit_core::assistants::markdown_content_hash(&markdown);
-            let _ = db.blocking_write_for_sync_ui(move |conn| {
-                cockpit_core::db::Db::upsert_assistant_conn(
-                    conn,
-                    &name,
-                    &home_dir,
-                    &config_json,
-                    &content_hash,
-                )
-            });
+            let request = cockpit_core::daemon::proto::Request::UpsertAssistant {
+                name: detail.name.clone(),
+                home_dir: home_dir.to_string_lossy().into_owned(),
+                config_json: config_json.clone(),
+                content_hash: cockpit_core::assistants::markdown_content_hash(&markdown),
+            };
+            if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
+                detail.status = Some(format!("save Unavailable — {error}; Retry"));
+                return;
+            }
         }
         detail.original_text = markdown;
         detail.status = Some(match cleanup_notice {
@@ -604,7 +605,11 @@ impl SettingsCx {
             None => format!("saved `{}`", detail.name),
         });
         let cwd = self.agents_cwd();
-        p.rows = rows_for(&cwd);
+        let (rows, status) = rows_for(&cwd);
+        p.rows = rows;
+        if status.is_some() {
+            p.status = status;
+        }
     }
 
     /// Begin editing the highlighted agent. A non-overridden built-in is
@@ -632,7 +637,7 @@ impl SettingsCx {
             // Refresh the rows now so the auto-ejected built-in is already
             // marked overridden under the cursor; the loop will re-read the
             // file after the external editor returns.
-            p.rows = rows_for(&cwd);
+            p.rows = rows_for(&cwd).0;
             p.pending_external_edit = Some(path);
             p.status = Some("opening $EDITOR…".into());
             return;
@@ -648,7 +653,7 @@ impl SettingsCx {
         };
         // Refresh rows so an auto-ejected built-in is marked overridden
         // while the in-TUI editor is open.
-        p.rows = rows_for(&cwd);
+        p.rows = rows_for(&cwd).0;
         let vim = self.extended.tui.vim_mode.vim_enabled();
         p.editing = Some(AgentEditor::new(name, path, &text, vim));
         p.status = None;
@@ -699,7 +704,7 @@ impl SettingsCx {
             },
             None => p.status = Some(format!("delete failed: `{name}` has no on-disk file")),
         }
-        p.rows = rows_for(&cwd);
+        p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
     }
 
@@ -730,7 +735,7 @@ impl SettingsCx {
             },
             None => p.status = Some(format!("reset: `{name}` has no override")),
         }
-        p.rows = rows_for(&cwd);
+        p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
     }
 
@@ -848,7 +853,7 @@ impl SettingsCx {
 /// given) move the cursor onto that row + re-surface a parse error inline.
 impl AgentsPage {
     fn refresh_after_edit(&mut self, cwd: &std::path::Path, name: Option<&str>) {
-        self.rows = rows_for(cwd);
+        self.rows = rows_for(cwd).0;
         if let Some(name) = name {
             if let Some(idx) = self.rows.iter().position(|r| r.name == name) {
                 self.cursor = idx;
@@ -1247,44 +1252,6 @@ mod tests {
                 .unwrap_or("")
                 .contains("raw editor")
         );
-    }
-
-    #[tokio::test]
-    async fn agents_page_assistant_rows_are_editable() {
-        let tmp = TempDir::new().unwrap();
-        let _xdg = XdgDataEnv::new_async(&tmp.path().join("xdg")).await;
-        // Test fixture only: this isolated XDG home deliberately constructs its
-        // own database before any App exists, so no TUI shared handle or daemon
-        // writer can exist to reuse.
-        let db = cockpit_core::db::Db::open_default().unwrap();
-        let home = tmp.path().join("assistants/helper-bot");
-        cockpit_core::assistants::create_assistant(
-            &db,
-            cockpit_core::assistants::CreateAssistantSpec {
-                name: "helper-bot".to_string(),
-                description: "Assistant".to_string(),
-                mode: cockpit_core::agents::AgentMode::Primary,
-                tools: Some(vec!["read".to_string()]),
-                tool_tiers: BTreeMap::new(),
-                model: None,
-                prompt: "Help.".to_string(),
-                home_dir: home.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "helper-bot");
-        assert!(matches!(
-            &page(&d).rows[page(&d).cursor].source,
-            AgentRowSource::Assistant { .. }
-        ));
-        d.handle_key(press(KeyCode::Enter));
-        focus_tool(&mut d, "search");
-        d.handle_key(press(KeyCode::Char(' ')));
-        d.handle_key(ctrl_s());
-        let def = cockpit_core::assistants::load_from_home("helper-bot", &home).unwrap();
-        assert!(def.agent.tools.unwrap().iter().any(|tool| tool == "search"));
     }
 
     #[test]

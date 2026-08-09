@@ -152,28 +152,32 @@ impl App {
             },
         );
 
-        let db = self.startup_background.db.clone();
-        self.async_actions.start(
+        let disclosure_root = self.launch.cwd.to_string_lossy().into_owned();
+        let disclosure_socket = self.startup_background.daemon_socket.clone();
+        self.async_actions.start_blocking(
             AsyncActionKind::Internal("startup.remote_disclosures"),
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
-            async move {
-                let Some(credential) = cockpit_core::auth::flycockpit::maybe_load_credential()
-                else {
-                    return Ok(AsyncActionPayload::RemoteDisclosures {
-                        org: None,
-                        connector: None,
-                    });
+            move || {
+                let request = cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                    project_root: disclosure_root,
                 };
-                let db = db.ok_or_else(|| "database unavailable during startup".to_string())?;
-                let org = db
-                    .org_sync_disclosure_for_server(&credential.server_url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let connector = db
-                    .connector_disclosure(&credential.server_url, &credential.instance_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(AsyncActionPayload::RemoteDisclosures { org, connector })
+                let response = match disclosure_socket.as_deref() {
+                    Some(socket) => agent_runner::daemon_request_at_blocking(socket, request),
+                    None => agent_runner::daemon_request_blocking(request),
+                }?;
+                match response {
+                    cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        org_sync,
+                        connector,
+                        ..
+                    } => Ok(AsyncActionPayload::RemoteDisclosures {
+                        org: org_sync,
+                        connector,
+                    }),
+                    other => Err(format!(
+                        "unexpected startup disclosures response: {other:?}"
+                    )),
+                }
             },
         );
     }

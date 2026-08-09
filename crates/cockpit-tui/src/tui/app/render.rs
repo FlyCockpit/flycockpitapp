@@ -5439,7 +5439,6 @@ mod render_history_spacing_tests {
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use cockpit_core::tokens::{count_call_count, reset_count_call_count};
-    use cockpit_db::{open_default_call_count, reset_open_default_call_count};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6994,9 +6993,7 @@ mod render_history_spacing_tests {
         app.pinned_seqs_cache.insert(42);
         app.history = vec![pinned_user("pin me", 42)].into();
 
-        reset_open_default_call_count();
         assert_eq!(render_calls_after(&mut app, 80, 8), 1);
-        assert_eq!(open_default_call_count(), 0);
         assert!(
             app.pin_control_rows
                 .iter()
@@ -7005,7 +7002,6 @@ mod render_history_spacing_tests {
             "render should expose the cached pin control hit region"
         );
         assert_eq!(render_calls_after(&mut app, 80, 8), 0);
-        assert_eq!(open_default_call_count(), 0);
     }
 
     #[test]

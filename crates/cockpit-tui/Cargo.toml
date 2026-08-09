@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
-cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
 
 anyhow = { workspace = true }

@@ -2,24 +2,34 @@
 //! pick-a-message mode, the `/pins` review mode, the mouse `[fork]` and
 //! `[pin]`/`[unpin]` controls, and the below-input count indicator's data source.
 //!
-//! Pins are pure DB state the TUI owns directly via [`cockpit_db::Db`]
-//! (`open_default`, same pattern as `/sessions` + `/export`). Nothing here
+//! Pins are daemon-owned state consumed through typed RPCs. Nothing here
 //! ever enters the outbound model prompt (token economy, priority #2).
 
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::history::HistoryEntry;
-use cockpit_db::Db;
-
 use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 
 use super::{App, ToastKind, render};
 
-async fn load_pin_state(db: &Db, sid: uuid::Uuid) -> Result<(usize, Vec<i64>), String> {
-    let count = db.count_pins(sid).await.map_err(|e| e.to_string())?.max(0) as usize;
-    let pinned_seqs = db.list_pin_seqs(sid).await.map_err(|e| e.to_string())?;
-    Ok((count, pinned_seqs))
+fn pin_rpc(
+    socket: &std::path::Path,
+    request: cockpit_core::daemon::proto::Request,
+) -> Result<cockpit_core::daemon::proto::Response, String> {
+    crate::tui::agent_runner::daemon_request_at_blocking(socket, request)
+}
+
+fn load_pin_state(socket: &std::path::Path, sid: uuid::Uuid) -> Result<(usize, Vec<i64>), String> {
+    match pin_rpc(
+        socket,
+        cockpit_core::daemon::proto::Request::PinnedMessageState { session_id: sid },
+    )? {
+        cockpit_core::daemon::proto::Response::PinState { state } => {
+            Ok((state.count.max(0) as usize, state.seqs))
+        }
+        other => Err(format!("unexpected pin-state response: {other:?}")),
+    }
 }
 
 #[cfg(test)]
@@ -52,13 +62,12 @@ impl App {
     /// Open the global DB for a pin operation. `None` (with a transcript
     /// note) when the DB can't be opened — pins degrade gracefully rather
     /// than crash the TUI.
-    fn pins_db(&mut self) -> Option<Db> {
-        match self.shared_db() {
-            Some(db) => Some(db),
-            None => {
-                self.push_plain("pins: database unavailable".to_string());
-                None
-            }
+    fn pins_socket(&mut self) -> Option<std::path::PathBuf> {
+        if self.daemon_connected {
+            self.startup_background.daemon_socket.clone()
+        } else {
+            self.push_plain("pins: Unavailable — reconnect to the daemon, then Retry".to_string());
+            None
         }
     }
 
@@ -89,8 +98,8 @@ impl App {
             self.pinned_seqs_session = None;
             return;
         };
-        match self.shared_db() {
-            Some(db) => self.start_pin_state_refresh(sid, db, true),
+        match self.pins_socket() {
+            Some(socket) => self.start_pin_state_refresh(sid, socket, true),
             None => {
                 self.pin_count_session = Some(sid);
                 self.pinned_seqs_session = Some(sid);
@@ -99,18 +108,23 @@ impl App {
         }
     }
 
-    fn start_pin_state_refresh(&mut self, sid: uuid::Uuid, db: Db, clear_first: bool) {
+    fn start_pin_state_refresh(
+        &mut self,
+        sid: uuid::Uuid,
+        socket: std::path::PathBuf,
+        clear_first: bool,
+    ) {
         if clear_first {
             self.pin_count = 0;
             self.pinned_seqs_cache.clear();
         }
         self.pin_count_session = Some(sid);
         self.pinned_seqs_session = Some(sid);
-        self.async_actions.start(
+        self.async_actions.start_blocking(
             AsyncActionKind::Refresh("pins.state"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.state:{sid}"))),
-            async move {
-                let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+            move || {
+                let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
                 Ok(AsyncActionPayload::PinState {
                     session_id: sid,
                     count,
@@ -118,20 +132,6 @@ impl App {
                 })
             },
         );
-    }
-
-    #[cfg(test)]
-    async fn refresh_pin_state_from_db(&mut self, sid: uuid::Uuid, db: &Db) {
-        self.pin_count_session = Some(sid);
-        self.pinned_seqs_session = Some(sid);
-        if let Ok(n) = db.count_pins(sid).await {
-            self.pin_count = n.max(0) as usize;
-        }
-        self.pinned_seqs_cache = db
-            .list_pin_seqs(sid)
-            .await
-            .map(|seqs| seqs.into_iter().collect())
-            .unwrap_or_default();
     }
 
     pub(super) fn apply_pin_state(&mut self, sid: uuid::Uuid, count: usize, pinned_seqs: Vec<i64>) {
@@ -200,13 +200,24 @@ impl App {
             self.pin_toast("pins: no active session".to_string());
             return;
         };
-        let Some(db) = self.pins_db() else { return };
-        self.async_actions.start(
+        let Some(socket) = self.pins_socket() else {
+            return;
+        };
+        self.async_actions.start_blocking(
             AsyncActionKind::Internal("pins.toggle"),
             AsyncActionPolicy::AllowConcurrent,
-            async move {
-                let now_pinned = db.toggle_pin(sid, seq).await.map_err(|e| e.to_string())?;
-                let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+            move || {
+                let now_pinned = match pin_rpc(
+                    &socket,
+                    cockpit_core::daemon::proto::Request::TogglePinnedMessage {
+                        session_id: sid,
+                        seq,
+                    },
+                )? {
+                    cockpit_core::daemon::proto::Response::PinToggled { pinned } => pinned,
+                    other => return Err(format!("unexpected pin-toggle response: {other:?}")),
+                };
+                let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
                 Ok(AsyncActionPayload::PinToggle {
                     session_id: sid,
                     seq,
@@ -252,15 +263,22 @@ impl App {
             self.push_plain("/pins: no active session".to_string());
             return;
         };
-        let Some(db) = self.pins_db() else { return };
-        self.async_actions.start(
+        let Some(socket) = self.pins_socket() else {
+            return;
+        };
+        self.async_actions.start_blocking(
             AsyncActionKind::Internal("pins.review"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(format!("pins.review:{sid}"))),
-            async move {
-                let pins = db
-                    .list_pins_with_text(sid)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            move || {
+                let pins = match pin_rpc(
+                    &socket,
+                    cockpit_core::daemon::proto::Request::ListPinnedMessagesWithText {
+                        session_id: sid,
+                    },
+                )? {
+                    cockpit_core::daemon::proto::Response::PinsWithText { pins } => pins,
+                    other => return Err(format!("unexpected pins-review response: {other:?}")),
+                };
                 Ok(AsyncActionPayload::PinsReview {
                     session_id: sid,
                     pins,
@@ -272,7 +290,7 @@ impl App {
     pub(super) fn apply_pins_review(
         &mut self,
         sid: uuid::Uuid,
-        pins: Vec<cockpit_db::pins::PinnedMessage>,
+        pins: Vec<cockpit_core::daemon::proto::PinnedMessage>,
     ) {
         if self.current_session_id() != Some(sid) {
             return;
@@ -490,14 +508,24 @@ impl App {
                 let Some(sid) = self.current_session_id() else {
                     return;
                 };
-                if let Some(db) = self.pins_db() {
-                    self.async_actions.start(
+                if let Some(socket) = self.pins_socket() {
+                    self.async_actions.start_blocking(
                         AsyncActionKind::Internal("pins.pin"),
                         AsyncActionPolicy::AllowConcurrent,
-                        async move {
-                            let inserted =
-                                db.pin_message(sid, seq).await.map_err(|e| e.to_string())?;
-                            let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                        move || {
+                            let inserted = match pin_rpc(
+                                &socket,
+                                cockpit_core::daemon::proto::Request::PinMessage {
+                                    session_id: sid,
+                                    seq,
+                                },
+                            )? {
+                                cockpit_core::daemon::proto::Response::PinChanged { changed } => {
+                                    changed
+                                }
+                                other => return Err(format!("unexpected pin response: {other:?}")),
+                            };
+                            let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
                             Ok(AsyncActionPayload::PinMessage {
                                 session_id: sid,
                                 seq,
@@ -561,15 +589,22 @@ impl App {
         let Some(sid) = self.current_session_id() else {
             return;
         };
-        if let Some(db) = self.pins_db() {
-            self.async_actions.start(
+        if let Some(socket) = self.pins_socket() {
+            self.async_actions.start_blocking(
                 AsyncActionKind::Internal("pins.unpin"),
                 AsyncActionPolicy::AllowConcurrent,
-                async move {
-                    db.unpin_message(sid, seq)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let (count, pinned_seqs) = load_pin_state(&db, sid).await?;
+                move || {
+                    match pin_rpc(
+                        &socket,
+                        cockpit_core::daemon::proto::Request::UnpinMessage {
+                            session_id: sid,
+                            seq,
+                        },
+                    )? {
+                        cockpit_core::daemon::proto::Response::PinChanged { .. } => {}
+                        other => return Err(format!("unexpected unpin response: {other:?}")),
+                    }
+                    let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
                     Ok(AsyncActionPayload::PinUnpin {
                         session_id: sid,
                         seq,
@@ -843,13 +878,10 @@ impl App {
 mod tests {
     use super::{App, CopyShape, pin_refresh_call_count, reset_pin_refresh_call_count};
     use crate::tui::settings::Dialog;
-    use cockpit_db::Db;
-    use cockpit_db::session_log::SessionEventKind;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use serde_json::json;
     use tokio::sync::mpsc;
 
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
@@ -904,18 +936,6 @@ mod tests {
             last_applied_seq: None,
             client_tasks: ClientTasks::default(),
         }
-    }
-
-    async fn record_msg(db: &Db, sid: uuid::Uuid, text: &str) -> i64 {
-        db.insert_session_event(
-            sid,
-            SessionEventKind::UserMessage,
-            Some("Build"),
-            None,
-            &json!({ "text": text }),
-        )
-        .await
-        .unwrap()
     }
 
     fn user(seq: Option<i64>) -> HistoryEntry {
@@ -1217,31 +1237,6 @@ mod tests {
         // Tool entries are never pinnable.
         assert_eq!(App::entry_pin_seq(&tool_line()), None);
         assert_eq!(App::entry_pin_seq(&toolbox()), None);
-    }
-
-    #[tokio::test]
-    async fn pin_cache_refreshes_after_pin_and_unpin() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = test_app(tmp.path());
-        let db = Db::open_in_memory().unwrap();
-        let session = db.create_session("p", "/x", "Build").await.unwrap();
-        let sid = session.session_id;
-        app.launch.session_id = Some(sid);
-        let seq = record_msg(&db, sid, "pin me").await;
-
-        app.refresh_pin_state_from_db(sid, &db).await;
-        assert_eq!(app.pin_count, 0);
-        assert!(!app.is_seq_pinned_for_render(seq));
-
-        assert!(db.pin_message(sid, seq).await.unwrap());
-        app.refresh_pin_state_from_db(sid, &db).await;
-        assert_eq!(app.pin_count, 1);
-        assert!(app.is_seq_pinned_for_render(seq));
-
-        assert!(db.unpin_message(sid, seq).await.unwrap());
-        app.refresh_pin_state_from_db(sid, &db).await;
-        assert_eq!(app.pin_count, 0);
-        assert!(!app.is_seq_pinned_for_render(seq));
     }
 
     #[test]

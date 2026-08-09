@@ -625,9 +625,9 @@ impl App {
                     crate::tui::notes_pane::NotesOutcome::Stay => {
                         self.overlay = Overlay::Notes(pane);
                     }
-                    crate::tui::notes_pane::NotesOutcome::Db(action) => {
+                    crate::tui::notes_pane::NotesOutcome::Rpc(action) => {
                         self.overlay = Overlay::Notes(pane);
-                        self.start_notes_db_action(action);
+                        self.start_notes_rpc_action(action);
                     }
                 }
                 return false;
@@ -4316,7 +4316,7 @@ mod paste_routing_tests {
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
-    use cockpit_db::pins::PinnedMessage;
+    use cockpit_core::daemon::proto::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};

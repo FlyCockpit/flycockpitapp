@@ -26,7 +26,6 @@ pub mod computer;
 pub mod container;
 pub mod credentials;
 pub mod daemon;
-pub use cockpit_db as db;
 pub mod diagnostics;
 pub mod embeddings;
 pub mod engine;

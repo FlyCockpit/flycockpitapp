@@ -171,7 +171,6 @@ fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
         true,
         Some(dead_socket),
         false,
-        app.shared_db(),
     );
     pane.apply_sessions_result(Ok(vec![session_summary(
         session_id,
@@ -201,7 +200,6 @@ fn question_dialog_shadows_and_resumes_an_open_overlay() {
         false,
         None,
         false,
-        app.shared_db(),
     ));
 
     assert_eq!(app.key_context(), KeyContext::Sessions);
@@ -301,7 +299,6 @@ fn leader_with_sessions_pane_open_shows_sessions_context() {
         false,
         None,
         false,
-        app.shared_db(),
     ));
     app.handle_key(ctrl('k'));
     let overlay = app.keys_overlay.as_ref().expect("leader opens over a pane");

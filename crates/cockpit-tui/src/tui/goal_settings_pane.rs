@@ -427,40 +427,6 @@ mod tests {
         assert!(pane.draft.to_override().is_empty());
     }
 
-    #[tokio::test]
-    async fn goal_settings_session_save_persists_and_does_not_eject() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = cockpit_db::Db::open_in_memory().unwrap();
-        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
-        focus_field(&mut pane, GoalSettingsField::SkepticCount);
-        pane.handle_key(KeyEvent::from(KeyCode::Char('+')));
-        pane.start_confirm(GoalSettingsSaveTarget::Session);
-
-        let outcome = pane.confirmed_save();
-
-        let GoalSettingsOutcome::Apply {
-            override_json,
-            persist_session: true,
-        } = outcome
-        else {
-            panic!("session save should apply");
-        };
-        session
-            .set_goal_settings_override_json(override_json)
-            .unwrap();
-        let stored = db.get_session(session.id).await.unwrap().unwrap();
-        assert!(stored.goal_settings_override_json.is_some());
-        assert!(
-            !tmp.path()
-                .join(".cockpit")
-                .join("agents")
-                .join("Build.md")
-                .exists(),
-            "session save must not eject built-in agent to disk"
-        );
-    }
-
     #[test]
     fn goal_settings_agent_save_writes_disk_and_ejects_pristine_builtin() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1287,7 +1287,10 @@ pub use cockpit_db::wire::{
 };
 
 pub use cockpit_db::db::session_goals::GoalStatus;
-pub use cockpit_db::stats::StatsRollup;
+pub use cockpit_db::stats::{
+    LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenRow,
+    TokenSpend,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoalSummary {

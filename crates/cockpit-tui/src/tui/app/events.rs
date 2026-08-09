@@ -1953,14 +1953,15 @@ impl App {
                 relay_region,
                 last_error,
             } => {
-                self.connector_disclosure = Some(cockpit_db::connector::ConnectorDisclosure {
-                    enabled,
-                    status,
-                    relay_url,
-                    relay_id,
-                    relay_region,
-                    last_error,
-                });
+                self.connector_disclosure =
+                    Some(cockpit_core::daemon::proto::ConnectorDisclosure {
+                        enabled,
+                        status,
+                        relay_url,
+                        relay_id,
+                        relay_region,
+                        last_error,
+                    });
             }
             TurnEvent::DaemonDraining { forced } => {
                 // Daemon-global drain notice

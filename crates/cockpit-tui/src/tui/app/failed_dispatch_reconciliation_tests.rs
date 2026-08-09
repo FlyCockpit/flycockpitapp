@@ -1529,11 +1529,7 @@ fn normal_dispatch_closed_marks_user_failed_and_ends_span() {
 #[test]
 fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     super::seed_ready_model_for_tests(&mut app);
     let (tx, mut rx) = mpsc::channel(1);
     tx.try_send(UserSubmission::text("channel blocker".to_string()).into())

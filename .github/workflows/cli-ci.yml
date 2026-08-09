@@ -111,6 +111,9 @@ jobs:
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
 
+      - name: Check TUI database ownership boundary
+        run: bash scripts/check-tui-db-boundary.sh
+
       - name: Doc tests
         run: cargo test --locked --workspace --doc
 

@@ -8,24 +8,27 @@ impl App {
         let pane = crate::tui::notes_pane::NotesPane::open(
             &self.launch.cwd,
             self.composer.vim_enabled(),
-            self.shared_db(),
+            self.startup_background.daemon_socket.clone(),
         );
         let action = pane.initial_load_action();
         self.overlay = Overlay::Notes(pane);
         if let Some(action) = action {
-            self.start_notes_db_action(action);
+            self.start_notes_rpc_action(action);
         }
     }
 
-    pub(super) fn start_notes_db_action(&mut self, action: crate::tui::notes_pane::NotesDbAction) {
+    pub(super) fn start_notes_rpc_action(
+        &mut self,
+        action: crate::tui::notes_pane::NotesRpcAction,
+    ) {
         self.async_actions.start(
-            crate::tui::async_action::AsyncActionKind::Internal("notes.db"),
+            crate::tui::async_action::AsyncActionKind::Internal("notes.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             async move {
                 action
                     .run()
                     .await
-                    .map(crate::tui::async_action::AsyncActionPayload::NotesDb)
+                    .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
                     .map_err(|e| e.to_string())
             },
         );

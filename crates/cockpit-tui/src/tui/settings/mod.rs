@@ -85,7 +85,7 @@ pub enum Dialog {
     WorkspaceTrust {
         root: cockpit_config::trust::TrustRoot,
         cursor: usize,
-        chosen: Option<cockpit_db::workspace_trust::WorkspaceTrustMode>,
+        chosen: Option<cockpit_config::WorkspaceTrustMode>,
     },
     PickConfig {
         dirs: Vec<ConfigDir>,
@@ -812,7 +812,7 @@ impl Dialog {
         &mut self,
     ) -> Option<(
         cockpit_config::trust::TrustRoot,
-        cockpit_db::workspace_trust::WorkspaceTrustMode,
+        cockpit_config::WorkspaceTrustMode,
     )> {
         let Dialog::WorkspaceTrust { root, chosen, .. } = self else {
             return None;
@@ -2793,11 +2793,11 @@ fn touch_tool_surface(
 
 enum WorkspaceTrustAction {
     Stay,
-    Choose(cockpit_db::workspace_trust::WorkspaceTrustMode),
+    Choose(cockpit_config::WorkspaceTrustMode),
 }
 
 fn workspace_trust_key_action(key: KeyEvent, cursor: &mut usize) -> WorkspaceTrustAction {
-    use cockpit_db::workspace_trust::WorkspaceTrustMode;
+    use cockpit_config::WorkspaceTrustMode;
     const LEN: usize = 3;
     match key.code {
         KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -2868,17 +2868,17 @@ fn render_workspace_trust(
         (
             "trust",
             "open and honor project .cockpit config",
-            cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+            cockpit_config::WorkspaceTrustMode::Trust,
         ),
         (
             "ignore-config",
             "open but ignore project .cockpit config and approvals",
-            cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+            cockpit_config::WorkspaceTrustMode::IgnoreConfig,
         ),
         (
             "untrusted",
             "refuse to open",
-            cockpit_db::workspace_trust::WorkspaceTrustMode::Untrusted,
+            cockpit_config::WorkspaceTrustMode::Untrusted,
         ),
     ];
     let mut lines = vec![

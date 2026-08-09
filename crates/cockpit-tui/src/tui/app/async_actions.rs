@@ -302,6 +302,13 @@ impl App {
                     self.connector_disclosure = connector;
                 }
             }
+            AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
+                Ok(AsyncActionPayload::AssistantSessionResolved { session_id }) => {
+                    self.resume_session(session_id);
+                }
+                Ok(_) => self.push_plain("/assistant: unexpected daemon response".to_string()),
+                Err(error) => self.push_plain(format!("/assistant: Unavailable — {error}; Retry")),
+            },
             AsyncActionKind::Refresh("stats.rollup") => {
                 if let Overlay::Stats(pane) = &mut self.overlay
                     && let Ok(AsyncActionPayload::StatsRollup(result)) = result.payload
@@ -451,14 +458,14 @@ impl App {
                 }
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
-            AsyncActionKind::Internal("notes.db") => {
+            AsyncActionKind::Internal("notes.rpc") => {
                 if let Overlay::Notes(pane) = &mut self.overlay {
                     let payload = match result.payload {
-                        Ok(AsyncActionPayload::NotesDb(result)) => Ok(result),
+                        Ok(AsyncActionPayload::NotesRpc(result)) => Ok(result),
                         Ok(_) => Err("notes db returned an unexpected response".to_string()),
                         Err(e) => Err(e),
                     };
-                    pane.apply_db_result(payload);
+                    pane.apply_rpc_result(payload);
                 }
             }
             AsyncActionKind::DaemonRpc("goal.status" | "goal.set" | "goal.clear") => {
@@ -974,13 +981,13 @@ impl App {
         &mut self,
         key: crate::tui::stats_pane::StatsPaneFetchKey,
     ) {
-        let db = self.startup_background.db.clone();
-        self.async_actions.start(
+        let socket = self.startup_background.daemon_socket.clone();
+        self.async_actions.start_blocking(
             AsyncActionKind::Refresh("stats.rollup"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("stats.rollup")),
-            async move {
+            move || {
                 Ok(AsyncActionPayload::StatsRollup(
-                    crate::tui::stats_pane::fetch_stats_rollup(db, key).await,
+                    crate::tui::stats_pane::fetch_stats_rollup(socket.as_deref(), key),
                 ))
             },
         );

@@ -649,7 +649,7 @@ impl App {
 
     pub(super) fn set_goal_status(
         &mut self,
-        status: cockpit_db::session_goals::GoalStatus,
+        status: cockpit_core::daemon::proto::GoalStatus,
         label: &str,
     ) {
         let Some(session_id) = self.goal_session_id(label) else {

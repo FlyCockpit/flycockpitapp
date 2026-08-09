@@ -424,11 +424,8 @@ fn resolve_tui_llm_mode(
     providers.resolve_mode(provider, model, global)
 }
 
-const DAEMON_AUTOSTART_NOTICE_FLAG: &str = "daemon-autostart-notice-v1";
-
 fn startup_daemon_state(
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
 ) -> StartupDaemonState {
     let notice_seen = false;
     match cockpit_core::daemon::DaemonPaths::resolve() {
@@ -440,7 +437,7 @@ fn startup_daemon_state(
                 daemonless: false,
                 notice: None,
             },
-            status => daemon_not_running_state(status, paths, autostart, db, notice_seen),
+            status => daemon_not_running_state(status, paths, autostart, notice_seen),
         },
         Ok(_) => {
             let probe = cockpit_core::daemon::discover_blocking();
@@ -452,7 +449,7 @@ fn startup_daemon_state(
                     daemonless: false,
                     notice: None,
                 },
-                status => daemon_not_running_state(status, probe.paths, autostart, db, notice_seen),
+                status => daemon_not_running_state(status, probe.paths, autostart, notice_seen),
             }
         }
         Err(_) => StartupDaemonState {
@@ -469,10 +466,9 @@ fn daemon_not_running_state(
     status: cockpit_core::daemon::DaemonStatus,
     paths: cockpit_core::daemon::DaemonPaths,
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
 ) -> StartupDaemonState {
-    daemon_not_running_state_with_spawn(status, paths, autostart, db, notice_seen, || {
+    daemon_not_running_state_with_spawn(status, paths, autostart, notice_seen, || {
         cockpit_core::daemon::spawn_detached(false)
     })
 }
@@ -481,7 +477,6 @@ fn daemon_not_running_state_with_spawn(
     status: cockpit_core::daemon::DaemonStatus,
     paths: cockpit_core::daemon::DaemonPaths,
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
     spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
 ) -> StartupDaemonState {
@@ -501,7 +496,6 @@ fn daemon_not_running_state_with_spawn(
             socket: None,
             daemonless: true,
             notice: daemon_autostart_notice(
-                db,
                 notice_seen,
                 "started a private cockpit daemon for this window only",
             ),
@@ -513,7 +507,6 @@ fn daemon_not_running_state_with_spawn(
                 socket: Some(paths.socket.clone()),
                 daemonless: false,
                 notice: daemon_autostart_notice(
-                    db,
                     notice_seen,
                     &format!(
                         "started the cockpit daemon (pid {pid}) — persists across windows; `cockpit daemon stop` to stop"
@@ -535,15 +528,10 @@ fn daemon_not_running_state_with_spawn(
     }
 }
 
-fn daemon_autostart_notice(
-    db: Option<&cockpit_db::Db>,
-    notice_seen: bool,
-    text: &str,
-) -> Option<String> {
+fn daemon_autostart_notice(notice_seen: bool, text: &str) -> Option<String> {
     if notice_seen {
         return None;
     }
-    db?;
     Some(text.to_string())
 }
 
@@ -553,7 +541,7 @@ pub(crate) fn trusted_workspace_policy_for_tests(
 ) -> cockpit_config::trust::WorkspaceTrustPolicy {
     cockpit_config::trust::WorkspaceTrustPolicy {
         root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
-        mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
     }
 }
 
@@ -594,38 +582,35 @@ impl App {
         }
     }
 
-    /// The sole database connection opened during TUI startup. UI surfaces clone
-    /// this handle instead of reopening SQLite and revalidating migrations.
-    pub(super) fn shared_db(&self) -> Option<cockpit_db::Db> {
-        self.startup_background.db.clone()
-    }
-
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
         root: cockpit_config::trust::TrustRoot,
-        mode: cockpit_db::workspace_trust::WorkspaceTrustMode,
+        mode: cockpit_config::WorkspaceTrustMode,
     ) -> bool {
-        let Some(db) = self.startup_background.db.clone() else {
-            self.show_toast("workspace trust could not be saved", ToastKind::Error);
-            return false;
+        let rpc_mode = match mode {
+            cockpit_config::WorkspaceTrustMode::Trust => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::Trust
+            }
+            cockpit_config::WorkspaceTrustMode::IgnoreConfig => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::IgnoreConfig
+            }
+            cockpit_config::WorkspaceTrustMode::Untrusted => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
+            }
         };
-        let normalized_root = root.root.to_string_lossy().into_owned();
-        if let Err(error) = db.blocking_write_for_sync_ui(move |conn| {
-            cockpit_db::Db::set_workspace_trust_conn(
-                conn,
-                &normalized_root,
-                mode,
-                chrono::Utc::now().timestamp(),
-            )
-            .map(|_| ())
-        }) {
+        let request = cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+            project_root: root.root.to_string_lossy().into_owned(),
+            mode: rpc_mode,
+            expected_config_generation: self.config_snapshot.generation,
+        };
+        if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
             self.show_toast(
                 format!("workspace trust could not be saved: {error}"),
                 ToastKind::Error,
             );
             return false;
         }
-        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Untrusted {
+        if mode == cockpit_config::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
                 root.root.display()
@@ -636,7 +621,7 @@ impl App {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
             return false;
         }
-        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Trust {
+        if mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
@@ -1513,7 +1498,6 @@ pub(super) enum PaneSide {
 #[derive(Debug, Clone)]
 struct StartupBackground {
     daemon_socket: Option<PathBuf>,
-    db: Option<cockpit_db::Db>,
     started: bool,
 }
 
@@ -2311,10 +2295,10 @@ pub struct App {
     pub(super) pending_tandem_options: Vec<(String, String)>,
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
-    pub(super) org_sync_disclosure: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
+    pub(super) org_sync_disclosure: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
-    pub(super) connector_disclosure: Option<cockpit_db::connector::ConnectorDisclosure>,
+    pub(super) connector_disclosure: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -2910,65 +2894,43 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(
-            project,
-            no_sandbox,
-            None,
-            StartupWorkspaceTrust::Decided,
-            None,
-        )
+        Self::new_inner(project, no_sandbox, StartupWorkspaceTrust::Decided, None)
     }
 
-    #[cfg(test)]
-    pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: cockpit_db::Db) -> Self {
-        Self::new_inner(
-            project,
-            no_sandbox,
-            Some(db),
-            StartupWorkspaceTrust::Decided,
-            None,
-        )
-    }
-
-    pub fn new_with_db_and_workspace_trust(
+    pub fn new_with_workspace_trust(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
     ) -> Self {
-        Self::new_with_db_and_workspace_trust_and_launch_start(project, no_sandbox, db, trust, None)
+        Self::new_with_workspace_trust_and_launch_start(project, no_sandbox, trust, None)
     }
 
-    pub fn new_with_db_and_workspace_trust_and_launch_start(
+    pub fn new_with_workspace_trust_and_launch_start(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, Some(db), trust, launch_start)
+        Self::new_inner(project, no_sandbox, trust, launch_start)
     }
 
-    pub fn new_with_db_and_session(
+    pub fn new_with_session(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         session_id: uuid::Uuid,
     ) -> Self {
-        Self::new_with_db_and_session_and_launch_start(project, no_sandbox, db, session_id, None)
+        Self::new_with_session_and_launch_start(project, no_sandbox, session_id, None)
     }
 
-    pub fn new_with_db_and_session_and_launch_start(
+    pub fn new_with_session_and_launch_start(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         session_id: uuid::Uuid,
         launch_start: Option<Instant>,
     ) -> Self {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
-            Some(db),
             StartupWorkspaceTrust::Decided,
             launch_start,
         );
@@ -2985,7 +2947,6 @@ impl App {
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
-        startup_db: Option<cockpit_db::Db>,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
@@ -3053,7 +3014,7 @@ impl App {
         // Probe the daemon synchronously up front so startup can either
         // autostart it per config or show the ask-mode/failure prompt on the
         // first frame.
-        let daemon_state = startup_daemon_state(extended.daemon.autostart, startup_db.as_ref());
+        let daemon_state = startup_daemon_state(extended.daemon.autostart);
         timer.phase("daemon_probe");
         let org_sync_disclosure = None;
         let connector_disclosure = None;
@@ -3155,7 +3116,6 @@ impl App {
             skills_pane_generation: 0,
             startup_background: StartupBackground {
                 daemon_socket: daemon_state.socket,
-                db: startup_db,
                 started: false,
             },
             startup_daemon_notice: daemon_state.notice,
@@ -3351,16 +3311,27 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        if let Some(notice) = self.startup_daemon_notice.take()
-            && let Some(db) = self.startup_background.db.as_ref()
-        {
-            let notice_seen = db
-                .app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
-                .await
-                .unwrap_or(false);
-            if !notice_seen {
-                let _ = db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).await;
-                self.show_toast(notice, ToastKind::Info);
+        if let Some(notice) = self.startup_daemon_notice.take() {
+            let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
+            let state = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::GetAppFlag { key },
+            );
+            match state {
+                Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
+                Ok(cockpit_core::daemon::proto::Response::AppFlag {
+                    seen: false,
+                    version,
+                    ..
+                }) => {
+                    let _ = crate::tui::agent_runner::daemon_request_blocking(
+                        cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                            key,
+                            expected_version: version,
+                        },
+                    );
+                    self.show_toast(notice, ToastKind::Info);
+                }
+                _ => self.show_toast(notice, ToastKind::Info),
             }
         }
 

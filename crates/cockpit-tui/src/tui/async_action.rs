@@ -74,8 +74,11 @@ pub enum AsyncActionPayload {
     SideSessionReturned(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
-        org: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
-        connector: Option<cockpit_db::connector::ConnectorDisclosure>,
+        org: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
+        connector: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
+    },
+    AssistantSessionResolved {
+        session_id: uuid::Uuid,
     },
     StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
     SubagentHistory {
@@ -117,7 +120,7 @@ pub enum AsyncActionPayload {
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_core::daemon::proto::Response),
-    NotesDb(crate::tui::notes_pane::NotesDbResult),
+    NotesRpc(crate::tui::notes_pane::NotesRpcResult),
     PasteTokenCount {
         block_id: u64,
         tokens: usize,
@@ -136,7 +139,7 @@ pub enum AsyncActionPayload {
     },
     PinsReview {
         session_id: uuid::Uuid,
-        pins: Vec<cockpit_db::pins::PinnedMessage>,
+        pins: Vec<cockpit_core::daemon::proto::PinnedMessage>,
     },
     PinMessage {
         session_id: uuid::Uuid,

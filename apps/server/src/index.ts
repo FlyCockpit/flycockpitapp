@@ -12,7 +12,7 @@ import { runWithAllowedUserCreation } from "@flycockpit/auth/user-creation-polic
 import { THEME_INIT_SCRIPT } from "@flycockpit/config/theme-init";
 import prisma from "@flycockpit/db";
 import { ADMIN_EMAILS, env, SIGNUP_ENABLED } from "@flycockpit/env/server";
-import { redisConnection } from "@flycockpit/queue";
+import { getRedisConnection } from "@flycockpit/queue";
 import { serve } from "@hono/node-server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
@@ -168,6 +168,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 app.get("/api/meta/profile", (c) => c.json(getPublicDeploymentProfile()));
 mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
+const redisConnection = getRedisConnection();
 const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
 app.use("/api/remote/*", createRateLimiterMiddleware(rpcLimiter));
 mountRemoteAuthorityRoutes(app, {

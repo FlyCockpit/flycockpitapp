@@ -1,11 +1,24 @@
 import type { Session } from "@flycockpit/auth";
 import { env } from "@flycockpit/env/server";
-import { redisConnection } from "@flycockpit/queue";
+import { getRedisConnection } from "@flycockpit/queue";
 import type { Context, Next } from "hono";
 import { RateLimiterMemory, RateLimiterRedis, RateLimiterRes } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
 
 type RateLimiter = Pick<RateLimiterRedis, "consume" | "points">;
+type RedisLimiterOptions = Omit<ConstructorParameters<typeof RateLimiterRedis>[0], "storeClient">;
+function lazyRedisLimiter(options: RedisLimiterOptions): RateLimiterRedis {
+  let limiter: RateLimiterRedis | undefined;
+  const current = () =>
+    (limiter ??= new RateLimiterRedis({ ...options, storeClient: getRedisConnection() }));
+  return new Proxy({} as RateLimiterRedis, {
+    get: (_target, property) => {
+      const value = Reflect.get(current(), property);
+      return typeof value === "function" ? value.bind(current()) : value;
+    },
+    set: (_target, property, value) => Reflect.set(current(), property, value),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Rate limiters backed by Redis with in-memory insurance
@@ -27,8 +40,7 @@ type RateLimiter = Pick<RateLimiterRedis, "consume" | "points">;
  *
  * 10 requests / 60 s per key. Offenders are blocked for 15 minutes.
  */
-export const authLimiter = new RateLimiterRedis({
-  storeClient: redisConnection,
+export const authLimiter = lazyRedisLimiter({
   keyPrefix: "rl:auth",
   points: env.RATE_LIMIT_AUTH_POINTS,
   duration: env.RATE_LIMIT_AUTH_DURATION,
@@ -50,8 +62,7 @@ export const authLimiter = new RateLimiterRedis({
  * Must be mounted BEFORE the general authLimiter so signup traffic hits this
  * tighter limit first; the authLimiter still applies as a second layer.
  */
-export const signupLimiter = new RateLimiterRedis({
-  storeClient: redisConnection,
+export const signupLimiter = lazyRedisLimiter({
   keyPrefix: "rl:signup",
   points: env.RATE_LIMIT_SIGNUP_POINTS,
   duration: env.RATE_LIMIT_SIGNUP_DURATION,
@@ -71,8 +82,7 @@ export const signupLimiter = new RateLimiterRedis({
  *
  * 100 requests / 60 s per key.
  */
-export const rpcLimiter = new RateLimiterRedis({
-  storeClient: redisConnection,
+export const rpcLimiter = lazyRedisLimiter({
   keyPrefix: "rl:rpc",
   points: env.RATE_LIMIT_RPC_POINTS,
   duration: env.RATE_LIMIT_RPC_DURATION,
@@ -89,8 +99,7 @@ export const rpcLimiter = new RateLimiterRedis({
  * Instance invite limiters — stricter than the generic RPC limiter and keyed
  * by both owner and target email to limit account-level and recipient spam.
  */
-export const instanceInviteOwnerLimiter = new RateLimiterRedis({
-  storeClient: redisConnection,
+export const instanceInviteOwnerLimiter = lazyRedisLimiter({
   keyPrefix: "rl:instance-invite:owner",
   points: env.RATE_LIMIT_INSTANCE_INVITE_POINTS,
   duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,
@@ -105,8 +114,7 @@ export const instanceInviteOwnerLimiter = new RateLimiterRedis({
   }),
 });
 
-export const instanceInviteTargetLimiter = new RateLimiterRedis({
-  storeClient: redisConnection,
+export const instanceInviteTargetLimiter = lazyRedisLimiter({
   keyPrefix: "rl:instance-invite:target",
   points: env.RATE_LIMIT_INSTANCE_INVITE_POINTS,
   duration: env.RATE_LIMIT_INSTANCE_INVITE_DURATION,

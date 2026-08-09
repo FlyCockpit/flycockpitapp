@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
+use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs, ImageSpendArgs};
 use crate::config::extended::{DeepthinkConfig, ExtendedConfig, ExtendedConfigDoc};
 use crate::config::providers::{HeaderSpec, ProviderEntry, ProvidersConfig};
 
@@ -12,9 +12,47 @@ const POLICY_BUNDLE_VERSION: u32 = 1;
 
 pub async fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
+        ConfigCommand::ImageSpend(args) => image_spend(args).await,
         ConfigCommand::ExportPolicy(args) => export_policy(args).await,
         ConfigCommand::ImportPolicy(args) => import_policy(args).await,
     }
+}
+
+async fn image_spend(args: ImageSpendArgs) -> Result<()> {
+    let project_key = args
+        .project_key
+        .context("--project-key is required to read or save image spend policy")?;
+    let db = cockpit_db::Db::open_default().context("opening cockpit database")?;
+    if let Some(file) = args.save {
+        let raw = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let settings =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", file.display()))?;
+        let current = db.current_image_spend_policy(project_key.clone()).await?;
+        let saved_at_ms = chrono::Utc::now().timestamp_millis();
+        let saved = cockpit_config::config::image_spend::activate_saved_policy(
+            &db,
+            project_key,
+            settings,
+            current.map(|value| value.policy_version),
+            saved_at_ms,
+        )
+        .await?;
+        println!("saved image spend policy version {}", saved.policy_version);
+        return Ok(());
+    }
+    let settings = db
+        .current_image_spend_policy(project_key)
+        .await?
+        .map(|current| current.settings)
+        .unwrap_or_default();
+    println!("{}", serde_json::to_string_pretty(&settings)?);
+    if let Err(reason) = settings.validate() {
+        println!(
+            "paid image dispatch blocked: {reason:?}; review and save request, session, project, and project-window settings"
+        );
+    }
+    Ok(())
 }
 
 async fn export_policy(args: ConfigExportPolicyArgs) -> Result<()> {

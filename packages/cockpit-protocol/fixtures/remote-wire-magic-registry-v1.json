@@ -13,7 +13,7 @@
   },
   {
     "magic": "FCAB",
-    "symbolicType": "RemoteAttemptBindingV1",
+    "symbolicType": "RemoteChildAuthenticationBundleV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -31,7 +31,7 @@
   },
   {
     "magic": "FCAK",
-    "symbolicType": "RemoteAttemptKeyV1",
+    "symbolicType": "RemoteSignalingCommitAckV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -55,7 +55,7 @@
   },
   {
     "magic": "FCCP",
-    "symbolicType": "RemoteControlPlanePolicyV1",
+    "symbolicType": "ClientAdmissionProofV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -79,7 +79,7 @@
   },
   {
     "magic": "FCDO",
-    "symbolicType": "RemoteDaemonOfferV1",
+    "symbolicType": "DaemonAdmissionOfferV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -103,7 +103,7 @@
   },
   {
     "magic": "FCFP",
-    "symbolicType": "RemoteFrameProofV1",
+    "symbolicType": "RemoteEndpointFinalProofV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -223,7 +223,7 @@
   },
   {
     "magic": "FCSE",
-    "symbolicType": "RemoteSessionEvidenceV1",
+    "symbolicType": "RemoteSignalingEventRequestV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -271,25 +271,25 @@
   },
   {
     "magic": "FCWC",
-    "symbolicType": "RemoteWebsocketChallengeV1",
+    "symbolicType": "RemoteWebRtcCandidateV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
   {
     "magic": "FCWE",
-    "symbolicType": "RemoteWebsocketEvidenceV1",
+    "symbolicType": "RemoteWebRtcIceCompleteV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
   {
     "magic": "FCWN",
-    "symbolicType": "RemoteWebsocketNonceV1",
+    "symbolicType": "RemoteWebRtcAnswerV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
   {
     "magic": "FCWO",
-    "symbolicType": "RemoteWebsocketOfferV1",
+    "symbolicType": "RemoteWebRtcOfferV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },

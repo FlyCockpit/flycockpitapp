@@ -26,6 +26,7 @@
 
 pub mod remote_identity_protocol;
 pub mod remote_protocol_id;
+pub mod remote_signaling_attempt_store;
 pub mod remote_transport;
 pub mod remote_wire_magic_registry;
 pub mod terminal;
@@ -42,6 +43,18 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use uuid::Uuid;
+
+/// Source-preserving image spend settings shared by daemon clients.
+pub type ImageSpendPolicyView = cockpit_config::config::image_spend::ImageSpendSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSpendPreflightView {
+    pub policy: ImageSpendPolicyView,
+    pub blocked: Option<cockpit_config::config::image_spend::BudgetBlockReason>,
+    pub policy_version: Option<u64>,
+    pub epoch_policy_version: Option<u64>,
+    pub epoch_sequence: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

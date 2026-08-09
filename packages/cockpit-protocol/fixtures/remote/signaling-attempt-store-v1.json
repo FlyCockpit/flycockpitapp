@@ -1,0 +1,308 @@
+{
+  "version": 1,
+  "limits": {
+    "headerBytes": 44,
+    "requestBytes": 131072,
+    "eventCount": 256,
+    "aggregateBytes": 2097152
+  },
+  "payloads": {
+    "fcabHex": "46434142010102030405060708090a0b0c0d0e0f1000010100010200010300010400010500",
+    "fallbackPairHex": "0102030405060708090a0b0c0d0e0f1000000000000000010000000000000001000000000000000100000000000000010000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "fallbackNoiseHex": "010102030405060708090a0b0c0d0e0f100000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "readyHex": "0102030405060708090a0b0c0d0e0f10aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "transitions": [
+    {
+      "transport": "common",
+      "event": "attempt_available",
+      "role": "server",
+      "from": "absent",
+      "to": "created",
+      "prerequisites": [],
+      "result": "created",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "common",
+      "event": "daemon_admission_offer",
+      "role": "daemon",
+      "from": "created",
+      "to": "daemon_offered",
+      "prerequisites": [],
+      "result": "daemon_offered",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "common",
+      "event": "client_admission_proof",
+      "role": "client",
+      "from": "daemon_offered",
+      "to": "admitted",
+      "prerequisites": [],
+      "result": "admitted",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "webrtc",
+      "event": "offer",
+      "role": "client",
+      "from": "admitted",
+      "to": "offered",
+      "prerequisites": [],
+      "result": "offered",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "webrtc",
+      "event": "answer",
+      "role": "daemon",
+      "from": "offered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ice_candidate",
+      "role": "client",
+      "from": "offered|answered",
+      "to": "offered",
+      "prerequisites": [],
+      "result": "offered",
+      "slotCardinality": "repeatable"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ice_candidate",
+      "role": "daemon",
+      "from": "answered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "repeatable"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ice_complete",
+      "role": "client",
+      "from": "offered|answered",
+      "to": "offered",
+      "prerequisites": [],
+      "result": "offered",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ice_complete",
+      "role": "daemon",
+      "from": "answered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "webrtc",
+      "event": "client_final_proof",
+      "role": "client",
+      "from": "answered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "webrtc",
+      "event": "daemon_final_proof",
+      "role": "daemon",
+      "from": "answered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ready",
+      "role": "client",
+      "from": "answered",
+      "to": "answered",
+      "prerequisites": [],
+      "result": "answered",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "fallback_pair_authenticated",
+      "role": "server",
+      "from": "admitted",
+      "to": "fallback_paired",
+      "prerequisites": [],
+      "result": "fallback_paired",
+      "slotCardinality": "one_per_attempt"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "fallback_noise_complete",
+      "role": "client",
+      "from": "fallback_paired",
+      "to": "fallback_paired",
+      "prerequisites": [],
+      "result": "fallback_paired",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "fallback_noise_complete",
+      "role": "daemon",
+      "from": "fallback_paired",
+      "to": "fallback_noise_complete",
+      "prerequisites": [],
+      "result": "fallback_noise_complete",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "webrtc",
+      "event": "ready",
+      "role": "daemon",
+      "from": "answered",
+      "to": "completed",
+      "prerequisites": [],
+      "result": "completed",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "client_final_proof",
+      "role": "client",
+      "from": "fallback_noise_complete",
+      "to": "fallback_noise_complete",
+      "prerequisites": [],
+      "result": "fallback_noise_complete",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "daemon_final_proof",
+      "role": "daemon",
+      "from": "fallback_noise_complete",
+      "to": "fallback_noise_complete",
+      "prerequisites": [],
+      "result": "fallback_noise_complete",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "ready",
+      "role": "client",
+      "from": "fallback_noise_complete",
+      "to": "fallback_noise_complete",
+      "prerequisites": [],
+      "result": "fallback_noise_complete",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "websocket_data",
+      "event": "ready",
+      "role": "daemon",
+      "from": "fallback_noise_complete",
+      "to": "completed",
+      "prerequisites": [],
+      "result": "completed",
+      "slotCardinality": "one_per_role"
+    },
+    {
+      "transport": "common",
+      "event": "attempt_rejected",
+      "role": "server",
+      "from": "nonterminal",
+      "to": "rejected",
+      "prerequisites": [],
+      "result": "rejected",
+      "slotCardinality": "one_terminal"
+    },
+    {
+      "transport": "common",
+      "event": "attempt_cancelled",
+      "role": "client",
+      "from": "nonterminal",
+      "to": "cancelled",
+      "prerequisites": [],
+      "result": "cancelled",
+      "slotCardinality": "one_terminal"
+    },
+    {
+      "transport": "common",
+      "event": "attempt_rejected",
+      "role": "daemon",
+      "from": "nonterminal",
+      "to": "rejected",
+      "prerequisites": [],
+      "result": "rejected",
+      "slotCardinality": "one_terminal"
+    },
+    {
+      "transport": "common",
+      "event": "attempt_cancelled",
+      "role": "daemon",
+      "from": "nonterminal",
+      "to": "cancelled",
+      "prerequisites": [],
+      "result": "cancelled",
+      "slotCardinality": "one_terminal"
+    },
+    {
+      "transport": "common",
+      "event": "attempt_superseded",
+      "role": "server",
+      "from": "nonterminal",
+      "to": "superseded",
+      "prerequisites": [],
+      "result": "superseded",
+      "slotCardinality": "one_terminal"
+    }
+  ],
+  "requests": [
+    {
+      "name": "attempt_available_fcab",
+      "requestHex": "46435345010101010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f200000002546434142010102030405060708090a0b0c0d0e0f1000010100010200010300010400010500",
+      "eventDigestHex": "7c163e64d9e1a021b86d2b475d3385dca021ecac2ee1545f7715f725292359e8",
+      "ackHex": "4643414b011112131415161718191a1b1c1d1e1f2000000000000000017c163e64d9e1a021b86d2b475d3385dca021ecac2ee1545f7715f725292359e8"
+    },
+    {
+      "name": "attempt_superseded_payload",
+      "requestHex": "464353450101010f0102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f30000000102122232425262728292a2b2c2d2e2f30",
+      "eventDigestHex": "d6e380df0457c025b75c2f77e83fed3518eabd11ae6804e4754914aae635386d",
+      "ackHex": "4643414b012122232425262728292a2b2c2d2e2f300000000000000002d6e380df0457c025b75c2f77e83fed3518eabd11ae6804e4754914aae635386d"
+    }
+  ],
+  "malformedRequests": [
+    {
+      "name": "truncated",
+      "requestHex": "4643534501",
+      "rejection": "length"
+    },
+    {
+      "name": "zero_child",
+      "requestHex": "4643534501010101000000000000000000000000000000001112131415161718191a1b1c1d1e1f2000000000",
+      "rejection": "zero_id"
+    },
+    {
+      "name": "wrong_magic",
+      "requestHex": "47435345010101010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000000",
+      "rejection": "preamble"
+    },
+    {
+      "name": "unknown_role",
+      "requestHex": "46435345010100010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000000",
+      "rejection": "discriminant"
+    },
+    {
+      "name": "wrong_role_for_available",
+      "requestHex": "46435345010103010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000000",
+      "rejection": "combination"
+    }
+  ]
+}

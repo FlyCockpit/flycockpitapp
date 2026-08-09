@@ -145,6 +145,7 @@ fn target_package_features(
         .map(|package| (package, BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
     let mut reported_packages = BTreeSet::new();
+    let mut feature_activations = Vec::new();
 
     for line in feature_tree.lines() {
         let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
@@ -153,7 +154,12 @@ fn target_package_features(
             let Some((name, version)) = subject.rsplit_once(" v") else {
                 panic!("unexpected cargo feature-tree package row: {row}");
             };
-            let version = version.split_whitespace().next().unwrap();
+            let Some(version) = version.split_whitespace().next() else {
+                panic!("malformed cargo feature-tree package row with empty version: {row}");
+            };
+            if name.is_empty() {
+                panic!("malformed cargo feature-tree package row with empty name: {row}");
+            }
             let key = format!("{name}@{version}");
             let Some(actual) = package_features.get_mut(&key) else {
                 panic!("cargo feature tree contains package outside normal/build graph: {key}");
@@ -194,6 +200,27 @@ fn target_package_features(
                 .any(|package| package.starts_with(&package_prefix)),
             "cargo feature tree contains activation for package outside normal/build graph: {subject}"
         );
+        feature_activations.push((subject.to_owned(), package_name, &feature[..feature.len() - 1]));
+    }
+
+    for (subject, package_name, feature) in feature_activations {
+        let package_prefix = format!("{package_name}@");
+        let matching_packages = reported_packages
+            .iter()
+            .filter(|package| package.starts_with(&package_prefix))
+            .filter(|package| package_features[*package].contains(feature))
+            .collect::<Vec<_>>();
+        match matching_packages.as_slice() {
+            [_] => {}
+            [] => panic!(
+                "cargo feature activation is absent from every reported resolved feature set: \
+                 {subject}"
+            ),
+            packages => panic!(
+                "cargo feature activation is ambiguous across package versions for {subject}: \
+                 {packages:?}"
+            ),
+        }
     }
 
     package_features
@@ -233,6 +260,26 @@ fn target_package_feature_inventory_is_total_for_featureless_graph_packages() {
 fn target_package_feature_inventory_rejects_unobserved_packages() {
     target_package_features(
         "0image v0.25.10|png\n1surprise v1.0.0|default\n",
+        &BTreeSet::from(["image@0.25.10".to_owned()]),
+    );
+}
+
+#[test]
+#[should_panic(expected =
+    "feature activation is absent from every reported resolved feature set: png feature \"fake\""
+)]
+fn target_package_feature_inventory_rejects_unreported_activations() {
+    target_package_features(
+        "0image v0.25.10|png\n1png feature \"fake\"\n2png v0.18.0|default,std\n",
+        &BTreeSet::from(["image@0.25.10".to_owned(), "png@0.18.0".to_owned()]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "package row with empty version: image v|png")]
+fn target_package_feature_inventory_rejects_empty_versions_precisely() {
+    target_package_features(
+        "0image v|png\n",
         &BTreeSet::from(["image@0.25.10".to_owned()]),
     );
 }

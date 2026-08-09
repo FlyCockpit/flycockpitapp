@@ -110,14 +110,15 @@ pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> b
     }
 }
 
-/// Select the executables used by the media inspection/decoding path.
+/// Select the resolved executable paths used by the media inspection/decoding
+/// path.
 ///
 /// Callers must obtain the pair through this gate immediately before spawning
 /// either process. Returning paths independently would permit an incompatible
 /// FFmpeg/FFprobe pair to escape the health rule.
 pub fn select_media_runtime_pair(
     snapshot: &ExternalRuntimeSnapshot,
-) -> Result<(&str, &str), &'static str> {
+) -> Result<(&Path, &Path), &'static str> {
     if !media_runtime_pair_is_compatible(snapshot) {
         return Err("media inspection requires a healthy compatible FFmpeg/FFprobe pair");
     }

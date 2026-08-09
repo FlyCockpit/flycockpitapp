@@ -63,7 +63,7 @@ fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
     assert!(media_runtime_pair_is_compatible(&available));
     assert_eq!(
         select_media_runtime_pair(&available),
-        Ok(("/tools/ffmpeg", "/tools/ffprobe"))
+        Ok((Path::new("/tools/ffmpeg"), Path::new("/tools/ffprobe")))
     );
     assert!(matches!(
         available.get(ID_MEDIA_FFMPEG).unwrap().state,

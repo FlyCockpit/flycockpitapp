@@ -781,15 +781,24 @@ impl RemoteBulkTransferRef {
         sha256: [u8; 32],
         mime_class: RemoteBulkMimeClass,
     ) -> RemoteTransportResult<Self> {
-        if total_length > mime_class.max_total_length() {
-            return Err(bulk_err(RemoteTransportReason::BulkClassLimit));
-        }
-        Ok(Self {
+        let reference = Self {
             transfer_id,
             total_length: CanonicalU64DecimalStringV1::from_u64(total_length),
             sha256,
             mime_class,
-        })
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Revalidate the semantic relationship between otherwise canonical
+    /// public wire fields. Binary canonicalizers call this too, so an
+    /// in-process struct literal cannot bypass the class ceiling.
+    pub fn validate(&self) -> RemoteTransportResult<()> {
+        if self.total_length.value() > self.mime_class.max_total_length() {
+            return Err(bulk_err(RemoteTransportReason::BulkClassLimit));
+        }
+        Ok(())
     }
 
     pub fn total_length_value(&self) -> u64 {

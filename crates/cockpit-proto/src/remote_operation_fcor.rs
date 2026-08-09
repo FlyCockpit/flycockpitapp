@@ -204,6 +204,8 @@ impl CanonicalFcorValueV1 for crate::remote_protocol_id::RemoteTransferId {
 
 impl CanonicalFcorValueV1 for crate::remote_transport::bulk::RemoteBulkTransferRef {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut nested = CanonicalParamsV1::new();
         self.transfer_id.encode_fcor_value_v1(&mut nested)?;
         nested.push_u64(self.total_length.value());
@@ -517,6 +519,104 @@ pub fn validate_fcor_v1(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_reference_value_bytes_are_exact_and_revalidate_class_limit() {
+        use crate::remote_protocol_id::{kind, tag_protocol_id_bytes};
+        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+        let reference = RemoteBulkTransferRef::new(
+            tag_protocol_id_bytes::<kind::Transfer>([1; 16]).unwrap(),
+            5,
+            [2; 32],
+            RemoteBulkMimeClass::Opaque,
+        )
+        .unwrap();
+        let mut encoded = CanonicalParamsV1::new();
+        reference.encode_fcor_value_v1(&mut encoded).unwrap();
+        assert_eq!(
+            hex(&encoded.into_bytes()),
+            "010101010101010101010101010101010000000000000005020202020202020202020202020202020202020202020202020202020202020205"
+        );
+
+        let invalid = RemoteBulkTransferRef {
+            transfer_id: reference.transfer_id,
+            total_length: crate::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                RemoteBulkMimeClass::Image.max_total_length() + 1,
+            ),
+            sha256: [2; 32],
+            mime_class: RemoteBulkMimeClass::Image,
+        };
+        assert!(
+            invalid
+                .encode_fcor_value_v1(&mut CanonicalParamsV1::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn frozen_enum16_ordinals_match_shared_fixture() {
+        fn ordinal(value: &impl CanonicalFcorValueV1) -> u16 {
+            let mut bytes = CanonicalParamsV1::new();
+            value.encode_fcor_value_v1(&mut bytes).unwrap();
+            u16::from_be_bytes(bytes.into_bytes().try_into().unwrap())
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-operation-enum16-v1.json"
+        ))
+        .unwrap();
+        let expected = &fixture["ordinals"];
+        macro_rules! check {
+            ($key:literal, $value:expr) => {
+                assert_eq!(ordinal(&$value), expected[$key].as_u64().unwrap() as u16)
+            };
+        }
+        check!("env_drift_policy.daemon", crate::EnvDriftPolicy::Daemon);
+        check!("env_drift_policy.client", crate::EnvDriftPolicy::Client);
+        check!(
+            "env_drift_policy.update_daemon",
+            crate::EnvDriftPolicy::UpdateDaemon
+        );
+        check!(
+            "env_drift_policy.error_on_drift",
+            crate::EnvDriftPolicy::ErrorOnDrift
+        );
+        check!("caffeinate_mode.toggle", crate::CaffeinateMode::Toggle);
+        check!("caffeinate_mode.on", crate::CaffeinateMode::On);
+        check!("caffeinate_mode.off", crate::CaffeinateMode::Off);
+        check!(
+            "caffeinate_mode.until_idle",
+            crate::CaffeinateMode::UntilIdle
+        );
+        check!(
+            "workspace_trust_mode.trust",
+            crate::WorkspaceTrustMode::Trust
+        );
+        check!(
+            "workspace_trust_mode.ignore_config",
+            crate::WorkspaceTrustMode::IgnoreConfig
+        );
+        check!(
+            "workspace_trust_mode.untrusted",
+            crate::WorkspaceTrustMode::Untrusted
+        );
+        check!("usage_kind.model", crate::UsageKind::Model);
+        check!("usage_kind.slash", crate::UsageKind::Slash);
+        check!("usage_kind.tag", crate::UsageKind::Tag);
+        check!("lsp_control_action.check", crate::LspControlAction::Check);
+        check!(
+            "lsp_control_action.install",
+            crate::LspControlAction::Install
+        );
+        check!(
+            "lsp_control_action.uninstall",
+            crate::LspControlAction::Uninstall
+        );
+        check!(
+            "lsp_control_action.restart",
+            crate::LspControlAction::Restart
+        );
+        assert_eq!(expected.as_object().unwrap().len(), 34);
+    }
 
     #[test]
     fn fcor_cross_language_vector_is_exact() {

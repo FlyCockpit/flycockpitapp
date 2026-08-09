@@ -1102,13 +1102,11 @@ impl App {
         for slot in &fence.slots {
             if let crate::tui::structured_paste::PasteSlotState::Ready {
                 original_offset,
-                png,
+                png: Some(png),
                 ..
             } = slot
             {
-                if let Some(png) = png {
-                    resolved_images.push((*original_offset, png.clone()));
-                }
+                resolved_images.push((*original_offset, png.clone()));
             }
         }
         resolved_images.sort_by_key(|(offset, _)| *offset);

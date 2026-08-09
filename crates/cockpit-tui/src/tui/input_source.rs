@@ -231,10 +231,7 @@ impl TerminalInput {
         while let Some(event) = self.pending_observed.pop_front() {
             ready.push((event.observed_at, 0_u8, Some(event)));
         }
-        loop {
-            let Some(event) = self.native_paste_rx.try_recv().ok() else {
-                break;
-            };
+        while let Ok(event) = self.native_paste_rx.try_recv() {
             ready.push((event.observed_at, 0_u8, Some(event)));
         }
         let Some(stream) = self.stream.as_mut() else {

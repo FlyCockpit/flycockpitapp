@@ -188,6 +188,7 @@ pub(super) struct SettingsPointerSurface {
     pub targets: RefCell<Vec<SettingsPointerTarget>>,
     pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
     pub hover: std::cell::Cell<Option<SettingsControlId>>,
+    pub header_hover: std::cell::Cell<Option<SettingsHeaderAction>>,
     pub enabled: std::cell::Cell<bool>,
     pub pressed: std::cell::Cell<Option<SettingsPointerAction>>,
 }
@@ -200,6 +201,7 @@ impl Default for SettingsPointerSurface {
             targets: RefCell::new(Vec::new()),
             scroll_regions: RefCell::new(Vec::new()),
             hover: std::cell::Cell::new(None),
+            header_hover: std::cell::Cell::new(None),
             enabled: std::cell::Cell::new(true),
             pressed: std::cell::Cell::new(None),
         }
@@ -210,6 +212,7 @@ impl SettingsPointerSurface {
     pub fn clear_for(&self, area: Rect) {
         if self.area.get() != Some(area) {
             self.hover.set(None);
+            self.header_hover.set(None);
         }
         self.area.set(Some(area));
         self.targets.borrow_mut().clear();
@@ -219,6 +222,7 @@ impl SettingsPointerSurface {
     pub fn clear_for_page(&self, area: Rect, page_token: u64) {
         if self.page_token.replace(Some(page_token)) != Some(page_token) {
             self.hover.set(None);
+            self.header_hover.set(None);
             self.pressed.set(None);
         }
         self.clear_for(area);

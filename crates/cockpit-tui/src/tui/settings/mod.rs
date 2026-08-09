@@ -2090,22 +2090,31 @@ impl SettingsDialog {
             || mouse.row < area.y
             || mouse.row >= area.bottom()
         {
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                self.pointer_surface.hover.set(None);
+                self.pointer_surface.header_hover.set(None);
+            }
             return SettingsPointerOutcome::Consumed;
         }
         match mouse.kind {
             MouseEventKind::Moved => {
-                self.pointer_surface.hover.set(
-                    self.pointer_surface
-                        .hit(mouse.column, mouse.row)
-                        .filter(|target| target.enabled)
-                        .and_then(|target| match target.action {
-                            SettingsPointerAction::Page(id) => Some(id),
-                            SettingsPointerAction::Header(_) => None,
-                        }),
-                );
+                let action = self
+                    .pointer_surface
+                    .hit(mouse.column, mouse.row)
+                    .filter(|target| target.enabled)
+                    .map(|target| target.action);
+                self.pointer_surface.hover.set(match action {
+                    Some(SettingsPointerAction::Page(id)) => Some(id),
+                    _ => None,
+                });
+                self.pointer_surface.header_hover.set(match action {
+                    Some(SettingsPointerAction::Header(action)) => Some(action),
+                    _ => None,
+                });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.pointer_surface.hover.set(None);
+                self.pointer_surface.header_hover.set(None);
                 if let Some(region) = self
                     .pointer_surface
                     .scroll_region_at(mouse.column, mouse.row)
@@ -2221,7 +2230,17 @@ impl SettingsDialog {
             Constraint::Length(1),
         ])
         .split(inner);
-        let mut header = vec![Span::raw("[Close settings]")];
+        let header_style = |action| {
+            if self.pointer_surface.header_hover.get() == Some(action) {
+                Style::default().add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            }
+        };
+        let mut header = vec![Span::styled(
+            "[Close settings]",
+            header_style(SettingsHeaderAction::Close),
+        )];
         self.pointer_surface.register(SettingsPointerTarget {
             rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
             action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
@@ -2230,7 +2249,10 @@ impl SettingsDialog {
         });
         let root = self.page.as_any().is::<RootPage>();
         if !root || !self.stack.is_empty() {
-            header.push(Span::raw("  [Back]"));
+            header.push(Span::styled(
+                "  [Back]",
+                header_style(SettingsHeaderAction::Back),
+            ));
             self.pointer_surface.register(SettingsPointerTarget {
                 rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
                 action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
@@ -2238,7 +2260,10 @@ impl SettingsDialog {
                 disabled_reason: None,
             });
         } else if self.picker_cwd.is_some() {
-            header.push(Span::raw("  [Back to config picker]"));
+            header.push(Span::styled(
+                "  [Back to config picker]",
+                header_style(SettingsHeaderAction::BackToConfigPicker),
+            ));
             self.pointer_surface.register(SettingsPointerTarget {
                 rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
                 action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),

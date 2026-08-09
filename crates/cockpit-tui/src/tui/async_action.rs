@@ -335,11 +335,11 @@ impl AsyncActionRunner {
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                matches!(pending.kind, AsyncActionKind::Blocking(_))
+                matches!(&pending.kind, AsyncActionKind::Blocking(_))
                     .then_some(*id)
                     .filter(|_| {
                         !matches!(
-                            pending.kind,
+                            &pending.kind,
                             AsyncActionKind::Blocking("export.transcript" | "export.debug")
                         )
                     })
@@ -355,7 +355,7 @@ impl AsyncActionRunner {
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                (matches!(pending.kind, AsyncActionKind::Blocking(_))
+                (matches!(&pending.kind, AsyncActionKind::Blocking(_))
                     && now.saturating_duration_since(pending.started_at) >= timeout)
                     .then_some((*id, pending.kind.clone()))
             })

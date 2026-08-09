@@ -840,7 +840,7 @@ fn render_grab_list(
         }));
         if pending {
             controls.push(None);
-            confirmation_lines.push((lines.len() - 1, 12 + item.as_str().width(), id));
+            confirmation_lines.push((lines.len() - 1, 13 + item.as_str().width(), id));
         } else {
             controls.push(Some((
                 SettingsPointerAction::List(ListAction::Delete(id)),

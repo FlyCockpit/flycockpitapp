@@ -503,7 +503,7 @@ impl SettingsCx {
                 controls.push(None);
                 confirmation_lines.push((
                     lines.len() - 1,
-                    12 + display.as_str().width(),
+                    13 + display.as_str().width(),
                     string_list_row_id(p.kind, i, val),
                 ));
             } else {

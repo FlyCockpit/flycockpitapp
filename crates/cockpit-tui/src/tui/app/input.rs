@@ -2980,6 +2980,18 @@ impl App {
     /// if the cursor sits at a matching text block's right edge, else
     /// condense-or-insert by the threshold rule.
     pub(super) fn handle_paste(&mut self, data: String) {
+        // Any authoritative non-empty paste supersedes an unclaimed native
+        // clipboard probe from the same shortcut before routing is frozen.
+        // Do this ahead of every literal/non-input early return: focus can
+        // change while the clipboard read is parked, and its late result must
+        // never mutate the composer after the text was routed elsewhere.
+        if !data.is_empty() {
+            self.pending_paste_probes.retain(|_, probe| {
+                probe.owner_fence.is_some()
+                    || probe.request.source
+                        != crate::tui::structured_paste::PasteSource::NativePaste
+            });
+        }
         if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
             if let Some(pane) = self.btw_pane.as_mut() {
                 pane.paste(&data);
@@ -3048,14 +3060,6 @@ impl App {
                 return;
             }
             _ => {}
-        }
-
-        if !data.is_empty() {
-            self.pending_paste_probes.retain(|_, probe| {
-                probe.owner_fence.is_some()
-                    || probe.request.source
-                        != crate::tui::structured_paste::PasteSource::NativePaste
-            });
         }
 
         if data.is_empty() {
@@ -5090,6 +5094,19 @@ mod paste_routing_tests {
     fn paste_noncomposer_literal_routing() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
+        let stale_native = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            .expect("fixture claims a parked native probe");
+        let stale_native_id = stale_native.paste_correlation_id;
+        app.pending_paste_probes.insert(
+            stale_native_id,
+            super::PendingPasteProbe {
+                request: stale_native,
+                source_draft_generation: app.draft_generation,
+                owner_fence: None,
+                original_offset: 0,
+            },
+        );
         app.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::editing_for_test(
             "", false,
         ));
@@ -5099,6 +5116,7 @@ mod paste_routing_tests {
         };
         assert_eq!(pane.editor_text_for_test(), "literal ' paste\n");
         assert!(app.composer.is_empty());
+        assert!(!app.pending_paste_probes.contains_key(&stale_native_id));
         assert_eq!(
             app.async_actions.pending_kind_count(
                 &crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe")

@@ -15,6 +15,7 @@ if bad:
 ' <<<"$metadata"
 
 if rg -n \
+  --glob '!tests/tui_db_boundary.rs' \
   -e 'cockpit_db' \
   -e 'cockpit_core::db' \
   -e '(^|[^[:alnum:]_])Db::(open|open_default|open_in_memory)' \

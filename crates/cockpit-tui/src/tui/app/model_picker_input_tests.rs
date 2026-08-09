@@ -171,6 +171,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
     };
     super::QueuedModelSubmission {
         client_submission_id: uuid::Uuid::new_v4(),
+        fence_sequence: 0,
         composer_text: "review @src/model.rs with image".to_string(),
         display: "review @src/model.rs with image".to_string(),
         submission: cockpit_core::engine::message::UserSubmission {

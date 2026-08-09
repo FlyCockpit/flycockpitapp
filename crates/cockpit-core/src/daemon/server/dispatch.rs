@@ -100,7 +100,7 @@ async fn handle_send_user_message(
         (expected_model_state_generation, expected_model.as_ref())
     {
         let model_json = serde_json::to_string(model).map_err(internal)?;
-        wire_fingerprint.push_str(&format!("|model:{generation}:{}", model_json));
+        wire_fingerprint.push_str(&format!("|model:{generation}:{model_json}"));
     }
     // Run marker acceptance is a durable barrier before queueing. Include
     // immutable options in the fingerprint so option drift conflicts.

@@ -430,7 +430,7 @@ export class RemoteAuthorityRuntime {
           authorityEpoch: ring.authorityEpoch,
           currentKid: ring.currentKid,
           revokedKids,
-          highestStatusGeneration: generation,
+          highestStatusGeneration: body.statusGeneration,
         };
       }
     }

@@ -325,7 +325,8 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         if (
           !row ||
           text(row.ringDigest) !== args.from.ringDigest ||
-          text(row.authorityEpoch) !== args.from.authorityEpoch
+          text(row.authorityEpoch) !== args.from.authorityEpoch ||
+          text(row.generation) !== args.from.highestStatusGeneration
         )
           return false;
         await tx.$executeRawUnsafe(
@@ -399,7 +400,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     return this.db.$transaction(
       async (tx) => {
         const changed = await tx.$executeRawUnsafe(
-          `UPDATE remote_authority_lifecycle_state l SET "revision"=t."toRevision","ringDigest"=t."toDigest","authorityEpoch"=t."toAuthorityEpoch","currentKid"=t."toCurrentKid","revokedKidsJson"=$3,"generation"=t."statusGeneration","updatedAt"=NOW() FROM remote_authority_lifecycle_transitions t WHERE t."transitionId"=$1 AND t."deploymentId"=$2 AND t."state"='status_signed' AND t."statusCompactJws"=$4 AND l."deploymentId"=t."deploymentId" AND l."revision"=t."fromRevision" AND l."ringDigest"=t."fromDigest" AND l."authorityEpoch"=t."fromAuthorityEpoch"`,
+          `UPDATE remote_authority_lifecycle_state l SET "revision"=t."toRevision","ringDigest"=t."toDigest","authorityEpoch"=t."toAuthorityEpoch","currentKid"=t."toCurrentKid","revokedKidsJson"=$3,"generation"=t."statusGeneration","updatedAt"=NOW() FROM remote_authority_lifecycle_transitions t WHERE t."transitionId"=$1 AND t."deploymentId"=$2 AND t."state"='status_signed' AND t."statusCompactJws"=$4 AND t."statusGeneration">l."generation" AND l."deploymentId"=t."deploymentId" AND l."revision"=t."fromRevision" AND l."ringDigest"=t."fromDigest" AND l."authorityEpoch"=t."fromAuthorityEpoch"`,
           args.transitionId,
           args.deploymentId,
           JSON.stringify(args.revokedKids),
@@ -407,7 +408,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         );
         if (changed !== 1) return false;
         await tx.$executeRawUnsafe(
-          `INSERT INTO remote_authority_statuses ("deploymentId","statusGeneration","revision","ringDigest","authorityEpoch","kid","compactJws","issuedAt","validUntil","finalizedAt") VALUES ($1,$2::numeric,$3::numeric,$4,$5::numeric,$6,$7,to_timestamp($8::numeric),to_timestamp($9::numeric),NOW()) ON CONFLICT ("deploymentId","statusGeneration") DO NOTHING`,
+          `INSERT INTO remote_authority_statuses ("deploymentId","statusGeneration","revision","ringDigest","authorityEpoch","kid","compactJws","issuedAt","validUntil","finalizedAt") VALUES ($1,$2::numeric,$3::numeric,$4,$5::numeric,$6,$7,to_timestamp($8::numeric),to_timestamp($9::numeric),NOW())`,
           args.deploymentId,
           args.status.statusGeneration,
           args.status.revision,

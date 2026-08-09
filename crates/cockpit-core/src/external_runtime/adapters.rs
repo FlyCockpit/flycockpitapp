@@ -1868,6 +1868,13 @@ mod tests {
             r#"{"sandbox":{"defaultMode":"container_readonly"}}"#,
         )
         .unwrap();
+        // The primary test process may already carry a COCKPIT_CONFIG
+        // override. Point the layered loader at this fixture explicitly so
+        // the test exercises container selection rather than ambient config.
+        guard.set_var(
+            crate::config::dirs::COCKPIT_CONFIG_ENV,
+            config_dir.join("config.json"),
+        );
         let previous = super::super::safety_adapters::current_container_engine_mode();
         super::super::safety_adapters::set_container_engine_mode(
             super::super::safety_adapters::ContainerEngineMode::Auto,

@@ -3743,6 +3743,7 @@ impl App {
                 .values()
                 .filter_map(|probe| probe.owner_fence)
                 .collect::<std::collections::HashSet<_>>();
+            let had_cancelled_fence = !cancelled_fences.is_empty();
             let had_unowned = self
                 .pending_paste_probes
                 .values()
@@ -3755,7 +3756,7 @@ impl App {
                 }
             }
             self.dispatch_next_ready_paste_fence();
-            if had_unowned {
+            if had_unowned || had_cancelled_fence {
                 self.show_toast("Paste unavailable", ToastKind::Error);
             }
             self.terminal_input_generation = Some(terminal_generation);

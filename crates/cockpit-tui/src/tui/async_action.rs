@@ -637,6 +637,7 @@ mod tests {
             async { Ok(AsyncActionPayload::Text("replacement".into())) },
         );
         assert!(!runner.is_pending(stale.id()));
+        tokio::task::yield_now().await;
         assert!(
             stale_tx.send(()).is_err(),
             "cancelled work cannot settle late"

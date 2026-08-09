@@ -124,12 +124,16 @@ impl App {
                 .then_some((*id, fence.fence_sequence))
             })
             .collect::<Vec<_>>();
+        let cancelled_any = !cancelled.is_empty();
         for (id, sequence) in cancelled {
             self.submission_fences.remove(&id);
             self.deferred_fence_dispatches.remove(&id);
             self.pending_paste_probes
                 .retain(|_, probe| probe.owner_fence != Some(id));
             self.submission_order.cancel(sequence);
+        }
+        if cancelled_any {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
         }
         if !matches!(
             self.submission_order.front(),

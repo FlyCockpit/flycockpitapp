@@ -3050,6 +3050,14 @@ impl App {
             _ => {}
         }
 
+        if !data.is_empty() {
+            self.pending_paste_probes.retain(|_, probe| {
+                probe.owner_fence.is_some()
+                    || probe.request.source
+                        != crate::tui::structured_paste::PasteSource::NativePaste
+            });
+        }
+
         if data.is_empty() {
             let native_kind =
                 crate::tui::async_action::AsyncActionKind::Internal("paste.native_image");

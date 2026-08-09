@@ -1,6 +1,6 @@
 //! Canonical outer request framing for durable remote-operation identity.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
@@ -28,6 +28,18 @@ pub struct RemoteOperationResource<'a> {
     pub value: &'a [u8],
 }
 
+fn validate_stable_resource_shape(kind: u8, value: &[u8]) -> Result<()> {
+    match kind {
+        1 | 5 | 6 | 7 | 9 => ensure!(value.len() == 16, "UUID resource must be 16 bytes"),
+        11 => ensure!(value.is_empty(), "daemon_global resource must be empty"),
+        // Text/path canonicalization is descriptor-specific because paths must
+        // first pass through the daemon authorization resolver.
+        2 | 3 | 4 | 8 | 10 => {}
+        _ => bail!("unknown resource kind"),
+    }
+    Ok(())
+}
+
 pub fn encode_fcor_v1(
     request_kind: &str,
     resources: &[RemoteOperationResource<'_>],
@@ -52,6 +64,7 @@ pub fn encode_fcor_v1(
     out.extend_from_slice(kind);
     out.extend_from_slice(&resource_count.to_be_bytes());
     for resource in resources {
+        validate_stable_resource_shape(resource.kind as u8, resource.value)?;
         let value_len = u32::try_from(resource.value.len())?;
         out.push(resource.kind as u8);
         out.extend_from_slice(&value_len.to_be_bytes());
@@ -92,6 +105,7 @@ pub fn validate_fcor_v1(bytes: &[u8]) -> Result<()> {
     for _ in 0..resource_count {
         ensure!(offset + 5 <= bytes.len(), "truncated resource");
         ensure!((1..=11).contains(&bytes[offset]), "unknown resource kind");
+        let resource_kind = bytes[offset];
         offset += 1;
         let len = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as usize;
         offset += 4;
@@ -99,6 +113,7 @@ pub fn validate_fcor_v1(bytes: &[u8]) -> Result<()> {
             .checked_add(len)
             .ok_or_else(|| anyhow::anyhow!("resource length overflow"))?;
         ensure!(offset <= bytes.len(), "truncated resource value");
+        validate_stable_resource_shape(resource_kind, &bytes[offset - len..offset])?;
     }
     ensure!(offset + 4 <= bytes.len(), "missing params length");
     let len = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as usize;
@@ -130,10 +145,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hex(&bytes), fixture["canonicalHex"].as_str().unwrap());
+        assert_eq!(
+            hex(&hash_fcor_v1(&bytes).unwrap()),
+            fixture["sha256Hex"].as_str().unwrap()
+        );
         assert!(encode_fcor_v1("DaemonStatus", &[], &[]).is_err());
+        for malformed in fixture["malformed"].as_array().unwrap() {
+            let mut candidate = bytes.clone();
+            if let Some(replacement) = malformed["replaceByte"].as_array() {
+                candidate[replacement[0].as_u64().unwrap() as usize] =
+                    replacement[1].as_u64().unwrap() as u8;
+            }
+            if let Some(truncate_by) = malformed["truncateBy"].as_u64() {
+                candidate.truncate(candidate.len() - truncate_by as usize);
+            }
+            if let Some(append_hex) = malformed["appendHex"].as_str() {
+                candidate.extend_from_slice(&decode_hex(append_hex));
+            }
+            assert!(
+                validate_fcor_v1(&candidate).is_err(),
+                "malformed vector unexpectedly valid: {}",
+                malformed["name"]
+            );
+        }
     }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn decode_hex(text: &str) -> Vec<u8> {
+        text.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
 }

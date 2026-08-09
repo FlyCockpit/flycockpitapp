@@ -2,5 +2,17 @@
   "requestKind": "daemon_status",
   "resources": [{ "kind": "daemon_global", "valueHex": "" }],
   "paramsHex": "",
-  "canonicalHex": "46434f52010d6461656d6f6e5f73746174757300010b0000000000000000"
+  "canonicalHex": "46434f52010d6461656d6f6e5f73746174757300010b0000000000000000",
+  "sha256Hex": "7ea781718e707de7107ecaf18e3d4de8e76a749ccbc116360023022cbf60f954",
+  "malformed": [
+    { "name": "magic", "replaceByte": [0, 0] },
+    { "name": "version", "replaceByte": [4, 2] },
+    { "name": "zero kind length", "replaceByte": [5, 0] },
+    { "name": "non-lowercase ASCII kind", "replaceByte": [6, 68] },
+    { "name": "resource count mismatch", "replaceByte": [20, 2] },
+    { "name": "unknown resource kind", "replaceByte": [21, 12] },
+    { "name": "truncated resource header", "truncateBy": 7 },
+    { "name": "truncated params length", "truncateBy": 1 },
+    { "name": "trailing bytes", "appendHex": "00" }
+  ]
 }

@@ -28,7 +28,7 @@ fn tui_image_codec_dependency_inventory() {
         "fixtures/image-codec-dependency-inventory.json"
     ))
     .unwrap();
-    assert_eq!(fixture["schemaVersion"], 2);
+    assert_eq!(fixture["schemaVersion"], 3);
     let targets = fixture["targets"].as_object().unwrap();
     let package_fixture = fixture["packages"].as_object().unwrap();
     assert_eq!(targets.len(), 3);
@@ -69,12 +69,70 @@ fn tui_image_codec_dependency_inventory() {
             .map(|(id, _)| *id)
             .unwrap();
 
+        // `cargo metadata --filter-platform` exposes the workspace-unified feature
+        // set in resolve.nodes, so it cannot prove target-specific activation for
+        // image (notably arboard's BMP/TIFF requests). `cargo tree --target` uses
+        // Cargo's target-aware feature resolver and is the authoritative source for
+        // packages whose feature set differs by target.
+        let tree_output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(workspace)
+            .args([
+                "tree",
+                "--locked",
+                "--offline",
+                "--target",
+                triple,
+                "-e",
+                "features",
+                "-p",
+                "image@0.25.10",
+                "--prefix",
+                "depth",
+                "--format",
+                "{p}|{f}",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            tree_output.status.success(),
+            "cargo tree failed for {triple}"
+        );
+        let tree = String::from_utf8(tree_output.stdout).unwrap();
+        let mut target_package_features = BTreeMap::new();
+        for line in tree.lines() {
+            let row = line.trim_start_matches(|character: char| character.is_ascii_digit());
+            let Some((package, features)) = row.split_once('|') else {
+                continue;
+            };
+            let Some((name, version)) = package.rsplit_once(" v") else {
+                continue;
+            };
+            let key = format!("{name}@{version}");
+            target_package_features.entry(key).or_insert_with(|| {
+                features
+                    .trim_end_matches(" (*)")
+                    .split(',')
+                    .filter(|feature| !feature.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<BTreeSet<_>>()
+            });
+        }
+        let image_tree_features = &target_package_features["image@0.25.10"];
+
         let resolved_features = expected["resolvedFeatures"]
             .as_array()
             .unwrap()
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect::<BTreeSet<_>>();
+        assert_eq!(
+            *image_tree_features,
+            resolved_features
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+            "{triple} target-resolved image feature drift"
+        );
         let mut permitted_image_deps =
             BTreeSet::from(["bytemuck", "byteorder_lite", "moxcms", "num_traits"]);
         for feature in &resolved_features {
@@ -134,6 +192,16 @@ fn tui_image_codec_dependency_inventory() {
             .collect::<BTreeSet<_>>();
         assert_eq!(graph_packages, expected_packages, "{triple} package drift");
         assert_eq!(graph_edges, expected_edges, "{triple} edge drift");
+        assert_eq!(
+            expected["packageFeatures"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_packages,
+            "{triple} target feature inventory must cover every graph package"
+        );
 
         for id in graph_ids {
             let package = packages[id];
@@ -164,19 +232,27 @@ fn tui_image_codec_dependency_inventory() {
                 let version = (parts.next().unwrap(), parts.next().unwrap_or_default());
                 assert!(version <= (1, 95), "{key} requires Rust {msrv}");
             }
-            let actual_features = if id == image_id {
-                resolved_features
-                    .iter()
-                    .map(|feature| serde_json::Value::String((*feature).to_string()))
-                    .collect::<Vec<_>>()
-            } else {
-                let mut features = nodes[id]["features"].as_array().unwrap().clone();
-                features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
-                features
-            };
+            let expected_features = &expected["packageFeatures"][&key];
+            assert!(
+                !expected_features.is_null(),
+                "missing feature row for {key}"
+            );
+            let mut metadata_features = nodes[id]["features"].as_array().unwrap().clone();
+            metadata_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
+            assert_eq!(
+                serde_json::Value::Array(metadata_features),
+                expected_package["features"],
+                "{key} raw metadata feature drift"
+            );
+            let mut actual_features = target_package_features[&key]
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>();
+            actual_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
             assert_eq!(
                 serde_json::Value::Array(actual_features),
-                expected_package["features"],
+                *expected_features,
                 "{key} feature drift"
             );
             let checksum = expected_package["checksum"].as_str().unwrap();

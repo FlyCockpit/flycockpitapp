@@ -2974,11 +2974,14 @@ impl SettingsCx {
                 }
                 if s.is_step("headers") {
                     lines.push(Line::default());
-                    controls.extend(
-                        render_header_editor(&mut lines, &s.headers)
-                            .into_iter()
-                            .map(|(line, id)| (line, id.0 as usize)),
-                    );
+                    let header_controls = render_header_editor(&mut lines, &s.headers);
+                    if !s.headers.is_editing() {
+                        controls.extend(
+                            header_controls
+                                .into_iter()
+                                .map(|(line, id)| (line, id.0 as usize)),
+                        );
+                    }
                 }
                 if s.is_step("url")
                     && let Some(hint) = t.hint
@@ -4435,6 +4438,34 @@ impl SettingsPage for ProvidersPage {
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: SettingsControlId,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if let ProvidersPage::Add(state) = self {
+            let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
+                Some("id") => ("id", &mut state.id_field),
+                Some("url") => ("url", &mut state.url_field),
+                Some("api-key") => ("api key", state.api_key_field.as_mut()),
+                Some("env-var") => ("env var", state.env_var_field.as_mut()),
+                _ => return self.handle_pointer_control(cx, control),
+            };
+            let value_x = cx
+                .pointer_surface
+                .area
+                .get()
+                .map_or(label.len() as u16 + 2, |area| {
+                    area.x.saturating_add(label.len() as u16 + 2)
+                });
+            field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, control)
     }
 
     fn handle_pointer_scroll(

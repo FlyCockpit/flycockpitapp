@@ -3893,7 +3893,15 @@ impl App {
                     return true;
                 }
             }
-            return self.handle_terminal_event(event);
+            let is_literal_paste = matches!(event, Event::Paste(_));
+            let exit = self.handle_terminal_event(event);
+            if is_literal_paste && let Some(correlation_id) = paste_correlation_id {
+                crate::tui::input_source::acknowledge_native_paste(
+                    correlation_id,
+                    crate::tui::structured_paste::DedupResult::Committed,
+                );
+            }
+            return exit;
         }
         let decision = self.terminal_paste_classifier.observe_with_paste_source(
             event,

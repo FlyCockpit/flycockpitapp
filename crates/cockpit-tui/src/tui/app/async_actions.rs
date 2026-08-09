@@ -45,6 +45,10 @@ impl App {
                 self.async_actions.abort_id(action_id);
             }
             self.pending_paste_probes.remove(&id);
+            crate::tui::input_source::acknowledge_native_paste(
+                id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
         }
     }
 

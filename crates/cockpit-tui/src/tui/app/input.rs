@@ -261,10 +261,12 @@ impl App {
         request.source = source;
         self.handle_paste_inner(data, Some(request));
         if !self.pending_paste_probes.contains_key(&correlation_id) {
-            crate::tui::input_source::acknowledge_native_paste(
-                correlation_id,
-                crate::tui::structured_paste::DedupResult::Committed,
-            );
+            let result = self
+                .paste_correlations
+                .existing(correlation_id, host, self.event_loop_monotonic_now)
+                .map(|(_, result)| result)
+                .unwrap_or(crate::tui::structured_paste::DedupResult::Busy);
+            crate::tui::input_source::acknowledge_native_paste(correlation_id, result);
         }
     }
 

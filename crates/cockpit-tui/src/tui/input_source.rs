@@ -44,8 +44,15 @@ pub struct NativePasteAdapter {
 
 impl NativePasteAdapter {
     pub fn enqueue(&self, text: String) -> bool {
-        self.enqueue_with_correlation(text, uuid::Uuid::new_v4())
-            .is_some()
+        self.tx
+            .send(ObservedTerminalEvent {
+                event: Ok(Event::Paste(text)),
+                observed_at: (self.clock)(),
+                terminal_generation: self.terminal_generation,
+                paste_source: Some(crate::tui::structured_paste::PasteSource::NativePaste),
+                paste_correlation_id: Some(uuid::Uuid::new_v4()),
+            })
+            .is_ok()
     }
 
     pub fn enqueue_with_correlation(
@@ -55,7 +62,7 @@ impl NativePasteAdapter {
     ) -> Option<tokio::sync::oneshot::Receiver<crate::tui::structured_paste::DedupResult>> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if let Ok(mut acks) = native_paste_acks().lock() {
-            acks.insert(correlation_id, ack_tx);
+            acks.entry(correlation_id).or_default().push(ack_tx);
         }
         let sent = self
             .tx
@@ -80,10 +87,10 @@ impl NativePasteAdapter {
 
 static NATIVE_PASTE_ADAPTER: OnceLock<Mutex<Option<NativePasteAdapter>>> = OnceLock::new();
 type NativePasteAckSender = tokio::sync::oneshot::Sender<crate::tui::structured_paste::DedupResult>;
-static NATIVE_PASTE_ACKS: OnceLock<Mutex<HashMap<uuid::Uuid, NativePasteAckSender>>> =
+static NATIVE_PASTE_ACKS: OnceLock<Mutex<HashMap<uuid::Uuid, Vec<NativePasteAckSender>>>> =
     OnceLock::new();
 
-fn native_paste_acks() -> &'static Mutex<HashMap<uuid::Uuid, NativePasteAckSender>> {
+fn native_paste_acks() -> &'static Mutex<HashMap<uuid::Uuid, Vec<NativePasteAckSender>>> {
     NATIVE_PASTE_ACKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -92,9 +99,11 @@ pub fn acknowledge_native_paste(
     result: crate::tui::structured_paste::DedupResult,
 ) {
     if let Ok(mut acks) = native_paste_acks().lock()
-        && let Some(ack) = acks.remove(&correlation_id)
+        && let Some(waiters) = acks.remove(&correlation_id)
     {
-        let _ = ack.send(result);
+        for ack in waiters {
+            let _ = ack.send(result);
+        }
     }
 }
 
@@ -109,6 +118,13 @@ pub fn clear_native_paste_adapter() {
         && let Ok(mut slot) = slot.lock()
     {
         *slot = None;
+    }
+    if let Ok(mut acks) = native_paste_acks().lock() {
+        for (_, waiters) in acks.drain() {
+            for ack in waiters {
+                let _ = ack.send(crate::tui::structured_paste::DedupResult::Busy);
+            }
+        }
     }
 }
 
@@ -174,6 +190,12 @@ impl TerminalInput {
     }
 
     pub async fn next(&mut self) -> Option<ObservedTerminalEvent> {
+        while let Ok(event) = self.native_paste_rx.try_recv() {
+            self.pending_observed.push_back(event);
+        }
+        self.pending_observed
+            .make_contiguous()
+            .sort_by_key(|event| event.observed_at);
         if let Some(event) = self.pending_observed.pop_front() {
             return Some(event);
         }
@@ -204,14 +226,11 @@ impl TerminalInput {
     where
         F: FnMut(Option<ObservedTerminalEvent>) -> Result<bool>,
     {
-        let mut ready = Vec::with_capacity(cap);
-        while ready.len() < cap {
-            let Some(event) = self.pending_observed.pop_front() else {
-                break;
-            };
+        let mut ready = Vec::new();
+        while let Some(event) = self.pending_observed.pop_front() {
             ready.push((event.observed_at, 0_u8, Some(event)));
         }
-        while ready.len() < cap {
+        loop {
             let Some(event) = self.native_paste_rx.try_recv().ok() else {
                 break;
             };
@@ -231,7 +250,7 @@ impl TerminalInput {
         // Always sample at least one ready PTY event even when native events
         // fill the output cap. The timestamp merge below emits only `cap`
         // items and retains overflow for the next call.
-        let remaining = cap.saturating_sub(ready.len()).max(1);
+        let remaining = cap.max(1);
         stream
             .drain_ready(remaining, |item| {
                 let observed_at = clock();

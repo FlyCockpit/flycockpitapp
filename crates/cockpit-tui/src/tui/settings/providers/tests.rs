@@ -7,6 +7,7 @@ use cockpit_config::providers::{ConfigDoc, ProviderEntry};
 use cockpit_core::providers::deepfetch::{
     ContextProbeRequest, DeepfetchProbeClient, EndpointProbeRequest, ProbeRawOutcome,
 };
+use cockpit_core::wizard::ProviderWizardStep;
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
@@ -1603,7 +1604,7 @@ fn pointer_add_codex_login_renders_and_dispatches_from_fresh_state() {
     let (_tmp, mut fresh) = fixture();
     click_rendered_provider_action(&mut fresh, &login);
     assert!(matches!(
-        fresh.take_oauth_action(),
+        fresh.pending_oauth_action.take(),
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Begin,

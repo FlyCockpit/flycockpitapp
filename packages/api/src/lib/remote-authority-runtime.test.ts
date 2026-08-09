@@ -27,6 +27,7 @@ import {
   type AuthorityRuntimeStore,
   type FinalizedAuthorityStatus,
   RemoteAuthorityRuntime,
+  shouldAbortSupersededTransitions,
 } from "./remote-authority-runtime";
 
 const issuer = "https://authority.example";
@@ -162,6 +163,20 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
 });
 
 describe("authority overlap, replacement, and public status boundaries", () => {
+  it("aborts rollback transitions only after steady-plan lease convergence", () => {
+    const digest = "a".repeat(64),
+      other = "b".repeat(64),
+      lease = observation(digest, "a");
+    expect(shouldAbortSupersededTransitions([digest], digest, [lease])).toBe(true);
+    expect(shouldAbortSupersededTransitions([digest], digest, [])).toBe(false);
+    expect(shouldAbortSupersededTransitions([digest], digest, [{ ...lease, digest: other }])).toBe(
+      false,
+    );
+    expect(shouldAbortSupersededTransitions([digest, other, "c".repeat(64)], digest, [lease])).toBe(
+      false,
+    );
+  });
+
   it("requires every required D0/D1/D2 member while ignoring a draining member", () => {
     const publicRing = publicAuthorityRing(makeRing(), { issuer, deploymentId }),
       digest = publicAuthorityRingDigest(publicRing),

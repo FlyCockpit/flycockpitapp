@@ -199,7 +199,7 @@ describe("remote_authority_key_cli_state_machine", () => {
         "--expected-epoch",
         initialized.authorityEpoch,
       ]),
-    ).rejects.toThrow();
+    ).rejects.toThrow("cannot revoke sole signer");
     await expect(
       run([
         "promote",

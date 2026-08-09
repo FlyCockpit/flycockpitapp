@@ -130,6 +130,17 @@ export interface AuthorityRuntimeOptions {
   observations: AuthorityObservationStore;
   snapshot: AuthorityPublicSnapshot;
 }
+export function shouldAbortSupersededTransitions(
+  allowedDigests: readonly string[],
+  lifecycleDigest: string,
+  leases: readonly ObservationLease[],
+) {
+  return (
+    allowedDigests.length === 1 &&
+    leases.length > 0 &&
+    leases.every((lease) => lease.digest === lifecycleDigest)
+  );
+}
 export class RemoteAuthorityRuntime {
   readonly config: AuthorityConfig;
   #ring?: AuthorityRingFile;
@@ -257,9 +268,11 @@ export class RemoteAuthorityRuntime {
         ]);
       convergenceLeases = leases;
       if (
-        this.config.allowedDigests.length === 1 &&
-        leases.length > 0 &&
-        leases.every((item) => item.digest === observedLifecycleDigest)
+        shouldAbortSupersededTransitions(
+          this.config.allowedDigests,
+          observedLifecycleDigest,
+          leases,
+        )
       )
         await this.options.store.abortSupersededTransitions(
           this.config.deploymentId,

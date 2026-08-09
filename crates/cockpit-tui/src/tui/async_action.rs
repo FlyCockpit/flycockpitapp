@@ -275,6 +275,7 @@ struct PendingAction {
     kind: AsyncActionKind,
     started_at: Instant,
     generation: u64,
+    view_generation: u64,
     key: Option<AsyncActionKey>,
     handle: JoinHandle<()>,
 }
@@ -291,6 +292,7 @@ struct CompletedAction {
 pub struct AsyncActionRunner {
     next_id: AtomicU64,
     next_generation: AtomicU64,
+    view_generation: u64,
     pending: HashMap<AsyncActionId, PendingAction>,
     keyed: HashMap<AsyncActionKey, AsyncActionId>,
     tx: mpsc::UnboundedSender<CompletedAction>,
@@ -304,6 +306,7 @@ impl Default for AsyncActionRunner {
         Self {
             next_id: AtomicU64::new(1),
             next_generation: AtomicU64::new(1),
+            view_generation: 1,
             pending: HashMap::new(),
             keyed: HashMap::new(),
             tx,
@@ -316,6 +319,23 @@ impl Default for AsyncActionRunner {
 impl AsyncActionRunner {
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Advance the UI ownership fence and cancel blocking work owned by the
+    /// previous view. Results already queued retain their old fence and are
+    /// discarded by `drain_completed`.
+    pub fn advance_view_generation(&mut self) {
+        self.view_generation = self.view_generation.wrapping_add(1).max(1);
+        let stale = self
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                matches!(pending.kind, AsyncActionKind::Blocking(_)).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.abort_id(id);
+        }
     }
 
     #[cfg(test)]
@@ -511,6 +531,7 @@ impl AsyncActionRunner {
                 kind,
                 started_at: Instant::now(),
                 generation,
+                view_generation: self.view_generation,
                 key,
                 handle,
             },
@@ -524,7 +545,10 @@ impl AsyncActionRunner {
             let Some(pending) = self.pending.remove(&completed.id) else {
                 continue;
             };
-            if pending.generation != completed.generation || pending.kind != completed.kind {
+            if pending.generation != completed.generation
+                || pending.view_generation != self.view_generation
+                || pending.kind != completed.kind
+            {
                 continue;
             }
             if let Some(key) = pending.key

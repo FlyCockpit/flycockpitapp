@@ -1009,7 +1009,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Discard(_, _)) => {
             ProvidersFixture::ModelDiscard
         }
-        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Retry) => {
+        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Retry(_, _)) => {
             ProvidersFixture::ModelRetry
         }
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Reload) => {

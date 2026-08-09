@@ -232,6 +232,72 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state();
     pointer_model_refresh_renders_and_dispatches_from_fresh_state();
     pointer_model_discard_renders_and_dispatches_from_fresh_state();
+    pointer_model_retry_renders_and_dispatches_from_fresh_state();
+}
+
+#[test]
+fn pointer_model_retry_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{
+        ModelLifecycleAction, ProvidersAction, SettingsPointerAction,
+    };
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let config = one_provider_config(None);
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let entry = dialog.config.providers["p"].clone();
+        let model_id = entry.models[0].id.clone();
+        let mut editor = SettingsEditor::for_model_with_generation("p", &entry, &model_id, 1);
+        let refresh_id = editor
+            .begin_multimodal_refresh()
+            .expect("multimodal refresh begins");
+        editor.complete_multimodal_refresh_failure(refresh_id, "fixture refresh failure");
+        dialog.page = super::super::providers_page(ProvidersPage::ModelSettings {
+            editor,
+            models: Box::new(ModelEditor::new(None, entry.models.clone())),
+            parent: Box::new(EditState::new("p".into(), entry)),
+        });
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::ModelLifecycle(
+                        ModelLifecycleAction::Retry(provider, model),
+                    )),
+                ),
+                true,
+            ) if provider.0 == "p" && model.0 == "stale" => Some(action.clone()),
+            _ => None,
+        })
+        .expect("failed multimodal refresh renders identity-keyed Retry");
+    assert_eq!(
+        super::super::pointer_action_fixtures::key_for(&action),
+        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+            super::super::pointer_action_fixtures::ProvidersFixture::ModelRetry,
+        )
+    );
+
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::ModelSettings { editor, parent, .. })
+            if parent.provider_id == "p"
+                && editor.multimodal().is_some_and(|multimodal| {
+                    matches!(&multimodal.refresh,
+                        super::super::multimodal_capability_editor::RefreshPhase::Idle)
+                        && !multimodal.available_actions().contains(&"Retry")
+                })
+                && editor.status.as_deref() == Some("media capabilities refreshed")
+    ));
 }
 
 #[test]

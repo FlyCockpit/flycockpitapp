@@ -233,7 +233,7 @@ pub(super) enum DeepFetchChoice {
 pub(super) enum ModelLifecycleAction {
     Refresh(ProviderId, ModelId),
     Discard(ProviderId, ModelId),
-    Retry,
+    Retry(ProviderId, ModelId),
     Reload,
     Reapply,
     Rebind,

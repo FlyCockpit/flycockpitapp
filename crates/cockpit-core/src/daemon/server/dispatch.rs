@@ -557,9 +557,9 @@ pub(super) async fn handle_serialized_request(
                 .db
                 .set_session_goal_status(session_id, status)
                 .await
-                .map_err(|e| ErrorPayload {
+                .map_err(|error| ErrorPayload {
                     code: ErrorCode::BadRequest,
-                    message: e.to_string(),
+                    message: error.to_string(),
                 })?;
             Ok(Response::GoalUpdated {
                 goal: goal_to_proto(goal),
@@ -897,9 +897,18 @@ pub(super) async fn handle_serialized_request(
                     env_snapshot,
                 )
                 .await
-                .map_err(|e| ErrorPayload {
-                    code: ErrorCode::BadRequest,
-                    message: e.to_string(),
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+                        .is_some()
+                    {
+                        daemon_config_error(error)
+                    } else {
+                        ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: error.to_string(),
+                        }
+                    }
                 })?;
             Ok(Response::AssistantSessionCreated {
                 session: proto::AssistantSessionCreated {
@@ -1771,15 +1780,17 @@ pub(super) async fn handle_serialized_request(
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
-            let _generation = crate::daemon::config_refresh::refresh_session_config(
+            let refreshed = crate::daemon::config_refresh::refresh_session_config_explicit(
                 &ctx.db,
                 ctx.config_source(),
                 &att.handle,
-                None,
             )
             .await
-            .map_err(internal)?;
-            Ok(Response::Ack)
+            .map_err(explicit_config_refresh_error)?;
+            Ok(Response::ConfigRefreshed {
+                applied_generation: refreshed.applied_generation,
+                changed: refreshed.changed,
+            })
         }
 
         Request::RecordUsage {
@@ -1859,6 +1870,7 @@ pub(super) async fn handle_serialized_request(
                     model.as_deref().unwrap_or(""),
                 )
                 .await;
+            let strategy = crate::tokens::calibration_strategy_from_persisted(strategy.as_str());
             let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
             let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
             let model_instruction_tokens = provider
@@ -2391,13 +2403,13 @@ pub(super) async fn get_inventory_bundle(
                 held.generation,
             )
         } else {
-            match ctx.config_source().load_with_trust(cwd, &trust_policy) {
+            match ctx
+                .config_source()
+                .load_effective_for_daemon(cwd, &trust_policy)
+            {
                 Ok((providers, extended)) => (providers, extended.skills, 0),
                 Err(err) => {
-                    return Err(ErrorPayload {
-                        code: ErrorCode::InvalidConfig,
-                        message: format!("invalid config while building inventory: {err:#}"),
-                    });
+                    return Err(daemon_config_error(err));
                 }
             }
         };
@@ -2436,6 +2448,43 @@ pub(super) fn require_shared_attached(
         code: ErrorCode::NotAttached,
         message: "client has not attached to a session".into(),
     })
+}
+
+pub(super) fn daemon_config_error(error: anyhow::Error) -> ErrorPayload {
+    if let Some(invalid) =
+        error.downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+    {
+        tracing::warn!(diagnostic = %invalid.diagnostic(), "daemon config rejected invalid response tokenizer");
+        ErrorPayload {
+            code: ErrorCode::InvalidResponseMetricsTokenizer,
+            message: "configuration value is invalid".into(),
+        }
+    } else {
+        ErrorPayload {
+            code: ErrorCode::InvalidConfig,
+            message: format!("invalid config: {error:#}"),
+        }
+    }
+}
+
+pub(super) fn explicit_config_refresh_error(
+    error: crate::daemon::config_refresh::ExplicitConfigRefreshError,
+) -> ErrorPayload {
+    ErrorPayload {
+        code: match &error {
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidResponseMetricsTokenizer => ErrorCode::InvalidResponseMetricsTokenizer,
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidConfig(_) => ErrorCode::InvalidConfig,
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::Internal => ErrorCode::Internal,
+        },
+        message: match &error {
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::Internal => "config refresh failed",
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidResponseMetricsTokenizer => "configuration value is invalid",
+            crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidConfig(detail) => return ErrorPayload {
+                code: ErrorCode::InvalidConfig,
+                message: format!("invalid config: {detail}"),
+            },
+        }.into(),
+    }
 }
 
 pub(super) async fn attached_trust_policy_shared(
@@ -2477,11 +2526,8 @@ pub(super) async fn get_inventory_bundle_shared(
     let cwd = att.project_root.as_path();
     let (providers, extended) = ctx
         .config_source()
-        .load_with_trust(cwd, &trust_policy)
-        .map_err(|err| ErrorPayload {
-            code: ErrorCode::InvalidConfig,
-            message: format!("invalid config while building inventory: {err:#}"),
-        })?;
+        .load_effective_for_daemon(cwd, &trust_policy)
+        .map_err(daemon_config_error)?;
 
     // Shared concurrent path has no live config handle; use inventory gen only.
     let config_generation = super::inventory::current_inventory_generation();
@@ -2521,6 +2567,7 @@ pub(super) async fn guidance_estimate(
             model.as_deref().unwrap_or(""),
         )
         .await;
+    let strategy = crate::tokens::calibration_strategy_from_persisted(strategy.as_str());
     let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
     let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
     let model_instruction_tokens = provider

@@ -478,9 +478,9 @@ pub(super) fn redacted_provider_view(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReplaceConfigSnapshotResult {
-    pub(super) generation: u64,
-    pub(super) changed: bool,
+pub struct ReplaceConfigSnapshotResult {
+    pub generation: u64,
+    pub changed: bool,
 }
 
 pub(super) fn replace_config_snapshot(
@@ -1389,7 +1389,7 @@ pub enum SessionWork {
     },
     ReplaceConfigSnapshot {
         snapshot: Box<SessionConfigSnapshot>,
-        respond_to: oneshot::Sender<u64>,
+        respond_to: oneshot::Sender<ReplaceConfigSnapshotResult>,
     },
     SetActiveModel {
         selection_id: Uuid,

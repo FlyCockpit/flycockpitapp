@@ -797,6 +797,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "config_refreshed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "restart_decision",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
@@ -1755,7 +1760,7 @@ mod tests {
 
         // Exact table sizes, so a silent shrink is caught.
         assert_eq!(REQUEST_CLASSIFICATION.len(), 114);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 72);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 73);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 

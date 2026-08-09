@@ -470,8 +470,9 @@ mod tests;
 use self::helpers::queue_target_to_proto;
 
 pub use handle::{
-    InteractiveClientGuard, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
-    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
+    InteractiveClientGuard, ReplaceConfigSnapshotResult, SessionConfigHandle,
+    SessionConfigSnapshot, SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
+    spawn,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;

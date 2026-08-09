@@ -13,6 +13,7 @@ workspace = true
 anyhow = { workspace = true }
 chrono = { workspace = true }
 cockpit-db = { path = "../cockpit-db" }
+cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 dirs = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }

@@ -3205,6 +3205,7 @@ async fn session_scoped_code_has_no_direct_config_reads() {
     // bypasses the session snapshot.
     let banned = [
         "load_for_cwd(",
+        "load_for_cwd_for_daemon",
         "secret_ref::load_effective(",
         "ConfigDoc::load_effective(",
         "load_configs_for(",
@@ -3286,7 +3287,7 @@ async fn config_reresolve_rereads_trust_policy() {
         .find("resolve_workspace_trust_policy_from_db")
         .expect("refresh re-reads trust policy");
     let load_pos = shared
-        .find("load_with_trust")
+        .find("load_effective_for_daemon")
         .expect("refresh loads through ConfigSource with trust");
     let replace_pos = shared
         .find("ReplaceConfigSnapshot")

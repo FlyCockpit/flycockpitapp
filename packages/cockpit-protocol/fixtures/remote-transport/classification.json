@@ -53,7 +53,7 @@
   "counts": {
     "event": 76,
     "request": 114,
-    "response": 72
+    "response": 73
   },
   "messages": {
     "event": [
@@ -1206,6 +1206,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "ack"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "config_refreshed"
       },
       {
         "class": "liveness",

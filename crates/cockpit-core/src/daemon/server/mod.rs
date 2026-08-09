@@ -157,6 +157,10 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        proto::Response::ConfigRefreshed {
+            applied_generation: _,
+            changed: _,
+        } => {}
         proto::Response::UserMessageQueued { item, queue } => {
             scrub_queue_item(item, redact);
             scrub_queue(queue, redact);

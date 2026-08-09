@@ -742,6 +742,38 @@ fn pins_with_text_response_is_scrubbed() {
     assert!(pins[0].text.contains("[redacted]"));
 }
 
+#[test]
+fn config_refreshed_is_exhaustively_redacted() {
+    let redact = table_for("literal-secret");
+    let mut response = Response::ConfigRefreshed {
+        applied_generation: 9,
+        changed: true,
+    };
+    scrub_response_free_text(&mut response, &redact);
+    assert!(matches!(
+        response,
+        Response::ConfigRefreshed {
+            applied_generation: 9,
+            changed: true
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refresh_config_response_is_causally_terminal() {
+    assert_worker_delivery_happy("refresh_config").await;
+}
+
+#[test]
+fn invalid_response_metrics_tokenizer_dispatch_error_is_exact_and_safe() {
+    let error = explicit_config_refresh_error(
+        crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidResponseMetricsTokenizer,
+    );
+    assert_eq!(error.code, ErrorCode::InvalidResponseMetricsTokenizer);
+    assert_eq!(error.message, "configuration value is invalid");
+}
+
 fn remote_principal() -> ClientPrincipal {
     ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-user".to_string(),
@@ -7172,7 +7204,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     },
                 ) => {
                     assert_eq!(snapshot.generation, 0);
-                    respond_to.send(1).unwrap();
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                            generation: 1,
+                            changed: true,
+                        })
+                        .unwrap();
                 }
                 ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
                     assert_eq!(job_id, "job-1");
@@ -7221,6 +7258,13 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 scan_environment: false,
                 scan_dotenv: true,
                 scan_ssh_keys: true,
+            }
+        )),
+        "refresh_config" => assert!(matches!(
+            response,
+            Response::ConfigRefreshed {
+                applied_generation: 1,
+                changed: true
             }
         )),
         _ => assert!(matches!(response, Response::Ack), "{kind}: {response:?}"),
@@ -9089,7 +9133,7 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
 
 /// Criterion 6 (`engine-config-snapshot-adoption`): after a re-resolution
 /// over a malformed layer, a dispatched client still holds the last good
-/// snapshot (no new `ConfigSnapshot` event) and receives a `Notice`. Driven
+/// snapshot (no new `ConfigSnapshot` event) and receives a terminal error. Driven
 /// through the real `RefreshConfig` dispatch path.
 #[cfg(unix)]
 #[tokio::test]
@@ -9148,14 +9192,8 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
         Request::RefreshConfig,
     )
     .await;
-    assert!(result.is_ok(), "refresh config dispatch: {result:?}");
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            proto::Event::Notice { text, .. } if text.contains("last good snapshot")
-        )),
-        "invalid re-resolution must notify the client, got {events:?}"
-    );
+    let error = result.expect_err("explicit refresh must reject invalid config");
+    assert_eq!(error.code, proto::ErrorCode::InvalidConfig);
     // The only ConfigSnapshot delivered is the attach hydration at the last
     // good generation (0); the malformed re-resolution pushes no new one.
     assert!(
@@ -12275,7 +12313,12 @@ async fn assert_set_model_favorite_happy() {
                     .find(|model| model.id == "a")
                     .expect("model in refreshed snapshot");
                 assert!(model.favorite);
-                respond_to.send(1).unwrap();
+                respond_to
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        generation: 1,
+                        changed: true,
+                    })
+                    .unwrap();
             }
             other => panic!("unexpected work: {other:?}"),
         }
@@ -12342,7 +12385,12 @@ async fn assert_set_default_model_happy() {
             match work {
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     kinds.push("replace_config_snapshot");
-                    respond_to.send(1).unwrap();
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                            generation: 1,
+                            changed: true,
+                        })
+                        .unwrap();
                     break;
                 }
                 SessionWork::SetActiveModel { .. } => {
@@ -12533,7 +12581,12 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config refresh work") {
             SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
-                respond_to.send(1).unwrap();
+                respond_to
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        generation: 1,
+                        changed: true,
+                    })
+                    .unwrap();
             }
             other => panic!("unexpected work: {other:?}"),
         }

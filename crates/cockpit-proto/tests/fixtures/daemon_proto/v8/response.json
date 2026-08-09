@@ -46,6 +46,13 @@
   "ack": {
     "response": "ack"
   },
+  "config_refreshed": {
+    "data": {
+      "applied_generation": 3,
+      "changed": true
+    },
+    "response": "config_refreshed"
+  },
   "approval_mode_state": {
     "data": {
       "mode": "auto"

@@ -2458,6 +2458,13 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
         Ok(Response::Unknown) => {
             ControlRequestOutcome::Rejected("unexpected daemon response: Unknown".to_string())
         }
+        Ok(Response::ConfigRefreshed {
+            applied_generation,
+            changed,
+        }) => ControlRequestOutcome::ConfigRefreshed {
+            applied_generation,
+            changed,
+        },
         Ok(_) => ControlRequestOutcome::Applied,
         Err(error) => ControlRequestOutcome::Rejected(error),
     }
@@ -6269,5 +6276,42 @@ mod tests {
         drop(runner);
 
         assert_task_future_dropped(dropped).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_config_control_outcome_preserves_generation_and_changed() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+        send_control_request(
+            &control_tx,
+            &events,
+            &notify,
+            ControlRequestId(41),
+            Uuid::new_v4(),
+            3,
+            Request::RefreshConfig,
+        )
+        .unwrap();
+        let request = control_rx.recv().await.unwrap();
+        request
+            .response_tx
+            .send(Ok(Response::ConfigRefreshed {
+                applied_generation: 17,
+                changed: false,
+            }))
+            .unwrap();
+        notified.await;
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [TurnEvent::ControlRequestFinished {
+                request_id: ControlRequestId(41),
+                outcome: ControlRequestOutcome::ConfigRefreshed {
+                    applied_generation: 17,
+                    changed: false
+                }
+            }]
+        ));
     }
 }

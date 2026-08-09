@@ -1046,7 +1046,6 @@ dependencies = [
  "sqlite-vec",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -1080,6 +1079,7 @@ dependencies = [
  "chrono",
  "cockpit-db",
  "cockpit-test-support",
+ "cockpit-tokenizer",
  "dirs",
  "libc",
  "reqwest 0.13.4",
@@ -1113,6 +1113,7 @@ dependencies = [
  "cockpit-db",
  "cockpit-proto",
  "cockpit-test-support",
+ "cockpit-tokenizer",
  "croner",
  "csv",
  "dirs",
@@ -1158,7 +1159,6 @@ dependencies = [
  "sqlite-vec",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -1241,6 +1241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tiktoken-rs",
+]
+
+[[package]]
 name = "cockpit-tui"
 version = "0.1.0"
 dependencies = [
@@ -1275,7 +1284,6 @@ dependencies = [
  "similar 3.1.2",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
  "tracing",
  "tree-sitter",

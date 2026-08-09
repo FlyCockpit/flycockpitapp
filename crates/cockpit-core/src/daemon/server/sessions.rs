@@ -549,8 +549,8 @@ pub(super) fn validate_set_agent(
 ) -> std::result::Result<(), ErrorPayload> {
     let _ = ctx
         .config_source()
-        .load_with_trust(&att.handle.project_root, &att.handle.trust_policy)
-        .map_err(internal)?;
+        .load_effective_for_daemon(&att.handle.project_root, &att.handle.trust_policy)
+        .map_err(super::dispatch::daemon_config_error)?;
     let ownable =
         crate::config::trust::with_workspace_trust_policy(att.handle.trust_policy.clone(), || {
             crate::agents::chat_ownable_primaries(&att.handle.project_root)
@@ -596,6 +596,12 @@ pub(super) fn require_scheduler(
 }
 
 pub(super) fn workspace_trust_error(err: anyhow::Error) -> ErrorPayload {
+    if err
+        .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+        .is_some()
+    {
+        return super::dispatch::daemon_config_error(err);
+    }
     if err
         .downcast_ref::<crate::config::trust::WorkspaceTrustError>()
         .is_some()

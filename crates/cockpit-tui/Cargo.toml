@@ -35,7 +35,6 @@ shellexpand = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tiktoken-rs = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread", "macros", "process", "io-util", "fs",
     "net", "signal", "time", "sync",

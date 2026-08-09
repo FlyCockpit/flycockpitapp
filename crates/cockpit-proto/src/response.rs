@@ -13,6 +13,12 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    /// Terminal proof that an explicit config refresh was adopted.
+    ConfigRefreshed {
+        applied_generation: u64,
+        changed: bool,
+    },
+
     /// Result of [`Request::RestartIfIdle`].
     RestartDecision {
         will_restart: bool,
@@ -666,6 +672,7 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
             (Response::UserMessageQueued { .. }, "user_message_queued");
             (Response::DelegationSteer { .. }, "delegation_steer");

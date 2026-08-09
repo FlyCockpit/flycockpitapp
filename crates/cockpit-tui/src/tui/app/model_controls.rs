@@ -786,7 +786,9 @@ impl App {
             _ => None,
         };
         match outcome {
-            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
+            ControlRequestOutcome::Applied | ControlRequestOutcome::ConfigRefreshed { .. } => {
+                self.apply_control_success(pending.applied)
+            }
             ControlRequestOutcome::Rejected(error) => {
                 let message = format!("{}: daemon rejected request: {error}", pending.label);
                 if let Some(selection) = self.clear_pending_model_selection(selection_id) {

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cockpit_tokenizer::TiktokenEncoding;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -79,6 +80,9 @@ use harness::{parse_harness_config, resolve_harnesses_from_paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfig {
+    /// Encoding used exclusively for locally measured response metrics.
+    #[serde(default)]
+    pub response_metrics_tokenizer: TiktokenEncoding,
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
 
@@ -1537,6 +1541,7 @@ impl ExtendedConfig {
 impl Default for ExtendedConfig {
     fn default() -> Self {
         Self {
+            response_metrics_tokenizer: TiktokenEncoding::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
             concurrency: Concurrency::default(),
@@ -1715,10 +1720,14 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
     let docs = load_existing_docs_from_paths(&paths);
+    resolve_loaded_docs(&docs)
+}
+
+fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
     if !docs.is_empty() {
-        let mut cfg = load_merged_from_docs(&docs);
-        cfg.gitignore_allow = resolve_gitignore_allow_from_docs(&docs);
-        let redact_unions = resolve_redact_list_unions_from_docs(&docs);
+        let mut cfg = load_merged_from_docs(docs);
+        cfg.gitignore_allow = resolve_gitignore_allow_from_docs(docs);
+        let redact_unions = resolve_redact_list_unions_from_docs(docs);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
@@ -1732,6 +1741,65 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
         ..Default::default()
     }
 }
+
+/// Daemon-only effective loader. Existing settings/bootstrap callers remain
+/// advisory, while an explicitly present malformed response tokenizer in any
+/// participating (trust-filtered) readable layer rejects daemon adoption.
+pub struct DaemonExtendedConfigLoad {
+    pub config: ExtendedConfig,
+    pub response_metrics_tokenizer_validation:
+        std::result::Result<(), InvalidResponseMetricsTokenizer>,
+    pub participating_layers: Vec<PathBuf>,
+}
+
+pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> DaemonExtendedConfigLoad {
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let paths = config_file_paths_for_load(cwd);
+    // Read each participating layer exactly once. Whole-document failures
+    // retain the advisory skip behavior, while readable object documents
+    // preserve raw field presence for the narrow strict validation below.
+    let docs = load_existing_docs_from_paths(&paths);
+    let mut validation = Ok(());
+    for doc in &docs {
+        if let Some(value) = doc.raw_field("response_metrics_tokenizer") {
+            if let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+                && validation.is_ok()
+            {
+                validation = Err(InvalidResponseMetricsTokenizer {
+                    path: doc.path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
+    let config = resolve_loaded_docs(&docs);
+    DaemonExtendedConfigLoad {
+        config,
+        response_metrics_tokenizer_validation: validation,
+        participating_layers,
+    }
+}
+
+#[derive(Debug)]
+pub struct InvalidResponseMetricsTokenizer {
+    path: PathBuf,
+    source: serde_json::Error,
+}
+
+impl InvalidResponseMetricsTokenizer {
+    pub fn diagnostic(&self) -> String {
+        format!("{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::fmt::Display for InvalidResponseMetricsTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("configuration value is invalid")
+    }
+}
+
+impl std::error::Error for InvalidResponseMetricsTokenizer {}
 
 fn read_extended_config_doc(path: &Path) -> Result<ExtendedConfigDoc> {
     CONFIG_LAYER_READS.with(|calls| calls.set(calls.get() + 1));
@@ -1886,6 +1954,7 @@ impl ExtendedConfigDoc {
         }
 
         parse_field!("harnesses", harnesses);
+        parse_field!("response_metrics_tokenizer", response_metrics_tokenizer);
         parse_field!("agent_guidance_files", agent_guidance_files);
         parse_field!("concurrency", concurrency);
         parse_field!("agent_dirs", agent_dirs);
@@ -1999,6 +2068,7 @@ impl ExtendedConfigDoc {
         }
 
         remove_malformed!("redact", RedactConfig);
+        remove_malformed!("response_metrics_tokenizer", TiktokenEncoding);
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("project_knowledge", bool);

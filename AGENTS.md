@@ -11,7 +11,7 @@ Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, B
 
 Apps under `apps/`: `apps/cli` (Rust Cockpit CLI), `apps/docs` (documentation site), `apps/native` (Expo app), `apps/relay` (temporary TypeScript standalone relay bridge still deployed until WebSocket ownership moves into `apps/server`), `apps/server` (Hono API; destination owner of public WebSocket signaling/gateway work), `apps/web` (React app), and `apps/worker` (BullMQ worker). There is no Rust WebSocket relay app: the former `apps/relay-rs` experiment was deleted.
 
-Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (legacy relay wire types still used by the daemon client). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-config` (config types/loading), `crates/cockpit-tokenizer` (strict shared tiktoken contract), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), and `crates/relay-protocol` (legacy relay wire types still used by the daemon client). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
 
 ### Rust crate graph
 
@@ -22,9 +22,10 @@ apps/cli            -> cockpit-tui, cockpit-core, cockpit-proto, cockpit-config,
                        cockpit-db, relay-protocol
 crates/cockpit-tui  -> cockpit-core, cockpit-proto, cockpit-config, cockpit-db,
                        relay-protocol
-crates/cockpit-core -> cockpit-proto, cockpit-config, cockpit-db, relay-protocol
+crates/cockpit-core -> cockpit-proto, cockpit-config, cockpit-tokenizer, cockpit-db, relay-protocol
 crates/cockpit-proto-> cockpit-config, cockpit-db
-crates/cockpit-config -> cockpit-db
+crates/cockpit-config -> cockpit-tokenizer, cockpit-db
+crates/cockpit-tokenizer -> (none)
 crates/cockpit-db   -> (none)
 crates/relay-protocol -> (none)
 ```

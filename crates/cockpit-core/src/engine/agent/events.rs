@@ -18,6 +18,10 @@ pub enum ControlRequestOutcome {
     NotDelivered(ControlRequestNotDelivered),
     Rejected(String),
     Applied,
+    ConfigRefreshed {
+        applied_generation: u64,
+        changed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -416,4 +416,17 @@ describe("cockpit-proto daemon wire schemas", () => {
       false,
     );
   });
+
+  it("config_refreshed_typescript_mirror_is_v8", () => {
+    expect(PROTOCOL_VERSION).toBe(8);
+    expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
+      responsesFixture.config_refreshed,
+    );
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.config_refreshed,
+        data: { ...responsesFixture.config_refreshed.data, extra: true },
+      }).success,
+    ).toBe(false);
+  });
 });

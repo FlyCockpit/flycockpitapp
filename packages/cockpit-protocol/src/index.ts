@@ -1,9 +1,10 @@
 import { z } from "zod";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
+
 export * from "./remote-identity-protocol";
 export * from "./remote-wire-magic-registry";
 
-export const PROTOCOL_VERSION = 6 as const;
+export const PROTOCOL_VERSION = 8 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust
@@ -577,6 +578,7 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
+  "config_refreshed",
   "attached",
   "forked",
   "fs_list",
@@ -892,6 +894,10 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
+  responseVariant(
+    "config_refreshed",
+    z.object({ applied_generation: z.number().int().nonnegative(), changed: z.boolean() }).strict(),
+  ),
   responseVariant("attached", attachedDataSchema),
   responseVariant("export_session_data", z.object({ data: exportSessionDataSchema }).passthrough()),
   responseVariant(

@@ -2159,3 +2159,147 @@ fn clipboard_recovery_config_omission_preserves_sibling_tui_values() {
 }
 
 mod guards_and_resolvers;
+
+#[test]
+fn response_metrics_tokenizer_config_defaults_and_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    assert_eq!(
+        ExtendedConfigDoc::load(&path)
+            .unwrap()
+            .config()
+            .response_metrics_tokenizer,
+        cockpit_tokenizer::TiktokenEncoding::Cl100k
+    );
+    std::fs::write(&path, r#"{"response_metrics_tokenizer":"o200k_base"}"#).unwrap();
+    assert_eq!(
+        ExtendedConfigDoc::load(&path)
+            .unwrap()
+            .config()
+            .response_metrics_tokenizer,
+        cockpit_tokenizer::TiktokenEncoding::O200k
+    );
+    assert!(serde_json::from_str::<cockpit_tokenizer::TiktokenEncoding>("\"unknown\"").is_err());
+}
+
+#[test]
+fn settings_advisory_load_remains_editable_with_invalid_response_metrics_tokenizer() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"name":"editable","response_metrics_tokenizer":"invalid"}"#,
+    )
+    .unwrap();
+    let (config, warnings) = ExtendedConfigDoc::load(&path)
+        .unwrap()
+        .config_with_warnings();
+    assert_eq!(config.name.as_deref(), Some("editable"));
+    assert_eq!(
+        config.response_metrics_tokenizer,
+        cockpit_tokenizer::TiktokenEncoding::Cl100k
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("response_metrics_tokenizer"))
+    );
+}
+
+#[test]
+fn daemon_effective_load_rejects_invalid_response_metrics_tokenizer() {
+    let tmp = TempDir::new().unwrap();
+    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"response_metrics_tokenizer":"invalid"}"#,
+    )
+    .unwrap();
+    let _trust = enter_trusted_workspace(&project);
+    assert!(
+        load_for_cwd_for_daemon_contract(&project)
+            .response_metrics_tokenizer_validation
+            .is_err()
+    );
+}
+
+#[test]
+fn invalid_response_metrics_tokenizer_fails_effective_load() {
+    let tmp = TempDir::new().unwrap();
+    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"response_metrics_tokenizer":"not-an-encoding"}"#,
+    )
+    .unwrap();
+    let _trust = enter_trusted_workspace(&project);
+    let load = load_for_cwd_for_daemon_contract(&project);
+    assert_eq!(load.participating_layers.len(), 1);
+    assert!(load.response_metrics_tokenizer_validation.is_err());
+}
+
+#[test]
+fn response_metrics_tokenizer_daemon_load_respects_layered_trust_policy() {
+    let tmp = TempDir::new().unwrap();
+    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let global = tmp.path().join("home/.config/cockpit/config.json");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    std::fs::write(
+        &global,
+        r#"{"response_metrics_tokenizer":"invalid-global"}"#,
+    )
+    .unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"response_metrics_tokenizer":"o200k_base"}"#,
+    )
+    .unwrap();
+    {
+        let _trust = enter_trusted_workspace(&project);
+        let load = load_for_cwd_for_daemon_contract(&project);
+        assert!(load.response_metrics_tokenizer_validation.is_err());
+        assert_eq!(load.participating_layers.len(), 2);
+    }
+
+    std::fs::write(&global, "{}").unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"response_metrics_tokenizer":"invalid-project"}"#,
+    )
+    .unwrap();
+    let _refuse = crate::config::trust::enter_workspace_trust_policy(
+        crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(&project).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Refuse,
+        },
+    );
+    let load = load_for_cwd_for_daemon_contract(&project);
+    assert!(load.response_metrics_tokenizer_validation.is_ok());
+    assert_eq!(load.participating_layers, vec![global]);
+}
+
+#[test]
+fn daemon_tokenizer_validation_keeps_whole_document_failures_advisory() {
+    let tmp = TempDir::new().unwrap();
+    let _home = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    let path = project.join(".cockpit/config.json");
+    let _trust = enter_trusted_workspace(&project);
+    for contents in ["not json", "[]"] {
+        std::fs::write(&path, contents).unwrap();
+        let load = load_for_cwd_for_daemon_contract(&project);
+        assert!(load.response_metrics_tokenizer_validation.is_ok());
+        assert_eq!(
+            load.config.response_metrics_tokenizer,
+            cockpit_tokenizer::TiktokenEncoding::Cl100k
+        );
+    }
+}

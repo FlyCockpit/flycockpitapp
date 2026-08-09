@@ -209,6 +209,7 @@
               }
             }
           },
+          "response_metrics_tokenizer": "cl100k_base",
           "retention": {
             "payload_window_days": 30,
             "session_window_days": 0,

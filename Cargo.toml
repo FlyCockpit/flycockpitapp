@@ -6,6 +6,7 @@ members = [
     "crates/cockpit-db",
     "crates/cockpit-proto",
     "crates/cockpit-test-support",
+    "crates/cockpit-tokenizer",
     "crates/cockpit-tui",
     "crates/relay-protocol",
 ]
@@ -82,7 +83,6 @@ similar = "3"
 sqlite-vec = "0.1.9"
 tempfile = "3"
 thiserror = "2"
-tiktoken-rs = "0.12"
 # Feature sets differ per member (rt-only in cockpit-config, full runtime in
 # the binaries); members declare their own features additively.
 tokio = "1.52"

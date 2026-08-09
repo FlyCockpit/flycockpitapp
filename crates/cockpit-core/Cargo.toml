@@ -31,6 +31,7 @@ tokio-tungstenite = { workspace = true }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
+cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 zip = { workspace = true }
@@ -55,7 +56,6 @@ brush-parser = { workspace = true }
 zerobox = { workspace = true }
 aho-corasick = { workspace = true }
 dotenvy = { workspace = true }
-tiktoken-rs = { workspace = true }
 keepawake = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }

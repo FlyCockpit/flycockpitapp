@@ -1517,6 +1517,27 @@ pub enum RemoteAdapterRecoveryStrategy {
     StagedFilesystemCommit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAdapterEvidenceV1 {
+    DomainResultTuple,
+    DispatchKeyAndGeneration,
+    DesiredStateGenerationAndObservedDigest,
+    StagedArtifactFingerprintsAndFsyncBarriers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAdapterRecoveryContractV1 {
+    pub schema_version: u8,
+    pub strategy: RemoteAdapterRecoveryStrategy,
+    pub evidence: RemoteAdapterEvidenceV1,
+    pub binds_operation_id: bool,
+    pub binds_actor_generation: bool,
+    pub binds_request_hash: bool,
+    pub requires_dispatch_generation: bool,
+}
+
 impl Request {
     pub fn remote_operation_class(&self) -> Option<RemoteOperationClass> {
         remote_operation_class_for_tag(self.wire_tag())
@@ -1564,7 +1585,6 @@ pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass>
         | "record_usage"
         | "cancel_run_invocation"
         | "create_goal"
-        | "set_workspace_trust"
         | "mark_app_flag_seen"
         | "resolve_assistant_session" => TransactionalMutation,
 
@@ -1606,7 +1626,8 @@ pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass>
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
         | "refresh_env"
-        | "refresh_config" => IdempotentAdapterMutation,
+        | "refresh_config"
+        | "set_workspace_trust" => IdempotentAdapterMutation,
 
         "steer_delegation"
         | "cancel_turn"
@@ -1688,7 +1709,8 @@ pub fn remote_adapter_recovery_strategy_for_tag(
         | "set_tandem_models"
         | "set_caffeinate"
         | "refresh_env"
-        | "refresh_config" => Some(DurableDesiredState),
+        | "refresh_config"
+        | "set_workspace_trust" => Some(DurableDesiredState),
         "fs_write"
         | "fs_create_dir"
         | "fs_rename"
@@ -1699,6 +1721,35 @@ pub fn remote_adapter_recovery_strategy_for_tag(
         | "clear_flycockpit_credential" => Some(StagedFilesystemCommit),
         _ => None,
     }
+}
+
+pub fn remote_adapter_recovery_contract_for_tag(
+    tag: &str,
+) -> Option<RemoteAdapterRecoveryContractV1> {
+    let strategy = remote_adapter_recovery_strategy_for_tag(tag)?;
+    let evidence = match strategy {
+        RemoteAdapterRecoveryStrategy::DomainTransaction => {
+            RemoteAdapterEvidenceV1::DomainResultTuple
+        }
+        RemoteAdapterRecoveryStrategy::DurableDispatchKey => {
+            RemoteAdapterEvidenceV1::DispatchKeyAndGeneration
+        }
+        RemoteAdapterRecoveryStrategy::DurableDesiredState => {
+            RemoteAdapterEvidenceV1::DesiredStateGenerationAndObservedDigest
+        }
+        RemoteAdapterRecoveryStrategy::StagedFilesystemCommit => {
+            RemoteAdapterEvidenceV1::StagedArtifactFingerprintsAndFsyncBarriers
+        }
+    };
+    Some(RemoteAdapterRecoveryContractV1 {
+        schema_version: 1,
+        strategy,
+        evidence,
+        binds_operation_id: true,
+        binds_actor_generation: true,
+        binds_request_hash: true,
+        requires_dispatch_generation: strategy != RemoteAdapterRecoveryStrategy::DomainTransaction,
+    })
 }
 
 #[cfg(test)]
@@ -1922,7 +1973,7 @@ mod tests {
             }
             match class {
                 RemoteOperationClass::IdempotentAdapterMutation => assert!(
-                    remote_adapter_recovery_strategy_for_tag(tag).is_some(),
+                    remote_adapter_recovery_contract_for_tag(tag).is_some(),
                     "adapter mutation {tag} needs a recovery strategy"
                 ),
                 _ => assert_eq!(
@@ -1944,6 +1995,19 @@ mod tests {
         assert_eq!(
             remote_adapter_recovery_strategy_for_tag("set_default_model"),
             Some(RemoteAdapterRecoveryStrategy::StagedFilesystemCommit)
+        );
+        assert_eq!(
+            remote_operation_class_for_tag("set_workspace_trust"),
+            Some(RemoteOperationClass::IdempotentAdapterMutation)
+        );
+        let trust = remote_adapter_recovery_contract_for_tag("set_workspace_trust").unwrap();
+        assert_eq!(
+            trust.strategy,
+            RemoteAdapterRecoveryStrategy::DurableDesiredState
+        );
+        assert_eq!(
+            trust.evidence,
+            RemoteAdapterEvidenceV1::DesiredStateGenerationAndObservedDigest
         );
     }
 

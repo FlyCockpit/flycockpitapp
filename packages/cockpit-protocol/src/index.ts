@@ -237,6 +237,28 @@ export const resolveResponseSchema: z.ZodType<ResolveResponseValue> = z.lazy(() 
 export type ResolveResponse = z.infer<typeof resolveResponseSchema>;
 
 const requestParamSchemas = {
+  get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
+  get_startup_disclosures: z.object({ project_root: projectRootSchema }).strict(),
+  mark_app_flag_seen: z
+    .object({
+      key: z.literal("daemon_autostart_notice"),
+      expected_version: z.number().int().nonnegative(),
+    })
+    .strict(),
+  resolve_assistant_session: z
+    .object({
+      assistant_id: z.string().min(1),
+      project_root: projectRootSchema,
+      mode: z.literal("most_recent_or_create"),
+    })
+    .strict(),
+  set_workspace_trust: z
+    .object({
+      project_root: projectRootSchema,
+      mode: z.enum(["trust", "ignore_config", "untrusted"]),
+      expected_config_generation: z.number().int().nonnegative(),
+    })
+    .strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
   attach: z
     .object({
@@ -448,6 +470,11 @@ function requestVariantNoParams<Name extends RequestName>(request: Name) {
 // array directly so it stays in sync with `clientRequestSchema` by
 // construction.
 const clientRequestVariants = [
+  requestVariant("get_app_flag", requestParamSchemas.get_app_flag),
+  requestVariant("get_startup_disclosures", requestParamSchemas.get_startup_disclosures),
+  requestVariant("mark_app_flag_seen", requestParamSchemas.mark_app_flag_seen),
+  requestVariant("resolve_assistant_session", requestParamSchemas.resolve_assistant_session),
+  requestVariant("set_workspace_trust", requestParamSchemas.set_workspace_trust),
   requestVariant("archive_session", requestParamSchemas.archive_session),
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
@@ -578,6 +605,9 @@ export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResu
 
 export const responseNameSchema = z.enum([
   "ack",
+  "app_flag",
+  "app_flag_seen",
+  "assistant_session_resolved",
   "config_refreshed",
   "attached",
   "forked",
@@ -597,11 +627,13 @@ export const responseNameSchema = z.enum([
   "session_live_status",
   "sessions",
   "stats_rollup",
+  "startup_disclosures",
   "subagent_history_page",
   "user_message_queued",
   "export_session_data",
   "bulk_transfer_chunk_accepted",
   "bulk_transfer_chunk",
+  "workspace_trust_set",
 ]);
 export type ResponseName = z.infer<typeof responseNameSchema>;
 
@@ -894,6 +926,61 @@ const responseVariant = <Name extends ResponseName, Schema extends z.ZodTypeAny>
 
 export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   z.object({ ...responseBaseSchema, response: z.literal("ack") }).passthrough(),
+  responseVariant(
+    "app_flag",
+    z
+      .object({
+        key: z.literal("daemon_autostart_notice"),
+        seen: z.boolean(),
+        version: z.number().int().nonnegative(),
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "app_flag_seen",
+    z
+      .object({
+        key: z.literal("daemon_autostart_notice"),
+        version: z.number().int().nonnegative(),
+        changed: z.boolean(),
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "assistant_session_resolved",
+    z.object({ session: sessionSummaryWireSchema, created: z.boolean() }).strict(),
+  ),
+  responseVariant(
+    "startup_disclosures",
+    z
+      .object({
+        org_sync: z
+          .object({
+            org_id: z.string(),
+            cursor_seq: z.number().int(),
+            last_synced_at_ms: z.number().int().optional(),
+          })
+          .strict()
+          .optional(),
+        connector: z
+          .object({
+            enabled: z.boolean(),
+            status: z.string(),
+            relay_url: z.string().optional(),
+            relay_id: z.string().optional(),
+            relay_region: z.string().optional(),
+            last_error: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        config_generation: z.number().int().nonnegative(),
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "workspace_trust_set",
+    z.object({ config_generation: z.number().int().nonnegative() }).strict(),
+  ),
   responseVariant(
     "config_refreshed",
     z.object({ applied_generation: z.number().int().nonnegative(), changed: z.boolean() }).strict(),

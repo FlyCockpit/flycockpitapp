@@ -882,6 +882,63 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
     assert_eq!(reached_dispatch, 3);
 }
 
+#[test]
+fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
+    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let root = tempfile::tempdir().unwrap();
+    let alias = root.path().join(".").to_string_lossy().into_owned();
+    let attach = |project_root| Request::Attach {
+        session_id: None,
+        since_seq: None,
+        project_root,
+        initial_model: None,
+        no_sandbox: false,
+        interactive: false,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    };
+    let explicit = resolve_authorized_fcor_resources(&attach(Some(alias)), root.path()).unwrap();
+    let effective = resolve_authorized_fcor_resources(&attach(None), root.path()).unwrap();
+    assert_eq!(explicit, effective);
+    assert_eq!(explicit[0].kind, Kind::ProjectRoot);
+    assert_eq!(
+        explicit[0].value,
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .as_bytes()
+    );
+
+    let scheduled = Request::CreateScheduledJob {
+        job: proto::ScheduledJobCreate {
+            id: "job-1".into(),
+            owner: "system:test".into(),
+            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+            payload: proto::ScheduledJobPayload::RunPrompt {
+                assistant: "Build".into(),
+                prompt: "run".into(),
+                project_root: root.path().join(".").to_string_lossy().into_owned(),
+            },
+            enabled: true,
+            missed_run_policy: proto::MissedRunPolicy::Skip,
+        },
+    };
+    let resources = resolve_authorized_fcor_resources(&scheduled, root.path()).unwrap();
+    assert_eq!(
+        resources
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SchedulerId, Kind::ProjectRoot]
+    );
+    assert_eq!(resources[0].value, b"job-1");
+    assert_eq!(resources[1].value, explicit[0].value);
+}
+
 #[tokio::test]
 async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let ctx = test_ctx();

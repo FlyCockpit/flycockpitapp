@@ -1,6 +1,75 @@
 use super::sessions::*;
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AuthorizedFcorResource {
+    pub(super) kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
+    pub(super) value: Vec<u8>,
+}
+
+fn canonical_project_root_bytes(
+    path: &std::path::Path,
+) -> std::result::Result<Vec<u8>, ErrorPayload> {
+    let text = path.to_str().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "canonical project root is not valid UTF-8".into(),
+    })?;
+    Ok(text.as_bytes().to_vec())
+}
+
+/// Resolve path-bearing FCOR resources only after request authorization.
+/// Raw client path text never leaves this boundary.
+pub(super) fn resolve_authorized_fcor_resources(
+    request: &Request,
+    daemon_cwd: &std::path::Path,
+) -> std::result::Result<Vec<AuthorizedFcorResource>, ErrorPayload> {
+    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let mut resources = Vec::new();
+    match request {
+        Request::Attach {
+            session_id,
+            project_root,
+            ..
+        } => {
+            if let Some(session_id) = session_id {
+                resources.push(AuthorizedFcorResource {
+                    kind: Kind::SessionUuid,
+                    value: session_id.as_bytes().to_vec(),
+                });
+            }
+            let requested = project_root
+                .as_deref()
+                .map(std::path::Path::new)
+                .unwrap_or(daemon_cwd);
+            let canonical = crate::daemon::fs_api::canonical_project_root(
+                requested.to_str().ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "project root is not valid UTF-8".into(),
+                })?,
+            )?;
+            resources.push(AuthorizedFcorResource {
+                kind: Kind::ProjectRoot,
+                value: canonical_project_root_bytes(&canonical)?,
+            });
+        }
+        Request::CreateScheduledJob { job } => {
+            resources.push(AuthorizedFcorResource {
+                kind: Kind::SchedulerId,
+                value: job.id.as_bytes().to_vec(),
+            });
+            if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+                let canonical = crate::daemon::fs_api::canonical_project_root(project_root)?;
+                resources.push(AuthorizedFcorResource {
+                    kind: Kind::ProjectRoot,
+                    value: canonical_project_root_bytes(&canonical)?,
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(resources)
+}
+
 pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,
     row: &crate::db::sessions::SessionRow,

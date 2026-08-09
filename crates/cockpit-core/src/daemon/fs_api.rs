@@ -587,7 +587,7 @@ fn dotenv_pattern_matches(
     ))
 }
 
-fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
+pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
     let root = Path::new(project_root);
     match std::fs::canonicalize(root) {
         Ok(path) if path.is_dir() => Ok(path),

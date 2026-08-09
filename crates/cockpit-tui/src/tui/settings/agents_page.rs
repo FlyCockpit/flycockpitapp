@@ -852,7 +852,7 @@ impl SettingsCx {
     }
 
     fn render_agent_detail(&self, frame: &mut Frame, area: Rect, detail: &AgentDetail) {
-        let (lines, selected_line) = tool_surface_lines(
+        let (lines, selected_line, semantic_rows) = tool_surface_lines(
             &detail.picker,
             &detail.draft,
             ToolSurfaceRender {
@@ -863,8 +863,19 @@ impl SettingsCx {
                 block_safety_ungrant: false,
             },
         );
-        self.scroll_states
-            .render_lines(frame, area, "agent-detail", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "agent-detail",
+            lines,
+            selected_line,
+            semantic_rows
+                .into_iter()
+                .filter(|(_, _, enabled)| *enabled)
+                .map(|(line, index, _)| (line, SettingsControlId(index as u64))),
+            &self.pointer_surface,
+            SettingsScrollRegionId("agents:detail"),
+        );
     }
 }
 
@@ -905,7 +916,15 @@ impl SettingsPage for AgentsPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
-        if self.detail.is_some() || self.editing.is_some() || index >= self.rows.len() {
+        if let Some(detail) = self.detail.as_mut() {
+            if index >= cockpit_core::agents::tool_surface_catalog().len() {
+                return Nav::Stay;
+            }
+            detail.picker.set_cursor(index);
+            return cx
+                .handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self);
+        }
+        if self.editing.is_some() || index >= self.rows.len() {
             return Nav::Stay;
         }
         self.cursor = index;
@@ -927,6 +946,18 @@ impl SettingsPage for AgentsPage {
                 .cursor
                 .saturating_add_signed(delta)
                 .min(self.rows.len().saturating_sub(1));
+        } else if region == SettingsScrollRegionId("agents:detail")
+            && let Some(detail) = self.detail.as_mut()
+        {
+            let last = cockpit_core::agents::tool_surface_catalog()
+                .len()
+                .saturating_sub(1);
+            let cursor = detail
+                .picker
+                .cursor()
+                .saturating_add_signed(delta)
+                .min(last);
+            detail.picker.set_cursor(cursor);
         }
         Nav::Stay
     }

@@ -162,7 +162,7 @@ pub(crate) fn tool_surface_lines(
     picker: &ToolSurfacePicker,
     draft: &ToolSurfaceDraft,
     opts: ToolSurfaceRender<'_>,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, Option<usize>, Vec<(usize, usize, bool)>) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let red = Style::default().fg(Color::Red);
@@ -179,6 +179,7 @@ pub(crate) fn tool_surface_lines(
         ]),
         Line::default(),
     ];
+    let mut semantic_rows = Vec::new();
     let mut last_family = "";
     for (index, item) in cockpit_core::agents::tool_surface_catalog()
         .into_iter()
@@ -234,6 +235,7 @@ pub(crate) fn tool_surface_lines(
             spans.push(Span::raw("  "));
             spans.push(Span::styled(error.clone(), red));
         }
+        semantic_rows.push((lines.len(), index, !safety_blocked));
         lines.push(Line::from(spans));
     }
     if let Some(status) = opts.status {
@@ -245,7 +247,7 @@ pub(crate) fn tool_surface_lines(
             .first()
             .is_some_and(|span| span.content.starts_with('▸'))
     });
-    (lines, selected_line)
+    (lines, selected_line, semantic_rows)
 }
 
 #[cfg(test)]

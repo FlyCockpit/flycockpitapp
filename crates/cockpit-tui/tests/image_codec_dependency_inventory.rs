@@ -555,9 +555,25 @@ fn tui_image_codec_dependency_inventory() {
             "{triple} image dependency must be unconditional"
         );
         assert_eq!(tui_image["uses_default_features"], false);
+        // Cargo metadata reports the additive workspace/member declarations as
+        // one array and may retain the same leaf more than once (the workspace
+        // and cockpit-tui both request png). Feature activation is set-valued,
+        // so compare its normalized union while the manifest checks above keep
+        // proving each declaration independently.
+        let direct_feature_union = tui_image["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|feature| feature.as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        let expected_tui_features = expected
+            .tui_features
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            tui_image["features"],
-            serde_json::json!(expected.tui_features)
+            direct_feature_union, expected_tui_features,
+            "{triple} direct image feature union"
         );
         assert_eq!(expected.tui_features, ["gif", "jpeg", "png", "webp"]);
         assert_eq!(expected.probe_formats, ["gif", "jpeg", "png", "webp"]);

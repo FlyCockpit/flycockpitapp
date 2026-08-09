@@ -8,6 +8,7 @@ import {
   daemonRelayFrameSchema,
   type RelayControlMessage,
   type RelayGrant,
+  RELAY_ENVELOPE_VERSION,
   type RelayTokenPayload,
   relayControlMessageSchema,
   type UserRelayFrame,
@@ -400,7 +401,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       channelOwners.set(ownerKey, connection);
     }
     sendJson(daemon.ws, {
-      v: 1,
+      v: RELAY_ENVELOPE_VERSION,
       channelId: frame.channelId,
       from: "client",
       principal: {

@@ -10,7 +10,7 @@ use serde_json::Value;
 /// window must keep parsing known data and ignoring unknown additive fields.
 /// Breaking changes such as removals, renames, or type changes bump
 /// `RELAY_MIN_SUPPORTED_ENVELOPE_VERSION`.
-pub const RELAY_ENVELOPE_VERSION: u32 = 1;
+pub const RELAY_ENVELOPE_VERSION: u32 = 2;
 pub const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION: u32 = 1;
 
 pub fn is_relay_envelope_version_supported(version: u32) -> bool {
@@ -44,12 +44,68 @@ pub struct RelayPrincipal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientActorBindingV1 {
+    #[serde(deserialize_with = "schema_version_one")]
     pub schema_version: u8,
-    pub device_id: String,
+    #[serde(deserialize_with = "canonical_nonnil_uuid")]
+    pub device_id: uuid::Uuid,
+    #[serde(with = "canonical_positive_u64")]
     pub device_generation: u64,
-    pub logical_attachment_id: String,
+    #[serde(deserialize_with = "canonical_nonnil_uuid")]
+    pub logical_attachment_id: uuid::Uuid,
+}
+
+fn schema_version_one<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let value = u8::deserialize(deserializer)?;
+    if value != 1 {
+        return Err(serde::de::Error::custom(
+            "actor binding schemaVersion must be 1",
+        ));
+    }
+    Ok(value)
+}
+
+fn canonical_nonnil_uuid<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<uuid::Uuid, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    let value = uuid::Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+    if value.is_nil()
+        || value.get_variant() != uuid::Variant::RFC4122
+        || value.hyphenated().to_string() != text
+    {
+        return Err(serde::de::Error::custom(
+            "UUID must be canonical lowercase and nonnil",
+        ));
+    }
+    Ok(value)
+}
+
+mod canonical_positive_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.is_empty()
+            || (text.len() > 1 && text.starts_with('0'))
+            || !text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(serde::de::Error::custom(
+                "generation must be canonical decimal u64",
+            ));
+        }
+        let value = text.parse::<u64>().map_err(serde::de::Error::custom)?;
+        if value == 0 {
+            return Err(serde::de::Error::custom("generation must be positive"));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +527,28 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn client_actor_binding_codec_is_strict_and_u64_complete() {
+        let valid = serde_json::json!({
+            "schemaVersion": 1,
+            "deviceId": "00000000-0000-4000-8000-000000000001",
+            "deviceGeneration": "18446744073709551615",
+            "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+        });
+        let binding: ClientActorBindingV1 = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(binding.device_generation, u64::MAX);
+        assert_eq!(serde_json::to_value(binding).unwrap(), valid);
+        for invalid in [
+            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":0,"logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
+            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"0","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
+            serde_json::json!({"schemaVersion":2,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"1","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
+            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-0000-0000-000000000000","deviceGeneration":"1","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
+            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"9007199254740993","logicalAttachmentId":"00000000-0000-4000-8000-000000000002","unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<ClientActorBindingV1>(invalid).is_err());
+        }
+    }
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use serde_json::{Map, json};

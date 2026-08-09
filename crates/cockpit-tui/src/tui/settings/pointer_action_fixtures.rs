@@ -32,14 +32,7 @@ fixture_enum!(CategoryFixture {
     SuggestionSelect,
     TextEditorSave,
     TextEditorCancel,
-    Reset,
-    ExternalEditBeginCursor,
-    ExternalEditBeginInline,
-    ExternalEditBeginPathEditor,
-    ExternalEditBeginTextEditor,
-    ExternalEditResultSaved,
-    ExternalEditResultCancelled,
-    ExternalEditResultFailed
+    Reset
 });
 fixture_enum!(AgentsFixture {
     Open,
@@ -459,9 +452,7 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
             | CategoryAction::PathEditCommit(id)
             | CategoryAction::PathEditCancel(id)
             | CategoryAction::TextEditorSave(id)
-            | CategoryAction::TextEditorCancel(id)
-            | CategoryAction::ExternalEditBegin(id, _)
-            | CategoryAction::ExternalEditResult(id, _) => {
+            | CategoryAction::TextEditorCancel(id) => {
                 vec![PayloadFixtureKey::CategorySetting(*id)]
             }
             CategoryAction::SuggestionSelect(id, _) => {
@@ -625,17 +616,6 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
             CategoryAction::TextEditorSave(_) => CategoryFixture::TextEditorSave,
             CategoryAction::TextEditorCancel(_) => CategoryFixture::TextEditorCancel,
             CategoryAction::Reset => CategoryFixture::Reset,
-            CategoryAction::ExternalEditBegin(_, source) => match source {
-                CategoryExternalSource::Cursor => CategoryFixture::ExternalEditBeginCursor,
-                CategoryExternalSource::Inline => CategoryFixture::ExternalEditBeginInline,
-                CategoryExternalSource::PathEditor => CategoryFixture::ExternalEditBeginPathEditor,
-                CategoryExternalSource::TextEditor => CategoryFixture::ExternalEditBeginTextEditor,
-            },
-            CategoryAction::ExternalEditResult(_, result) => match result {
-                ExternalEditOutcome::Saved => CategoryFixture::ExternalEditResultSaved,
-                ExternalEditOutcome::Cancelled => CategoryFixture::ExternalEditResultCancelled,
-                ExternalEditOutcome::Failed => CategoryFixture::ExternalEditResultFailed,
-            },
         }),
         SettingsPointerAction::Agents(action) => K::Agents(match action {
             AgentsAction::Open(_) => AgentsFixture::Open,

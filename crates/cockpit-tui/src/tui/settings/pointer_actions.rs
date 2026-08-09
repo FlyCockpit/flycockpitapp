@@ -161,13 +161,6 @@ pub(super) enum ExternalEditOutcome {
     Failed,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum CategoryExternalSource {
-    Cursor,
-    Inline,
-    PathEditor,
-    TextEditor,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum CredentialKind {
     Firecrawl,
     TinyFish,
@@ -260,8 +253,6 @@ pub(super) enum CategoryAction {
     TextEditorSave(SettingId),
     TextEditorCancel(SettingId),
     Reset,
-    ExternalEditBegin(SettingId, CategoryExternalSource),
-    ExternalEditResult(SettingId, ExternalEditOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -5135,7 +5135,7 @@ mod paste_routing_tests {
     }
 
     #[test]
-    fn paste_probe_deadline_uses_injected_event_loop_clock() {
+    fn paste_probe_off_event_loop() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
         let request = app
@@ -5183,30 +5183,52 @@ mod paste_routing_tests {
     }
 
     #[cfg(unix)]
-    fn spawn_cat_pane(app: &mut App, focused: bool) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    fn spawn_cat_pane(
+        app: &mut App,
+        focused: bool,
+    ) -> (
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
         let argv = vec!["cat".to_string()];
         let cwd = std::env::temp_dir();
         let pane =
             crate::tui::pty::PtyPane::spawn(crate::tui::pty::PaneKind::Editor, &argv, &cwd, 24, 80)
                 .expect("spawn cat pty child");
         let (tx, rx) = std::sync::mpsc::channel();
+        let (screen_tx, screen_rx) = std::sync::mpsc::channel();
         let mut pane = pane;
         pane.install_input_observer(tx);
+        pane.install_screen_apply_observer(screen_tx);
         app.pane = Some(pane);
         app.pane_focused = focused;
-        rx
+        (rx, screen_rx)
     }
 
     #[cfg(unix)]
     #[test]
-    fn paste_routes_to_focused_pty_pane() {
+    fn paste_tests_corrected_first() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        let input = spawn_cat_pane(&mut app, true);
+        let (input, screen_applied) = spawn_cat_pane(&mut app, true);
 
         app.handle_paste("hello\n".to_string());
 
         assert_eq!(input.recv().unwrap(), b"hello\n");
+        let applied = screen_applied.recv().unwrap();
+        assert!(
+            applied
+                .windows(b"hello".len())
+                .any(|bytes| bytes == b"hello"),
+            "reader acknowledgement follows applying the exact cat echo"
+        );
+        assert!(
+            app.pane
+                .as_ref()
+                .expect("pane remains open")
+                .screen_contents_for_test()
+                .contains("hello")
+        );
         assert!(app.composer.is_empty());
         assert!(app.paste_registry.is_empty());
         app.close_pane(true);
@@ -5217,11 +5239,18 @@ mod paste_routing_tests {
     fn paste_shortcut_chars_reach_focused_pty_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        let input = spawn_cat_pane(&mut app, true);
+        let (input, screen_applied) = spawn_cat_pane(&mut app, true);
 
         app.handle_paste("cqjk\n".to_string());
 
         assert_eq!(input.recv().unwrap(), b"cqjk\n");
+        assert!(
+            screen_applied
+                .recv()
+                .unwrap()
+                .windows(b"cqjk".len())
+                .any(|bytes| bytes == b"cqjk")
+        );
         assert!(app.composer.is_empty());
         app.close_pane(true);
     }
@@ -5231,7 +5260,7 @@ mod paste_routing_tests {
     fn paste_ignores_unfocused_pty_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        let input = spawn_cat_pane(&mut app, false);
+        let (input, _screen_applied) = spawn_cat_pane(&mut app, false);
 
         app.handle_paste("hello".to_string());
 

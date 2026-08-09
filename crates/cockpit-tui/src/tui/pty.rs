@@ -60,6 +60,10 @@ pub struct PtyPane {
     _reader: JoinHandle<()>,
     #[cfg(test)]
     input_observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// Deterministic test acknowledgement emitted only after the PTY reader
+    /// has applied a child-output chunk to the screen parser.
+    #[cfg(test)]
+    screen_apply_observer: Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl PtyPane {
@@ -106,10 +110,15 @@ impl PtyPane {
 
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
         let reader_eof = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let screen_apply_observer: Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(None));
 
         let thread = {
             let parser = Arc::clone(&parser);
             let reader_eof = Arc::clone(&reader_eof);
+            #[cfg(test)]
+            let screen_apply_observer = Arc::clone(&screen_apply_observer);
             std::thread::Builder::new()
                 .name(format!("cockpit-pty-{}", kind.label()))
                 .spawn(move || {
@@ -120,6 +129,12 @@ impl PtyPane {
                             Ok(n) => {
                                 if let Ok(mut p) = parser.lock() {
                                     p.process(&buf[..n]);
+                                    #[cfg(test)]
+                                    if let Ok(observer) = screen_apply_observer.lock()
+                                        && let Some(observer) = observer.as_ref()
+                                    {
+                                        let _ = observer.send(buf[..n].to_vec());
+                                    }
                                 }
                             }
                             Err(_) => break,
@@ -141,6 +156,8 @@ impl PtyPane {
             _reader: thread,
             #[cfg(test)]
             input_observer: None,
+            #[cfg(test)]
+            screen_apply_observer,
         })
     }
 
@@ -181,6 +198,17 @@ impl PtyPane {
     #[cfg(test)]
     pub(crate) fn install_input_observer(&mut self, observer: std::sync::mpsc::Sender<Vec<u8>>) {
         self.input_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_screen_apply_observer(
+        &mut self,
+        observer: std::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        *self
+            .screen_apply_observer
+            .lock()
+            .expect("screen observer mutex poisoned") = Some(observer);
     }
 
     /// Forward a key press to the child, encoding it back into terminal

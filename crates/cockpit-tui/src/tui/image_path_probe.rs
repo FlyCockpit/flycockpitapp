@@ -68,15 +68,7 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
         .into_decoder()
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
     let (encoded_width, encoded_height) = decoder.dimensions();
-    let encoded_pixels = u64::from(encoded_width)
-        .checked_mul(u64::from(encoded_height))
-        .ok_or(ImageProbeError::PasteUnavailable)?;
-    if encoded_width > MAX_DIMENSION
-        || encoded_height > MAX_DIMENSION
-        || encoded_pixels > MAX_PIXELS
-    {
-        return Err(ImageProbeError::PasteUnavailable);
-    }
+    validate_dimensions(encoded_width, encoded_height)?;
     let orientation = decoder
         .orientation()
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
@@ -84,18 +76,30 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
         DynamicImage::from_decoder(decoder).map_err(|_| ImageProbeError::PasteUnavailable)?;
     image.apply_orientation(orientation);
     let (width, height) = image.dimensions();
-    let pixels = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or(ImageProbeError::PasteUnavailable)?;
-    if pixels > MAX_PIXELS {
-        return Err(ImageProbeError::PasteUnavailable);
-    }
+    validate_dimensions(width, height)?;
     let rgba = image.into_rgba8();
     let mut normalized = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(rgba)
         .write_to(&mut normalized, ImageFormat::Png)
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
     Ok(normalized.into_inner())
+}
+
+fn validate_dimensions(width: u32, height: u32) -> Result<(), ImageProbeError> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(ImageProbeError::PasteUnavailable)?;
+    let decoded_bytes = pixels
+        .checked_mul(4)
+        .ok_or(ImageProbeError::PasteUnavailable)?;
+    if width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || pixels > MAX_PIXELS
+        || decoded_bytes > MAX_DECODED_BYTES
+    {
+        return Err(ImageProbeError::PasteUnavailable);
+    }
+    Ok(())
 }
 
 fn browser_format(bytes: &[u8]) -> Result<ImageFormat, ImageProbeError> {
@@ -314,5 +318,41 @@ mod tests {
         let oversized = binding.join("d234567d234567d234567d2345.png");
         std::fs::write(&oversized, vec![0; MAX_INPUT_BYTES as usize + 1]).unwrap();
         assert!(normalize_private_image(&oversized).is_err());
+        assert!(normalize_private_image(&binding).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = binding.join("target.png");
+            image::DynamicImage::ImageRgba8(image.clone())
+                .save_with_format(&target, ImageFormat::Png)
+                .unwrap();
+            let link = binding.join("link.png");
+            symlink(&target, &link).unwrap();
+            assert!(normalize_private_image(&link).is_err());
+        }
+
+        assert!(validate_dimensions(8_192, 4_882).is_ok());
+        assert!(validate_dimensions(8_193, 1).is_err());
+        assert!(validate_dimensions(1, 8_193).is_err());
+        assert!(validate_dimensions(8_192, 4_883).is_err());
+        assert!(validate_dimensions(8_000, 5_000).is_ok());
+        assert!(validate_dimensions(8_000, 5_001).is_err());
+
+        for (format, bytes) in [
+            (ImageFormat::Png, b"header-acTL-tail".as_slice()),
+            (ImageFormat::WebP, b"header-ANMF-tail".as_slice()),
+        ] {
+            assert!(reject_animation(format, bytes).is_err());
+        }
+        // A minimally structured two-frame GIF is rejected before decode.
+        let two_frame_gif = [
+            b"GIF89a".as_slice(),
+            &[1, 0, 1, 0, 0, 0, 0],
+            &[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0],
+            &[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0],
+            &[0x3b],
+        ]
+        .concat();
+        assert!(reject_animation(ImageFormat::Gif, &two_frame_gif).is_err());
     }
 }

@@ -4,6 +4,81 @@
   "paramsHex": "",
   "canonicalHex": "46434f52010d6461656d6f6e5f73746174757300010b0000000000000000",
   "sha256Hex": "7ea781718e707de7107ecaf18e3d4de8e76a749ccbc116360023022cbf60f954",
+  "richPositive": {
+    "requestKind": "fs_read",
+    "resources": [
+      { "kind": "project_root", "valueHex": "2f746d702f78" },
+      { "kind": "file_path", "valueHex": "612e747874" }
+    ],
+    "paramsHex": "01",
+    "canonicalHex": "46434f52010766735f72656164000203000000062f746d702f780400000005612e7478740000000101",
+    "sha256Hex": "67c61e0070db03a09e2fe4d1bb8e2166299bb5972da93afe0a07d41ff587ff87"
+  },
+  "sizeCases": [
+    {
+      "name": "kind 255",
+      "kindLength": 255,
+      "resourceLengths": [],
+      "paramsLength": 0,
+      "valid": true
+    },
+    {
+      "name": "kind 256",
+      "kindLength": 256,
+      "resourceLengths": [],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "resource u32",
+      "kindLength": 1,
+      "resourceLengths": [4294967295],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "resource over u32",
+      "kindLength": 1,
+      "resourceLengths": [4294967296],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "params u32",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967295,
+      "valid": false
+    },
+    {
+      "name": "params over u32",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967296,
+      "valid": false
+    },
+    {
+      "name": "total exact maximum",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967282,
+      "valid": true
+    },
+    {
+      "name": "total maximum plus one",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967283,
+      "valid": false
+    }
+  ],
+  "shapeCases": [
+    { "name": "daemon global empty", "kind": "daemon_global", "valueLength": 0, "valid": true },
+    { "name": "daemon global nonempty", "kind": "daemon_global", "valueLength": 1, "valid": false },
+    { "name": "UUID 15", "kind": "session_uuid", "valueLength": 15, "valid": false },
+    { "name": "UUID 16", "kind": "session_uuid", "valueLength": 16, "valid": true },
+    { "name": "UUID 17", "kind": "session_uuid", "valueLength": 17, "valid": false }
+  ],
   "malformed": [
     { "name": "magic", "replaceByte": [0, 0] },
     { "name": "version", "replaceByte": [4, 2] },

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
-import { encodeFcorV1, hashFcorV1, validateFcorV1 } from "./remote-operation-fcor";
+import {
+  checkedFcorV1Size,
+  encodeFcorV1,
+  hashFcorV1,
+  validateFcorV1,
+} from "./remote-operation-fcor";
 
 describe("FCOR v1", () => {
   it("matches the shared canonical vector and digest exactly", async () => {
@@ -35,6 +40,33 @@ describe("FCOR v1", () => {
       if ("appendHex" in malformed)
         candidate = Uint8Array.from([...candidate, ...Buffer.from(malformed.appendHex, "hex")]);
       expect(() => validateFcorV1(candidate), malformed.name).toThrow();
+    }
+    const rich = vector.richPositive;
+    const richBytes = encodeFcorV1(
+      rich.requestKind,
+      rich.resources.map((resource) => ({
+        kind: resource.kind,
+        value: Uint8Array.from(Buffer.from(resource.valueHex, "hex")),
+      })),
+      Uint8Array.from(Buffer.from(rich.paramsHex, "hex")),
+    );
+    expect(Buffer.from(richBytes).toString("hex")).toBe(rich.canonicalHex);
+    expect(Buffer.from(await hashFcorV1(richBytes)).toString("hex")).toBe(rich.sha256Hex);
+    for (const boundary of vector.sizeCases) {
+      const call = () =>
+        checkedFcorV1Size(boundary.kindLength, boundary.resourceLengths, boundary.paramsLength);
+      if (boundary.valid) expect(call(), boundary.name).toBeGreaterThan(0);
+      else expect(call, boundary.name).toThrow();
+    }
+    for (const shape of vector.shapeCases) {
+      const call = () =>
+        encodeFcorV1(
+          "status",
+          [{ kind: shape.kind, value: new Uint8Array(shape.valueLength) }],
+          new Uint8Array(),
+        );
+      if (shape.valid) expect(call(), shape.name).toBeInstanceOf(Uint8Array);
+      else expect(call, shape.name).toThrow();
     }
   });
 });

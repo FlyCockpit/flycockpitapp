@@ -5,6 +5,41 @@ use sha2::{Digest, Sha256};
 
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
 pub const FCOR_SCHEMA_VERSION: u8 = 1;
+pub const MAX_FCOR_V1_BYTES: u64 = u32::MAX as u64;
+
+pub fn checked_fcor_v1_size(
+    request_kind_len: u64,
+    resource_value_lengths: impl IntoIterator<Item = u64>,
+    params_len: u64,
+) -> Result<u64> {
+    ensure!(
+        (1..=u8::MAX as u64).contains(&request_kind_len),
+        "invalid request kind length"
+    );
+    ensure!(params_len <= u32::MAX as u64, "params exceed u32 length");
+    let mut total = 4_u64
+        .checked_add(1)
+        .and_then(|v| v.checked_add(1))
+        .and_then(|v| v.checked_add(request_kind_len))
+        .and_then(|v| v.checked_add(2))
+        .and_then(|v| v.checked_add(4))
+        .and_then(|v| v.checked_add(params_len))
+        .ok_or_else(|| anyhow::anyhow!("FCOR size overflow"))?;
+    let mut count = 0_u64;
+    for length in resource_value_lengths {
+        ensure!(length <= u32::MAX as u64, "resource exceeds u32 length");
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("resource count overflow"))?;
+        ensure!(count <= u16::MAX as u64, "too many resources");
+        total = total
+            .checked_add(5)
+            .and_then(|v| v.checked_add(length))
+            .ok_or_else(|| anyhow::anyhow!("FCOR size overflow"))?;
+    }
+    ensure!(total <= MAX_FCOR_V1_BYTES, "FCOR exceeds maximum size");
+    Ok(total)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -57,7 +92,12 @@ pub fn encode_fcor_v1(
     );
     let resource_count = u16::try_from(resources.len())?;
     let params_len = u32::try_from(canonical_params.len())?;
-    let mut out = Vec::new();
+    let total = checked_fcor_v1_size(
+        kind.len() as u64,
+        resources.iter().map(|resource| resource.value.len() as u64),
+        canonical_params.len() as u64,
+    )?;
+    let mut out = Vec::with_capacity(usize::try_from(total)?);
     out.extend_from_slice(&FCOR_MAGIC);
     out.push(FCOR_SCHEMA_VERSION);
     out.push(kind.len() as u8);
@@ -167,6 +207,67 @@ mod tests {
                 "malformed vector unexpectedly valid: {}",
                 malformed["name"]
             );
+        }
+        let rich = &fixture["richPositive"];
+        let rich_values: Vec<Vec<u8>> = rich["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|resource| decode_hex(resource["valueHex"].as_str().unwrap()))
+            .collect();
+        let rich_resources: Vec<_> = rich["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(&rich_values)
+            .map(|(resource, value)| RemoteOperationResource {
+                kind: match resource["kind"].as_str().unwrap() {
+                    "project_root" => RemoteOperationResourceKind::ProjectRoot,
+                    "file_path" => RemoteOperationResourceKind::FilePath,
+                    other => panic!("unexpected fixture kind {other}"),
+                },
+                value,
+            })
+            .collect();
+        let rich_bytes = encode_fcor_v1(
+            rich["requestKind"].as_str().unwrap(),
+            &rich_resources,
+            &decode_hex(rich["paramsHex"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(hex(&rich_bytes), rich["canonicalHex"].as_str().unwrap());
+        assert_eq!(
+            hex(&hash_fcor_v1(&rich_bytes).unwrap()),
+            rich["sha256Hex"].as_str().unwrap()
+        );
+        for boundary in fixture["sizeCases"].as_array().unwrap() {
+            let result = checked_fcor_v1_size(
+                boundary["kindLength"].as_u64().unwrap(),
+                boundary["resourceLengths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_u64().unwrap()),
+                boundary["paramsLength"].as_u64().unwrap(),
+            );
+            assert_eq!(result.is_ok(), boundary["valid"].as_bool().unwrap());
+        }
+        for shape in fixture["shapeCases"].as_array().unwrap() {
+            let value = vec![0; shape["valueLength"].as_u64().unwrap() as usize];
+            let kind = match shape["kind"].as_str().unwrap() {
+                "daemon_global" => RemoteOperationResourceKind::DaemonGlobal,
+                "session_uuid" => RemoteOperationResourceKind::SessionUuid,
+                other => panic!("unexpected fixture kind {other}"),
+            };
+            let result = encode_fcor_v1(
+                "status",
+                &[RemoteOperationResource {
+                    kind,
+                    value: &value,
+                }],
+                &[],
+            );
+            assert_eq!(result.is_ok(), shape["valid"].as_bool().unwrap());
         }
     }
 

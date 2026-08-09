@@ -24,6 +24,37 @@ declare const validatedFcorV1: unique symbol;
 export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 
 const U32_MAX = 0xffffffff;
+export const MAX_FCOR_V1_BYTES = U32_MAX;
+
+export function checkedFcorV1Size(
+  requestKindLength: number,
+  resourceValueLengths: readonly number[],
+  paramsLength: number,
+): number {
+  if (
+    !Number.isSafeInteger(requestKindLength) ||
+    requestKindLength < 1 ||
+    requestKindLength > 255
+  ) {
+    throw new Error("invalid FCOR request kind length");
+  }
+  if (!Number.isSafeInteger(paramsLength) || paramsLength < 0 || paramsLength > U32_MAX) {
+    throw new Error("FCOR params exceed u32 length");
+  }
+  if (resourceValueLengths.length > 0xffff) throw new Error("too many FCOR resources");
+  let total = 4 + 1 + 1 + requestKindLength + 2 + 4 + paramsLength;
+  for (const length of resourceValueLengths) {
+    if (!Number.isSafeInteger(length) || length < 0 || length > U32_MAX) {
+      throw new Error("FCOR resource exceeds u32 length");
+    }
+    total += 5 + length;
+    if (!Number.isSafeInteger(total) || total > MAX_FCOR_V1_BYTES) {
+      throw new Error("FCOR total length exceeds maximum");
+    }
+  }
+  if (total > MAX_FCOR_V1_BYTES) throw new Error("FCOR total length exceeds maximum");
+  return total;
+}
 
 function resourceKindCode(kind: string): number {
   const code = remoteOperationResourceKinds[kind as keyof typeof remoteOperationResourceKinds];
@@ -52,19 +83,13 @@ export function encodeFcorV1(
   if (kind.length < 1 || kind.length > 255 || !/^[a-z0-9_]+$/.test(requestKind)) {
     throw new Error("request kind must be 1..255 lowercase ASCII bytes");
   }
-  if (resources.length > 0xffff || canonicalParams.length > U32_MAX) {
-    throw new Error("FCOR field exceeds v1 length bound");
-  }
-  let size = 4 + 1 + 1 + kind.length + 2 + 4 + canonicalParams.length;
+  const resourceLengths: number[] = [];
   for (const resource of resources) {
     const code = resourceKindCode(resource.kind);
-    if (resource.value.length > U32_MAX) throw new Error("FCOR resource exceeds u32 length");
     validateStableResourceShape(code, resource.value);
-    size += 1 + 4 + resource.value.length;
-    if (!Number.isSafeInteger(size) || size > U32_MAX) {
-      throw new Error("FCOR total length exceeds safe allocation bound");
-    }
+    resourceLengths.push(resource.value.length);
   }
+  const size = checkedFcorV1Size(kind.length, resourceLengths, canonicalParams.length);
   const out = new Uint8Array(size);
   const view = new DataView(out.buffer);
   let offset = 0;

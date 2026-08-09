@@ -226,6 +226,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
+    pointer_add_codex_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
 }
 
@@ -1669,6 +1670,63 @@ fn pointer_add_grok_continue_renders_and_dispatches_from_fresh_state() {
             if state.saved_provider_id.as_deref() == Some("grok-oauth")
                 && state.error.as_deref().is_some_and(|message| message.starts_with("saved."))
     ));
+}
+
+#[test]
+fn pointer_add_codex_continue_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+        oauth.logged_in = true;
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "codex-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        ProviderWizardStep::CodexOAuth,
+                        WizardControlId::OAuth(OAuthOption::Continue),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("logged-in Codex wizard renders Continue");
+    assert_eq!(
+        super::super::pointer_action_fixtures::key_for(&action),
+        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+            super::super::pointer_action_fixtures::ProvidersFixture::WizardCodexContinue,
+        )
+    );
+
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(fresh.config.providers.contains_key("codex-oauth"));
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.saved_provider_id.as_deref() == Some("codex-oauth")
+                && state.error.as_deref().is_some_and(|message| message.starts_with("saved."))
+    ));
+    assert_eq!(
+        load_provider(&fresh.config_path, "codex-oauth").auth,
+        Some(AuthKind::OAuth)
+    );
 }
 
 #[test]

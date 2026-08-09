@@ -14,7 +14,7 @@
 //! entries; the last row is the synthetic `[+ add directory]`. Toggling
 //! and list edits both persist via `save_extended()`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -25,7 +25,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
 use super::reset::{ResetButton, ResetOutcome};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 #[cfg(test)]
 use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
@@ -212,6 +214,7 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
             area.width,
@@ -222,7 +225,9 @@ impl SettingsCx {
              dir up to the git root.",
             muted,
         );
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
         // Row 0: auto-`!` toggle.
         let toggle_on_cursor = p.cursor == 0;
@@ -242,6 +247,7 @@ impl SettingsCx {
             Span::styled("auto-! commands  ", toggle_label_style),
             Span::styled(toggle_value.to_string(), muted),
         ]));
+        controls.push(Some((SettingsControlId(0), true, None)));
 
         // Row 1: ancestor-walk toggle.
         let walk_on_cursor = p.cursor == 1;
@@ -261,12 +267,15 @@ impl SettingsCx {
             Span::styled("ancestor walk    ", walk_label_style),
             Span::styled(walk_value.to_string(), muted),
         ]));
+        controls.push(Some((SettingsControlId(1), true, None)));
 
         lines.push(Line::default());
+        controls.push(None);
         lines.push(Line::from(Span::styled(
             "scan directories".to_string(),
             muted,
         )));
+        controls.push(None);
 
         for (i, dir) in self.extended.skills.scan_dirs.iter().enumerate() {
             let row_cursor = i + TOGGLE_ROWS; // skip the leading toggle rows
@@ -278,6 +287,7 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     "  (type directory)",
                 )));
+                controls.push(Some((SettingsControlId(row_cursor as u64), true, None)));
                 continue;
             }
             let marker = if on_cursor {
@@ -294,6 +304,7 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled(dir.clone(), style),
             ]));
+            controls.push(Some((SettingsControlId(row_cursor as u64), true, None)));
         }
 
         // `[+ add directory]` row — hidden while a row is grabbed.
@@ -310,6 +321,7 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled("[+ add directory]".to_string(), style),
             ]));
+            controls.push(Some((SettingsControlId(add_idx as u64), true, None)));
 
             // `[reset to defaults]` button — the last navigable row, just
             // below `[+ add directory]`. Hidden (like `[+ add]`) while a
@@ -319,21 +331,34 @@ impl SettingsCx {
                 p.reset
                     .render_line(p.cursor == reset_idx, "reset to defaults"),
             );
+            controls.push(Some((SettingsControlId(reset_idx as u64), true, None)));
         }
 
         if p.grabbed.is_some() {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(grab::grab_hint_line(grab::GRAB_HINT_EDIT));
+            controls.push(None);
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "skills", lines, selected_line);
+        self.scroll_states.render_control_lines(
+            frame,
+            area,
+            "skills",
+            lines,
+            selected_line,
+            controls,
+            &self.pointer_surface,
+            SettingsScrollRegionId("skills"),
+        );
     }
 }
 
@@ -352,6 +377,30 @@ impl SettingsPage for SkillsPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_skills_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let nav_len = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 2;
+        let index = control.0 as usize;
+        if index >= nav_len {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_skills_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("skills") && self.grabbed.is_none() {
+            let last = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1;
+            self.reset.disarm();
+            self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

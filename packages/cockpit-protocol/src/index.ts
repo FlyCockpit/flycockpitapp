@@ -124,8 +124,17 @@ export const remoteReplayAckV2Schema = z
   .object({
     v: z.literal(PROTOCOL_VERSION),
     kind: z.literal("replay_ack"),
+    id: canonicalRfcUuidSchema,
     deliveryId: canonicalRfcUuidSchema,
     leaseToken: canonicalRfcUuidSchema,
+  })
+  .strict();
+export const remoteReplayAckResponseV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_ack_res"),
+    id: canonicalRfcUuidSchema,
+    acked: z.boolean(),
   })
   .strict();
 const clientSubmissionIdSchema = uuidSchema.refine(

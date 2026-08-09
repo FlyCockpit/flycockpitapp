@@ -6,7 +6,7 @@ fn shared_remote_replay_vectors_are_strict_and_exact() {
         "../../../packages/cockpit-protocol/fixtures/remote-operation-replay-v2.json"
     ))
     .unwrap();
-    for key in ["request", "response", "ack"] {
+    for key in ["request", "response", "ack", "ackResponse"] {
         let envelope: Envelope = serde_json::from_value(fixture[key].clone()).unwrap();
         assert_eq!(serde_json::to_value(envelope).unwrap(), fixture[key]);
     }
@@ -14,5 +14,5 @@ fn shared_remote_replay_vectors_are_strict_and_exact() {
         assert!(serde_json::from_value::<Envelope>(invalid.clone()).is_err());
     }
     let request: Envelope = serde_json::from_value(fixture["request"].clone()).unwrap();
-    assert!(matches!(request.body, Body::RemoteReplayRequest { .. }));
+    assert!(matches!(request.body, Body::RemoteReplayRequest(_)));
 }

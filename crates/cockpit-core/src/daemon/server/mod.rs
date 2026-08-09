@@ -3771,11 +3771,11 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
-        Body::RemoteReplayRequest {
+        Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
             id,
             after_event_seq,
             limit,
-        } => {
+        }) => {
             let ClientPrincipal::Remote(remote) = &state.principal else {
                 let _ = send_writer_envelope(
                     writer_tx,
@@ -3843,28 +3843,53 @@ async fn handle_envelope(
             let high_water = ctx.db.remote_outbox_high_water(&attachment).await?;
             let envelope = Envelope {
                 v: proto::PROTOCOL_VERSION,
-                body: Body::RemoteReplayResponse {
+                body: Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 {
                     id,
                     events,
                     high_water_mark:
                         proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(high_water),
-                },
+                }),
             };
             let _ = send_writer_envelope(writer_tx, envelope).await;
         }
-        Body::RemoteReplayAck {
+        Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+            id,
             delivery_id,
             lease_token,
-        } => {
+        }) => {
             let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message:
+                                "remote replay acknowledgement requires an authenticated actor"
+                                    .into(),
+                        },
+                    ),
+                )
+                .await;
                 return Ok(());
             };
             let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot acknowledge replay".into(),
+                        },
+                    ),
+                )
+                .await;
                 return Ok(());
             };
             let attachment = actor.logical_attachment_id.to_string();
             let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
-            let _ = ctx
+            let acked = ctx
                 .db
                 .ack_remote_outbox_delivery(
                     &attachment,
@@ -3874,8 +3899,20 @@ async fn handle_envelope(
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
+            let _ = send_writer_envelope(
+                writer_tx,
+                Envelope {
+                    v: proto::PROTOCOL_VERSION,
+                    body: Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 {
+                        id,
+                        acked,
+                    }),
+                },
+            )
+            .await;
         }
-        Body::RemoteReplayResponse { id, .. } => {
+        Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
+        | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
             tracing::warn!(%id, "client sent a replay response; ignoring");
         }
         Body::Response { id, .. } => {
@@ -4039,9 +4076,10 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
-        Body::RemoteReplayRequest { .. } => "replay_request",
-        Body::RemoteReplayResponse { .. } => "replay_response",
-        Body::RemoteReplayAck { .. } => "replay_ack",
+        Body::RemoteReplayRequest(_) => "replay_request",
+        Body::RemoteReplayResponse(_) => "replay_response",
+        Body::RemoteReplayAck(_) => "replay_ack",
+        Body::RemoteReplayAckResponse(_) => "replay_ack_response",
         Body::Unknown => "unknown",
     }
 }

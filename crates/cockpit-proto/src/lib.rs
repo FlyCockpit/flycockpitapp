@@ -876,29 +876,47 @@ pub enum Body {
         error: ErrorPayload,
     },
     #[serde(rename = "replay_req")]
-    RemoteReplayRequest {
-        id: Uuid,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[serde(rename = "afterEventSeq")]
-        after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
-        limit: RemoteReplayLimit,
-    },
+    RemoteReplayRequest(RemoteReplayRequestV2),
     #[serde(rename = "replay_res")]
-    RemoteReplayResponse {
-        id: Uuid,
-        events: Vec<RemoteOutboxDeliveryV1>,
-        #[serde(rename = "highWaterMark")]
-        high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
-    },
+    RemoteReplayResponse(RemoteReplayResponseV2),
     #[serde(rename = "replay_ack")]
-    RemoteReplayAck {
-        #[serde(rename = "deliveryId")]
-        delivery_id: CanonicalRfcUuidV1,
-        #[serde(rename = "leaseToken")]
-        lease_token: CanonicalRfcUuidV1,
-    },
+    RemoteReplayAck(RemoteReplayAckV2),
+    #[serde(rename = "replay_ack_res")]
+    RemoteReplayAckResponse(RemoteReplayAckResponseV2),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteReplayRequestV2 {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+    pub limit: RemoteReplayLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteReplayResponseV2 {
+    pub id: Uuid,
+    pub events: Vec<RemoteOutboxDeliveryV1>,
+    pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteReplayAckV2 {
+    pub id: Uuid,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub lease_token: CanonicalRfcUuidV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteReplayAckResponseV2 {
+    pub id: Uuid,
+    pub acked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2326,9 +2344,10 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
-        Body::RemoteReplayRequest { .. }
-        | Body::RemoteReplayResponse { .. }
-        | Body::RemoteReplayAck { .. } => false,
+        Body::RemoteReplayRequest(_)
+        | Body::RemoteReplayResponse(_)
+        | Body::RemoteReplayAck(_)
+        | Body::RemoteReplayAckResponse(_) => false,
         Body::Unknown => true,
     }
 }

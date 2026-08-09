@@ -3307,6 +3307,19 @@ impl SettingsCx {
             ]));
         }
 
+        if s.delete_pending {
+            lines.push(Line::default());
+            lines.push(Line::from(format!("Delete {}?", s.provider_id)));
+            for (id, label) in [
+                (9000, "[Delete and remove secrets]"),
+                (9001, "[Delete but keep secrets]"),
+                (9002, "[Cancel]"),
+            ] {
+                bindings.push((lines.len(), SettingsControlId(id)));
+                lines.push(Line::from(label));
+            }
+        }
+
         if let Some(field) = s.editing_field {
             let prompt = match field {
                 EditField::Url => "URL: ",
@@ -4390,6 +4403,30 @@ impl SettingsPage for ProvidersPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        if matches!(self, ProvidersPage::Edit(state) if state.delete_pending) {
+            match index {
+                9000 => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                9001 => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                9002 => {
+                    if let ProvidersPage::Edit(state) = self {
+                        state.delete_pending = false;
+                        state.status = None;
+                    }
+                    return Nav::Stay;
+                }
+                _ => return Nav::Stay,
+            }
+        }
         match self {
             ProvidersPage::List { cursor, .. } if index <= cx.config.providers.len() => {
                 *cursor = index;

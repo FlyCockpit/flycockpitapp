@@ -1633,6 +1633,13 @@ impl App {
     pub(super) fn reset_at_window(&mut self) {
         self.at_selected = 0;
         self.at_scroll = 0;
+        #[cfg(test)]
+        if self.dispatch_owned_test_barrier(
+            blocking_operations::BlockingOperationKind::FileAutocomplete,
+        ) {
+            self.at_suggestions_loading = true;
+            return;
+        }
         let Some(query) = self.composer.at_query().map(str::to_string) else {
             self.at_cache.borrow_mut().take();
             self.at_suggestions_loading = false;
@@ -3069,6 +3076,13 @@ pub(super) enum QueueEditOutcome {
 
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
+        #[cfg(test)]
+        if self
+            .dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::QueueMutation)
+        {
+            self.push_queue_edit_notice("retrieving queued messages…");
+            return true;
+        }
         let attached_request = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => runner.attached_request_binding(),
             _ => {

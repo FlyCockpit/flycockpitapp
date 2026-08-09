@@ -59,25 +59,21 @@ fn blocking_operation_manifest_is_complete() {
 async fn no_owned_blocking_command_runs_on_event_loop() {
     let mut app = App::new(None, false);
     let release = std::sync::Arc::new(std::sync::Barrier::new(7));
-    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
-        let release = std::sync::Arc::clone(&release);
-        let entered = entered_tx.clone();
-        let action = registration.actions[0];
-        app.async_actions.start_blocking(
-            AsyncActionKind::Blocking(action),
-            AsyncActionPolicy::AllowConcurrent,
-            move || {
-                entered.send(action).unwrap();
-                release.wait();
-                Ok(AsyncActionPayload::Unit)
-            },
+        blocking_operations::install_owned_test_barrier(
+            registration.kind,
+            std::sync::Arc::clone(&release),
         );
     }
-    drop(entered_tx);
-    for _ in 0..6 {
-        entered_rx.recv().expect("owned action reached barrier");
-    }
+    app.handle_curator_command("status");
+    app.handle_doctor_command();
+    app.handle_export_command("");
+    app.handle_btw_command("end");
+    app.composer.set("@src".to_string());
+    app.reset_at_window();
+    app.composer.clear();
+    app.queue.push(optimistic_queue_item("queued".to_string()));
+    app.history_up();
 
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(

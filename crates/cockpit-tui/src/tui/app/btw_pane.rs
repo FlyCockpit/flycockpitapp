@@ -782,6 +782,13 @@ fn optimistic_queue_item(id: Uuid, text: String) -> QueuedUserMessage {
 
 impl App {
     pub(super) fn handle_btw_command(&mut self, args: &str) {
+        #[cfg(test)]
+        if self.dispatch_owned_test_barrier(
+            super::blocking_operations::BlockingOperationKind::BtwTeardown,
+        ) {
+            self.push_plain("/btw: pending".to_string());
+            return;
+        }
         if self.side_conversation.is_some() {
             self.history.push(HistoryEntry::CommandError {
                 line: "/btw: end /side first".to_string(),

@@ -78,6 +78,27 @@ impl BlockingOperationKind {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(super) fn dispatch_owned_test_barrier(&mut self, operation: BlockingOperationKind) -> bool {
+        let Some(barrier) = TEST_OWNED_BARRIERS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(&operation)
+        else {
+            return false;
+        };
+        self.async_actions.start_blocking(
+            operation.action_kind(),
+            AsyncActionPolicy::AllowConcurrent,
+            move || {
+                barrier.wait();
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        true
+    }
+
     pub(super) fn start_owned_blocking_action<F>(
         &mut self,
         operation: BlockingOperationKind,
@@ -90,4 +111,23 @@ impl App {
         self.async_actions
             .start_blocking(operation.action_kind(), policy, work)
     }
+}
+
+#[cfg(test)]
+static TEST_OWNED_BARRIERS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<BlockingOperationKind, std::sync::Arc<std::sync::Barrier>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn install_owned_test_barrier(
+    operation: BlockingOperationKind,
+    barrier: std::sync::Arc<std::sync::Barrier>,
+) {
+    TEST_OWNED_BARRIERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(operation, barrier);
 }

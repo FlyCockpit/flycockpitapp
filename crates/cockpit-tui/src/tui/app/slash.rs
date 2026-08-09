@@ -1444,6 +1444,13 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
+        #[cfg(test)]
+        if self.dispatch_owned_test_barrier(
+            blocking_operations::BlockingOperationKind::CuratorMaintenance,
+        ) {
+            self.push_plain("/curator: pending".to_string());
+            return;
+        }
         let Some(socket) = self.startup_background.daemon_socket.clone() else {
             self.push_plain(
                 "/curator: Unavailable — reconnect to the daemon, then Retry".to_string(),
@@ -1945,6 +1952,13 @@ impl App {
     }
 
     pub(super) fn handle_doctor_command(&mut self) {
+        #[cfg(test)]
+        if self
+            .dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::DoctorSnapshot)
+        {
+            self.push_plain("/doctor: collecting diagnostics…".to_string());
+            return;
+        }
         type DoctorSnapshotInput = cockpit_core::diagnostics::DiagnosticsInput;
         let input = DoctorSnapshotInput {
             cwd: self.launch.cwd.clone(),
@@ -2298,6 +2312,12 @@ impl App {
     /// the full CLI bundle `.zip`. Both overwrite their own prior file
     /// and surface success/failure as a chat line, never a panic.
     pub(super) fn handle_export_command(&mut self, arg: &str) {
+        #[cfg(test)]
+        if self.dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::ExportWrite)
+        {
+            self.push_plain("/export: writing transcript…".to_string());
+            return;
+        }
         // Authoritative current session: the live runner if attached,
         // else the last-attached ids tracked on launch info.
         let (session_id, short_id) = match self.agent_runner.as_ref() {

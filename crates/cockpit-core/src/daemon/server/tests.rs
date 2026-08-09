@@ -1710,6 +1710,66 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
     assert!(!ctx.db.is_pinned(session_id, note_seq).await.unwrap());
     assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
 
+    let toggle_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-999999999999").unwrap(),
+    )
+    .unwrap();
+    for (request_id, label) in [
+        (Uuid::new_v4(), "first toggle"),
+        (Uuid::new_v4(), "toggle replay"),
+    ] {
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                toggle_operation,
+                Request::TogglePinnedMessage {
+                    session_id,
+                    seq: note_seq,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id, response }
+                if id == request_id && matches!(*response, Response::PinToggled { pinned: true })
+        ));
+    }
+    let toggle_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            toggle_conflict_id,
+            toggle_operation,
+            Request::TogglePinnedMessage {
+                session_id,
+                seq: note_seq + 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "toggle conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == toggle_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(ctx.db.is_pinned(session_id, note_seq).await.unwrap());
+    assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
+
     let rename_operation = proto::RemoteOperationIdentityV1::new(
         logical_attachment_id,
         Uuid::parse_str("018f3f24-7a10-7cc2-8f55-444444444444").unwrap(),

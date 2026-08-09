@@ -1040,12 +1040,51 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .map(|changed| Response::PinChanged { changed })
                 .map_err(|error| bad_request(error.to_string()))
         }
-        Request::TogglePinnedMessage { session_id, seq } => ctx
-            .db
-            .toggle_pin(session_id, seq)
-            .await
-            .map(|pinned| Response::PinToggled { pinned })
-            .map_err(|error| bad_request(error.to_string())),
+        Request::TogglePinnedMessage { session_id, seq } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::TogglePinnedMessage { session_id, seq };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let pinned = crate::db::Db::toggle_pin_conn(conn, session_id, seq, chrono::Utc::now().timestamp_millis())
+                            .map_err(|error| PinMutationRejected(error.to_string()))?;
+                        let response = Response::PinToggled { pinned };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "toggle_pinned_message".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<PinMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .toggle_pin(session_id, seq)
+                .await
+                .map(|pinned| Response::PinToggled { pinned })
+                .map_err(|error| bad_request(error.to_string()))
+        }
         Request::CountPinnedMessages { session_id } => ctx
             .db
             .count_pins(session_id)

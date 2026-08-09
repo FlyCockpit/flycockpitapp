@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use zeroize::Zeroize;
 
 use crate::frame::{HandshakeFrame, MAX_HANDSHAKE_MESSAGE};
@@ -512,7 +512,7 @@ pub fn run_nn_test_vector(
     if payloads.len() < 2 {
         return Err(NoiseError::InvalidHandshakeFrame);
     }
-    let params = SUITE.parse().map_err(|_| NoiseError::CryptoUnavailable)?;
+    let params: NoiseParams = SUITE.parse().map_err(|_| NoiseError::CryptoUnavailable)?;
     let mut initiator = Builder::new(params.clone())
         .prologue(prologue)
         .map_err(|_| NoiseError::CryptoUnavailable)?

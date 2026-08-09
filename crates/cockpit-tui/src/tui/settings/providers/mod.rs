@@ -36,7 +36,7 @@ pub(crate) use oauth_flow::{
 };
 use oauth_flow::{
     OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend,
-    oauth_setup_lines, render_oauth_body,
+    oauth_setup_lines, oauth_setup_lines_with_controls, render_oauth_body,
 };
 
 use chrono::Utc;
@@ -637,6 +637,36 @@ fn wrap_oauth_render_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'s
         wrapped.push(line);
     }
     wrapped
+}
+
+fn wrap_oauth_render_lines_with_controls(
+    lines: Vec<Line<'static>>,
+    controls: Vec<(usize, usize)>,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let mut wrapped = Vec::new();
+    let mut remapped = Vec::new();
+    let width = width.max(1);
+    for (source_line, line) in lines.into_iter().enumerate() {
+        let target_line = wrapped.len();
+        if line.spans.len() == 1 {
+            let span = &line.spans[0];
+            if UnicodeWidthStr::width(span.content.as_ref()) > usize::from(width) {
+                push_wrapped_text(&mut wrapped, width, span.content.as_ref(), span.style);
+            } else {
+                wrapped.push(line);
+            }
+        } else {
+            wrapped.push(line);
+        }
+        remapped.extend(
+            controls
+                .iter()
+                .filter(|(line, _)| *line == source_line)
+                .map(|(_, control)| (target_line, *control)),
+        );
+    }
+    (wrapped, remapped)
 }
 
 fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
@@ -2807,13 +2837,24 @@ impl SettingsCx {
         links: Option<&mut crate::tui::links::LinkRegistry>,
     ) {
         let flow = OAuthFlowView::OAuth(s);
-        let mut lines =
-            wrap_oauth_render_lines(oauth_setup_lines(flow, OAuthHost::Standalone), area.width);
+        let (lines, controls) = oauth_setup_lines_with_controls(flow, OAuthHost::Standalone);
+        let (mut lines, controls) =
+            wrap_oauth_render_lines_with_controls(lines, controls, area.width);
         let link_regions = prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
             .unwrap_or_default();
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:oauth-setup", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:oauth-setup",
+            lines,
+            selected_line,
+            controls
+                .into_iter()
+                .map(|(line, control)| (line, SettingsControlId(control as u64))),
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:oauth-setup"),
+        );
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -4335,6 +4376,11 @@ impl SettingsPage for ProvidersPage {
                     return Nav::Stay;
                 }
             }
+            ProvidersPage::OAuthSetup { state, .. }
+                if !state.paste_focused && index < state.option_count(OAuthHost::Standalone) =>
+            {
+                state.cursor = index;
+            }
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4419,6 +4465,13 @@ impl SettingsPage for ProvidersPage {
                     if region == SettingsScrollRegionId("providers:deep-fetch") =>
                 {
                     state.scroll_pointer_choice(delta);
+                }
+                ProvidersPage::OAuthSetup { state, .. }
+                    if region == SettingsScrollRegionId("providers:oauth-setup")
+                        && !state.paste_focused =>
+                {
+                    let last = state.option_count(OAuthHost::Standalone).saturating_sub(1);
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(last);
                 }
                 _ => {}
             }

@@ -621,7 +621,15 @@ impl OAuthFlowView<'_> {
 }
 
 pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>, host: OAuthHost) -> Vec<Line<'static>> {
+    oauth_setup_lines_with_controls(flow, host).0
+}
+
+pub(super) fn oauth_setup_lines_with_controls(
+    flow: OAuthFlowView<'_>,
+    host: OAuthHost,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut lines = Vec::new();
+    let mut controls = Vec::new();
     let title = match flow {
         OAuthFlowView::Copilot(_) => "Set up GitHub Copilot auth",
         OAuthFlowView::OAuth(s) => match s.provider {
@@ -634,8 +642,11 @@ pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>, host: OAuthHost) -> Vec
         Style::default().add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::default());
-    render_oauth_body(&mut lines, flow, host);
-    lines
+    match flow {
+        OAuthFlowView::Copilot(s) => render_copilot_body(&mut lines, s),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(&mut lines, s, host, Some(&mut controls)),
+    }
+    (lines, controls)
 }
 
 pub(super) fn render_oauth_body(
@@ -645,7 +656,7 @@ pub(super) fn render_oauth_body(
 ) {
     match flow {
         OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
-        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host, None),
     }
 }
 
@@ -992,7 +1003,12 @@ pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static
     }
 }
 
-fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, host: OAuthHost) {
+fn render_provider_oauth(
+    lines: &mut Vec<Line<'static>>,
+    s: &OAuthFlowState,
+    host: OAuthHost,
+    mut controls: Option<&mut Vec<(usize, usize)>>,
+) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
@@ -1060,6 +1076,9 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, hos
             } else {
                 Style::default().fg(Color::White)
             };
+            if let Some(controls) = controls.as_deref_mut() {
+                controls.push((lines.len(), i));
+            }
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("[{}]", option.label()), style),
@@ -1094,6 +1113,9 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, hos
         } else {
             Style::default().fg(Color::White)
         };
+        if let Some(controls) = controls.as_deref_mut() {
+            controls.push((lines.len(), i));
+        }
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("[{label}]"), style),

@@ -662,3 +662,36 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
 }
+
+#[tokio::test]
+async fn image_generation_runtime_rejects_mixed_dns_location_classes() {
+    let adapter = Arc::new(Adapter {
+        kind: ImageAdapterKind::OpenaiImages,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = ImageRuntimeRegistry::new(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(SequenceDns(Mutex::new(vec![vec![
+            "8.8.8.8".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        ]]))),
+        Arc::new(Connector),
+        vec![adapter],
+    )
+    .unwrap();
+    let endpoint = endpoint();
+    registry.apply_endpoint(&endpoint, 1, 1);
+    assert!(matches!(
+        registry
+            .refresh(
+                endpoint,
+                1,
+                1,
+                1,
+                RefreshKind::Health,
+                credential_digest(8),
+            )
+            .await,
+        Err(error) if error.code == RuntimeErrorCode::DnsDenied
+    ));
+}

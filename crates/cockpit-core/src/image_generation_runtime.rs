@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageEndpoint, ImageLocationClass,
@@ -44,6 +45,26 @@ pub const REDIRECT_LIMIT: usize = 3;
 
 pub trait RuntimeClock: Send + Sync {
     fn now_millis(&self) -> u64;
+}
+
+/// Process-monotonic production clock. Wall-clock adjustments cannot make a
+/// stale capability appear fresh again.
+pub struct SystemRuntimeClock {
+    started: Instant,
+}
+
+impl Default for SystemRuntimeClock {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl RuntimeClock for SystemRuntimeClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,6 +305,34 @@ pub trait DnsResolver: Send + Sync {
         &'a self,
         hostname: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RuntimeError>> + Send + 'a>>;
+}
+
+pub struct TokioDnsResolver;
+
+impl DnsResolver for TokioDnsResolver {
+    fn resolve<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((hostname, 0)).await.map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Dns,
+                    "Check the endpoint hostname and DNS availability.",
+                )
+            })?;
+            let mut addresses = resolved.map(|address| address.ip()).collect::<Vec<_>>();
+            addresses.sort_unstable();
+            addresses.dedup();
+            if addresses.is_empty() {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Dns,
+                    "Check the endpoint hostname and DNS availability.",
+                ));
+            }
+            Ok(addresses)
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionHop {
@@ -538,6 +587,15 @@ impl ImageRuntimeRegistry {
             self.inner.cache.lock().unwrap().remove(&endpoint.id);
         }
     }
+    pub fn remove_endpoint(&self, endpoint_id: &str) {
+        self.inner.current.lock().unwrap().remove(endpoint_id);
+        self.inner.cache.lock().unwrap().remove(endpoint_id);
+        self.inner
+            .inflight
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.endpoint != endpoint_id);
+    }
     pub fn snapshot(&self, endpoint_id: &str) -> Option<ImageHealthSnapshot> {
         let now = self.clock.now_millis();
         self.inner
@@ -711,11 +769,7 @@ impl ImageRuntimeRegistry {
             }
         };
         let wanted = declared_class(endpoint.location);
-        let allowed = resolved
-            .into_iter()
-            .filter(|ip| classify_address(*ip) == wanted)
-            .collect::<Vec<_>>();
-        if allowed.is_empty() {
+        if resolved.is_empty() || resolved.iter().any(|ip| classify_address(*ip) != wanted) {
             self.commit_failure(
                 &endpoint,
                 generation,
@@ -730,6 +784,7 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
+        let allowed = resolved;
         let limits = if kind == RefreshKind::Capabilities {
             ProbeLimits::discovery()
         } else {
@@ -1140,17 +1195,14 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
-        let allowed = ips
-            .into_iter()
-            .filter(|ip| classify_address(*ip) == class)
-            .collect::<Vec<_>>();
-        if allowed.is_empty() {
+        if ips.is_empty() || ips.iter().any(|ip| classify_address(*ip) != class) {
             self.inner.cache.lock().unwrap().remove(&endpoint.id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::DnsDenied,
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
+        let allowed = ips;
         let proof = self
             .connector
             .connect(&authority, &allowed, class, ProbeLimits::health())

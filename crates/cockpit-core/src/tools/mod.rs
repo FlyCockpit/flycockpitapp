@@ -14,6 +14,7 @@
 //! - [`task`] — structural; the engine intercepts this name.
 //! - [`todo`] — durable task-backed todo state.
 
+pub mod audio_video;
 pub mod bash;
 pub mod command_resource_profiles;
 pub mod custom;

@@ -40,7 +40,7 @@ use oauth_flow::{
 };
 
 use chrono::Utc;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -72,7 +72,9 @@ pub(super) use row_editor::{
 
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
 #[cfg(test)]
 use super::{Page, TestPageRef};
@@ -2696,6 +2698,7 @@ impl SettingsCx {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         let ids: Vec<&String> = self.config.providers.keys().collect();
 
         // Row 0: the `[refetch provider models]` button. Provider rows follow
@@ -2708,6 +2711,7 @@ impl SettingsCx {
         } else {
             muted
         };
+        bindings.push((lines.len(), SettingsControlId(0)));
         lines.push(Line::from(vec![
             Span::raw(if button_selected { "▸ " } else { "  " }),
             Span::styled("[refetch provider models]".to_string(), button_style),
@@ -2751,6 +2755,7 @@ impl SettingsCx {
                     Style::default().fg(Color::White)
                 };
                 let model_count = format!("{} models", entry.models.len());
+                bindings.push((lines.len(), SettingsControlId(row as u64)));
                 lines.push(Line::from(vec![
                     Span::raw(marker),
                     Span::styled(label, style),
@@ -2770,8 +2775,16 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:list",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:list"),
+        );
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
@@ -4170,6 +4183,38 @@ impl SettingsPage for ProvidersPage {
     ) {
         let _surface = self.pointer_surface_kind();
         cx.render_providers_page(frame, area, self, Some(links));
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        match self {
+            ProvidersPage::List { cursor, .. } if index <= cx.config.providers.len() => {
+                *cursor = index;
+            }
+            _ => return Nav::Stay,
+        }
+        cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("providers:list")
+            && let ProvidersPage::List {
+                cursor,
+                delete_pending,
+                ..
+            } = self
+        {
+            *delete_pending = false;
+            *cursor = cursor
+                .saturating_add_signed(delta)
+                .min(cx.config.providers.len());
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

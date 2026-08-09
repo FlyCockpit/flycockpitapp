@@ -163,10 +163,11 @@ fn validate_site_reachability(
         SlashBtw => slash_route(slash, "btw", &graph, handler)?,
         QueueEditKey => {
             match_arm_calls(input, "KeyCode::Up", "self.history_up")?
+                && function_invokes_parameter(input, "history_up_with_queue_edit", "edit_queue")?
                 && graph_reaches(&graph, "history_up", handler)?
         }
         ComposerSuggestions => {
-            match_arm_has_call(input, "self.reset_at_window")?
+            match_arm_calls(input, "KeyCode::Char(ch)", "self.reset_at_window")?
                 && graph_reaches(&graph, "reset_at_window", handler)?
         }
     };
@@ -223,11 +224,64 @@ fn collect_direct_call_names(
         && let Ok(text) = function.utf8_text(source)
     {
         calls.insert(text.rsplit('.').next().unwrap_or(text).to_string());
+        if let Some(arguments) = node.child_by_field_name("arguments") {
+            collect_self_function_items(arguments, source, calls);
+        }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_direct_call_names(child, source, calls);
     }
+}
+
+fn collect_self_function_items(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    calls: &mut std::collections::HashSet<String>,
+) {
+    if node.kind() == "scoped_identifier"
+        && let Ok(text) = node.utf8_text(source)
+        && let Some(callback) = text.strip_prefix("Self::")
+    {
+        calls.insert(callback.to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_self_function_items(child, source, calls);
+    }
+}
+
+fn function_invokes_parameter(
+    source: &str,
+    function: &str,
+    parameter: &str,
+) -> Result<bool, String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    let mut functions = Vec::new();
+    collect_named_functions(
+        tree.root_node(),
+        source.as_bytes(),
+        function,
+        &mut functions,
+    );
+    if functions.len() != 1 {
+        return Err(format!(
+            "expected one `{function}`, found {}",
+            functions.len()
+        ));
+    }
+    let body = functions[0]
+        .child_by_field_name("body")
+        .ok_or("callback receiver has no body")?;
+    let mut invoked = false;
+    scan_exact_call(body, source.as_bytes(), parameter, &mut invoked);
+    Ok(invoked)
 }
 
 fn graph_reaches(
@@ -334,9 +388,6 @@ fn collect_struct_initializers<'tree>(
 
 fn match_arm_calls(source: &str, pattern: &str, call: &str) -> Result<bool, String> {
     match_arm_query(source, Some(pattern), call)
-}
-fn match_arm_has_call(source: &str, call: &str) -> Result<bool, String> {
-    match_arm_query(source, None, call)
 }
 fn match_arm_query(source: &str, pattern: Option<&str>, call: &str) -> Result<bool, String> {
     let mut parser = tree_sitter::Parser::new();
@@ -578,6 +629,11 @@ fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
         )
         .unwrap()
     );
+    assert!(
+        !function_invokes_parameter("fn receiver(cb: fn()){ wrong(); }", "receiver", "cb").unwrap()
+    );
+    let wrong_arm = "fn key(){ match code { KeyCode::Down => self.reset_at_window(), _ => {} } }";
+    assert!(!match_arm_calls(wrong_arm, "KeyCode::Char(ch)", "self.reset_at_window").unwrap());
 }
 
 #[test]

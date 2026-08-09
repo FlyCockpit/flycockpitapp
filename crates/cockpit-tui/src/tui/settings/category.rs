@@ -3488,8 +3488,11 @@ impl SettingsPage for CategoryPage {
     }
 
     fn pointer_surface_token(&self) -> u64 {
-        let mode = if self.utility_picker.is_some() {
-            5
+        let mode = if let Some(picker) = &self.utility_picker {
+            match &picker.mode {
+                super::ui_page::PickerMode::List { .. } => 5,
+                super::ui_page::PickerMode::Custom { .. } => 6,
+            }
         } else if self.pending_external_edit.is_some() {
             4
         } else if self.text_editor.is_some() {
@@ -3501,22 +3504,7 @@ impl SettingsPage for CategoryPage {
         } else {
             0
         };
-        600 + self.category as u64 * 6 + mode
-    }
-
-    fn pointer_surface_token(&self) -> u64 {
-        if self.path_editor.is_some() {
-            504
-        } else if self.text_editor.is_some() {
-            503
-        } else if let Some(picker) = &self.utility_picker {
-            match &picker.mode {
-                super::ui_page::PickerMode::List { .. } => 501,
-                super::ui_page::PickerMode::Custom { .. } => 502,
-            }
-        } else {
-            500
-        }
+        600 + self.category as u64 * 7 + mode
     }
 
     fn resolve_header_back(&self) -> super::SettingsLocalBack {

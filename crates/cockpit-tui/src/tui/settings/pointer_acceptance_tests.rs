@@ -401,9 +401,9 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
                 "nested settings surface token {token} was never concretely rendered"
             );
         }
-        for mode in 0..=5 {
+        for mode in 0..=6 {
             assert!(
-                (0..5).any(|category| coverage.2.contains(&(600 + category * 6 + mode))),
+                (0..5).any(|category| coverage.2.contains(&(600 + category * 7 + mode))),
                 "category editor mode {mode} was never concretely rendered"
             );
         }

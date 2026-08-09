@@ -3,12 +3,46 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn package_key(package: &serde_json::Value) -> String {
-    format!(
-        "{}@{}",
-        package["name"].as_str().unwrap(),
-        package["version"].as_str().unwrap()
-    )
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Fixture {
+    schema_version: u64,
+    packages: BTreeMap<String, PackageFixture>,
+    targets: BTreeMap<String, TargetFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PackageFixture {
+    checksum: String,
+    raw_metadata_feature_union: Vec<String>,
+    license: Option<String>,
+    rust_version: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TargetFixture {
+    arboard_features: Vec<String>,
+    edges: Vec<EdgeFixture>,
+    package_features: BTreeMap<String, Vec<String>>,
+    packages: Vec<String>,
+    probe_formats: Vec<String>,
+    provenance_edges: Vec<EdgeFixture>,
+    resolved_features: Vec<String>,
+    tui_features: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct EdgeFixture {
+    from: String,
+    to: String,
+    target: String,
+    provenance: String,
 }
 
 fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format: &str) -> String {
@@ -48,7 +82,11 @@ fn tree_package_key(row: &str) -> String {
     format!("{name}@{version}")
 }
 
-fn normal_tree_graph(tree: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+fn normal_tree_graph(
+    tree: &str,
+    target: &str,
+    provenance: &str,
+) -> (BTreeSet<String>, BTreeSet<EdgeFixture>) {
     let mut packages = BTreeSet::new();
     let mut edges = BTreeSet::new();
     let mut ancestors = Vec::<String>::new();
@@ -61,11 +99,39 @@ fn normal_tree_graph(tree: &str) -> (BTreeSet<String>, BTreeSet<String>) {
         packages.insert(package.clone());
         ancestors.truncate(depth);
         if let Some(parent) = ancestors.last() {
-            edges.insert(format!("{parent} -> {package}"));
+            edges.insert(EdgeFixture {
+                from: parent.clone(),
+                to: package.clone(),
+                target: target.to_owned(),
+                provenance: provenance.to_owned(),
+            });
         }
         ancestors.push(package);
     }
     (packages, edges)
+}
+
+fn image_requester_subgraph(edges: &BTreeSet<EdgeFixture>) -> BTreeSet<EdgeFixture> {
+    let mut ancestors = BTreeSet::from(["image@0.25.10".to_owned()]);
+    loop {
+        let prior = ancestors.len();
+        for edge in edges {
+            if ancestors.contains(&edge.to) {
+                ancestors.insert(edge.from.clone());
+            }
+        }
+        if ancestors.len() == prior {
+            break;
+        }
+    }
+    edges
+        .iter()
+        .filter(|edge| ancestors.contains(&edge.from) && ancestors.contains(&edge.to))
+        .map(|edge| EdgeFixture {
+            provenance: "image-requester".to_owned(),
+            ..edge.clone()
+        })
+        .collect()
 }
 
 #[test]
@@ -120,35 +186,43 @@ fn tui_image_codec_dependency_inventory() {
         ])
     );
     assert!(tui_image.get("default-features").is_none());
-    for second_codec in [
+    let prohibited_codec_packages = BTreeSet::from([
         "png",
         "jpeg-decoder",
-        "jpeg_decoder",
         "gif",
         "webp",
         "image-webp",
         "tiff",
         "zune-jpeg",
-        "zune_jpeg",
-    ] {
+        "ravif",
+        "webp-animation",
+    ]);
+    for (dependency_key, declaration) in tui_dependencies {
+        let actual_package = declaration
+            .as_table()
+            .and_then(|table| table.get("package"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(dependency_key);
         assert!(
-            !tui_dependencies.contains_key(second_codec),
-            "cockpit-tui must not directly depend on second image codec {second_codec}"
+            !prohibited_codec_packages.contains(actual_package),
+            "cockpit-tui dependency {dependency_key} aliases prohibited codec package {actual_package}"
         );
     }
 
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+    let fixture: Fixture = serde_json::from_str(include_str!(
         "fixtures/image-codec-dependency-inventory.json"
     ))
     .unwrap();
-    assert_eq!(fixture["schemaVersion"], 4);
-    let targets = fixture["targets"].as_object().unwrap();
-    let package_fixture = fixture["packages"].as_object().unwrap();
-    assert_eq!(targets.len(), 3);
-    let lock = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
+    assert_eq!(fixture.schema_version, 5);
+    assert_eq!(fixture.targets.len(), 3);
+    let lock = fs::read_to_string(workspace.join("Cargo.lock"))
+        .unwrap()
+        .parse::<toml::Value>()
+        .unwrap();
+    let locked_packages = lock["package"].as_array().unwrap();
     let mut observed_fixture_rows = BTreeSet::new();
 
-    for (triple, expected) in targets {
+    for (triple, expected) in &fixture.targets {
         let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
             .current_dir(workspace)
             .args([
@@ -203,11 +277,10 @@ fn tui_image_codec_dependency_inventory() {
         }
         let image_tree_features = &target_package_features["image@0.25.10"];
 
-        let resolved_features = expected["resolvedFeatures"]
-            .as_array()
-            .unwrap()
+        let resolved_features = expected
+            .resolved_features
             .iter()
-            .map(|value| value.as_str().unwrap())
+            .map(String::as_str)
             .collect::<BTreeSet<_>>();
         assert_eq!(
             *image_tree_features,
@@ -228,25 +301,15 @@ fn tui_image_codec_dependency_inventory() {
         // Consequently a newly activated direct image dependency cannot be hidden
         // by a fixture-derived allowlist.
         let normal_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal", "{p}");
-        let (graph_packages, graph_edges) = normal_tree_graph(&normal_tree);
-        let expected_packages = expected["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap().to_string())
-            .collect::<BTreeSet<_>>();
-        let expected_edges = expected["edges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap().to_string())
-            .collect::<BTreeSet<_>>();
+        let (graph_packages, graph_edges) =
+            normal_tree_graph(&normal_tree, triple, "image-descendant");
+        let expected_packages = expected.packages.iter().cloned().collect::<BTreeSet<_>>();
+        let expected_edges = expected.edges.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(graph_packages, expected_packages, "{triple} package drift");
         assert_eq!(graph_edges, expected_edges, "{triple} edge drift");
         assert_eq!(
-            expected["packageFeatures"]
-                .as_object()
-                .unwrap()
+            expected
+                .package_features
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
@@ -261,67 +324,65 @@ fn tui_image_codec_dependency_inventory() {
                 .find(|(_, package)| package["name"] == name && package["version"] == version)
                 .unwrap_or_else(|| panic!("metadata omitted target graph package {key}"));
             observed_fixture_rows.insert(key.clone());
-            let expected_package = &package_fixture[key];
-            assert!(!expected_package.is_null(), "missing fixture row for {key}");
+            let expected_package = fixture
+                .packages
+                .get(key)
+                .unwrap_or_else(|| panic!("missing fixture row for {key}"));
             assert_eq!(
-                package["source"], expected_package["source"],
+                package["source"].as_str(),
+                Some(expected_package.source.as_str()),
                 "{key} source"
             );
             assert_eq!(
-                package["license"], expected_package["license"],
+                package["license"].as_str(),
+                expected_package.license.as_deref(),
                 "{key} license"
             );
             assert_eq!(
-                package["rust_version"], expected_package["rustVersion"],
+                package["rust_version"].as_str(),
+                expected_package.rust_version.as_deref(),
                 "{key} declared MSRV"
             );
             assert!(
-                expected_package["source"]
-                    .as_str()
-                    .is_some_and(|source| source.starts_with("registry+")),
+                expected_package.source.starts_with("registry+"),
                 "{key} must retain its exact registry source"
             );
-            if let Some(msrv) = expected_package["rustVersion"].as_str() {
+            if let Some(msrv) = expected_package.rust_version.as_deref() {
                 let mut parts = msrv.split('.').map(|part| part.parse::<u32>().unwrap());
                 let version = (parts.next().unwrap(), parts.next().unwrap_or_default());
                 assert!(version <= (1, 95), "{key} requires Rust {msrv}");
             }
-            let expected_features = &expected["packageFeatures"][&key];
-            assert!(
-                !expected_features.is_null(),
-                "missing feature row for {key}"
-            );
-            let mut metadata_features = nodes[*id]["features"].as_array().unwrap().clone();
-            metadata_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
+            let expected_features = expected
+                .package_features
+                .get(key)
+                .unwrap_or_else(|| panic!("missing feature row for {key}"));
+            let mut metadata_features = nodes[*id]["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feature| feature.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            metadata_features.sort();
             assert_eq!(
-                serde_json::Value::Array(metadata_features),
-                expected_package["rawMetadataFeatureUnion"],
+                metadata_features, expected_package.raw_metadata_feature_union,
                 "{key} raw metadata feature drift"
             );
-            let mut actual_features = target_package_features[key]
+            let actual_features = target_package_features[key]
                 .iter()
                 .cloned()
-                .map(serde_json::Value::String)
                 .collect::<Vec<_>>();
-            actual_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
-            assert_eq!(
-                serde_json::Value::Array(actual_features),
-                *expected_features,
-                "{key} feature drift"
-            );
-            let checksum = expected_package["checksum"].as_str().unwrap();
-            let block = lock
-                .split("[[package]]")
-                .find(|block| {
-                    block.contains(&format!("name = \"{}\"", package["name"].as_str().unwrap()))
-                        && block.contains(&format!(
-                            "version = \"{}\"",
-                            package["version"].as_str().unwrap()
-                        ))
+            assert_eq!(actual_features, *expected_features, "{key} feature drift");
+            let checksum = &expected_package.checksum;
+            let locked = locked_packages
+                .iter()
+                .find(|locked| {
+                    locked["name"].as_str() == package["name"].as_str()
+                        && locked["version"].as_str() == package["version"].as_str()
                 })
                 .unwrap_or_else(|| panic!("missing exact lock package {key}"));
-            assert!(
-                block.contains(&format!("checksum = \"{checksum}\"")),
+            assert_eq!(
+                locked["checksum"].as_str(),
+                Some(checksum.as_str()),
                 "{key} checksum"
             );
         }
@@ -339,35 +400,31 @@ fn tui_image_codec_dependency_inventory() {
             .find(|dependency| dependency["name"] == "image")
             .unwrap();
         assert_eq!(tui_image["uses_default_features"], false);
-        assert_eq!(tui_image["features"], expected["tuiFeatures"]);
         assert_eq!(
-            expected["tuiFeatures"],
-            serde_json::json!(["gif", "jpeg", "png", "webp"])
+            tui_image["features"],
+            serde_json::json!(expected.tui_features)
         );
-        assert_eq!(
-            expected["probeFormats"],
-            serde_json::json!(["gif", "jpeg", "png", "webp"])
-        );
+        assert_eq!(expected.tui_features, ["gif", "jpeg", "png", "webp"]);
+        assert_eq!(expected.probe_formats, ["gif", "jpeg", "png", "webp"]);
+
+        // Metadata exposes the actual package name even when a manifest key is
+        // an alias. This closes the alias escape hatch for every target-resolved
+        // direct dependency, rather than relying only on TOML keys.
+        for dependency in tui["dependencies"].as_array().unwrap() {
+            let actual_name = dependency["name"].as_str().unwrap();
+            assert!(
+                !prohibited_codec_packages.contains(actual_name),
+                "cockpit-tui resolves prohibited direct codec package {actual_name} on {triple}"
+            );
+        }
 
         let tui_tree = cargo_tree(workspace, triple, "cockpit-tui", "normal", "{p}");
-        let (_, tui_edges) = normal_tree_graph(&tui_tree);
-        let observed_provenance = tui_edges
+        let (_, tui_edges) = normal_tree_graph(&tui_tree, triple, "tui-normal");
+        let observed_provenance = image_requester_subgraph(&tui_edges);
+        let expected_provenance = expected
+            .provenance_edges
             .iter()
-            .filter(|edge| {
-                matches!(
-                    edge.as_str(),
-                    "cockpit-tui@0.1.0 -> image@0.25.10"
-                        | "cockpit-tui@0.1.0 -> arboard@3.6.1"
-                        | "arboard@3.6.1 -> image@0.25.10"
-                )
-            })
             .cloned()
-            .collect::<BTreeSet<_>>();
-        let expected_provenance = expected["provenanceEdges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|edge| edge.as_str().unwrap().to_owned())
             .collect::<BTreeSet<_>>();
         assert_eq!(
             observed_provenance, expected_provenance,
@@ -399,7 +456,12 @@ fn tui_image_codec_dependency_inventory() {
             .unwrap();
         let mut arboard_features = arboard_image["features"].as_array().unwrap().clone();
         arboard_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
-        let mut expected_arboard = expected["arboardFeatures"].as_array().unwrap().clone();
+        let mut expected_arboard = expected
+            .arboard_features
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
         expected_arboard.sort_by_key(|feature| feature.as_str().unwrap().to_string());
         assert_eq!(
             arboard_features, expected_arboard,
@@ -408,7 +470,7 @@ fn tui_image_codec_dependency_inventory() {
     }
     assert_eq!(
         observed_fixture_rows,
-        package_fixture.keys().cloned().collect::<BTreeSet<_>>(),
+        fixture.packages.keys().cloned().collect::<BTreeSet<_>>(),
         "fixture contains an unaccounted package row"
     );
 }

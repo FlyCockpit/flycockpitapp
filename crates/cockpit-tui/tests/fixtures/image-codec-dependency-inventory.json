@@ -266,7 +266,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     }
   },
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "targets": {
     "aarch64-apple-darwin": {
       "arboardFeatures": ["tiff"],
@@ -340,54 +340,294 @@
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
-        "crc32fast@1.5.0 -> cfg-if@1.0.4",
-        "fdeflate@0.3.7 -> simd-adler32@0.3.10",
-        "flate2@1.1.9 -> crc32fast@1.5.0",
-        "flate2@1.1.9 -> miniz_oxide@0.8.9",
-        "flate2@1.1.9 -> zlib-rs@0.6.7",
-        "gif@0.14.2 -> color_quant@1.1.0",
-        "gif@0.14.2 -> weezl@0.1.12",
-        "half@2.7.1 -> cfg-if@1.0.4",
-        "half@2.7.1 -> zerocopy@0.8.55",
-        "image-webp@0.2.4 -> byteorder-lite@0.1.0",
-        "image-webp@0.2.4 -> quick-error@2.0.1",
-        "image@0.25.10 -> bytemuck@1.25.2",
-        "image@0.25.10 -> byteorder-lite@0.1.0",
-        "image@0.25.10 -> color_quant@1.1.0",
-        "image@0.25.10 -> gif@0.14.2",
-        "image@0.25.10 -> image-webp@0.2.4",
-        "image@0.25.10 -> moxcms@0.8.1",
-        "image@0.25.10 -> num-traits@0.2.19",
-        "image@0.25.10 -> png@0.18.1",
-        "image@0.25.10 -> tiff@0.11.3",
-        "image@0.25.10 -> zune-core@0.5.1",
-        "image@0.25.10 -> zune-jpeg@0.5.15",
-        "miniz_oxide@0.8.9 -> adler2@2.0.1",
-        "miniz_oxide@0.8.9 -> simd-adler32@0.3.10",
-        "moxcms@0.8.1 -> num-traits@0.2.19",
-        "moxcms@0.8.1 -> pxfm@0.1.30",
-        "num-traits@0.2.19 -> autocfg@1.5.1",
-        "png@0.18.1 -> bitflags@2.13.1",
-        "png@0.18.1 -> crc32fast@1.5.0",
-        "png@0.18.1 -> fdeflate@0.3.7",
-        "png@0.18.1 -> flate2@1.1.9",
-        "png@0.18.1 -> miniz_oxide@0.8.9",
-        "proc-macro2@1.0.107 -> unicode-ident@1.0.24",
-        "quote@1.0.47 -> proc-macro2@1.0.107",
-        "syn@2.0.119 -> proc-macro2@1.0.107",
-        "syn@2.0.119 -> quote@1.0.47",
-        "syn@2.0.119 -> unicode-ident@1.0.24",
-        "tiff@0.11.3 -> fax@0.2.7",
-        "tiff@0.11.3 -> flate2@1.1.9",
-        "tiff@0.11.3 -> half@2.7.1",
-        "tiff@0.11.3 -> quick-error@2.0.1",
-        "tiff@0.11.3 -> weezl@0.1.12",
-        "tiff@0.11.3 -> zune-jpeg@0.5.15",
-        "zerocopy-derive@0.8.55 -> proc-macro2@1.0.107",
-        "zerocopy-derive@0.8.55 -> quote@1.0.47",
-        "zerocopy-derive@0.8.55 -> syn@2.0.119",
-        "zerocopy@0.8.55 -> zerocopy-derive@0.8.55",
-        "zune-jpeg@0.5.15 -> zune-core@0.5.1"
+        {
+          "from": "crc32fast@1.5.0",
+          "to": "cfg-if@1.0.4",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "fdeflate@0.3.7",
+          "to": "simd-adler32@0.3.10",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "crc32fast@1.5.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "miniz_oxide@0.8.9",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "zlib-rs@0.6.7",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "color_quant@1.1.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "weezl@0.1.12",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "half@2.7.1",
+          "to": "cfg-if@1.0.4",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "half@2.7.1",
+          "to": "zerocopy@0.8.55",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "byteorder-lite@0.1.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "quick-error@2.0.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "bytemuck@1.25.2",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "byteorder-lite@0.1.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "color_quant@1.1.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "gif@0.14.2",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "image-webp@0.2.4",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "moxcms@0.8.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "num-traits@0.2.19",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "png@0.18.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "tiff@0.11.3",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-core@0.5.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-jpeg@0.5.15",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "adler2@2.0.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "simd-adler32@0.3.10",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "num-traits@0.2.19",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "pxfm@0.1.30",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "num-traits@0.2.19",
+          "to": "autocfg@1.5.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "bitflags@2.13.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "crc32fast@1.5.0",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "fdeflate@0.3.7",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "flate2@1.1.9",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "miniz_oxide@0.8.9",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "proc-macro2@1.0.107",
+          "to": "unicode-ident@1.0.24",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "quote@1.0.47",
+          "to": "proc-macro2@1.0.107",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "syn@2.0.119",
+          "to": "proc-macro2@1.0.107",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "syn@2.0.119",
+          "to": "quote@1.0.47",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "syn@2.0.119",
+          "to": "unicode-ident@1.0.24",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "fax@0.2.7",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "flate2@1.1.9",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "half@2.7.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "quick-error@2.0.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "weezl@0.1.12",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "tiff@0.11.3",
+          "to": "zune-jpeg@0.5.15",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zerocopy-derive@0.8.55",
+          "to": "proc-macro2@1.0.107",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zerocopy-derive@0.8.55",
+          "to": "quote@1.0.47",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zerocopy-derive@0.8.55",
+          "to": "syn@2.0.119",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zerocopy@0.8.55",
+          "to": "zerocopy-derive@0.8.55",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zune-jpeg@0.5.15",
+          "to": "zune-core@0.5.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-descendant"
+        }
       ],
       "packages": [
         "adler2@2.0.1",
@@ -426,9 +666,24 @@
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],
       "provenanceEdges": [
-        "arboard@3.6.1 -> image@0.25.10",
-        "cockpit-tui@0.1.0 -> arboard@3.6.1",
-        "cockpit-tui@0.1.0 -> image@0.25.10"
+        {
+          "from": "arboard@3.6.1",
+          "to": "image@0.25.10",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "arboard@3.6.1",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "image@0.25.10",
+          "target": "aarch64-apple-darwin",
+          "provenance": "image-requester"
+        }
       ],
       "resolvedFeatures": ["gif", "jpeg", "png", "tiff", "webp"],
       "tuiFeatures": ["gif", "jpeg", "png", "webp"]
@@ -484,36 +739,186 @@
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
-        "crc32fast@1.5.0 -> cfg-if@1.0.4",
-        "fdeflate@0.3.7 -> simd-adler32@0.3.10",
-        "flate2@1.1.9 -> crc32fast@1.5.0",
-        "flate2@1.1.9 -> miniz_oxide@0.8.9",
-        "flate2@1.1.9 -> zlib-rs@0.6.7",
-        "gif@0.14.2 -> color_quant@1.1.0",
-        "gif@0.14.2 -> weezl@0.1.12",
-        "image-webp@0.2.4 -> byteorder-lite@0.1.0",
-        "image-webp@0.2.4 -> quick-error@2.0.1",
-        "image@0.25.10 -> bytemuck@1.25.2",
-        "image@0.25.10 -> byteorder-lite@0.1.0",
-        "image@0.25.10 -> color_quant@1.1.0",
-        "image@0.25.10 -> gif@0.14.2",
-        "image@0.25.10 -> image-webp@0.2.4",
-        "image@0.25.10 -> moxcms@0.8.1",
-        "image@0.25.10 -> num-traits@0.2.19",
-        "image@0.25.10 -> png@0.18.1",
-        "image@0.25.10 -> zune-core@0.5.1",
-        "image@0.25.10 -> zune-jpeg@0.5.15",
-        "miniz_oxide@0.8.9 -> adler2@2.0.1",
-        "miniz_oxide@0.8.9 -> simd-adler32@0.3.10",
-        "moxcms@0.8.1 -> num-traits@0.2.19",
-        "moxcms@0.8.1 -> pxfm@0.1.30",
-        "num-traits@0.2.19 -> autocfg@1.5.1",
-        "png@0.18.1 -> bitflags@2.13.1",
-        "png@0.18.1 -> crc32fast@1.5.0",
-        "png@0.18.1 -> fdeflate@0.3.7",
-        "png@0.18.1 -> flate2@1.1.9",
-        "png@0.18.1 -> miniz_oxide@0.8.9",
-        "zune-jpeg@0.5.15 -> zune-core@0.5.1"
+        {
+          "from": "crc32fast@1.5.0",
+          "to": "cfg-if@1.0.4",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "fdeflate@0.3.7",
+          "to": "simd-adler32@0.3.10",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "crc32fast@1.5.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "miniz_oxide@0.8.9",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "zlib-rs@0.6.7",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "color_quant@1.1.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "weezl@0.1.12",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "byteorder-lite@0.1.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "quick-error@2.0.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "bytemuck@1.25.2",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "byteorder-lite@0.1.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "color_quant@1.1.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "gif@0.14.2",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "image-webp@0.2.4",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "moxcms@0.8.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "num-traits@0.2.19",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "png@0.18.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-core@0.5.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-jpeg@0.5.15",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "adler2@2.0.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "simd-adler32@0.3.10",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "num-traits@0.2.19",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "pxfm@0.1.30",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "num-traits@0.2.19",
+          "to": "autocfg@1.5.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "bitflags@2.13.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "crc32fast@1.5.0",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "fdeflate@0.3.7",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "flate2@1.1.9",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "miniz_oxide@0.8.9",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zune-jpeg@0.5.15",
+          "to": "zune-core@0.5.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-descendant"
+        }
       ],
       "packages": [
         "adler2@2.0.1",
@@ -543,9 +948,24 @@
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],
       "provenanceEdges": [
-        "arboard@3.6.1 -> image@0.25.10",
-        "cockpit-tui@0.1.0 -> arboard@3.6.1",
-        "cockpit-tui@0.1.0 -> image@0.25.10"
+        {
+          "from": "arboard@3.6.1",
+          "to": "image@0.25.10",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "arboard@3.6.1",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "image@0.25.10",
+          "target": "x86_64-pc-windows-msvc",
+          "provenance": "image-requester"
+        }
       ],
       "resolvedFeatures": ["bmp", "gif", "jpeg", "png", "webp"],
       "tuiFeatures": ["gif", "jpeg", "png", "webp"]
@@ -601,36 +1021,186 @@
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
-        "crc32fast@1.5.0 -> cfg-if@1.0.4",
-        "fdeflate@0.3.7 -> simd-adler32@0.3.10",
-        "flate2@1.1.9 -> crc32fast@1.5.0",
-        "flate2@1.1.9 -> miniz_oxide@0.8.9",
-        "flate2@1.1.9 -> zlib-rs@0.6.7",
-        "gif@0.14.2 -> color_quant@1.1.0",
-        "gif@0.14.2 -> weezl@0.1.12",
-        "image-webp@0.2.4 -> byteorder-lite@0.1.0",
-        "image-webp@0.2.4 -> quick-error@2.0.1",
-        "image@0.25.10 -> bytemuck@1.25.2",
-        "image@0.25.10 -> byteorder-lite@0.1.0",
-        "image@0.25.10 -> color_quant@1.1.0",
-        "image@0.25.10 -> gif@0.14.2",
-        "image@0.25.10 -> image-webp@0.2.4",
-        "image@0.25.10 -> moxcms@0.8.1",
-        "image@0.25.10 -> num-traits@0.2.19",
-        "image@0.25.10 -> png@0.18.1",
-        "image@0.25.10 -> zune-core@0.5.1",
-        "image@0.25.10 -> zune-jpeg@0.5.15",
-        "miniz_oxide@0.8.9 -> adler2@2.0.1",
-        "miniz_oxide@0.8.9 -> simd-adler32@0.3.10",
-        "moxcms@0.8.1 -> num-traits@0.2.19",
-        "moxcms@0.8.1 -> pxfm@0.1.30",
-        "num-traits@0.2.19 -> autocfg@1.5.1",
-        "png@0.18.1 -> bitflags@2.13.1",
-        "png@0.18.1 -> crc32fast@1.5.0",
-        "png@0.18.1 -> fdeflate@0.3.7",
-        "png@0.18.1 -> flate2@1.1.9",
-        "png@0.18.1 -> miniz_oxide@0.8.9",
-        "zune-jpeg@0.5.15 -> zune-core@0.5.1"
+        {
+          "from": "crc32fast@1.5.0",
+          "to": "cfg-if@1.0.4",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "fdeflate@0.3.7",
+          "to": "simd-adler32@0.3.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "crc32fast@1.5.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "miniz_oxide@0.8.9",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "flate2@1.1.9",
+          "to": "zlib-rs@0.6.7",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "color_quant@1.1.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "gif@0.14.2",
+          "to": "weezl@0.1.12",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "byteorder-lite@0.1.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image-webp@0.2.4",
+          "to": "quick-error@2.0.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "bytemuck@1.25.2",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "byteorder-lite@0.1.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "color_quant@1.1.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "gif@0.14.2",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "image-webp@0.2.4",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "moxcms@0.8.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "num-traits@0.2.19",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "png@0.18.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-core@0.5.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "image@0.25.10",
+          "to": "zune-jpeg@0.5.15",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "adler2@2.0.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "miniz_oxide@0.8.9",
+          "to": "simd-adler32@0.3.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "num-traits@0.2.19",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "moxcms@0.8.1",
+          "to": "pxfm@0.1.30",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "num-traits@0.2.19",
+          "to": "autocfg@1.5.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "bitflags@2.13.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "crc32fast@1.5.0",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "fdeflate@0.3.7",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "flate2@1.1.9",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "png@0.18.1",
+          "to": "miniz_oxide@0.8.9",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        },
+        {
+          "from": "zune-jpeg@0.5.15",
+          "to": "zune-core@0.5.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-descendant"
+        }
       ],
       "packages": [
         "adler2@2.0.1",
@@ -660,9 +1230,24 @@
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],
       "provenanceEdges": [
-        "arboard@3.6.1 -> image@0.25.10",
-        "cockpit-tui@0.1.0 -> arboard@3.6.1",
-        "cockpit-tui@0.1.0 -> image@0.25.10"
+        {
+          "from": "arboard@3.6.1",
+          "to": "image@0.25.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "arboard@3.6.1",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-requester"
+        },
+        {
+          "from": "cockpit-tui@0.1.0",
+          "to": "image@0.25.10",
+          "target": "x86_64-unknown-linux-gnu",
+          "provenance": "image-requester"
+        }
       ],
       "resolvedFeatures": ["gif", "jpeg", "png", "webp"],
       "tuiFeatures": ["gif", "jpeg", "png", "webp"]

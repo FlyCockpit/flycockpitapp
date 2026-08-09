@@ -2101,13 +2101,13 @@ fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
         context: row.get(4)?,
         disposition: disposition_value,
         phase: phase
-            .map(|value| GoalPhase::parse(&value).map_err(decode_err))
+            .map(|value| GoalPhase::parse(&value).map_err(decode_anyhow_err))
             .transpose()?,
         resume_phase: resume_phase
-            .map(|value| GoalPhase::parse(&value).map_err(decode_err))
+            .map(|value| GoalPhase::parse(&value).map_err(decode_anyhow_err))
             .transpose()?,
         pause_reason: pause_reason
-            .map(|value| GoalPauseReason::parse(&value).map_err(decode_err))
+            .map(|value| GoalPauseReason::parse(&value).map_err(decode_anyhow_err))
             .transpose()?,
         attempt_generation: row.get(9)?,
         contract: contract
@@ -2137,6 +2137,10 @@ fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
 
 fn decode_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+
+fn decode_anyhow_err(error: anyhow::Error) -> rusqlite::Error {
+    decode_err(std::io::Error::other(error.to_string()))
 }
 
 #[cfg(test)]
@@ -2957,7 +2961,7 @@ mod tests {
         for expected in 1..=3 {
             let updated = db
                 .finish_goal_control_job(
-                    evaluator,
+                    evaluator.clone(),
                     Ok(r#"{"decision":"blocked","blocker_key":"same","explanation":"waiting"}"#),
                 )
                 .await
@@ -3315,7 +3319,7 @@ mod tests {
             paused
                 .lifecycle_history
                 .last()
-                .map(|entry| (entry.disposition, entry.reason,)),
+                .map(|entry| (entry.disposition, entry.reason.clone())),
             Some((GoalDisposition::UserPaused, Some(GoalPauseReason::User)))
         );
     }

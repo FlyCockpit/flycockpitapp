@@ -1322,10 +1322,10 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
-    use cockpit_core::db::Db;
     use cockpit_core::process_containment::{
         FakeProvenAdapter, PlatformKind, ProcessContainmentActor,
     };
+    use cockpit_db::Db;
     use std::sync::Arc as StdArc;
 
     // -- helpers -----------------------------------------------------------

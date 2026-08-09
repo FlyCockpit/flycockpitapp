@@ -579,7 +579,21 @@ pub(super) async fn handle_serialized_request(
                 .config_source
                 .load(std::path::Path::new(&session.project_root))
                 .map_err(internal)?;
-            let policy = extended.goal_supervision;
+            let session_override = session
+                .goal_settings_override_json
+                .as_deref()
+                .map(crate::agents::parse_goal_settings_override_json)
+                .transpose()
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: error.to_string(),
+                })?;
+            let policy = crate::agents::effective_goal_supervision_for_agent(
+                std::path::Path::new(&session.project_root),
+                &session.active_agent,
+                session_override.as_ref(),
+                extended.goal_supervision,
+            );
             if !policy.enabled {
                 return Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
@@ -599,22 +613,19 @@ pub(super) async fn handle_serialized_request(
             }
             let goal = ctx
                 .db
-                .create_session_goal(
+                .create_session_goal_with_policy(
                     session_id,
                     &session.project_id,
                     &objective,
                     None,
                     Some(budget),
+                    &serde_json::to_string(&policy).map_err(internal)?,
                 )
                 .await
                 .map_err(|error| ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message: error.to_string(),
                 })?;
-            ctx.db
-                .persist_goal_policy(goal.id, &serde_json::to_string(&policy).map_err(internal)?)
-                .await
-                .map_err(internal)?;
             let goal = ctx
                 .db
                 .current_session_goal(session_id, false)
@@ -708,6 +719,18 @@ pub(super) async fn handle_serialized_request(
                 .clear_session_goal(session_id)
                 .await
                 .map_err(internal)?;
+            if cleared
+                && let Some(attached) = state
+                    .attached
+                    .as_ref()
+                    .filter(|attached| attached.handle.session().id == session_id)
+            {
+                attached
+                    .handle
+                    .send_work(SessionWork::WakeGoal)
+                    .await
+                    .map_err(internal)?;
+            }
             Ok(Response::GoalCleared { cleared })
         }
 

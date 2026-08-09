@@ -13,6 +13,13 @@ pub struct GoalScratchRoot {
 
 impl GoalScratchRoot {
     pub fn create(goal_id: Uuid) -> Result<Self> {
+        #[cfg(unix)]
+        let parent = std::env::temp_dir().join(format!(
+            "cockpit-goals-{}",
+            // SAFETY: geteuid has no preconditions and does not expose secrets.
+            unsafe { libc::geteuid() }
+        ));
+        #[cfg(not(unix))]
         let parent = std::env::temp_dir().join("cockpit-goals");
         Self::create_in(&parent, goal_id)
     }
@@ -124,9 +131,54 @@ fn verify_checked_dir(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn set_private(path: &Path) -> Result<()> {
-    // Creation inherits the current user's private temp-directory DACL. Verify
-    // reparse safety immediately; platform ACL hardening remains centralized in
-    // Cockpit's private-fs setup rather than shelling out.
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor: *const u16,
+            revision: u32,
+            security_descriptor: *mut *mut core::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
+        fn SetFileSecurityW(
+            file_name: *const u16,
+            security_information: u32,
+            security_descriptor: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    // Protected DACL with one full-control ACE for the object's owner. `OW`
+    // resolves to the current user for directories Cockpit just created.
+    let sddl: Vec<u16> = std::ffi::OsStr::new("D:P(A;;FA;;;OW)")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: both strings are NUL-terminated, the descriptor out-pointer is
+    // valid, and LocalFree releases the Windows-owned allocation exactly once.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("building private goal DACL");
+        }
+        let applied = SetFileSecurityW(wide_path.as_ptr(), 0x0000_0004, descriptor);
+        LocalFree(descriptor);
+        if applied == 0 {
+            return Err(std::io::Error::last_os_error()).context("applying private goal DACL");
+        }
+    }
     verify_checked_dir(path)
 }
 

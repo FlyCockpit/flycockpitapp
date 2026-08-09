@@ -46,6 +46,19 @@ async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
 }
 
+#[test]
+fn worker_cannot_create_or_mutate_goal() {
+    assert!(!crate::agents::known_tool_names().contains(&"goal"));
+}
+
+#[test]
+fn goal_continue_progress_accepts_goal_status_update() {
+    assert!(
+        !crate::agents::known_tool_names().contains(&"goal"),
+        "worker status updates must remain unavailable; host continuations use durable DB state"
+    );
+}
+
 #[tokio::test]
 async fn delegation_brief_todo_block_omits_append_note_instruction() {
     let (driver, _tmp) = test_driver(1);

@@ -932,9 +932,9 @@ impl SettingId {
                  be at least 1."
             }
             SettingId::GoalSupervisionEnabled => {
-                "Verify model-claimed goal completion before closing budgeted goals. On \
-                 (default) means a complete update on a token-budgeted goal runs \
-                 refute-framed skeptic scouts first; off restores immediate completion."
+                "Operator kill switch for host-supervised `/goal` runs. On (default) \
+                 enables planning, evaluation, and verification; off rejects new goals \
+                 and pauses open goals without restoring worker lifecycle authority."
             }
             SettingId::GoalSupervisionSkepticCount => {
                 "How many refute-framed skeptic scouts run in parallel for each \
@@ -945,8 +945,8 @@ impl SettingId {
                  Blank falls back to the same model as the active session."
             }
             SettingId::GoalSupervisionMaxRounds => {
-                "How many failed or inconclusive verification rounds the driver will \
-                 auto-reopen before surfacing `verification_failed`. Default 2."
+                "Maximum verification attempts before the host pauses the goal for \
+                 explicit user action. Default 4."
             }
             SettingId::DialogLockoutMs => {
                 "How long (milliseconds) an answer dialog ignores input after it \
@@ -2588,6 +2588,9 @@ impl SettingsCx {
             }
             S::GoalSupervisionSkepticCount => {
                 let v = parse_min_usize(trimmed, 1)?;
+                if v > 5 {
+                    return Err("must be between 1 and 5".to_string());
+                }
                 self.extended.goal_supervision.cold_skeptic_count = v;
             }
             S::GoalSupervisionMaxRounds => {

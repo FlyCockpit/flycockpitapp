@@ -2782,6 +2782,13 @@ impl Driver {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
                     tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                    if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+                        let _ = self
+                            .session
+                            .db
+                            .defer_goal_root_turn_for_approval(goal_id, generation, turn_id)
+                            .await;
+                    }
                     self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                         code: "parked_interrupt".to_string(),
                     });
@@ -6837,6 +6844,13 @@ impl Driver {
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+                        let _ = self
+                            .session
+                            .db
+                            .cancel_goal_root_turn_for_user(goal_id, generation, turn_id)
+                            .await;
+                    }
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
                     if let Some(run_id) = run_invocation_id {
                         let now = std::time::SystemTime::now()

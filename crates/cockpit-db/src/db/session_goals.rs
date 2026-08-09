@@ -484,6 +484,16 @@ pub struct GoalCompactionSnapshot {
 }
 
 impl SessionGoal {
+    fn transition(&self, event: GoalLifecycleEvent) -> Result<GoalTransition> {
+        GoalLifecycle {
+            disposition: self.disposition,
+            phase: self.phase,
+            resume_phase: self.resume_phase,
+            attempt_generation: self.attempt_generation,
+        }
+        .apply(event)
+    }
+
     pub fn compaction_snapshot(&self) -> GoalCompactionSnapshot {
         let mut objective = sanitize_goal_finding(&self.objective);
         objective.truncate(floor_char_boundary(&objective, 512));
@@ -534,6 +544,26 @@ impl Db {
         context: Option<&str>,
         token_budget: Option<i64>,
     ) -> Result<SessionGoal> {
+        self.create_session_goal_with_policy(
+            session_id,
+            project_id,
+            objective,
+            context,
+            token_budget,
+            "{}",
+        )
+        .await
+    }
+
+    pub async fn create_session_goal_with_policy(
+        &self,
+        session_id: Uuid,
+        project_id: &str,
+        objective: &str,
+        context: Option<&str>,
+        token_budget: Option<i64>,
+        policy_json: &str,
+    ) -> Result<SessionGoal> {
         let objective = objective.trim();
         if objective.is_empty() {
             anyhow::bail!("goal objective must not be empty");
@@ -547,6 +577,9 @@ impl Db {
         let project_id = project_id.to_owned();
         let objective = objective.to_owned();
         let context = context.map(str::to_owned);
+        serde_json::from_str::<serde_json::Value>(policy_json)
+            .context("validating resolved goal policy")?;
+        let policy_json = policy_json.to_owned();
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let conn = &tx;
@@ -577,16 +610,17 @@ impl Db {
                 "INSERT INTO session_goals
                     (id, session_id, project_id, objective, context, disposition, phase,
                      attempt_generation, resolved_policy_json, token_budget, token_accounting_baseline, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'planning', 1, '{}', ?6, ?7, ?8, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'planning', 1, ?6, ?7, ?8, ?9, ?9)",
                 params![
                     id.to_string(),
                     session_id.to_string(),
                     project_id,
                     objective,
                     clean_opt(context.as_deref()),
+                    policy_json,
                     token_budget,
                     token_baseline,
-                    now
+                    now,
                 ],
             )
             .context("inserting session_goal")?;
@@ -629,20 +663,6 @@ impl Db {
     ) -> Result<Option<SessionGoal>> {
         self.write(move |conn| Db::current_session_goal_conn(conn, session_id, mark_read))
             .await
-    }
-
-    pub async fn persist_goal_policy(&self, goal_id: Uuid, policy_json: &str) -> Result<()> {
-        let policy_json = policy_json.to_owned();
-        self.write(move |conn| {
-            serde_json::from_str::<serde_json::Value>(&policy_json)
-                .context("validating resolved goal policy")?;
-            let changed = conn.execute(
-                "UPDATE session_goals SET resolved_policy_json = ?1 WHERE id = ?2 AND disposition = 'running' AND phase = 'planning'",
-                params![policy_json, goal_id.to_string()],
-            )?;
-            anyhow::ensure!(changed == 1, "goal policy can only be persisted for a running planning goal");
-            Ok(())
-        }).await
     }
 
     pub async fn update_session_goal(
@@ -746,106 +766,6 @@ impl Db {
             .await
     }
 
-    pub async fn begin_session_goal_supervision(
-        &self,
-        session_id: Uuid,
-        evidence: &str,
-        context_delta: Option<&str>,
-    ) -> Result<SessionGoal> {
-        let evidence = evidence.to_owned();
-        let context_delta = context_delta.map(str::to_owned);
-        let now = Utc::now().timestamp();
-        self.write(move |conn| {
-            let mut goal = current_goal_required(conn, session_id)?;
-            let evidence = clean_opt(Some(evidence.as_str()))
-                .ok_or_else(|| anyhow::anyhow!("complete requires evidence"))?;
-            if goal.disposition != GoalDisposition::Running
-                || goal.phase != Some(GoalPhase::Evaluating)
-            {
-                anyhow::bail!("only the evaluator may nominate a running goal for verification");
-            }
-            let context = append_context(goal.context.as_deref(), context_delta.as_deref());
-            conn.execute(
-                "UPDATE session_goals
-                    SET phase = 'verifying',
-                        context = COALESCE(?1, context),
-                        completion_evidence = ?2,
-                        updated_at = ?3
-                  WHERE id = ?4 AND session_id = ?5",
-                params![
-                    context,
-                    evidence,
-                    now,
-                    goal.id.to_string(),
-                    session_id.to_string()
-                ],
-            )
-            .context("beginning session goal verification")?;
-            load_goal(conn, session_id, goal.id)
-        })
-        .await
-    }
-
-    pub async fn complete_pending_session_goal_supervision(
-        &self,
-        session_id: Uuid,
-        goal_id: Uuid,
-    ) -> Result<Option<SessionGoal>> {
-        self.write(move |conn| {
-            let Some(goal) = load_goal_optional(conn, session_id, goal_id)? else {
-                return Ok(None);
-            };
-            if goal.disposition != GoalDisposition::Running
-                || goal.phase != Some(GoalPhase::Verifying)
-            {
-                return Ok(None);
-            }
-            let now = Utc::now().timestamp();
-            conn.execute(
-                "UPDATE session_goals
-                    SET disposition = 'complete', phase = NULL, resume_phase = NULL, updated_at = ?1
-                  WHERE id = ?2 AND session_id = ?3 AND disposition = 'running' AND phase = 'verifying'",
-                params![now, goal.id.to_string(), session_id.to_string()],
-            )
-            .context("completing pending goal verification")?;
-            Ok(Some(load_goal(conn, session_id, goal.id)?))
-        })
-        .await
-    }
-
-    pub async fn reopen_pending_session_goal_supervision(
-        &self,
-        session_id: Uuid,
-        goal_id: Uuid,
-        context_delta: &str,
-    ) -> Result<Option<SessionGoal>> {
-        let context_delta = context_delta.to_owned();
-        self.write(move |conn| {
-            let Some(goal) = load_goal_optional(conn, session_id, goal_id)? else {
-                return Ok(None);
-            };
-            if goal.disposition != GoalDisposition::Running
-                || goal.phase != Some(GoalPhase::Verifying)
-            {
-                return Ok(None);
-            }
-            let now = Utc::now().timestamp();
-            let context = append_context(goal.context.as_deref(), Some(context_delta.as_str()));
-            conn.execute(
-                "UPDATE session_goals
-                    SET phase = 'executing',
-                        context = COALESCE(?1, context),
-                        verification_rounds = verification_rounds + 1,
-                        updated_at = ?2
-                  WHERE id = ?3 AND session_id = ?4 AND disposition = 'running' AND phase = 'verifying'",
-                params![context, now, goal.id.to_string(), session_id.to_string()],
-            )
-            .context("reopening pending goal verification")?;
-            Ok(Some(load_goal(conn, session_id, goal.id)?))
-        })
-        .await
-    }
-
     pub async fn set_session_goal_status(
         &self,
         session_id: Uuid,
@@ -932,7 +852,7 @@ impl Db {
             let conn = &tx;
             let now = Utc::now().timestamp();
             let changed = conn.execute(
-                "UPDATE goal_root_turns SET state = 'finished', updated_at = ?1
+                "UPDATE goal_root_turns SET state = 'finished', audit_excerpt = 'host-observed successful root turn', updated_at = ?1
                  WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'
                    AND EXISTS (SELECT 1 FROM session_goals WHERE id = ?2 AND disposition = 'running'
                                AND phase = 'executing' AND attempt_generation = ?3)",
@@ -941,7 +861,8 @@ impl Db {
             if changed != 1 { return Ok(None); }
             let session_id: String = conn.query_row("SELECT session_id FROM session_goals WHERE id = ?1", params![goal_id.to_string()], |row| row.get(0))?;
             let current = load_goal(conn, Uuid::parse_str(&session_id)?, goal_id)?;
-            let next_generation = attempt_generation + 1;
+            let transition = current.transition(GoalLifecycleEvent::RootSucceeded)?;
+            let next_generation = transition.lifecycle.attempt_generation;
             let job_id = Uuid::new_v4();
             let request = serde_json::json!({
                 "goal_id": goal_id,
@@ -983,8 +904,20 @@ impl Db {
     ) -> Result<bool> {
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let goal: SessionGoal = tx.query_row(
+                &format!("SELECT {GOAL_SELECT} FROM session_goals WHERE id = ?1"),
+                params![goal_id.to_string()],
+                decode_goal,
+            )?;
+            if goal.disposition != GoalDisposition::Running
+                || goal.phase != Some(GoalPhase::Executing)
+                || goal.attempt_generation != attempt_generation
+            {
+                return Ok(false);
+            }
+            goal.transition(GoalLifecycleEvent::RootFailed)?;
             let changed = tx.execute(
-                "UPDATE goal_root_turns SET state = 'failed', updated_at = ?1
+                "UPDATE goal_root_turns SET state = 'failed', audit_excerpt = 'root turn failed before evaluation', updated_at = ?1
                  WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'",
                 params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation, turn_id.to_string()],
             )?;
@@ -1001,12 +934,79 @@ impl Db {
         }).await
     }
 
+    pub async fn cancel_goal_root_turn_for_user(
+        &self,
+        goal_id: Uuid,
+        attempt_generation: i64,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            let now = Utc::now().timestamp();
+            let goal: SessionGoal = conn.query_row(
+                &format!("SELECT {GOAL_SELECT} FROM session_goals WHERE id = ?1"),
+                params![goal_id.to_string()],
+                decode_goal,
+            )?;
+            if goal.disposition != GoalDisposition::Running
+                || goal.phase != Some(GoalPhase::Executing)
+                || goal.attempt_generation != attempt_generation
+            {
+                return Ok(false);
+            }
+            goal.transition(GoalLifecycleEvent::UserPause)?;
+            let changed = conn.execute(
+                "UPDATE goal_root_turns SET state = 'cancelled', audit_excerpt = 'cancelled by user', updated_at = ?1
+                 WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'",
+                params![now, goal_id.to_string(), attempt_generation, turn_id.to_string()],
+            )?;
+            if changed == 1 {
+                conn.execute(
+                    "UPDATE session_goals SET disposition = 'user_paused', resume_phase = 'executing',
+                            phase = NULL, pause_reason = 'user', updated_at = ?1
+                     WHERE id = ?2 AND attempt_generation = ?3 AND disposition = 'running' AND phase = 'executing'",
+                    params![now, goal_id.to_string(), attempt_generation],
+                )?;
+            }
+            Ok(changed == 1)
+        }).await
+    }
+
+    pub async fn defer_goal_root_turn_for_approval(
+        &self,
+        goal_id: Uuid,
+        attempt_generation: i64,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        self.write(move |conn| {
+            let goal: SessionGoal = conn.query_row(
+                &format!("SELECT {GOAL_SELECT} FROM session_goals WHERE id = ?1"),
+                params![goal_id.to_string()],
+                decode_goal,
+            )?;
+            if goal.disposition != GoalDisposition::Running
+                || goal.phase != Some(GoalPhase::Executing)
+                || goal.attempt_generation != attempt_generation
+            {
+                return Ok(false);
+            }
+            goal.transition(GoalLifecycleEvent::ApprovalPending)?;
+            Ok(conn.execute(
+                "UPDATE goal_root_turns SET state = 'cancelled', audit_excerpt = 'deferred for approval', updated_at = ?1
+                 WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'
+                   AND EXISTS (SELECT 1 FROM session_goals WHERE id = ?2 AND disposition = 'running'
+                               AND phase = 'executing' AND attempt_generation = ?3)",
+                params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation, turn_id.to_string()],
+            )? == 1)
+        }).await
+    }
+
     /// Crash recovery is intentionally fail-closed: pre-crash work is never
     /// redispatched, and the interrupted phase is retained for explicit resume.
     pub async fn restore_supervised_goals(&self, session_id: Uuid) -> Result<Option<SessionGoal>> {
         self.transaction(move |conn| {
             let Some(goal) = Db::current_session_goal_conn(conn, session_id, false)? else { return Ok(None); };
             if goal.disposition != GoalDisposition::Running { return Ok(Some(goal)); }
+            goal.transition(GoalLifecycleEvent::Restart)?;
             let now = Utc::now().timestamp();
             conn.execute(
                 "UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'restart', updated_at = ?1
@@ -1034,6 +1034,7 @@ impl Db {
         self.transaction(move |conn| {
             let Some(goal) = Db::current_session_goal_conn(conn, session_id, false)? else { return Ok(None); };
             if goal.disposition != GoalDisposition::Running { return Ok(Some(goal)); }
+            goal.transition(GoalLifecycleEvent::OperatorDisabled)?;
             let now = Utc::now().timestamp();
             conn.execute("UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'operator_disabled', updated_at = ?1 WHERE goal_id = ?2 AND state IN ('pending', 'leased')", params![now, goal.id.to_string()])?;
             conn.execute("UPDATE goal_root_turns SET state = 'cancelled', updated_at = ?1 WHERE goal_id = ?2 AND state IN ('pending', 'leased')", params![now, goal.id.to_string()])?;
@@ -1090,20 +1091,23 @@ impl Db {
                 GoalControlRole::Planner => {
                     let contract = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalContract>(raw).ok()).filter(|contract| contract.validate().is_ok());
                     let Some(contract) = contract else {
+                        goal.transition(GoalLifecycleEvent::PlannerFailed)?;
                         finish_control_row(conn, &job, output.as_ref().ok().map(String::as_str), now)?;
                         pause_goal_for_failure(conn, &goal, GoalPhase::Planning, "planner_failure", now)?;
                         return Ok(Some(load_goal(conn, goal.session_id, goal.id)?));
                     };
+                    let transition = goal.transition(GoalLifecycleEvent::PlannerAccepted)?;
                     finish_control_row(conn, &job, output.as_ref().ok().map(String::as_str), now)?;
                     conn.execute(
-                        "UPDATE session_goals SET contract_json = ?1, phase = 'executing', updated_at = ?2
-                         WHERE id = ?3 AND disposition = 'running' AND phase = 'planning' AND attempt_generation = ?4",
-                        params![serde_json::to_string(&contract)?, now, goal.id.to_string(), job.attempt_generation],
+                        "UPDATE session_goals SET contract_json = ?1, phase = 'executing', attempt_generation = ?2, updated_at = ?3
+                         WHERE id = ?4 AND disposition = 'running' AND phase = 'planning' AND attempt_generation = ?5",
+                        params![serde_json::to_string(&contract)?, transition.lifecycle.attempt_generation, now, goal.id.to_string(), job.attempt_generation],
                     )?;
                 }
                 GoalControlRole::Evaluator => {
                     let decision = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalEvaluatorDecision>(raw).ok());
                     let Some(decision) = decision else {
+                        goal.transition(GoalLifecycleEvent::EvaluatorFailed)?;
                         finish_control_row(conn, &job, output.as_ref().ok().map(String::as_str), now)?;
                         pause_goal_for_failure(conn, &goal, GoalPhase::Evaluating, "evaluator_failure", now)?;
                         return Ok(Some(load_goal(conn, goal.session_id, goal.id)?));
@@ -1112,20 +1116,26 @@ impl Db {
                     let decision_json = serde_json::to_string(&decision)?;
                     match decision {
                         GoalEvaluatorDecision::Continue { .. } => {
-                            conn.execute("UPDATE session_goals SET phase = 'executing', evaluator_outcome_json = ?1, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?2 WHERE id = ?3 AND attempt_generation = ?4", params![decision_json, now, goal.id.to_string(), job.attempt_generation])?;
+                            let transition = goal.transition(GoalLifecycleEvent::EvaluatorContinue)?;
+                            conn.execute("UPDATE session_goals SET phase = 'executing', attempt_generation = ?1, evaluator_outcome_json = ?2, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5", params![transition.lifecycle.attempt_generation, decision_json, now, goal.id.to_string(), job.attempt_generation])?;
                         }
                         GoalEvaluatorDecision::Blocked { blocker_key, .. } => {
                             let key = sanitize_goal_finding(&blocker_key);
                             let streak = if goal.blocker_key.as_deref() == Some(key.as_str()) { goal.blocker_key_streak + 1 } else { 1 };
+                            let transition = goal.transition(GoalLifecycleEvent::EvaluatorBlocked {
+                                streak: u8::try_from(streak).unwrap_or(u8::MAX),
+                            })?;
                             if streak >= 3 {
                                 conn.execute("UPDATE session_goals SET disposition = 'blocked', phase = NULL, resume_phase = 'executing', evaluator_outcome_json = ?1, blocker_key = ?2, blocker_key_streak = ?3, updated_at = ?4 WHERE id = ?5 AND attempt_generation = ?6", params![decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
                             } else {
-                                conn.execute("UPDATE session_goals SET phase = 'executing', evaluator_outcome_json = ?1, blocker_key = ?2, blocker_key_streak = ?3, updated_at = ?4 WHERE id = ?5 AND attempt_generation = ?6", params![decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
+                                conn.execute("UPDATE session_goals SET phase = 'executing', attempt_generation = ?1, evaluator_outcome_json = ?2, blocker_key = ?3, blocker_key_streak = ?4, updated_at = ?5 WHERE id = ?6 AND attempt_generation = ?7", params![transition.lifecycle.attempt_generation, decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
                             }
                         }
                         GoalEvaluatorDecision::CandidateComplete { .. } => {
-                            conn.execute("UPDATE session_goals SET phase = 'verifying', evaluator_outcome_json = ?1, verification_rounds = verification_rounds + 1, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?2 WHERE id = ?3 AND attempt_generation = ?4", params![decision_json, now, goal.id.to_string(), job.attempt_generation])?;
-                            register_verification_jobs(conn, &goal, &decision_json, now)?;
+                            let transition = goal.transition(GoalLifecycleEvent::EvaluatorCandidateComplete)?;
+                            conn.execute("UPDATE session_goals SET phase = 'verifying', attempt_generation = ?1, evaluator_outcome_json = ?2, verification_rounds = verification_rounds + 1, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5", params![transition.lifecycle.attempt_generation, decision_json, now, goal.id.to_string(), job.attempt_generation])?;
+                            let verifying = load_goal(conn, goal.session_id, goal.id)?;
+                            register_verification_jobs(conn, &verifying, &decision_json, now)?;
                         }
                     }
                 }
@@ -1182,6 +1192,7 @@ impl Db {
         let Some(goal) = Db::current_session_goal_conn(conn, session_id, false)? else {
             return Ok(false);
         };
+        goal.transition(GoalLifecycleEvent::UserClear)?;
         conn.execute(
             "UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'cleared', updated_at = ?1
              WHERE goal_id = ?2 AND state IN ('pending', 'leased')",
@@ -1395,9 +1406,7 @@ fn register_verification_jobs(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(3)
         .clamp(1, 5);
-    let gatekeepers = (!goal.unresolved_gaps.is_empty())
-        .then_some((GoalControlRole::Gatekeeper, 0_i64))
-        .into_iter();
+    let gatekeepers = std::iter::once((GoalControlRole::Gatekeeper, 0_i64));
     for (role, slot) in gatekeepers.chain((0..count).map(|slot| {
         (
             GoalControlRole::ColdSkeptic,
@@ -1483,6 +1492,7 @@ fn apply_verification_if_terminal(
         }
     }
     if !gatekeeper_refuted && approvals > cold_total / 2 {
+        goal.transition(GoalLifecycleEvent::VerificationApproved)?;
         conn.execute(
             "UPDATE session_goals SET disposition = 'complete', phase = NULL, resume_phase = NULL,
                     verifier_outcome_json = ?1, updated_at = ?2
@@ -1518,6 +1528,11 @@ fn apply_verification_if_terminal(
     let findings_json = serde_json::to_string(&findings)?;
     let fingerprints_json = serde_json::to_string(&fingerprints)?;
     if let Some(reason) = pause_reason {
+        goal.transition(if repeated {
+            GoalLifecycleEvent::RepeatedGapSet
+        } else {
+            GoalLifecycleEvent::VerificationCap
+        })?;
         conn.execute(
             "UPDATE session_goals SET disposition = 'no_progress_paused', phase = NULL,
                     resume_phase = 'executing', pause_reason = ?1, unresolved_gaps_json = ?2,
@@ -1526,11 +1541,22 @@ fn apply_verification_if_terminal(
             params![reason, findings_json, fingerprints_json, set_hash, serde_json::json!({"approved": false}).to_string(), now, goal.id.to_string(), goal.attempt_generation],
         )?;
     } else {
+        let transition = goal.transition(GoalLifecycleEvent::VerificationRefuted)?;
         conn.execute(
-            "UPDATE session_goals SET phase = 'executing', unresolved_gaps_json = ?1,
-                    gap_fingerprints_json = ?2, previous_gap_set_hash = ?3, verifier_outcome_json = ?4,
-                    updated_at = ?5 WHERE id = ?6 AND attempt_generation = ?7",
-            params![findings_json, fingerprints_json, set_hash, serde_json::json!({"approved": false}).to_string(), now, goal.id.to_string(), goal.attempt_generation],
+            "UPDATE session_goals SET phase = 'executing', attempt_generation = ?1,
+                    unresolved_gaps_json = ?2, gap_fingerprints_json = ?3,
+                    previous_gap_set_hash = ?4, verifier_outcome_json = ?5,
+                    updated_at = ?6 WHERE id = ?7 AND attempt_generation = ?8",
+            params![
+                transition.lifecycle.attempt_generation,
+                findings_json,
+                fingerprints_json,
+                set_hash,
+                serde_json::json!({"approved": false}).to_string(),
+                now,
+                goal.id.to_string(),
+                goal.attempt_generation
+            ],
         )?;
     }
     Ok(())
@@ -2134,9 +2160,15 @@ mod tests {
     async fn goal_cold_panel_is_completion_authority() {
         let (db, verifying, jobs) = verification_fixture().await;
         assert!(!jobs.is_empty());
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.role == GoalControlRole::Gatekeeper)
+                .count(),
+            1
+        );
         assert!(
             jobs.iter()
-                .all(|job| job.role == GoalControlRole::ColdSkeptic)
+                .any(|job| job.role == GoalControlRole::ColdSkeptic)
         );
         let mut last = None;
         for job in jobs {
@@ -2280,5 +2312,316 @@ mod tests {
         assert_eq!(restored.disposition, GoalDisposition::UserPaused);
         assert_eq!(restored.resume_phase, Some(GoalPhase::Planning));
         assert_eq!(restored.pause_reason, Some(GoalPauseReason::Restart));
+    }
+
+    async fn finish_verification_with_refutation(
+        db: &Db,
+        jobs: Vec<GoalControlJob>,
+        finding: &str,
+    ) -> SessionGoal {
+        let refutation = serde_json::json!({"verdict":"refute", "findings":[finding]}).to_string();
+        let mut last = None;
+        for job in jobs {
+            last = db
+                .finish_goal_control_job(job, Ok(&refutation))
+                .await
+                .unwrap();
+        }
+        last.unwrap()
+    }
+
+    async fn start_next_verification(
+        db: &Db,
+        executing: &SessionGoal,
+    ) -> (SessionGoal, Vec<GoalControlJob>) {
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        let evaluating = db
+            .finish_goal_root_turn(executing.id, executing.attempt_generation, turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let evaluator = db
+            .lease_goal_control_job(
+                evaluating.id,
+                evaluating.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let verifying = db
+            .finish_goal_control_job(
+                evaluator,
+                Ok(r#"{"decision":"candidate_complete","evidence":"retry"}"#),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut jobs = Vec::new();
+        while let Some(job) = db
+            .lease_goal_control_job(
+                verifying.id,
+                verifying.attempt_generation,
+                Utc::now().timestamp(),
+                60,
+            )
+            .await
+            .unwrap()
+        {
+            jobs.push(job);
+        }
+        (verifying, jobs)
+    }
+
+    #[tokio::test]
+    async fn goal_verification_replays_unresolved_gaps() {
+        let (db, _, jobs) = verification_fixture().await;
+        let executing = finish_verification_with_refutation(&db, jobs, "missing evidence").await;
+        let (_, next_jobs) = start_next_verification(&db, &executing).await;
+        assert!(next_jobs.iter().any(|job| {
+            job.role == GoalControlRole::Gatekeeper && job.request_json.contains("missing evidence")
+        }));
+    }
+
+    #[tokio::test]
+    async fn goal_repeated_gap_set_pauses_on_second_occurrence() {
+        let (db, _, jobs) = verification_fixture().await;
+        let executing = finish_verification_with_refutation(&db, jobs, "same gap").await;
+        let (_, jobs) = start_next_verification(&db, &executing).await;
+        let paused = finish_verification_with_refutation(&db, jobs, "same gap").await;
+        assert_eq!(paused.disposition, GoalDisposition::NoProgressPaused);
+        assert_eq!(paused.pause_reason, Some(GoalPauseReason::RepeatedGapSet));
+    }
+
+    #[tokio::test]
+    async fn goal_identical_gap_set_pauses_before_verification_cap() {
+        let (db, _, jobs) = verification_fixture().await;
+        let executing = finish_verification_with_refutation(&db, jobs, "same gap").await;
+        let (_, jobs) = start_next_verification(&db, &executing).await;
+        let paused = finish_verification_with_refutation(&db, jobs, "same gap").await;
+        assert_eq!(paused.pause_reason, Some(GoalPauseReason::RepeatedGapSet));
+        assert!(paused.verification_rounds < 4);
+    }
+
+    #[tokio::test]
+    async fn goal_new_gap_set_resets_stall_counter() {
+        let (db, _, jobs) = verification_fixture().await;
+        let executing = finish_verification_with_refutation(&db, jobs, "first gap").await;
+        let (_, jobs) = start_next_verification(&db, &executing).await;
+        let executing = finish_verification_with_refutation(&db, jobs, "different gap").await;
+        assert_eq!(executing.disposition, GoalDisposition::Running);
+        assert_eq!(executing.phase, Some(GoalPhase::Executing));
+    }
+
+    #[tokio::test]
+    async fn goal_gatekeeper_cannot_approve_completion() {
+        let (db, _, jobs) = verification_fixture().await;
+        let executing = finish_verification_with_refutation(&db, jobs, "first gap").await;
+        let (_, jobs) = start_next_verification(&db, &executing).await;
+        let mut last = None;
+        for job in jobs {
+            let verdict = if job.role == GoalControlRole::Gatekeeper {
+                r#"{"verdict":"approve","evidence":"gap resolved"}"#
+            } else {
+                r#"{"verdict":"refute","findings":["cold refutation"]}"#
+            };
+            last = db.finish_goal_control_job(job, Ok(verdict)).await.unwrap();
+        }
+        assert_ne!(last.unwrap().disposition, GoalDisposition::Complete);
+    }
+
+    #[tokio::test]
+    async fn goal_verification_attempt_cap_is_inclusive_and_pauses() {
+        let (db, _, jobs) = verification_fixture().await;
+        let mut goal = finish_verification_with_refutation(&db, jobs, "gap one").await;
+        for finding in ["gap two", "gap three", "gap four"] {
+            let (_, jobs) = start_next_verification(&db, &goal).await;
+            goal = finish_verification_with_refutation(&db, jobs, finding).await;
+        }
+        assert_eq!(goal.verification_rounds, 4);
+        assert_eq!(goal.disposition, GoalDisposition::NoProgressPaused);
+        assert_eq!(
+            goal.pause_reason,
+            Some(GoalPauseReason::VerificationAttemptCap)
+        );
+    }
+
+    async fn control_job_state(db: &Db, goal_id: Uuid) -> String {
+        db.read(move |conn| {
+            conn.query_row(
+                "SELECT state FROM goal_control_jobs WHERE goal_id = ?1 LIMIT 1",
+                params![goal_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn goal_control_outbox_recovers_prelease_crash() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("p", "/tmp/goal-supervision", "Build")
+            .await
+            .unwrap();
+        let goal = db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship",
+                None,
+                Some(1000),
+            )
+            .await
+            .unwrap();
+        db.restore_supervised_goals(goal.session_id).await.unwrap();
+        assert_eq!(control_job_state(&db, goal.id).await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn goal_control_outbox_recovers_postlease_crash() {
+        let (db, goal, _leased) = planning_fixture().await;
+        db.restore_supervised_goals(goal.session_id).await.unwrap();
+        assert_eq!(control_job_state(&db, goal.id).await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn goal_tombstone_cleanup_waits_for_registered_job_and_retires_terminal_audit_rows() {
+        let (db, goal, _) = planning_fixture().await;
+        db.clear_session_goal(goal.session_id).await.unwrap();
+        let now = Utc::now().timestamp();
+        let id = goal.id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE session_goals SET cleared_at = ?1 WHERE id = ?2",
+                params![now - 31 * 86_400, id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE goal_control_jobs SET state = 'pending' WHERE goal_id = ?1",
+                params![id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.purge_cleared_goal_tombstones(now).await.unwrap(), 0);
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE goal_control_jobs SET state = 'cancelled' WHERE goal_id = ?1",
+                params![id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.purge_cleared_goal_tombstones(now).await.unwrap(), 1);
+        assert!(
+            db.read(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM goal_control_jobs WHERE goal_id = ?1",
+                    params![id.to_string()],
+                    |row| row.get(0),
+                )?;
+                Ok(count == 0)
+            })
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_late_result_for_expired_or_deleted_id_is_rejected() {
+        let (db, goal, job) = planning_fixture().await;
+        db.clear_session_goal(goal.session_id).await.unwrap();
+        let now = Utc::now().timestamp();
+        let id = goal.id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE session_goals SET cleared_at = ?1 WHERE id = ?2",
+                params![now - 31 * 86_400, id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.finish_goal_control_job(job.clone(), Ok("{}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.purge_cleared_goal_tombstones(now).await.unwrap();
+        assert!(
+            db.finish_goal_control_job(job, Ok("{}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_user_cancel_pauses_without_evaluation() {
+        let (db, _, planner) = planning_fixture().await;
+        let raw = serde_json::to_string(&contract()).unwrap();
+        let executing = db
+            .finish_goal_control_job(planner, Ok(&raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        db.cancel_goal_root_turn_for_user(executing.id, executing.attempt_generation, turn)
+            .await
+            .unwrap();
+        let paused = db
+            .current_session_goal(executing.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.disposition, GoalDisposition::UserPaused);
+        assert_eq!(paused.pause_reason, Some(GoalPauseReason::User));
+    }
+
+    #[tokio::test]
+    async fn goal_approval_blocked_turn_skips_evaluation_and_continuation() {
+        let (db, _, planner) = planning_fixture().await;
+        let raw = serde_json::to_string(&contract()).unwrap();
+        let executing = db
+            .finish_goal_control_job(planner, Ok(&raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = db
+            .begin_goal_root_turn(executing.id, executing.attempt_generation)
+            .await
+            .unwrap();
+        db.defer_goal_root_turn_for_approval(executing.id, executing.attempt_generation, turn)
+            .await
+            .unwrap();
+        let current = db
+            .current_session_goal(executing.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase, Some(GoalPhase::Executing));
+        assert!(
+            db.lease_goal_control_job(
+                current.id,
+                current.attempt_generation,
+                Utc::now().timestamp(),
+                60
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 }

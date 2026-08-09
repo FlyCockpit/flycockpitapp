@@ -278,8 +278,11 @@ impl GoalSettingsOverride {
         if self.default_token_budget.is_some_and(|budget| budget <= 0) {
             bail!("goalSupervision.defaultTokenBudget must be positive");
         }
-        if self.cold_skeptic_count == Some(0) {
-            bail!("goalSupervision.coldSkepticCount must be at least 1");
+        if self
+            .cold_skeptic_count
+            .is_some_and(|count| !(1..=5).contains(&count))
+        {
+            bail!("goalSupervision.coldSkepticCount must be between 1 and 5");
         }
         if self.max_verification_attempts == Some(0) {
             bail!("goalSupervision.maxVerificationAttempts must be at least 1");

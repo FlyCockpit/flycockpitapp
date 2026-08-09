@@ -152,7 +152,7 @@ impl ConfigDoc {
         )
         .context("recovering a pending default-model transaction")?;
         let generation = next_load_effective_generation();
-        let (mut masks, mut unmaskable) = effective_default::masked_layers(paths);
+        let (mut masks, unmaskable) = effective_default::masked_layers(paths);
         if !unmaskable.is_empty() {
             anyhow::bail!(
                 "{} configuration layer(s) have a pending default-model transaction that cannot be masked; run `cockpit doctor` to inspect the journal",
@@ -160,28 +160,29 @@ impl ConfigDoc {
             );
         }
 
-        let (mut providers, mut layers) =
-            Self::providers_and_layer_snapshot_with_masks(paths, &masks);
         // The mask probe and capture both happen outside the cross-process
-        // mutation lock. If a transaction appeared between them, the first
-        // capture may contain its partially committed active-model bytes.
-        // Reprobe once and rebuild both projections from the same masked read.
-        if masks.is_empty()
-            && unmaskable.is_empty()
-            && effective_default::any_journal_present(paths)
-        {
-            (masks, unmaskable) = effective_default::masked_layers(paths);
+        // mutation lock. Validate every capture against a fresh probe and
+        // retry the whole projection when the journal picture moved. This
+        // covers a transaction starting on a different layer during a retry,
+        // while the bound fails closed under continuous config churn.
+        const MAX_STABLE_CAPTURE_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_STABLE_CAPTURE_ATTEMPTS {
+            let (providers, layers) = Self::providers_and_layer_snapshot_with_masks(paths, &masks);
+            let (observed_masks, unmaskable) = effective_default::masked_layers(paths);
             if !unmaskable.is_empty() {
                 anyhow::bail!(
                     "{} configuration layer(s) have a pending default-model transaction that cannot be masked; run `cockpit doctor` to inspect the journal",
                     unmaskable.len()
                 );
             }
-            if !masks.is_empty() {
-                (providers, layers) = Self::providers_and_layer_snapshot_with_masks(paths, &masks);
+            if observed_masks == masks {
+                return Ok((providers.with_resolution_generation(generation), layers));
             }
+            masks = observed_masks;
         }
-        Ok((providers.with_resolution_generation(generation), layers))
+        anyhow::bail!(
+            "configuration layers changed during daemon snapshot capture; retry after configuration writes settle"
+        )
     }
 
     fn providers_and_layer_snapshot_with_masks(

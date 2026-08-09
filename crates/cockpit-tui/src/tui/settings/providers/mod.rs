@@ -4330,6 +4330,11 @@ impl SettingsPage for ProvidersPage {
             }
             ProvidersPage::FetchOnePrompt(state) if index <= 2 => state.cursor = index,
             ProvidersPage::FetchFallbackPrompt(state) if index <= 3 => state.cursor = index,
+            ProvidersPage::DeepFetch { state, .. } => {
+                if !state.set_pointer_choice(index) {
+                    return Nav::Stay;
+                }
+            }
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4409,6 +4414,11 @@ impl SettingsPage for ProvidersPage {
                     if region == SettingsScrollRegionId("providers:fetch-fallback") =>
                 {
                     state.cursor = state.cursor.saturating_add_signed(delta).min(3);
+                }
+                ProvidersPage::DeepFetch { state, .. }
+                    if region == SettingsScrollRegionId("providers:deep-fetch") =>
+                {
+                    state.scroll_pointer_choice(delta);
                 }
                 _ => {}
             }

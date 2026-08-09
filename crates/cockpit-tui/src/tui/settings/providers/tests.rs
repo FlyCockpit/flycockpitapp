@@ -1264,6 +1264,11 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
 
 #[test]
 fn pointer_prompt_surfaces_render_and_dispatch() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("provider prompt pointer runtime");
+    let _runtime_guard = runtime.enter();
     for kind in [
         PromptFixture::FetchAll,
         PromptFixture::FetchOne,
@@ -1399,6 +1404,11 @@ fn replay_special_provider_edit_actions(
 
 #[test]
 fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Copilot pointer runtime");
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         ConfirmationChoice, ProviderId, ProvidersAction, SettingsPointerAction,
     };
@@ -1525,6 +1535,11 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Grok OAuth pointer runtime");
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         OAuthCopyKind, ProviderId, ProvidersAction, SettingsPointerAction,
     };
@@ -1743,6 +1758,11 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Codex OAuth pointer runtime");
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         OAuthCopyKind, ProviderId, ProvidersAction, SettingsPointerAction,
     };
@@ -2492,6 +2512,11 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_test_key_choices_render_and_dispatch_from_fresh_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("provider key-test pointer runtime");
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         ProvidersAction, SettingsPointerAction, WizardControlId, WizardTestChoice,
     };
@@ -3103,6 +3128,11 @@ fn nested_provider_fixture(
 
 #[test]
 fn pointer_reachable_nested_surfaces_render_and_dispatch() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("nested provider pointer runtime");
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::ProvidersAction;
     let config = one_provider_config(None);
     for path in [0, 1, 2, 3] {
@@ -6538,7 +6568,10 @@ fn codex_skip_row_saves_with_device_code_present() {
         "https://example.test/device",
         "CODE-123",
     ));
-    oauth.cursor = 1;
+    oauth.cursor = oauth_options(&oauth, OAuthHost::AddWizard)
+        .iter()
+        .position(|option| *option == OAuthOption::SkipContinue)
+        .expect("device Codex renders skip / continue");
     let mut state = add_state_for_oauth("codex-oauth", oauth);
 
     dialog.handle_add_key(press(KeyCode::Enter), &mut state);
@@ -6554,7 +6587,10 @@ fn grok_pending_skip_row_saves_at_rendered_index() {
     let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     oauth.set_browser_session_for_test("https://example.test/oauth");
     oauth.pending = true;
-    oauth.cursor = 1;
+    oauth.cursor = oauth_options(&oauth, OAuthHost::AddWizard)
+        .iter()
+        .position(|option| *option == OAuthOption::SkipContinue)
+        .expect("pending Grok renders skip / continue");
     let mut state = add_state_for_oauth("grok-oauth", oauth);
 
     dialog.handle_add_key(press(KeyCode::Enter), &mut state);
@@ -6591,7 +6627,9 @@ fn standalone_oauth_setup_scrolls_to_reveal_option_rows() {
 #[test]
 fn standalone_oauth_setup_renders_full_hints_at_80_columns() {
     let dialog = codex_standalone_dialog();
-    let rendered = render_provider_rows(&dialog, 80, 18).join("\n");
+    // Narrow wrapping needs additional rows now that the device-code copy
+    // affordance is part of the genuine OAuth surface.
+    let rendered = render_provider_rows(&dialog, 80, 24).join("\n");
 
     assert_rendered_contains_text(&rendered, "documented Codex agent login");
     assert_rendered_contains_text(&rendered, "refresh-token contention");

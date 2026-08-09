@@ -28,6 +28,7 @@ pub mod remote_identity_protocol;
 pub mod remote_protocol_id;
 pub mod remote_transport;
 pub mod remote_wire_magic_registry;
+pub mod send_user_message_v2;
 pub mod terminal;
 
 use std::collections::{BTreeMap, HashMap};

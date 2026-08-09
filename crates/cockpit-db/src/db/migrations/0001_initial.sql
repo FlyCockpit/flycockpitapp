@@ -652,6 +652,69 @@ CREATE TABLE client_submission_terminal_receipts (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- Authoritative exactly-once ledger for typed user-message submissions. UUID
+-- identities that cross the canonical binary boundary are RFC-byte BLOBs;
+-- actor identity is deliberately absent for the local-owner tuple.
+CREATE TABLE message_operation_receipts (
+    session_id             TEXT NOT NULL,
+    operation_id           BLOB NOT NULL CHECK (length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    actor_kind             TEXT NOT NULL CHECK (actor_kind IN ('local_owner', 'remote_device')),
+    actor_id               BLOB,
+    actor_generation       INTEGER NOT NULL,
+    request_hash           BLOB NOT NULL CHECK (length(request_hash) = 32),
+    message_request_digest BLOB NOT NULL CHECK (length(message_request_digest) = 32),
+    client_submission_id   BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
+    safe_outcome           BLOB NOT NULL,
+    outbox_sequence        INTEGER NOT NULL CHECK (outbox_sequence >= 0),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (session_id, operation_id),
+    UNIQUE (session_id, client_submission_id),
+    CHECK (
+      (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = 0) OR
+      (actor_kind = 'remote_device' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation > 0)
+    ),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_submission_receipts (
+    session_id             TEXT NOT NULL,
+    client_submission_id   BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    operation_id           BLOB NOT NULL CHECK (length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    message_request_digest BLOB NOT NULL CHECK (length(message_request_digest) = 32),
+    attachment_set_digest  BLOB NOT NULL CHECK (length(attachment_set_digest) = 32),
+    state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
+    queue_item_id          BLOB NOT NULL CHECK (length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    message_seq            INTEGER CHECK (message_seq IS NULL OR message_seq > 0),
+    fold_ordinal           INTEGER CHECK (fold_ordinal IS NULL OR fold_ordinal >= 0),
+    safe_outcome           BLOB NOT NULL,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (session_id, client_submission_id),
+    UNIQUE (session_id, operation_id),
+    CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
+    FOREIGN KEY (session_id, operation_id)
+      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_attachment_references (
+    session_id           TEXT NOT NULL,
+    client_submission_id BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    ordinal              INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 16),
+    attachment_id        BLOB NOT NULL CHECK (length(attachment_id) = 16 AND attachment_id <> zeroblob(16)),
+    attachment_version   INTEGER NOT NULL CHECK (attachment_version > 0),
+    checksum             BLOB NOT NULL CHECK (length(checksum) = 32),
+    kind                 INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
+    acquired_at          INTEGER NOT NULL,
+    released_at          INTEGER,
+    PRIMARY KEY (session_id, client_submission_id, ordinal),
+    UNIQUE (session_id, client_submission_id, attachment_id),
+    CHECK (released_at IS NULL OR released_at >= acquired_at),
+    FOREIGN KEY (session_id, client_submission_id)
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+);
+
 -- Large compaction records spill out of the inline event JSON as one canonical
 -- payload (brief + handoff + serialized tail). The `session_compacted` event
 -- remains authoritative and carries this opaque, session-scoped id.

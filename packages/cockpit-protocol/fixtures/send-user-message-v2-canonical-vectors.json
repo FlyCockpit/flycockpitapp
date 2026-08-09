@@ -1,0 +1,49 @@
+{
+  "schema": "flycockpit.send_user_message_v2.canonical_vectors.v1",
+  "vectors": [
+    {
+      "name": "attachment_only_audio",
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "canonical_project_digest_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "model_config_generation": "5",
+      "canonical_model_digest_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "text": "",
+      "display_text": null,
+      "tag_expansions": [],
+      "forced_skill": null,
+      "attachments": [
+        {
+          "attachment_id": "33333333-3333-4333-8333-333333333333",
+          "attachment_version": "7",
+          "checksum_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "kind": "audio"
+        }
+      ],
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02",
+      "message_request_digest_hex": "9cd8ee995bfe07fbfc5ed30e612e27ea45c8f1196bf99c2229b5a3e0a35efaca",
+      "attachment_set_digest_hex": "01f8f33c7decc3b3f022f2c606c9ec90e581be6ecabe98192288f72e552f6c71"
+    }
+  ],
+  "predicate_vectors": [
+    {
+      "text": "\t\n\u000b\f\r \u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000",
+      "has_message_text": false
+    },
+    { "text": "\ufeff", "has_message_text": true },
+    { "text": "\u200b", "has_message_text": true },
+    { "text": "é", "has_message_text": true },
+    { "text": "😀", "has_message_text": true }
+  ],
+  "malformed": [
+    "old_image_refs_field",
+    "trailing_bytes",
+    "unknown_kind",
+    "zero_attachment_version",
+    "duplicate_attachment_id",
+    "nil_uuid",
+    "invalid_utf8",
+    "unpaired_utf16_surrogate",
+    "one_byte_over_maximum"
+  ]
+}

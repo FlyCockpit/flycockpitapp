@@ -5195,7 +5195,11 @@ pub(super) fn extract_selection_semantic(
             return None;
         }
     }
-    (saw_semantic_row && !out.is_empty()).then_some(out)
+    // An all-chrome selection inside a Markdown message is still a
+    // successfully mapped semantic selection: its clipboard value is empty.
+    // Returning `None` here would incorrectly authorize the caller's visible
+    // plaintext fallback and leak headings, fences, or table borders.
+    saw_semantic_row.then_some(out)
 }
 
 /// Rough row count for a history entry. Mirrors the breakdown in
@@ -9742,6 +9746,18 @@ mod render_history_spacing_tests {
         let copied = extract_full_semantic_selection(&app, 40, 12);
         assert_eq!(copied, "title\n\nlet x = 1;");
         assert!(!copied.contains('#') && !copied.contains('`') && !copied.contains('*'));
+
+        let heading_row = find_row(&app, "# title");
+        let chrome_only = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (2, heading_row as u16),
+                focus: (2, heading_row as u16),
+                active: false,
+            },
+        );
+        assert_eq!(chrome_only.as_deref(), Some(""));
 
         app.history = vec![agent("```diff\ndiff --git a/x b/x\n```\n\n1. 1999 follows")].into();
         render_history(&mut app, 40, 12);

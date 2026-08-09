@@ -244,13 +244,17 @@ fn push_copy_text(
     }
 }
 
-/// Small, dependency-free extended-grapheme approximation tailored to cell
-/// identity: combining/variation/modifier characters and every ZWJ-linked
-/// component stay with their base, as do regional-indicator pairs.
+/// Dependency-free terminal grapheme clustering. In addition to zero-width
+/// combining/variation/modifier characters and ZWJ-linked emoji, keep the
+/// stateful clusters whose scalar widths alone do not describe their terminal
+/// identity: regional-indicator pairs, Hangul Jamo syllables, and Indic virama
+/// conjuncts.
 pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut join_next = false;
     let mut regional_in_last = false;
+    let mut hangul_state = None;
+    let mut after_virama = false;
     for ch in text.chars() {
         let cp = ch as u32;
         let combining = !ch.is_control() && ch.width().unwrap_or(0) == 0
@@ -258,7 +262,14 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
             || (0x1F3FB..=0x1F3FF).contains(&cp)
             || (0xE0100..=0xE01EF).contains(&cp);
         let regional = (0x1F1E6..=0x1F1FF).contains(&cp);
-        if combining || join_next || (regional && regional_in_last) {
+        let hangul = hangul_jamo_class(cp);
+        let joins_hangul = matches!(
+            (hangul_state, hangul),
+            (Some(HangulJamo::L), Some(HangulJamo::L | HangulJamo::V))
+                | (Some(HangulJamo::V), Some(HangulJamo::V | HangulJamo::T))
+                | (Some(HangulJamo::T), Some(HangulJamo::T))
+        );
+        if combining || join_next || after_virama || joins_hangul || (regional && regional_in_last) {
             if let Some(last) = out.last_mut() {
                 last.push(ch);
             } else {
@@ -268,12 +279,45 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
             out.push(ch.to_string());
         }
         join_next = ch == '\u{200d}';
+        after_virama = is_virama(cp);
+        hangul_state = hangul;
         regional_in_last = regional && !regional_in_last;
         if !regional {
             regional_in_last = false;
         }
     }
     out
+}
+
+#[derive(Clone, Copy)]
+enum HangulJamo {
+    L,
+    V,
+    T,
+}
+
+fn hangul_jamo_class(cp: u32) -> Option<HangulJamo> {
+    match cp {
+        0x1100..=0x115f | 0xa960..=0xa97c => Some(HangulJamo::L),
+        0x1160..=0x11a7 | 0xd7b0..=0xd7c6 => Some(HangulJamo::V),
+        0x11a8..=0x11ff | 0xd7cb..=0xd7fb => Some(HangulJamo::T),
+        _ => None,
+    }
+}
+
+fn is_virama(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x094d | 0x09cd | 0x0a4d | 0x0acd | 0x0b4d | 0x0bcd | 0x0c4d
+            | 0x0ccd | 0x0d3b | 0x0d3c | 0x0d4d | 0x0dca | 0x0e3a | 0x0f84
+            | 0x1039 | 0x103a | 0x1714 | 0x1734 | 0x17d2 | 0x1a60 | 0x1b44
+            | 0x1baa | 0x1bab | 0xa806 | 0xa8c4 | 0xa953 | 0xa9c0 | 0xaaf6
+            | 0xabed | 0x10a3f | 0x11046 | 0x11070 | 0x11133 | 0x11134
+            | 0x111c0 | 0x11235 | 0x112ea | 0x1134d | 0x11442 | 0x114c2
+            | 0x115bf | 0x1163f | 0x116b6 | 0x1172b | 0x11839 | 0x1193d
+            | 0x1193e | 0x119e0 | 0x11a34 | 0x11a47 | 0x11a99 | 0x11c3f
+            | 0x11d44 | 0x11d45 | 0x11d97 | 0x11f41 | 0x11f42
+    )
 }
 
 #[cfg(test)]
@@ -1453,10 +1497,22 @@ mod tests {
 
     #[test]
     fn selection_grapheme_identity_is_width_safe() {
-        let values = semantic_graphemes("界 e\u{301} 👩\u{200d}💻 🇺🇸");
+        let values = semantic_graphemes("界 e\u{301} 👩\u{200d}💻 🇺🇸 क्\u{200d}ष 각");
         assert_eq!(
             values,
-            vec!["界", " ", "e\u{301}", " ", "👩\u{200d}💻", " ", "🇺🇸"]
+            vec![
+                "界",
+                " ",
+                "e\u{301}",
+                " ",
+                "👩\u{200d}💻",
+                " ",
+                "🇺🇸",
+                " ",
+                "क्\u{200d}ष",
+                " ",
+                "각"
+            ]
         );
     }
 

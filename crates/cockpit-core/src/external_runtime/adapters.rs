@@ -532,9 +532,7 @@ pub fn compose_settings_doctor_health_with_executor(
         input,
         executor,
         path_env,
-        None,
-        true,
-        None,
+        CompositionScope::global(),
         |_| {},
     )
 }
@@ -553,9 +551,7 @@ pub(crate) fn compose_settings_doctor_health_for_invocation(
         input,
         &super::probe::SystemProbeExecutor,
         None,
-        Some(cancel),
-        false,
-        Some(generation),
+        CompositionScope::invocation(cancel, generation),
         observer,
     )
 }
@@ -603,17 +599,40 @@ pub(crate) fn resolved_container_engine_mode(
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompositionScope<'a> {
+    cancel: Option<&'a super::probe::CancelToken>,
+    publish_global: bool,
+    generation: Option<u64>,
+}
+
+impl<'a> CompositionScope<'a> {
+    fn global() -> Self {
+        Self {
+            cancel: None,
+            publish_global: true,
+            generation: None,
+        }
+    }
+
+    fn invocation(cancel: &'a super::probe::CancelToken, generation: u64) -> Self {
+        Self {
+            cancel: Some(cancel),
+            publish_global: false,
+            generation: Some(generation),
+        }
+    }
+}
+
 fn compose_settings_doctor_health_internal(
     cwd: &Path,
     input: &IntegrationHealthComposeInput,
     executor: &dyn super::probe::ProbeExecutor,
     path_env: Option<&str>,
-    invocation_cancel: Option<&super::probe::CancelToken>,
-    publish_global: bool,
-    generation_override: Option<u64>,
+    scope: CompositionScope<'_>,
     mut observer: impl FnMut(&ExternalRuntimeSnapshot),
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
-    let registry = if publish_global {
+    let registry = if scope.publish_global {
         super::registry::global_registry()
     } else {
         Arc::new(super::registry::ExternalRuntimeRegistry::new())
@@ -673,9 +692,9 @@ fn compose_settings_doctor_health_internal(
     descriptors.sort_by(|left, right| left.id.cmp(&right.id));
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
-    let generation = if let Some(generation) = generation_override {
+    let generation = if let Some(generation) = scope.generation {
         generation
-    } else if publish_global {
+    } else if scope.publish_global {
         store.begin_refresh()
     } else {
         store
@@ -683,7 +702,7 @@ fn compose_settings_doctor_health_internal(
             .map_or(1, |snapshot| snapshot.generation.saturating_add(1))
     };
     let local_cancel = super::probe::CancelToken::new();
-    let cancel = invocation_cancel.unwrap_or(&local_cancel);
+    let cancel = scope.cancel.unwrap_or(&local_cancel);
     let mut snapshot = super::probe::refresh_snapshot_with_observer(
         generation,
         &base_descriptors,
@@ -743,7 +762,7 @@ fn compose_settings_doctor_health_internal(
             }
         }
     }
-    if !publish_global {
+    if !scope.publish_global {
         return Ok(Arc::new(snapshot));
     }
     if !store.publish_bundle(snapshot.clone(), descriptors) {

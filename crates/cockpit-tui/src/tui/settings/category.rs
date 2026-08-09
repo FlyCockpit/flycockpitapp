@@ -1232,6 +1232,11 @@ pub(super) struct CategoryExternalEdit {
 }
 
 impl CategoryExternalEdit {
+    #[cfg(test)]
+    pub(super) fn source(&self) -> CategoryExternalSource {
+        self.source
+    }
+
     fn new(
         operation_id: PointerOperationId,
         id: SettingId,
@@ -1429,23 +1434,23 @@ impl CategoryPathEditor {
                 super::pointer_actions::CategoryAction::PathEditCommit(category_pointer_id(
                     self.id,
                 )),
-                0,
-                6,
+                0u16,
+                6u16,
             ),
             (
                 super::pointer_actions::CategoryAction::PathEditCancel(category_pointer_id(
                     self.id,
                 )),
-                8,
-                8,
+                8u16,
+                8u16,
             ),
             (
                 super::pointer_actions::CategoryAction::ExternalEditBegin(
                     category_pointer_id(self.id),
                     super::pointer_actions::CategoryExternalSource::PathEditor,
                 ),
-                18,
-                17,
+                18u16,
+                17u16,
             ),
         ] {
             if x.saturating_add(width) > area.width {
@@ -2278,14 +2283,13 @@ impl SettingsCx {
         else {
             return;
         };
-        let Some(setting) = p
+        if !p
             .pending_external_edit
             .as_ref()
-            .filter(|pending| pending.operation_id == operation_id && pending.id == setting)
-            .map(|pending| pending.id)
-        else {
+            .is_some_and(|pending| pending.operation_id == operation_id && pending.id == setting)
+        {
             return;
-        };
+        }
         if p.pending_external_edit
             .as_ref()
             .map(|pending| pending.operation_id)
@@ -3403,8 +3407,16 @@ impl SettingsCx {
                 area,
             );
             for (choice, x, width) in [
-                (super::pointer_actions::ConfirmationChoice::Confirm, 0, 17),
-                (super::pointer_actions::ConfirmationChoice::Cancel, 19, 15),
+                (
+                    super::pointer_actions::ConfirmationChoice::Confirm,
+                    0u16,
+                    17u16,
+                ),
+                (
+                    super::pointer_actions::ConfirmationChoice::Cancel,
+                    19u16,
+                    15u16,
+                ),
             ] {
                 if area.height <= 4 || x.saturating_add(width) > area.width {
                     continue;
@@ -3457,16 +3469,16 @@ impl SettingsCx {
                     super::pointer_actions::CategoryAction::TextEditorCancel(category_pointer_id(
                         editor.id,
                     )),
-                    8,
-                    8,
+                    8u16,
+                    8u16,
                 ),
                 (
                     super::pointer_actions::CategoryAction::ExternalEditBegin(
                         category_pointer_id(editor.id),
                         super::pointer_actions::CategoryExternalSource::TextEditor,
                     ),
-                    18,
-                    17,
+                    18u16,
+                    17u16,
                 ),
             ] {
                 if x.saturating_add(width) > area.width {
@@ -3684,16 +3696,16 @@ impl SettingsCx {
                         super::pointer_actions::CategoryAction::InlineEditCancel(
                             category_pointer_id(id),
                         ),
-                        8,
-                        8,
+                        8u16,
+                        8u16,
                     ),
                     (
                         super::pointer_actions::CategoryAction::ExternalEditBegin(
                             category_pointer_id(id),
                             super::pointer_actions::CategoryExternalSource::Inline,
                         ),
-                        18,
-                        17,
+                        18u16,
+                        17u16,
                     ),
                 ] {
                     if x.saturating_add(width) > settings_area.width {

@@ -52,7 +52,7 @@ use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
     PointerOperationGate, PointerOperationId, SettingsScrollRegionId, push_wrapped_text,
-    selected_line_from_marker, selected_style,
+    selected_line_from_marker,
 };
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
@@ -413,7 +413,7 @@ impl AgentsPage {
                         );
                     }
                     std::fs::set_permissions(
-                        pending.staging.as_ref(),
+                        pending.staging.as_ref() as &std::path::Path,
                         pending.original_metadata.permissions.clone(),
                     )
                     .map_err(|error| {
@@ -1167,17 +1167,17 @@ impl SettingsCx {
                     (
                         super::pointer_actions::AgentsAction::Save(agent.clone()),
                         0,
-                        6,
+                        6u16,
                     ),
                     (
                         super::pointer_actions::AgentsAction::Cancel(agent.clone()),
-                        8,
-                        8,
+                        8u16,
+                        8u16,
                     ),
                     (
                         super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
-                        18,
-                        17,
+                        18u16,
+                        17u16,
                     ),
                 ]
             };
@@ -2534,7 +2534,16 @@ pub(super) mod tests {
             edit_text.rect.x,
             edit_text.rect.y + 3,
         ));
-        dialog.handle_key(press(KeyCode::Char('X')));
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            edit_text.rect.x,
+            edit_text.rect.y + 3,
+        ));
+        page_mut(&mut dialog)
+            .editing
+            .as_mut()
+            .expect("raw editor remains open after pointer placement")
+            .paste("X");
         assert!(
             page(&dialog)
                 .editing
@@ -2562,6 +2571,11 @@ pub(super) mod tests {
             .expect("raw editor publishes Open in $EDITOR");
         dialog.handle_pointer(super::super::tests::settings_mouse(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            begin.rect.x,
+            begin.rect.y,
+        ));
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             begin.rect.x,
             begin.rect.y,
         ));
@@ -2615,6 +2629,19 @@ pub(super) mod tests {
             .as_ref()
             .expect("confirmed activation submits effect")
             .id;
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            confirm.rect.x,
+            confirm.rect.y,
+        ));
+        assert_eq!(
+            page(&dialog)
+                .pending_external_edit
+                .as_ref()
+                .map(|pending| pending.id),
+            Some(operation),
+            "release preserves the one correlated operation"
+        );
         assert_eq!(
             fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap(),
             original,
@@ -2715,16 +2742,17 @@ pub(super) mod tests {
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
-            retry
-                .page
-                .handle_pointer_control(&mut retry.cx, action.clone());
-            retry.page.handle_pointer_control(&mut retry.cx, action);
+            {
+                let page = &mut retry.dialog.page;
+                let cx = &mut retry.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
             let effect = page_mut(&mut retry)
                 .take_external_edit_request()
                 .expect("terminal outcome effect");
             let operation = effect.operation_id;
             fs::write(&effect.path, "externally changed staging").unwrap();
-            let cwd = retry.cx.agents_cwd();
             let result_action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditResult(
                     agent.clone(),
@@ -2762,12 +2790,12 @@ pub(super) mod tests {
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
-            conflict
-                .page
-                .handle_pointer_control(&mut conflict.cx, action.clone());
-            conflict
-                .page
-                .handle_pointer_control(&mut conflict.cx, action);
+            {
+                let page = &mut conflict.dialog.page;
+                let cx = &mut conflict.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
             let effect = page_mut(&mut conflict)
                 .take_external_edit_request()
                 .expect("regular-file conflict effect");
@@ -2806,12 +2834,12 @@ pub(super) mod tests {
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
-            chmod_race
-                .page
-                .handle_pointer_control(&mut chmod_race.cx, action.clone());
-            chmod_race
-                .page
-                .handle_pointer_control(&mut chmod_race.cx, action);
+            {
+                let page = &mut chmod_race.dialog.page;
+                let cx = &mut chmod_race.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
             let effect = page_mut(&mut chmod_race)
                 .take_external_edit_request()
                 .expect("chmod-race effect");
@@ -2854,10 +2882,12 @@ pub(super) mod tests {
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
-            swapped
-                .page
-                .handle_pointer_control(&mut swapped.cx, action.clone());
-            swapped.page.handle_pointer_control(&mut swapped.cx, action);
+            {
+                let page = &mut swapped.dialog.page;
+                let cx = &mut swapped.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
             let effect = page_mut(&mut swapped)
                 .take_external_edit_request()
                 .expect("symlink-swap effect");
@@ -2883,6 +2913,78 @@ pub(super) mod tests {
                     .as_deref()
                     .is_some_and(|status| status.contains("symbolic link"))
             );
+        }
+    }
+
+    pub(crate) fn run_pointer_raw_editor_terminal_actions_regression() {
+        let _g = EditorEnv::with(Some("true"));
+        for terminal in ["save", "cancel"] {
+            let tmp = TempDir::new().unwrap();
+            let agents_dir = tmp.path().join(".cockpit/agents");
+            fs::create_dir_all(&agents_dir).unwrap();
+            fs::write(
+                agents_dir.join("pointer-agent.md"),
+                "---\ndescription: pointer fixture\n---\nbody\n",
+            )
+            .unwrap();
+            let mut dialog = agents_dialog(&tmp);
+            focus(&mut dialog, "pointer-agent");
+            dialog.handle_key(press(KeyCode::Enter));
+            dialog.handle_key(press(KeyCode::Char('e')));
+            page_mut(&mut dialog)
+                .editing
+                .as_mut()
+                .expect("raw editor opens")
+                .paste("changed-by-pointer\n");
+            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                if terminal == "save" {
+                    super::super::pointer_actions::AgentsAction::Save(agent)
+                } else {
+                    super::super::pointer_actions::AgentsAction::Cancel(agent)
+                },
+            );
+            let target = {
+                let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+                dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action
+                                == super::super::shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("raw agent editor publishes its named terminal action")
+            };
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            assert!(
+                page(&dialog).editing.is_none(),
+                "{terminal} closes the raw editor through its real reducer"
+            );
+            let persisted = fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap();
+            if terminal == "save" {
+                assert!(
+                    persisted.contains("changed-by-pointer"),
+                    "Save persists the raw editor draft"
+                );
+            } else {
+                assert_eq!(
+                    persisted, "---\ndescription: pointer fixture\n---\nbody\n",
+                    "Cancel discards the raw editor draft"
+                );
+            }
         }
     }
 

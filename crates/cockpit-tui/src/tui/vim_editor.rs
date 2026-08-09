@@ -4,10 +4,10 @@ use ratatui::layout::{Margin, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::cell::Cell;
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::composer::{Composer, VimMode};
+use crate::tui::markdown;
 
 pub enum VimEditorOutcome {
     Stay,
@@ -57,8 +57,8 @@ impl VimEditor {
         }
         let mut display = 0usize;
         let mut byte = 0usize;
-        for grapheme in line.graphemes(true) {
-            let width = UnicodeWidthStr::width(grapheme);
+        for grapheme in markdown::semantic_graphemes(line) {
+            let width = UnicodeWidthStr::width(grapheme.as_str());
             if col < display.saturating_add(width) {
                 break;
             }

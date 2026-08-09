@@ -1,3 +1,4 @@
+use super::shell::PointerOperationId;
 use super::*;
 use cockpit_config::providers::{ModelEntry, ProviderEntry};
 use cockpit_test_support::TestEnvGuard;
@@ -4244,7 +4245,7 @@ fn type_chars(d: &mut SettingsDialog, s: &str) {
 }
 
 /// Open the Behavior page on the utility-model row and open the picker.
-fn open_utility_picker(d: &mut SettingsDialog) {
+pub(super) fn open_utility_picker(d: &mut SettingsDialog) {
     open_category_on(d, Category::Behavior, SettingId::UtilityModel);
     d.handle_key(press(KeyCode::Enter)); // open picker
 }
@@ -4308,7 +4309,7 @@ fn utility_picker_no_models_falls_back_to_free_text() {
     );
 }
 
-fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
+pub(super) fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     // Two providers, each with two models, in natural (stored) order.
     std::fs::write(&path, "{}").unwrap();

@@ -435,10 +435,14 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::tests::run_pointer_category_confirmation_and_effect_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
+    super::agents_page::tests::run_pointer_raw_editor_terminal_actions_regression();
     dispatch_enabled_category_descriptor_actions();
     dispatch_all_rendered_numeric_inline_begin_actions();
     dispatch_inline_numeric_terminal_actions();
     dispatch_category_nested_editor_actions();
+    dispatch_category_cursor_external_action();
+    dispatch_profile_name_inline_actions();
+    dispatch_utility_model_selection_actions();
     ACTION_COVERAGE.with(|coverage| {
         let coverage = coverage.borrow();
         let missing = coverage
@@ -719,6 +723,8 @@ fn activate_category_descriptor(
 fn dispatch_category_nested_editor_actions() {
     use super::category::{Category, SettingId};
 
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
     let tmp = TempDir::new().unwrap();
     let suggestion_root = tmp.path().join("package-suggestions");
     std::fs::create_dir_all(suggestion_root.join("alpha")).unwrap();
@@ -748,6 +754,10 @@ fn dispatch_category_nested_editor_actions() {
                         CategoryAction::PathEditBegin(SettingId::PackagesDir)
                         | CategoryAction::PathEditCommit(SettingId::PackagesDir)
                         | CategoryAction::PathEditCancel(SettingId::PackagesDir)
+                        | CategoryAction::ExternalEditBegin(
+                            SettingId::PackagesDir,
+                            CategoryExternalSource::PathEditor,
+                        )
                         | CategoryAction::SuggestionSelect(SettingId::PackagesDir, _),
                     ),
                 ),
@@ -784,10 +794,17 @@ fn dispatch_category_nested_editor_actions() {
             .expect("dynamic packages editor action is rerendered");
         click_target(&mut dialog, &target);
         match action {
-            SettingsPointerAction::Category(CategoryAction::PathEditBegin(_)) => assert!(matches!(
-                dialog.test_page(),
-                TestPageRef::Category(page) if page.is_path_editing()
-            )),
+            SettingsPointerAction::Category(CategoryAction::PathEditBegin(_)) => assert!(
+                matches!(dialog.test_page(), TestPageRef::Category(page) if page.is_path_editing())
+            ),
+            SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                id,
+                CategoryExternalSource::PathEditor,
+            )) => assert_category_external_request(
+                &mut dialog,
+                id,
+                CategoryExternalSource::PathEditor,
+            ),
             _ => assert!(matches!(
                 dialog.test_page(),
                 TestPageRef::Category(page) if !page.is_path_editing()
@@ -815,7 +832,11 @@ fn dispatch_category_nested_editor_actions() {
                 RenderAction::Page(
                     action @ SettingsPointerAction::Category(
                         CategoryAction::TextEditorSave(SettingId::CompactPrompt)
-                        | CategoryAction::TextEditorCancel(SettingId::CompactPrompt),
+                        | CategoryAction::TextEditorCancel(SettingId::CompactPrompt)
+                        | CategoryAction::ExternalEditBegin(
+                            SettingId::CompactPrompt,
+                            CategoryExternalSource::TextEditor,
+                        ),
                     ),
                 ),
                 true,
@@ -823,7 +844,7 @@ fn dispatch_category_nested_editor_actions() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(text_actions.len(), 2);
+    assert_eq!(text_actions.len(), 3);
     for action in text_actions {
         let mut dialog = fresh_dialog(&tmp);
         activate_category_descriptor(&mut dialog, Category::Behavior, SettingId::CompactPrompt);
@@ -837,10 +858,23 @@ fn dispatch_category_nested_editor_actions() {
             .cloned()
             .expect("compact prompt editor action is rendered");
         click_target(&mut dialog, &target);
-        assert!(matches!(
-            dialog.test_page(),
-            TestPageRef::Category(page) if !page.is_editing()
-        ));
+        if matches!(
+            action,
+            SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                _,
+                CategoryExternalSource::TextEditor
+            ))
+        ) {
+            assert_category_external_request(
+                &mut dialog,
+                SettingId::CompactPrompt,
+                CategoryExternalSource::TextEditor,
+            );
+        } else {
+            assert!(
+                matches!(dialog.test_page(), TestPageRef::Category(page) if !page.is_editing())
+            );
+        }
     }
 
     for setting in [
@@ -883,6 +917,7 @@ fn dispatch_path_editor_actions(
                         CategoryAction::PathEditBegin(id)
                         | CategoryAction::PathEditCommit(id)
                         | CategoryAction::PathEditCancel(id)
+                        | CategoryAction::ExternalEditBegin(id, CategoryExternalSource::PathEditor)
                         | CategoryAction::SuggestionSelect(id, _),
                     ),
                 ),
@@ -916,6 +951,19 @@ fn dispatch_path_editor_actions(
             .cloned()
             .expect("path action rerenders from the same deterministic source");
         click_target(&mut dialog, &target);
+        if matches!(
+            action,
+            SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                _,
+                CategoryExternalSource::PathEditor
+            ))
+        ) {
+            assert_category_external_request(
+                &mut dialog,
+                setting,
+                CategoryExternalSource::PathEditor,
+            );
+        }
     }
 }
 
@@ -938,7 +986,9 @@ fn dispatch_text_editor_actions(setting: super::category::SettingId) {
             (
                 RenderAction::Page(
                     action @ SettingsPointerAction::Category(
-                        CategoryAction::TextEditorSave(id) | CategoryAction::TextEditorCancel(id),
+                        CategoryAction::TextEditorSave(id)
+                        | CategoryAction::TextEditorCancel(id)
+                        | CategoryAction::ExternalEditBegin(id, CategoryExternalSource::TextEditor),
                     ),
                 ),
                 true,
@@ -946,7 +996,7 @@ fn dispatch_text_editor_actions(setting: super::category::SettingId) {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(actions.len(), 2);
+    assert_eq!(actions.len(), 3);
     for action in actions {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
@@ -965,6 +1015,196 @@ fn dispatch_text_editor_actions(setting: super::category::SettingId) {
             .cloned()
             .expect("text editor action rerenders from a fresh source");
         click_target(&mut dialog, &target);
+        if matches!(
+            action,
+            SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+                _,
+                CategoryExternalSource::TextEditor
+            ))
+        ) {
+            assert_category_external_request(
+                &mut dialog,
+                setting,
+                CategoryExternalSource::TextEditor,
+            );
+        }
+    }
+}
+
+fn assert_category_external_request(
+    dialog: &mut super::SettingsDialog,
+    id: super::category::SettingId,
+    source: CategoryExternalSource,
+) {
+    let expected_source = match source {
+        CategoryExternalSource::Cursor => super::category::CategoryExternalSource::Cursor,
+        CategoryExternalSource::Inline => super::category::CategoryExternalSource::Inline,
+        CategoryExternalSource::PathEditor => super::category::CategoryExternalSource::PathEditor,
+        CategoryExternalSource::TextEditor => super::category::CategoryExternalSource::TextEditor,
+    };
+    let (operation, path) = dialog
+        .take_pending_category_external_edit()
+        .expect("external editor action emits its typed request");
+    assert!(path.exists());
+    assert!(
+        dialog.take_pending_category_external_edit().is_none(),
+        "typed request is drainable exactly once"
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page)
+            if page.pending_external_edit.as_ref().is_some_and(|pending|
+                pending.operation_id == operation
+                    && pending.id == id
+                    && pending.source() == expected_source)
+    ));
+}
+
+fn dispatch_category_cursor_external_action() {
+    use super::category::{Category, SettingId};
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    super::tests::open_category_on(&mut dialog, Category::Interface, SettingId::ExitTailLines);
+    let action = SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
+        SettingId::ExitTailLines,
+        CategoryExternalSource::Cursor,
+    ));
+    let target = {
+        let _ = render_settings_rows(&dialog, 100, 50);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("selected external-editable descriptor publishes its cursor action")
+    };
+    click_target(&mut dialog, &target);
+    let (operation, path) = dialog
+        .take_pending_category_external_edit()
+        .expect("cursor action emits its typed external-edit request");
+    assert!(path.exists());
+    assert!(dialog.take_pending_category_external_edit().is_none());
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page)
+            if page.pending_external_edit.as_ref().is_some_and(|pending|
+                pending.operation_id == operation
+                    && pending.id == SettingId::ExitTailLines
+                    && pending.source() == super::category::CategoryExternalSource::Cursor)
+    ));
+}
+
+fn dispatch_profile_name_inline_actions() {
+    use super::category::{Category, SettingId};
+    for action in [
+        CategoryAction::InlineEditBegin(SettingId::Name),
+        CategoryAction::InlineEditCommit(SettingId::Name),
+        CategoryAction::InlineEditCancel(SettingId::Name),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+        let activate = {
+            let _ = render_settings_rows(&dialog, 100, 50);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled
+                        && target.action
+                            == RenderAction::Page(SettingsPointerAction::Category(
+                                CategoryAction::DescriptorActivate(SettingId::Name),
+                            ))
+                })
+                .cloned()
+                .expect("profile name descriptor publishes its activation")
+        };
+        click_target(&mut dialog, &activate);
+        if !matches!(action, CategoryAction::InlineEditBegin(_)) {
+            for ch in "Pointer Name".chars() {
+                dialog.handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(ch),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+        }
+        let pointer_action = SettingsPointerAction::Category(action.clone());
+        let target = {
+            let _ = render_settings_rows(&dialog, 100, 50);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled && target.action == RenderAction::Page(pointer_action.clone())
+                })
+                .cloned()
+                .expect("active profile name editor publishes its terminal action")
+        };
+        click_target(&mut dialog, &target);
+        match action {
+            CategoryAction::InlineEditBegin(_) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page)
+                    if page.editing == Some(SettingId::Name) && page.cursor == 0
+            )),
+            CategoryAction::InlineEditCommit(_) => {
+                assert_eq!(dialog.extended.name.as_deref(), Some("Pointer Name"));
+                let saved = cockpit_config::extended::ExtendedConfigDoc::load(&dialog.config_path)
+                    .unwrap()
+                    .config();
+                assert_eq!(saved.name.as_deref(), Some("Pointer Name"));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Category(page) if page.editing.is_none()
+                ));
+            }
+            CategoryAction::InlineEditCancel(_) => {
+                assert_eq!(dialog.extended.name, None);
+                let saved = cockpit_config::extended::ExtendedConfigDoc::load(&dialog.config_path)
+                    .unwrap()
+                    .config();
+                assert_eq!(saved.name, None);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Category(page) if page.editing.is_none()
+                ));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn dispatch_utility_model_selection_actions() {
+    for model in ["anthropic:opus", "anthropic:haiku", "openai:gpt-5"] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = super::tests::dialog_with_models(&tmp);
+        super::tests::open_utility_picker(&mut dialog);
+        let action = SettingsPointerAction::UtilityModel(UtilityModelAction::Select(
+            UtilityModelId(model.into()),
+        ));
+        let target = {
+            let _ = render_settings_rows(&dialog, 100, 50);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled && target.action == RenderAction::Page(action.clone())
+                })
+                .cloned()
+                .expect("configured utility model publishes a stable selection target")
+        };
+        click_target(&mut dialog, &target);
+        assert_eq!(dialog.extended.utility_model.as_deref(), Some(model));
     }
 }
 

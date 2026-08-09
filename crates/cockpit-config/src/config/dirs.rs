@@ -341,7 +341,7 @@ pub fn walk_up_to_stops(cwd: &Path) -> Vec<PathBuf> {
     out
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     pub struct CockpitConfigOverride {
         _guard: crate::test_env::TestEnvGuard,

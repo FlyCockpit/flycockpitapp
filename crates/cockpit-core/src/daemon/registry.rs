@@ -1548,7 +1548,8 @@ mod tests {
                 ),
             )
             .await
-            .expect_err("invalid tokenizer must block registry snapshot");
+            .err()
+            .expect("invalid tokenizer must block registry snapshot");
         assert!(
             error
                 .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
@@ -1567,7 +1568,8 @@ mod tests {
                 ),
             )
             .await
-            .expect_err("invalid tokenizer must block resumed snapshot");
+            .err()
+            .expect("invalid tokenizer must block resumed snapshot");
         assert!(
             resume_error
                 .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
@@ -1597,7 +1599,8 @@ mod tests {
                 ),
             )
             .await
-            .expect_err("invalid tokenizer must block assistant snapshot creation");
+            .err()
+            .expect("invalid tokenizer must block assistant snapshot creation");
         assert!(
             create_error
                 .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()

@@ -14,6 +14,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
+cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 dirs = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
@@ -28,7 +29,7 @@ uuid = { workspace = true }
 # Exposes the effective-default journal's phase-boundary crash seam so
 # daemon-level tests can replay the same failures. Only enabled by
 # `cockpit-core`'s dev-dependencies; never by a normal build.
-test-support = []
+test-support = ["dep:cockpit-test-support"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", default-features = false, features = [

@@ -133,4 +133,21 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
     expect(queries[1]?.query).not.toContain('"signingGeneration"=$3::numeric');
     expect(queries[1]?.values).toEqual(["prod_1", "k0"]);
   });
+
+  it("refuses a cutoff proof while any generation for the kid remains open", async () => {
+    const db = {
+      $transaction: async <T>(fn: (tx: SqlClient) => Promise<T>) => fn(db),
+      $executeRawUnsafe: async () => 0,
+      $queryRawUnsafe: async (query: string) =>
+        query.includes("remote_authority_signing_fences")
+          ? [
+              { state: "frozen", updatedAt: new Date(21_000) },
+              { state: "open", updatedAt: new Date(22_000) },
+            ]
+          : [],
+    } satisfies SqlClient;
+    await expect(
+      new PostgresAuthorityRuntimeStore(db).loadFrozenSigningJournalProof("prod_1", "k0"),
+    ).rejects.toThrow("every signing fence must be frozen");
+  });
 });

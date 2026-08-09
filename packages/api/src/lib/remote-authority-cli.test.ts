@@ -220,5 +220,47 @@ describe("remote_authority_key_cli_state_machine", () => {
         initialized.authorityEpoch,
       ]),
     ).rejects.toThrow();
+
+    await expect(
+      run([
+        "revoke",
+        ...common,
+        "--input",
+        input,
+        "--output",
+        output,
+        "--kid",
+        "missing",
+        "--replacement-kid",
+        initialized.currentKid,
+        "--expected-revision",
+        initialized.revision,
+        "--expected-digest",
+        initialized.digest,
+        "--expected-epoch",
+        initialized.authorityEpoch,
+      ]),
+    ).rejects.toThrow("revocation target is invalid");
+
+    await expect(run(["initialize", ...common, "--output", input])).rejects.toThrow(
+      "output path already exists",
+    );
+
+    await expect(
+      run([
+        "publish",
+        ...common,
+        "--input",
+        input,
+        "--output",
+        input,
+        "--expected-revision",
+        initialized.revision,
+        "--expected-digest",
+        initialized.digest,
+        "--expected-epoch",
+        initialized.authorityEpoch,
+      ]),
+    ).rejects.toThrow("output must be an explicit different absolute path");
   });
 });

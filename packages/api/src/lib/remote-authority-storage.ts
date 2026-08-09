@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { canonicalizeRfc8785 } from "@flycockpit/cockpit-protocol";
 import {
   type MembershipSnapshot,
@@ -243,6 +244,11 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     compactJws: string;
     bodyDigest: string;
   }) {
+    if (
+      createHash("sha256").update(canonicalizeRfc8785(args.status)).digest("hex") !==
+      args.bodyDigest
+    )
+      throw new Error("status body digest mismatch");
     return this.db.$transaction(
       async (tx) => {
         const changed = await tx.$executeRawUnsafe(
@@ -335,9 +341,14 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
           args.signerKid,
         );
         const transition = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
-          `SELECT "statusCompactJws" FROM remote_authority_lifecycle_transitions WHERE "transitionId"=$1`,
+          `SELECT "statusCompactJws","statusBodyDigest","signerKid" FROM remote_authority_lifecycle_transitions WHERE "transitionId"=$1`,
           args.transitionId,
         );
+        if (
+          text(transition[0]?.statusBodyDigest) !== args.statusBodyDigest ||
+          text(transition[0]?.signerKid) !== args.signerKid
+        )
+          return false;
         return typeof transition[0]?.statusCompactJws === "string"
           ? transition[0].statusCompactJws
           : true;
@@ -345,11 +356,26 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       { isolationLevel: "Serializable" },
     );
   }
-  async markTransitionStatusSigned(transitionId: string, compactJws: string) {
+  async markTransitionStatusSigned(args: {
+    transitionId: string;
+    compactJws: string;
+    statusBodyDigest: string;
+    signerKid: string;
+  }) {
+    const parts = args.compactJws.split(".");
+    if (parts.length !== 3) return false;
+    const header = JSON.parse(Buffer.from(parts[0]!, "base64url").toString("utf8")) as {
+        kid?: unknown;
+      },
+      payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as unknown,
+      actualDigest = createHash("sha256").update(canonicalizeRfc8785(payload)).digest("hex");
+    if (header.kid !== args.signerKid || actualDigest !== args.statusBodyDigest) return false;
     const changed = await this.db.$executeRawUnsafe(
-      `UPDATE remote_authority_lifecycle_transitions SET "state"='status_signed',"statusCompactJws"=$2,"updatedAt"=NOW() WHERE "transitionId"=$1 AND ("state"='reserved' OR ("state"='status_signed' AND "statusCompactJws"=$2))`,
-      transitionId,
-      compactJws,
+      `UPDATE remote_authority_lifecycle_transitions SET "state"='status_signed',"statusCompactJws"=$2,"updatedAt"=NOW() WHERE "transitionId"=$1 AND "statusBodyDigest"=$3 AND "signerKid"=$4 AND ("state"='reserved' OR ("state"='status_signed' AND "statusCompactJws"=$2))`,
+      args.transitionId,
+      args.compactJws,
+      args.statusBodyDigest,
+      args.signerKid,
     );
     return changed === 1;
   }
@@ -500,12 +526,13 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
   }
   async loadFrozenSigningJournalProof(deploymentId: string, kid: string) {
     const fences = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
-        `SELECT "state","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 AND "state"='frozen' ORDER BY "signingGeneration"`,
+        `SELECT "state","updatedAt" FROM remote_authority_signing_fences WHERE "deploymentId"=$1 AND "kid"=$2 ORDER BY "signingGeneration"`,
         deploymentId,
         kid,
       ),
       fence = fences[0];
-    if (fence?.state !== "frozen") throw new Error("signing fence is not frozen");
+    if (!fence || fences.some((item) => item.state !== "frozen"))
+      throw new Error("every signing fence must be frozen");
     const rows = await this.db.$queryRawUnsafe<Array<Record<string, unknown>>>(
       `SELECT "mintId","state","signedAt" FROM remote_authority_signing_journal WHERE "deploymentId"=$1 AND "kid"=$2 ORDER BY "mintId"`,
       deploymentId,

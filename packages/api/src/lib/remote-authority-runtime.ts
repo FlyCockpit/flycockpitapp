@@ -84,7 +84,12 @@ export interface AuthorityRuntimeStore {
     statusBodyDigest: string;
     signerKid: string;
   }): Promise<boolean | string>;
-  markTransitionStatusSigned(transitionId: string, compactJws: string): Promise<boolean>;
+  markTransitionStatusSigned(args: {
+    transitionId: string;
+    compactJws: string;
+    statusBodyDigest: string;
+    signerKid: string;
+  }): Promise<boolean>;
   commitLifecycleTransition(args: {
     transitionId: string;
     deploymentId: string;
@@ -300,8 +305,12 @@ export class RemoteAuthorityRuntime {
         BigInt(ring.revision) !== BigInt(lifecycle.revision) + 1n ||
         BigInt(ring.authorityEpoch) !== BigInt(lifecycle.authorityEpoch) + 1n
       ) {
-        if (BigInt(ring.revision) > BigInt(lifecycle.revision))
-          return this.#fail("lifecycle_transition_required");
+        return this.#fail(
+          BigInt(ring.revision) < BigInt(lifecycle.revision) ||
+            BigInt(ring.authorityEpoch) < BigInt(lifecycle.authorityEpoch)
+            ? "lifecycle_revision_regression"
+            : "lifecycle_transition_required",
+        );
       } else {
         const generation = (BigInt(lifecycle.highestStatusGeneration) + 1n).toString(),
           revokedKids = publicRing.keys
@@ -376,7 +385,12 @@ export class RemoteAuthorityRuntime {
         } else compactJws = await createRemoteAuthorityStatusJws(body, signer);
         if (
           (typeof prepared !== "string" &&
-            !(await this.options.store.markTransitionStatusSigned(transitionId, compactJws))) ||
+            !(await this.options.store.markTransitionStatusSigned({
+              transitionId,
+              compactJws,
+              statusBodyDigest: bodyDigest,
+              signerKid: signer.kid,
+            }))) ||
           !(await this.options.store.commitLifecycleTransition({
             transitionId,
             deploymentId: this.config.deploymentId,
@@ -516,7 +530,7 @@ export class RemoteAuthorityRuntime {
               expectedGeneration: lifecycle.highestStatusGeneration,
               status: body,
               compactJws,
-              bodyDigest: createHash("sha256").update(compactJws).digest("hex"),
+              bodyDigest: createHash("sha256").update(canonicalizeRfc8785(body)).digest("hex"),
             });
           if (!committed) {
             status = await this.options.store.loadHighestFinalizedStatus({

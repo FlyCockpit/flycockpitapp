@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { generateKeyPairSync } from "node:crypto";
-import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
+import { link, lstat, open, readFile, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   type AuthorityPrivateKey,
@@ -47,8 +47,18 @@ async function loadPrivateJson(path: string) {
   return JSON.parse(await readFile(path, "utf8")) as unknown;
 }
 async function write(path: string, ring: AuthorityRingFile) {
-  if (!isAbsolute(path) || resolve(path) === resolve(flags.get("input") ?? "."))
+  const sourcePaths = ["input", "base", "signing-journal-proof"]
+    .map((name) => flags.get(name))
+    .filter((value): value is string => value !== undefined)
+    .map(resolve);
+  if (!isAbsolute(path) || sourcePaths.includes(resolve(path)))
     throw new Error("output must be an explicit different absolute path");
+  try {
+    await lstat(path);
+    throw new Error("output path already exists");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const temp = resolve(
       dirname(path),
       `.remote-authority-${process.pid}-${crypto.randomUUID()}.tmp`,
@@ -58,7 +68,10 @@ async function write(path: string, ring: AuthorityRingFile) {
     await handle.writeFile(`${JSON.stringify(ring, null, 2)}\n`);
     await handle.sync();
     await handle.close();
-    await rename(temp, path);
+    // A hard-link publication is atomic and, unlike rename, cannot replace a
+    // path created between the preflight check and publication.
+    await link(temp, path);
+    await unlink(temp);
     const directory = await open(dirname(path), "r");
     try {
       await directory.sync();
@@ -183,7 +196,9 @@ async function main() {
         keys: prior.keys.map((k) => (k.kid === kid ? { ...k, retireAt: now.toString() } : k)),
       };
     } else if (command === "revoke") {
-      const kid = required("kid");
+      const kid = required("kid"),
+        target = prior.keys.find((key) => key.kid === kid);
+      if (!target || target.state === "revoked") throw new Error("revocation target is invalid");
       if (
         kid === prior.currentKid &&
         !prior.keys.some((k) => k.kid !== kid && k.state !== "revoked")

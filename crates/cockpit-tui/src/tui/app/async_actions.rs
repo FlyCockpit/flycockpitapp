@@ -129,11 +129,11 @@ impl App {
                 Ok(AsyncActionPayload::ImagePathProbe {
                     terminal_generation,
                     original: _,
-                    composer_snapshot,
+                    source_draft_generation,
                     cursor,
                     png: Some(png),
                 }) if terminal_generation == self.terminal_input_generation
-                    && composer_snapshot == self.composer.text() =>
+                    && source_draft_generation == self.draft_generation =>
                 {
                     self.composer.set_cursor(cursor);
                     self.insert_image_block(png)
@@ -141,11 +141,11 @@ impl App {
                 Ok(AsyncActionPayload::ImagePathProbe {
                     terminal_generation,
                     original: _,
-                    composer_snapshot,
+                    source_draft_generation,
                     cursor: _,
                     png: None,
                 }) if terminal_generation == self.terminal_input_generation
-                    && composer_snapshot == self.composer.text() =>
+                    && source_draft_generation == self.draft_generation =>
                 {
                     self.show_toast("Paste unavailable", ToastKind::Error);
                 }
@@ -155,18 +155,26 @@ impl App {
             AsyncActionKind::Internal("paste.native_image") => match result.payload {
                 Ok(AsyncActionPayload::NativeImagePaste {
                     terminal_generation,
-                    composer_snapshot,
+                    source_draft_generation,
                     cursor,
                     png: Some(png),
                 }) if terminal_generation == self.terminal_input_generation
-                    && composer_snapshot == self.composer.text() =>
+                    && source_draft_generation == self.draft_generation =>
                 {
                     self.composer.set_cursor(cursor);
                     self.insert_image_block(png);
                 }
-                Ok(AsyncActionPayload::NativeImagePaste { png: None, .. }) | Err(_) => {
+                Ok(AsyncActionPayload::NativeImagePaste {
+                    terminal_generation,
+                    source_draft_generation,
+                    png: None,
+                    ..
+                }) if terminal_generation == self.terminal_input_generation
+                    && source_draft_generation == self.draft_generation =>
+                {
                     self.show_toast("Paste unavailable", ToastKind::Error);
                 }
+                Err(_) => self.show_toast("Paste unavailable", ToastKind::Error),
                 Ok(_) => {}
             },
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {

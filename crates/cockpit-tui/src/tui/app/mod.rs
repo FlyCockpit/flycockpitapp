@@ -1600,6 +1600,9 @@ pub struct App {
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
 
     pub(super) composer: Composer,
+    /// Ownership epoch for asynchronous paste results. Edits keep the same
+    /// epoch; detaching a submitted draft advances it.
+    pub(super) draft_generation: u64,
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
     /// the Normal-mode hint chip is shown.
     pub(super) vim_setting: VimModeSetting,
@@ -3115,6 +3118,7 @@ impl App {
             active_model_state_confirmed: false,
             active_model_selection,
             composer,
+            draft_generation: 0,
             vim_setting,
             thinking_setting,
             markdown_opts,

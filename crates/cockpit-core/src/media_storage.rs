@@ -1316,6 +1316,32 @@ mod tests {
             recovery.cancel_media_upload(cancel, 31).await.unwrap(),
             cancelled
         );
+        let status = db
+            .read(move |conn| {
+                cockpit_db::Db::media_upload_status_for_owner_conn(
+                    conn,
+                    &cockpit_db::media_attachments::GetMediaUploadStatusV1 {
+                        schema_version: 1,
+                        kind: "getMediaUploadStatus".into(),
+                        session_id,
+                        canonical_project_digest: "22".repeat(32),
+                        client_draft_id: draft_id,
+                        upload_id,
+                        upload_generation: 3,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.acknowledged_bytes, 7);
+        assert_eq!(status.expires_at_unix_ms, 86_400_010);
+        assert!(matches!(
+            status.detail,
+            cockpit_db::media_attachments::MediaUploadStateDetailV1::Cancelled {
+                reason: cockpit_db::media_attachments::MediaUploadTerminalReasonV1::ClientCancelled
+            }
+        ));
         let counts = db
             .read(|conn| {
                 Ok((

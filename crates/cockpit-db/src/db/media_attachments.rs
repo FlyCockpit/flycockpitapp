@@ -829,6 +829,87 @@ pub enum SecurityRecoverySnapshotResult {
 }
 
 impl super::Db {
+    pub fn media_upload_status_for_owner_conn(
+        conn: &Connection,
+        request: &GetMediaUploadStatusV1,
+    ) -> Result<Option<MediaUploadStatusV1>> {
+        ensure!(
+            request.schema_version == 1
+                && request.kind == "getMediaUploadStatus"
+                && is_strict_uuid_v7(request.session_id)
+                && is_strict_uuid_v7(request.client_draft_id)
+                && is_strict_uuid_v7(request.upload_id)
+                && request.upload_generation > 0,
+            "invalid upload status request"
+        );
+        validate_digest(&request.canonical_project_digest, "project digest")?;
+        let row:Option<(String,String,String,u32,String,i64,String,String,Option<String>,Option<String>)>=conn.query_row("SELECT state,upload_generation,media_kind,acknowledged_chunks,acknowledged_bytes,expires_at_unix_ms,last_transition_json,client_draft_id,attachment_id,attachment_version FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![request.upload_id.to_string(),request.session_id.to_string(),request.canonical_project_digest,request.client_draft_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
+        let Some((
+            state,
+            generation,
+            kind,
+            chunks,
+            bytes,
+            expires,
+            transition,
+            draft,
+            attachment,
+            attachment_version,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let generation = generation.parse::<u64>()?;
+        ensure!(
+            generation == request.upload_generation,
+            "media_attachment_unavailable"
+        );
+        let media_kind = serde_json::from_value(serde_json::Value::String(kind))?;
+        let reason = match state.as_str() {
+            "cancelled" => Some(MediaUploadTerminalReasonV1::ClientCancelled),
+            "expired" => Some(MediaUploadTerminalReasonV1::DraftExpired),
+            _ => None,
+        };
+        let detail = match state.as_str() {
+            "open" => MediaUploadStateDetailV1::Open {
+                next_chunk_index: chunks,
+            },
+            "finalizing" => MediaUploadStateDetailV1::Finalizing {
+                next_chunk_index: chunks,
+            },
+            "materialized" => MediaUploadStateDetailV1::Materialized {
+                attachment_id: Uuid::parse_str(
+                    &attachment.context("materialized attachment missing")?,
+                )?,
+                attachment_version: attachment_version
+                    .context("materialized version missing")?
+                    .parse()?,
+            },
+            "cancelled" => MediaUploadStateDetailV1::Cancelled {
+                reason: reason.unwrap(),
+            },
+            "expired" => MediaUploadStateDetailV1::Expired {
+                reason: reason.unwrap(),
+            },
+            "failed" => MediaUploadStateDetailV1::Failed {
+                reason: MediaUploadTerminalReasonV1::StorageFailure,
+            },
+            _ => bail!("invalid upload state"),
+        };
+        Ok(Some(MediaUploadStatusV1 {
+            schema_version: 1,
+            kind: "mediaUploadStatus".into(),
+            upload_id: request.upload_id,
+            upload_generation: generation,
+            client_draft_id: Uuid::parse_str(&draft)?,
+            media_kind,
+            expires_at_unix_ms: expires,
+            acknowledged_chunks: chunks,
+            acknowledged_bytes: bytes.parse()?,
+            last_transition: serde_json::from_str(&transition)?,
+            detail,
+        }))
+    }
     pub fn validate_local_media_mutation_v1(request: &LocalMediaMutationV1) -> Result<()> {
         ensure!(
             request.schema_version == 1 && request.kind == "localMediaMutation",

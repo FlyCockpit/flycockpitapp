@@ -1497,8 +1497,17 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         )));
         click_settings_action(&mut dialog, &open);
         let before = config(&dialog);
-        let editor_enabled_before = match dialog.test_page() {
-            TestPageRef::Mcp(McpPage::Add(state)) => state.enabled,
+        let saved_enabled_from_editor = match dialog.test_page() {
+            TestPageRef::Mcp(McpPage::Add(state)) => {
+                if state.auth == mcp_page::AuthKind::Oauth
+                    && (state.oauth_authorize_url.text().trim().is_empty()
+                        || state.oauth_token_url.text().trim().is_empty())
+                {
+                    false
+                } else {
+                    state.enabled
+                }
+            }
             other => panic!("MCP open did not produce an editor source: {other:?}"),
         };
         click_settings_action(&mut dialog, &action);
@@ -1531,7 +1540,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                     .servers
                     .get_mut("docs")
                     .expect("editor source server remains in expected config")
-                    .enabled = editor_enabled_before;
+                    .enabled = saved_enabled_from_editor;
                 assert_eq!(snapshot(&config(&dialog)), snapshot(&expected));
             }
             SettingsPointerAction::Mcp(

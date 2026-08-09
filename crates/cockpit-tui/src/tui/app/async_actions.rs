@@ -22,6 +22,14 @@ fn reconnectable_session_switch_error(error: &str) -> bool {
         || error.contains("connection reset")
 }
 
+fn floor_char_boundary(text: &str, requested: usize) -> usize {
+    let mut offset = requested.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
 impl App {
     pub(super) fn drain_async_actions(&mut self) -> bool {
         let results = self.async_actions.drain_completed();
@@ -976,25 +984,29 @@ impl App {
         let Some(fence) = self.submission_fences.get_mut(&fence_id) else {
             return;
         };
+        let mut insertions = Vec::new();
         for slot in &fence.slots {
-            if let crate::tui::structured_paste::PasteSlotState::Ready { display, wire, png } = slot
+            if let crate::tui::structured_paste::PasteSlotState::Ready {
+                original_offset,
+                png,
+                ..
+            } = slot
             {
-                if !display.is_empty() {
-                    if !deferred.display.is_empty() {
-                        deferred.display.push('\n');
-                    }
-                    deferred.display.push_str(display);
-                }
-                if !wire.is_empty() {
-                    if !deferred.submission.text.is_empty() {
-                        deferred.submission.text.push('\n');
-                    }
-                    deferred.submission.text.push_str(wire);
-                }
                 if let Some(png) = png {
                     deferred.submission.images.push(png.clone());
+                    insertions.push(*original_offset);
                 }
             }
+        }
+        insertions.sort_unstable_by(|left, right| right.cmp(left));
+        for offset in insertions {
+            let display_offset = floor_char_boundary(&deferred.display, offset);
+            deferred.display.insert_str(display_offset, "[image]");
+            let wire_offset = floor_char_boundary(&deferred.submission.text, offset);
+            deferred.submission.text.insert_str(
+                wire_offset,
+                cockpit_core::daemon::proto::IMAGE_PART_SENTINEL,
+            );
         }
         if deferred.submission.text.trim().is_empty() && deferred.submission.images.is_empty() {
             fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::NoPayload;
@@ -1016,12 +1028,25 @@ impl App {
         }
         let sequence = fence.fence_sequence;
         fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+        let was_busy = self.busy;
+        if was_busy {
+            self.queue.push(super::input::optimistic_queue_item_with_id(
+                fence_id,
+                deferred.submission.text.clone(),
+                Some(deferred.display.clone()),
+            ));
+        } else {
+            self.begin_working_span();
+            self.prompt_history.push(deferred.display.clone());
+            self.prompt_history_cursor = 0;
+            self.staged_draft = None;
+        }
         self.dispatch_optimistic_user_submission_with_id(
             fence_id,
             deferred.display,
             deferred.submission,
             "engine",
-            true,
+            !was_busy,
             &deferred.tag_expansions,
         );
         let _ = self.submission_order.complete(sequence);

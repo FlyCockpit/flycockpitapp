@@ -520,9 +520,11 @@ impl App {
                         .values_mut()
                         .filter(|deferred| deferred.waiting_model_selection == Some(selection_id))
                     {
-                        deferred.submission.expected_model_state_generation = Some(generation);
-                        deferred.submission.expected_model =
+                        let expected_model =
                             applied_state.as_ref().map(|state| state.selection.clone());
+                        deferred.submission.expected_model_state_generation =
+                            expected_model.as_ref().map(|_| generation);
+                        deferred.submission.expected_model = expected_model;
                         deferred.waiting_model_selection = None;
                     }
                 } else {
@@ -596,24 +598,20 @@ impl App {
                         self.at_selected = 0;
                         self.at_scroll = 0;
                     }
-                    queued.submission.expected_model_state_generation = Some(generation);
-                    queued.submission.expected_model =
+                    let expected_model =
                         applied_state.as_ref().map(|state| state.selection.clone());
-                    self.dispatch_optimistic_user_submission_with_id(
+                    queued.submission.expected_model_state_generation =
+                        expected_model.as_ref().map(|_| generation);
+                    queued.submission.expected_model = expected_model;
+                    self.deferred_fence_dispatches.insert(
                         queued.client_submission_id,
-                        queued.display,
-                        queued.submission,
-                        "engine",
-                        true,
-                        &queued.tag_expansions,
+                        super::DeferredFenceDispatch {
+                            display: queued.display,
+                            submission: queued.submission,
+                            tag_expansions: queued.tag_expansions,
+                            waiting_model_selection: None,
+                        },
                     );
-                    if let Some(fence) =
-                        self.submission_fences.get_mut(&queued.client_submission_id)
-                    {
-                        fence.lifecycle =
-                            crate::tui::structured_paste::FenceLifecycle::PossiblySent;
-                    }
-                    let _ = self.submission_order.complete(queued.fence_sequence);
                 }
                 self.dispatch_next_ready_paste_fence();
             }

@@ -255,6 +255,8 @@ impl App {
             self.pending_paste_probes
                 .retain(|_, probe| probe.owner_fence != Some(id));
         }
+        self.pending_paste_probes
+            .retain(|_, probe| probe.owner_fence.is_some());
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;

@@ -292,8 +292,10 @@ pub struct PasteCorrelationCache {
 pub enum PasteSlotState {
     Pending {
         request: PasteRequest,
+        original_offset: usize,
     },
     Ready {
+        original_offset: usize,
         display: String,
         wire: String,
         png: Option<Vec<u8>>,
@@ -352,14 +354,25 @@ impl SubmissionFenceV1 {
             return false;
         }
         let Some(slot) = self.slots.iter_mut().find(|slot| {
-            matches!(slot, PasteSlotState::Pending { request }
+            matches!(slot, PasteSlotState::Pending { request, .. }
                 if request.paste_correlation_id == request_id
                     && request.paste_generation == request_generation)
         }) else {
             return false;
         };
+        let original_offset = match slot {
+            PasteSlotState::Pending {
+                original_offset, ..
+            } => *original_offset,
+            _ => return false,
+        };
         *slot = match result {
-            Some((display, wire, png)) => PasteSlotState::Ready { display, wire, png },
+            Some((display, wire, png)) => PasteSlotState::Ready {
+                original_offset,
+                display,
+                wire,
+                png,
+            },
             None => PasteSlotState::Unavailable,
         };
         if self
@@ -398,7 +411,7 @@ pub enum OrderedIntent {
 #[derive(Debug, Default)]
 pub struct SubmissionOrderCoordinator {
     next_sequence: u64,
-    queue: VecDeque<(u64, OrderedIntent)>,
+    queue: VecDeque<(u64, OrderedIntent, bool)>,
 }
 
 impl SubmissionOrderCoordinator {
@@ -408,32 +421,52 @@ impl SubmissionOrderCoordinator {
             .checked_add(1)
             .ok_or("fence sequence exhausted")?;
         self.next_sequence = sequence;
-        self.queue.push_back((sequence, intent));
+        self.queue.push_back((sequence, intent, false));
         Ok(sequence)
     }
 
     pub fn front(&self) -> Option<(u64, OrderedIntent)> {
-        self.queue.front().copied()
+        self.queue
+            .front()
+            .map(|(sequence, intent, _)| (*sequence, *intent))
     }
 
     pub fn complete(&mut self, sequence: u64) -> bool {
-        if self
+        let was_head = self
             .queue
             .front()
-            .is_some_and(|(front, _)| *front == sequence)
+            .is_some_and(|(candidate, _, _)| *candidate == sequence);
+        let Some((_, _, completed)) = self
+            .queue
+            .iter_mut()
+            .find(|(candidate, _, _)| *candidate == sequence)
+        else {
+            return false;
+        };
+        *completed = true;
+        while self
+            .queue
+            .front()
+            .is_some_and(|(_, _, completed)| *completed)
         {
             self.queue.pop_front();
-            true
-        } else {
-            false
         }
+        was_head
     }
 
     /// Remove an intent that was proven not to have crossed its dispatch
     /// boundary. This cannot reorder the remaining checked sequence domain.
     pub fn cancel(&mut self, sequence: u64) -> bool {
         let before = self.queue.len();
-        self.queue.retain(|(candidate, _)| *candidate != sequence);
+        self.queue
+            .retain(|(candidate, _, _)| *candidate != sequence);
+        while self
+            .queue
+            .front()
+            .is_some_and(|(_, _, completed)| *completed)
+        {
+            self.queue.pop_front();
+        }
         self.queue.len() != before
     }
 }
@@ -839,7 +872,10 @@ mod tests {
                 active_model_state_generation: 11,
                 image_capability_generation: 4,
             },
-            slots: vec![PasteSlotState::Pending { request }],
+            slots: vec![PasteSlotState::Pending {
+                request,
+                original_offset: 3,
+            }],
             lifecycle: FenceLifecycle::AwaitingProbes,
         }
     }
@@ -854,7 +890,7 @@ mod tests {
         };
         let mut fence = pending_fence(1, host);
         let (request_id, request_generation) = match &fence.slots[0] {
-            PasteSlotState::Pending { request } => {
+            PasteSlotState::Pending { request, .. } => {
                 (request.paste_correlation_id, request.paste_generation)
             }
             _ => unreachable!(),

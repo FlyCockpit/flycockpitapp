@@ -3578,7 +3578,7 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
-        if self.btw_pane.is_some() {
+        if run_post_loop_btw_teardown(self.btw_pane.is_some(), || {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let _ = agent_runner::attached_request_tx_blocking(
                     runner.attached_request_binding(),
@@ -3587,6 +3587,7 @@ impl App {
                     },
                 );
             }
+        }) {
             self.close_btw_pane();
         }
         self.async_actions.shutdown_and_reap().await;
@@ -4064,6 +4065,13 @@ impl App {
                 .pending_any_kind_elapsed(&session_switches, now)
                 .is_some_and(|elapsed| elapsed >= SESSION_SWITCH_SPINNER_THRESHOLD)
     }
+}
+
+fn run_post_loop_btw_teardown(open: bool, teardown: impl FnOnce()) -> bool {
+    if open {
+        teardown();
+    }
+    open
 }
 
 fn editor_argv_for_cwd(editor: &std::ffi::OsStr, cwd: &std::path::Path) -> Vec<String> {

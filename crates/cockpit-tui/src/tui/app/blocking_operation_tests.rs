@@ -1,10 +1,17 @@
+use super::blocking_operations::BlockingOperationKind;
 use super::*;
 
 #[test]
 fn blocking_operation_manifest_is_complete() {
-    use super::blocking_operations::{BLOCKING_OPERATION_MANIFEST, BlockingOperationKind};
+    use super::blocking_operations::{
+        BLOCKING_OPERATION_KINDS, BLOCKING_OPERATION_MANIFEST, BlockingOperationKind,
+    };
 
     assert_eq!(BLOCKING_OPERATION_MANIFEST.len(), 6);
+    assert_eq!(
+        BLOCKING_OPERATION_MANIFEST.len(),
+        BLOCKING_OPERATION_KINDS.len()
+    );
     let expected = [
         ("slash:/curator", BlockingOperationKind::CuratorMaintenance),
         ("slash:/doctor", BlockingOperationKind::DoctorSnapshot),
@@ -26,13 +33,6 @@ fn blocking_operation_manifest_is_complete() {
 
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
-    let production = [
-        include_str!("slash.rs"),
-        include_str!("input.rs"),
-        include_str!("btw_pane.rs"),
-        include_str!("export_actions.rs"),
-    ]
-    .join("\n");
     let mut actions = std::collections::HashSet::new();
     for registration in BLOCKING_OPERATION_MANIFEST {
         assert!(
@@ -45,11 +45,45 @@ fn blocking_operation_manifest_is_complete() {
             "duplicate blocking-operation kind: {:?}",
             registration.kind,
         );
+        assert!(!registration.actions.is_empty());
         for action in registration.actions {
             assert!(actions.insert(*action), "duplicate action: {action}");
+            let index = registration
+                .actions
+                .iter()
+                .position(|it| it == action)
+                .unwrap();
+            assert_eq!(registration.kind.action_name_at(index), *action);
+        }
+    }
+}
+
+#[test]
+fn classified_handlers_dispatch_before_any_owned_blocking_call() {
+    let forbidden = [
+        "std::fs::",
+        "std::process::",
+        "attached_request_tx_blocking",
+        "daemon_request_at_blocking",
+        "diagnostics::tui_snapshot",
+        "tags::suggestions",
+    ];
+    for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
+        let source = match registration.site {
+            "slash:/curator" | "slash:/doctor" | "slash:/export" => include_str!("slash.rs"),
+            "key:queue-edit" | "composer:@suggestions" => include_str!("input.rs"),
+            "slash:/btw" => include_str!("btw_pane.rs"),
+            unknown => panic!("manifest registered unknown handler site {unknown}"),
+        };
+        let handler = registration.handler;
+        let dispatch = registration.dispatch;
+        let signature = format!("fn {handler}");
+        let body = source.split_once(&signature).unwrap().1;
+        let before_dispatch = body.split_once(dispatch).unwrap().0;
+        for blocking_call in forbidden {
             assert!(
-                production.contains(*action),
-                "undispatched action: {action}"
+                !before_dispatch.contains(blocking_call),
+                "{handler} performs {blocking_call} before dispatching its AsyncAction"
             );
         }
     }
@@ -103,65 +137,138 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     release.wait();
 }
 
-#[test]
-fn curator_command_is_async_with_pending_line() {
-    let source = include_str!("slash.rs");
-    assert!(source.contains("/curator: pending"));
+fn owned_barrier(kind: BlockingOperationKind) -> std::sync::Arc<std::sync::Barrier> {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    blocking_operations::install_owned_test_barrier(kind, std::sync::Arc::clone(&barrier));
+    barrier
 }
 
-#[test]
-fn doctor_command_is_async() {
-    let source = include_str!("slash.rs");
-    assert!(source.contains("/doctor: collecting diagnostics…"));
+#[tokio::test]
+async fn curator_command_is_async_with_pending_line() {
+    let barrier = owned_barrier(BlockingOperationKind::CuratorMaintenance);
+    let mut app = App::new(None, false);
+    app.handle_curator_command("status");
+    assert!(
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/curator: pending")
+    );
+    assert_eq!(app.async_actions.pending_count(), 1);
+    barrier.wait();
+}
+
+#[tokio::test]
+async fn doctor_command_is_async() {
+    let barrier = owned_barrier(BlockingOperationKind::DoctorSnapshot);
+    let mut app = App::new(None, false);
+    app.handle_doctor_command();
+    assert!(
+        matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/doctor: collecting diagnostics…")
+    );
+    assert_eq!(app.async_actions.pending_count(), 1);
+    barrier.wait();
 }
 
 #[test]
 fn doctor_snapshot_is_point_in_time() {
-    assert!(include_str!("slash.rs").contains("DoctorSnapshotInput"));
+    let mut app = App::new(None, false);
+    app.launch.agent_name = "before".to_string();
+    app.launch.active_model = Some(("provider-a".to_string(), "model-a".to_string()));
+    let input = app.doctor_snapshot_input();
+
+    app.launch.agent_name = "after".to_string();
+    app.launch.active_model = Some(("provider-b".to_string(), "model-b".to_string()));
+
+    assert_eq!(input.active_agent, "before");
+    assert_eq!(
+        input.active_model,
+        Some(("provider-a".to_string(), "model-a".to_string()))
+    );
 }
 
-#[test]
-fn export_writes_off_the_loop_thread() {
-    let source = include_str!("export_actions.rs");
-    assert!(source.contains("self.async_actions.start("));
-    assert!(source.contains("write_export_no_clobber"));
+#[tokio::test]
+async fn export_writes_off_the_loop_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("export.json");
+    let cancellation = AsyncActionCancellation::default();
+    export_actions::write_export_no_clobber(&target, b"complete", "/export", &cancellation)
+        .await
+        .unwrap();
+    assert_eq!(tokio::fs::read(&target).await.unwrap(), b"complete");
 }
 
-#[test]
-fn queue_edit_does_not_block_key_handler() {
-    let source = include_str!("input.rs");
-    assert!(source.contains("queue.edit"));
+#[tokio::test]
+async fn queue_edit_does_not_block_key_handler() {
+    let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
+    let mut app = App::new(None, false);
+    app.queue.push(optimistic_queue_item("queued".to_string()));
+    app.history_up();
+    app.handle_terminal_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
+    assert_eq!(app.composer.text(), "x");
+    assert_eq!(app.async_actions.pending_count(), 1);
+    barrier.wait();
 }
 
-#[test]
-fn queue_edits_apply_in_user_order() {
-    let source = include_str!("input.rs");
-    assert!(source.contains("start_serialized"));
-}
-
-#[test]
-fn btw_teardown_does_not_block_during_session() {
-    let source = include_str!("btw_pane.rs");
-    assert!(source.contains("BtwRpcPlan::End"));
-    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-    assert!(!production.contains("attached_request_tx_blocking"));
-    assert!(production.contains("BtwTransition"));
+#[tokio::test]
+async fn btw_teardown_does_not_block_during_session() {
+    let barrier = owned_barrier(BlockingOperationKind::BtwTeardown);
+    let mut app = App::new(None, false);
+    app.handle_btw_command("end");
+    app.handle_terminal_event(crossterm::event::Event::Resize(91, 37));
+    assert_eq!(app.async_actions.pending_count(), 1);
+    barrier.wait();
 }
 
 #[test]
 fn btw_teardown_on_exit_path_remains_synchronous() {
-    assert!(include_str!("mod.rs").contains("Request::EndBtwFork"));
+    let called = std::cell::Cell::new(false);
+    assert!(run_post_loop_btw_teardown(true, || called.set(true)));
+    assert!(
+        called.get(),
+        "post-loop teardown completed before returning"
+    );
+
+    called.set(false);
+    assert!(!run_post_loop_btw_teardown(false, || called.set(true)));
+    assert!(!called.get());
 }
 
-#[test]
-fn at_suggestions_do_no_blocking_work() {
-    let source = include_str!("render.rs");
-    assert!(!source.contains("cockpit_core::tags::suggestions(&self.launch.cwd"));
+#[tokio::test]
+async fn at_suggestions_do_no_blocking_work() {
+    let barrier = owned_barrier(BlockingOperationKind::FileAutocomplete);
+    let mut app = App::new(None, false);
+    app.composer.set("@src".to_string());
+    app.reset_at_window();
+    app.handle_terminal_event(crossterm::event::Event::Resize(80, 24));
+    assert!(app.at_suggestions_loading);
+    assert_eq!(app.async_actions.pending_count(), 1);
+    barrier.wait();
 }
 
-#[test]
-fn stale_at_suggestion_result_is_discarded() {
-    assert!(include_str!("async_actions.rs").contains("autocomplete.files"));
+#[tokio::test]
+async fn stale_at_suggestion_result_is_discarded() {
+    let mut app = App::new(None, false);
+    app.composer.set("@new".to_string());
+    app.at_suggestions_loading = true;
+    app.async_actions.start(
+        AsyncActionKind::Blocking("autocomplete.files"),
+        AsyncActionPolicy::AllowConcurrent,
+        async {
+            Ok(AsyncActionPayload::FileSuggestions {
+                query: "old".to_string(),
+                suggestions: Vec::new(),
+            })
+        },
+    );
+    app.async_actions.notifier().notified().await;
+    app.drain_async_actions();
+
+    assert!(app.at_suggestions_loading);
+    assert!(app.at_suggestions_loaded_query.is_none());
+    assert!(app.at_cache.borrow().is_none());
 }
 
 #[tokio::test]
@@ -182,17 +289,48 @@ async fn at_suggestion_failure_is_terminal() {
     assert_eq!(app.at_suggestions_error.as_deref(), Some("walk failed"));
 }
 
-#[test]
-fn at_suggestions_distinguish_loading_from_empty() {
-    let source = include_str!("render.rs");
-    assert!(source.contains("loading files…"));
-    assert!(source.contains("no matching files"));
+#[tokio::test]
+async fn at_suggestions_distinguish_loading_from_empty() {
+    let mut app = App::new(None, false);
+    app.composer.set("@none".to_string());
+    app.at_suggestions_loading = true;
+    app.async_actions.start(
+        AsyncActionKind::Blocking("autocomplete.files"),
+        AsyncActionPolicy::AllowConcurrent,
+        async {
+            Ok(AsyncActionPayload::FileSuggestions {
+                query: "none".to_string(),
+                suggestions: Vec::new(),
+            })
+        },
+    );
+    assert!(app.at_suggestions_loading);
+    app.async_actions.notifier().notified().await;
+    app.drain_async_actions();
+    assert!(!app.at_suggestions_loading);
+    assert!(
+        matches!(&*app.at_cache.borrow(), Some((query, suggestions)) if query == "none" && suggestions.is_empty())
+    );
 }
 
-#[test]
-fn export_is_atomic_and_does_not_clobber() {
-    let source = include_str!("export_actions.rs");
-    assert!(source.contains("create_new(true)"));
-    assert!(source.contains("hard_link(&temp, out_path)"));
-    assert!(source.contains("remove_file(&temp)"));
+#[tokio::test]
+async fn export_is_atomic_and_does_not_clobber() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("existing.json");
+    tokio::fs::write(&target, b"original").await.unwrap();
+    let cancellation = AsyncActionCancellation::default();
+    let error =
+        export_actions::write_export_no_clobber(&target, b"replacement", "/export", &cancellation)
+            .await
+            .unwrap_err();
+    assert!(error.contains("already exists"));
+    assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
+    assert_eq!(
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
+            .count(),
+        0
+    );
 }

@@ -1,55 +1,43 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub(super) enum BlockingOperationKind {
-    CuratorMaintenance,
-    DoctorSnapshot,
-    ExportWrite,
-    QueueMutation,
-    BtwTeardown,
-    FileAutocomplete,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BlockingOperationRegistration {
     pub(super) site: &'static str,
+    pub(super) handler: &'static str,
+    pub(super) dispatch: &'static str,
     pub(super) kind: BlockingOperationKind,
     pub(super) actions: &'static [&'static str],
 }
 
-pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
-    BlockingOperationRegistration {
-        site: "slash:/curator",
-        kind: BlockingOperationKind::CuratorMaintenance,
-        actions: &["curator.command"],
-    },
-    BlockingOperationRegistration {
-        site: "slash:/doctor",
-        kind: BlockingOperationKind::DoctorSnapshot,
-        actions: &["doctor.snapshot"],
-    },
-    BlockingOperationRegistration {
-        site: "slash:/export",
-        kind: BlockingOperationKind::ExportWrite,
-        actions: &["export.transcript", "export.debug"],
-    },
-    BlockingOperationRegistration {
-        site: "key:queue-edit",
-        kind: BlockingOperationKind::QueueMutation,
-        actions: &["queue.edit"],
-    },
-    BlockingOperationRegistration {
-        site: "slash:/btw",
-        kind: BlockingOperationKind::BtwTeardown,
-        actions: &["btw.teardown"],
-    },
-    BlockingOperationRegistration {
-        site: "composer:@suggestions",
-        kind: BlockingOperationKind::FileAutocomplete,
-        actions: &["autocomplete.files"],
-    },
-];
+macro_rules! blocking_operation_manifest {
+    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => [$($action:literal),+ $(,)?] ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub(super) enum BlockingOperationKind { $( $kind ),+ }
+
+        pub(super) const BLOCKING_OPERATION_KINDS: &[BlockingOperationKind] =
+            &[$(BlockingOperationKind::$kind),+];
+
+        pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
+            $(BlockingOperationRegistration {
+                site: $site,
+                handler: $handler,
+                dispatch: $dispatch,
+                kind: BlockingOperationKind::$kind,
+                actions: &[$($action),+],
+            }),+
+        ];
+    };
+}
+
+blocking_operation_manifest! {
+    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => ["curator.command"],
+    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => ["doctor.snapshot"],
+    ExportWrite => "slash:/export" => "handle_export_command" => "export_transcript_json" => ["export.transcript", "export.debug"],
+    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => ["queue.edit"],
+    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => ["btw.teardown"],
+    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => ["autocomplete.files"],
+}
 
 impl BlockingOperationKind {
     const fn registration(self) -> BlockingOperationRegistration {

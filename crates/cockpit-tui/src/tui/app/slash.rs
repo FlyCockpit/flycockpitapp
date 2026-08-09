@@ -1959,21 +1959,7 @@ impl App {
             self.push_plain("/doctor: collecting diagnostics…".to_string());
             return;
         }
-        type DoctorSnapshotInput = cockpit_core::diagnostics::DiagnosticsInput;
-        let input = DoctorSnapshotInput {
-            cwd: self.launch.cwd.clone(),
-            session_id: self.launch.session_id,
-            session_short_id: self.launch.session_short_id.clone(),
-            active_agent: self.launch.agent_name.clone(),
-            active_model: self.launch.active_model.clone(),
-            pending_model_selection: self.pending_model_selection.as_ref().map(|pending| {
-                format!(
-                    "pending {}: {}/{}",
-                    pending.selection_id, pending.requested.provider, pending.requested.model
-                )
-            }),
-            sandbox_enabled: Some(!self.no_sandbox),
-        };
+        let input = self.doctor_snapshot_input();
         let clipboard_recovery = self.clipboard_recovery;
         self.push_plain("/doctor: collecting diagnostics…".to_string());
         self.start_owned_blocking_action(
@@ -1992,6 +1978,23 @@ impl App {
                 Ok(AsyncActionPayload::DoctorSnapshot(rendered))
             },
         );
+    }
+
+    fn doctor_snapshot_input(&self) -> cockpit_core::diagnostics::DiagnosticsInput {
+        cockpit_core::diagnostics::DiagnosticsInput {
+            cwd: self.launch.cwd.clone(),
+            session_id: self.launch.session_id,
+            session_short_id: self.launch.session_short_id.clone(),
+            active_agent: self.launch.agent_name.clone(),
+            active_model: self.launch.active_model.clone(),
+            pending_model_selection: self.pending_model_selection.as_ref().map(|pending| {
+                format!(
+                    "pending {}: {}/{}",
+                    pending.selection_id, pending.requested.provider, pending.requested.model
+                )
+            }),
+            sandbox_enabled: Some(!self.no_sandbox),
+        }
     }
 
     /// `/preflight [on|off]`: flip request preflight for the running session

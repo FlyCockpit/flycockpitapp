@@ -153,7 +153,7 @@ async fn export_via_attached_daemon(
 /// Publish through an owned temporary file and a no-replace hard link.  The
 /// target either remains absent or contains the complete verified export;
 /// failures clean up the partial file and never overwrite an earlier export.
-async fn write_export_no_clobber(
+pub(super) async fn write_export_no_clobber(
     out_path: &std::path::Path,
     bytes: &[u8],
     command: &'static str,

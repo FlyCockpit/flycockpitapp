@@ -183,6 +183,8 @@ pub(super) fn run_pointer_provider_regression_matrix() {
     pointer_row_editor_actions_survive_reordering_by_identity();
     header_delete_requires_second_press_on_same_row();
     model_delete_requires_second_press_on_same_row();
+    q_commits_headers_subpage();
+    standalone_oauth_enter_on_continue_returns_to_edit();
     edit_delete_enter_requires_second_enter_to_confirm();
     provider_delete_removes_its_unshared_stored_secret();
     provider_delete_preserves_a_shared_stored_secret();

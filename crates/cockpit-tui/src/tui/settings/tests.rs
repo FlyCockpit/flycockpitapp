@@ -650,6 +650,267 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     category_reset_pending_cancelled_by_navigation();
 }
 
+pub(super) fn run_pointer_text_layout_matrix() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    let entry = entry(&[]);
+    let mut editor = settings_editor::SettingsEditor::for_provider("p", &entry);
+    let field = settings_editor::ProviderSettingId::AutoCompactPct;
+    editor.cursor = editor
+        .fields()
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap();
+    editor.editing = Some(field);
+    editor.buf = TextField::new("12345");
+    d.set_test_page(Page::Providers(ProvidersPage::ProviderSettings {
+        editor,
+        parent: Box::new(providers::EditState::new("p".into(), entry)),
+    }));
+    for (width, height) in [(100, 30), (48, 18)] {
+        let _ = render_settings_rows(&d, width, height);
+        let target = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    shell::SettingsPointerAction::Page(
+                        pointer_actions::SettingsPointerAction::Providers(
+                            pointer_actions::ProvidersAction::RowEditor(
+                                pointer_actions::ProviderRowEditorAction::SettingEdit(_)
+                            )
+                        )
+                    )
+                )
+            })
+            .cloned()
+            .expect("numeric field target");
+        let x = target.rect.right().saturating_sub(2);
+        assert_eq!(
+            d.handle_pointer(settings_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                target.rect.y
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+        let TestPageRef::Providers(ProvidersPage::ProviderSettings { editor, .. }) = d.test_page()
+        else {
+            panic!("provider settings");
+        };
+        assert!(editor.buf.text().is_char_boundary(editor.buf.cursor()));
+        assert_eq!(
+            editor.buf.text(),
+            "12345",
+            "click does not commit or mutate"
+        );
+    }
+
+    for value in ["ascii", "a界b", "e\u{301}x"] {
+        let mut field = TextField::new(value);
+        for column in 0..=12 {
+            field.set_cursor_display_col(column);
+            assert!(field.text().is_char_boundary(field.cursor()));
+        }
+    }
+}
+
+pub(super) fn run_pointer_picker_suggestion_matrix() {
+    for expected in ["anthropic:opus", "", "custom-provider:model"] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        open_utility_picker(&mut d);
+        let _ = render_settings_rows(&d, 90, 24);
+        let wanted = if expected == "" {
+            pointer_actions::UtilityModelAction::Clear
+        } else if expected.starts_with("custom-") {
+            pointer_actions::UtilityModelAction::OpenCustom
+        } else {
+            pointer_actions::UtilityModelAction::Select(pointer_actions::UtilityModelId(
+                expected.into(),
+            ))
+        };
+        let target = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action
+                    == shell::SettingsPointerAction::Page(
+                        pointer_actions::SettingsPointerAction::UtilityModel(wanted.clone()),
+                    )
+            })
+            .cloned()
+            .expect("rendered picker target");
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        if expected.starts_with("custom-") {
+            type_chars(&mut d, expected);
+            let _ = render_settings_rows(&d, 48, 18);
+            let save = d
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action
+                        == shell::SettingsPointerAction::Page(
+                            pointer_actions::SettingsPointerAction::UtilityModel(
+                                pointer_actions::UtilityModelAction::CommitCustom,
+                            ),
+                        )
+                })
+                .cloned()
+                .expect("custom save target");
+            d.handle_pointer(settings_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                save.rect.x,
+                save.rect.y,
+            ));
+        }
+        assert_eq!(d.extended.utility_model.as_deref().unwrap_or(""), expected);
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch").unwrap();
+    open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
+    d.handle_key(press(KeyCode::Enter));
+    if let TestPageMut::Category(page) = d.test_page_mut() {
+        page.path_editor
+            .as_mut()
+            .unwrap()
+            .set_text_for_test("Dock".into(), tmp.path());
+    }
+    let before = d.extended.sandbox.dockerfile.clone();
+    let _ = render_settings_rows(&d, 72, 20);
+    let target = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                shell::SettingsPointerAction::Page(
+                    pointer_actions::SettingsPointerAction::Category(
+                        pointer_actions::CategoryAction::SuggestionSelect(_, _)
+                    )
+                )
+            )
+        })
+        .cloned()
+        .expect("directory suggestion target");
+    d.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        target.rect.x,
+        target.rect.y,
+    ));
+    assert_ne!(
+        d.extended.sandbox.dockerfile, before,
+        "suggestion click follows Enter commit path"
+    );
+}
+
+pub(super) fn run_pointer_header_back_matrix() {
+    for title in [
+        PROVIDERS_TITLE,
+        "Agents",
+        "Interface",
+        "Behavior",
+        "Privacy & Safety",
+        "Translation",
+        "Profile",
+        "Tools",
+        "Harnesses",
+        "Skills",
+        "MCP",
+        "LSP",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, title);
+        let _ = render_settings_rows(&d, 92, 20);
+        let back = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action
+                    == shell::SettingsPointerAction::Header(shell::SettingsHeaderAction::Back)
+            })
+            .cloned()
+            .expect("child Back target");
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            back.rect.x,
+            back.rect.y,
+        ));
+        assert!(
+            matches!(d.test_page(), TestPageRef::Root { cursor } if cursor == root_index(title))
+        );
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = dialog_with_one_provider(&tmp);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 92, 20);
+    let back = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action == shell::SettingsPointerAction::Header(shell::SettingsHeaderAction::Back)
+        })
+        .cloned()
+        .unwrap();
+    d.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        back.rect.x,
+        back.rect.y,
+    ));
+    assert!(matches!(
+        d.test_page(),
+        TestPageRef::Providers(ProvidersPage::List { .. })
+    ));
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.cx.picker_cwd = Some(tmp.path().to_path_buf());
+    let _ = render_settings_rows(&d, 48, 10);
+    let picker = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == shell::SettingsPointerAction::Header(
+                    shell::SettingsHeaderAction::BackToConfigPicker,
+                )
+        })
+        .cloned()
+        .expect("picker return target");
+    assert_eq!(
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            picker.rect.x,
+            picker.rect.y
+        )),
+        SettingsPointerOutcome::Close
+    );
+    assert!(d.back_to_picker);
+}
+
 #[test]
 fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
     let tmp = TempDir::new().unwrap();

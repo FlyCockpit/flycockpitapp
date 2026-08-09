@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -16,12 +17,21 @@ pub struct LinkRegistry {
     regions: Vec<LinkRegion>,
     hovered: Option<usize>,
     hovered_url: Option<String>,
+    generation: u64,
 }
 
 impl LinkRegistry {
     pub fn begin_frame(&mut self) {
         self.regions.clear();
         self.hovered = None;
+    }
+
+    pub fn invalidate_pointer_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn register(&mut self, rect: Rect, url: impl Into<String>, label: impl Into<String>) {
@@ -74,6 +84,87 @@ impl LinkRegistry {
 
     pub fn regions(&self) -> &[LinkRegion] {
         &self.regions
+    }
+}
+
+const LINK_RELEASE_WINDOW: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone)]
+struct PendingLinkPress {
+    url: String,
+    column: u16,
+    row: u16,
+    registry_generation: u64,
+    pressed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkGestureOutcome {
+    Consumed,
+    Activate(String),
+    Unhandled,
+}
+
+/// Generation-scoped press/release reducer for registered links. Activation
+/// happens only on a matching release within the multi-click window; a new
+/// press, capture transition, render generation, or unrelated button makes a
+/// stale release inert.
+#[derive(Debug, Default)]
+pub struct LinkPointerGesture {
+    pending: Option<PendingLinkPress>,
+}
+
+impl LinkPointerGesture {
+    pub fn handle(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        hit_url: Option<&str>,
+        registry_generation: u64,
+        now: Instant,
+    ) -> LinkGestureOutcome {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(url) = hit_url else {
+                    self.cancel();
+                    return LinkGestureOutcome::Unhandled;
+                };
+                self.pending = Some(PendingLinkPress {
+                    url: url.to_string(),
+                    column,
+                    row,
+                    registry_generation,
+                    pressed_at: now,
+                });
+                LinkGestureOutcome::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pending) = self.pending.take() else {
+                    return LinkGestureOutcome::Unhandled;
+                };
+                let matches = pending.column == column
+                    && pending.row == row
+                    && pending.registry_generation == registry_generation
+                    && hit_url == Some(pending.url.as_str())
+                    && now.saturating_duration_since(pending.pressed_at) <= LINK_RELEASE_WINDOW;
+                if matches {
+                    LinkGestureOutcome::Activate(pending.url)
+                } else {
+                    LinkGestureOutcome::Consumed
+                }
+            }
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cancel();
+                LinkGestureOutcome::Unhandled
+            }
+            _ => LinkGestureOutcome::Unhandled,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.pending = None;
     }
 }
 
@@ -240,5 +331,86 @@ mod tests {
         assert!(links.update_hover(1, 2));
         let after = osc8_bytes(&links, true, true);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pointer_gesture_activates_only_matching_live_release_once() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let now = Instant::now();
+        let mut gesture = LinkPointerGesture::default();
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now,
+            ),
+            LinkGestureOutcome::Consumed
+        );
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now + Duration::from_millis(499),
+            ),
+            LinkGestureOutcome::Activate("https://x.test".into())
+        );
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now + Duration::from_millis(499),
+            ),
+            LinkGestureOutcome::Unhandled
+        );
+
+        let _ = gesture.handle(
+            MouseEventKind::Down(MouseButton::Left),
+            4,
+            7,
+            Some("https://x.test"),
+            9,
+            now,
+        );
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                10,
+                now + Duration::from_millis(1)
+            ),
+            LinkGestureOutcome::Consumed,
+            "render generation invalidates the press"
+        );
+        let _ = gesture.handle(
+            MouseEventKind::Down(MouseButton::Left),
+            4,
+            7,
+            Some("https://x.test"),
+            10,
+            now,
+        );
+        gesture.cancel();
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                10,
+                now
+            ),
+            LinkGestureOutcome::Unhandled
+        );
     }
 }

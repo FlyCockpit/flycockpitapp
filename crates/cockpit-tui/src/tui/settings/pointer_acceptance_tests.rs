@@ -331,6 +331,7 @@ fn settings_pointer_contract_covers_all_current_pages() {
 
 #[test]
 fn settings_pointer_dispatch_preempts_chat() {
+    crate::tui::app::settings_pointer_tests::run_settings_pointer_z_order_matrix();
     let surface = rendered_surface();
     assert_eq!(
         surface.hit(13, 7).unwrap().action,
@@ -421,6 +422,7 @@ fn settings_pointer_clicks_visible_controls_only() {
 
 #[test]
 fn settings_text_click_places_grapheme_safe_caret() {
+    super::tests::run_pointer_text_layout_matrix();
     let mut field = crate::tui::textfield::TextField::new("a界e\u{301}");
     field.set_cursor_display_col(2);
     assert!(field.cursor() <= field.text().len());
@@ -429,6 +431,7 @@ fn settings_text_click_places_grapheme_safe_caret() {
 
 #[test]
 fn settings_pointer_picker_and_suggestion_actions_match_enter() {
+    super::tests::run_pointer_picker_suggestion_matrix();
     assert_rendered_action_matrix(&[
         SettingsPointerAction::UtilityModel(UtilityModelAction::Select(UtilityModelId(
             "provider/model".into(),
@@ -472,6 +475,64 @@ fn settings_pointer_surface_registry_is_exhaustive() {
 
 #[test]
 fn settings_pointer_links_and_capture_transitions_are_safe() {
+    use crossterm::event::MouseButton;
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let mut gesture = crate::tui::links::LinkPointerGesture::default();
+    assert_eq!(
+        gesture.handle(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            3,
+            Some("https://example.test"),
+            1,
+            now
+        ),
+        crate::tui::links::LinkGestureOutcome::Consumed
+    );
+    assert_eq!(
+        gesture.handle(
+            MouseEventKind::Up(MouseButton::Left),
+            2,
+            3,
+            Some("https://example.test"),
+            1,
+            now + Duration::from_millis(500)
+        ),
+        crate::tui::links::LinkGestureOutcome::Activate("https://example.test".into())
+    );
+    assert_eq!(
+        gesture.handle(
+            MouseEventKind::Up(MouseButton::Left),
+            2,
+            3,
+            Some("https://example.test"),
+            1,
+            now
+        ),
+        crate::tui::links::LinkGestureOutcome::Unhandled
+    );
+    let _ = gesture.handle(
+        MouseEventKind::Down(MouseButton::Left),
+        2,
+        3,
+        Some("https://example.test"),
+        1,
+        now,
+    );
+    gesture.cancel();
+    assert_eq!(
+        gesture.handle(
+            MouseEventKind::Up(MouseButton::Left),
+            2,
+            3,
+            Some("https://example.test"),
+            1,
+            now
+        ),
+        crate::tui::links::LinkGestureOutcome::Unhandled
+    );
+    super::providers::tests::run_pointer_provider_regression_matrix();
     let surface = rendered_surface();
     surface.enabled.set(false);
     surface.clear_for(Rect::new(0, 0, 1, 1));
@@ -491,6 +552,71 @@ fn settings_pointer_hover_and_help_are_truthful() {
     ))));
     surface.clear_for_page(Rect::new(10, 5, 30, 10), 2);
     assert!(surface.hover.borrow().is_none());
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let rows = render_settings_rows(&dialog, 80, 18);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("click: activate") && row.contains("wheel: scroll"))
+    );
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| target.enabled && matches!(target.action, RenderAction::Page(_)))
+        .cloned()
+        .unwrap();
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Moved,
+        target.rect.x,
+        target.rect.y,
+    ));
+    assert!(dialog.pointer_surface.hover.borrow().is_some());
+    let area = dialog.pointer_surface.area.get().unwrap();
+    let blank = (area.y..area.bottom())
+        .find_map(|row| {
+            (area.x..area.right())
+                .find(|column| dialog.pointer_surface.hit(*column, row).is_none())
+                .map(|column| (column, row))
+        })
+        .expect("render includes inert title/gutter/blank geometry");
+    dialog.handle_pointer(settings_mouse(MouseEventKind::Moved, blank.0, blank.1));
+    assert!(
+        dialog.pointer_surface.hover.borrow().is_none(),
+        "blank move clears hover"
+    );
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Moved,
+        target.rect.x,
+        target.rect.y,
+    ));
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::ScrollDown,
+        target.rect.x,
+        target.rect.y,
+    ));
+    assert!(
+        dialog.pointer_surface.hover.borrow().is_none(),
+        "wheel clears hover"
+    );
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Moved,
+        target.rect.x,
+        target.rect.y,
+    ));
+    let _ = render_settings_rows(&dialog, 72, 16);
+    assert!(
+        dialog.pointer_surface.hover.borrow().is_none(),
+        "resize clears hover"
+    );
+    dialog.pointer_surface.enabled.set(false);
+    let _ = render_settings_rows(&dialog, 72, 16);
+    assert!(
+        dialog.pointer_surface.targets.borrow().is_empty(),
+        "capture-off render has no pointer affordances"
+    );
 }
 
 #[test]
@@ -588,6 +714,9 @@ fn existing_settings_tests_retain_behavioral_assertions() {
 
 #[test]
 fn settings_pointer_header_navigation_is_complete() {
+    super::tests::run_pointer_header_back_matrix();
+    super::tests::run_pointer_dialog_regression_matrix();
+    super::providers::tests::run_pointer_provider_regression_matrix();
     let tmp = TempDir::new().unwrap();
     let dialog = fresh_dialog(&tmp);
     let rows = render_settings_rows(&dialog, 80, 12);

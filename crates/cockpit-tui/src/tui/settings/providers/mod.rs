@@ -5096,6 +5096,34 @@ impl SettingsPage for ProvidersPage {
         let super::pointer_actions::SettingsPointerAction::Providers(_) = &action else {
             return Nav::Stay;
         };
+        if let (
+            ProvidersPage::ModelSettings { editor, .. }
+            | ProvidersPage::ProviderSettings { editor, .. },
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::RowEditor(
+                    super::pointer_actions::ProviderRowEditorAction::SettingEdit(id),
+                ),
+            ),
+        ) = (&mut *self, &action)
+            && editor.editing.is_some_and(|field| field.label() == id.0)
+        {
+            let label_width = editor
+                .fields()
+                .iter()
+                .map(|field| field.label().chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            let value_x = cx.pointer_surface.area.get().map_or(0, |area| {
+                area.x
+                    .saturating_add(2)
+                    .saturating_add(label_width)
+                    .saturating_add(2)
+            });
+            editor
+                .buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
         if let ProvidersPage::Add(state) = self {
             let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
                 Some("id") => ("id", &mut state.id_field),

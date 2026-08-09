@@ -100,13 +100,32 @@ impl App {
             self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(url) = self
-                .link_registry
-                .at(mouse.column, mouse.row)
-                .map(|link| link.url.clone())
-        {
+        if !self.mouse_capture {
+            self.link_pointer_gesture.cancel();
+        }
+        let hit_url = self
+            .link_registry
+            .at(mouse.column, mouse.row)
+            .map(|link| link.url.clone());
+        let link_outcome = if self.mouse_capture {
+            self.link_pointer_gesture.handle(
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+                hit_url.as_deref(),
+                self.link_registry.generation(),
+                std::time::Instant::now(),
+            )
+        } else {
+            crate::tui::links::LinkGestureOutcome::Unhandled
+        };
+        if matches!(
+            link_outcome,
+            crate::tui::links::LinkGestureOutcome::Consumed
+        ) {
+            return;
+        }
+        if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
             if cockpit_core::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {

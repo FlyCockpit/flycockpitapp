@@ -707,6 +707,13 @@ impl SettingsPage for HarnessesPage {
         super::SettingsPointerSurfaceKind::Harnesses
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        match self {
+            HarnessesPage::List(_) => 200,
+            HarnessesPage::Edit(_) => 201,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_harnesses_page_key(key, self)
     }

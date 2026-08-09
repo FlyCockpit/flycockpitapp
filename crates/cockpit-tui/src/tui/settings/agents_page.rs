@@ -906,6 +906,16 @@ impl SettingsPage for AgentsPage {
         super::SettingsPointerSurfaceKind::Agents
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        if self.editing.is_some() {
+            402
+        } else if self.detail.is_some() {
+            401
+        } else {
+            400
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_agents_page_key(key, self)
     }

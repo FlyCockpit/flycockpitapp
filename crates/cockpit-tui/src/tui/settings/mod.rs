@@ -259,6 +259,9 @@ pub(super) struct RootPage {
 /// title, help, or key-dispatch arms.
 pub(super) trait SettingsPage: Any {
     fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind;
+    fn pointer_surface_token(&self) -> u64 {
+        self.pointer_surface_kind() as u64
+    }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
     fn render_with_links(
@@ -2142,9 +2145,8 @@ impl SettingsDialog {
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
-        let surface_kind = self.page.pointer_surface_kind();
-        self.pointer_surface
-            .clear_for_page(area, surface_kind as u64);
+        let surface_token = self.page.pointer_surface_token();
+        self.pointer_surface.clear_for_page(area, surface_token);
         let title = self.title();
         let block = Block::default()
             .borders(Borders::ALL)

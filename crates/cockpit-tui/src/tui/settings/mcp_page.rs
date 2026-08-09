@@ -1098,6 +1098,13 @@ impl SettingsPage for McpPage {
         super::SettingsPointerSurfaceKind::Mcp
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        match self {
+            McpPage::List(_) => 300,
+            McpPage::Add(_) => 301,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match self {
             McpPage::List(s) => cx.handle_mcp_list_key(key, s),

@@ -4190,6 +4190,10 @@ impl SettingsPage for ProvidersPage {
         super::SettingsPointerSurfaceKind::Providers
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        100 + ProvidersPage::pointer_surface_kind(self) as u64
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_providers_page_key(key, self)
     }

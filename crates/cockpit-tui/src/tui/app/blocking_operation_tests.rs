@@ -75,7 +75,9 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         );
     }
     drop(entered_tx);
-    assert_eq!(entered_rx.iter().count(), 6);
+    for _ in 0..6 {
+        entered_rx.recv().expect("owned action reached barrier");
+    }
 
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(

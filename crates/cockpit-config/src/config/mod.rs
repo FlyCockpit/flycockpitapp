@@ -68,7 +68,7 @@ pub fn write_terminal_ingress_private_file(
     bytes: &[u8],
 ) -> anyhow::Result<TerminalIngressFileIdentity> {
     files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
-    let (_, identity) = files::read_file_nofollow_with_identity(path)?
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path)?
         .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
     Ok(identity)
 }
@@ -94,10 +94,62 @@ pub struct TerminalIngressFileIdentity {
     pub links: u32,
 }
 
+#[derive(Debug)]
+pub struct VerifiedTerminalIngressFile {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    pub bytes: Vec<u8>,
+    pub identity: TerminalIngressFileIdentity,
+    cleanup_armed: bool,
+}
+
+impl VerifiedTerminalIngressFile {
+    pub fn retain(mut self) -> TerminalIngressFileIdentity {
+        self.cleanup_armed = false;
+        self.identity
+    }
+}
+
+impl Drop for VerifiedTerminalIngressFile {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        // The held exact object is scrubbed even if a same-user process renamed
+        // it after verification. Removal of the published name remains
+        // identity-gated and never follows a replacement.
+        let _ = self.file.set_len(0);
+        if let Ok(Some((_, _, current))) = files::read_file_nofollow_with_identity(&self.path)
+            && current == self.identity
+        {
+            let _ = files::remove_file_nofollow(&self.path);
+        }
+    }
+}
+
 pub fn read_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    files::read_file_nofollow_with_identity(path)
+    Ok(
+        files::read_file_nofollow_with_identity(path)?
+            .map(|(_, bytes, identity)| (bytes, identity)),
+    )
+}
+
+pub fn hold_terminal_ingress_file_verified(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
+    Ok(
+        files::read_file_nofollow_with_identity(path)?.map(|(file, bytes, identity)| {
+            VerifiedTerminalIngressFile {
+                file,
+                path: path.to_path_buf(),
+                bytes,
+                identity,
+                cleanup_armed: true,
+            }
+        }),
+    )
 }
 
 /// Remove the exact no-follow terminal-ingress entry through the audited

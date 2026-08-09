@@ -10,8 +10,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,6 +40,7 @@ const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 const MAX_TERMINALS: usize = 4;
 const TERMINAL_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const TERMINAL_INPUT_CAP: usize = 1024 * 1024;
+const TERMINAL_INPUT_QUEUE_CAP: usize = 64;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const INGRESS_JOURNAL_CAP: usize = 64;
@@ -57,6 +58,7 @@ struct IngressOperation {
     committed_at: Option<Instant>,
     path: Option<PathBuf>,
     file_identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
+    binding_dir: PathBuf,
     owner: AuthenticatedTerminalContext,
     session_id: Uuid,
 }
@@ -156,7 +158,9 @@ struct TerminalState {
     /// Exact terminal generation. Tombstoned generations never reopen.
     generation: u64,
     master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
+    input_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    input_cancel: Arc<AtomicBool>,
+    input_thread: Option<std::thread::JoinHandle<()>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     buffer: ReplayBuffer,
     filter: TerminalOutputFilter,
@@ -786,12 +790,7 @@ impl TerminalHost {
         let terminal = self.get_terminal(terminal_id)?;
         let mut state = crate::sync::lock_or_recover(&terminal);
         ensure_open(&state, terminal_id)?;
-        let writer = state
-            .writer
-            .as_mut()
-            .ok_or_else(|| unknown_terminal(terminal_id))?;
-        writer.write_all(&bytes).map_err(internal)?;
-        writer.flush().map_err(internal)?;
+        reserve_input_locked(&state, bytes).map_err(internal)?;
         Ok(Response::Ack)
     }
 
@@ -807,9 +806,7 @@ impl TerminalHost {
         if bytes.len() > TERMINAL_INPUT_CAP {
             return Err(invalid_ingress());
         }
-        let writer = state.writer.as_mut().ok_or_else(invalid_ingress)?;
-        writer.write_all(&bytes).map_err(internal)?;
-        writer.flush().map_err(internal)?;
+        reserve_input_locked(&state, bytes).map_err(|_| invalid_ingress())?;
         Ok(Response::Ack)
     }
 
@@ -902,7 +899,6 @@ impl TerminalHost {
                 return Err(ingress_conflict());
             }
             if operation.binding != binding {
-                let old_binding = operation.binding;
                 let new_owner = state
                     .bindings
                     .get(&binding.binding_id)
@@ -915,12 +911,6 @@ impl TerminalHost {
                 {
                     return Err(invalid_ingress());
                 }
-                let original_dir = state
-                    .binding_dirs
-                    .get(&old_binding.binding_id)
-                    .cloned()
-                    .ok_or_else(invalid_ingress)?;
-                state.binding_dirs.insert(binding.binding_id, original_dir);
                 let operation = state
                     .ingress
                     .get_mut(&metadata.operation_id)
@@ -947,6 +937,11 @@ impl TerminalHost {
             .get(&binding.binding_id)
             .cloned()
             .ok_or_else(invalid_ingress)?;
+        let binding_dir = state
+            .binding_dirs
+            .get(&binding.binding_id)
+            .cloned()
+            .ok_or_else(invalid_ingress)?;
         state.ingress.insert(
             metadata.operation_id,
             IngressOperation {
@@ -959,6 +954,7 @@ impl TerminalHost {
                 committed_at: None,
                 path: None,
                 file_identity: None,
+                binding_dir,
                 owner: binding_record.owner,
                 session_id: binding_record.session_id,
             },
@@ -1048,10 +1044,11 @@ impl TerminalHost {
         };
         validate_image(&metadata, &bytes)?;
         let binding_dir = state
-            .binding_dirs
-            .get(&binding.binding_id)
-            .cloned()
-            .ok_or_else(invalid_ingress)?;
+            .ingress
+            .get(&operation_id)
+            .ok_or_else(invalid_ingress)?
+            .binding_dir
+            .clone();
         let name = format!("{}.{}", random_base32(), metadata.media_type.extension());
         let final_path = binding_dir.join(name);
         let path_text = final_path.to_str().ok_or_else(ingress_path_unavailable)?;
@@ -1065,7 +1062,7 @@ impl TerminalHost {
                 .map_err(internal)?;
         #[cfg(test)]
         self.hit_ingress_barrier(IngressMutationEdge::AfterPublish, &final_path);
-        let (verified, file_identity) = match read_verified_final(&final_path, metadata.size) {
+        let (verified, verified_file) = match read_verified_final(&final_path, metadata.size) {
             Ok(verified) => verified,
             Err(error) => {
                 remove_if_same_identity(&final_path, Some(published_identity));
@@ -1073,24 +1070,23 @@ impl TerminalHost {
             }
         };
         if let Err(error) = validate_image(&metadata, &verified) {
-            remove_if_same_identity(&final_path, file_identity);
+            drop(verified_file);
             return Err(error);
         }
         #[cfg(test)]
         self.hit_ingress_barrier(IngressMutationEdge::AfterFinalVerification, &final_path);
         if let Err(error) = authorize_binding(&state, binding) {
-            remove_if_same_identity(&final_path, file_identity);
+            drop(verified_file);
             return Err(error);
         }
         let frame = bracketed_paste_bytes(&shell_path_literal(path_text, host_shell_dialect())?);
         #[cfg(test)]
         self.hit_ingress_barrier(IngressMutationEdge::BeforeReserve, &final_path);
-        let writer = state
-            .writer
-            .as_mut()
-            .ok_or_else(|| unknown_terminal(terminal_id))?;
-        writer.write_all(&frame).map_err(internal)?;
-        writer.flush().map_err(internal)?;
+        if let Err(error) = reserve_input_locked(&state, frame) {
+            drop(verified_file);
+            return Err(internal(error));
+        }
+        let file_identity = Some(verified_file.retain());
         state.input_sequence = state.input_sequence.saturating_add(1);
         let sequence = state.input_sequence;
         let operation = state
@@ -1283,7 +1279,11 @@ fn close_generation_locked(
     state.filter.finish();
 
     // Close PTY writer/master handles (reader is cancelled via closed flag).
-    state.writer.take();
+    state.input_cancel.store(true, Ordering::Release);
+    state.input_tx.take();
+    if let Some(input_thread) = state.input_thread.take() {
+        let _ = input_thread.join();
+    }
     state.master.take();
 
     // Containment terminate + same-generation empty oracle when a lease is
@@ -1548,7 +1548,27 @@ fn spawn_terminal(
     drop(pair.slave);
 
     let master = pair.master;
-    let writer = master.take_writer().context("take terminal pty writer")?;
+    let mut writer = master.take_writer().context("take terminal pty writer")?;
+    let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(TERMINAL_INPUT_QUEUE_CAP);
+    let input_cancel = Arc::new(AtomicBool::new(false));
+    let writer_cancel = Arc::clone(&input_cancel);
+    let input_thread = std::thread::Builder::new()
+        .name(format!("terminal-input-{id}"))
+        .spawn(move || {
+            while let Ok(frame) = input_rx.recv() {
+                if writer_cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if writer
+                    .write_all(&frame)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .context("spawn terminal input writer")?;
     let mut reader = master
         .try_clone_reader()
         .context("clone terminal pty reader")?;
@@ -1557,7 +1577,9 @@ fn spawn_terminal(
         id,
         generation: 1,
         master: Some(master),
-        writer: Some(writer),
+        input_tx: Some(input_tx),
+        input_cancel,
+        input_thread: Some(input_thread),
         child: Some(child),
         buffer: ReplayBuffer::new(REPLAY_BUFFER_BYTES),
         filter: TerminalOutputFilter::default(),
@@ -1662,6 +1684,16 @@ fn ensure_open(state: &TerminalState, terminal_id: Uuid) -> std::result::Result<
     } else {
         Ok(())
     }
+}
+
+fn reserve_input_locked(state: &TerminalState, bytes: Vec<u8>) -> Result<()> {
+    let sender = state
+        .input_tx
+        .as_ref()
+        .context("terminal input queue is unavailable")?;
+    sender
+        .try_send(bytes)
+        .map_err(|error| anyhow::anyhow!("terminal input queue rejected frame: {error}"))
 }
 
 fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
@@ -1952,27 +1984,21 @@ fn set_private_open_file_permissions(_file: &std::fs::File) -> Result<()> {
 fn read_verified_final(
     path: &Path,
     expected_len: u64,
-) -> std::result::Result<
-    (
-        Vec<u8>,
-        Option<cockpit_config::config::TerminalIngressFileIdentity>,
-    ),
-    ErrorPayload,
-> {
+) -> std::result::Result<(Vec<u8>, cockpit_config::config::VerifiedTerminalIngressFile), ErrorPayload>
+{
     let (bytes, identity) = cockpit_config::config::read_terminal_ingress_file_verified(path)
         .map_err(internal)?
         .ok_or_else(invalid_ingress)?;
     if bytes.len() as u64 != expected_len || identity.links != 1 {
         return Err(invalid_ingress());
     }
-    let (post_bytes, post_identity) =
-        cockpit_config::config::read_terminal_ingress_file_verified(path)
-            .map_err(internal)?
-            .ok_or_else(invalid_ingress)?;
-    if post_identity != identity || post_bytes != bytes {
+    let post = cockpit_config::config::hold_terminal_ingress_file_verified(path)
+        .map_err(internal)?
+        .ok_or_else(invalid_ingress)?;
+    if post.identity != identity || post.bytes != bytes {
         return Err(invalid_ingress());
     }
-    Ok((bytes, Some(identity)))
+    Ok((bytes, post))
 }
 
 fn remove_if_same_identity(
@@ -2535,7 +2561,7 @@ mod tests {
             assert!(state.forwarding_cancelled);
             assert_eq!(state.close_transitions, 1);
             assert!(state.osc52_violation_emitted);
-            assert!(state.writer.is_none());
+            assert!(state.input_tx.is_none());
             assert!(state.master.is_none());
             assert!(state.child.is_none());
             assert!(state.test_leader_reaped);
@@ -3358,7 +3384,9 @@ mod tests {
                 id,
                 generation: 1,
                 master: None,
-                writer: None,
+                input_tx: None,
+                input_cancel: Arc::new(AtomicBool::new(true)),
+                input_thread: None,
                 child: None,
                 buffer: ReplayBuffer::new(REPLAY_BUFFER_BYTES),
                 filter: TerminalOutputFilter::default(),

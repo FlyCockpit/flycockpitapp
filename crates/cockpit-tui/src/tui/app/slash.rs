@@ -1513,13 +1513,13 @@ impl App {
         match trimmed {
             "pause" => {
                 self.set_goal_status(
-                    cockpit_core::daemon::proto::GoalStatus::Paused,
+                    cockpit_core::daemon::proto::GoalDisposition::UserPaused,
                     "/goal pause",
                 );
             }
             "resume" => {
                 self.set_goal_status(
-                    cockpit_core::daemon::proto::GoalStatus::Active,
+                    cockpit_core::daemon::proto::GoalDisposition::Running,
                     "/goal resume",
                 );
             }

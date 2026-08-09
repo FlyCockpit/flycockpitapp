@@ -1295,7 +1295,9 @@ pub use cockpit_db::wire::{
     SessionMessage, SessionSummary, WriteContentPreview,
 };
 
-pub use cockpit_db::db::session_goals::GoalStatus;
+pub use cockpit_db::db::session_goals::{
+    GoalContract, GoalDisposition, GoalPauseReason, GoalPhase,
+};
 pub use cockpit_db::stats::{
     HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryModeRow,
     RecoveryRow, RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope,

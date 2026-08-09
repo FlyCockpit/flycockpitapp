@@ -2182,7 +2182,19 @@ pub(super) async fn run_worker(
                 } => {
                     let result = replace_config_snapshot(&config_snapshot, *snapshot);
                     let changed = result.changed;
-                    send_config_snapshot_event_if_changed(
+                    let supervision_enabled = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extended
+                        .goal_supervision
+                        .enabled;
+                    if changed && !supervision_enabled {
+                        let _ = session
+                            .db
+                            .pause_open_goal_for_operator_disable(session_id)
+                            .await;
+                    }
+                    let generation = send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,
                         &config_snapshot,
@@ -2203,7 +2215,7 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
-                    let _ = respond_to.send(result);
+                    let _ = respond_to.send(generation);
                 }
                 SessionWork::SetAgent { name } => {
                     // Persist the active-agent choice so a resume restarts on it,

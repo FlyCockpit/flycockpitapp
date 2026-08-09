@@ -2231,6 +2231,7 @@ pub struct App {
     pub(super) mouse_capture: bool,
     pub(super) hyperlinks: bool,
     pub(super) link_registry: crate::tui::links::LinkRegistry,
+    pub(super) link_pointer_gesture: crate::tui::links::LinkPointerGesture,
     /// User's `tui.exit_tail_lines` setting (GOALS §1d). Cached at
     /// startup so the exit-tail dump survives the dialog being closed.
     pub(super) exit_tail_lines: i32,
@@ -3371,6 +3372,7 @@ impl App {
             mouse_capture,
             hyperlinks,
             link_registry: crate::tui::links::LinkRegistry::default(),
+            link_pointer_gesture: crate::tui::links::LinkPointerGesture::default(),
             exit_tail_lines,
             rich_text_copy,
             clipboard_recovery,
@@ -3846,7 +3848,12 @@ impl App {
                 self.handle_mouse(mouse);
                 false
             }
-            Event::Resize(_, _) => false,
+            Event::Resize(_, _) => {
+                self.link_pointer_gesture.cancel();
+                self.link_registry.invalidate_pointer_generation();
+                self.dialog.cancel_settings_pointer_transients();
+                false
+            }
             _ => false,
         }
     }
@@ -4145,6 +4152,8 @@ mod resume_history_conversion_tests;
 mod sandbox_notice_tests;
 #[cfg(test)]
 mod session_schedule_tests;
+#[cfg(test)]
+pub(crate) mod settings_pointer_tests;
 #[cfg(test)]
 mod skill_auto_injected_tests;
 #[cfg(test)]

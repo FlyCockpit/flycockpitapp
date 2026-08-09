@@ -14,7 +14,7 @@
 //! entries; the last row is the synthetic `[+ add directory]`. Toggling
 //! and list edits both persist via `save_extended()`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -24,8 +24,11 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
+use super::pointer_actions::{
+    ConfirmationChoice, ScanDirectoryId, SettingsPointerAction, SkillsAction,
+};
 use super::reset::{ResetButton, ResetOutcome};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 #[cfg(test)]
 use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
@@ -44,6 +47,8 @@ pub(super) struct SkillsPage {
     /// Page-level "reset to defaults" confirm state (the last navigable
     /// row, below the `[+ add directory]` synthetic row).
     pub(super) reset: ResetButton,
+    /// Stable row value awaiting an explicit pointer deletion confirmation.
+    pub(super) pointer_delete_pending: Option<String>,
 }
 
 pub(super) struct GrabState {
@@ -85,10 +90,12 @@ impl SettingsCx {
                 return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                p.pointer_delete_pending = None;
                 p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                p.pointer_delete_pending = None;
                 p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
             }
@@ -212,6 +219,7 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
             area.width,
@@ -222,7 +230,9 @@ impl SettingsCx {
              dir up to the git root.",
             muted,
         );
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
         // Row 0: auto-`!` toggle.
         let toggle_on_cursor = p.cursor == 0;
@@ -242,6 +252,11 @@ impl SettingsCx {
             Span::styled("auto-! commands  ", toggle_label_style),
             Span::styled(toggle_value.to_string(), muted),
         ]));
+        controls.push(Some((
+            SettingsPointerAction::Skills(SkillsAction::ToggleAutoBangCommands),
+            true,
+            None,
+        )));
 
         // Row 1: ancestor-walk toggle.
         let walk_on_cursor = p.cursor == 1;
@@ -261,12 +276,19 @@ impl SettingsCx {
             Span::styled("ancestor walk    ", walk_label_style),
             Span::styled(walk_value.to_string(), muted),
         ]));
+        controls.push(Some((
+            SettingsPointerAction::Skills(SkillsAction::ToggleAncestorWalk),
+            true,
+            None,
+        )));
 
         lines.push(Line::default());
+        controls.push(None);
         lines.push(Line::from(Span::styled(
             "scan directories".to_string(),
             muted,
         )));
+        controls.push(None);
 
         for (i, dir) in self.extended.skills.scan_dirs.iter().enumerate() {
             let row_cursor = i + TOGGLE_ROWS; // skip the leading toggle rows
@@ -277,6 +299,13 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.text(),
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     "  (type directory)",
+                )));
+                controls.push(Some((
+                    SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                    )),
+                    true,
+                    None,
                 )));
                 continue;
             }
@@ -294,6 +323,44 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled(dir.clone(), style),
             ]));
+            controls.push(Some((
+                SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(ScanDirectoryId(
+                    dir.clone(),
+                ))),
+                true,
+                None,
+            )));
+            if p.pointer_delete_pending.as_deref() == Some(dir.as_str()) {
+                lines.push(Line::from(format!("Delete scan directory {dir}?")));
+                controls.push(None);
+                lines.push(Line::from("[Delete]"));
+                controls.push(Some((
+                    SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                        ConfirmationChoice::Confirm,
+                    )),
+                    true,
+                    None,
+                )));
+                lines.push(Line::from("[Cancel]"));
+                controls.push(Some((
+                    SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                        ConfirmationChoice::Cancel,
+                    )),
+                    true,
+                    None,
+                )));
+            } else {
+                lines.push(Line::from("  [Delete]"));
+                controls.push(Some((
+                    SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                    )),
+                    true,
+                    None,
+                )));
+            }
         }
 
         // `[+ add directory]` row — hidden while a row is grabbed.
@@ -310,6 +377,11 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled("[+ add directory]".to_string(), style),
             ]));
+            controls.push(Some((
+                SettingsPointerAction::Skills(SkillsAction::AddScanDirectory),
+                true,
+                None,
+            )));
 
             // `[reset to defaults]` button — the last navigable row, just
             // below `[+ add directory]`. Hidden (like `[+ add]`) while a
@@ -319,21 +391,36 @@ impl SettingsCx {
                 p.reset
                     .render_line(p.cursor == reset_idx, "reset to defaults"),
             );
+            controls.push(Some((
+                SettingsPointerAction::Skills(SkillsAction::Reset),
+                true,
+                None,
+            )));
         }
 
         if p.grabbed.is_some() {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(grab::grab_hint_line(grab::GRAB_HINT_EDIT));
+            controls.push(None);
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "skills", lines, selected_line);
+        self.scroll_states.render_control_lines(
+            frame,
+            area,
+            "skills",
+            (lines, selected_line),
+            controls,
+            (&self.pointer_surface, SettingsScrollRegionId("skills")).into(),
+        );
     }
 }
 
@@ -346,12 +433,120 @@ fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
 }
 
 impl SettingsPage for SkillsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Skills
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() || self.pointer_delete_pending.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_skills_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_skills_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::Skills(action) = action else {
+            return Nav::Stay;
+        };
+        if let SkillsAction::ConfirmDeleteScanDirectory(
+            ScanDirectoryId(path),
+            ConfirmationChoice::Confirm,
+        ) = &action
+            && self.pointer_delete_pending.as_ref() == Some(path)
+            && let Some(index) = cx
+                .extended
+                .skills
+                .scan_dirs
+                .iter()
+                .position(|entry| entry == path)
+        {
+            cx.extended.skills.scan_dirs.remove(index);
+            self.pointer_delete_pending = None;
+            self.cursor = self
+                .cursor
+                .min(TOGGLE_ROWS + cx.extended.skills.scan_dirs.len());
+            self.status = save_status(cx.save_extended());
+            return Nav::Stay;
+        }
+        if let SkillsAction::ConfirmDeleteScanDirectory(
+            ScanDirectoryId(path),
+            ConfirmationChoice::Cancel,
+        ) = &action
+            && self.pointer_delete_pending.as_ref() == Some(path)
+        {
+            self.pointer_delete_pending = None;
+            self.status = Some("delete cancelled".into());
+            return Nav::Stay;
+        }
+        if let SkillsAction::DeleteScanDirectory(ScanDirectoryId(path)) = &action
+            && let Some(index) = cx
+                .extended
+                .skills
+                .scan_dirs
+                .iter()
+                .position(|entry| entry == path)
+        {
+            self.cursor = TOGGLE_ROWS + index;
+            self.pointer_delete_pending = Some(path.clone());
+            self.reset.disarm();
+            return Nav::Stay;
+        }
+        let index = match action {
+            SkillsAction::ToggleAutoBangCommands => 0,
+            SkillsAction::ToggleAncestorWalk => 1,
+            SkillsAction::EditScanDirectory(ScanDirectoryId(path)) => {
+                let Some(index) = cx
+                    .extended
+                    .skills
+                    .scan_dirs
+                    .iter()
+                    .position(|entry| entry == &path)
+                else {
+                    return Nav::Stay;
+                };
+                TOGGLE_ROWS + index
+            }
+            SkillsAction::AddScanDirectory => TOGGLE_ROWS + cx.extended.skills.scan_dirs.len(),
+            SkillsAction::Reset => TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1,
+            SkillsAction::DeleteScanDirectory(_)
+            | SkillsAction::ConfirmDeleteScanDirectory(_, _) => return Nav::Stay,
+        };
+        self.cursor = index;
+        self.pointer_delete_pending = None;
+        cx.handle_skills_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("skills") && self.grabbed.is_none() {
+            self.pointer_delete_pending = None;
+            let last = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1;
+            self.reset.disarm();
+            self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.pointer_delete_pending = None;
+        self.reset.disarm();
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -409,6 +604,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d
     }
@@ -424,6 +620,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d
     }
@@ -520,6 +717,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d.handle_key(press(KeyCode::Char('d')));
         assert!(d.extended.skills.scan_dirs.is_empty());
@@ -554,6 +752,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d.handle_key(press(KeyCode::Enter)); // grab existing
         for ch in "XYZ".chars() {

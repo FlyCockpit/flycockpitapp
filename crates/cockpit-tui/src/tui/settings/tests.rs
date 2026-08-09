@@ -1,3 +1,4 @@
+use super::shell::PointerOperationId;
 use super::*;
 use cockpit_config::providers::{ModelEntry, ProviderEntry};
 use cockpit_test_support::TestEnvGuard;
@@ -241,7 +242,7 @@ impl EditorEnv {
     }
 }
 
-fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
+pub(super) fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     SettingsDialog::open(path)
@@ -520,7 +521,7 @@ fn grok_and_codex_oauth_render_register_link_regions() {
 use category::{Category, SettingId};
 
 /// Open a category page on `d` with the cursor on `id`'s row.
-fn open_category_on(d: &mut SettingsDialog, category: Category, id: SettingId) {
+pub(super) fn open_category_on(d: &mut SettingsDialog, category: Category, id: SettingId) {
     d.enter_category(category);
     if let TestPageMut::Category(p) = d.test_page_mut() {
         p.cursor = p
@@ -572,7 +573,7 @@ fn line_text(line: &Line<'static>) -> String {
         .collect()
 }
 
-fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<String> {
+pub(super) fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut links = crate::tui::links::LinkRegistry::default();
@@ -622,12 +623,2852 @@ fn rendered_char(row: &str, x: u16) -> char {
     row.chars().nth(usize::from(x)).unwrap_or(' ')
 }
 
+pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// Real rendered/reducer regressions reused by the named pointer acceptance
+/// suites. Keeping these here lets them share the same concrete page fixtures
+/// as the keyboard contract instead of rebuilding synthetic registries.
+pub(super) fn run_pointer_dialog_regression_matrix() {
+    render_all_non_provider_pointer_surface_variants();
+    pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_default_model_actions_dispatch_from_fresh_sources();
+    pointer_lsp_save_actions_dispatch_from_fresh_sources();
+    pointer_skills_action_family_dispatches_from_fresh_sources();
+    pointer_mcp_action_family_dispatches_from_fresh_sources();
+    pointer_tool_credential_family_dispatches_from_fresh_sources();
+    pointer_tool_custom_command_family_dispatches_from_fresh_sources();
+    pointer_user_tool_action_family_dispatches_from_fresh_sources();
+    pointer_tool_field_reset_family_dispatches_from_fresh_sources();
+    pointer_read_only_tool_sources_render_disabled();
+    pointer_harness_list_actions_dispatch_from_fresh_sources();
+    pointer_harness_field_actions_dispatch_from_fresh_sources();
+    pointer_harness_editor_lifecycle_dispatches_from_fresh_sources();
+    pointer_instruction_list_actions_dispatch_from_fresh_sources();
+    pointer_redact_pattern_rows_dispatch_from_fresh_sources();
+    pointer_string_list_action_families_dispatch_from_fresh_sources();
+    root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
+    category_short_viewport_keeps_bottom_reset_row_visible();
+    nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
+    nav_stack_restores_privacy_and_string_list_parents();
+    root_children_restore_their_own_root_cursor();
+    instructions_enter_grabs_existing_row_then_arrow_swaps();
+    string_list_keyboard_delete_remains_immediate();
+    tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools();
+    tools_reset_pending_cancelled_by_navigation();
+    lsp_reset_r_once_arms_without_wiping();
+    lsp_reset_r_twice_restores_defaults();
+    lsp_reset_pending_cancelled_by_navigation();
+    category_reset_pending_cancelled_by_navigation();
+}
+
+fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
+    use string_list::{StringListKind, StringListPage};
+
+    fn fixture(tmp: &TempDir, kind: StringListKind) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        match kind {
+            StringListKind::AgentDirs => {
+                dialog.extended.agent_dirs = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::ExtraDotenvPaths => {
+                dialog.extended.redact.extra_dotenv_paths = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::RedactDenylist => {
+                dialog.extended.redact.denylist = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::RedactAllowlist => {
+                dialog.extended.redact.allowlist = vec!["ALPHA".into(), "BETA".into()]
+            }
+            StringListKind::GitignoreAllow => {
+                dialog.extended.gitignore_allow = vec!["alpha/**".into(), "beta/**".into()]
+            }
+        }
+        let page = match kind {
+            StringListKind::AgentDirs => StringListPage::agent_dirs(),
+            StringListKind::ExtraDotenvPaths => StringListPage::extra_dotenv_paths(),
+            StringListKind::RedactDenylist => StringListPage::redact_denylist(),
+            StringListKind::RedactAllowlist => StringListPage::redact_allowlist(),
+            StringListKind::GitignoreAllow => StringListPage::gitignore_allow(),
+        };
+        dialog.set_test_page(Page::StringList(Box::new(page)));
+        dialog
+    }
+
+    fn values(dialog: &SettingsDialog, kind: StringListKind) -> Vec<String> {
+        match kind {
+            StringListKind::AgentDirs => dialog
+                .extended
+                .agent_dirs
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::ExtraDotenvPaths => dialog
+                .extended
+                .redact
+                .extra_dotenv_paths
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::RedactDenylist => dialog.extended.redact.denylist.clone(),
+            StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.clone(),
+            StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.clone(),
+        }
+    }
+
+    fn persisted_values(dialog: &SettingsDialog, kind: StringListKind) -> Vec<String> {
+        let config = ExtendedConfigDoc::load(&dialog.extended_path)
+            .expect("persisted string-list config")
+            .config();
+        match kind {
+            StringListKind::AgentDirs => config
+                .agent_dirs
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::ExtraDotenvPaths => config
+                .redact
+                .extra_dotenv_paths
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::RedactDenylist => config.redact.denylist,
+            StringListKind::RedactAllowlist => config.redact.allowlist,
+            StringListKind::GitignoreAllow => config.gitignore_allow,
+        }
+    }
+
+    let kinds = [
+        StringListKind::AgentDirs,
+        StringListKind::ExtraDotenvPaths,
+        StringListKind::RedactDenylist,
+        StringListKind::RedactAllowlist,
+        StringListKind::GitignoreAllow,
+    ];
+    for kind in kinds {
+        let source_tmp = TempDir::new().unwrap();
+        let source = fixture(&source_tmp, kind);
+        let _ = render_settings_rows(&source, 100, 40);
+        assert!(matches!(
+            source.test_page(),
+            TestPageRef::StringList(page) if page.kind == kind
+        ));
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::List(_)),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SettingsPointerAction::List(ListAction::Add)))
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, SettingsPointerAction::List(ListAction::Edit(_))))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    SettingsPointerAction::List(ListAction::Delete(_))
+                ))
+                .count(),
+            2,
+            "each concrete list publishes both stable delete identities"
+        );
+        let expected_ids = values(&source, kind)
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| ListRowId {
+                kind: ListKind::String(kind),
+                index,
+                value,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for ids in [
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    SettingsPointerAction::List(ListAction::Edit(id)) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>(),
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    SettingsPointerAction::List(ListAction::Delete(id)) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>(),
+        ] {
+            assert_eq!(
+                ids, expected_ids,
+                "row payloads preserve exact source identity"
+            );
+        }
+
+        let mut harvested = actions
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut dispatched = harvested.clone();
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fixture(&tmp, kind);
+            let before = values(&dialog, kind);
+            let disk_before = std::fs::read(&dialog.extended_path).ok();
+            click_settings_action(&mut dialog, &action);
+            match &action {
+                SettingsPointerAction::List(ListAction::Delete(id)) => {
+                    dialog.handle_key(press(KeyCode::Char('d')));
+                    let after = values(&dialog, kind);
+                    assert_eq!(after.len(), 1);
+                    assert!(!after.contains(&id.value));
+                    assert_eq!(after[0], before[1usize.saturating_sub(id.index)]);
+                    assert_eq!(persisted_values(&dialog, kind), after);
+                    assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+                }
+                SettingsPointerAction::List(ListAction::Add) => {
+                    type_chars(&mut dialog, "gamma");
+                    click_settings_action(
+                        &mut dialog,
+                        &SettingsPointerAction::List(ListAction::Save),
+                    );
+                    let mut expected = before.clone();
+                    expected.push("gamma".into());
+                    assert_eq!(values(&dialog, kind), expected);
+                    assert_eq!(persisted_values(&dialog, kind), expected);
+                    assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+                }
+                SettingsPointerAction::List(ListAction::Edit(id)) => {
+                    assert!(matches!(
+                        dialog.test_page(),
+                        TestPageRef::StringList(page) if page.grabbed.is_some()
+                    ));
+                    type_chars(&mut dialog, "discarded");
+                    click_settings_action(
+                        &mut dialog,
+                        &SettingsPointerAction::List(ListAction::Cancel),
+                    );
+                    assert_eq!(values(&dialog, kind), before);
+                    assert_eq!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+
+                    let save_tmp = TempDir::new().unwrap();
+                    let mut save_dialog = fixture(&save_tmp, kind);
+                    let save_before = values(&save_dialog, kind);
+                    let save_disk_before = std::fs::read(&save_dialog.extended_path).ok();
+                    click_settings_action(&mut save_dialog, &action);
+                    type_chars(&mut save_dialog, "updated");
+                    click_settings_action(
+                        &mut save_dialog,
+                        &SettingsPointerAction::List(ListAction::Save),
+                    );
+                    let after = values(&save_dialog, kind);
+                    let mut expected = save_before.clone();
+                    expected[id.index] = if kind == StringListKind::RedactDenylist {
+                        "updated".into()
+                    } else {
+                        format!("{}updated", save_before[id.index])
+                    };
+                    assert_eq!(after, expected);
+                    assert_eq!(persisted_values(&save_dialog, kind), expected);
+                    assert_ne!(
+                        std::fs::read(&save_dialog.extended_path).ok(),
+                        save_disk_before
+                    );
+                }
+                _ => {}
+            }
+        }
+        dispatched.extend([
+            SettingsPointerAction::List(ListAction::Save),
+            SettingsPointerAction::List(ListAction::Cancel),
+        ]);
+
+        let initial_tmp = TempDir::new().unwrap();
+        let initial = values(&fixture(&initial_tmp, kind), kind);
+        let row_id = |index: usize| ListRowId {
+            kind: ListKind::String(kind),
+            index,
+            value: initial[index].clone(),
+        };
+        let move_cases = [
+            (
+                SettingsPointerAction::List(ListAction::Edit(row_id(0))),
+                SettingsPointerAction::List(ListAction::MoveDown(row_id(0))),
+                false,
+            ),
+            (
+                SettingsPointerAction::List(ListAction::Edit(row_id(1))),
+                SettingsPointerAction::List(ListAction::MoveUp(row_id(1))),
+                false,
+            ),
+            (
+                SettingsPointerAction::List(ListAction::Add),
+                SettingsPointerAction::List(ListAction::MoveUp(ListRowId {
+                    kind: ListKind::String(kind),
+                    index: 2,
+                    value: String::new(),
+                })),
+                true,
+            ),
+        ];
+        for (begin, movement, added) in move_cases {
+            let source_tmp = TempDir::new().unwrap();
+            let mut source = fixture(&source_tmp, kind);
+            click_settings_action(&mut source, &begin);
+            let _ = render_settings_rows(&source, 100, 40);
+            harvested.extend(
+                source
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::List(_),
+                            ),
+                            true,
+                        ) => Some(action.clone()),
+                        _ => None,
+                    }),
+            );
+            assert!(
+                source
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .any(|target| {
+                        target.enabled
+                            && target.action == shell::SettingsPointerAction::Page(movement.clone())
+                    })
+            );
+
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fixture(&tmp, kind);
+            let disk_before = std::fs::read(&dialog.extended_path).ok();
+            click_settings_action(&mut dialog, &begin);
+            click_settings_action(&mut dialog, &movement);
+            dispatched.insert(movement.clone());
+            if added {
+                type_chars(&mut dialog, "gamma");
+            }
+            let expected = if added {
+                vec![initial[0].clone(), "gamma".into(), initial[1].clone()]
+            } else {
+                vec![initial[1].clone(), initial[0].clone()]
+            };
+            dialog.handle_key(press(KeyCode::Enter));
+            assert_eq!(values(&dialog, kind), expected);
+            assert_eq!(persisted_values(&dialog, kind), expected);
+            assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+        }
+        assert_eq!(
+            harvested, dispatched,
+            "every enabled identity from each closed list source state is replayed"
+        );
+    }
+}
+
+fn pointer_tool_credential_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{CredentialKind, SettingsPointerAction, ToolsAction};
+    for credential in CredentialKind::ALL {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.provider = match credential {
+            CredentialKind::Firecrawl => cockpit_config::extended::WebProvider::Firecrawl,
+            CredentialKind::TinyFish => cockpit_config::extended::WebProvider::Tinyfish,
+        };
+        let action = SettingsPointerAction::Tools(ToolsAction::EditCredential(credential));
+        click_settings_action(&mut dialog, &action);
+        let expected = match credential {
+            CredentialKind::Firecrawl => tools_page::WebKeyProvider::Firecrawl,
+            CredentialKind::TinyFish => tools_page::WebKeyProvider::TinyFish,
+        };
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Tools(page)
+                if page.editing == Some(tools_page::ToolField::WebKey(expected))
+        ));
+    }
+}
+
+fn pointer_tool_custom_command_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{SettingsPointerAction, ToolsAction};
+    for (action, expected) in [
+        (
+            ToolsAction::EditWebFetchCommand,
+            tools_page::ToolField::WebFetchCommand,
+        ),
+        (
+            ToolsAction::EditWebSearchCommand,
+            tools_page::ToolField::WebSearchCommand,
+        ),
+    ] {
+        let source_tmp = TempDir::new().unwrap();
+        let mut source = standalone_pointer_dialog(&source_tmp, "Tools");
+        enter_root_node(&mut source, "Tools");
+        source.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+        let _ = render_settings_rows(&source, 100, 80);
+        let expected_action = SettingsPointerAction::Tools(action.clone());
+        assert!(source.pointer_surface.targets.borrow().iter().any(|target| {
+            target.enabled
+                && matches!(
+                    &target.action,
+                    shell::SettingsPointerAction::Page(rendered) if rendered == &expected_action
+                )
+        }));
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&dispatch_tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+        click_settings_action(&mut dialog, &expected_action);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Tools(page) if page.editing.as_ref() == Some(&expected)
+        ));
+    }
+}
+
+fn pointer_user_tool_action_family_dispatches_from_fresh_sources() {
+    use cockpit_config::extended::ToolCommandTemplate;
+    use pointer_actions::{SettingsPointerAction, ToolsAction, UserToolId};
+
+    fn dialog_with_user_tool(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = standalone_pointer_dialog(tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.tools.insert(
+            "pointer-tool".into(),
+            ToolCommandTemplate {
+                enabled: true,
+                command: "printf pointer".into(),
+                description: Some("pointer acceptance fixture".into()),
+            },
+        );
+        set_tools_cursor_to_label(&mut dialog, "pointer-tool");
+        dialog
+    }
+
+    let id = UserToolId("pointer-tool".into());
+    let actions = [
+        ToolsAction::EditUserToolCommand(id.clone()),
+        ToolsAction::ToggleUserTool(id.clone()),
+        ToolsAction::DeleteUserTool(id.clone()),
+    ];
+    let source_tmp = TempDir::new().unwrap();
+    let source = dialog_with_user_tool(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for action in &actions {
+        let expected = SettingsPointerAction::Tools(action.clone());
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &expected
+                        )
+                })
+        );
+    }
+
+    for action in actions {
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_user_tool(&dispatch_tmp);
+        click_settings_action(&mut dialog, &SettingsPointerAction::Tools(action.clone()));
+        match action {
+            ToolsAction::EditUserToolCommand(_) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Tools(page)
+                    if page.editing
+                        == Some(tools_page::ToolField::UserToolCommand("pointer-tool".into()))
+            )),
+            ToolsAction::ToggleUserTool(_) => assert!(
+                !dialog
+                    .extended
+                    .tools
+                    .get("pointer-tool")
+                    .expect("pointer tool remains present")
+                    .enabled
+            ),
+            ToolsAction::DeleteUserTool(_) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Tools(page) if page.delete_pending.as_deref() == Some("pointer-tool")
+            )),
+            _ => unreachable!("sealed user-tool action family"),
+        }
+    }
+}
+
+fn pointer_tool_field_reset_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{SettingsPointerAction, ToolFieldId, ToolsAction};
+
+    fn dialog_for_field(tmp: &TempDir, field: ToolFieldId) -> SettingsDialog {
+        let mut dialog = standalone_pointer_dialog(tmp, "Tools");
+        enter_root_node(&mut dialog, "Tools");
+        dialog.extended.web.firecrawl_base_url = Some("https://pointer.invalid".into());
+        dialog.extended.web.custom.fetch_command = Some("pointer-fetch {url}".into());
+        dialog.extended.web.custom.search_command = Some("pointer-search {query}".into());
+        let label = match field {
+            ToolFieldId::FirecrawlBaseUrl => "base url",
+            ToolFieldId::WebFetchCommand => {
+                dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+                "webfetch"
+            }
+            ToolFieldId::WebSearchCommand => {
+                dialog.extended.web.provider = cockpit_config::extended::WebProvider::Custom;
+                "websearch"
+            }
+        };
+        set_tools_cursor_to_label(&mut dialog, label);
+        dialog
+    }
+
+    for field in [
+        ToolFieldId::FirecrawlBaseUrl,
+        ToolFieldId::WebFetchCommand,
+        ToolFieldId::WebSearchCommand,
+    ] {
+        let action = SettingsPointerAction::Tools(ToolsAction::ResetToolField(field));
+        let source_tmp = TempDir::new().unwrap();
+        let source = dialog_for_field(&source_tmp, field);
+        let _ = render_settings_rows(&source, 100, 80);
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &action
+                        )
+                })
+        );
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_for_field(&dispatch_tmp, field);
+        click_settings_action(&mut dialog, &action);
+        match field {
+            ToolFieldId::FirecrawlBaseUrl => {
+                assert_eq!(dialog.extended.web.firecrawl_base_url, None);
+                assert_eq!(
+                    dialog.extended.web.custom.fetch_command.as_deref(),
+                    Some("pointer-fetch {url}")
+                );
+                assert_eq!(
+                    dialog.extended.web.custom.search_command.as_deref(),
+                    Some("pointer-search {query}")
+                );
+            }
+            ToolFieldId::WebFetchCommand => {
+                assert_eq!(dialog.extended.web.custom.fetch_command, None);
+                assert_eq!(
+                    dialog.extended.web.custom.search_command.as_deref(),
+                    Some("pointer-search {query}")
+                );
+                assert_eq!(
+                    dialog.extended.web.firecrawl_base_url.as_deref(),
+                    Some("https://pointer.invalid")
+                );
+            }
+            ToolFieldId::WebSearchCommand => {
+                assert_eq!(dialog.extended.web.custom.search_command, None);
+                assert_eq!(
+                    dialog.extended.web.custom.fetch_command.as_deref(),
+                    Some("pointer-fetch {url}")
+                );
+                assert_eq!(
+                    dialog.extended.web.firecrawl_base_url.as_deref(),
+                    Some("https://pointer.invalid")
+                );
+            }
+        }
+    }
+}
+
+fn pointer_read_only_tool_sources_render_disabled() {
+    use pointer_actions::{SettingsPointerAction, ToolsAction};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut dialog);
+    set_tools_cursor_to_label(&mut dialog, "read");
+    let _ = render_settings_rows(&dialog, 100, 18);
+    assert!(
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                !target.enabled
+                    && matches!(
+                        &target.action,
+                        shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                            ToolsAction::ReadOnlyBuiltin(id)
+                        )) if id.0 == "read"
+                    )
+            })
+    );
+
+    let raw = r#"{"servers":{"docs":{"transport":"streamable","endpoint":"https://example.test/mcp","enabled":true}}}"#;
+    std::fs::write(tmp.path().join("mcp.json"), raw).unwrap();
+    let cfg = cockpit_core::mcp::config::McpConfig::parse(raw).unwrap();
+    let server = cfg.servers.get("docs").unwrap();
+    let cache_dir = tmp.path().join("mcp-cache");
+    cockpit_core::mcp::cache::save_in(
+        &cache_dir,
+        &cockpit_core::mcp::cache::cache_key("docs", server),
+        &[cockpit_core::mcp::protocol::ToolDescriptor {
+            name: "lookup".into(),
+            description: "Find docs".into(),
+            input_schema: serde_json::json!({}),
+        }],
+    )
+    .unwrap();
+    dialog.mcp_cache_dir = Some(cache_dir);
+    set_tools_cursor_to_label(&mut dialog, "docs/lookup");
+    let _ = render_settings_rows(&dialog, 100, 18);
+    assert!(
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                !target.enabled
+                    && matches!(
+                        &target.action,
+                        shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                            ToolsAction::ReadOnlyMcpTool(server, tool)
+                        )) if server.0 == "docs" && tool.0 == "lookup"
+                    )
+            })
+    );
+}
+
+fn redact_patterns_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.page = Box::new(RedactPatternsPage::new());
+    dialog
+}
+
+fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, SettingsPointerAction};
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = redact_patterns_pointer_fixture(&source_tmp);
+    let expected_values = source.extended.redact.dotenv_patterns.clone();
+    assert_eq!(expected_values, [".env", ".env.local"]);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::List(
+                        ListAction::Edit(_) | ListAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(actions.len(), expected_values.len() * 2);
+
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = redact_patterns_pointer_fixture(&tmp);
+        match &action {
+            SettingsPointerAction::List(ListAction::Edit(_)) => {
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::RedactPatterns(page) if page.grabbed.is_some()
+                ));
+                let _ = render_settings_rows(&dialog, 100, 40);
+                let grabbed_actions = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::List(
+                                    ListAction::MoveUp(_)
+                                    | ListAction::MoveDown(_)
+                                    | ListAction::Save
+                                    | ListAction::Cancel,
+                                ),
+                            ),
+                            true,
+                        ) => Some(action.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(grabbed_actions.len(), 3);
+                for grabbed_action in grabbed_actions {
+                    let nested_tmp = TempDir::new().unwrap();
+                    let mut nested = redact_patterns_pointer_fixture(&nested_tmp);
+                    click_settings_action(&mut nested, &action);
+                    click_settings_action(&mut nested, &grabbed_action);
+                    match grabbed_action {
+                        SettingsPointerAction::List(
+                            ListAction::MoveUp(_) | ListAction::MoveDown(_),
+                        ) => assert_ne!(
+                            nested.extended.redact.dotenv_patterns, expected_values,
+                            "enabled move changes row order"
+                        ),
+                        SettingsPointerAction::List(ListAction::Save | ListAction::Cancel) => {
+                            assert!(matches!(
+                                nested.test_page(),
+                                TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
+                            ));
+                            assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            SettingsPointerAction::List(ListAction::Delete(_)) => {
+                click_settings_action(&mut dialog, &action);
+                assert_eq!(dialog.extended.redact.dotenv_patterns, expected_values);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::RedactPatterns(page) if page.delete.is_pending_for(page.cursor)
+                ));
+                click_settings_action(&mut dialog, &action);
+                assert_eq!(dialog.extended.redact.dotenv_patterns.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{LspAction, McpAction, SettingsPointerAction, SkillsAction, ToolsAction};
+
+    for title in ["Tools", "Skills", "MCP", "LSP"] {
+        let source_tmp = TempDir::new().unwrap();
+        let mut source = standalone_pointer_dialog(&source_tmp, title);
+        enter_root_node(&mut source, title);
+        let _ = render_settings_rows(&source, 100, 80);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled, title) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Tools(_)),
+                    true,
+                    "Tools",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Skills(_)),
+                    true,
+                    "Skills",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Mcp(_)),
+                    true,
+                    "MCP",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Lsp(_)),
+                    true,
+                    "LSP",
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !actions.is_empty(),
+            "{title} source renders enabled actions"
+        );
+
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = standalone_pointer_dialog(&tmp, title);
+            enter_root_node(&mut dialog, title);
+            let before = serde_json::to_value(&dialog.extended).unwrap();
+            let token_before = dialog.page.pointer_surface_token();
+            click_settings_action(&mut dialog, &action);
+            let config_changed = serde_json::to_value(&dialog.extended).unwrap() != before;
+            let token_changed = dialog.page.pointer_surface_token() != token_before;
+            let semantic_outcome = match (&action, dialog.test_page()) {
+                (SettingsPointerAction::Tools(ToolsAction::CycleWebProvider), _) => config_changed,
+                (
+                    SettingsPointerAction::Tools(
+                        ToolsAction::EditFirecrawlBaseUrl
+                        | ToolsAction::EditCredential(_)
+                        | ToolsAction::EditWebFetchCommand
+                        | ToolsAction::EditWebSearchCommand
+                        | ToolsAction::AddUserTool,
+                    ),
+                    TestPageRef::Tools(page),
+                ) => page.editing.is_some(),
+                (SettingsPointerAction::Tools(ToolsAction::Reset), TestPageRef::Tools(page)) => {
+                    page.reset.is_pending()
+                }
+                (SettingsPointerAction::Tools(ToolsAction::McpJump), _) => token_changed,
+                (
+                    SettingsPointerAction::Skills(
+                        SkillsAction::ToggleAutoBangCommands | SkillsAction::ToggleAncestorWalk,
+                    ),
+                    _,
+                ) => config_changed,
+                (
+                    SettingsPointerAction::Skills(SkillsAction::AddScanDirectory),
+                    TestPageRef::Skills(page),
+                ) => page.grabbed.is_some(),
+                (SettingsPointerAction::Skills(SkillsAction::Reset), TestPageRef::Skills(page)) => {
+                    page.reset.is_pending()
+                }
+                (SettingsPointerAction::Mcp(McpAction::Add), _) => token_changed,
+                (
+                    SettingsPointerAction::Lsp(
+                        LspAction::ToggleEnabled
+                        | LspAction::CycleAutoInstall
+                        | LspAction::ToggleDiagnostics,
+                    ),
+                    _,
+                ) => config_changed,
+                (SettingsPointerAction::Lsp(LspAction::Edit(_)), TestPageRef::Lsp(page)) => {
+                    page.editing.is_some()
+                }
+                (SettingsPointerAction::Lsp(LspAction::Reset), TestPageRef::Lsp(page)) => {
+                    page.reset.is_pending()
+                }
+                (
+                    SettingsPointerAction::Lsp(
+                        LspAction::Check(_)
+                        | LspAction::Install(_)
+                        | LspAction::Uninstall(_)
+                        | LspAction::Restart(_),
+                    ),
+                    _,
+                ) => dialog.pending_daemon_request.is_some(),
+                _ => panic!("unclassified fresh standalone action {action:?}"),
+            };
+            assert!(semantic_outcome, "{action:?} produced no semantic outcome");
+        }
+    }
+}
+
+fn pointer_default_model_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{DefaultModelAction, SettingsPointerAction};
+
+    fn selected() -> cockpit_config::providers::ActiveModelRef {
+        cockpit_config::providers::ActiveModelRef {
+            provider: "vendor".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        }
+    }
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        let selected = selected();
+        dialog.config.active_model = Some(selected.clone());
+        dialog.original_config.active_model = Some(selected);
+        enter_root_node(&mut dialog, DEFAULT_MODEL_TITLE);
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let rendered = render_settings_rows(&source, 100, 24).join("\n");
+    assert!(
+        rendered.contains("Effective default: vendor/m1"),
+        "fixture renders its exact effective selection: {rendered}"
+    );
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::DefaultModel(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        actions,
+        [
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Choose),
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Clear),
+        ]
+        .into_iter()
+        .collect(),
+        "configured default-model page exposes its complete action family"
+    );
+
+    let unset_tmp = TempDir::new().unwrap();
+    let mut unset = fresh_dialog(&unset_tmp);
+    enter_root_node(&mut unset, DEFAULT_MODEL_TITLE);
+    let _ = render_settings_rows(&unset, 100, 24);
+    let clear_targets = unset
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter(|target| {
+            target.action
+                == shell::SettingsPointerAction::Page(SettingsPointerAction::DefaultModel(
+                    DefaultModelAction::Clear,
+                ))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(clear_targets.len(), 1, "unset default has one Clear source");
+    assert!(
+        !clear_targets[0].enabled,
+        "unset default renders Clear disabled"
+    );
+
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let persisted_before = std::fs::read(tmp.path().join("config.json")).unwrap();
+        let _ = render_settings_rows(&dialog, 100, 24);
+        let targets = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter(|target| {
+                target.enabled
+                    && target.action == shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets.len(),
+            1,
+            "default-model action has one exact source"
+        );
+        let target = &targets[0];
+        let down = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        match action {
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Choose) => {
+                assert_eq!(down, SettingsPointerOutcome::Close);
+                assert!(dialog.pending_default_model_picker);
+                assert!(dialog.pending_daemon_request.is_none());
+            }
+            SettingsPointerAction::DefaultModel(DefaultModelAction::Clear) => {
+                assert_eq!(down, SettingsPointerOutcome::Consumed);
+                let staged = dialog.pending_default_model_update_id;
+                assert!(matches!(
+                    dialog.pending_daemon_request.as_ref(),
+                    Some(Request::SetDefaultModel {
+                        default_update_id,
+                        provider: None,
+                        model: None,
+                        clear: true,
+                        ..
+                    }) if Some(*default_update_id) == staged
+                ));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::DefaultModel(page)
+                        if page.effective_default.as_ref() == Some(&selected())
+                            && page.status.as_deref().is_some_and(|status| {
+                            status.starts_with("Clearing the default for new sessions")
+                        })
+                ));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::DefaultModel(page)
+                if page.effective_default.as_ref() == Some(&selected())
+        ));
+        assert_eq!(
+            dialog.handle_pointer(settings_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+        assert_eq!(
+            dialog.config.active_model.as_ref(),
+            Some(&selected()),
+            "pointer action does not claim daemon persistence before completion"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.json")).unwrap(),
+            persisted_before,
+            "default-model actions leave persistence to the selected workflow"
+        );
+    }
+}
+
+fn pointer_lsp_save_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{LspAction, LspEdit as PointerLspEdit, SettingsPointerAction};
+
+    let edits = [
+        PointerLspEdit::OtherFilesLimit,
+        PointerLspEdit::PerFileLimit,
+        PointerLspEdit::DebounceMs,
+        PointerLspEdit::DocumentTimeoutMs,
+        PointerLspEdit::WorkspaceTimeoutMs,
+    ];
+    for (index, edit) in edits.into_iter().enumerate() {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&tmp, "LSP");
+        enter_root_node(&mut dialog, "LSP");
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Lsp(LspAction::Edit(edit)),
+        );
+        let value = 700 + index as u64;
+        let TestPageMut::Lsp(page) = dialog.test_page_mut() else {
+            panic!("LSP edit action must preserve its page")
+        };
+        page.buf.set(value.to_string());
+
+        let _ = render_settings_rows(&dialog, 100, 80);
+        let actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Lsp(LspAction::SaveEdit(rendered)),
+                    ),
+                    true,
+                ) if *rendered == edit => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1, "each LSP edit owns one exact save source");
+        click_settings_action(&mut dialog, &actions[0]);
+
+        let diagnostics = &dialog.extended.lsp.diagnostics;
+        let saved = match edit {
+            PointerLspEdit::OtherFilesLimit => diagnostics.other_files_limit as u64,
+            PointerLspEdit::PerFileLimit => diagnostics.per_file_limit as u64,
+            PointerLspEdit::DebounceMs => diagnostics.debounce_ms,
+            PointerLspEdit::DocumentTimeoutMs => diagnostics.document_timeout_ms,
+            PointerLspEdit::WorkspaceTimeoutMs => diagnostics.workspace_timeout_ms,
+        };
+        assert_eq!(saved, value, "LSP save applies its source field exactly");
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Lsp(page) if page.editing.is_none() && page.status.as_deref() == Some("saved")
+        ));
+
+        let cancel_tmp = TempDir::new().unwrap();
+        let mut cancel_dialog = standalone_pointer_dialog(&cancel_tmp, "LSP");
+        enter_root_node(&mut cancel_dialog, "LSP");
+        let config_before = serde_json::to_value(&cancel_dialog.extended).unwrap();
+        click_settings_action(
+            &mut cancel_dialog,
+            &SettingsPointerAction::Lsp(LspAction::Edit(edit)),
+        );
+        let TestPageMut::Lsp(page) = cancel_dialog.test_page_mut() else {
+            panic!("LSP cancel fixture must enter its editor")
+        };
+        page.buf.set("999999");
+        let _ = render_settings_rows(&cancel_dialog, 100, 80);
+        let cancel_actions = cancel_dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Lsp(LspAction::CancelEdit(rendered)),
+                    ),
+                    true,
+                ) if *rendered == edit => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancel_actions.len(),
+            1,
+            "each LSP edit owns one exact cancel source"
+        );
+        click_settings_action(&mut cancel_dialog, &cancel_actions[0]);
+        assert_eq!(
+            serde_json::to_value(&cancel_dialog.extended).unwrap(),
+            config_before,
+            "LSP cancel does not persist its draft"
+        );
+        assert!(matches!(
+            cancel_dialog.test_page(),
+            TestPageRef::Lsp(page)
+                if page.editing.is_none() && page.buf.text().is_empty() && page.status.is_none()
+        ));
+    }
+}
+
+fn pointer_skills_action_family_dispatches_from_fresh_sources() {
+    use cockpit_config::extended::{ExtendedConfigDoc, SkillsConfig};
+    use pointer_actions::{ConfirmationChoice, SettingsPointerAction, SkillsAction};
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        enter_root_node(&mut dialog, "Skills");
+        dialog.extended.skills.scan_dirs = vec!["alpha/skills".into(), "beta/skills".into()];
+        dialog.extended.skills.auto_bang_commands = false;
+        dialog.extended.skills.ancestor_walk = false;
+        dialog
+            .save_extended()
+            .expect("persist Skills fixture baseline");
+        dialog
+    }
+
+    fn persisted(dialog: &SettingsDialog) -> SkillsConfig {
+        ExtendedConfigDoc::load(&dialog.extended_path)
+            .expect("reload pointer-written Skills config")
+            .config()
+            .skills
+    }
+
+    fn snapshot(skills: &SkillsConfig) -> serde_json::Value {
+        serde_json::to_value(skills).expect("serialize Skills assertion snapshot")
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Skills(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        actions.len(),
+        8,
+        "two rows publish edit and delete controls"
+    );
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let before = dialog.extended.skills.clone();
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Skills(SkillsAction::ToggleAutoBangCommands) => {
+                assert!(dialog.extended.skills.auto_bang_commands);
+                assert!(persisted(&dialog).auto_bang_commands);
+            }
+            SettingsPointerAction::Skills(SkillsAction::ToggleAncestorWalk) => {
+                assert!(dialog.extended.skills.ancestor_walk);
+                assert!(persisted(&dialog).ancestor_walk);
+            }
+            SettingsPointerAction::Skills(SkillsAction::AddScanDirectory) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.grabbed.is_some())
+                );
+                dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&before));
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&before));
+
+                let nested_tmp = TempDir::new().unwrap();
+                let mut nested = fixture(&nested_tmp);
+                click_settings_action(&mut nested, &action);
+                for ch in "gamma/skills".chars() {
+                    nested.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                }
+                nested.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                let mut expected = before.clone();
+                expected.scan_dirs.push("gamma/skills".into());
+                assert_eq!(snapshot(&nested.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&nested)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(ref id)) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.grabbed.is_some())
+                );
+                dialog.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(
+                    snapshot(&dialog.extended.skills),
+                    snapshot(&before),
+                    "cancel rolls back {id:?}"
+                );
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&before));
+
+                let nested_tmp = TempDir::new().unwrap();
+                let mut nested = fixture(&nested_tmp);
+                click_settings_action(&mut nested, &action);
+                nested.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+                nested.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                let mut expected = before.clone();
+                let edited = expected
+                    .scan_dirs
+                    .iter_mut()
+                    .find(|path| path.as_str() == id.0)
+                    .expect("edited source row remains addressable");
+                edited.push('x');
+                assert_eq!(snapshot(&nested.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&nested)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(ref id)) => {
+                assert_eq!(
+                    snapshot(&dialog.extended.skills),
+                    snapshot(&before),
+                    "delete first arms {id:?}"
+                );
+                let _ = render_settings_rows(&dialog, 100, 80);
+                let confirmations = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::Skills(
+                                    SkillsAction::ConfirmDeleteScanDirectory(confirm_id, _),
+                                ),
+                            ),
+                            true,
+                        ) if confirm_id == id => Some(action.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(confirmations.len(), 2);
+                for confirmation in confirmations {
+                    let nested_tmp = TempDir::new().unwrap();
+                    let mut nested = fixture(&nested_tmp);
+                    click_settings_action(&mut nested, &action);
+                    click_settings_action(&mut nested, &confirmation);
+                    match confirmation {
+                        SettingsPointerAction::Skills(
+                            SkillsAction::ConfirmDeleteScanDirectory(
+                                _,
+                                ConfirmationChoice::Confirm,
+                            ),
+                        ) => {
+                            assert!(!nested.extended.skills.scan_dirs.contains(&id.0));
+                            assert_eq!(
+                                snapshot(&persisted(&nested)),
+                                snapshot(&nested.extended.skills)
+                            );
+                        }
+                        SettingsPointerAction::Skills(
+                            SkillsAction::ConfirmDeleteScanDirectory(_, ConfirmationChoice::Cancel),
+                        ) => {
+                            assert_eq!(snapshot(&nested.extended.skills), snapshot(&before));
+                            assert_eq!(snapshot(&persisted(&nested)), snapshot(&before));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            SettingsPointerAction::Skills(SkillsAction::Reset) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Skills(page) if page.reset.is_pending())
+                );
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&before));
+                click_settings_action(&mut dialog, &action);
+                let expected = SkillsConfig::seeded_default();
+                assert_eq!(snapshot(&dialog.extended.skills), snapshot(&expected));
+                assert_eq!(snapshot(&persisted(&dialog)), snapshot(&expected));
+            }
+            SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(_, _)) => {
+                unreachable!("confirmation controls are only rendered after delete")
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{McpAction, SettingsPointerAction};
+
+    const MCP: &str = r#"{
+      "servers": {
+        "docs": {
+          "transport": "streamable",
+          "endpoint": "https://example.test/mcp",
+          "auth": { "kind": "oauth" },
+          "enabled": true
+        }
+      }
+    }"#;
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        std::fs::write(tmp.path().join("mcp.json"), MCP).unwrap();
+        enter_root_node(&mut dialog, "MCP");
+        dialog
+    }
+
+    fn config(dialog: &SettingsDialog) -> cockpit_core::mcp::config::McpConfig {
+        dialog.load_mcp()
+    }
+
+    fn snapshot(config: &cockpit_core::mcp::config::McpConfig) -> serde_json::Value {
+        serde_json::to_value(config).expect("serialize canonical MCP assertion snapshot")
+    }
+
+    fn rendered_actions(
+        dialog: &SettingsDialog,
+    ) -> std::collections::HashSet<SettingsPointerAction> {
+        let _ = render_settings_rows(dialog, 120, 100);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Mcp(_)),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let list_actions = rendered_actions(&source);
+    let docs = pointer_actions::McpServerId("docs".into());
+    assert_eq!(
+        list_actions,
+        [
+            SettingsPointerAction::Mcp(McpAction::Open(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Add),
+            SettingsPointerAction::Mcp(McpAction::ToggleEnabled(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Authenticate(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Delete(docs)),
+        ]
+        .into_iter()
+        .collect(),
+        "populated OAuth row publishes its exact initial control set"
+    );
+
+    for action in list_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let before = config(&dialog);
+        match &action {
+            SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async { click_settings_action(&mut dialog, &action) });
+                assert_eq!(
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
+                    "authentication does not rewrite mcp.json"
+                );
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::List(state)) if state.status.is_some())
+                );
+            }
+            _ => click_settings_action(&mut dialog, &action),
+        }
+        match action {
+            SettingsPointerAction::Mcp(McpAction::Open(_)) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.as_deref() == Some("docs"))
+                );
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
+            }
+            SettingsPointerAction::Mcp(McpAction::Add) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.is_none())
+                );
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
+            }
+            SettingsPointerAction::Mcp(McpAction::ToggleEnabled(_)) => {
+                assert!(!config(&dialog).servers["docs"].enabled);
+            }
+            SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {}
+            SettingsPointerAction::Mcp(McpAction::Delete(_)) => {
+                assert_eq!(
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
+                    "first delete only arms confirmation"
+                );
+                let confirmations = rendered_actions(&dialog);
+                assert!(confirmations.contains(&SettingsPointerAction::Mcp(McpAction::Cancel)));
+                assert!(confirmations.contains(&action));
+
+                let cancel_tmp = TempDir::new().unwrap();
+                let mut cancel = fixture(&cancel_tmp);
+                click_settings_action(&mut cancel, &action);
+                click_settings_action(&mut cancel, &SettingsPointerAction::Mcp(McpAction::Cancel));
+                assert_eq!(snapshot(&config(&cancel)), snapshot(&before));
+
+                click_settings_action(&mut dialog, &action);
+                assert!(config(&dialog).servers.is_empty());
+            }
+            SettingsPointerAction::Mcp(McpAction::Cancel) => unreachable!(),
+            _ => unreachable!(),
+        }
+    }
+
+    let editor_source_tmp = TempDir::new().unwrap();
+    let mut editor_source = fixture(&editor_source_tmp);
+    click_settings_action(
+        &mut editor_source,
+        &SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId("docs".into()))),
+    );
+    let editor_actions = rendered_actions(&editor_source);
+    assert_eq!(
+        editor_actions.len(),
+        19,
+        "editor publishes every typed field and save"
+    );
+
+    for action in editor_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let open = SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId(
+            "docs".into(),
+        )));
+        click_settings_action(&mut dialog, &open);
+        let before = config(&dialog);
+        let saved_enabled_from_editor = match dialog.test_page() {
+            TestPageRef::Mcp(McpPage::Add(state)) => {
+                if state.auth == mcp_page::AuthKind::Oauth
+                    && (state.oauth_authorize_url.text().trim().is_empty()
+                        || state.oauth_token_url.text().trim().is_empty())
+                {
+                    false
+                } else {
+                    state.enabled
+                }
+            }
+            other => panic!("MCP open did not produce an editor source: {other:?}"),
+        };
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Mcp(McpAction::ToggleEditorEnabled) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if !state.enabled)
+                );
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
+            }
+            SettingsPointerAction::Mcp(McpAction::CycleTransport) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.transport == cockpit_core::mcp::config::Transport::Stdio)
+                );
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
+            }
+            SettingsPointerAction::Mcp(McpAction::CycleAuth) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.auth == mcp_page::AuthKind::None)
+                );
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
+            }
+            SettingsPointerAction::Mcp(McpAction::Save) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Mcp(McpPage::List(_))
+                ));
+                let mut expected = before.clone();
+                expected
+                    .servers
+                    .get_mut("docs")
+                    .expect("editor source server remains in expected config")
+                    .enabled = saved_enabled_from_editor;
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&expected));
+            }
+            SettingsPointerAction::Mcp(
+                McpAction::EditName
+                | McpAction::EditEndpoint
+                | McpAction::EditCommand
+                | McpAction::EditArgs
+                | McpAction::EditBaseEnv
+                | McpAction::EditHeaderName
+                | McpAction::EditHeaderValue
+                | McpAction::EditAuthEnv
+                | McpAction::EditOauthAuthorizeUrl
+                | McpAction::EditOauthTokenUrl
+                | McpAction::EditOauthClientId
+                | McpAction::EditOauthScopes
+                | McpAction::EditCacheTtl
+                | McpAction::EditConnectTimeout
+                | McpAction::EditRequestTimeout,
+            ) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Mcp(McpPage::Add(_))
+                ));
+                assert_eq!(
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
+                    "field focus does not persist edits"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn standalone_pointer_dialog(tmp: &TempDir, title: &str) -> SettingsDialog {
+    if title == "LSP" {
+        let active = tmp.path().join("active-project");
+        std::fs::create_dir_all(&active).unwrap();
+        SettingsDialog::open_from_picker(tmp.path().join("config.json"), active)
+    } else {
+        fresh_dialog(tmp)
+    }
+}
+
+fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.command_installed = |_| true;
+    enter_harnesses_from_root(&mut dialog);
+    dialog.extended.tui.mouse_capture = true;
+    dialog
+}
+
+fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.command_installed = |_| true;
+    enter_harnesses_from_root(&mut dialog);
+    dialog.extended.tui.mouse_capture = true;
+    let mut presets = cockpit_config::extended::builtin_harness_presets().into_iter();
+    let (_, alpha) = presets.next().expect("first populated harness fixture");
+    let (_, beta) = presets.next().expect("second populated harness fixture");
+    dialog
+        .extended
+        .harnesses
+        .insert("custom".into(), alpha.clone());
+    dialog.extended.harnesses.insert("alpha".into(), alpha);
+    dialog.extended.harnesses.insert("beta".into(), beta);
+    let TestPageMut::Harnesses(HarnessesPage::List(state)) = dialog.test_page_mut() else {
+        panic!("populated Harnesses fixture did not enter its list page");
+    };
+    state.cursor = 0;
+    assert_eq!(dialog.extended.harnesses.len(), 3);
+    dialog
+}
+
+fn click_settings_action(
+    dialog: &mut SettingsDialog,
+    action: &pointer_actions::SettingsPointerAction,
+) {
+    if let pointer_actions::SettingsPointerAction::Harnesses(
+        pointer_actions::HarnessesAction::Open(id) | pointer_actions::HarnessesAction::Delete(id),
+    ) = action
+    {
+        let mut names = dialog
+            .extended
+            .harnesses
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        let index = names
+            .iter()
+            .position(|name| name == &id.0)
+            .unwrap_or_else(|| panic!("harness action names a missing source row: {}", id.0));
+        let TestPageMut::Harnesses(HarnessesPage::List(state)) = dialog.test_page_mut() else {
+            panic!("harness row action requires a list source: {action:?}");
+        };
+        state.cursor = index;
+    }
+    let _ = render_settings_rows(dialog, 100, 80);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled && target.action == shell::SettingsPointerAction::Page(action.clone())
+        })
+        .cloned()
+        .expect("source action must render on fresh harness fixture");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+    }
+}
+
+fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{HarnessesAction, SettingsPointerAction};
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = harness_list_pointer_fixture(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Harnesses(_)),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 3, "empty Harnesses list has three actions");
+
+    for action in actions {
+        let SettingsPointerAction::Harnesses(harness_action) = &action else {
+            unreachable!();
+        };
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = harness_list_pointer_fixture(&tmp);
+        match harness_action {
+            HarnessesAction::Add => {
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if state.adding.is_some()
+                ));
+            }
+            HarnessesAction::SeedInstalledPresets => {
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.is_empty());
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if state.status.as_deref() == Some("saved")
+                ));
+            }
+            HarnessesAction::ResetAndSeedPresets => {
+                let (_, custom) = cockpit_config::extended::builtin_harness_presets()
+                    .into_iter()
+                    .next()
+                    .expect("harness reset fixture");
+                dialog.extended.harnesses.insert("custom".into(), custom);
+                click_settings_action(&mut dialog, &action);
+                assert!(dialog.extended.harnesses.contains_key("custom"));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state)) if state.reset.is_pending()
+                ));
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.contains_key("custom"));
+                assert!(!dialog.extended.harnesses.is_empty());
+            }
+            HarnessesAction::Open(_)
+            | HarnessesAction::Delete(_)
+            | HarnessesAction::EditField(_)
+            | HarnessesAction::Save
+            | HarnessesAction::Cancel => {
+                panic!("empty Harnesses list rendered unexpected action {harness_action:?}")
+            }
+        }
+    }
+
+    let populated_tmp = TempDir::new().unwrap();
+    let populated = populated_harness_list_pointer_fixture(&populated_tmp);
+    let _ = render_settings_rows(&populated, 100, 40);
+    let populated_actions = populated
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Harnesses(
+                        HarnessesAction::Open(_) | HarnessesAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Open(
+            pointer_actions::HarnessId("alpha".into()),
+        )))
+    );
+    assert!(
+        populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Delete(
+            pointer_actions::HarnessId("alpha".into()),
+        )))
+    );
+    for action in &populated_actions {
+        let SettingsPointerAction::Harnesses(
+            HarnessesAction::Open(id) | HarnessesAction::Delete(id),
+        ) = action
+        else {
+            unreachable!("populated source filter admitted a non-row action");
+        };
+        assert!(
+            populated.extended.harnesses.contains_key(&id.0),
+            "rendered Harnesses identity must name a live config entry: {}",
+            id.0
+        );
+    }
+    for action in populated_actions {
+        match &action {
+            SettingsPointerAction::Harnesses(HarnessesAction::Open(id)) => {
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.name == id.0
+                ));
+            }
+            SettingsPointerAction::Harnesses(HarnessesAction::Delete(id)) => {
+                // First press only arms; the explicit Cancel target clears it.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                assert!(dialog.extended.harnesses.contains_key(&id.0));
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
+                ));
+                click_settings_action(
+                    &mut dialog,
+                    &SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+                );
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if !state.delete_pending
+                            && state.status.as_deref() == Some("delete cancelled")
+                ));
+
+                // A second press on the same stable row identity applies.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                click_settings_action(&mut dialog, &action);
+                click_settings_action(&mut dialog, &action);
+                assert!(!dialog.extended.harnesses.contains_key(&id.0));
+                assert_eq!(dialog.extended.harnesses.len(), 2);
+
+                // A target captured before its row disappears must be inert.
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+                let _ = render_settings_rows(&dialog, 100, 40);
+                let stale = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action == shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("populated delete target");
+                dialog.extended.harnesses.remove(&id.0);
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    dialog.handle_pointer(settings_mouse(kind, stale.rect.x, stale.rect.y));
+                }
+                assert_eq!(dialog.extended.harnesses.len(), 2);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Harnesses(HarnessesPage::List(state))
+                        if !state.delete_pending
+                ));
+            }
+            SettingsPointerAction::Harnesses(
+                HarnessesAction::Add
+                | HarnessesAction::SeedInstalledPresets
+                | HarnessesAction::ResetAndSeedPresets
+                | HarnessesAction::EditField(_)
+                | HarnessesAction::Save
+                | HarnessesAction::Cancel,
+            )
+            | SettingsPointerAction::Root(_)
+            | SettingsPointerAction::Category(_)
+            | SettingsPointerAction::Agents(_)
+            | SettingsPointerAction::Tools(_)
+            | SettingsPointerAction::Skills(_)
+            | SettingsPointerAction::Mcp(_)
+            | SettingsPointerAction::Providers(_)
+            | SettingsPointerAction::Lsp(_)
+            | SettingsPointerAction::List(_)
+            | SettingsPointerAction::UtilityModel(_)
+            | SettingsPointerAction::DefaultModel(_) => {
+                panic!("populated Harnesses fixture harvested unexpected action {action:?}")
+            }
+        }
+    }
+
+    // Delete is published only for the selected row. Independently select
+    // and dispatch every real source identity, including rows clipped from
+    // the smaller inventory render above.
+    for name in ["alpha", "beta", "custom"] {
+        let delete = SettingsPointerAction::Harnesses(HarnessesAction::Delete(
+            pointer_actions::HarnessId(name.into()),
+        ));
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+        click_settings_action(&mut dialog, &delete);
+        assert!(dialog.extended.harnesses.contains_key(name));
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
+        ));
+    }
+}
+
+fn pointer_harness_field_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{HarnessField, HarnessId, HarnessesAction, SettingsPointerAction};
+
+    fn detail_dialog(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = populated_harness_list_pointer_fixture(tmp);
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::Open(HarnessId("custom".into()))),
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.name == "custom"
+        ));
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = detail_dialog(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for field in HarnessField::ALL {
+        let action = SettingsPointerAction::Harnesses(HarnessesAction::EditField(field));
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &action
+                        )
+                })
+        );
+
+        let dispatch_tmp = TempDir::new().unwrap();
+        let mut dialog = detail_dialog(&dispatch_tmp);
+        let before = dialog
+            .extended
+            .harnesses
+            .get("custom")
+            .expect("custom harness source")
+            .clone();
+        let before_json = serde_json::to_value(&before).expect("serialize harness source");
+        click_settings_action(&mut dialog, &action);
+        let TestPageRef::Harnesses(HarnessesPage::Edit(state)) = dialog.test_page() else {
+            panic!("field dispatch preserves harness detail");
+        };
+        let after = dialog
+            .extended
+            .harnesses
+            .get("custom")
+            .expect("custom harness remains present");
+        match field {
+            HarnessField::PromptInput => {
+                assert!(state.editing.is_none());
+                assert_ne!(after.prompt_input, before.prompt_input);
+            }
+            HarnessField::ArgvOverflow => {
+                assert!(state.editing.is_none());
+                assert_ne!(after.argv_overflow, before.argv_overflow);
+            }
+            HarnessField::SupportsJson => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.supports_json_output, !before.supports_json_output);
+            }
+            HarnessField::SupportsAgentFile => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.supports_agent_file, !before.supports_agent_file);
+            }
+            HarnessField::AlwaysAllow => {
+                assert!(state.editing.is_none());
+                assert_eq!(after.always_allow, !before.always_allow);
+            }
+            HarnessField::Command
+            | HarnessField::Args
+            | HarnessField::ModelArgs
+            | HarnessField::DefaultModel
+            | HarnessField::Models
+            | HarnessField::ModelListArgs
+            | HarnessField::JsonOutputArgs
+            | HarnessField::AgentFileArgs
+            | HarnessField::AgentFileEnv
+            | HarnessField::AuthEnvVars
+            | HarnessField::AuthProbeArgs
+            | HarnessField::Timeout => {
+                assert!(state.editing.is_some());
+                assert_eq!(
+                    serde_json::to_value(after).expect("serialize harness after editor open"),
+                    before_json,
+                    "opening a field editor does not commit"
+                );
+            }
+        }
+    }
+}
+
+fn pointer_harness_editor_lifecycle_dispatches_from_fresh_sources() {
+    use pointer_actions::{HarnessField, HarnessId, HarnessesAction, SettingsPointerAction};
+
+    fn command_editor(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = populated_harness_list_pointer_fixture(tmp);
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::Open(HarnessId("custom".into()))),
+        );
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Harnesses(HarnessesAction::EditField(HarnessField::Command)),
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_some()
+        ));
+        dialog
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = command_editor(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 80);
+    for action in [HarnessesAction::Save, HarnessesAction::Cancel] {
+        let expected = SettingsPointerAction::Harnesses(action);
+        assert!(
+            source
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    target.enabled
+                        && matches!(
+                            &target.action,
+                            shell::SettingsPointerAction::Page(rendered) if rendered == &expected
+                        )
+                })
+        );
+    }
+
+    let save_tmp = TempDir::new().unwrap();
+    let mut save_dialog = command_editor(&save_tmp);
+    let original = save_dialog.extended.harnesses["custom"].command.clone();
+    let TestPageMut::Harnesses(HarnessesPage::Edit(state)) = save_dialog.test_page_mut() else {
+        panic!("command editor remains open");
+    };
+    state.editing = Some(crate::tui::textfield::TextField::new("pointer-command"));
+    click_settings_action(
+        &mut save_dialog,
+        &SettingsPointerAction::Harnesses(HarnessesAction::Save),
+    );
+    assert_ne!(original, "pointer-command");
+    assert_eq!(
+        save_dialog.extended.harnesses["custom"].command,
+        "pointer-command"
+    );
+    assert!(matches!(
+        save_dialog.test_page(),
+        TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_none()
+    ));
+    let persisted = ExtendedConfigDoc::load(&save_dialog.extended_path)
+        .expect("saved harness config")
+        .config();
+    assert_eq!(persisted.harnesses["custom"].command, "pointer-command");
+
+    let cancel_tmp = TempDir::new().unwrap();
+    let mut cancel_dialog = command_editor(&cancel_tmp);
+    let original = cancel_dialog.extended.harnesses["custom"].command.clone();
+    let disk_before = std::fs::read(&cancel_dialog.extended_path).ok();
+    let TestPageMut::Harnesses(HarnessesPage::Edit(state)) = cancel_dialog.test_page_mut() else {
+        panic!("command editor remains open");
+    };
+    state.editing = Some(crate::tui::textfield::TextField::new("discarded-command"));
+    click_settings_action(
+        &mut cancel_dialog,
+        &SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
+    );
+    assert_eq!(cancel_dialog.extended.harnesses["custom"].command, original);
+    assert!(matches!(
+        cancel_dialog.test_page(),
+        TestPageRef::Harnesses(HarnessesPage::Edit(state)) if state.editing.is_none()
+    ));
+    assert_eq!(
+        std::fs::read(&cancel_dialog.extended_path).ok(),
+        disk_before,
+        "Cancel must not persist the edited buffer"
+    );
+}
+
+/// Render the concrete nested states whose discriminants form the strict
+/// pointer-surface inventory. Mouse capture is disabled for this inventory
+/// pass: enabled controls are exercised by the reducer matrices below, while
+/// this pass proves that every state variant itself remains constructible and
+/// renderable through production navigation.
+fn render_all_non_provider_pointer_surface_variants() {
+    // Render each standalone root child explicitly. Surface coverage must be
+    // owned by this acceptance run, never inherited accidentally from some
+    // earlier test that happened to execute on the same thread-local worker.
+    for (title, expected_surface) in [
+        ("Dependencies", SettingsPointerSurfaceKind::Dependencies),
+        ("Tools", SettingsPointerSurfaceKind::Tools),
+        ("Skills", SettingsPointerSurfaceKind::Skills),
+        ("MCP", SettingsPointerSurfaceKind::Mcp),
+        ("LSP", SettingsPointerSurfaceKind::Lsp),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = standalone_pointer_dialog(&tmp, title);
+        enter_root_node(&mut d, title);
+        let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(
+            actual_surface, expected_surface,
+            "rendered {title} source page"
+        );
+        // Keep the acceptance recorder tied to the verified source page in
+        // addition to the production render hook. This makes the fixture
+        // deterministic under the parallel libtest harness instead of
+        // relying on a render-hook thread-local surviving the draw closure.
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
+    }
+
+    for (page, expected_surface) in [
+        (
+            instructions_page(InstructionsPage::new()),
+            SettingsPointerSurfaceKind::Instructions,
+        ),
+        (
+            Box::new(RedactPatternsPage::new()) as PageBox,
+            SettingsPointerSurfaceKind::RedactPatterns,
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.page = page;
+        let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(actual_surface, expected_surface);
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
+    }
+
+    // Harnesses: list, add-name editor, harness editor, field editor.
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_harnesses_from_root(&mut d);
+    d.extended.tui.mouse_capture = false;
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Char('a')));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    enter_harnesses_from_root(&mut d);
+    d.extended.tui.mouse_capture = false;
+    let (_, harness) = cockpit_config::extended::builtin_harness_presets()
+        .into_iter()
+        .next()
+        .expect("built-in harness fixture");
+    d.extended.harnesses.insert("fixture".into(), harness);
+    let TestPageMut::Harnesses(HarnessesPage::List(state)) = d.test_page_mut() else {
+        panic!("Harnesses edit surface fixture did not enter list");
+    };
+    state.cursor = 0;
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    // Agents: list, structured detail, and the in-TUI source editor.
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Agents");
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    let _editor = EditorEnv::unset();
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Agents");
+    d.handle_key(press(KeyCode::Char('e')));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    // Every StringListKind in both browse and grab/edit modes.
+    let constructors: [fn() -> StringListPage; 5] = [
+        StringListPage::agent_dirs,
+        StringListPage::extra_dotenv_paths,
+        StringListPage::redact_denylist,
+        StringListPage::redact_allowlist,
+        StringListPage::gitignore_allow,
+    ];
+    for construct in constructors {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.tui.mouse_capture = false;
+        d.set_test_page(Page::StringList(Box::new(construct())));
+        let _ = render_settings_rows(&d, 100, 40);
+        d.handle_key(press(KeyCode::Enter));
+        let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(actual_surface, SettingsPointerSurfaceKind::StringList);
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
+    }
+
+    // Category base, inline, path, full-text, external, picker-list, and
+    // picker-custom modes. The fixture constructor uses the same production
+    // editor/picker types as normal descriptor activation.
+    for mode in category::CategoryPointerFixtureMode::ALL {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.tui.mouse_capture = false;
+        d.set_test_page(Page::Category(Box::new(
+            category::CategoryPage::pointer_surface_fixture(mode, tmp.path()),
+        )));
+        let rows = render_settings_rows(&d, 100, 40);
+        let rendered = rows.join("\n");
+        assert!(!rendered.contains("[Save custom]"));
+        assert!(!rendered.contains("[clear — unset]"));
+        assert!(!rendered.contains("[custom provider:model-id…]"));
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Default model for new sessions");
+    let rendered = render_settings_rows(&d, 100, 40).join("\n");
+    assert!(!rendered.contains("[Choose default model]"));
+    assert!(!rendered.contains("[Clear default for this scope]"));
+}
+
+pub(super) fn run_pointer_text_layout_matrix() {
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    let entry = entry(&[]);
+    let mut editor = settings_editor::SettingsEditor::for_provider("p", &entry);
+    let field = settings_editor::ProviderSettingId::AutoCompactPct;
+    editor.cursor = editor
+        .fields()
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap();
+    editor.editing = Some(field);
+    editor.buf = TextField::new("12345");
+    d.set_test_page(Page::Providers(ProvidersPage::ProviderSettings {
+        editor,
+        parent: Box::new(providers::EditState::new("p".into(), entry)),
+    }));
+    for (width, height) in [(100, 30), (48, 18)] {
+        let _ = render_settings_rows(&d, width, height);
+        let target = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    shell::SettingsPointerAction::Page(
+                        pointer_actions::SettingsPointerAction::Providers(
+                            pointer_actions::ProvidersAction::RowEditor(
+                                pointer_actions::ProviderRowEditorAction::SettingEdit(_)
+                            )
+                        )
+                    )
+                )
+            })
+            .cloned()
+            .expect("numeric field target");
+        let x = target.rect.right().saturating_sub(2);
+        assert_eq!(
+            d.handle_pointer(settings_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                target.rect.y
+            )),
+            SettingsPointerOutcome::Consumed
+        );
+        let TestPageRef::Providers(ProvidersPage::ProviderSettings { editor, .. }) = d.test_page()
+        else {
+            panic!("provider settings");
+        };
+        assert!(editor.buf.text().is_char_boundary(editor.buf.cursor()));
+        assert_eq!(
+            editor.buf.text(),
+            "12345",
+            "click does not commit or mutate"
+        );
+    }
+
+    for value in ["ascii", "a界b", "e\u{301}x"] {
+        let mut field = TextField::new(value);
+        for column in 0..=12 {
+            field.set_cursor_display_col(column);
+            assert!(field.text().is_char_boundary(field.cursor()));
+        }
+    }
+}
+
+pub(super) fn run_pointer_picker_suggestion_matrix() {
+    for expected in ["anthropic:opus", "", "custom-provider:model"] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        open_utility_picker(&mut d);
+        let _ = render_settings_rows(&d, 90, 24);
+        let wanted = if expected.is_empty() {
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::Clear,
+            )
+        } else if expected.starts_with("custom-") {
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::OpenCustom,
+            )
+        } else {
+            pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::PickerSelect(
+                    SettingId::UtilityModel,
+                    pointer_actions::PickerOptionId(expected.into()),
+                ),
+            )
+        };
+        let target = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.action == shell::SettingsPointerAction::Page(wanted.clone()))
+            .cloned()
+            .expect("rendered picker target");
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        if expected.starts_with("custom-") {
+            type_chars(&mut d, expected);
+            let _ = render_settings_rows(&d, 48, 18);
+            let save = d
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action
+                        == shell::SettingsPointerAction::Page(
+                            pointer_actions::SettingsPointerAction::UtilityModel(
+                                pointer_actions::UtilityModelAction::CommitCustom,
+                            ),
+                        )
+                })
+                .cloned()
+                .expect("custom save target");
+            d.handle_pointer(settings_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                save.rect.x,
+                save.rect.y,
+            ));
+        }
+        assert_eq!(d.extended.utility_model.as_deref().unwrap_or(""), expected);
+    }
+
+    // Dispatch every concrete model identity published by the live picker,
+    // not just one representative entry. The acceptance inventory compares
+    // exact source payloads so a newly rendered model cannot hide behind the
+    // shared `Select` discriminant.
+    let source_tmp = TempDir::new().unwrap();
+    let mut source = dialog_with_models(&source_tmp);
+    open_utility_picker(&mut source);
+    let _ = render_settings_rows(&source, 90, 24);
+    let select_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::Category(
+                        pointer_actions::CategoryAction::PickerSelect(_, _),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!select_actions.is_empty());
+    for action in select_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(&mut dialog, &action);
+        let pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::PickerSelect(_, id),
+        ) = action
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            dialog.extended.utility_model.as_deref(),
+            Some(id.0.as_str())
+        );
+    }
+
+    let utility_select_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::Select(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!utility_select_actions.is_empty());
+    for action in utility_select_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(&mut dialog, &action);
+        let pointer_actions::SettingsPointerAction::UtilityModel(
+            pointer_actions::UtilityModelAction::Select(id),
+        ) = action
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            dialog.extended.utility_model.as_deref(),
+            Some(id.0.as_str())
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if page.utility_picker.is_none()
+        ));
+    }
+
+    let back_tmp = TempDir::new().unwrap();
+    let mut back = dialog_with_models(&back_tmp);
+    open_utility_picker(&mut back);
+    let config_before = serde_json::to_value(&back.extended).unwrap();
+    let persisted_before = std::fs::read(back_tmp.path().join("config.json")).unwrap();
+    let _ = render_settings_rows(&back, 90, 24);
+    let back_actions = back
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::Back,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(back_actions.len(), 1, "utility picker owns one Back source");
+    let target = back
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled
+                && target.action == shell::SettingsPointerAction::Page(back_actions[0].clone())
+        })
+        .cloned()
+        .expect("fresh utility picker renders its exact Back target");
+    assert_eq!(
+        back.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        back.test_page(),
+        TestPageRef::Category(page)
+            if page.category == Category::Behavior
+                && page.utility_picker.is_none()
+                && page.utility_picker_target.is_none()
+                && page.editing.is_none()
+    ));
+    assert_eq!(
+        back.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert_eq!(serde_json::to_value(&back.extended).unwrap(), config_before);
+    assert_eq!(
+        std::fs::read(back_tmp.path().join("config.json")).unwrap(),
+        persisted_before,
+        "Utility Back does not write configuration"
+    );
+    assert!(matches!(
+        back.test_page(),
+        TestPageRef::Category(page)
+            if page.category == Category::Behavior
+                && page.utility_picker.is_none()
+                && page.utility_picker_target.is_none()
+                && page.editing.is_none()
+    ));
+
+    let tmp = TempDir::new().unwrap();
+    let mut source = dialog_with_models(&tmp);
+    open_utility_picker(&mut source);
+    click_settings_action(
+        &mut source,
+        &pointer_actions::SettingsPointerAction::UtilityModel(
+            pointer_actions::UtilityModelAction::OpenCustom,
+        ),
+    );
+    let _ = render_settings_rows(&source, 90, 24);
+    let custom_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::EditCustom
+                        | pointer_actions::UtilityModelAction::CommitCustom
+                        | pointer_actions::UtilityModelAction::CancelCustom,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(custom_actions.len(), 3);
+    for action in custom_actions {
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::OpenCustom,
+            ),
+        );
+        if matches!(
+            action,
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CommitCustom
+            )
+        ) {
+            type_chars(&mut dialog, "custom-provider:model");
+        }
+        click_settings_action(&mut dialog, &action);
+        match action {
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::EditCustom,
+            ) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Category(page) if page.utility_picker.is_some()
+            )),
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CommitCustom,
+            ) => assert_eq!(
+                dialog.extended.utility_model.as_deref(),
+                Some("custom-provider:model")
+            ),
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::CancelCustom,
+            ) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Category(page)
+                        if page.utility_picker.as_ref().is_some_and(|picker| matches!(
+                            &picker.mode,
+                            super::ui_page::PickerMode::List { .. }
+                        ))
+                ));
+                assert!(dialog.extended.utility_model.is_none());
+
+                let mut keyboard = dialog_with_models(&tmp);
+                open_utility_picker(&mut keyboard);
+                click_settings_action(
+                    &mut keyboard,
+                    &pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::OpenCustom,
+                    ),
+                );
+                keyboard.handle_key(press(KeyCode::Esc));
+                assert!(matches!(
+                    keyboard.test_page(),
+                    TestPageRef::Category(page)
+                        if page.utility_picker.as_ref().is_some_and(|picker| matches!(
+                            &picker.mode,
+                            super::ui_page::PickerMode::List { .. }
+                        ))
+                ));
+                assert!(keyboard.extended.utility_model.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch").unwrap();
+    open_category_on(&mut d, Category::Privacy, SettingId::SandboxDockerfile);
+    d.handle_key(press(KeyCode::Enter));
+    if let TestPageMut::Category(page) = d.test_page_mut() {
+        page.path_editor
+            .as_mut()
+            .unwrap()
+            .set_text_for_test("Dock".into(), tmp.path());
+    }
+    let before = d.extended.sandbox.dockerfile.clone();
+    let _ = render_settings_rows(&d, 72, 20);
+    let target = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                shell::SettingsPointerAction::Page(
+                    pointer_actions::SettingsPointerAction::Category(
+                        pointer_actions::CategoryAction::SuggestionSelect(_, _)
+                    )
+                )
+            )
+        })
+        .cloned()
+        .expect("directory suggestion target");
+    d.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        target.rect.x,
+        target.rect.y,
+    ));
+    assert_ne!(
+        d.extended.sandbox.dockerfile, before,
+        "suggestion click follows Enter commit path"
+    );
+}
+
+fn instructions_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.extended.agent_guidance_files = vec!["AGENTS.md".into(), "GUIDE.md".into()];
+    dialog.page = super::instructions_page(super::ui_page::InstructionsPage::new());
+    dialog
+}
+
+fn pointer_instruction_list_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, SettingsPointerAction};
+    let tmp = TempDir::new().unwrap();
+    let source = instructions_pointer_fixture(&tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::List(
+                        ListAction::Add | ListAction::Edit(_) | ListAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, SettingsPointerAction::List(ListAction::Add)))
+    );
+    for action in actions {
+        let mut dialog = instructions_pointer_fixture(&tmp);
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::List(ListAction::Add | ListAction::Edit(_)) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Instructions(page) if page.grabbed.is_some()
+                ))
+            }
+            SettingsPointerAction::List(ListAction::Delete(row)) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Instructions(page) if page.delete.is_pending_for(row.index)
+            )),
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub(super) fn run_pointer_header_back_matrix() {
+    for title in [
+        PROVIDERS_TITLE,
+        "Agents",
+        "Interface",
+        "Behavior",
+        "Privacy & Safety",
+        "Translation",
+        "Profile",
+        "Tools",
+        "Harnesses",
+        "Skills",
+        "MCP",
+        "LSP",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, title);
+        let _ = render_settings_rows(&d, 92, 20);
+        let back = d
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action
+                    == shell::SettingsPointerAction::Header(shell::SettingsHeaderAction::Back)
+            })
+            .cloned()
+            .expect("child Back target");
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            back.rect.x,
+            back.rect.y,
+        ));
+        assert!(
+            matches!(d.test_page(), TestPageRef::Root { cursor } if cursor == root_index(title))
+        );
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = dialog_with_one_provider(&tmp);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 92, 20);
+    let back = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action == shell::SettingsPointerAction::Header(shell::SettingsHeaderAction::Back)
+        })
+        .cloned()
+        .unwrap();
+    d.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        back.rect.x,
+        back.rect.y,
+    ));
+    assert!(matches!(
+        d.test_page(),
+        TestPageRef::Providers(ProvidersPage::List { .. })
+    ));
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.cx.picker_cwd = Some(tmp.path().to_path_buf());
+    let _ = render_settings_rows(&d, 48, 10);
+    let picker = d
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == shell::SettingsPointerAction::Header(
+                    shell::SettingsHeaderAction::BackToConfigPicker,
+                )
+        })
+        .cloned()
+        .expect("picker return target");
+    assert_eq!(
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            picker.rect.x,
+            picker.rect.y
+        )),
+        SettingsPointerOutcome::Close
+    );
+    assert!(d.back_to_picker);
+}
+
+#[test]
+fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let _ = render_settings_rows(&dialog, 80, 12);
+
+    let first = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                shell::SettingsPointerAction::Page(pointer_actions::SettingsPointerAction::Root(_))
+            )
+        })
+        .cloned()
+        .expect("root's first semantic target");
+    assert_eq!(
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollDown,
+            first.rect.x,
+            first.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 3 }
+    ));
+    for _ in 0..10 {
+        let _ = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollUp,
+            first.rect.x,
+            first.rect.y,
+        ));
+    }
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 0 }
+    ));
+
+    let _ = dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        first.rect.x,
+        first.rect.y,
+    ));
+    assert_eq!(
+        dialog.page.pointer_surface_kind(),
+        SettingsPointerSurfaceKind::DefaultModel
+    );
+
+    // Dispatch every identity published by the real root source, not merely
+    // the first row. Each action gets a fresh dialog because navigation
+    // replaces the root page.
+    let source_tmp = TempDir::new().unwrap();
+    let source = fresh_dialog(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::Root(_),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), pointer_actions::RootNodeId::ALL.len());
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut fresh = fresh_dialog(&tmp);
+        click_settings_action(&mut fresh, &action);
+        assert_ne!(
+            fresh.page.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::Root,
+            "root action did not navigate: {action:?}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct ProbePage {
     handled: bool,
 }
 
 impl SettingsPage for ProbePage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Root
+    }
+
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc => Nav::Back,
@@ -688,7 +3529,9 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
         "probe page should handle keys through SettingsPage"
     );
 
-    let rows = render_settings_rows(&d, 40, 4).join("\n");
+    // The dialog reserves one row each for its header and help strip. Include
+    // one body row inside the border so the boxed page can render content.
+    let rows = render_settings_rows(&d, 40, 5).join("\n");
     assert!(rows.contains("probe page"), "rendered rows were {rows:?}");
 
     d.handle_key(press(KeyCode::Esc));
@@ -753,10 +3596,10 @@ fn category_wrapped_values_continue_under_value_column() {
     if let TestPageMut::Category(p) = d.test_page_mut() {
         p.cursor = p.cursor_of(SettingId::LlmMode).expect("llm mode");
     }
-    let rendered = render_settings_rows(&d, 62, 18).join("\n");
+    let rendered = render_settings_rows(&d, 62, 30).join("\n");
     let continuation = rendered
         .lines()
-        .find(|line| line.contains("default) uses"))
+        .find(|line| line.contains("decomposition"))
         .unwrap_or_else(|| panic!("expected wrapped llm-mode value:\n{rendered}"));
     assert!(
         continuation.starts_with("│     "),
@@ -1014,12 +3857,16 @@ fn category_ctrl_g_focused_prose_setting_round_trips_and_commits() {
     let mut d = fresh_dialog(&tmp);
     open_category_on(&mut d, Category::Behavior, SettingId::CompactPrompt);
     d.handle_key(ctrl('g'));
-    let path = d
+    let (operation_id, path) = d
         .take_pending_category_external_edit()
         .expect("category external edit should be pending");
     assert!(d.take_pending_category_external_edit().is_none());
     std::fs::write(&path, "external compact prompt\n").unwrap();
-    d.finish_category_external_edit(None);
+    d.finish_category_external_edit(
+        operation_id,
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
 
     assert_eq!(
         d.extended.compact_prompt.as_deref(),
@@ -1361,6 +4208,135 @@ fn global_name_edit_prompts_to_remove_shadowing_project_value() {
     assert_eq!(global_cfg.name.as_deref(), Some("Ada"));
     assert!(project_raw.get("name").is_none());
     assert_eq!(project_raw["tui"]["show_cwd"], false);
+}
+
+pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
+    use cockpit_config::extended::ExtendedConfigDoc;
+    for (choice, removes) in [
+        (pointer_actions::ConfirmationChoice::Confirm, true),
+        (pointer_actions::ConfirmationChoice::Cancel, false),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("home/.config/cockpit/config.json");
+        let project = tmp.path().join("repo");
+        let project_config = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::write(&global, r#"{"name":"Global"}"#).unwrap();
+        std::fs::write(&project_config, r#"{"name":"Project"}"#).unwrap();
+        let mut dialog = SettingsDialog::open_from_picker(global, project);
+        open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+        dialog.handle_key(press(KeyCode::Enter));
+        type_chars(&mut dialog, " pointer");
+        dialog.handle_key(press(KeyCode::Enter));
+        let _ = render_settings_rows(&dialog, 80, 20);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::Confirm(SettingId::Name, choice),
+            ),
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_config).unwrap()).unwrap();
+        assert_eq!(raw.get("name").is_none(), removes);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if page.shadowed_global.is_none()
+        ));
+        let _ = ExtendedConfigDoc::load(&dialog.config_path).unwrap();
+    }
+
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+    dialog.handle_key(press(KeyCode::Enter));
+    let action = pointer_actions::SettingsPointerAction::Category(
+        pointer_actions::CategoryAction::ExternalEditBegin(
+            SettingId::Name,
+            pointer_actions::CategoryExternalSource::Inline,
+        ),
+    );
+    let _ = render_settings_rows(&dialog, 80, 20);
+    click_settings_action(&mut dialog, &action);
+    let (operation, _) = dialog
+        .take_pending_category_external_edit()
+        .expect("category effect drains once");
+    assert!(dialog.take_pending_category_external_edit().is_none());
+    dialog.finish_category_external_edit(
+        PointerOperationId(operation.0 + 1),
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page) if page.pending_external_edit.is_some()
+    ));
+    let saved_action = pointer_actions::SettingsPointerAction::Category(
+        pointer_actions::CategoryAction::ExternalEditResult(
+            SettingId::Name,
+            pointer_actions::ExternalEditOutcome::Saved,
+        ),
+    );
+    super::pointer_acceptance_tests::record_source_action(&saved_action);
+    dialog.finish_category_external_edit(
+        operation,
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
+    super::pointer_acceptance_tests::record_dispatched_action(&saved_action);
+    let status = match dialog.test_page() {
+        TestPageRef::Category(page) => page.status.clone(),
+        _ => unreachable!(),
+    };
+    dialog.finish_category_external_edit(
+        operation,
+        pointer_actions::ExternalEditOutcome::Failed,
+        Some("duplicate".into()),
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page) if page.status == status
+    ));
+
+    for outcome in [
+        pointer_actions::ExternalEditOutcome::Cancelled,
+        pointer_actions::ExternalEditOutcome::Failed,
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+        dialog.handle_key(press(KeyCode::Enter));
+        type_chars(&mut dialog, " retained-draft");
+        let _ = render_settings_rows(&dialog, 80, 20);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::ExternalEditBegin(
+                    SettingId::Name,
+                    pointer_actions::CategoryExternalSource::Inline,
+                ),
+            ),
+        );
+        let operation = dialog
+            .take_pending_category_external_edit()
+            .expect("category outcome effect")
+            .0;
+        let result_action = pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::ExternalEditResult(SettingId::Name, outcome),
+        );
+        super::pointer_acceptance_tests::record_source_action(&result_action);
+        dialog.finish_category_external_edit(operation, outcome, None);
+        super::pointer_acceptance_tests::record_dispatched_action(&result_action);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page)
+                if page.pending_external_edit.is_none()
+                    && page.editing == Some(SettingId::Name)
+                    && page.buf.text().contains("retained-draft")
+        ));
+    }
 }
 
 fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
@@ -2806,7 +5782,7 @@ fn type_chars(d: &mut SettingsDialog, s: &str) {
 }
 
 /// Open the Behavior page on the utility-model row and open the picker.
-fn open_utility_picker(d: &mut SettingsDialog) {
+pub(super) fn open_utility_picker(d: &mut SettingsDialog) {
     open_category_on(d, Category::Behavior, SettingId::UtilityModel);
     d.handle_key(press(KeyCode::Enter)); // open picker
 }
@@ -2870,7 +5846,7 @@ fn utility_picker_no_models_falls_back_to_free_text() {
     );
 }
 
-fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
+pub(super) fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     // Two providers, each with two models, in natural (stored) order.
     std::fs::write(&path, "{}").unwrap();
@@ -3459,6 +6435,7 @@ fn instructions_enter_grabs_existing_row_then_arrow_swaps() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     // Now grabbed at idx 0. Press ↓ to swap with row 1.
@@ -3484,6 +6461,7 @@ fn instructions_esc_after_swap_restores_original_order() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     d.handle_key(press(KeyCode::Down));
@@ -3506,6 +6484,7 @@ fn instructions_typing_while_grabbed_edits_filename() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     for ch in "Y".chars() {
@@ -3522,7 +6501,7 @@ fn instructions_typing_while_grabbed_edits_filename() {
 }
 
 #[test]
-fn string_list_delete_requires_second_press_and_first_press_does_not_persist() {
+fn string_list_keyboard_delete_remains_immediate() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.extended.redact.denylist = vec!["secret-value".to_string(), "other-value".to_string()];
@@ -3532,43 +6511,9 @@ fn string_list_delete_requires_second_press_and_first_press_does_not_persist() {
     ));
 
     d.handle_key(press(KeyCode::Char('d')));
-    match d.test_page() {
-        TestPageRef::StringList(p) => {
-            assert_eq!(
-                d.extended.redact.denylist,
-                vec!["secret-value".to_string(), "other-value".to_string()],
-                "first press only arms"
-            );
-            assert!(p.delete.is_pending_for(0));
-            let status = p.status.as_deref().unwrap_or("");
-            assert!(status.contains(secret_display::MASKED_VALUE));
-            assert!(!status.contains("secret-value"));
-        }
-        other => panic!("expected StringList, got {other:?}"),
-    }
+    assert_eq!(d.extended.redact.denylist, vec!["other-value".to_string()]);
     let on_disk = std::fs::read_to_string(&d.extended_path).unwrap();
-    assert!(
-        on_disk.contains("secret-value"),
-        "single delete press must not persist removal:\n{on_disk}"
-    );
-
-    d.handle_key(press(KeyCode::Down));
-    match d.test_page() {
-        TestPageRef::StringList(p) => {
-            assert!(!p.delete.is_pending_for(0), "navigation disarms");
-        }
-        other => panic!("expected StringList, got {other:?}"),
-    }
-    d.handle_key(press(KeyCode::Char('d')));
-    assert_eq!(
-        d.extended.redact.denylist.len(),
-        2,
-        "fresh first press on row 1 only arms"
-    );
-    d.handle_key(press(KeyCode::Char('d')));
-    assert_eq!(d.extended.redact.denylist, vec!["secret-value".to_string()]);
-    let on_disk = std::fs::read_to_string(&d.extended_path).unwrap();
-    assert!(!on_disk.contains("other-value"), "{on_disk}");
+    assert!(!on_disk.contains("secret-value"), "{on_disk}");
 }
 
 #[test]
@@ -3853,6 +6798,7 @@ fn instructions_esc_after_rename_restores_original_name() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     // Type some junk.

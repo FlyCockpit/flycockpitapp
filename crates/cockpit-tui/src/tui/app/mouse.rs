@@ -39,11 +39,56 @@ impl App {
         {
             self.toast = None;
         }
+        // The keys overlay is visually topmost and therefore owns pointer
+        // input before links or settings targets underneath it.
+        if let Some(overlay) = self.keys_overlay.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => overlay.scroll_up(),
+                MouseEventKind::ScrollDown => overlay.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
+        // A visible context menu is the next modal layer. It must preempt a
+        // settings dialog that may still be rendered underneath it.
+        if let Some(menu) = self.context_menu.clone() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
+                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                        self.context_menu = None;
+                        self.execute_context_menu_action(action, menu.clicked_chat_row);
+                    } else {
+                        self.context_menu = None;
+                    }
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.context_menu = None;
+                }
+                _ => {}
+            }
+            return;
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
                 self.link_registry.clear_hover();
+            }
+            if self.link_registry.hovered().is_some() {
+                self.dialog.clear_settings_pointer_hover();
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                return;
+            }
+            if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                return;
             }
             self.update_hovered_affordance(&mouse);
             if self.link_registry.hovered().is_some() {
@@ -55,13 +100,32 @@ impl App {
             self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(url) = self
-                .link_registry
-                .at(mouse.column, mouse.row)
-                .map(|link| link.url.clone())
-        {
+        if !self.mouse_capture {
+            self.link_pointer_gesture.cancel();
+        }
+        let hit_url = self
+            .link_registry
+            .at(mouse.column, mouse.row)
+            .map(|link| link.url.clone());
+        let link_outcome = if self.mouse_capture {
+            self.link_pointer_gesture.handle(
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+                hit_url.as_deref(),
+                self.link_registry.generation(),
+                std::time::Instant::now(),
+            )
+        } else {
+            crate::tui::links::LinkGestureOutcome::Unhandled
+        };
+        if matches!(
+            link_outcome,
+            crate::tui::links::LinkGestureOutcome::Consumed
+        ) {
+            return;
+        }
+        if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
             if cockpit_core::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
@@ -82,6 +146,16 @@ impl App {
                         self.show_toast(format!("Could not open link: {error}"), ToastKind::Error)
                     }
                 }
+            }
+            return;
+        }
+        if self.mouse_capture
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.sync_mouse_capture_from_dialog();
+                self.resync_config_after_local_write();
             }
             return;
         }
@@ -112,17 +186,6 @@ impl App {
                 .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
         {
             self.open_auth_failure_provider();
-            return;
-        }
-        // Which-key overlay (`which-key-overlay.md`): rendered on top of every
-        // pane, so it intercepts the wheel first. Wheel scrolls it; every other
-        // mouse event is eaten so nothing reaches the pane/chat underneath.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                _ => {}
-            }
             return;
         }
         if self.mouse_capture
@@ -280,30 +343,6 @@ impl App {
         if self.pane.is_some() && self.handle_pane_mouse(&mouse) {
             return;
         }
-        // Context menu is modal too — clicks either hit an item or
-        // dismiss. Wheel events while it's open are eaten so we don't
-        // accidentally scroll chat underneath.
-        if let Some(menu) = self.context_menu.clone() {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
-                        self.context_menu = None;
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    } else {
-                        // Click outside the menu dismisses it without
-                        // executing anything.
-                        self.context_menu = None;
-                    }
-                }
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    self.context_menu = None;
-                }
-                _ => {}
-            }
-            return;
-        }
-
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(hit) = self.footer_hit_areas.iter().find(|hit| {

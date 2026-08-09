@@ -29,18 +29,21 @@ pub(super) use fetch::{
     render_fetch_all_results,
 };
 #[cfg(test)]
+pub(crate) use oauth_flow::CodexOAuthOption;
+#[cfg(test)]
 use oauth_flow::handle_oauth_flow_key_with;
 pub(crate) use oauth_flow::{
     GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest,
-    OAuthFlowState, OAuthProvider, prepare_grok_browser_start,
+    OAuthFlowState, OAuthOption, OAuthProvider, prepare_grok_browser_start,
 };
 use oauth_flow::{
-    OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend,
-    oauth_setup_lines, render_oauth_body,
+    OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend, oauth_options,
+    oauth_setup_lines, oauth_setup_lines_with_controls, render_oauth_body,
+    render_oauth_body_with_controls,
 };
 
 use chrono::Utc;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -72,7 +75,9 @@ pub(super) use row_editor::{
 
 use super::auth::FetchHandle;
 use super::settings_editor::{SettingsEditor, SettingsResult};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsDialog, SettingsPage, save_button_line};
 #[cfg(test)]
 use super::{Page, TestPageRef};
@@ -491,6 +496,66 @@ pub(super) enum ProvidersPage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvidersPointerSurface {
+    List,
+    Add,
+    Edit,
+    Headers,
+    Models,
+    ModelSettings,
+    ProviderSettings,
+    FetchAll,
+    FetchOnePrompt,
+    FetchFallbackPrompt,
+    DeepFetch,
+    CopilotSetup,
+    OAuthSetup,
+}
+
+impl ProvidersPointerSurface {
+    /// Exhaustive token inventory used by the concrete-render acceptance
+    /// gate. Adding a nested provider page requires adding it here as well.
+    const ALL: [Self; 13] = [
+        Self::List,
+        Self::Add,
+        Self::Edit,
+        Self::Headers,
+        Self::Models,
+        Self::ModelSettings,
+        Self::ProviderSettings,
+        Self::FetchAll,
+        Self::FetchOnePrompt,
+        Self::FetchFallbackPrompt,
+        Self::DeepFetch,
+        Self::CopilotSetup,
+        Self::OAuthSetup,
+    ];
+}
+
+impl ProvidersPage {
+    /// Sealed compile-time inventory for provider pointer fixtures. There is
+    /// intentionally no wildcard: a new provider state cannot compile until
+    /// it declares which semantic pointer surface it renders.
+    fn pointer_surface_kind(&self) -> ProvidersPointerSurface {
+        match self {
+            Self::List { .. } => ProvidersPointerSurface::List,
+            Self::Add(_) => ProvidersPointerSurface::Add,
+            Self::Edit(_) => ProvidersPointerSurface::Edit,
+            Self::Headers { .. } => ProvidersPointerSurface::Headers,
+            Self::Models { .. } => ProvidersPointerSurface::Models,
+            Self::ModelSettings { .. } => ProvidersPointerSurface::ModelSettings,
+            Self::ProviderSettings { .. } => ProvidersPointerSurface::ProviderSettings,
+            Self::FetchAll(_) => ProvidersPointerSurface::FetchAll,
+            Self::FetchOnePrompt(_) => ProvidersPointerSurface::FetchOnePrompt,
+            Self::FetchFallbackPrompt(_) => ProvidersPointerSurface::FetchFallbackPrompt,
+            Self::DeepFetch { .. } => ProvidersPointerSurface::DeepFetch,
+            Self::CopilotSetup { .. } => ProvidersPointerSurface::CopilotSetup,
+            Self::OAuthSetup { .. } => ProvidersPointerSurface::OAuthSetup,
+        }
+    }
+}
+
 impl ProvidersPage {
     pub(super) fn paste_oauth(&mut self, text: &str) -> bool {
         let state = match self {
@@ -597,6 +662,36 @@ fn wrap_oauth_render_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'s
     wrapped
 }
 
+fn wrap_oauth_render_lines_with_controls(
+    lines: Vec<Line<'static>>,
+    controls: Vec<(usize, usize)>,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let mut wrapped = Vec::new();
+    let mut remapped = Vec::new();
+    let width = width.max(1);
+    for (source_line, line) in lines.into_iter().enumerate() {
+        let target_line = wrapped.len();
+        if line.spans.len() == 1 {
+            let span = &line.spans[0];
+            if UnicodeWidthStr::width(span.content.as_ref()) > usize::from(width) {
+                push_wrapped_text(&mut wrapped, width, span.content.as_ref(), span.style);
+            } else {
+                wrapped.push(line);
+            }
+        } else {
+            wrapped.push(line);
+        }
+        remapped.extend(
+            controls
+                .iter()
+                .filter(|(line, _)| *line == source_line)
+                .map(|(_, control)| (target_line, *control)),
+        );
+    }
+    (wrapped, remapped)
+}
+
 fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
     match flow {
         OAuthFlowView::OAuth(state) if state.provider == OAuthProvider::Grok => {
@@ -661,6 +756,7 @@ pub(super) struct CopilotSetupState {
     /// inject `GH_TOKEN` into the running process so the resolver
     /// picks it up before the user restarts.
     pub(super) outcome: Option<Result<String, String>>,
+    operation: super::shell::PointerOperationGate,
 }
 
 impl CopilotSetupState {
@@ -676,7 +772,56 @@ impl CopilotSetupState {
             rc_path,
             already_configured,
             outcome: None,
+            operation: super::shell::PointerOperationGate::default(),
         }
+    }
+
+    fn submit(
+        &mut self,
+        credential_store_path: Option<&std::path::Path>,
+        effect: &mut impl CopilotSetupEffect,
+    ) {
+        let (Some(shell), Some(rc_path)) = (self.shell, self.rc_path.as_deref()) else {
+            return;
+        };
+        if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
+            return;
+        }
+        let operation_id = self.operation.begin();
+        let result = effect.apply(shell, rc_path, credential_store_path);
+        self.complete(operation_id, result);
+    }
+
+    fn complete(
+        &mut self,
+        operation_id: super::shell::PointerOperationId,
+        result: Result<String, String>,
+    ) {
+        if self.operation.complete(operation_id) {
+            self.outcome = Some(result);
+        }
+    }
+}
+
+trait CopilotSetupEffect {
+    fn apply(
+        &mut self,
+        shell: CopilotShell,
+        rc_path: &std::path::Path,
+        credential_store_path: Option<&std::path::Path>,
+    ) -> Result<String, String>;
+}
+
+struct ProductionCopilotSetupEffect;
+
+impl CopilotSetupEffect for ProductionCopilotSetupEffect {
+    fn apply(
+        &mut self,
+        shell: CopilotShell,
+        rc_path: &std::path::Path,
+        credential_store_path: Option<&std::path::Path>,
+    ) -> Result<String, String> {
+        apply_copilot_setup(shell, rc_path, credential_store_path)
     }
 }
 
@@ -762,7 +907,7 @@ pub(super) struct EditState {
     pub(super) delete_pending: bool,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum EditField {
     Url,
 }
@@ -1445,13 +1590,10 @@ impl SettingsCx {
                         && state.rc_path.is_some()
                         && !state.already_configured;
                     if can_apply {
-                        let shell = state.shell.unwrap();
-                        let rc_path = state.rc_path.clone().unwrap();
-                        state.outcome = Some(apply_copilot_setup(
-                            shell,
-                            &rc_path,
+                        state.submit(
                             self.credential_store_path.as_deref(),
-                        ));
+                            &mut ProductionCopilotSetupEffect,
+                        );
                     } else {
                         // Skip — move to save + fetch.
                         let template = s.template.expect("template chosen");
@@ -2576,21 +2718,20 @@ impl SettingsCx {
                 // If we can't auto-write (unsupported shell, marker
                 // already present), Enter just returns to the Edit page —
                 // the screen was informational only.
-                let Some(shell) = s.shell else {
+                let Some(_shell) = s.shell else {
                     return back_to_edit(parent, None);
                 };
                 if s.already_configured {
                     return back_to_edit(parent, None);
                 }
-                let Some(rc_path) = s.rc_path.clone() else {
+                let Some(_rc_path) = s.rc_path.clone() else {
                     return back_to_edit(parent, None);
                 };
 
-                s.outcome = Some(apply_copilot_setup(
-                    shell,
-                    &rc_path,
+                s.submit(
                     self.credential_store_path.as_deref(),
-                ));
+                    &mut ProductionCopilotSetupEffect,
+                );
             }
             _ => {}
         }
@@ -2636,11 +2777,11 @@ impl SettingsCx {
                 self.render_fetch_fallback_prompt(frame, area, s)
             }
             ProvidersPage::DeepFetch { state, .. } => self.render_deep_fetch(frame, area, state),
-            ProvidersPage::CopilotSetup { state, .. } => {
-                self.render_copilot_setup(frame, area, state)
+            ProvidersPage::CopilotSetup { state, parent } => {
+                self.render_copilot_setup(frame, area, state, &parent.provider_id)
             }
-            ProvidersPage::OAuthSetup { state, .. } => {
-                self.render_oauth_setup(frame, area, state, links)
+            ProvidersPage::OAuthSetup { state, parent } => {
+                self.render_oauth_setup(frame, area, state, &parent.provider_id, links)
             }
         }
     }
@@ -2656,6 +2797,7 @@ impl SettingsCx {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         let ids: Vec<&String> = self.config.providers.keys().collect();
 
         // Row 0: the `[refetch provider models]` button. Provider rows follow
@@ -2668,13 +2810,32 @@ impl SettingsCx {
         } else {
             muted
         };
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::RefetchAll,
+            ),
+        ));
         lines.push(Line::from(vec![
             Span::raw(if button_selected { "▸ " } else { "  " }),
             Span::styled("[refetch provider models]".to_string(), button_style),
         ]));
-        // Read-only summary of the global on-unlisted-models policy. Cycled
-        // with `m`; it has no own cursor row so the provider list keeps its
-        // simple index map.
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::Add,
+            ),
+        ));
+        lines.push(Line::from("  [+ add provider]"));
+        // Pointer/keyboard control for the global on-unlisted-models policy.
+        // It has no own cursor row, so the provider list keeps its simple
+        // index map.
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ),
+        ));
         lines.push(Line::from(vec![
             Span::styled("  on unlisted models (m): ".to_string(), muted),
             Span::styled(
@@ -2693,7 +2854,7 @@ impl SettingsCx {
             let id_w = ids.iter().map(|s| s.chars().count()).max().unwrap_or(0);
             for (i, id) in ids.iter().enumerate() {
                 let row = i + 1;
-                let entry = self.config.providers.get(*id).unwrap();
+                let entry = self.config.providers.get(id.as_str()).unwrap();
                 let marker = if row == cursor { "▸ " } else { "  " };
                 let label = format!("{:<width$}", id, width = id_w);
                 let star = if entry.favorite.unwrap_or(false) {
@@ -2711,6 +2872,14 @@ impl SettingsCx {
                     Style::default().fg(Color::White)
                 };
                 let model_count = format!("{} models", entry.models.len());
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::Open(
+                            super::pointer_actions::ProviderId((*id).clone()),
+                        ),
+                    ),
+                ));
                 lines.push(Line::from(vec![
                     Span::raw(marker),
                     Span::styled(label, style),
@@ -2721,6 +2890,48 @@ impl SettingsCx {
                     Span::styled(model_count, muted),
                 ]));
             }
+            if !delete_pending
+                && let Some(id) = cursor.checked_sub(1).and_then(|index| ids.get(index))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::BeginDelete(
+                            super::pointer_actions::ProviderId((*id).clone()),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("  [Delete]"));
+            }
+        }
+        if delete_pending && let Some(id) = cursor.checked_sub(1).and_then(|index| ids.get(index)) {
+            lines.push(Line::default());
+            lines.push(Line::from(format!("Delete {id}?")));
+            for (choice, label) in [
+                (
+                    super::pointer_actions::ProviderDeleteChoice::RemoveSecrets,
+                    "[Delete and remove secrets]",
+                ),
+                (
+                    super::pointer_actions::ProviderDeleteChoice::KeepSecrets,
+                    "[Delete but keep secrets]",
+                ),
+                (
+                    super::pointer_actions::ProviderDeleteChoice::Cancel,
+                    "[Cancel]",
+                ),
+            ] {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::Delete(
+                            super::pointer_actions::ProviderId((*id).clone()),
+                            choice,
+                        ),
+                    ),
+                ));
+                lines.push(Line::from(label));
+            }
         }
         if let Some(msg) = status {
             lines.push(Line::default());
@@ -2730,19 +2941,78 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:list",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:list"),
+            )
+                .into(),
+        );
     }
 
-    fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
-        let lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
+    fn render_copilot_setup(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        s: &CopilotSetupState,
+        provider_id: &str,
+    ) {
+        let mut lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
+        let mut controls = Vec::new();
+        let copilot_id = || super::pointer_actions::ProviderId(provider_id.into());
+        let provider_action =
+            |action| super::pointer_actions::SettingsPointerAction::Providers(action);
+        lines.push(Line::default());
+        if s.outcome.is_some() {
+            controls.push((
+                lines.len(),
+                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
+                    copilot_id(),
+                    super::pointer_actions::ConfirmationChoice::Confirm,
+                )),
+            ));
+            lines.push(Line::from("[Continue]"));
+        } else if s.shell.is_some() && s.rc_path.is_some() && !s.already_configured {
+            controls.push((
+                lines.len(),
+                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
+                    copilot_id(),
+                    super::pointer_actions::ConfirmationChoice::Confirm,
+                )),
+            ));
+            lines.push(Line::from("[Set up Copilot auth]"));
+            controls.push((
+                lines.len(),
+                provider_action(super::pointer_actions::ProvidersAction::CopilotConfirm(
+                    copilot_id(),
+                    super::pointer_actions::ConfirmationChoice::Cancel,
+                )),
+            ));
+            lines.push(Line::from("[Cancel]"));
+        } else {
+            controls.push((
+                lines.len(),
+                provider_action(super::pointer_actions::ProvidersAction::LocalBack),
+            ));
+            lines.push(Line::from("[Back]"));
+        }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states.render_lines(
+        self.scroll_states.render_bound_lines(
             frame,
             area,
             "providers:copilot-setup",
-            lines,
-            selected_line,
+            (lines, selected_line),
+            controls,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:copilot-setup"),
+            )
+                .into(),
         );
     }
 
@@ -2751,16 +3021,70 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         s: &OAuthFlowState,
+        provider_id: &str,
         links: Option<&mut crate::tui::links::LinkRegistry>,
     ) {
         let flow = OAuthFlowView::OAuth(s);
-        let mut lines =
-            wrap_oauth_render_lines(oauth_setup_lines(flow, OAuthHost::Standalone), area.width);
+        let (lines, controls) = oauth_setup_lines_with_controls(flow, OAuthHost::Standalone);
+        let (mut lines, controls) =
+            wrap_oauth_render_lines_with_controls(lines, controls, area.width);
         let link_regions = prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref())
             .unwrap_or_default();
+        let mut bindings = controls
+            .into_iter()
+            .filter_map(|(line, control)| {
+                oauth_options(s, OAuthHost::Standalone)
+                    .get(control)
+                    .map(|option| {
+                        (
+                            line,
+                            super::pointer_actions::SettingsPointerAction::Providers(
+                                super::pointer_actions::ProvidersAction::OAuthOption(
+                                    super::pointer_actions::ProviderId(provider_id.into()),
+                                    *option,
+                                ),
+                            ),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if s.authorize_url().is_some() {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::CopyOAuth(
+                        s.flow_id,
+                        super::pointer_actions::OAuthCopyKind::AuthorizationUrl,
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[copy authorization URL]"));
+        }
+        if s.device_login().is_some() {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::CopyOAuth(
+                        s.flow_id,
+                        super::pointer_actions::OAuthCopyKind::DeviceCode,
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[copy device code]"));
+        }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:oauth-setup", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:oauth-setup",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:oauth-setup"),
+            )
+                .into(),
+        );
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -2778,10 +3102,15 @@ impl SettingsCx {
         s: &AddState,
         links: Option<&mut crate::tui::links::LinkRegistry>,
     ) {
+        #[cfg(test)]
+        if let Some(step) = s.run.current_provider_step() {
+            super::pointer_acceptance_tests::record_rendered_wizard_step(step);
+        }
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut controls = Vec::new();
 
         match s.run.current_step_id() {
             Some("template") => {
@@ -2797,6 +3126,7 @@ impl SettingsCx {
                     } else {
                         Style::default().fg(Color::White)
                     };
+                    controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
                         Span::styled(t.display.to_string(), style),
@@ -2818,8 +3148,13 @@ impl SettingsCx {
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
-                render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                let id_line = render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
+                let url_line = render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                if s.is_step("id") {
+                    controls.push((id_line, 0));
+                } else if s.is_step("url") {
+                    controls.push((url_line, 0));
+                }
                 if s.is_step("auth-method") {
                     lines.push(Line::default());
                     let options = [
@@ -2838,6 +3173,7 @@ impl SettingsCx {
                         } else {
                             Style::default().fg(Color::White)
                         };
+                        controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
                             Span::raw(marker),
                             Span::styled((*label).to_string(), style),
@@ -2853,6 +3189,7 @@ impl SettingsCx {
                     } else {
                         "••••••••"
                     };
+                    controls.push((lines.len(), 0));
                     lines.push(Line::from(vec![
                         Span::styled("api key: ", muted),
                         Span::styled(masked.to_string(), Style::default().fg(Color::White)),
@@ -2866,11 +3203,19 @@ impl SettingsCx {
                 }
                 if s.is_step("env-var") {
                     lines.push(Line::default());
-                    render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    let line = render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    controls.push((line, 0));
                 }
                 if s.is_step("headers") {
                     lines.push(Line::default());
-                    render_header_editor(&mut lines, &s.headers);
+                    let header_controls = render_header_editor(&mut lines, &s.headers);
+                    if !s.headers.is_editing() {
+                        controls.extend(
+                            header_controls
+                                .into_iter()
+                                .map(|(line, id)| (line, id.0 as usize)),
+                        );
+                    }
                 }
                 if s.is_step("url")
                     && let Some(hint) = t.hint
@@ -2910,6 +3255,17 @@ impl SettingsCx {
                     OAuthFlowView::Copilot(state),
                     OAuthHost::AddWizard,
                 );
+                controls.push((lines.len(), 0));
+                let primary_label = if state.outcome.is_none()
+                    && state.shell.is_some()
+                    && state.rc_path.is_some()
+                    && !state.already_configured
+                {
+                    "[Set up Copilot auth]"
+                } else {
+                    "[Continue]"
+                };
+                lines.push(Line::from(primary_label));
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
                     "After this step we'll fetch the model list automatically. \
@@ -2930,11 +3286,11 @@ impl SettingsCx {
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_oauth_body(
+                controls.extend(render_oauth_body_with_controls(
                     &mut lines,
                     OAuthFlowView::OAuth(state),
                     OAuthHost::AddWizard,
-                );
+                ));
             }
             Some("test-key-choice") => {
                 lines.push(Line::from(Span::styled(
@@ -2958,6 +3314,7 @@ impl SettingsCx {
                     } else {
                         Style::default().fg(Color::White)
                     };
+                    controls.push((lines.len(), index));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
                         Span::styled((*label).to_string(), style),
@@ -2972,6 +3329,8 @@ impl SettingsCx {
                         .to_string(),
                     muted,
                 )));
+                controls.push((lines.len(), 0));
+                lines.push(Line::from("[Continue]"));
             }
             Some("saving" | "fetching" | "test-key") => {
                 lines.push(Line::from(Span::styled(
@@ -2991,6 +3350,10 @@ impl SettingsCx {
                     "Done.".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
+                if s.is_step("done") {
+                    controls.push((lines.len(), 0));
+                    lines.push(Line::from("[Continue]"));
+                }
             }
             Some(other) => {
                 lines.push(Line::from(Span::styled(
@@ -3015,14 +3378,29 @@ impl SettingsCx {
             .flatten()
             .map(OAuthFlowView::OAuth);
         if oauth_flow.is_some() {
-            lines = wrap_oauth_render_lines(lines, area.width);
+            let (wrapped, remapped) =
+                wrap_oauth_render_lines_with_controls(lines, controls, area.width);
+            lines = wrapped;
+            controls = remapped;
         }
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:add", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:add",
+            (lines, selected_line),
+            controls.into_iter().filter_map(|(line, control)| {
+                provider_add_pointer_action(s, control).map(|action| (line, action))
+            }),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:add"),
+            )
+                .into(),
+        );
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -3040,6 +3418,7 @@ impl SettingsCx {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
 
         lines.push(Line::from(vec![
             Span::styled("Provider: ", muted),
@@ -3143,6 +3522,7 @@ impl SettingsCx {
 
         for (idx, action) in actions.iter().enumerate() {
             let selected = idx == s.cursor;
+            bindings.push((lines.len(), provider_edit_pointer_action(s, *action)));
             if *action == EditAction::Save {
                 lines.push(save_button_line("[save changes]", selected));
                 continue;
@@ -3160,6 +3540,36 @@ impl SettingsCx {
                 Span::raw("  "),
                 Span::styled(value, muted),
             ]));
+        }
+
+        if s.delete_pending {
+            lines.push(Line::default());
+            lines.push(Line::from(format!("Delete {}?", s.provider_id)));
+            for (choice, label) in [
+                (
+                    super::pointer_actions::ProviderDeleteChoice::RemoveSecrets,
+                    "[Delete and remove secrets]",
+                ),
+                (
+                    super::pointer_actions::ProviderDeleteChoice::KeepSecrets,
+                    "[Delete but keep secrets]",
+                ),
+                (
+                    super::pointer_actions::ProviderDeleteChoice::Cancel,
+                    "[Cancel]",
+                ),
+            ] {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::Delete(
+                            super::pointer_actions::ProviderId(s.provider_id.clone()),
+                            choice,
+                        ),
+                    ),
+                ));
+                lines.push(Line::from(label));
+            }
         }
 
         if let Some(field) = s.editing_field {
@@ -3188,8 +3598,18 @@ impl SettingsCx {
         )));
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:edit", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:edit",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:edit"),
+            )
+                .into(),
+        );
     }
 
     /// Full-pane render for the Headers sub-page. The header rows are
@@ -3212,7 +3632,16 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
-        render_header_editor(&mut lines, editor);
+        let mut bindings = render_header_editor(&mut lines, editor)
+            .into_iter()
+            .filter_map(|(line, control)| {
+                provider_header_pointer_action(editor, control.0 as usize)
+                    .map(|action| (line, action))
+            })
+            .collect::<Vec<_>>();
+        if editor.is_editing() {
+            bindings.clear();
+        }
         if let Some(status) = &editor.status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -3221,8 +3650,18 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:headers", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:headers",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:headers"),
+            )
+                .into(),
+        );
         if editor.is_editing() {
             render_header_edit_popup(frame, area, editor);
         }
@@ -3249,7 +3688,60 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
-        render_model_editor(&mut lines, editor);
+        let mut bindings = render_model_editor(&mut lines, editor)
+            .into_iter()
+            .filter_map(|(line, control)| {
+                provider_model_pointer_action(editor, control.0 as usize)
+                    .map(|action| (line, action))
+            })
+            .collect::<Vec<_>>();
+        if !editor.is_editing() {
+            let provider = super::pointer_actions::ProviderId(parent.provider_id.clone());
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::AddModel(provider.clone()),
+                ),
+            ));
+            lines.push(Line::from("[Add model]"));
+            if let Some(model) = editor.rows().get(editor.cursor) {
+                let model_id = super::pointer_actions::ModelId(model.id.clone());
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelSettings(
+                            provider.clone(),
+                            model_id.clone(),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[Model settings]"));
+                if model.manual {
+                    bindings.push((
+                        lines.len(),
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::RenameModel(
+                                provider.clone(),
+                                model_id.clone(),
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Rename model]"));
+                    bindings.push((
+                        lines.len(),
+                        super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::DeleteModel(
+                                provider, model_id,
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Delete model]"));
+                }
+            }
+        }
+        if editor.is_editing() {
+            bindings.clear();
+        }
         render_model_fetch_status_block(&mut lines, &parent.entry, Utc::now());
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -3267,8 +3759,18 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:models", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:models",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:models"),
+            )
+                .into(),
+        );
         if editor.is_editing() {
             render_model_edit_popup(frame, area, editor);
         }
@@ -3301,6 +3803,7 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
+        let mut bindings = Vec::new();
 
         // Scope-aware field list: provider scope includes provider-only
         // transport security, while model scope omits provider-only rows and
@@ -3349,11 +3852,146 @@ impl SettingsCx {
             if !overridden {
                 spans.push(Span::styled("  (inherited)".to_string(), muted));
             }
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::RowEditor(
+                        super::pointer_actions::ProviderRowEditorAction::SettingEdit(*field),
+                    ),
+                ),
+            ));
             lines.push(Line::from(spans));
         }
 
         // `[save changes]` row, styled like MCP Add's button.
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::RowEditor(
+                    super::pointer_actions::ProviderRowEditorAction::SettingSave,
+                ),
+            ),
+        ));
         lines.push(save_button_line("[save changes]", editor.on_save_row()));
+
+        if let (Some(_), super::settings_editor::SettingsScope::Model { model_id }) =
+            (editor.multimodal(), &editor.scope)
+        {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::ModelLifecycle(
+                        super::pointer_actions::ModelLifecycleAction::Refresh(
+                            super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                            super::pointer_actions::ModelId(model_id.clone()),
+                        ),
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[refresh detected media capabilities]"));
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Discard"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Discard(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[discard media capability draft]"));
+            }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Retry"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Retry(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[retry media capability action]"));
+            }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reload"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Reload(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[reload media capability draft]"));
+            }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reapply"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Reapply(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[reapply media capability draft]"));
+            }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Rebind"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Rebind(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[rebind media capability draft]"));
+            }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Dismiss"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Dismiss(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[dismiss media capability refresh failure]"));
+            }
+        }
 
         // Read-only model metadata, surfaced (not hidden) for completeness:
         // the `manual` marker and any preserved provider `extra` keys. These
@@ -3429,8 +4067,18 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:settings", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:settings",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:settings"),
+            )
+                .into(),
+        );
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -3493,6 +4141,7 @@ impl SettingsCx {
             "Don't remove unlisted models (default)",
             "Remove unlisted models",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3500,6 +4149,16 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::FetchAllConfirm(if i == 0 {
+                        super::pointer_actions::FetchAllChoice::Apply
+                    } else {
+                        super::pointer_actions::FetchAllChoice::Cancel
+                    }),
+                ),
+            ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
@@ -3511,11 +4170,29 @@ impl SettingsCx {
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ),
+        ));
         lines.push(Line::from(vec![
             Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-all",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-all"),
+            )
+                .into(),
+        );
     }
 
     fn render_fetch_one_prompt(&self, frame: &mut Frame, area: Rect, s: &FetchOnePromptState) {
@@ -3544,6 +4221,7 @@ impl SettingsCx {
             "Don't remove unlisted models (default)",
             "Remove unlisted models",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3551,22 +4229,63 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                        super::pointer_actions::ProviderId(s.provider_id.clone()),
+                        if i == 0 {
+                            super::pointer_actions::FetchOneChoice::KeepLocal
+                        } else {
+                            super::pointer_actions::FetchOneChoice::Apply
+                        },
+                    ),
+                ),
+            ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
             ]));
         }
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                    super::pointer_actions::ProviderId(s.provider_id.clone()),
+                    super::pointer_actions::FetchOneChoice::Cancel,
+                ),
+            ),
+        ));
+        lines.push(Line::from("[Cancel]"));
         let check = if s.dont_ask_again { "[x]" } else { "[ ]" };
         let style = if s.cursor == 2 {
             yellow.add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ),
+        ));
         lines.push(Line::from(vec![
             Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-one",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-one"),
+            )
+                .into(),
+        );
     }
 
     fn render_fetch_fallback_prompt(
@@ -3594,6 +4313,7 @@ impl SettingsCx {
             "Use fallback catalog",
             "Cancel",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3601,12 +4321,39 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            let choice = match i {
+                0 => super::pointer_actions::FetchFallbackChoice::Retry,
+                1 => super::pointer_actions::FetchFallbackChoice::KeepLocal,
+                2 => super::pointer_actions::FetchFallbackChoice::UseFallback,
+                _ => super::pointer_actions::FetchFallbackChoice::Cancel,
+            };
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::FetchFallbackConfirm(
+                        super::pointer_actions::ProviderId(s.provider_id.clone()),
+                        choice,
+                    ),
+                ),
+            ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
             ]));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-fallback",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-fallback"),
+            )
+                .into(),
+        );
     }
 }
 
@@ -3622,9 +4369,13 @@ fn spinner_glyph(tick: usize) -> &'static str {
 /// Render a [`HeaderEditor`] as rows + `[+ add header]` + (optional)
 /// `[continue →]`. The active cursor row is highlighted in yellow; the
 /// in-flight name/value buffer (when editing) replaces the row's value.
-fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
+fn render_header_editor(
+    lines: &mut Vec<Line<'static>>,
+    h: &HeaderEditor,
+) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
+    let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Headers:".to_string(),
         Style::default().add_modifier(Modifier::BOLD),
@@ -3645,6 +4396,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((lines.len(), SettingsControlId(i as u64)));
         lines.push(Line::from(vec![
             Span::raw(marker.to_string()),
             Span::styled(format!("{:<width$}", row.name, width = name_w), name_style),
@@ -3661,6 +4413,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
     } else {
         muted
     };
+    bindings.push((lines.len(), SettingsControlId(add_idx as u64)));
     lines.push(Line::from(vec![
         Span::raw(add_marker.to_string()),
         Span::styled("[+ add header]".to_string(), add_style),
@@ -3674,6 +4427,7 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
         } else {
             muted
         };
+        bindings.push((lines.len(), SettingsControlId(cont_idx as u64)));
         lines.push(Line::from(vec![
             Span::raw(marker.to_string()),
             Span::styled("[continue → save & fetch /models]".to_string(), style),
@@ -3683,8 +4437,31 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
     // `[save changes]` row on the Edit-page sub-page (mutually exclusive
     // with `[continue →]`). Styled like MCP Add's button.
     if let Some(save_idx) = h.save_idx() {
+        bindings.push((lines.len(), SettingsControlId(save_idx as u64)));
         lines.push(save_button_line("[save changes]", h.cursor == save_idx));
     }
+    bindings
+}
+
+fn provider_header_pointer_action(
+    editor: &HeaderEditor,
+    index: usize,
+) -> Option<super::pointer_actions::SettingsPointerAction> {
+    use super::pointer_actions::{
+        HeaderName, ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+    };
+    let control = if let Some(row) = editor.rows().get(index) {
+        ProviderRowEditorAction::HeaderOpen(HeaderName(row.name.clone()))
+    } else if index == editor.add_row_idx() {
+        ProviderRowEditorAction::HeaderAdd
+    } else if editor.save_idx() == Some(index) {
+        ProviderRowEditorAction::HeaderSave
+    } else {
+        return None;
+    };
+    Some(SettingsPointerAction::Providers(
+        ProvidersAction::RowEditor(control),
+    ))
 }
 
 /// Centered name/value popup for adding or editing a header. Drawn on
@@ -3780,10 +4557,14 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
 /// Render a [`ModelEditor`] as rows + `[+ add model]`. Each row shows the
 /// model id, an `M` tag for manual entries, the display name, and the
 /// context length when set. The active cursor row is highlighted.
-fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
+fn render_model_editor(
+    lines: &mut Vec<Line<'static>>,
+    m: &ModelEditor,
+) -> Vec<(usize, SettingsControlId)> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
+    let mut bindings = Vec::new();
     lines.push(Line::from(Span::styled(
         "Provider models:".to_string(),
         Style::default().add_modifier(Modifier::BOLD),
@@ -3817,6 +4598,7 @@ fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
                 }
                 detail.push_str(&format!("ctx {ctx}"));
             }
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker.to_string()),
                 Span::styled(format!("{tag} "), green),
@@ -3835,13 +4617,37 @@ fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
     } else {
         muted
     };
+    bindings.push((lines.len(), SettingsControlId(add_idx as u64)));
     lines.push(Line::from(vec![
         Span::raw(add_marker.to_string()),
         Span::styled("[+ add model]".to_string(), add_style),
     ]));
 
     // `[save changes]` row, styled like MCP Add's button.
+    bindings.push((lines.len(), SettingsControlId(m.save_idx() as u64)));
     lines.push(save_button_line("[save changes]", m.cursor == m.save_idx()));
+    bindings
+}
+
+fn provider_model_pointer_action(
+    editor: &ModelEditor,
+    index: usize,
+) -> Option<super::pointer_actions::SettingsPointerAction> {
+    use super::pointer_actions::{
+        ModelId, ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+    };
+    let control = if let Some(row) = editor.rows().get(index) {
+        ProviderRowEditorAction::ModelOpen(ModelId(row.id.clone()))
+    } else if index == editor.add_row_idx() {
+        ProviderRowEditorAction::ModelAdd
+    } else if index == editor.save_idx() {
+        ProviderRowEditorAction::ModelSave
+    } else {
+        return None;
+    };
+    Some(SettingsPointerAction::Providers(
+        ProvidersAction::RowEditor(control),
+    ))
 }
 
 fn render_model_fetch_status_block(
@@ -3957,7 +4763,13 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextField, active: bool) {
+fn render_field_row(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    field: &TextField,
+    active: bool,
+) -> usize {
+    let line = lines.len();
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let value_style = if active {
         Style::default().fg(Color::White)
@@ -3989,6 +4801,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
         spans.push(Span::styled(field.text().to_string(), value_style));
     }
     lines.push(Line::from(spans));
+    line
 }
 
 /// Build the `ProvidersPage` for `/model-settings`: the active model's
@@ -4108,15 +4921,125 @@ fn valid_id(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+fn provider_edit_pointer_action(
+    state: &EditState,
+    action: EditAction,
+) -> super::pointer_actions::SettingsPointerAction {
+    use super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
+    let id = ProviderId(state.provider_id.clone());
+    let action = match action {
+        EditAction::Url => ProvidersAction::EditField(id, EditField::Url),
+        EditAction::Headers => ProvidersAction::EditHeaders(id),
+        EditAction::CopilotAuth => ProvidersAction::CopilotSetup(id),
+        EditAction::OAuthAuth(provider) => ProvidersAction::BeginOAuth(id, provider),
+        EditAction::Models => ProvidersAction::ManageModels(id),
+        EditAction::Settings => ProvidersAction::ProviderSettings(id),
+        EditAction::Favorite => ProvidersAction::Favorite(id),
+        EditAction::Refetch => ProvidersAction::Refetch(id),
+        EditAction::DeepFetch => ProvidersAction::DeepFetchConfirm(id),
+        EditAction::Delete => ProvidersAction::BeginDelete(id),
+        EditAction::Save => ProvidersAction::SaveProvider(id),
+        EditAction::Back => ProvidersAction::LocalBack,
+    };
+    SettingsPointerAction::Providers(action)
+}
+
+fn provider_add_pointer_action(
+    state: &AddState,
+    index: usize,
+) -> Option<super::pointer_actions::SettingsPointerAction> {
+    use super::pointer_actions::{
+        HeaderName, ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
+        WizardStepId, WizardTestChoice,
+    };
+    let step = state.run.current_provider_step()?;
+    let control = match step {
+        WizardStepId::Template => {
+            WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
+        }
+        WizardStepId::AuthMethod => WizardControlId::AuthMethod(
+            *[
+                WizardAuthMethod::PasteKey,
+                WizardAuthMethod::EnvVar,
+                WizardAuthMethod::AdvancedHeaders,
+            ]
+            .get(index)?,
+        ),
+        WizardStepId::TestKeyChoice => WizardControlId::TestChoice(
+            *[WizardTestChoice::TestKey, WizardTestChoice::SkipTest].get(index)?,
+        ),
+        WizardStepId::GrokOAuth | WizardStepId::CodexOAuth => {
+            WizardControlId::OAuth(state.oauth_auth.as_deref().and_then(|oauth| {
+                oauth_options(oauth, OAuthHost::AddWizard)
+                    .into_iter()
+                    .nth(index)
+            })?)
+        }
+        WizardStepId::Headers => {
+            if let Some(row) = state.headers.rows().get(index) {
+                WizardControlId::Header(HeaderName(row.name.clone()))
+            } else if index == state.headers.add_row_idx() {
+                WizardControlId::AddHeader
+            } else if state.headers.continue_idx() == Some(index) {
+                WizardControlId::ContinueHeaders
+            } else {
+                return None;
+            }
+        }
+        WizardStepId::ProviderId
+        | WizardStepId::Url
+        | WizardStepId::ApiKey
+        | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
+        WizardStepId::TestSkipped => {
+            (index == 0).then_some(WizardControlId::TestSkippedContinue)?
+        }
+        WizardStepId::Done => (index == 0).then_some(WizardControlId::DoneContinue)?,
+        WizardStepId::Saving | WizardStepId::TestKey | WizardStepId::Fetching => return None,
+    };
+    Some(SettingsPointerAction::Providers(
+        ProvidersAction::WizardControl(step, control),
+    ))
+}
+
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 impl SettingsPage for ProvidersPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Providers
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        let surface = ProvidersPage::pointer_surface_kind(self);
+        debug_assert!(ProvidersPointerSurface::ALL.contains(&surface));
+        100 + surface as u64
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            ProvidersPage::List { .. } => super::SettingsLocalBack::NoLocalBack,
+            ProvidersPage::Add(_)
+            | ProvidersPage::Edit(_)
+            | ProvidersPage::Headers { .. }
+            | ProvidersPage::Models { .. }
+            | ProvidersPage::ModelSettings { .. }
+            | ProvidersPage::ProviderSettings { .. }
+            | ProvidersPage::FetchAll(_)
+            | ProvidersPage::FetchOnePrompt(_)
+            | ProvidersPage::FetchFallbackPrompt(_)
+            | ProvidersPage::DeepFetch { .. }
+            | ProvidersPage::CopilotSetup { .. }
+            | ProvidersPage::OAuthSetup { .. } => super::SettingsLocalBack::LocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_providers_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        let _surface = self.pointer_surface_kind();
         cx.render_providers_page(frame, area, self, None);
     }
 
@@ -4127,7 +5050,784 @@ impl SettingsPage for ProvidersPage {
         area: Rect,
         links: &mut crate::tui::links::LinkRegistry,
     ) {
+        let _surface = self.pointer_surface_kind();
         cx.render_providers_page(frame, area, self, Some(links));
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Providers(provider_action) = action
+        else {
+            return Nav::Stay;
+        };
+        if let super::pointer_actions::ProvidersAction::Delete(id, choice) = provider_action {
+            let pending_matches = match self {
+                ProvidersPage::List {
+                    cursor,
+                    delete_pending,
+                    ..
+                } if *delete_pending => {
+                    cursor
+                        .checked_sub(1)
+                        .and_then(|index| cx.config.providers.keys().nth(index))
+                        == Some(&id.0)
+                }
+                ProvidersPage::Edit(state) if state.delete_pending => state.provider_id == id.0,
+                _ => false,
+            };
+            if !pending_matches {
+                return Nav::Stay;
+            }
+            match choice {
+                super::pointer_actions::ProviderDeleteChoice::RemoveSecrets => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProviderDeleteChoice::KeepSecrets => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProviderDeleteChoice::Cancel => {
+                    if let ProvidersPage::List {
+                        status,
+                        delete_pending,
+                        ..
+                    } = self
+                    {
+                        *delete_pending = false;
+                        *status = None;
+                    } else if let ProvidersPage::Edit(state) = self {
+                        state.delete_pending = false;
+                        state.status = None;
+                    }
+                    return Nav::Stay;
+                }
+            }
+        }
+        // Copilot setup controls are commands, not cursor positions.  Reduce
+        // them directly from their rendered identity so a fresh dispatch does
+        // not depend on the number or ordering of lines in the prompt.
+        if let ProvidersPage::CopilotSetup { parent, .. } = self {
+            match provider_action {
+                super::pointer_actions::ProvidersAction::CopilotConfirm(id, choice)
+                    if parent.provider_id == id.0 =>
+                {
+                    let code = match choice {
+                        super::pointer_actions::ConfirmationChoice::Confirm => KeyCode::Enter,
+                        super::pointer_actions::ConfirmationChoice::Cancel => KeyCode::Esc,
+                    };
+                    return cx
+                        .handle_providers_page_key(KeyEvent::new(code, KeyModifiers::NONE), self);
+                }
+                super::pointer_actions::ProvidersAction::LocalBack => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => return Nav::Stay,
+            }
+        }
+        if let ProvidersPage::Models { editor, parent } = self {
+            let legacy = match &provider_action {
+                super::pointer_actions::ProvidersAction::AddModel(provider) => {
+                    Some((provider, None, KeyCode::Char('a')))
+                }
+                super::pointer_actions::ProvidersAction::RenameModel(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Char('r')))
+                }
+                super::pointer_actions::ProvidersAction::DeleteModel(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Char('d')))
+                }
+                super::pointer_actions::ProvidersAction::ModelSettings(provider, model) => {
+                    Some((provider, Some(model), KeyCode::Enter))
+                }
+                _ => None,
+            };
+            if let Some((provider, model, key)) = legacy {
+                if parent.provider_id != provider.0 || editor.is_editing() {
+                    return Nav::Stay;
+                }
+                if let Some(model) = model {
+                    let Some(index) = editor.rows().iter().position(|row| row.id == model.0) else {
+                        return Nav::Stay;
+                    };
+                    editor.cursor = index;
+                }
+                return cx.handle_providers_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+            }
+        }
+        if let (
+            ProvidersPage::OAuthSetup { state, .. },
+            super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, kind),
+        ) = (&mut *self, &provider_action)
+        {
+            state.submit_pointer_copy(*flow_id, *kind);
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Refresh(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                );
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Dismiss(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Dismiss"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Rebind(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Rebind"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Reapply(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reapply"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Reload(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reload"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Retry(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Retry"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Discard(provider, model),
+            ),
+        ) = (&mut *self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                );
+            if matches_source
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Discard"))
+            {
+                editor.multimodal_action("Discard", &parent.entry);
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::FetchOnePrompt(state),
+            super::pointer_actions::ProvidersAction::FetchOneConfirm(
+                id,
+                super::pointer_actions::FetchOneChoice::Cancel,
+            ),
+        ) = (&*self, &provider_action)
+            && state.provider_id == id.0
+        {
+            return cx
+                .handle_providers_page_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), self);
+        }
+        if matches!(&*self, ProvidersPage::List { .. }) {
+            match &provider_action {
+                super::pointer_actions::ProvidersAction::Add => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::BeginDelete(id) => {
+                    let Some(index) = cx
+                        .config
+                        .providers
+                        .keys()
+                        .position(|candidate| candidate == &id.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    if let ProvidersPage::List { cursor, .. } = self {
+                        *cursor = index + 1;
+                    }
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => {}
+            }
+        }
+        let index = match (&*self, &provider_action) {
+            (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::RefetchAll) => 0,
+            (ProvidersPage::List { .. }, super::pointer_actions::ProvidersAction::Open(id)) => {
+                let Some(index) = cx
+                    .config
+                    .providers
+                    .keys()
+                    .position(|candidate| candidate == &id.0)
+                else {
+                    return Nav::Stay;
+                };
+                index + 1
+            }
+            (ProvidersPage::Edit(state), action) => {
+                let Some(index) = edit_menu_actions(&state.provider_id, &state.entry)
+                    .iter()
+                    .position(|source| {
+                        provider_edit_pointer_action(state, *source)
+                            == super::pointer_actions::SettingsPointerAction::Providers(
+                                action.clone(),
+                            )
+                    })
+                else {
+                    return Nav::Stay;
+                };
+                index
+            }
+            (
+                ProvidersPage::Headers { editor, .. },
+                super::pointer_actions::ProvidersAction::RowEditor(control),
+            ) => match control {
+                super::pointer_actions::ProviderRowEditorAction::HeaderOpen(id) => {
+                    let Some(index) = editor.rows().iter().position(|row| row.name == id.0) else {
+                        return Nav::Stay;
+                    };
+                    index
+                }
+                super::pointer_actions::ProviderRowEditorAction::HeaderAdd => editor.add_row_idx(),
+                super::pointer_actions::ProviderRowEditorAction::HeaderSave => {
+                    let Some(index) = editor.save_idx() else {
+                        return Nav::Stay;
+                    };
+                    index
+                }
+                _ => return Nav::Stay,
+            },
+            (
+                ProvidersPage::Models { editor, .. },
+                super::pointer_actions::ProvidersAction::RowEditor(control),
+            ) => match control {
+                super::pointer_actions::ProviderRowEditorAction::ModelOpen(id) => {
+                    let Some(index) = editor.rows().iter().position(|row| row.id == id.0) else {
+                        return Nav::Stay;
+                    };
+                    index
+                }
+                super::pointer_actions::ProviderRowEditorAction::ModelAdd => editor.add_row_idx(),
+                super::pointer_actions::ProviderRowEditorAction::ModelSave => editor.save_idx(),
+                _ => return Nav::Stay,
+            },
+            (
+                ProvidersPage::ModelSettings { editor, .. }
+                | ProvidersPage::ProviderSettings { editor, .. },
+                super::pointer_actions::ProvidersAction::RowEditor(control),
+            ) => match control {
+                super::pointer_actions::ProviderRowEditorAction::SettingEdit(id) => {
+                    let Some(index) = editor.fields().iter().position(|field| field == id) else {
+                        return Nav::Stay;
+                    };
+                    index
+                }
+                super::pointer_actions::ProviderRowEditorAction::SettingSave => {
+                    editor.fields().len()
+                }
+                _ => return Nav::Stay,
+            },
+            (
+                ProvidersPage::OAuthSetup { state, parent },
+                super::pointer_actions::ProvidersAction::OAuthOption(id, option),
+            ) if parent.provider_id == id.0 => {
+                let Some(index) = oauth_options(state, OAuthHost::Standalone)
+                    .iter()
+                    .position(|candidate| candidate == option)
+                else {
+                    return Nav::Stay;
+                };
+                index
+            }
+            (
+                ProvidersPage::Add(state),
+                super::pointer_actions::ProvidersAction::WizardControl(step, control),
+            ) if state.run.current_step_id() == Some(step.source_id()) => {
+                let Some(index) = (0..256).position(|index| {
+                    provider_add_pointer_action(state, index)
+                        == Some(super::pointer_actions::SettingsPointerAction::Providers(
+                            super::pointer_actions::ProvidersAction::WizardControl(
+                                *step,
+                                control.clone(),
+                            ),
+                        ))
+                }) else {
+                    return Nav::Stay;
+                };
+                index
+            }
+            (
+                ProvidersPage::FetchAll(_),
+                super::pointer_actions::ProvidersAction::FetchAllConfirm(choice),
+            ) => match choice {
+                super::pointer_actions::FetchAllChoice::Apply => 0,
+                super::pointer_actions::FetchAllChoice::Cancel => 1,
+            },
+            (
+                ProvidersPage::FetchAll(_),
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ) => 2,
+            (
+                ProvidersPage::FetchOnePrompt(_),
+                super::pointer_actions::ProvidersAction::FetchOneConfirm(_, choice),
+            ) => match choice {
+                super::pointer_actions::FetchOneChoice::KeepLocal => 0,
+                super::pointer_actions::FetchOneChoice::Apply => 1,
+                super::pointer_actions::FetchOneChoice::Cancel => return Nav::Stay,
+            },
+            (
+                ProvidersPage::FetchOnePrompt(_),
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ) => 2,
+            (
+                ProvidersPage::FetchFallbackPrompt(_),
+                super::pointer_actions::ProvidersAction::FetchFallbackConfirm(_, choice),
+            ) => match choice {
+                super::pointer_actions::FetchFallbackChoice::Retry => 0,
+                super::pointer_actions::FetchFallbackChoice::KeepLocal => 1,
+                super::pointer_actions::FetchFallbackChoice::UseFallback => 2,
+                super::pointer_actions::FetchFallbackChoice::Cancel => 3,
+            },
+            (
+                ProvidersPage::DeepFetch { .. },
+                super::pointer_actions::ProvidersAction::DeepFetchChoice(_, choice),
+            ) => match choice {
+                super::pointer_actions::DeepFetchChoice::Fetch => 0,
+                super::pointer_actions::DeepFetchChoice::Cancel => 1,
+            },
+            _ => return Nav::Stay,
+        };
+        match self {
+            ProvidersPage::List { cursor, .. } if index <= cx.config.providers.len() => {
+                *cursor = index;
+            }
+            ProvidersPage::Edit(state)
+                if index < edit_menu_actions(&state.provider_id, &state.entry).len() =>
+            {
+                state.cursor = index;
+            }
+            ProvidersPage::ModelSettings { editor, .. }
+            | ProvidersPage::ProviderSettings { editor, .. }
+                if index <= editor.fields().len() =>
+            {
+                editor.cursor = index;
+            }
+            ProvidersPage::Headers { editor, .. }
+                if !editor.is_editing()
+                    && index
+                        <= editor
+                            .save_idx()
+                            .or_else(|| editor.continue_idx())
+                            .unwrap_or_else(|| editor.add_row_idx()) =>
+            {
+                editor.cursor = index;
+            }
+            ProvidersPage::Models { editor, .. }
+                if !editor.is_editing() && index <= editor.save_idx() =>
+            {
+                editor.cursor = index;
+            }
+            ProvidersPage::FetchAll(state)
+                if !state.is_fetching() && !state.unlisted.is_empty() && index <= 2 =>
+            {
+                state.cursor = index;
+            }
+            ProvidersPage::FetchOnePrompt(state) if index <= 2 => state.cursor = index,
+            ProvidersPage::FetchFallbackPrompt(state) if index <= 3 => state.cursor = index,
+            ProvidersPage::DeepFetch { state, .. } => {
+                if !state.set_pointer_choice(index) {
+                    return Nav::Stay;
+                }
+            }
+            ProvidersPage::OAuthSetup { state, .. }
+                if !state.paste_focused && index < state.option_count(OAuthHost::Standalone) =>
+            {
+                state.cursor = index;
+            }
+            ProvidersPage::Add(state) => match state.run.current_step_id() {
+                Some("template") if index < templates::TEMPLATES.len() => {
+                    state.template_cursor = index;
+                }
+                Some("auth-method") if index < 3 => state.auth_method_cursor = index,
+                Some("headers") if !state.headers.is_editing() => {
+                    let last = state
+                        .headers
+                        .continue_idx()
+                        .unwrap_or_else(|| state.headers.add_row_idx());
+                    if index > last {
+                        return Nav::Stay;
+                    }
+                    state.headers.cursor = index;
+                }
+                Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
+                Some("copilot-auth") if index == 0 => {}
+                Some("test-skipped") if index == 0 => {}
+                Some("done") if index == 0 => {}
+                Some("grok-oauth" | "codex-oauth")
+                    if state.oauth_auth.as_ref().is_some_and(|oauth| {
+                        !oauth.paste_focused && index < oauth.option_count(OAuthHost::AddWizard)
+                    }) =>
+                {
+                    state
+                        .oauth_auth
+                        .as_mut()
+                        .expect("guarded OAuth state")
+                        .cursor = index;
+                }
+                Some("id" | "url" | "api-key" | "env-var") => return Nav::Stay,
+                _ => return Nav::Stay,
+            },
+            ProvidersPage::CopilotSetup { state, .. } => match index {
+                0 if state.outcome.is_some()
+                    || (state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured) => {}
+                1 => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => return Nav::Stay,
+            },
+            _ => return Nav::Stay,
+        }
+        cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Providers(_) = &action else {
+            return Nav::Stay;
+        };
+        if let (
+            ProvidersPage::ModelSettings { editor, .. }
+            | ProvidersPage::ProviderSettings { editor, .. },
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::RowEditor(
+                    super::pointer_actions::ProviderRowEditorAction::SettingEdit(id),
+                ),
+            ),
+        ) = (&mut *self, &action)
+            && editor.editing.is_some_and(|field| field == *id)
+        {
+            let label_width = editor
+                .fields()
+                .iter()
+                .map(|field| field.label().chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            let value_x = cx.pointer_surface.area.get().map_or(0, |area| {
+                area.x
+                    .saturating_add(2)
+                    .saturating_add(label_width)
+                    .saturating_add(2)
+            });
+            editor
+                .buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        if let ProvidersPage::Add(state) = self {
+            let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
+                Some("id") => ("id", &mut state.id_field),
+                Some("url") => ("url", &mut state.url_field),
+                Some("api-key") => ("api key", state.api_key_field.as_mut()),
+                Some("env-var") => ("env var", state.env_var_field.as_mut()),
+                _ => {
+                    return self.handle_pointer_control(cx, action);
+                }
+            };
+            let value_x = cx
+                .pointer_surface
+                .area
+                .get()
+                .map_or(label.len() as u16 + 2, |area| {
+                    area.x.saturating_add(label.len() as u16 + 2)
+                });
+            field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("providers:list")
+            && let ProvidersPage::List {
+                cursor,
+                delete_pending,
+                ..
+            } = self
+        {
+            *delete_pending = false;
+            *cursor = cursor
+                .saturating_add_signed(delta)
+                .min(cx.config.providers.len());
+        } else if region == SettingsScrollRegionId("providers:edit")
+            && let ProvidersPage::Edit(state) = self
+            && state.editing_field.is_none()
+        {
+            state.delete_pending = false;
+            state.cursor = state
+                .cursor
+                .saturating_add_signed(delta)
+                .min(edit_menu_actions(&state.provider_id, &state.entry).len() - 1);
+        } else if region == SettingsScrollRegionId("providers:settings") {
+            match self {
+                ProvidersPage::ModelSettings { editor, .. }
+                | ProvidersPage::ProviderSettings { editor, .. }
+                    if editor.editing.is_none() =>
+                {
+                    editor.cursor = editor
+                        .cursor
+                        .saturating_add_signed(delta)
+                        .min(editor.fields().len());
+                }
+                _ => {}
+            }
+        } else if region == SettingsScrollRegionId("providers:headers")
+            && let ProvidersPage::Headers { editor, .. } = self
+            && !editor.is_editing()
+        {
+            let last = editor
+                .save_idx()
+                .or_else(|| editor.continue_idx())
+                .unwrap_or_else(|| editor.add_row_idx());
+            editor.cursor = editor.cursor.saturating_add_signed(delta).min(last);
+        } else if region == SettingsScrollRegionId("providers:models")
+            && let ProvidersPage::Models { editor, .. } = self
+            && !editor.is_editing()
+        {
+            editor.cursor = editor
+                .cursor
+                .saturating_add_signed(delta)
+                .min(editor.save_idx());
+        } else {
+            match self {
+                ProvidersPage::FetchAll(state)
+                    if region == SettingsScrollRegionId("providers:fetch-all")
+                        && !state.is_fetching()
+                        && !state.unlisted.is_empty() =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(2);
+                }
+                ProvidersPage::FetchOnePrompt(state)
+                    if region == SettingsScrollRegionId("providers:fetch-one") =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(2);
+                }
+                ProvidersPage::FetchFallbackPrompt(state)
+                    if region == SettingsScrollRegionId("providers:fetch-fallback") =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(3);
+                }
+                ProvidersPage::DeepFetch { state, .. }
+                    if region == SettingsScrollRegionId("providers:deep-fetch") =>
+                {
+                    state.scroll_pointer_choice(delta);
+                }
+                ProvidersPage::OAuthSetup { state, .. }
+                    if region == SettingsScrollRegionId("providers:oauth-setup")
+                        && !state.paste_focused =>
+                {
+                    let last = state.option_count(OAuthHost::Standalone).saturating_sub(1);
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(last);
+                }
+                ProvidersPage::Add(state) if region == SettingsScrollRegionId("providers:add") => {
+                    match state.run.current_step_id() {
+                        Some("template") => {
+                            state.template_cursor = state
+                                .template_cursor
+                                .saturating_add_signed(delta)
+                                .min(templates::TEMPLATES.len().saturating_sub(1));
+                        }
+                        Some("auth-method") => {
+                            state.auth_method_cursor =
+                                state.auth_method_cursor.saturating_add_signed(delta).min(2);
+                        }
+                        Some("headers") if !state.headers.is_editing() => {
+                            let last = state
+                                .headers
+                                .continue_idx()
+                                .unwrap_or_else(|| state.headers.add_row_idx());
+                            state.headers.cursor =
+                                state.headers.cursor.saturating_add_signed(delta).min(last);
+                        }
+                        Some("test-key-choice") => {
+                            state.test_choice_cursor =
+                                state.test_choice_cursor.saturating_add_signed(delta).min(1);
+                        }
+                        Some("grok-oauth" | "codex-oauth") => {
+                            if let Some(oauth) = state.oauth_auth.as_mut()
+                                && !oauth.paste_focused
+                            {
+                                let last =
+                                    oauth.option_count(OAuthHost::AddWizard).saturating_sub(1);
+                                oauth.cursor = oauth.cursor.saturating_add_signed(delta).min(last);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        match self {
+            ProvidersPage::CopilotSetup { state, .. } => state.operation.cancel(),
+            ProvidersPage::OAuthSetup { state, .. } => state.cancel_copy_effect(),
+            ProvidersPage::Add(state) => {
+                if let Some(oauth) = state.oauth_auth.as_mut() {
+                    oauth.cancel_copy_effect();
+                }
+            }
+            ProvidersPage::List { delete_pending, .. } => *delete_pending = false,
+            ProvidersPage::Edit(state) => state.delete_pending = false,
+            _ => {}
+        }
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -96,7 +96,7 @@ struct DetectedCapabilityPreview {
 }
 
 /// The editable provider/model fields, in row order.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ProviderSettingId {
     /// Provider-only opt-in for plaintext non-loopback HTTP base URLs.
     AllowInsecureHttp,
@@ -153,7 +153,7 @@ pub(super) enum ProviderSettingId {
     XaiMultiAgentToolsBeta,
 }
 
-const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
+pub(super) const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::AllowInsecureHttp,
     ProviderSettingId::TrustPolicy,
     ProviderSettingId::Location,
@@ -1850,17 +1850,8 @@ impl SettingsEditor {
         if format!("{:?}", editor.refresh) == before_refresh {
             return; // superseded: no status mutation
         }
-        // Always clear the Refreshing… busy status on accepted success.
-        if let Some(line) = self
-            .multimodal
-            .as_ref()
-            .and_then(|m| m.accessibility_projection().first())
-            .cloned()
-        {
-            self.status = Some(line);
-        } else {
-            self.status = Some("media capabilities refreshed".into());
-        }
+        // Always clear the Refreshing… announcement on accepted success.
+        self.status = Some("media capabilities refreshed".into());
     }
 
     /// Complete a failed multimodal refresh without mutating drafts.
@@ -1941,6 +1932,26 @@ impl SettingsEditor {
             _ => return false,
         }
         self.sync_media_drafts_from_multimodal();
+        if action == "Discard" {
+            self.status = Some("media capability draft discarded".into());
+            return true;
+        }
+        if action == "Reload" {
+            self.status = Some("media capability draft reloaded".into());
+            return true;
+        }
+        if action == "Reapply" {
+            self.status = Some("media capability draft reapplied".into());
+            return true;
+        }
+        if action == "Rebind" {
+            self.status = Some("media capability draft rebound".into());
+            return true;
+        }
+        if action == "Dismiss" {
+            self.status = Some("media capability refresh failure dismissed".into());
+            return true;
+        }
         if let Some(line) = self
             .multimodal
             .as_ref()

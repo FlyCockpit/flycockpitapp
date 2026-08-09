@@ -101,6 +101,10 @@ impl DependenciesPage {
 }
 
 impl SettingsPage for DependenciesPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Dependencies
+    }
+
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {

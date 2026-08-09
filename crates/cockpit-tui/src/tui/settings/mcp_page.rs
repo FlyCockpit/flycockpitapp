@@ -10,7 +10,7 @@
 //!   - **Add**: name + cycled transport / auth + endpoint-or-command
 //!     text field, with a warning when auth is `none`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -25,8 +25,8 @@ use cockpit_core::mcp::config::{
 
 use super::secret_display;
 use super::shell::{
-    error_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
-    selected_style, warning_style,
+    SettingsScrollRegionId, error_style, marker, muted_style, push_text_field_at_cursor,
+    selected_line_from_marker, selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_button_line, save_status};
 
@@ -137,6 +137,71 @@ const FIELD_CONNECT_TIMEOUT: usize = 16;
 const FIELD_REQUEST_TIMEOUT: usize = 17;
 const FIELD_SAVE: usize = 18;
 const ADD_FIELDS: usize = 19;
+
+macro_rules! push_pointer_text_field {
+    ($bindings:expr, $id:expr, $($args:expr),+ $(,)?) => {{
+        let range = push_text_field_at_cursor($($args),+);
+        $bindings.extend(range.map(|line| (line, mcp_add_action($id))));
+    }};
+}
+
+fn mcp_add_action(index: usize) -> super::pointer_actions::McpAction {
+    use super::pointer_actions::McpAction;
+    match index {
+        FIELD_NAME => McpAction::EditName,
+        FIELD_ENABLED => McpAction::ToggleEditorEnabled,
+        FIELD_TRANSPORT => McpAction::CycleTransport,
+        FIELD_ENDPOINT => McpAction::EditEndpoint,
+        FIELD_COMMAND => McpAction::EditCommand,
+        FIELD_ARGS => McpAction::EditArgs,
+        FIELD_BASE_ENV => McpAction::EditBaseEnv,
+        FIELD_AUTH => McpAction::CycleAuth,
+        FIELD_HEADER_NAME => McpAction::EditHeaderName,
+        FIELD_HEADER_VALUE => McpAction::EditHeaderValue,
+        FIELD_AUTH_ENV => McpAction::EditAuthEnv,
+        FIELD_OAUTH_AUTHORIZE => McpAction::EditOauthAuthorizeUrl,
+        FIELD_OAUTH_TOKEN => McpAction::EditOauthTokenUrl,
+        FIELD_OAUTH_CLIENT => McpAction::EditOauthClientId,
+        FIELD_OAUTH_SCOPES => McpAction::EditOauthScopes,
+        FIELD_CACHE_TTL => McpAction::EditCacheTtl,
+        FIELD_CONNECT_TIMEOUT => McpAction::EditConnectTimeout,
+        FIELD_REQUEST_TIMEOUT => McpAction::EditRequestTimeout,
+        FIELD_SAVE => McpAction::Save,
+        _ => unreachable!("sealed MCP add field index"),
+    }
+}
+
+fn mcp_add_index(action: &super::pointer_actions::McpAction) -> Option<usize> {
+    use super::pointer_actions::McpAction;
+    Some(match action {
+        McpAction::EditName => FIELD_NAME,
+        McpAction::ToggleEditorEnabled => FIELD_ENABLED,
+        McpAction::CycleTransport => FIELD_TRANSPORT,
+        McpAction::EditEndpoint => FIELD_ENDPOINT,
+        McpAction::EditCommand => FIELD_COMMAND,
+        McpAction::EditArgs => FIELD_ARGS,
+        McpAction::EditBaseEnv => FIELD_BASE_ENV,
+        McpAction::CycleAuth => FIELD_AUTH,
+        McpAction::EditHeaderName => FIELD_HEADER_NAME,
+        McpAction::EditHeaderValue => FIELD_HEADER_VALUE,
+        McpAction::EditAuthEnv => FIELD_AUTH_ENV,
+        McpAction::EditOauthAuthorizeUrl => FIELD_OAUTH_AUTHORIZE,
+        McpAction::EditOauthTokenUrl => FIELD_OAUTH_TOKEN,
+        McpAction::EditOauthClientId => FIELD_OAUTH_CLIENT,
+        McpAction::EditOauthScopes => FIELD_OAUTH_SCOPES,
+        McpAction::EditCacheTtl => FIELD_CACHE_TTL,
+        McpAction::EditConnectTimeout => FIELD_CONNECT_TIMEOUT,
+        McpAction::EditRequestTimeout => FIELD_REQUEST_TIMEOUT,
+        McpAction::Save => FIELD_SAVE,
+        McpAction::Cancel
+        | McpAction::Open(_)
+        | McpAction::Add
+        | McpAction::ToggleEnabled(_)
+        | McpAction::Authenticate(_)
+        | McpAction::Delete(_) => return None,
+    })
+}
+
 type EnvMaps = (BTreeMap<String, String>, BTreeMap<String, String>);
 
 enum ServerLifecycle {
@@ -431,6 +496,7 @@ impl SettingsCx {
             )),
             Line::from(""),
         ];
+        let mut bindings = Vec::new();
         let names: Vec<&String> = cfg.servers.keys().collect();
         for (i, name) in names.iter().enumerate() {
             let server = &cfg.servers[*name];
@@ -447,16 +513,72 @@ impl SettingsCx {
                 server.auth.kind_str(),
                 lifecycle_label(name, server),
             );
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::McpAction::Open(super::pointer_actions::McpServerId(
+                    (*name).clone(),
+                )),
+            ));
             lines.push(Line::from(Span::styled(text, Style::default().fg(color))));
         }
         // [+ add server] row.
         let add_marker = marker(s.cursor == names.len());
+        bindings.push((lines.len(), super::pointer_actions::McpAction::Add));
         lines.push(Line::from(Span::styled(
             format!("{add_marker}[+ add server]"),
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        if let Some(name) = names.get(s.cursor) {
+            lines.push(Line::from(""));
+            if s.delete_pending {
+                lines.push(Line::from(format!("Delete {name}?")));
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::McpAction::Delete(super::pointer_actions::McpServerId(
+                        (*name).clone(),
+                    )),
+                ));
+                lines.push(Line::from("[Delete]"));
+                bindings.push((lines.len(), super::pointer_actions::McpAction::Cancel));
+                lines.push(Line::from("[Cancel]"));
+            } else {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::McpAction::ToggleEnabled(
+                        super::pointer_actions::McpServerId((*name).clone()),
+                    ),
+                ));
+                lines.push(Line::from("[Toggle enabled]"));
+                let oauth = self
+                    .load_mcp()
+                    .servers
+                    .get(*name)
+                    .is_some_and(|server| matches!(server.auth, Auth::Oauth(_)));
+                if oauth {
+                    bindings.push((
+                        lines.len(),
+                        super::pointer_actions::McpAction::Authenticate(
+                            super::pointer_actions::McpServerId((*name).clone()),
+                        ),
+                    ));
+                    lines.push(Line::from("[Authenticate]"));
+                }
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::McpAction::Delete(super::pointer_actions::McpServerId(
+                        (*name).clone(),
+                    )),
+                ));
+                lines.push(Line::from("[Delete]"));
+            }
+        }
         if names.is_empty() {
             lines.insert(2, Line::from("No MCP servers configured."));
+            for (line, _) in &mut bindings {
+                if *line >= 2 {
+                    *line += 1;
+                }
+            }
         }
         if let Some(status) = &s.status {
             lines.push(Line::from(""));
@@ -466,8 +588,14 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "mcp:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "mcp:list",
+            (lines, selected_line),
+            bindings,
+            (&self.pointer_surface, SettingsScrollRegionId("mcp:list")).into(),
+        );
     }
 
     fn render_mcp_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
@@ -483,7 +611,10 @@ impl SettingsCx {
             Line::from(""),
             Line::from(Span::styled("Server", muted_style())),
         ];
-        push_text_field_at_cursor(
+        let mut bindings = Vec::new();
+        push_pointer_text_field!(
+            bindings,
+            FIELD_NAME,
             &mut lines,
             area.width,
             "name",
@@ -492,6 +623,7 @@ impl SettingsCx {
             s.cursor == FIELD_NAME,
             None,
         );
+        bindings.push((lines.len(), mcp_add_action(FIELD_ENABLED)));
         lines.push(Line::from(vec![
             Span::raw("enabled: "),
             Span::styled(
@@ -503,6 +635,7 @@ impl SettingsCx {
                 },
             ),
         ]));
+        bindings.push((lines.len(), mcp_add_action(FIELD_TRANSPORT)));
         lines.push(Line::from(vec![
             Span::raw("transport: "),
             Span::styled(
@@ -516,7 +649,9 @@ impl SettingsCx {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Connection", muted_style())));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_ENDPOINT,
             &mut lines,
             area.width,
             "endpoint",
@@ -525,7 +660,9 @@ impl SettingsCx {
             s.cursor == FIELD_ENDPOINT,
             Some("remote transports"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_COMMAND,
             &mut lines,
             area.width,
             "command",
@@ -534,7 +671,9 @@ impl SettingsCx {
             s.cursor == FIELD_COMMAND,
             Some("stdio"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_ARGS,
             &mut lines,
             area.width,
             "args",
@@ -543,7 +682,9 @@ impl SettingsCx {
             s.cursor == FIELD_ARGS,
             Some("stdio, space separated"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_BASE_ENV,
             &mut lines,
             area.width,
             "base env",
@@ -554,6 +695,7 @@ impl SettingsCx {
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Auth", muted_style())));
+        bindings.push((lines.len(), mcp_add_action(FIELD_AUTH)));
         lines.push(Line::from(vec![
             Span::raw("auth: "),
             Span::styled(
@@ -565,7 +707,9 @@ impl SettingsCx {
                 },
             ),
         ]));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_HEADER_NAME,
             &mut lines,
             area.width,
             "header name",
@@ -574,7 +718,9 @@ impl SettingsCx {
             s.cursor == FIELD_HEADER_NAME,
             Some("remote header auth"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_HEADER_VALUE,
             &mut lines,
             area.width,
             "header value",
@@ -583,7 +729,9 @@ impl SettingsCx {
             s.cursor == FIELD_HEADER_VALUE,
             Some("literal stored in credentials, or $ENV"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_AUTH_ENV,
             &mut lines,
             area.width,
             "auth env",
@@ -592,7 +740,9 @@ impl SettingsCx {
             s.cursor == FIELD_AUTH_ENV,
             Some("stdio env auth, one KEY=VALUE per row"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_AUTHORIZE,
             &mut lines,
             area.width,
             "oauth authorize",
@@ -601,7 +751,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_AUTHORIZE,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_TOKEN,
             &mut lines,
             area.width,
             "oauth token",
@@ -610,7 +762,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_TOKEN,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_CLIENT,
             &mut lines,
             area.width,
             "oauth client id",
@@ -619,7 +773,9 @@ impl SettingsCx {
             s.cursor == FIELD_OAUTH_CLIENT,
             None,
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_OAUTH_SCOPES,
             &mut lines,
             area.width,
             "oauth scopes",
@@ -630,7 +786,9 @@ impl SettingsCx {
         );
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Behavior", muted_style())));
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_CACHE_TTL,
             &mut lines,
             area.width,
             "cache ttl",
@@ -639,7 +797,9 @@ impl SettingsCx {
             s.cursor == FIELD_CACHE_TTL,
             Some("seconds"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_CONNECT_TIMEOUT,
             &mut lines,
             area.width,
             "connect timeout",
@@ -648,7 +808,9 @@ impl SettingsCx {
             s.cursor == FIELD_CONNECT_TIMEOUT,
             Some("seconds, remote"),
         );
-        push_text_field_at_cursor(
+        push_pointer_text_field!(
+            bindings,
+            FIELD_REQUEST_TIMEOUT,
             &mut lines,
             area.width,
             "request timeout",
@@ -657,6 +819,7 @@ impl SettingsCx {
             s.cursor == FIELD_REQUEST_TIMEOUT,
             Some("seconds, remote"),
         );
+        bindings.push((lines.len(), mcp_add_action(FIELD_SAVE)));
         lines.push(save_button_line("[ save ]", s.cursor == FIELD_SAVE));
         if !s.auth.is_compatible(s.transport) {
             lines.push(Line::from(""));
@@ -682,8 +845,14 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(status.clone(), error_style())));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "mcp:add", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "mcp:add",
+            (lines, selected_line),
+            bindings,
+            (&self.pointer_surface, SettingsScrollRegionId("mcp:add")).into(),
+        );
     }
 }
 
@@ -1070,6 +1239,24 @@ fn format_pairs_for_edit(
 }
 
 impl SettingsPage for McpPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Mcp
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        match self {
+            McpPage::List(_) => 300,
+            McpPage::Add(_) => 301,
+        }
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            McpPage::List(_) => super::SettingsLocalBack::NoLocalBack,
+            McpPage::Add(_) => super::SettingsLocalBack::LocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match self {
             McpPage::List(s) => cx.handle_mcp_list_key(key, s),
@@ -1079,6 +1266,152 @@ impl SettingsPage for McpPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_mcp_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Mcp(action) = action else {
+            return Nav::Stay;
+        };
+        if let McpPage::List(state) = self {
+            let key = match &action {
+                super::pointer_actions::McpAction::Cancel if state.delete_pending => {
+                    state.delete_pending = false;
+                    state.status = Some("delete cancelled".into());
+                    return Nav::Stay;
+                }
+                super::pointer_actions::McpAction::ToggleEnabled(id) => {
+                    let names: Vec<_> = cx.load_mcp().servers.keys().cloned().collect();
+                    let Some(index) = names.iter().position(|name| name == &id.0) else {
+                        return Nav::Stay;
+                    };
+                    state.cursor = index;
+                    Some(KeyCode::Char(' '))
+                }
+                super::pointer_actions::McpAction::Authenticate(id) => {
+                    let names: Vec<_> = cx.load_mcp().servers.keys().cloned().collect();
+                    let Some(index) = names.iter().position(|name| name == &id.0) else {
+                        return Nav::Stay;
+                    };
+                    state.cursor = index;
+                    Some(KeyCode::Char('a'))
+                }
+                super::pointer_actions::McpAction::Delete(id) => {
+                    let names: Vec<_> = cx.load_mcp().servers.keys().cloned().collect();
+                    let Some(index) = names.iter().position(|name| name == &id.0) else {
+                        return Nav::Stay;
+                    };
+                    state.cursor = index;
+                    Some(KeyCode::Char('d'))
+                }
+                _ => None,
+            };
+            if let Some(key) = key {
+                return cx.handle_mcp_list_key(KeyEvent::new(key, KeyModifiers::NONE), state);
+            }
+        }
+        match (&mut *self, &action) {
+            (McpPage::List(state), super::pointer_actions::McpAction::Open(id)) => {
+                let names: Vec<_> = cx.load_mcp().servers.keys().cloned().collect();
+                let Some(index) = names.iter().position(|name| name == &id.0) else {
+                    return Nav::Stay;
+                };
+                state.cursor = index;
+            }
+            (McpPage::List(state), super::pointer_actions::McpAction::Add) => {
+                state.cursor = cx.load_mcp().servers.len()
+            }
+            (McpPage::Add(state), _) => {
+                let Some(index) = mcp_add_index(&action) else {
+                    return Nav::Stay;
+                };
+                state.cursor = index;
+            }
+            _ => return Nav::Stay,
+        }
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Mcp(ref mcp_action) = action else {
+            return Nav::Stay;
+        };
+        let Some(index) = mcp_add_index(mcp_action) else {
+            return self.handle_pointer_control(cx, action);
+        };
+        if let McpPage::Add(state) = self {
+            if index >= ADD_FIELDS {
+                return Nav::Stay;
+            }
+            state.cursor = index;
+            let label = match index {
+                FIELD_NAME => Some("name"),
+                FIELD_ENDPOINT => Some("endpoint"),
+                FIELD_COMMAND => Some("command"),
+                FIELD_ARGS => Some("args"),
+                FIELD_BASE_ENV => Some("base env"),
+                FIELD_HEADER_NAME => Some("header name"),
+                FIELD_HEADER_VALUE => Some("header value"),
+                FIELD_AUTH_ENV => Some("auth env"),
+                FIELD_OAUTH_AUTHORIZE => Some("oauth authorize"),
+                FIELD_OAUTH_TOKEN => Some("oauth token"),
+                FIELD_OAUTH_CLIENT => Some("oauth client id"),
+                FIELD_OAUTH_SCOPES => Some("oauth scopes"),
+                FIELD_CACHE_TTL => Some("cache ttl"),
+                FIELD_CONNECT_TIMEOUT => Some("connect timeout"),
+                FIELD_REQUEST_TIMEOUT => Some("request timeout"),
+                _ => None,
+            };
+            if let Some(label) = label {
+                let area_x = cx.pointer_surface.area.get().map_or(0, |area| area.x);
+                let value_x = area_x.saturating_add(label.len() as u16 + 2);
+                if let Some(field) = active_text_field_mut(state) {
+                    field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+                }
+                return Nav::Stay;
+            }
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        match self {
+            McpPage::List(state) if region == SettingsScrollRegionId("mcp:list") => {
+                state.delete_pending = false;
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(cx.load_mcp().servers.len());
+            }
+            McpPage::Add(state) if region == SettingsScrollRegionId("mcp:add") => {
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(ADD_FIELDS - 1);
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        if let McpPage::List(state) = self {
+            state.delete_pending = false;
+        }
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

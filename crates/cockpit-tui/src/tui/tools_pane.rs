@@ -211,7 +211,7 @@ impl ToolsPane {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let (lines, selected_line) = tool_surface_lines(
+        let (lines, selected_line, _) = tool_surface_lines(
             &self.picker,
             &self.draft,
             ToolSurfaceRender {

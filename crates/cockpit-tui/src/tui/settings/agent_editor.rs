@@ -62,6 +62,10 @@ impl AgentEditor {
         self.editor.paste(text);
     }
 
+    pub(super) fn set_cursor_from_visible_cell(&mut self, row: usize, col: usize) {
+        self.editor.set_cursor_from_visible_cell(row, col);
+    }
+
     /// Apply a key. Save/cancel chords:
     ///   - Ctrl+S saves and closes from any mode.
     ///   - Ctrl+G asks the host to hand the current file to `$EDITOR`.

@@ -50,8 +50,9 @@ use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingSto
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
-    TextColumnLayout, heading_style, muted_style, push_label_text_field_row, push_label_value_row,
-    push_wrapped_text, selected_style, settings_text_columns, warning_style,
+    PointerOperationGate, PointerOperationId, SettingsPointerAction, SettingsPointerSurface,
+    SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_text_field_row,
+    push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -251,7 +252,7 @@ fn llm_mode_label(m: LlmMode) -> &'static str {
 /// Which top-level category a [`CategoryPage`] renders. Drives the page
 /// title, the section intro, the row descriptor list, the reset scope, and
 /// the back-target cursor.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub(super) enum Category {
     Interface,
     Behavior,
@@ -261,6 +262,26 @@ pub(super) enum Category {
 }
 
 impl Category {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 5] = [
+        Self::Interface,
+        Self::Behavior,
+        Self::Privacy,
+        Self::Translation,
+        Self::Profile,
+    ];
+
+    #[cfg(test)]
+    const fn fixture_ordinal(self) -> usize {
+        match self {
+            Self::Interface => 0,
+            Self::Behavior => 1,
+            Self::Privacy => 2,
+            Self::Translation => 3,
+            Self::Profile => 4,
+        }
+    }
+
     /// The page heading shown bold at the top of the body.
     pub(super) fn heading(self) -> &'static str {
         match self {
@@ -339,7 +360,7 @@ pub(super) enum Row {
 /// on this to render the value, describe it, and mutate `self.extended`.
 /// One enum (rather than per-category enums) keeps the read/write/help
 /// logic in a single exhaustive `match` per concern.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) enum SettingId {
     // ── Interface ────────────────────────────────────────────────────
     VimMode,
@@ -440,7 +461,7 @@ pub(super) enum SettingId {
     Name,
 }
 
-const ALL_SETTING_IDS: &[SettingId] = &[
+pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::VimMode,
     SettingId::Thinking,
     SettingId::RenderAgentMarkdown,
@@ -659,7 +680,8 @@ impl SettingId {
             }
             SettingId::Mouse => {
                 "Capture mouse events. On (default) gives click-to-position in the \
-                 composer, in-app drag-select, and clickable chips; hold \
+                 composer, in-app drag-select, clickable chips, and click/wheel \
+                 navigation and editing throughout Settings; hold \
                  Shift/Option/Fn for your terminal's native selection. Off hands \
                  selection and copy back to the terminal entirely."
             }
@@ -1176,6 +1198,7 @@ pub(super) struct CategoryPage {
     pub(super) text_editor: Option<CategoryTextEditor>,
     pub(super) path_editor: Option<CategoryPathEditor>,
     pub(super) pending_external_edit: Option<CategoryExternalEdit>,
+    external_edit_ops: PointerOperationGate,
     pub(super) status: Option<String>,
     pub(super) reset: ResetButton,
     /// Drained by the App on close to reconcile crossterm mouse capture
@@ -1221,6 +1244,7 @@ pub(super) enum CategoryExternalSource {
 }
 
 pub(super) struct CategoryExternalEdit {
+    pub(super) operation_id: PointerOperationId,
     pub(super) id: SettingId,
     pub(super) path: tempfile::TempPath,
     source: CategoryExternalSource,
@@ -1228,7 +1252,17 @@ pub(super) struct CategoryExternalEdit {
 }
 
 impl CategoryExternalEdit {
-    fn new(id: SettingId, text: &str, source: CategoryExternalSource) -> Result<Self, String> {
+    #[cfg(test)]
+    pub(super) fn source(&self) -> CategoryExternalSource {
+        self.source
+    }
+
+    fn new(
+        operation_id: PointerOperationId,
+        id: SettingId,
+        text: &str,
+        source: CategoryExternalSource,
+    ) -> Result<Self, String> {
         if std::env::var_os("EDITOR").is_none() {
             return Err("No $EDITOR environment variable".into());
         }
@@ -1242,6 +1276,7 @@ impl CategoryExternalEdit {
         temp.flush()
             .map_err(|e| format!("editor: failed to flush temp file: {e}"))?;
         Ok(Self {
+            operation_id,
             id,
             path: temp.into_temp_path(),
             source,
@@ -1307,7 +1342,7 @@ impl CategoryPathEditor {
         self.refresh(cwd);
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, surface: &SettingsPointerSurface) {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("editing {}", self.id.descriptor().label),
@@ -1315,6 +1350,7 @@ impl CategoryPathEditor {
             )),
             Line::default(),
         ];
+        let field_line = lines.len();
         super::shell::push_text_field_at_cursor(
             &mut lines,
             area.width,
@@ -1324,6 +1360,25 @@ impl CategoryPathEditor {
             true,
             None,
         );
+        let field_x = self.id.descriptor().label.chars().count().saturating_add(2);
+        surface.register(SettingsPointerTarget {
+            rect: Rect::new(
+                area.x.saturating_add(field_x.min(u16::MAX as usize) as u16),
+                area.y.saturating_add(field_line as u16),
+                area.width
+                    .saturating_sub(field_x.min(u16::MAX as usize) as u16),
+                1,
+            ),
+            action: SettingsPointerAction::Page(
+                super::pointer_actions::SettingsPointerAction::Category(
+                    super::pointer_actions::CategoryAction::PathEditBegin(category_pointer_id(
+                        self.id,
+                    )),
+                ),
+            ),
+            enabled: true,
+            disabled_reason: None,
+        });
         if let Some(ghost) = self.suggest.ghost_for(self.text())
             && let Some(last) = lines.last_mut()
         {
@@ -1341,6 +1396,7 @@ impl CategoryPathEditor {
                 .skip(self.suggest.scroll)
                 .take(DIR_SUGGEST_WINDOW)
             {
+                let suggestion_line = lines.len();
                 let active = i == self.suggest.selected;
                 let suffix = if entry.is_dir { "/" } else { "" };
                 lines.push(Line::from(vec![
@@ -1354,6 +1410,24 @@ impl CategoryPathEditor {
                         },
                     ),
                 ]));
+                surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x,
+                        area.y.saturating_add(suggestion_line as u16),
+                        area.width,
+                        1,
+                    ),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::SuggestionSelect(
+                                category_pointer_id(self.id),
+                                super::pointer_actions::SuggestionId(entry.replacement.clone()),
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
             if self.suggest.entries.len() > DIR_SUGGEST_WINDOW {
                 lines.push(Line::from(Span::styled(
@@ -1366,10 +1440,56 @@ impl CategoryPathEditor {
             }
         }
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "tab: accept  right: complete  enter: save  esc: cancel".to_string(),
-            muted_style(),
-        )));
+        let action_line = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled("[Save]", selected_style()),
+            Span::raw("  "),
+            Span::styled("[Cancel]", selected_style()),
+            Span::raw("  "),
+            Span::styled("[Open in $EDITOR]", selected_style()),
+            Span::styled("  tab: accept  right: complete", muted_style()),
+        ]));
+        for (action, x, width) in [
+            (
+                super::pointer_actions::CategoryAction::PathEditCommit(category_pointer_id(
+                    self.id,
+                )),
+                0u16,
+                6u16,
+            ),
+            (
+                super::pointer_actions::CategoryAction::PathEditCancel(category_pointer_id(
+                    self.id,
+                )),
+                8u16,
+                8u16,
+            ),
+            (
+                super::pointer_actions::CategoryAction::ExternalEditBegin(
+                    category_pointer_id(self.id),
+                    super::pointer_actions::CategoryExternalSource::PathEditor,
+                ),
+                18u16,
+                17u16,
+            ),
+        ] {
+            if x.saturating_add(width) > area.width {
+                continue;
+            }
+            surface.register(SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x + x,
+                    area.y.saturating_add(action_line as u16),
+                    width,
+                    1,
+                ),
+                action: SettingsPointerAction::Page(
+                    super::pointer_actions::SettingsPointerAction::Category(action),
+                ),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 }
@@ -1380,6 +1500,14 @@ fn path_setting_mode(id: SettingId) -> Option<PathSuggestMode> {
         SettingId::SandboxDockerfile => Some(PathSuggestMode::FilesAndDirectories),
         _ => None,
     }
+}
+
+fn category_pointer_id(id: SettingId) -> super::pointer_actions::SettingId {
+    id
+}
+
+fn category_setting_from_pointer(id: super::pointer_actions::SettingId) -> Option<SettingId> {
+    Some(id)
 }
 
 /// Full-area editor for long text and JSON category settings.
@@ -1487,6 +1615,7 @@ impl CategoryPage {
             text_editor: None,
             path_editor: None,
             pending_external_edit: None,
+            external_edit_ops: PointerOperationGate::default(),
             status: None,
             reset: ResetButton::default(),
             pending_mouse_capture: None,
@@ -1494,6 +1623,71 @@ impl CategoryPage {
             utility_picker_target: None,
             shadowed_global: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pointer_surface_fixture(
+        mode: CategoryPointerFixtureMode,
+        cwd: &std::path::Path,
+    ) -> Self {
+        use super::ui_page::PickerMode;
+
+        let mut page = Self::new(Category::Interface);
+        match mode {
+            CategoryPointerFixtureMode::Browse => {}
+            CategoryPointerFixtureMode::InlineEdit => {
+                page.editing = Some(SettingId::ExitTailLines);
+                page.buf = TextField::new("7");
+            }
+            CategoryPointerFixtureMode::PathEdit => {
+                page.path_editor = Some(CategoryPathEditor::new(
+                    SettingId::PackagesDir,
+                    cwd.display().to_string(),
+                    PathSuggestMode::Directories,
+                    cwd,
+                ));
+            }
+            CategoryPointerFixtureMode::TextEdit => {
+                page.text_editor = Some(CategoryTextEditor::new(
+                    SettingId::CompactPrompt,
+                    "echo fixture".into(),
+                    false,
+                ));
+            }
+            CategoryPointerFixtureMode::ExternalEdit => {
+                page.pending_external_edit = Some(CategoryExternalEdit {
+                    operation_id: PointerOperationId(1),
+                    id: SettingId::CompactPrompt,
+                    path: tempfile::NamedTempFile::new()
+                        .expect("category external-edit fixture")
+                        .into_temp_path(),
+                    source: CategoryExternalSource::TextEditor,
+                    servicing: false,
+                });
+            }
+            CategoryPointerFixtureMode::PickerList => {
+                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                    entries: Vec::new(),
+                    current: None,
+                    mode: PickerMode::List {
+                        cursor: 0,
+                        scroll: 0,
+                    },
+                }));
+                page.utility_picker_target = Some(SettingId::UtilityModel);
+            }
+            CategoryPointerFixtureMode::PickerCustom => {
+                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                    entries: Vec::new(),
+                    current: None,
+                    mode: PickerMode::Custom {
+                        buf: TextField::new("p:model"),
+                    },
+                }));
+                page.utility_picker_target = Some(SettingId::UtilityModel);
+            }
+        }
+        page
     }
 
     pub(super) fn is_path_editing(&self) -> bool {
@@ -1530,6 +1724,31 @@ impl CategoryPage {
             .reset_label()
             .map(|_| self.setting_ids().len())
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CategoryPointerFixtureMode {
+    Browse,
+    InlineEdit,
+    PathEdit,
+    TextEdit,
+    ExternalEdit,
+    PickerList,
+    PickerCustom,
+}
+
+#[cfg(test)]
+impl CategoryPointerFixtureMode {
+    pub(super) const ALL: [Self; 7] = [
+        Self::Browse,
+        Self::InlineEdit,
+        Self::PathEdit,
+        Self::TextEdit,
+        Self::ExternalEdit,
+        Self::PickerList,
+        Self::PickerCustom,
+    ];
 }
 
 /// Build the descriptor list for a category. Common, foundational settings
@@ -2053,27 +2272,79 @@ impl SettingsCx {
     pub(super) fn finish_category_page_external_edit(
         &mut self,
         p: &mut CategoryPage,
-        editor_error: Option<String>,
+        operation_id: PointerOperationId,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
+        let Some(setting) = p
+            .pending_external_edit
+            .as_ref()
+            .filter(|pending| pending.operation_id == operation_id)
+            .map(|pending| pending.id)
+        else {
+            return;
+        };
+        self.reduce_category_external_edit_result(
+            p,
+            operation_id,
+            super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome),
+            detail,
+        );
+    }
+
+    fn reduce_category_external_edit_result(
+        &mut self,
+        p: &mut CategoryPage,
+        operation_id: PointerOperationId,
+        action: super::pointer_actions::CategoryAction,
+        detail: Option<String>,
+    ) {
+        let super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome) = action
+        else {
+            return;
+        };
+        if !p
+            .pending_external_edit
+            .as_ref()
+            .is_some_and(|pending| pending.operation_id == operation_id && pending.id == setting)
+        {
+            return;
+        }
+        if p.pending_external_edit
+            .as_ref()
+            .map(|pending| pending.operation_id)
+            != Some(operation_id)
+            || !p.external_edit_ops.complete(operation_id)
+        {
+            return;
+        }
         let Some(pending) = p.pending_external_edit.take() else {
             return;
         };
-        if let Some(err) = editor_error {
-            match pending.source {
-                CategoryExternalSource::TextEditor => {
-                    if let Some(editor) = p.text_editor.as_mut() {
-                        editor.error = Some(err);
-                    } else {
-                        p.status = Some(err);
+        match outcome {
+            super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                p.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
+                return;
+            }
+            super::pointer_actions::ExternalEditOutcome::Failed => {
+                let error = detail.unwrap_or_else(|| "external edit failed".into());
+                match pending.source {
+                    CategoryExternalSource::TextEditor => {
+                        if let Some(editor) = p.text_editor.as_mut() {
+                            editor.error = Some(error);
+                        } else {
+                            p.status = Some(error);
+                        }
+                    }
+                    CategoryExternalSource::PathEditor
+                    | CategoryExternalSource::Inline
+                    | CategoryExternalSource::Cursor => {
+                        p.status = Some(error);
                     }
                 }
-                CategoryExternalSource::PathEditor
-                | CategoryExternalSource::Inline
-                | CategoryExternalSource::Cursor => {
-                    p.status = Some(err);
-                }
+                return;
             }
-            return;
+            super::pointer_actions::ExternalEditOutcome::Saved => {}
         }
 
         let raw = match std::fs::read_to_string(pending.path.as_ref() as &std::path::Path) {
@@ -2096,6 +2367,9 @@ impl SettingsCx {
                 p.path_editor = None;
                 p.status = None;
                 self.finish_category_save(id, p);
+                if let Some(detail) = detail {
+                    p.status = Some(format!("saved; {detail}"));
+                }
             }
             Err(reason) => {
                 self.restore_category_external_edit(p, id, text, pending.source, reason);
@@ -2179,6 +2453,7 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Char('g') if is_ctrl_g(key) => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::PathEditor,
@@ -2187,7 +2462,10 @@ impl SettingsCx {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                     p.path_editor = Some(editor);
                 }
@@ -2276,6 +2554,7 @@ impl SettingsCx {
                 }
                 VimEditorOutcome::ExternalEdit => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::TextEditor,
@@ -2285,7 +2564,10 @@ impl SettingsCx {
                             p.status = Some("opening $EDITOR...".into());
                             editor.error = None;
                         }
-                        Err(reason) => editor.error = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            editor.error = Some(reason);
+                        }
                     }
                     p.text_editor = Some(editor);
                 }
@@ -2302,8 +2584,14 @@ impl SettingsCx {
         // Inline text/number edit owns input until Enter/Esc.
         if let Some(id) = p.editing {
             match key.code {
-                KeyCode::Char('g') if is_ctrl_g(key) && category_external_editable(id) => {
+                // Every active inline text field publishes this explicit
+                // action, including validated numeric fields. The external
+                // round trip feeds the same commit validator and restores the
+                // inline draft on invalid content, so do not apply the
+                // cursor-only long-text/path eligibility filter here.
+                KeyCode::Char('g') if is_ctrl_g(key) => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         id,
                         p.buf.text(),
                         CategoryExternalSource::Inline,
@@ -2312,7 +2600,10 @@ impl SettingsCx {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                 }
                 KeyCode::Enter => {
@@ -2346,12 +2637,20 @@ impl SettingsCx {
                     && category_external_editable(id)
                 {
                     let seed = self.category_edit_seed(id);
-                    match CategoryExternalEdit::new(id, &seed, CategoryExternalSource::Cursor) {
+                    match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
+                        id,
+                        &seed,
+                        CategoryExternalSource::Cursor,
+                    ) {
                         Ok(request) => {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                 }
             }
@@ -2989,6 +3288,57 @@ fn category_external_editable(id: SettingId) -> bool {
     matches!(id.descriptor().kind, FieldKind::EditText) && !numeric_text_setting(id)
 }
 
+#[cfg(test)]
+pub(super) fn pointer_inline_editor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(|id| {
+        matches!(
+            id.descriptor().kind,
+            FieldKind::EditText | FieldKind::Numeric
+        ) && path_setting_mode(id).is_none()
+            && !long_text_setting(id)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn pointer_text_editor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(long_text_setting)
+}
+
+#[cfg(test)]
+pub(super) fn pointer_cursor_external_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(category_external_editable)
+}
+
+#[cfg(test)]
+pub(super) fn pointer_descriptor_sources() -> Vec<(Category, SettingId)> {
+    pointer_setting_sources(|_| true)
+}
+
+#[cfg(test)]
+fn pointer_setting_sources(predicate: impl Fn(SettingId) -> bool) -> Vec<(Category, SettingId)> {
+    let predicate = &predicate;
+    Category::ALL
+        .into_iter()
+        .enumerate()
+        .inspect(|(index, category)| {
+            assert_eq!(
+                *index,
+                category.fixture_ordinal(),
+                "sealed category inventory"
+            );
+        })
+        .map(|(_, category)| category)
+        .flat_map(|category| {
+            category_rows(category)
+                .into_iter()
+                .filter_map(move |row| match row {
+                    Row::Setting(id) if predicate(id) => Some((category, id)),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
 /// Parse a `>= min` `u32`, rejecting blank/non-numeric/below-floor input.
 fn parse_min_u32(raw: &str, min: u32) -> Result<u32, String> {
     if raw.is_empty() {
@@ -3118,18 +3468,127 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 
 impl SettingsCx {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
+        if let Some(prompt) = &p.shadowed_global {
+            let label = prompt.setting.descriptor().label;
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!(
+                        "Saved globally, but the project overrides {label}."
+                    )),
+                    Line::default(),
+                    Line::from("Remove that project override?"),
+                    Line::default(),
+                    Line::from("[Remove override]  [Keep override]"),
+                ]),
+                area,
+            );
+            for (choice, x, width) in [
+                (
+                    super::pointer_actions::ConfirmationChoice::Confirm,
+                    0u16,
+                    17u16,
+                ),
+                (
+                    super::pointer_actions::ConfirmationChoice::Cancel,
+                    19u16,
+                    15u16,
+                ),
+            ] {
+                if area.height <= 4 || x.saturating_add(width) > area.width {
+                    continue;
+                }
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(area.x + x, area.y.saturating_add(4), width, 1),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::Confirm(
+                                category_pointer_id(prompt.setting),
+                                choice,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+            return;
+        }
+
+        if let Some(pending) = &p.pending_external_edit {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Opening {} in $EDITOR…",
+                    pending.id.descriptor().label
+                )),
+                area,
+            );
+            return;
+        }
+
         if let Some(editor) = &p.path_editor {
-            editor.render(frame, area);
+            editor.render(frame, area, &self.pointer_surface);
             return;
         }
 
         if let Some(editor) = &p.text_editor {
             editor.render(frame, area);
+            let action_y = area.bottom().saturating_sub(1);
+            for (action, x, width) in [
+                (
+                    super::pointer_actions::CategoryAction::TextEditorSave(category_pointer_id(
+                        editor.id,
+                    )),
+                    0,
+                    6,
+                ),
+                (
+                    super::pointer_actions::CategoryAction::TextEditorCancel(category_pointer_id(
+                        editor.id,
+                    )),
+                    8u16,
+                    8u16,
+                ),
+                (
+                    super::pointer_actions::CategoryAction::ExternalEditBegin(
+                        category_pointer_id(editor.id),
+                        super::pointer_actions::CategoryExternalSource::TextEditor,
+                    ),
+                    18u16,
+                    17u16,
+                ),
+            ] {
+                if x.saturating_add(width) > area.width {
+                    continue;
+                }
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(area.x + x, action_y, width, 1),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(action),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+            frame.render_widget(
+                Line::from(vec![
+                    Span::styled("[Save]", selected_style()),
+                    Span::raw("  "),
+                    Span::styled("[Cancel]", selected_style()),
+                    Span::raw("  "),
+                    Span::styled("[Open in $EDITOR]", selected_style()),
+                ]),
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
 
         if let Some(picker) = &p.utility_picker {
-            self.render_utility_picker(frame, area, picker);
+            self.render_utility_picker(
+                frame,
+                area,
+                picker,
+                p.utility_picker_target.unwrap_or(SettingId::UtilityModel),
+            );
             return;
         }
 
@@ -3139,11 +3598,14 @@ impl SettingsCx {
         };
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut controls = Vec::new();
         lines.push(Line::from(Span::styled(
             p.category.heading().to_string(),
             heading_style(),
         )));
+        controls.push(None);
         lines.push(Line::default());
+        controls.push(None);
 
         let ids = p.setting_ids();
         let label_w = ids
@@ -3154,26 +3616,34 @@ impl SettingsCx {
 
         let mut selected_line = 0usize;
         let mut sel = 0usize;
+        let mut inline_actions = None;
+        let mut cursor_external_action = None;
         for row in &p.rows {
             match row {
                 Row::Heading(heading) => {
                     lines.push(Line::default());
+                    controls.push(None);
                     lines.push(Line::from(Span::styled(
                         format!("-- {} --", heading.title),
                         muted_style().add_modifier(Modifier::BOLD),
                     )));
+                    controls.push(None);
+                    let before = lines.len();
                     push_wrapped_text(
                         &mut lines,
                         settings_area.width,
                         heading.blurb,
                         muted_style(),
                     );
+                    controls.resize(lines.len(), None);
+                    debug_assert!(lines.len() >= before);
                 }
                 Row::Setting(id) => {
                     let on_cursor = sel == p.cursor;
                     if on_cursor {
                         selected_line = lines.len();
                     }
+                    let before = lines.len();
                     if p.editing == Some(*id) {
                         push_label_text_field_row(
                             &mut lines,
@@ -3195,6 +3665,53 @@ impl SettingsCx {
                             muted_style(),
                         );
                     }
+                    let action = if p.editing == Some(*id) {
+                        super::pointer_actions::CategoryAction::InlineEditBegin(
+                            category_pointer_id(*id),
+                        )
+                    } else {
+                        super::pointer_actions::CategoryAction::DescriptorActivate(
+                            category_pointer_id(*id),
+                        )
+                    };
+                    controls.resize(
+                        lines.len(),
+                        Some((
+                            super::pointer_actions::SettingsPointerAction::Category(action),
+                            true,
+                            None,
+                        )),
+                    );
+                    if on_cursor && p.editing == Some(*id) {
+                        let line = lines.len();
+                        lines.push(Line::from(vec![
+                            Span::styled("[Save]", selected_style()),
+                            Span::raw("  "),
+                            Span::styled("[Cancel]", selected_style()),
+                            Span::raw("  "),
+                            Span::styled("[Open in $EDITOR]", selected_style()),
+                        ]));
+                        controls.push(None);
+                        inline_actions = Some((line, *id));
+                        selected_line = line;
+                    }
+                    // Keep the selected row's explicit external-editor action
+                    // adjacent to its source control. Appending it after the
+                    // entire category made normal focus scrolling clip the
+                    // action even while the owning setting was visible.
+                    if on_cursor && p.editing.is_none() && category_external_editable(*id) {
+                        let line = lines.len();
+                        lines.push(Line::from("[Open selected in $EDITOR]"));
+                        controls.push(None);
+                        cursor_external_action = Some((line, *id));
+                        // The action is part of the selected control's focus
+                        // footprint. Anchor viewport correction here so the
+                        // source row immediately above and its action remain
+                        // visible together instead of clipping the action at
+                        // the lower edge.
+                        selected_line = line;
+                    }
+                    debug_assert!(lines.len() > before);
                     sel += 1;
                 }
             }
@@ -3202,6 +3719,7 @@ impl SettingsCx {
 
         if let Some(label) = p.category.reset_label() {
             lines.push(Line::default());
+            controls.push(None);
             if Some(p.cursor) == p.reset_cursor() {
                 selected_line = lines.len();
             }
@@ -3209,20 +3727,112 @@ impl SettingsCx {
                 p.reset
                     .render_line(Some(p.cursor) == p.reset_cursor(), label),
             );
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Category(
+                    super::pointer_actions::CategoryAction::Reset,
+                ),
+                true,
+                None,
+            )));
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), warning_style())));
+            controls.push(None);
         }
 
-        self.scroll_states.render_lines(
+        self.scroll_states.render_control_lines(
             frame,
             settings_area,
             format!("category:{:?}", p.category),
-            lines,
-            Some(selected_line),
+            (lines, Some(selected_line)),
+            controls,
+            (
+                &self.pointer_surface,
+                super::shell::SettingsScrollRegionId("category:settings"),
+            )
+                .into(),
         );
+        if let Some((line, id)) = inline_actions {
+            let offset = self
+                .scroll_states
+                .offset_for(&format!("category:{:?}", p.category));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(settings_area.height)
+            {
+                for (action, x, width) in [
+                    (
+                        super::pointer_actions::CategoryAction::InlineEditCommit(
+                            category_pointer_id(id),
+                        ),
+                        0,
+                        6,
+                    ),
+                    (
+                        super::pointer_actions::CategoryAction::InlineEditCancel(
+                            category_pointer_id(id),
+                        ),
+                        8u16,
+                        8u16,
+                    ),
+                    (
+                        super::pointer_actions::CategoryAction::ExternalEditBegin(
+                            category_pointer_id(id),
+                            super::pointer_actions::CategoryExternalSource::Inline,
+                        ),
+                        18u16,
+                        17u16,
+                    ),
+                ] {
+                    if x.saturating_add(width) > settings_area.width {
+                        continue;
+                    }
+                    self.pointer_surface.register(SettingsPointerTarget {
+                        rect: Rect::new(
+                            settings_area.x.saturating_add(x),
+                            settings_area.y.saturating_add(screen_row as u16),
+                            width,
+                            1,
+                        ),
+                        action: SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Category(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
+            }
+        }
+        if let Some((line, id)) = cursor_external_action {
+            let offset = self
+                .scroll_states
+                .offset_for(&format!("category:{:?}", p.category));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(settings_area.height)
+                && settings_area.width >= 26
+            {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        settings_area.x,
+                        settings_area.y.saturating_add(screen_row as u16),
+                        26,
+                        1,
+                    ),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::ExternalEditBegin(
+                                category_pointer_id(id),
+                                super::pointer_actions::CategoryExternalSource::Cursor,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
 
         let mut help: Vec<Line<'static>> = Vec::new();
         help.push(Line::from(Span::styled(
@@ -3296,12 +3906,412 @@ impl CategoryPage {
 }
 
 impl SettingsPage for CategoryPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Category
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        let mode = if let Some(picker) = &self.utility_picker {
+            match &picker.mode {
+                super::ui_page::PickerMode::List { .. } => 5,
+                super::ui_page::PickerMode::Custom { .. } => 6,
+            }
+        } else if self.pending_external_edit.is_some() {
+            4
+        } else if self.text_editor.is_some() {
+            3
+        } else if self.path_editor.is_some() {
+            2
+        } else if self.editing.is_some() {
+            1
+        } else {
+            0
+        };
+        600 + self.category as u64 * 7 + mode
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some()
+            || self.path_editor.is_some()
+            || self.text_editor.is_some()
+            || self.utility_picker.is_some()
+            || self.shadowed_global.is_some()
+            || self.pending_external_edit.is_some()
+        {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_category_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_category_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        use super::pointer_actions::{CategoryAction, SettingsPointerAction, UtilityModelAction};
+        match action {
+            SettingsPointerAction::Category(action) => match action {
+                CategoryAction::PathEditBegin(_) => Nav::Stay,
+                CategoryAction::SuggestionSelect(id, row) => {
+                    let Some(editor) = self.path_editor.as_mut() else {
+                        return Nav::Stay;
+                    };
+                    if category_pointer_id(editor.id) != id {
+                        return Nav::Stay;
+                    }
+                    let Some(index) = editor
+                        .suggest
+                        .entries
+                        .iter()
+                        .position(|entry| entry.replacement == row.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    editor.suggest.selected = index;
+                    let _ = cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                        self,
+                    );
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::PathEditCommit(id)
+                    if self
+                        .path_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::PathEditCancel(id)
+                    if self
+                        .path_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::TextEditorSave(id)
+                    if self
+                        .text_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                        self,
+                    )
+                }
+                CategoryAction::TextEditorCancel(id)
+                    if self
+                        .text_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::PickerSelect(id, option) => {
+                    let Some(target) = self.utility_picker_target else {
+                        return Nav::Stay;
+                    };
+                    if category_pointer_id(target) != id {
+                        return Nav::Stay;
+                    }
+                    let Some(picker) = self.utility_picker.as_mut() else {
+                        return Nav::Stay;
+                    };
+                    let super::ui_page::PickerMode::List { cursor, .. } = &mut picker.mode else {
+                        return Nav::Stay;
+                    };
+                    let Some(index) = picker
+                        .entries
+                        .iter()
+                        .position(|entry| entry.value() == option.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    *cursor = super::ui_page::PICKER_ACTION_ROWS + index;
+                    cx.handle_category_utility_picker_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                    Nav::Stay
+                }
+                CategoryAction::Confirm(id, choice) => {
+                    if self
+                        .shadowed_global
+                        .as_ref()
+                        .is_none_or(|prompt| category_pointer_id(prompt.setting) != id)
+                    {
+                        return Nav::Stay;
+                    }
+                    let code = match choice {
+                        super::pointer_actions::ConfirmationChoice::Confirm => KeyCode::Enter,
+                        super::pointer_actions::ConfirmationChoice::Cancel => KeyCode::Esc,
+                    };
+                    cx.handle_category_page_key(KeyEvent::new(code, KeyModifiers::NONE), self)
+                }
+                CategoryAction::ExternalEditBegin(id, source) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    let source_matches = match source {
+                        super::pointer_actions::CategoryExternalSource::Cursor => {
+                            self.editing.is_none()
+                                && self.path_editor.is_none()
+                                && self.text_editor.is_none()
+                                && self
+                                    .setting_ids()
+                                    .get(self.cursor)
+                                    .is_some_and(|candidate| *candidate == setting)
+                        }
+                        super::pointer_actions::CategoryExternalSource::Inline => {
+                            self.editing == Some(setting)
+                        }
+                        super::pointer_actions::CategoryExternalSource::PathEditor => self
+                            .path_editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.id == setting),
+                        super::pointer_actions::CategoryExternalSource::TextEditor => self
+                            .text_editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.id == setting),
+                    };
+                    if !source_matches || self.pending_external_edit.is_some() {
+                        return Nav::Stay;
+                    }
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                        self,
+                    )
+                }
+                CategoryAction::DescriptorActivate(id) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    let Some(index) = self
+                        .setting_ids()
+                        .iter()
+                        .position(|candidate| *candidate == setting)
+                    else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditBegin(id) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    if self.editing != Some(setting) {
+                        return Nav::Stay;
+                    }
+                    self.cursor = self
+                        .setting_ids()
+                        .iter()
+                        .position(|candidate| *candidate == setting)
+                        .unwrap_or(self.cursor);
+                    Nav::Stay
+                }
+                CategoryAction::InlineEditCommit(id)
+                    if self
+                        .editing
+                        .is_some_and(|editing| category_pointer_id(editing) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditCancel(id)
+                    if self
+                        .editing
+                        .is_some_and(|editing| category_pointer_id(editing) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::Reset => {
+                    let Some(index) = self.reset_cursor() else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditCommit(_)
+                | CategoryAction::InlineEditCancel(_)
+                | CategoryAction::ExternalEditResult(_, _)
+                | CategoryAction::PathEditCommit(_)
+                | CategoryAction::PathEditCancel(_)
+                | CategoryAction::TextEditorSave(_)
+                | CategoryAction::TextEditorCancel(_) => Nav::Stay,
+            },
+            SettingsPointerAction::UtilityModel(action) => {
+                let Some(picker) = self.utility_picker.as_mut() else {
+                    return Nav::Stay;
+                };
+                use super::ui_page::{
+                    PICKER_ACTION_ROWS, PICKER_CLEAR_ROW, PICKER_CUSTOM_ROW, PickerMode,
+                };
+                match (&mut picker.mode, action) {
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::Clear) => {
+                        *cursor = PICKER_CLEAR_ROW
+                    }
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::OpenCustom) => {
+                        *cursor = PICKER_CUSTOM_ROW
+                    }
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::Select(id)) => {
+                        let Some(index) = picker
+                            .entries
+                            .iter()
+                            .position(|entry| entry.value() == id.0)
+                        else {
+                            return Nav::Stay;
+                        };
+                        *cursor = PICKER_ACTION_ROWS + index;
+                    }
+                    (PickerMode::Custom { .. }, UtilityModelAction::EditCustom) => {
+                        return Nav::Stay;
+                    }
+                    (PickerMode::Custom { .. }, UtilityModelAction::CommitCustom) => {
+                        cx.handle_category_utility_picker_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            self,
+                        );
+                        return Nav::Stay;
+                    }
+                    (PickerMode::Custom { .. }, UtilityModelAction::CancelCustom)
+                    | (_, UtilityModelAction::Back) => {
+                        cx.handle_category_utility_picker_key(
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            self,
+                        );
+                        return Nav::Stay;
+                    }
+                    _ => return Nav::Stay,
+                }
+                cx.handle_category_utility_picker_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        if matches!(
+            &action,
+            super::pointer_actions::SettingsPointerAction::Category(
+                super::pointer_actions::CategoryAction::PathEditBegin(_)
+            )
+        ) && let Some(editor) = self.path_editor.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                .map_or(column, |target| target.rect.x);
+            editor
+                .buf
+                .set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+            return Nav::Stay;
+        }
+        if matches!(
+            &action,
+            super::pointer_actions::SettingsPointerAction::UtilityModel(
+                super::pointer_actions::UtilityModelAction::EditCustom
+            )
+        ) && let Some(picker) = self.utility_picker.as_mut()
+            && let super::ui_page::PickerMode::Custom { buf } = &mut picker.mode
+        {
+            let value_x = cx
+                .pointer_surface
+                .area
+                .get()
+                .map_or(2, |area| area.x.saturating_add(2));
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: super::shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if self.shadowed_global.take().is_some() {
+            self.status = Some("saved; project override kept".into());
+            return Nav::Stay;
+        }
+        if region == super::shell::SettingsScrollRegionId("category:utility-picker") {
+            if let Some(picker) = self.utility_picker.as_mut()
+                && let super::ui_page::PickerMode::List { cursor, scroll } = &mut picker.mode
+            {
+                let last = super::ui_page::PICKER_ACTION_ROWS + picker.entries.len() - 1;
+                *cursor = cursor.saturating_add_signed(delta).min(last);
+                *scroll =
+                    super::ui_page::picker_window_scroll(*cursor, *scroll, picker.entries.len());
+            }
+        } else if region == super::shell::SettingsScrollRegionId("category:settings")
+            && self.text_editor.is_none()
+            && self.utility_picker.is_none()
+        {
+            self.reset.disarm();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(self.nav_len().saturating_sub(1));
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.reset.disarm();
+        self.shadowed_global = None;
+        self.external_edit_ops.cancel();
+        self.pending_external_edit = None;
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -142,6 +142,45 @@ impl TextField {
     pub fn cursor_display_col(&self) -> usize {
         self.buffer[..self.cursor].width()
     }
+
+    /// Place the caret at the nearest display-cell boundary without
+    /// splitting combining-mark or common ZWJ grapheme sequences.
+    pub fn set_cursor_display_col(&mut self, target: usize) {
+        use unicode_width::UnicodeWidthChar;
+
+        let mut byte = 0;
+        let mut display = 0;
+        let mut chars = self.buffer.char_indices().peekable();
+        while let Some((start, ch)) = chars.next() {
+            let mut end = start + ch.len_utf8();
+            let mut width = ch.width().unwrap_or(0);
+            let mut join_next = false;
+            while let Some(&(next_start, next)) = chars.peek() {
+                let next_width = next.width().unwrap_or(0);
+                if next_width == 0 || join_next {
+                    let _ = chars.next();
+                    end = next_start + next.len_utf8();
+                    join_next = next == '\u{200d}';
+                    if !join_next {
+                        width = width.max(next_width);
+                    }
+                } else {
+                    break;
+                }
+            }
+            if target <= display + width / 2 {
+                self.cursor = byte;
+                return;
+            }
+            byte = end;
+            display += width;
+            if target < display {
+                self.cursor = byte;
+                return;
+            }
+        }
+        self.cursor = self.buffer.len();
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +207,17 @@ mod tests {
         assert_eq!(tf.cursor_col(), 3);
         tf.handle_key(key(KeyCode::Backspace));
         assert_eq!(tf.text(), "ab");
+    }
+
+    #[test]
+    fn display_column_caret_does_not_split_wide_or_combining_clusters() {
+        let mut field = TextField::new("a界e\u{301}z");
+        field.set_cursor_display_col(2);
+        assert_eq!(field.split_at_cursor(), ("a", "界e\u{301}z"));
+        field.set_cursor_display_col(3);
+        assert_eq!(field.split_at_cursor(), ("a界", "e\u{301}z"));
+        field.set_cursor_display_col(4);
+        assert_eq!(field.split_at_cursor(), ("a界e\u{301}", "z"));
     }
 
     #[test]

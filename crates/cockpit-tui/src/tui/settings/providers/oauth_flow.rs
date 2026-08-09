@@ -1,4 +1,8 @@
+use super::super::pointer_actions::OAuthFlowId;
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -123,7 +127,7 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OAuthProvider {
     Grok,
     Codex,
@@ -272,7 +276,7 @@ impl OAuthKeyOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OAuthOption {
     Login,
     ManualPaste,
@@ -282,8 +286,44 @@ pub(crate) enum OAuthOption {
     Acknowledge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CodexOAuthOption {
+    Login,
+    Poll,
+    SkipContinue,
+    Continue,
+    Acknowledge,
+}
+
+impl From<CodexOAuthOption> for OAuthOption {
+    fn from(option: CodexOAuthOption) -> Self {
+        match option {
+            CodexOAuthOption::Login => Self::Login,
+            CodexOAuthOption::Poll => Self::Poll,
+            CodexOAuthOption::SkipContinue => Self::SkipContinue,
+            CodexOAuthOption::Continue => Self::Continue,
+            CodexOAuthOption::Acknowledge => Self::Acknowledge,
+        }
+    }
+}
+
+impl TryFrom<OAuthOption> for CodexOAuthOption {
+    type Error = ();
+
+    fn try_from(option: OAuthOption) -> Result<Self, Self::Error> {
+        match option {
+            OAuthOption::Login => Ok(Self::Login),
+            OAuthOption::Poll => Ok(Self::Poll),
+            OAuthOption::SkipContinue => Ok(Self::SkipContinue),
+            OAuthOption::Continue => Ok(Self::Continue),
+            OAuthOption::Acknowledge => Ok(Self::Acknowledge),
+            OAuthOption::ManualPaste => Err(()),
+        }
+    }
+}
+
 impl OAuthOption {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             OAuthOption::Login => "log in",
             OAuthOption::ManualPaste => "manual paste",
@@ -351,6 +391,7 @@ enum OAuthSession {
 }
 
 pub(crate) struct OAuthFlowState {
+    pub(crate) flow_id: OAuthFlowId,
     pub(crate) provider: OAuthProvider,
     shape: FlowShape,
     pub(crate) cursor: usize,
@@ -365,6 +406,8 @@ pub(crate) struct OAuthFlowState {
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
+    copy_operation: super::super::shell::PointerOperationGate,
+    effects: OAuthEffects,
 }
 
 impl OAuthFlowState {
@@ -379,6 +422,16 @@ impl OAuthFlowState {
     pub(crate) fn new_with_acknowledgement_for_test(provider: OAuthProvider) -> Self {
         let mut state = Self::new(provider);
         state.acknowledgement_required = true;
+        state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_acknowledgement_with_effects_for_test(
+        provider: OAuthProvider,
+        effects: OAuthEffects,
+    ) -> Self {
+        let mut state = Self::new_with_effects(provider, effects);
+        state.acknowledgement_required = false;
         state
     }
 
@@ -416,6 +469,7 @@ impl OAuthFlowState {
             OAuthProvider::Codex => (FlowShape::DeviceCode, codex_oauth::is_logged_in()),
         };
         Self {
+            flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
             provider,
             shape,
             cursor: 0,
@@ -430,7 +484,104 @@ impl OAuthFlowState {
             ssh: (effects.is_ssh)(),
             spinner_tick: 0,
             acknowledgement_required: acknowledgement_required(provider),
+            copy_operation: super::super::shell::PointerOperationGate::default(),
+            effects,
         }
+    }
+
+    pub(super) fn submit_pointer_copy(
+        &mut self,
+        flow_id: OAuthFlowId,
+        kind: super::super::pointer_actions::OAuthCopyKind,
+    ) -> bool {
+        if self.flow_id != flow_id {
+            return false;
+        }
+        let (value, open_after_copy) = match kind {
+            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
+                (self.authorize_url().map(ToOwned::to_owned), None)
+            }
+            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
+                let login = self.device_login();
+                (
+                    login.map(|login| login.user_code.clone()),
+                    (!self.ssh)
+                        .then(|| login.map(|login| login.verification_uri.clone()))
+                        .flatten(),
+                )
+            }
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        match kind {
+            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
+                self.submit_copy(Some(&value), open_after_copy.as_deref(), self.effects);
+            }
+            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
+                self.submit_device_code(Some(&value), open_after_copy.as_deref(), self.effects);
+            }
+        }
+        true
+    }
+
+    pub(super) fn complete_copy(
+        &mut self,
+        flow_id: OAuthFlowId,
+        operation_id: super::super::shell::PointerOperationId,
+        result: Result<String, String>,
+    ) {
+        if self.flow_id == flow_id && self.copy_operation.complete(operation_id) {
+            self.status = Some(result);
+        }
+    }
+
+    fn submit_copy(
+        &mut self,
+        value: Option<&str>,
+        open_after_copy: Option<&str>,
+        effects: OAuthEffects,
+    ) {
+        if self.copy_operation.pending().is_some() {
+            return;
+        }
+        let flow_id = self.flow_id;
+        let operation_id = self.copy_operation.begin();
+        let mut result = None;
+        copy_oauth_url_with(value, &mut result, effects.copy);
+        if let Some(url) = open_after_copy
+            && let Err(error) = (effects.open)(url)
+        {
+            result = Some(Err(error.to_string()));
+        }
+        self.complete_copy(
+            flow_id,
+            operation_id,
+            result.unwrap_or_else(|| Err("OAuth copy effect returned no result".into())),
+        );
+    }
+
+    fn submit_device_code(
+        &mut self,
+        value: Option<&str>,
+        open_after_copy: Option<&str>,
+        effects: OAuthEffects,
+    ) {
+        self.submit_copy(value, open_after_copy, effects);
+        if let Some(Ok(message)) = &mut self.status {
+            *message = message.replacen("copied OAuth URL", "copied device code", 1);
+        }
+    }
+
+    pub(super) fn cancel_copy_effect(&mut self) {
+        self.copy_operation.cancel();
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin_copy_for_test(
+        &mut self,
+    ) -> (OAuthFlowId, super::super::shell::PointerOperationId) {
+        (self.flow_id, self.copy_operation.begin())
     }
 
     pub(super) fn confirming(&self) -> bool {
@@ -621,7 +772,15 @@ impl OAuthFlowView<'_> {
 }
 
 pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>, host: OAuthHost) -> Vec<Line<'static>> {
+    oauth_setup_lines_with_controls(flow, host).0
+}
+
+pub(super) fn oauth_setup_lines_with_controls(
+    flow: OAuthFlowView<'_>,
+    host: OAuthHost,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut lines = Vec::new();
+    let mut controls = Vec::new();
     let title = match flow {
         OAuthFlowView::Copilot(_) => "Set up GitHub Copilot auth",
         OAuthFlowView::OAuth(s) => match s.provider {
@@ -634,8 +793,11 @@ pub(super) fn oauth_setup_lines(flow: OAuthFlowView<'_>, host: OAuthHost) -> Vec
         Style::default().add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::default());
-    render_oauth_body(&mut lines, flow, host);
-    lines
+    match flow {
+        OAuthFlowView::Copilot(s) => render_copilot_body(&mut lines, s),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(&mut lines, s, host, Some(&mut controls)),
+    }
+    (lines, controls)
 }
 
 pub(super) fn render_oauth_body(
@@ -645,8 +807,21 @@ pub(super) fn render_oauth_body(
 ) {
     match flow {
         OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
-        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host, None),
     }
+}
+
+pub(super) fn render_oauth_body_with_controls(
+    lines: &mut Vec<Line<'static>>,
+    flow: OAuthFlowView<'_>,
+    host: OAuthHost,
+) -> Vec<(usize, usize)> {
+    let mut controls = Vec::new();
+    match flow {
+        OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host, Some(&mut controls)),
+    }
+    controls
 }
 
 pub(super) fn handle_oauth_flow_key(
@@ -663,6 +838,11 @@ pub(super) fn handle_oauth_flow_key_with(
     host: OAuthHost,
     effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
+    if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('y')) {
+        // Any option/focus/navigation change invalidates an outstanding copy
+        // completion for this flow generation.
+        s.cancel_copy_effect();
+    }
     if s.provider == OAuthProvider::Grok && s.paste_focused {
         match key.code {
             KeyCode::Esc => {
@@ -702,13 +882,13 @@ pub(super) fn handle_oauth_flow_key_with(
     match (s.provider, key.code) {
         (OAuthProvider::Grok, KeyCode::Char('c')) => {
             let url = s.authorize_url().map(ToOwned::to_owned);
-            copy_oauth_url_with(url.as_deref(), &mut s.status, effects.copy);
+            s.submit_copy(url.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
             if s.ssh {
                 let url = s.device_login().map(|login| login.verification_uri.clone());
-                copy_oauth_url_with(url.as_deref(), &mut s.status, effects.copy);
+                s.submit_copy(url.as_deref(), None, effects);
             } else {
                 let (code, url) = match s.device_login() {
                     Some(login) => (
@@ -717,18 +897,13 @@ pub(super) fn handle_oauth_flow_key_with(
                     ),
                     None => (None, None),
                 };
-                copy_oauth_url_with(code.as_deref(), &mut s.status, effects.copy);
-                if let Some(url) = url
-                    && let Err(e) = (effects.open)(&url)
-                {
-                    s.status = Some(Err(e.to_string()));
-                }
+                s.submit_device_code(code.as_deref(), url.as_deref(), effects);
             }
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
             let code = s.device_login().map(|login| login.user_code.clone());
-            copy_oauth_url_with(code.as_deref(), &mut s.status, effects.copy);
+            s.submit_device_code(code.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
         _ => {}
@@ -824,6 +999,15 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
                 op: OAuthFlowOp::Begin,
             }))
         }
+        (OAuthProvider::Grok, OAuthOption::Poll) => {
+            s.pending = true;
+            s.paste_focused = false;
+            s.status = Some(Ok("Checking xAI OAuth callback...".to_string()));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: OAuthProvider::Grok,
+                op: OAuthFlowOp::Begin,
+            }))
+        }
         (OAuthProvider::Codex, OAuthOption::Login) => {
             s.polling = true;
             s.status = Some(Ok("Requesting Codex device code...".to_string()));
@@ -877,6 +1061,12 @@ fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAut
 }
 
 pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOption> {
+    if s.provider == OAuthProvider::Codex {
+        return codex_oauth_options(s, host)
+            .into_iter()
+            .map(OAuthOption::from)
+            .collect();
+    }
     if s.acknowledgement_required {
         return vec![OAuthOption::Acknowledge];
     }
@@ -889,24 +1079,42 @@ pub(crate) fn oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<OAuthOpt
     match s.provider {
         OAuthProvider::Grok => {
             if s.pending {
-                opts.push(OAuthOption::ManualPaste);
-            } else {
-                opts.push(OAuthOption::Login);
-                opts.push(OAuthOption::ManualPaste);
-            }
-        }
-        OAuthProvider::Codex => {
-            if s.device_login().is_some() {
                 opts.push(OAuthOption::Poll);
+                opts.push(OAuthOption::ManualPaste);
             } else {
                 opts.push(OAuthOption::Login);
+                opts.push(OAuthOption::ManualPaste);
             }
         }
+        OAuthProvider::Codex => unreachable!("Codex options use their sealed inventory"),
     }
-    if host == OAuthHost::AddWizard {
+    if host == OAuthHost::AddWizard
+        || (host == OAuthHost::Standalone && (s.pending || s.device_login().is_some()))
+    {
         opts.push(OAuthOption::SkipContinue);
     }
     opts
+}
+
+fn codex_oauth_options(s: &OAuthFlowState, host: OAuthHost) -> Vec<CodexOAuthOption> {
+    if s.acknowledgement_required {
+        return vec![CodexOAuthOption::Acknowledge];
+    }
+    if s.confirming() {
+        return vec![CodexOAuthOption::Continue];
+    }
+
+    let mut options = vec![if s.device_login().is_some() {
+        CodexOAuthOption::Poll
+    } else {
+        CodexOAuthOption::Login
+    }];
+    if host == OAuthHost::AddWizard
+        || (host == OAuthHost::Standalone && (s.pending || s.device_login().is_some()))
+    {
+        options.push(CodexOAuthOption::SkipContinue);
+    }
+    options
 }
 
 fn rendered_cursor(s: &OAuthFlowState, host: OAuthHost) -> usize {
@@ -992,7 +1200,12 @@ pub(super) fn oauth_help_legend(host: OAuthHost, s: &OAuthFlowState) -> &'static
     }
 }
 
-fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, host: OAuthHost) {
+fn render_provider_oauth(
+    lines: &mut Vec<Line<'static>>,
+    s: &OAuthFlowState,
+    host: OAuthHost,
+    mut controls: Option<&mut Vec<(usize, usize)>>,
+) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let green = Style::default().fg(Color::Green);
@@ -1060,6 +1273,9 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, hos
             } else {
                 Style::default().fg(Color::White)
             };
+            if let Some(controls) = controls.as_deref_mut() {
+                controls.push((lines.len(), i));
+            }
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("[{}]", option.label()), style),
@@ -1094,6 +1310,9 @@ fn render_provider_oauth(lines: &mut Vec<Line<'static>>, s: &OAuthFlowState, hos
         } else {
             Style::default().fg(Color::White)
         };
+        if let Some(controls) = controls.as_deref_mut() {
+            controls.push((lines.len(), i));
+        }
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("[{label}]"), style),

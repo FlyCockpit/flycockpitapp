@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(private_interfaces)]
 //! `/settings` dialog state machine + rendering.
 //!
 //! Lifecycle:
@@ -44,6 +45,12 @@ mod harnesses_page;
 mod lsp_page;
 mod mcp_page;
 mod multimodal_capability_editor;
+#[cfg(test)]
+mod pointer_acceptance_tests;
+#[cfg(test)]
+mod pointer_action_fixtures;
+#[allow(dead_code)] // The registry is consumed incrementally by page fixture matrices.
+pub(crate) mod pointer_actions;
 mod providers;
 mod reset;
 pub(crate) mod secret_display;
@@ -58,7 +65,7 @@ use std::any::Any;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -77,7 +84,10 @@ use cockpit_config::providers::{
 };
 use cockpit_core::daemon::proto::Request;
 use cockpit_core::providers::models_fetch::FetchOutcome;
-use shell::{SettingsScrollStates, marker, muted_style, selected_or_field};
+use shell::{
+    SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsPointerTarget,
+    SettingsScrollStates, marker, muted_style, selected_or_field,
+};
 
 /// Height (in rows) the dialog wants when active.
 pub const DIALOG_HEIGHT: u16 = 20;
@@ -138,6 +148,56 @@ pub enum Dialog {
     /// (~1.1KB vs <100 bytes), which would otherwise bloat every
     /// [`Dialog`] on the stack.
     Settings(Box<SettingsDialog>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub(crate) enum SettingsPointerOutcome {
+    Consumed,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SettingsPointerSurfaceKind {
+    Root,
+    DefaultModel,
+    Agents,
+    Tools,
+    Harnesses,
+    Providers,
+    Category,
+    Instructions,
+    RedactPatterns,
+    StringList,
+    Skills,
+    Mcp,
+    Lsp,
+    Dependencies,
+}
+
+impl SettingsPointerSurfaceKind {
+    pub(super) const ALL: [Self; 14] = [
+        Self::Root,
+        Self::DefaultModel,
+        Self::Agents,
+        Self::Tools,
+        Self::Harnesses,
+        Self::Providers,
+        Self::Category,
+        Self::Instructions,
+        Self::RedactPatterns,
+        Self::StringList,
+        Self::Skills,
+        Self::Mcp,
+        Self::Lsp,
+        Self::Dependencies,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsLocalBack {
+    NoLocalBack,
+    LocalBack,
 }
 
 pub struct SetupWizardDialog {
@@ -230,7 +290,17 @@ pub(super) struct RootPage {
 /// current page and stack as boxed trait objects, so pushing and popping
 /// preserves the live concrete page state without adding central render,
 /// title, help, or key-dispatch arms.
+#[allow(private_interfaces)]
 pub(super) trait SettingsPage: Any {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind;
+    fn pointer_surface_token(&self) -> u64 {
+        self.pointer_surface_kind() as u64
+    }
+    /// Declare whether Back first cancels/leaves page-local state. The
+    /// dialog only pops its navigation stack for `NoLocalBack`.
+    fn resolve_header_back(&self) -> SettingsLocalBack {
+        SettingsLocalBack::NoLocalBack
+    }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav;
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect);
     fn render_with_links(
@@ -244,6 +314,50 @@ pub(super) trait SettingsPage: Any {
     }
     fn title(&self, cx: &SettingsCx) -> String;
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
+    /// Resolve a semantic control registered by this page. Implementations
+    /// must validate the stable identity against current state before
+    /// mutating; stale targets therefore become inert after reloads.
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        _action: pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        Nav::Stay
+    }
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: pointer_actions::SettingsPointerAction,
+        _column: u16,
+        _row: u16,
+    ) -> Nav {
+        self.handle_pointer_control(cx, action)
+    }
+    /// Move only the independently scrollable region under the pointer.
+    /// `delta` is measured in selectable controls and is already normalized
+    /// to the settings wheel step (three per notch).
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        _region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        let key = if delta < 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..delta.unsigned_abs() {
+            let nav = self.handle_key(cx, KeyEvent::new(key, KeyModifiers::NONE));
+            if !matches!(nav, Nav::Stay) {
+                return nav;
+            }
+        }
+        Nav::Stay
+    }
+    /// Invalidate pointer-only confirmations/effects whose hit geometry or
+    /// identity is no longer trustworthy after a terminal resize.
+    fn cancel_pointer_transients(&mut self) {}
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     #[cfg(test)]
@@ -310,8 +424,9 @@ fn boxed_page(page: Page) -> PageBox {
 
 #[allow(private_interfaces)]
 #[cfg(test)]
-enum TestPageRef<'a> {
+pub(crate) enum TestPageRef<'a> {
     Root { cursor: usize },
+    DefaultModel(&'a DefaultModelPage),
     Agents(&'a AgentsPage),
     Tools(&'a ToolsPage),
     Harnesses(&'a HarnessesPage),
@@ -346,6 +461,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Root { cursor } => write!(f, "Root({cursor})"),
+            Self::DefaultModel(_) => f.write_str("DefaultModel"),
             Self::Agents(_) => f.write_str("Agents"),
             Self::Tools(_) => f.write_str("Tools"),
             Self::Harnesses(_) => f.write_str("Harnesses"),
@@ -389,6 +505,7 @@ pub struct SettingsCx {
     /// lazily when the UI / Tools pages open; saved on each edit there.
     pub(super) extended_path: PathBuf,
     scroll_states: SettingsScrollStates,
+    pointer_surface: SettingsPointerSurface,
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
@@ -464,6 +581,10 @@ pub(super) struct DefaultModelPage {
 }
 
 impl SettingsPage for DefaultModelPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        SettingsPointerSurfaceKind::DefaultModel
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc
@@ -507,7 +628,25 @@ impl SettingsPage for DefaultModelPage {
         }
     }
 
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        match action {
+            pointer_actions::SettingsPointerAction::DefaultModel(
+                pointer_actions::DefaultModelAction::Choose,
+            ) => self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            pointer_actions::SettingsPointerAction::DefaultModel(
+                pointer_actions::DefaultModelAction::Clear,
+            ) if self.effective_default.is_some() => {
+                self.handle_key(cx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         // Both values are resolved when the page opens: each is a layered
         // resolution and must not run per frame.
         let default = self.effective_default.as_ref();
@@ -529,10 +668,19 @@ impl SettingsPage for DefaultModelPage {
         }
         lines.push(Line::from(format!("Scope: {scope}")));
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            "Enter: choose the default model for new sessions",
-        ));
-        lines.push(Line::from("x: clear the default for this scope"));
+        let pointer_enabled = cx.pointer_surface.enabled.get();
+        let choose_line = lines.len();
+        lines.push(Line::from(if pointer_enabled {
+            "[Choose default model]"
+        } else {
+            "Choose default model"
+        }));
+        let clear_line = lines.len();
+        lines.push(Line::from(if pointer_enabled {
+            "[Clear default for this scope]"
+        } else {
+            "Clear default for this scope"
+        }));
         lines.push(Line::from("Applies to newly created sessions only."));
         lines.push(Line::from(
             "Reopening an existing session keeps its own saved model.",
@@ -543,6 +691,31 @@ impl SettingsPage for DefaultModelPage {
         }
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, area);
+        for (line, action, enabled, reason) in [
+            (
+                choose_line,
+                pointer_actions::SettingsPointerAction::DefaultModel(
+                    pointer_actions::DefaultModelAction::Choose,
+                ),
+                true,
+                None,
+            ),
+            (
+                clear_line,
+                pointer_actions::SettingsPointerAction::DefaultModel(
+                    pointer_actions::DefaultModelAction::Clear,
+                ),
+                self.effective_default.is_some(),
+                Some("no effective default is set"),
+            ),
+        ] {
+            cx.pointer_surface.register(shell::SettingsPointerTarget {
+                rect: Rect::new(area.x, area.y.saturating_add(line as u16), area.width, 1),
+                action: shell::SettingsPointerAction::Page(action),
+                enabled,
+                disabled_reason: if enabled { None } else { reason },
+            });
+        }
     }
 
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -678,6 +851,34 @@ pub(super) enum Nav {
 // ── Dialog top-level ─────────────────────────────────────────────────────
 
 impl Dialog {
+    pub(crate) fn handle_settings_pointer(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> Option<SettingsPointerOutcome> {
+        let Dialog::Settings(settings) = self else {
+            return None;
+        };
+        // App-level z-order may route Settings before chat affordances only
+        // after the dialog has actually rendered a pointer surface. A newly
+        // constructed, not-yet-rendered dialog has no geometry to own and
+        // must not swallow suggestion/selection events underneath it.
+        settings.pointer_surface.area.get()?;
+        Some(settings.handle_pointer(mouse))
+    }
+
+    pub(crate) fn clear_settings_pointer_hover(&self) {
+        if let Dialog::Settings(settings) = self {
+            *settings.pointer_surface.hover.borrow_mut() = None;
+        }
+    }
+    pub(crate) fn cancel_settings_pointer_transients(&mut self) {
+        if let Dialog::Settings(settings) = self {
+            *settings.pointer_surface.hover.borrow_mut() = None;
+            settings.pointer_surface.header_hover.set(None);
+            *settings.pointer_surface.pressed.borrow_mut() = None;
+            settings.page.cancel_pointer_transients();
+        }
+    }
     pub fn is_active(&self) -> bool {
         !matches!(self, Dialog::None)
     }
@@ -1121,34 +1322,40 @@ impl Dialog {
     /// (the page handler can't), then calls [`Self::finish_agent_edit`] to
     /// re-read + re-parse the file. `None` unless the user just chose to
     /// edit an agent and `$EDITOR` is set.
-    pub fn take_pending_agent_edit(&mut self) -> Option<PathBuf> {
+    pub(crate) fn take_pending_agent_edit(
+        &mut self,
+    ) -> Option<agents_page::AgentExternalEditEffect> {
         let Dialog::Settings(s) = self else {
             return None;
         };
         s.page
             .downcast_mut::<AgentsPage>()
-            .and_then(|p| p.pending_external_edit.take())
+            .and_then(AgentsPage::take_external_edit_request)
     }
 
     /// Apply the result of an external-editor session the event loop ran on
     /// behalf of the Agents page: re-read the file from disk, re-parse it,
     /// surface any parse error inline, and refresh the row markers/model.
-    /// `editor_error` carries an external-process failure (non-zero exit /
-    /// missing binary) so the page reports it and leaves the file as-is.
-    pub fn finish_agent_edit(&mut self, editor_error: Option<String>) {
+    /// The host reports a typed Saved/Cancelled/Failed terminal outcome;
+    /// only Saved may atomically replace the real agent path.
+    pub(crate) fn finish_agent_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    ) {
         let Dialog::Settings(s) = self else {
             return;
         };
-        let cwd = s.agents_cwd();
-        if let Some(p) = s.page.downcast_mut::<AgentsPage>() {
-            p.finish_external_edit(&cwd, editor_error);
-        }
+        s.finish_agent_external_edit(operation_id, outcome, detail);
     }
 
     /// Drain a pending category setting `$EDITOR` request. The category page
     /// retains the temp path until [`Self::finish_category_setting_edit`] reads
     /// it back and drops it.
-    pub fn take_pending_category_setting_edit(&mut self) -> Option<PathBuf> {
+    pub(crate) fn take_pending_category_setting_edit(
+        &mut self,
+    ) -> Option<(shell::PointerOperationId, PathBuf)> {
         let Dialog::Settings(s) = self else {
             return None;
         };
@@ -1156,11 +1363,16 @@ impl Dialog {
     }
 
     /// Apply the result of a category-setting `$EDITOR` round trip.
-    pub fn finish_category_setting_edit(&mut self, editor_error: Option<String>) {
+    pub(crate) fn finish_category_setting_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    ) {
         let Dialog::Settings(s) = self else {
             return;
         };
-        s.finish_category_external_edit(editor_error);
+        s.finish_category_external_edit(operation_id, outcome, detail);
     }
 
     /// Called by the event loop each tick so async fetches can apply
@@ -1464,14 +1676,33 @@ impl Dialog {
 
 impl SettingsDialog {
     #[cfg(test)]
+    pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
+        self.cx
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .map(|target| target.rect)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_test_hover_is_none(&self) -> bool {
+        self.cx.pointer_surface.hover.borrow().is_none()
+    }
+
+    #[cfg(test)]
     fn set_test_page(&mut self, page: Page) {
         self.page = boxed_page(page);
     }
 
     #[cfg(test)]
-    fn test_page(&self) -> TestPageRef<'_> {
+    pub(crate) fn test_page(&self) -> TestPageRef<'_> {
         if let Some(p) = self.page.downcast_ref::<RootPage>() {
             return TestPageRef::Root { cursor: p.cursor };
+        }
+        if let Some(p) = self.page.downcast_ref::<DefaultModelPage>() {
+            return TestPageRef::DefaultModel(p);
         }
         if let Some(p) = self.page.downcast_ref::<AgentsPage>() {
             return TestPageRef::Agents(p);
@@ -1586,6 +1817,7 @@ impl SettingsDialog {
                 config_path,
                 extended_path,
                 scroll_states: SettingsScrollStates::default(),
+                pointer_surface: SettingsPointerSurface::default(),
                 original_config: config.clone(),
                 config,
                 extended,
@@ -1958,6 +2190,111 @@ impl SettingsDialog {
         self.apply_nav(nav)
     }
 
+    fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        let Some(area) = self.pointer_surface.area.get() else {
+            return SettingsPointerOutcome::Consumed;
+        };
+        if mouse.column < area.x
+            || mouse.column >= area.right()
+            || mouse.row < area.y
+            || mouse.row >= area.bottom()
+        {
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                *self.pointer_surface.hover.borrow_mut() = None;
+                self.pointer_surface.header_hover.set(None);
+            }
+            return SettingsPointerOutcome::Consumed;
+        }
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                let action = self
+                    .pointer_surface
+                    .hit(mouse.column, mouse.row)
+                    .filter(|target| target.enabled)
+                    .map(|target| target.action);
+                *self.pointer_surface.hover.borrow_mut() = match &action {
+                    Some(SettingsPointerAction::Page(action)) => Some(action.clone()),
+                    _ => None,
+                };
+                self.pointer_surface.header_hover.set(match action {
+                    Some(SettingsPointerAction::Header(action)) => Some(action),
+                    _ => None,
+                });
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                *self.pointer_surface.hover.borrow_mut() = None;
+                self.pointer_surface.header_hover.set(None);
+                if let Some(region) = self
+                    .pointer_surface
+                    .scroll_region_at(mouse.column, mouse.row)
+                {
+                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        -3
+                    } else {
+                        3
+                    };
+                    let nav = self.page.handle_pointer_scroll(&mut self.cx, region, delta);
+                    let _ = self.apply_nav(nav);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(target) = self.pointer_surface.hit(mouse.column, mouse.row) else {
+                    return SettingsPointerOutcome::Consumed;
+                };
+                if !target.enabled {
+                    return SettingsPointerOutcome::Consumed;
+                }
+                if self
+                    .pointer_surface
+                    .pressed
+                    .borrow_mut()
+                    .replace(target.action.clone())
+                    .is_some()
+                {
+                    return SettingsPointerOutcome::Consumed;
+                }
+                match target.action {
+                    SettingsPointerAction::Header(SettingsHeaderAction::Close) => {
+                        return SettingsPointerOutcome::Close;
+                    }
+                    SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker) => {
+                        self.back_to_picker = true;
+                        return SettingsPointerOutcome::Close;
+                    }
+                    SettingsPointerAction::Header(SettingsHeaderAction::Back) => {
+                        let nav = match self.page.resolve_header_back() {
+                            SettingsLocalBack::LocalBack => self.page.handle_key(
+                                &mut self.cx,
+                                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            ),
+                            SettingsLocalBack::NoLocalBack => Nav::Back,
+                        };
+                        let _ = self.apply_nav(nav);
+                    }
+                    SettingsPointerAction::Page(action) => {
+                        let nav = self.page.handle_pointer_control_at(
+                            &mut self.cx,
+                            action.clone(),
+                            mouse.column,
+                            mouse.row,
+                        );
+                        let close = self.apply_nav(nav);
+                        #[cfg(test)]
+                        pointer_acceptance_tests::record_dispatched_action(&action);
+                        if close {
+                            return SettingsPointerOutcome::Close;
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                *self.pointer_surface.pressed.borrow_mut() = None;
+            }
+            _ => {}
+        }
+        SettingsPointerOutcome::Consumed
+    }
+
     fn enter_mcp(&mut self) {
         self.page = mcp_page(mcp_page::McpPage::List(mcp_page::ListState {
             cursor: 0,
@@ -1971,22 +2308,60 @@ impl SettingsDialog {
         self.page = string_list_page(StringListPage::gitignore_allow());
     }
 
-    fn take_pending_category_external_edit(&mut self) -> Option<PathBuf> {
-        self.page
-            .downcast_mut::<CategoryPage>()
-            .and_then(|p| p.pending_external_edit.as_mut()?.service_path())
+    fn take_pending_category_external_edit(
+        &mut self,
+    ) -> Option<(shell::PointerOperationId, PathBuf)> {
+        self.page.downcast_mut::<CategoryPage>().and_then(|p| {
+            let pending = p.pending_external_edit.as_mut()?;
+            let id = pending.operation_id;
+            pending.service_path().map(|path| (id, path))
+        })
     }
 
-    fn finish_category_external_edit(&mut self, editor_error: Option<String>) {
+    fn finish_category_external_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    ) {
         let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
             return;
         };
-        self.cx.finish_category_page_external_edit(p, editor_error);
+        self.cx
+            .finish_category_page_external_edit(p, operation_id, outcome, detail);
+    }
+
+    fn finish_agent_external_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    ) {
+        let cwd = self.agents_cwd();
+        let Some(page) = self.page.downcast_mut::<AgentsPage>() else {
+            return;
+        };
+        page.finish_external_edit(&cwd, operation_id, outcome, detail);
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
 
-    fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
+    pub(crate) fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        links: &mut crate::tui::links::LinkRegistry,
+    ) {
+        let surface_token = self.page.pointer_surface_token();
+        #[cfg(test)]
+        pointer_acceptance_tests::record_rendered_surface(self.page.pointer_surface_kind());
+        self.pointer_surface
+            .enabled
+            .set(self.extended.tui.mouse_capture);
+        if !self.extended.tui.mouse_capture {
+            *self.pointer_surface.hover.borrow_mut() = None;
+        }
+        self.pointer_surface.clear_for_page(area, surface_token);
         let title = self.title();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1994,13 +2369,91 @@ impl SettingsDialog {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        let pointer_enabled = self.extended.tui.mouse_capture;
+        let header_style = |action| {
+            if pointer_enabled && self.pointer_surface.header_hover.get() == Some(action) {
+                Style::default().add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            }
+        };
+        let close_label = if pointer_enabled {
+            "[Close settings]"
+        } else {
+            "Close settings"
+        };
+        let mut header = vec![Span::styled(
+            close_label,
+            header_style(SettingsHeaderAction::Close),
+        )];
+        if pointer_enabled {
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
+                action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
+        let root = self.page.as_any().is::<RootPage>();
+        if !root || !self.stack.is_empty() {
+            header.push(Span::styled(
+                if pointer_enabled {
+                    "  [Back]"
+                } else {
+                    "  Back"
+                },
+                header_style(SettingsHeaderAction::Back),
+            ));
+            if pointer_enabled {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
+                    action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        } else if self.picker_cwd.is_some() {
+            header.push(Span::styled(
+                if pointer_enabled {
+                    "  [Back to config picker]"
+                } else {
+                    "  Back to config picker"
+                },
+                header_style(SettingsHeaderAction::BackToConfigPicker),
+            ));
+            if pointer_enabled {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
+                    action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
-            .render_with_links(&self.cx, frame, layout[0], links);
-        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[0]) {
+            .render_with_links(&self.cx, frame, layout[1], links);
+        #[cfg(test)]
+        for target in self.pointer_surface.targets.borrow().iter() {
+            if let SettingsPointerAction::Page(action) = &target.action {
+                pointer_acceptance_tests::record_rendered_action(action, target.enabled);
+            }
+        }
+        if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }
-        frame.render_widget(help_line(self.help_text()), layout[1]);
+        let help = if self.pointer_surface.enabled.get() {
+            format!("{}  click: activate  wheel: scroll", self.help_text())
+        } else {
+            self.help_text().to_string()
+        };
+        frame.render_widget(help_line(&help), layout[2]);
     }
 
     fn title(&self) -> String {
@@ -2013,6 +2466,10 @@ impl SettingsDialog {
 }
 
 impl SettingsPage for RootPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        SettingsPointerSurfaceKind::Root
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         let children = root_nodes();
         match key.code {
@@ -2095,6 +2552,7 @@ impl SettingsPage for RootPage {
                             grabbed: None,
                             status: None,
                             reset: ResetButton::default(),
+                            pointer_delete_pending: None,
                         }))
                     }
                     "MCP" => Some(mcp_page(mcp_page::McpPage::List(mcp_page::ListState {
@@ -2124,7 +2582,38 @@ impl SettingsPage for RootPage {
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        render_root(frame, area, self.cursor, &cx.scroll_states);
+        render_root(frame, area, self.cursor, cx);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(id)) =
+            action
+        else {
+            return Nav::Stay;
+        };
+        let Some(index) = root_nodes().iter().position(|node| node.id == id) else {
+            return Nav::Stay;
+        };
+        self.cursor = index;
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region != shell::SettingsScrollRegionId("root") {
+            return Nav::Stay;
+        }
+        let last = root_nodes().len().saturating_sub(1);
+        self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -2154,8 +2643,8 @@ impl SettingsPage for RootPage {
 // ── Helpers / freestanding renderers ─────────────────────────────────────
 
 /// The Providers & Provider Models menu node title (also the dispatch key).
-const PROVIDERS_TITLE: &str = "Providers & Provider Models";
-const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
+pub(super) const PROVIDERS_TITLE: &str = "Providers & Provider Models";
+pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 
 /// The reorganized top-level menu (implementation note).
 /// `Default model for new sessions` leads, then the locked scheme in order;
@@ -2164,58 +2653,72 @@ const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 fn root_nodes() -> [NavNode; 14] {
     [
         NavNode {
-            title: DEFAULT_MODEL_TITLE,
+            id: pointer_actions::RootNodeId::DefaultModel,
+            title: pointer_actions::RootNodeId::DefaultModel.title(),
             description: "Default model for newly created sessions in the current configuration context. Does not change the model of an already-running session.",
         },
         NavNode {
-            title: PROVIDERS_TITLE,
+            id: pointer_actions::RootNodeId::Providers,
+            title: pointer_actions::RootNodeId::Providers.title(),
             description: "Provider setup and request controls: endpoints, headers, model lists, default model, context/cache, fallback, wire API, and per-provider/per-model inline-<think> extraction overrides.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Dependencies,
             title: "Dependencies",
             description: "Read-only dependency health grouped by safety, selected features, optional integrations, and accelerators.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Agents,
             title: "Agents",
             description: "Manage agent definitions, presets, and per-agent overrides.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Interface,
             title: "Interface",
             description: "Display & input only: vim mode, thinking display for stored reasoning, markdown rendering, mouse, diff style, banner, chrome toggles, emojis, and exit scrollback.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Behavior,
             title: "Behavior",
             description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Privacy,
             title: "Privacy & Safety",
             description: "Redaction (master switch + every source), the prompt-injection guard, and the remote-config opt-in. Advanced holds the redaction internals.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Translation,
             title: "Translation",
             description: "Round-trip utility-model translation: your language and the model's language.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Tools,
             title: "Tools",
             description: "Tool inventory and configuration: web providers, builtin tools, user-defined command tools, and MCP catalogs.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Harnesses,
             title: "Harnesses",
             description: "External coding harnesses (claude, codex, opencode, grok, …) Build/Plan can delegate to via harness_invoke.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Skills,
             title: "Skills",
             description: "Skill scan directories and the auto-! command toggle (Claude vs Codex mode).",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Profile,
             title: "Profile",
             description: "Your display name, shown on the startup banner.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Mcp,
             title: "MCP",
             description: "Model Context Protocol servers: transport, auth, and enabled state.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Lsp,
             title: "LSP",
             description: "Language servers, diagnostics surfacing, semantic navigation, and install behavior.",
         },
@@ -2223,6 +2726,7 @@ fn root_nodes() -> [NavNode; 14] {
 }
 
 struct NavNode {
+    id: pointer_actions::RootNodeId,
     title: &'static str,
     description: &'static str,
 }
@@ -2247,7 +2751,7 @@ pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
     Line::from(Span::styled(label.to_string(), style))
 }
 
-fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &SettingsScrollStates) {
+fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
     let children = root_nodes();
     let cursor = cursor.min(children.len().saturating_sub(1));
     let rows = Layout::vertical([
@@ -2268,7 +2772,26 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &Set
             ])
         })
         .collect();
-    scroll_states.render_lines(frame, rows[0], "root", list_lines, Some(cursor));
+    let controls = children
+        .iter()
+        .map(|node| {
+            Some((
+                pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
+                    node.id,
+                )),
+                true,
+                None,
+            ))
+        })
+        .collect();
+    cx.scroll_states.render_control_lines(
+        frame,
+        rows[0],
+        "root",
+        (list_lines, Some(cursor)),
+        controls,
+        (&cx.pointer_surface, shell::SettingsScrollRegionId("root")).into(),
+    );
 
     let desc = children[cursor].description;
     frame.render_widget(
@@ -3399,4 +3922,4 @@ pub fn fetch_all_unlisted_dialog(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -151,6 +151,162 @@ pub(super) struct SettingsScrollStates {
     states: RefCell<BTreeMap<String, ListState>>,
 }
 
+/// Monotonic identity for a pointer-triggered effect.  Results are accepted
+/// only while the matching operation is live; this prevents a completion
+/// from a page that has since been cancelled/replaced from updating its
+/// successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PointerOperationId(pub u64);
+
+#[derive(Debug, Default)]
+pub(super) struct PointerOperationGate {
+    next: u64,
+    pending: Option<PointerOperationId>,
+}
+
+impl PointerOperationGate {
+    pub(super) fn begin(&mut self) -> PointerOperationId {
+        self.next = self.next.saturating_add(1).max(1);
+        let id = PointerOperationId(self.next);
+        self.pending = Some(id);
+        id
+    }
+
+    /// Consume a matching completion exactly once.
+    pub(super) fn complete(&mut self, id: PointerOperationId) -> bool {
+        if self.pending == Some(id) {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn cancel(&mut self) {
+        self.pending = None;
+    }
+
+    pub(super) fn pending(&self) -> Option<PointerOperationId> {
+        self.pending
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SettingsHeaderAction {
+    Close,
+    Back,
+    BackToConfigPicker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum SettingsPointerAction {
+    Header(SettingsHeaderAction),
+    /// A sealed, domain-identified page action. Render-local row keys never
+    /// cross this boundary or enter a behavioral reducer.
+    Page(super::pointer_actions::SettingsPointerAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct SettingsControlId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct SettingsScrollRegionId(pub &'static str);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SettingsPointerTarget {
+    pub rect: Rect,
+    pub action: SettingsPointerAction,
+    pub enabled: bool,
+    pub disabled_reason: Option<&'static str>,
+}
+
+#[derive(Debug)]
+pub(super) struct SettingsPointerSurface {
+    pub area: std::cell::Cell<Option<Rect>>,
+    page_token: std::cell::Cell<Option<u64>>,
+    pub targets: RefCell<Vec<SettingsPointerTarget>>,
+    pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
+    pub hover: RefCell<Option<super::pointer_actions::SettingsPointerAction>>,
+    pub header_hover: std::cell::Cell<Option<SettingsHeaderAction>>,
+    pub enabled: std::cell::Cell<bool>,
+    pub pressed: RefCell<Option<SettingsPointerAction>>,
+}
+
+impl Default for SettingsPointerSurface {
+    fn default() -> Self {
+        Self {
+            area: std::cell::Cell::new(None),
+            page_token: std::cell::Cell::new(None),
+            targets: RefCell::new(Vec::new()),
+            scroll_regions: RefCell::new(Vec::new()),
+            hover: RefCell::new(None),
+            header_hover: std::cell::Cell::new(None),
+            enabled: std::cell::Cell::new(true),
+            pressed: RefCell::new(None),
+        }
+    }
+}
+
+impl SettingsPointerSurface {
+    pub fn clear_for(&self, area: Rect) {
+        if self.area.get() != Some(area) {
+            *self.hover.borrow_mut() = None;
+            self.header_hover.set(None);
+        }
+        self.area.set(Some(area));
+        self.targets.borrow_mut().clear();
+        self.scroll_regions.borrow_mut().clear();
+    }
+
+    pub fn clear_for_page(&self, area: Rect, page_token: u64) {
+        if self.page_token.replace(Some(page_token)) != Some(page_token) {
+            *self.hover.borrow_mut() = None;
+            self.header_hover.set(None);
+            *self.pressed.borrow_mut() = None;
+        }
+        self.clear_for(area);
+    }
+
+    pub fn register(&self, target: SettingsPointerTarget) {
+        if !self.enabled.get() {
+            return;
+        }
+        self.targets.borrow_mut().push(target);
+    }
+
+    pub fn hit(&self, column: u16, row: u16) -> Option<SettingsPointerTarget> {
+        self.targets
+            .borrow()
+            .iter()
+            .rev()
+            .find(|target| {
+                column >= target.rect.x
+                    && column < target.rect.right()
+                    && row >= target.rect.y
+                    && row < target.rect.bottom()
+            })
+            .cloned()
+    }
+
+    pub fn register_scroll_region(&self, rect: Rect, id: SettingsScrollRegionId) {
+        if !self.enabled.get() {
+            return;
+        }
+        self.scroll_regions.borrow_mut().push((rect, id));
+    }
+
+    pub fn scroll_region_at(&self, column: u16, row: u16) -> Option<SettingsScrollRegionId> {
+        self.scroll_regions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(rect, _)| {
+                column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+            })
+            .map(|(_, id)| *id)
+    }
+}
+
 impl SettingsScrollStates {
     pub(super) fn render_lines(
         &self,
@@ -171,12 +327,108 @@ impl SettingsScrollStates {
         frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
     }
 
+    /// Render a list and publish its page-declared semantic controls from the
+    /// same final line layout and `ListState` offset. `controls` is parallel
+    /// to `lines`; continuation, heading, blank, and status lines use `None`.
+    /// This is deliberately source-backed metadata, not terminal-buffer or
+    /// marker-text inference.
+    pub(super) fn render_control_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        key: impl Into<String>,
+        content: (Vec<Line<'static>>, Option<usize>),
+        controls: Vec<
+            Option<(
+                super::pointer_actions::SettingsPointerAction,
+                bool,
+                Option<&'static str>,
+            )>,
+        >,
+        pointer: PointerRenderContext<'_>,
+    ) {
+        let (lines, selected_line) = content;
+        let PointerRenderContext { surface, region } = pointer;
+        debug_assert_eq!(lines.len(), controls.len());
+        let key = key.into();
+        self.render_lines(frame, area, key.clone(), lines, selected_line);
+        surface.register_scroll_region(area, region);
+        let offset = self.offset_for(&key);
+        for (screen_row, binding) in controls
+            .into_iter()
+            .skip(offset)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let Some((action, enabled, disabled_reason)) = binding else {
+                continue;
+            };
+            surface.register(SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    area.width,
+                    1,
+                ),
+                action: SettingsPointerAction::Page(action.clone()),
+                enabled,
+                disabled_reason,
+            });
+            if enabled && surface.hover.borrow().as_ref() == Some(&action) {
+                let y = area.y.saturating_add(screen_row as u16);
+                for x in area.x..area.right() {
+                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                        cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn render_bound_lines<A>(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        key: impl Into<String>,
+        content: (Vec<Line<'static>>, Option<usize>),
+        bindings: impl IntoIterator<Item = (usize, A)>,
+        pointer: PointerRenderContext<'_>,
+    ) where
+        A: Into<super::pointer_actions::SettingsPointerAction>,
+    {
+        let (lines, selected_line) = content;
+        let mut controls = vec![None; lines.len()];
+        for (line, id) in bindings {
+            if let Some(slot) = controls.get_mut(line) {
+                *slot = Some((id.into(), true, None));
+            }
+        }
+        self.render_control_lines(frame, area, key, (lines, selected_line), controls, pointer);
+    }
+
     pub(super) fn offset_for(&self, key: &str) -> usize {
         self.states
             .borrow()
             .get(key)
             .map(ListState::offset)
             .unwrap_or(0)
+    }
+}
+
+pub(super) struct PointerRenderContext<'a> {
+    pub(super) surface: &'a SettingsPointerSurface,
+    pub(super) region: SettingsScrollRegionId,
+}
+
+impl<'a> PointerRenderContext<'a> {
+    pub(super) fn new(surface: &'a SettingsPointerSurface, region: SettingsScrollRegionId) -> Self {
+        Self { surface, region }
+    }
+}
+
+impl<'a> From<(&'a SettingsPointerSurface, SettingsScrollRegionId)> for PointerRenderContext<'a> {
+    fn from((surface, region): (&'a SettingsPointerSurface, SettingsScrollRegionId)) -> Self {
+        Self::new(surface, region)
     }
 }
 
@@ -301,7 +553,8 @@ pub(super) fn push_text_field_at_cursor(
     cursor: usize,
     focused: bool,
     placeholder: Option<&str>,
-) {
+) -> std::ops::Range<usize> {
+    let start = lines.len();
     let prompt = format!("{label}: ");
     if focused {
         let mut spans = vec![Span::styled(prompt, muted_style())];
@@ -314,7 +567,7 @@ pub(super) fn push_text_field_at_cursor(
                 ));
             }
             lines.push(Line::from(spans));
-            return;
+            return start..lines.len();
         }
         let cursor = cockpit_core::text::floor_char_boundary(value, cursor);
         let (before, after) = value.split_at(cursor);
@@ -322,7 +575,7 @@ pub(super) fn push_text_field_at_cursor(
         spans.push(cursor_marker_span());
         spans.push(Span::styled(after.to_string(), focused_field_style()));
         lines.push(Line::from(spans));
-        return;
+        return start..lines.len();
     }
 
     let shown = if value.is_empty() {
@@ -347,6 +600,7 @@ pub(super) fn push_text_field_at_cursor(
         shown,
         value_style,
     );
+    start..lines.len()
 }
 
 pub(super) fn push_wrapped_text(
@@ -525,5 +779,79 @@ mod tests {
             offset_after_down,
             "moving up within the visible padded window must not bottom-anchor"
         );
+    }
+
+    #[test]
+    fn semantic_control_renderer_registers_visible_rows_only() {
+        let states = SettingsScrollStates::default();
+        let surface = SettingsPointerSurface::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                surface.clear_for_page(Rect::new(0, 0, 20, 3), 7);
+                states.render_control_lines(
+                    frame,
+                    Rect::new(0, 0, 20, 3),
+                    "controls",
+                    (
+                        (0..8).map(|row| Line::from(format!("row {row}"))).collect(),
+                        Some(6),
+                    ),
+                    (0..8)
+                        .map(|row| {
+                            let ids = [
+                                super::super::pointer_actions::RootNodeId::DefaultModel,
+                                super::super::pointer_actions::RootNodeId::Providers,
+                                super::super::pointer_actions::RootNodeId::Agents,
+                                super::super::pointer_actions::RootNodeId::Interface,
+                                super::super::pointer_actions::RootNodeId::Behavior,
+                                super::super::pointer_actions::RootNodeId::Privacy,
+                                super::super::pointer_actions::RootNodeId::Translation,
+                                super::super::pointer_actions::RootNodeId::Tools,
+                            ];
+                            Some((
+                                super::super::pointer_actions::SettingsPointerAction::Root(
+                                    super::super::pointer_actions::RootAction::Open(ids[row]),
+                                ),
+                                true,
+                                None,
+                            ))
+                        })
+                        .collect(),
+                    (&surface, SettingsScrollRegionId("controls")).into(),
+                );
+            })
+            .expect("draw controls");
+
+        let targets = surface.targets.borrow();
+        assert_eq!(targets.len(), 3);
+        assert!(targets.iter().all(|target| target.rect.bottom() <= 3));
+        assert!(
+            targets
+                .iter()
+                .all(|target| matches!(target.action, SettingsPointerAction::Page(_)))
+        );
+        assert_eq!(
+            surface.scroll_region_at(5, 2),
+            Some(SettingsScrollRegionId("controls"))
+        );
+        assert_eq!(surface.scroll_region_at(5, 3), None);
+    }
+
+    #[test]
+    fn hover_survives_same_surface_redraw_and_clears_on_transition() {
+        let surface = SettingsPointerSurface::default();
+        let area = Rect::new(1, 2, 20, 5);
+        surface.clear_for_page(area, 10);
+        let action = super::super::pointer_actions::SettingsPointerAction::Root(
+            super::super::pointer_actions::RootAction::Open(
+                super::super::pointer_actions::RootNodeId::Interface,
+            ),
+        );
+        *surface.hover.borrow_mut() = Some(action.clone());
+        surface.clear_for_page(area, 10);
+        assert_eq!(surface.hover.borrow().as_ref(), Some(&action));
+        surface.clear_for_page(area, 11);
+        assert!(surface.hover.borrow().is_none());
     }
 }

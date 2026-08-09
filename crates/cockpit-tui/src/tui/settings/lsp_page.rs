@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -9,6 +9,9 @@ use ratatui::text::{Line, Span};
 use crate::tui::textfield::TextField;
 use cockpit_core::daemon::proto::{LspControlAction, Request};
 
+use super::pointer_actions::{
+    LspAction as PointerLspAction, LspEdit as PointerLspEdit, LspServerId, SettingsPointerAction,
+};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{self, marker, muted_style, selected_or_field};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -58,6 +61,16 @@ pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
 
 pub(super) const LSP_SERVER_ROW_START: usize = LSP_NAV_ROWS.len();
 
+fn pointer_edit(edit: LspEdit) -> PointerLspEdit {
+    match edit {
+        LspEdit::OtherFilesLimit => PointerLspEdit::OtherFilesLimit,
+        LspEdit::PerFileLimit => PointerLspEdit::PerFileLimit,
+        LspEdit::DebounceMs => PointerLspEdit::DebounceMs,
+        LspEdit::DocumentTimeoutMs => PointerLspEdit::DocumentTimeoutMs,
+        LspEdit::WorkspaceTimeoutMs => PointerLspEdit::WorkspaceTimeoutMs,
+    }
+}
+
 fn lsp_row_for_cursor(cursor: usize) -> LspRow {
     LSP_NAV_ROWS
         .get(cursor)
@@ -65,6 +78,18 @@ fn lsp_row_for_cursor(cursor: usize) -> LspRow {
         .unwrap_or_else(|| LspRow::Server(cursor - LSP_SERVER_ROW_START))
 }
 impl SettingsPage for LspPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Lsp
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         let row_count = LSP_SERVER_ROW_START
             + cx.project_context()
@@ -233,6 +258,94 @@ impl SettingsPage for LspPage {
         cx.render_lsp_page(frame, area, self);
     }
 
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::Lsp(action) = action else {
+            return Nav::Stay;
+        };
+        let server_action = match &action {
+            PointerLspAction::Check(id) => Some((id, LspControlAction::Check)),
+            PointerLspAction::Install(id) => Some((id, LspControlAction::Install)),
+            PointerLspAction::Uninstall(id) => Some((id, LspControlAction::Uninstall)),
+            PointerLspAction::Restart(id) => Some((id, LspControlAction::Restart)),
+            _ => None,
+        };
+        if let Some((LspServerId(id), control_action)) = server_action {
+            let Some(cwd) = cx.project_context().project_root().cloned() else {
+                return Nav::Stay;
+            };
+            let Some(server_idx) =
+                cockpit_core::daemon::lsp::builtin_server_views(&cwd, &cx.extended)
+                    .iter()
+                    .position(|server| &server.id == id)
+            else {
+                return Nav::Stay;
+            };
+            self.cursor = LSP_SERVER_ROW_START + server_idx;
+            self.reset.disarm();
+            cx.queue_lsp_action(server_idx, control_action, self);
+            return Nav::Stay;
+        }
+        let row_count = LSP_SERVER_ROW_START
+            + cx.project_context()
+                .project_root()
+                .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
+                .unwrap_or(1);
+        let index = match action {
+            PointerLspAction::ToggleEnabled => row_index(LspRow::Enabled),
+            PointerLspAction::CycleAutoInstall => row_index(LspRow::AutoInstall),
+            PointerLspAction::ToggleDiagnostics => row_index(LspRow::Diagnostics),
+            PointerLspAction::Edit(edit) | PointerLspAction::SaveEdit(edit) => match edit {
+                PointerLspEdit::OtherFilesLimit => row_index(LspRow::OtherFilesLimit),
+                PointerLspEdit::PerFileLimit => row_index(LspRow::PerFileLimit),
+                PointerLspEdit::DebounceMs => row_index(LspRow::DebounceMs),
+                PointerLspEdit::DocumentTimeoutMs => row_index(LspRow::DocumentTimeoutMs),
+                PointerLspEdit::WorkspaceTimeoutMs => row_index(LspRow::WorkspaceTimeoutMs),
+            },
+            PointerLspAction::CancelEdit(edit) => {
+                if self.editing.map(pointer_edit) == Some(edit) {
+                    self.editing = None;
+                    self.buf = TextField::default();
+                }
+                return Nav::Stay;
+            }
+            PointerLspAction::Reset => row_index(LspRow::Reset),
+            PointerLspAction::Check(_)
+            | PointerLspAction::Install(_)
+            | PointerLspAction::Uninstall(_)
+            | PointerLspAction::Restart(_) => return Nav::Stay,
+        };
+        debug_assert!(index < row_count);
+        self.cursor = index;
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == shell::SettingsScrollRegionId("lsp") && self.editing.is_none() {
+            let row_count = LSP_SERVER_ROW_START
+                + cx.project_context()
+                    .project_root()
+                    .map(|cwd| {
+                        cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len()
+                    })
+                    .unwrap_or(1);
+            self.reset.disarm();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(row_count.saturating_sub(1));
+        }
+        Nav::Stay
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › LSP",
@@ -356,7 +469,7 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
                 p.cursor,
                 &server.id,
                 format!(
-                    "{status}; enter=check i=install u=uninstall R=restart; cockpit-installed: {}; cmd: {command}; install: {install}; uninstall: {uninstall}; {}",
+                    "[Check] [Install] [Uninstall] [Restart]  {status}; cockpit-installed: {}; cmd: {command}; install: {install}; uninstall: {uninstall}; {}",
                     on_off(server.cockpit_installed),
                     server.manual_guidance
                 ),
@@ -427,6 +540,7 @@ fn lsp_edit_row<T: ToString>(
             Span::styled(before.to_string(), muted_style()),
             shell::cursor_marker_span(),
             Span::styled(after.to_string(), muted_style()),
+            Span::styled("  [cancel]", muted_style()),
         ])
     } else {
         lsp_row(idx, p.cursor, label, value.to_string())
@@ -501,8 +615,151 @@ impl SettingsCx {
 
     fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
         let (rows, selected_line) = lsp_rows(self, p);
-        self.scroll_states
-            .render_lines(frame, area, "lsp", rows, Some(selected_line));
+        let row_count = LSP_SERVER_ROW_START
+            + self
+                .project_context()
+                .project_root()
+                .map(|cwd| {
+                    cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended).len()
+                })
+                .unwrap_or(1);
+        let servers = self
+            .project_context()
+            .project_root()
+            .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended));
+        let bindings = (0..row_count).filter_map(|cursor| {
+            let action = match lsp_row_for_cursor(cursor) {
+                LspRow::Enabled => Some(PointerLspAction::ToggleEnabled),
+                LspRow::AutoInstall => Some(PointerLspAction::CycleAutoInstall),
+                LspRow::Diagnostics => Some(PointerLspAction::ToggleDiagnostics),
+                LspRow::OtherFilesLimit => {
+                    Some(lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit))
+                }
+                LspRow::PerFileLimit => {
+                    Some(lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit))
+                }
+                LspRow::DebounceMs => Some(lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs)),
+                LspRow::DocumentTimeoutMs => Some(lsp_edit_pointer_action(
+                    p,
+                    PointerLspEdit::DocumentTimeoutMs,
+                )),
+                LspRow::WorkspaceTimeoutMs => Some(lsp_edit_pointer_action(
+                    p,
+                    PointerLspEdit::WorkspaceTimeoutMs,
+                )),
+                LspRow::Reset => Some(PointerLspAction::Reset),
+                // The unavailable sentinel is explanatory text, not an
+                // enabled Check control. A real project source below supplies
+                // stable server identities and actionable controls.
+                LspRow::Server(index) => servers
+                    .as_ref()
+                    .and_then(|items| items.get(index))
+                    .map(|server| PointerLspAction::Check(LspServerId(server.id.clone()))),
+            }?;
+            Some((
+                lsp_selected_line_for_cursor(cursor),
+                SettingsPointerAction::Lsp(action),
+            ))
+        });
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "lsp",
+            (rows, Some(selected_line)),
+            bindings,
+            (&self.pointer_surface, shell::SettingsScrollRegionId("lsp")).into(),
+        );
+        let offset = self.scroll_states.offset_for("lsp");
+        if let Some(edit) = p.editing {
+            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(area.height)
+            {
+                // The overlay owns the complete rendered `  [cancel]` span,
+                // beginning immediately after marker + label + draft + caret.
+                let cancel_x = 27usize.saturating_add(p.buf.text().chars().count());
+                if cancel_x < usize::from(area.width) {
+                    self.pointer_surface.register(shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x.saturating_add(cancel_x as u16),
+                            area.y.saturating_add(screen_row as u16),
+                            10.min(area.width.saturating_sub(cancel_x as u16)),
+                            1,
+                        ),
+                        action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
+                            PointerLspAction::CancelEdit(pointer_edit(edit)),
+                        )),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
+            }
+        }
+        let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
+        for server_idx in 0..server_count {
+            let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
+                continue;
+            };
+            let line = lsp_selected_line_for_cursor(LSP_SERVER_ROW_START + server_idx);
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if screen_row >= usize::from(area.height) {
+                continue;
+            }
+            let y = area.y.saturating_add(screen_row as u16);
+            for (action, (x, width)) in [
+                (
+                    PointerLspAction::Check(LspServerId(server.id.clone())),
+                    (26, 7),
+                ),
+                (
+                    PointerLspAction::Install(LspServerId(server.id.clone())),
+                    (34, 9),
+                ),
+                (
+                    PointerLspAction::Uninstall(LspServerId(server.id.clone())),
+                    (44, 11),
+                ),
+                (
+                    PointerLspAction::Restart(LspServerId(server.id.clone())),
+                    (56, 9),
+                ),
+            ] {
+                if x >= area.width {
+                    continue;
+                }
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(x),
+                        y,
+                        width.min(area.width.saturating_sub(x)),
+                        1,
+                    ),
+                    action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(action)),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
+    }
+}
+
+fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> PointerLspAction {
+    if p.editing.map(pointer_edit) == Some(edit) {
+        PointerLspAction::SaveEdit(edit)
+    } else {
+        PointerLspAction::Edit(edit)
+    }
+}
+
+fn lsp_row_for_edit(edit: LspEdit) -> LspRow {
+    match edit {
+        LspEdit::OtherFilesLimit => LspRow::OtherFilesLimit,
+        LspEdit::PerFileLimit => LspRow::PerFileLimit,
+        LspEdit::DebounceMs => LspRow::DebounceMs,
+        LspEdit::DocumentTimeoutMs => LspRow::DocumentTimeoutMs,
+        LspEdit::WorkspaceTimeoutMs => LspRow::WorkspaceTimeoutMs,
     }
 }
 

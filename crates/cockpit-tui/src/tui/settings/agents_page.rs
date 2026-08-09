@@ -29,10 +29,11 @@
 //! edit/eject/delete/reset so the overridden/custom markers + effective
 //! model stay accurate.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -49,7 +50,10 @@ use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, 
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    PointerOperationGate, PointerOperationId, SettingsScrollRegionId, push_wrapped_text,
+    selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
 use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
@@ -74,7 +78,150 @@ pub(super) struct AgentsPage {
     /// Set when the user chose to edit and `$EDITOR` is available: the
     /// event loop drains this (the page can't suspend the TUI itself),
     /// runs `$EDITOR`, then calls back to re-read + re-parse.
-    pub(super) pending_external_edit: Option<PathBuf>,
+    pub(super) pending_external_edit: Option<AgentExternalEdit>,
+    /// Pointer/keyboard confirmation shown before the raw editor hands the
+    /// current buffer to `$EDITOR`.  Keeping this separate from the live
+    /// operation means repeated presses cannot submit an effect early.
+    pub(super) external_edit_confirmation: Option<super::pointer_actions::AgentId>,
+    external_edit_ops: PointerOperationGate,
+    editor_body: Cell<Option<Rect>>,
+}
+
+pub(super) struct AgentExternalEdit {
+    pub(super) id: PointerOperationId,
+    pub(super) agent: super::pointer_actions::AgentId,
+    pub(super) path: PathBuf,
+    /// Same-directory staging file. The real path is replaced only after a
+    /// matching typed `Saved` completion.
+    staging: tempfile::TempPath,
+    original_contents: Vec<u8>,
+    original_metadata: AgentFileMetadata,
+    /// Buffer write owned by the injected host effect.
+    pub(super) text_before_launch: String,
+    /// Raw draft retained until the effect reaches a terminal outcome. A
+    /// failed/cancelled operation restores this exact editor for retry.
+    draft: Option<AgentEditor>,
+    servicing: bool,
+}
+
+/// Injected host-effect submission. The settings reducer only constructs this
+/// value; the App owns the optional buffer write, terminal suspension/editor
+/// launch, and completion callback.
+pub(crate) struct AgentExternalEditEffect {
+    pub(crate) operation_id: PointerOperationId,
+    pub(crate) path: PathBuf,
+    pub(crate) text_before_launch: String,
+}
+
+struct AgentExternalEditStaging {
+    path: tempfile::TempPath,
+    original_contents: Vec<u8>,
+    original_metadata: AgentFileMetadata,
+}
+
+struct AgentFileMetadata {
+    permissions: std::fs::Permissions,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl AgentFileMetadata {
+    fn capture(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            permissions: metadata.permissions(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+        }
+    }
+
+    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        self.len == metadata.len()
+            && self.modified == metadata.modified().ok()
+            && self.permissions.readonly() == metadata.permissions().readonly()
+            && {
+                #[cfg(unix)]
+                {
+                    self.device == metadata.dev()
+                        && self.inode == metadata.ino()
+                        && self.mode == metadata.mode()
+                        && self.uid == metadata.uid()
+                        && self.gid == metadata.gid()
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+    }
+}
+
+fn agent_external_edit_staging(
+    target: &std::path::Path,
+) -> Result<AgentExternalEditStaging, String> {
+    let metadata = std::fs::symlink_metadata(target)
+        .map_err(|error| format!("failed to inspect external-edit target: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to externally edit symbolic link {}",
+            target.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to externally edit non-file {}",
+            target.display()
+        ));
+    }
+    let mut original = std::fs::File::open(target)
+        .map_err(|error| format!("failed to open external-edit target: {error}"))?;
+    let opened_metadata = original
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened external-edit target: {error}"))?;
+    let original_metadata = AgentFileMetadata::capture(&metadata);
+    if !original_metadata.matches(&opened_metadata) {
+        return Err("external-edit target changed while it was being opened".into());
+    }
+    let mut original_contents = Vec::new();
+    std::io::Read::read_to_end(&mut original, &mut original_contents)
+        .map_err(|error| format!("failed to read external-edit target: {error}"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("external edit target has no parent: {}", target.display()))?;
+    let path = tempfile::Builder::new()
+        .prefix(".cockpit-agent-edit-")
+        .suffix(".stage")
+        .tempfile_in(parent)
+        .map(|file| file.into_temp_path())
+        .map_err(|error| format!("failed to create external-edit staging file: {error}"))?;
+    Ok(AgentExternalEditStaging {
+        path,
+        original_contents,
+        original_metadata,
+    })
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -128,6 +275,9 @@ impl AgentsPage {
             editing: None,
             detail: None,
             pending_external_edit: None,
+            external_edit_confirmation: None,
+            external_edit_ops: PointerOperationGate::default(),
+            editor_body: Cell::new(None),
         }
     }
 
@@ -161,22 +311,159 @@ impl AgentsPage {
         self.reset_one.disarm();
     }
 
+    pub(super) fn take_external_edit_request(&mut self) -> Option<AgentExternalEditEffect> {
+        let pending = self.pending_external_edit.as_mut()?;
+        if pending.servicing {
+            return None;
+        }
+        pending.servicing = true;
+        Some(AgentExternalEditEffect {
+            operation_id: pending.id,
+            path: pending.staging.to_path_buf(),
+            text_before_launch: pending.text_before_launch.clone(),
+        })
+    }
+
     /// Re-read the edited file from disk, re-parse it, and refresh the row.
     /// A parse error is surfaced inline (keeping the user on the page); the
     /// `editor_error` from a failed external process is reported as-is.
     pub(super) fn finish_external_edit(
         &mut self,
         cwd: &std::path::Path,
-        editor_error: Option<String>,
+        id: PointerOperationId,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
-        if let Some(err) = editor_error {
-            self.status = Some(err);
+        let Some(agent) = self
+            .pending_external_edit
+            .as_ref()
+            .filter(|pending| pending.id == id)
+            .map(|pending| pending.agent.clone())
+        else {
+            return;
+        };
+        self.reduce_external_edit_result(
+            cwd,
+            id,
+            super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome),
+            detail,
+        );
+    }
+
+    fn reduce_external_edit_result(
+        &mut self,
+        cwd: &std::path::Path,
+        id: PointerOperationId,
+        action: super::pointer_actions::AgentsAction,
+        detail: Option<String>,
+    ) {
+        let super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome) = action
+        else {
+            return;
+        };
+        let Some(agent) = self
+            .pending_external_edit
+            .as_ref()
+            .filter(|request| request.id == id && request.agent == agent)
+            .map(|request| request.agent.clone())
+        else {
+            return;
+        };
+        if !self.external_edit_ops.complete(id) {
             return;
         }
-        // Find the name we were editing by matching the cursor row (the
-        // page didn't navigate while the external editor ran).
-        let name = self.rows.get(self.cursor).map(|r| r.name.clone());
-        self.refresh_after_edit(cwd, name.as_deref());
+        let Some(mut pending) = self.pending_external_edit.take() else {
+            return;
+        };
+        match outcome {
+            super::pointer_actions::ExternalEditOutcome::Saved => {
+                let draft = pending.draft.take();
+                let commit = (|| -> Result<(), String> {
+                    let current_metadata = std::fs::symlink_metadata(&pending.path)
+                        .map_err(|error| format!("failed to revalidate agent path: {error}"))?;
+                    if current_metadata.file_type().is_symlink() {
+                        return Err("agent path became a symbolic link during external edit".into());
+                    }
+                    if !current_metadata.is_file() {
+                        return Err("agent path is no longer a regular file".into());
+                    }
+                    if !pending.original_metadata.matches(&current_metadata) {
+                        return Err(
+                            "agent file metadata changed during external edit; refusing overwrite"
+                                .into(),
+                        );
+                    }
+                    let mut current_file = std::fs::File::open(&pending.path)
+                        .map_err(|error| format!("failed to re-open agent path: {error}"))?;
+                    let opened_metadata = current_file
+                        .metadata()
+                        .map_err(|error| format!("failed to inspect opened agent path: {error}"))?;
+                    if !pending.original_metadata.matches(&opened_metadata) {
+                        return Err(
+                            "agent file changed while commit was being validated; refusing overwrite"
+                                .into(),
+                        );
+                    }
+                    let mut current = Vec::new();
+                    std::io::Read::read_to_end(&mut current_file, &mut current)
+                        .map_err(|error| format!("failed to re-read agent path: {error}"))?;
+                    if current != pending.original_contents {
+                        return Err(
+                            "agent file changed during external edit; refusing overwrite".into(),
+                        );
+                    }
+                    std::fs::set_permissions(
+                        pending.staging.as_ref() as &std::path::Path,
+                        pending.original_metadata.permissions.clone(),
+                    )
+                    .map_err(|error| {
+                        format!("failed to preserve agent-file permissions: {error}")
+                    })?;
+                    // Keep the pathname check adjacent to the atomic rename. The
+                    // descriptor above binds content validation to the opened
+                    // file; this final no-follow check catches a pathname swap
+                    // during that read or while staging permissions were set.
+                    let final_metadata = std::fs::symlink_metadata(&pending.path)
+                        .map_err(|error| format!("failed final agent-path validation: {error}"))?;
+                    if final_metadata.file_type().is_symlink()
+                        || !final_metadata.is_file()
+                        || !pending.original_metadata.matches(&final_metadata)
+                    {
+                        return Err(
+                            "agent path changed before atomic replacement; refusing overwrite"
+                                .into(),
+                        );
+                    }
+                    pending
+                        .staging
+                        .persist(&pending.path)
+                        .map(|_| ())
+                        .map_err(|error| format!("atomic replacement failed: {error}"))
+                })();
+                match commit {
+                    Ok(_) => {
+                        self.refresh_after_edit(cwd, Some(&agent.0));
+                        if let Some(detail) = detail {
+                            self.status = Some(format!("saved `{}`; {detail}", agent.0));
+                        }
+                    }
+                    Err(error) => {
+                        self.editing = draft;
+                        self.status = Some(format!(
+                            "failed to atomically commit external edit: {error}"
+                        ));
+                    }
+                }
+            }
+            super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                self.editing = pending.draft.take();
+                self.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
+            }
+            super::pointer_actions::ExternalEditOutcome::Failed => {
+                self.editing = pending.draft.take();
+                self.status = Some(detail.unwrap_or_else(|| "external edit failed".into()));
+            }
+        }
     }
 }
 
@@ -324,6 +611,17 @@ impl SettingsCx {
 
     fn handle_agents_page_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
         // ── In-TUI editor (vim or plain) ────────────────────────────
+        if p.external_edit_confirmation.is_some() {
+            match key.code {
+                KeyCode::Enter => self.submit_agent_external_edit(p),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    p.external_edit_confirmation = None;
+                    p.status = Some("external edit cancelled".into());
+                }
+                _ => {}
+            }
+            return Nav::Stay;
+        }
         if let Some(editor) = p.editing.as_mut() {
             match editor.handle_key(key) {
                 EditorOutcome::Stay => {}
@@ -348,19 +646,9 @@ impl SettingsCx {
                     if std::env::var_os("EDITOR").is_none() {
                         p.status = Some("No $EDITOR environment variable".into());
                     } else {
-                        let path = editor.path.clone();
-                        let text = editor.text().to_string();
-                        let text = format!("{}\n", text.trim_end_matches('\n'));
-                        match std::fs::write(&path, &text) {
-                            Ok(()) => {
-                                p.editing = None;
-                                p.pending_external_edit = Some(path);
-                                p.status = Some("opening $EDITOR…".into());
-                            }
-                            Err(e) => {
-                                p.status = Some(format!("write failed: {e}"));
-                            }
-                        }
+                        p.external_edit_confirmation =
+                            Some(super::pointer_actions::AgentId(editor.name.clone()));
+                        p.status = Some(format!("Open agent {} in $EDITOR?", editor.name));
                     }
                 }
                 EditorOutcome::Cancel => {
@@ -436,6 +724,43 @@ impl SettingsCx {
             _ => {}
         }
         Nav::Stay
+    }
+
+    /// Submit the confirmed raw-editor handoff exactly once. The event loop
+    /// drains this request as an injected effect and returns the same id.
+    fn submit_agent_external_edit(&mut self, p: &mut AgentsPage) {
+        let Some(expected) = p.external_edit_confirmation.take() else {
+            return;
+        };
+        let Some(editor) = p.editing.as_ref() else {
+            return;
+        };
+        if editor.name != expected.0 || p.pending_external_edit.is_some() {
+            return;
+        }
+        let path = editor.path.clone();
+        let text = format!("{}\n", editor.text().trim_end_matches('\n'));
+        let staging = match agent_external_edit_staging(&path) {
+            Ok(staging) => staging,
+            Err(error) => {
+                p.status = Some(error);
+                return;
+            }
+        };
+        let draft = p.editing.take();
+        let id = p.external_edit_ops.begin();
+        p.pending_external_edit = Some(AgentExternalEdit {
+            id,
+            agent: expected,
+            path,
+            original_contents: staging.original_contents,
+            original_metadata: staging.original_metadata,
+            staging: staging.path,
+            text_before_launch: text,
+            draft,
+            servicing: false,
+        });
+        p.status = Some("opening $EDITOR…".into());
     }
 
     fn handle_agent_detail_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
@@ -638,7 +963,32 @@ impl SettingsCx {
             // marked overridden under the cursor; the loop will re-read the
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
-            p.pending_external_edit = Some(path);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    p.status = Some(format!("edit failed: reading {}: {error}", path.display()));
+                    return;
+                }
+            };
+            let staging = match agent_external_edit_staging(&path) {
+                Ok(staging) => staging,
+                Err(error) => {
+                    p.status = Some(error);
+                    return;
+                }
+            };
+            let id = p.external_edit_ops.begin();
+            p.pending_external_edit = Some(AgentExternalEdit {
+                id,
+                agent: super::pointer_actions::AgentId(name.clone()),
+                path,
+                original_contents: staging.original_contents,
+                original_metadata: staging.original_metadata,
+                staging: staging.path,
+                text_before_launch: text,
+                draft: None,
+                servicing: false,
+            });
             p.status = Some("opening $EDITOR…".into());
             return;
         }
@@ -656,6 +1006,38 @@ impl SettingsCx {
         p.rows = rows_for(&cwd).0;
         let vim = self.extended.tui.vim_mode.vim_enabled();
         p.editing = Some(AgentEditor::new(name, path, &text, vim));
+        p.status = None;
+    }
+
+    /// Pointer raw-edit always enters the in-TUI raw editor first so the
+    /// separately named `$EDITOR` control can enforce its confirmation.
+    fn edit_selected_in_tui(&mut self, p: &mut AgentsPage) {
+        let Some(row) = p.rows.get(p.cursor) else {
+            return;
+        };
+        let name = row.name.clone();
+        let cwd = self.agents_cwd();
+        let path = match self.agent_edit_path(&cwd, &name) {
+            Ok(path) => path,
+            Err(error) => {
+                p.status = Some(format!("edit failed: {error}"));
+                return;
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                p.status = Some(format!("edit failed: reading {}: {error}", path.display()));
+                return;
+            }
+        };
+        p.rows = rows_for(&cwd).0;
+        p.editing = Some(AgentEditor::new(
+            name,
+            path,
+            &text,
+            self.extended.tui.vim_mode.vim_enabled(),
+        ));
         p.status = None;
     }
 
@@ -740,13 +1122,125 @@ impl SettingsCx {
     }
 
     pub(super) fn render_agents_page(&self, frame: &mut Frame, area: Rect, p: &AgentsPage) {
+        p.editor_body.set(None);
         // The in-TUI editor takes the whole page area when open.
         if let Some(editor) = &p.editing {
             editor.render(frame, area);
+            let action_y = area.bottom().saturating_sub(1);
+            let agent = super::pointer_actions::AgentId(editor.name.clone());
+            let confirming = p.external_edit_confirmation.as_ref() == Some(&agent);
+            if !confirming && area.width > 4 && area.height > 3 {
+                let editor_body = Rect::new(
+                    area.x.saturating_add(2),
+                    area.y.saturating_add(1),
+                    area.width.saturating_sub(4),
+                    area.height.saturating_sub(3),
+                );
+                p.editor_body.set(Some(editor_body));
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: editor_body,
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Agents(
+                                super::pointer_actions::AgentsAction::EditText(agent.clone()),
+                            ),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+            let actions = if confirming {
+                vec![
+                    (
+                        super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                        0,
+                        17,
+                    ),
+                    (
+                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
+                        19,
+                        8,
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        super::pointer_actions::AgentsAction::Save(agent.clone()),
+                        0,
+                        6u16,
+                    ),
+                    (
+                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
+                        8u16,
+                        8u16,
+                    ),
+                    (
+                        super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+                        18u16,
+                        17u16,
+                    ),
+                ]
+            };
+            for (action, x, width) in actions {
+                if x.saturating_add(width) > area.width {
+                    continue;
+                }
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(area.x + x, action_y, width, 1),
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Agents(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+            frame.render_widget(
+                if confirming {
+                    Line::from("[Open in $EDITOR]  [Cancel]")
+                } else {
+                    Line::from("[Save]  [Cancel]  [Open in $EDITOR]")
+                },
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
         if let Some(detail) = &p.detail {
-            self.render_agent_detail(frame, area, detail);
+            let action_y = area.bottom().saturating_sub(1);
+            let detail_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+            self.render_agent_detail(frame, detail_area, detail);
+            let agent = super::pointer_actions::AgentId(detail.name.clone());
+            for (action, x, width) in [
+                (
+                    super::pointer_actions::AgentsAction::OpenRawEditor(agent.clone()),
+                    0,
+                    15,
+                ),
+                (
+                    super::pointer_actions::AgentsAction::Save(agent.clone()),
+                    17,
+                    6,
+                ),
+            ] {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x + x,
+                            action_y,
+                            width.min(area.width.saturating_sub(x)),
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Agents(action),
+                        ),
+                        enabled: x < area.width,
+                        disabled_reason: (x >= area.width).then_some("control is clipped"),
+                    });
+            }
+            frame.render_widget(
+                Line::from("[Edit raw file]  [Save]"),
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
 
@@ -762,6 +1256,7 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
             area.width,
@@ -771,8 +1266,11 @@ impl SettingsCx {
              custom agent; reset reverts an overridden built-in.",
             muted,
         );
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
+        let mut selected_action_line = None;
         for (i, row) in p.rows.iter().enumerate() {
             let on_cursor = i == p.cursor;
             let marker = if on_cursor { "▸ " } else { "  " };
@@ -804,36 +1302,156 @@ impl SettingsCx {
                 spans.push(Span::styled(format!("  ⚠ {e}"), red));
             }
             lines.push(Line::from(spans));
+            let open = super::pointer_actions::SettingsPointerAction::Agents(
+                super::pointer_actions::AgentsAction::Open(super::pointer_actions::AgentId(
+                    row.name.clone(),
+                )),
+            );
+            controls.push(Some((open.clone(), true, None)));
             if let Ok(desc) = &row.detail {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(desc.clone(), muted),
                 ]));
+                controls.push(Some((open, true, None)));
+            }
+            if on_cursor && !p.confirm_reset && !p.delete.is_pending() && !p.reset_one.is_pending()
+            {
+                let id = super::pointer_actions::AgentId(row.name.clone());
+                lines.push(Line::from("[Open]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::Open(id.clone()),
+                    ),
+                    true,
+                    None,
+                )));
+                lines.push(Line::from("[Edit raw file]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::Edit(id.clone()),
+                    ),
+                    true,
+                    None,
+                )));
+                selected_action_line = Some(lines.len() - 1);
+                let row_action = match &row.kind {
+                    AgentKind::Custom => Some((
+                        "[Delete]",
+                        super::pointer_actions::AgentsAction::Delete(id.clone()),
+                    )),
+                    AgentKind::Builtin { overridden: true } => {
+                        Some(("[Reset]", super::pointer_actions::AgentsAction::Reset(id)))
+                    }
+                    AgentKind::Builtin { overridden: false } => None,
+                };
+                if let Some((label, action)) = row_action {
+                    lines.push(Line::from(label));
+                    controls.push(Some((
+                        super::pointer_actions::SettingsPointerAction::Agents(action),
+                        true,
+                        None,
+                    )));
+                }
+                lines.push(Line::from("[Reset all]"));
+                controls.push(Some((
+                    super::pointer_actions::SettingsPointerAction::Agents(
+                        super::pointer_actions::AgentsAction::ResetAll,
+                    ),
+                    true,
+                    None,
+                )));
             }
         }
 
         if p.confirm_reset {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(
                 "Reset ALL built-in agents to default? This deletes their \
                  on-disk overrides (custom agents are kept).  y: confirm  n: cancel"
                     .to_string(),
                 red.add_modifier(Modifier::BOLD),
             )));
+            controls.push(None);
+            lines.push(Line::from("[Reset]"));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::ResetAll,
+                ),
+                true,
+                None,
+            )));
+            selected_action_line = Some(lines.len() - 1);
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
+                        "reset-all".into(),
+                    )),
+                ),
+                true,
+                None,
+            )));
+        } else if p.delete.is_pending() || p.reset_one.is_pending() {
+            let verb = if p.delete.is_pending() {
+                "Delete"
+            } else {
+                "Reset"
+            };
+            let name = p
+                .rows
+                .get(p.cursor)
+                .map_or("agent", |row| row.name.as_str());
+            lines.push(Line::default());
+            controls.push(None);
+            lines.push(Line::from(format!("{verb} {name}?")));
+            controls.push(None);
+            lines.push(Line::from(format!("[{verb}]")));
+            let id = super::pointer_actions::AgentId(name.to_string());
+            let action = if p.delete.is_pending() {
+                super::pointer_actions::AgentsAction::Delete(id)
+            } else {
+                super::pointer_actions::AgentsAction::Reset(id)
+            };
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(action),
+                true,
+                None,
+            )));
+            selected_action_line = Some(lines.len() - 1);
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
+                        name.to_string(),
+                    )),
+                ),
+                true,
+                None,
+            )));
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
-        let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "agents", lines, selected_line);
+        let selected_line = selected_action_line.or_else(|| selected_line_from_marker(&lines));
+        self.scroll_states.render_control_lines(
+            frame,
+            area,
+            "agents",
+            (lines, selected_line),
+            controls,
+            (&self.pointer_surface, SettingsScrollRegionId("agents:list")).into(),
+        );
     }
 
     fn render_agent_detail(&self, frame: &mut Frame, area: Rect, detail: &AgentDetail) {
-        let (lines, selected_line) = tool_surface_lines(
+        let (lines, selected_line, semantic_rows) = tool_surface_lines(
             &detail.picker,
             &detail.draft,
             ToolSurfaceRender {
@@ -844,8 +1462,65 @@ impl SettingsCx {
                 block_safety_ungrant: false,
             },
         );
-        self.scroll_states
-            .render_lines(frame, area, "agent-detail", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "agent-detail",
+            (lines, selected_line),
+            semantic_rows
+                .iter()
+                .filter(|(_, _, enabled)| *enabled)
+                .map(|(line, index, _)| {
+                    (
+                        *line,
+                        super::pointer_actions::SettingsPointerAction::Agents(
+                            super::pointer_actions::AgentsAction::ToggleTool(
+                                super::pointer_actions::AgentId(detail.name.clone()),
+                                super::pointer_actions::AgentToolId(
+                                    cockpit_core::agents::tool_surface_catalog()[*index]
+                                        .name
+                                        .into(),
+                                ),
+                            ),
+                        ),
+                    )
+                }),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("agents:detail"),
+            )
+                .into(),
+        );
+        let offset = self.scroll_states.offset_for("agent-detail");
+        let tier_width = area.width.min(12);
+        for (line, index, enabled) in semantic_rows {
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if !enabled || screen_row >= usize::from(area.height) || tier_width == 0 {
+                continue;
+            }
+            let tool = cockpit_core::agents::tool_surface_catalog()[index].name;
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.right().saturating_sub(tier_width),
+                        area.y.saturating_add(screen_row as u16),
+                        tier_width,
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Agents(
+                            super::pointer_actions::AgentsAction::CycleTier(
+                                super::pointer_actions::AgentId(detail.name.clone()),
+                                super::pointer_actions::AgentToolId(tool.into()),
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+        }
     }
 }
 
@@ -872,12 +1547,280 @@ impl AgentsPage {
 }
 
 impl SettingsPage for AgentsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Agents
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        if self.editing.is_some() {
+            402
+        } else if self.detail.is_some() {
+            401
+        } else {
+            400
+        }
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() || self.detail.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_agents_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_agents_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Agents(action) = action else {
+            return Nav::Stay;
+        };
+        if self.editing.is_some() {
+            if let Some(confirming) = self.external_edit_confirmation.as_ref()
+                && !matches!(
+                    &action,
+                    super::pointer_actions::AgentsAction::ExternalEditBegin(agent)
+                        if agent == confirming
+                )
+                && !matches!(&action, super::pointer_actions::AgentsAction::Cancel(agent) if agent == confirming)
+            {
+                self.external_edit_confirmation = None;
+                self.status = Some("external edit cancelled".into());
+                return Nav::Stay;
+            }
+            return match action {
+                super::pointer_actions::AgentsAction::EditText(_) => Nav::Stay,
+                super::pointer_actions::AgentsAction::Save(_) => cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    self,
+                ),
+                super::pointer_actions::AgentsAction::Cancel(_) => {
+                    cx.handle_agents_page_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), self)
+                }
+                super::pointer_actions::AgentsAction::ExternalEditBegin(ref agent)
+                    if self
+                        .editing
+                        .as_ref()
+                        .is_some_and(|editor| editor.name == agent.0) =>
+                {
+                    if self.external_edit_confirmation.as_ref() == Some(agent) {
+                        cx.handle_agents_page_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            self,
+                        )
+                    } else if std::env::var_os("EDITOR").is_none() {
+                        self.status = Some("No $EDITOR environment variable".into());
+                        Nav::Stay
+                    } else {
+                        self.external_edit_confirmation = Some(agent.clone());
+                        self.status = Some(format!("Open agent {} in $EDITOR?", agent.0));
+                        Nav::Stay
+                    }
+                }
+                _ => Nav::Stay,
+            };
+        }
+        if self.detail.is_some()
+            && matches!(
+                &action,
+                super::pointer_actions::AgentsAction::OpenRawEditor(_)
+            )
+        {
+            return cx.handle_agents_page_key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                self,
+            );
+        }
+        if self.detail.is_some() && matches!(&action, super::pointer_actions::AgentsAction::Save(_))
+        {
+            return cx.handle_agents_page_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                self,
+            );
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            let (row, key) = match action {
+                super::pointer_actions::AgentsAction::ToggleTool(_, row) => {
+                    (row, KeyCode::Char(' '))
+                }
+                super::pointer_actions::AgentsAction::CycleTier(_, row) => {
+                    (row, KeyCode::Char('t'))
+                }
+                _ => return Nav::Stay,
+            };
+            let Some(index) = cockpit_core::agents::tool_surface_catalog()
+                .iter()
+                .position(|tool| tool.name == row.0)
+            else {
+                return Nav::Stay;
+            };
+            if index >= cockpit_core::agents::tool_surface_catalog().len() {
+                return Nav::Stay;
+            }
+            detail.picker.set_cursor(index);
+            return cx.handle_agents_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
+        let row_identity = match &action {
+            super::pointer_actions::AgentsAction::Open(id)
+            | super::pointer_actions::AgentsAction::Edit(id)
+            | super::pointer_actions::AgentsAction::Delete(id)
+            | super::pointer_actions::AgentsAction::Reset(id) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = row_identity {
+            let Some(index) = self.rows.iter().position(|row| row.name == id.0) else {
+                return Nav::Stay;
+            };
+            // A pending destructive action is valid only for the row that
+            // still owns it; a different stable target starts fresh.
+            if index != self.cursor {
+                self.disarm_guards();
+            }
+            self.cursor = index;
+        }
+        match &action {
+            super::pointer_actions::AgentsAction::ResetAll if self.confirm_reset => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::Cancel(_) if self.confirm_reset => {
+                self.confirm_reset = false;
+                self.status = Some("reset cancelled".into());
+                return Nav::Stay;
+            }
+            super::pointer_actions::AgentsAction::Delete(_) if self.delete.is_pending() => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::Reset(_) if self.reset_one.is_pending() => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::Open(_) => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::Cancel(_) => {
+                self.disarm_guards();
+                self.status = Some("action cancelled".into());
+                return Nav::Stay;
+            }
+            super::pointer_actions::AgentsAction::Edit(_) => {
+                cx.edit_selected_in_tui(self);
+                return Nav::Stay;
+            }
+            super::pointer_actions::AgentsAction::Delete(_) => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::Reset(_) => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            super::pointer_actions::AgentsAction::ResetAll => {
+                return cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("agents:list")
+            && self.detail.is_none()
+            && self.editing.is_none()
+        {
+            self.disarm_guards();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(self.rows.len().saturating_sub(1));
+        } else if region == SettingsScrollRegionId("agents:detail")
+            && let Some(detail) = self.detail.as_mut()
+        {
+            let last = cockpit_core::agents::tool_surface_catalog()
+                .len()
+                .saturating_sub(1);
+            let cursor = detail
+                .picker
+                .cursor()
+                .saturating_add_signed(delta)
+                .min(last);
+            detail.picker.set_cursor(cursor);
+        }
+        Nav::Stay
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        row: u16,
+    ) -> Nav {
+        if matches!(
+            &action,
+            super::pointer_actions::SettingsPointerAction::Agents(
+                super::pointer_actions::AgentsAction::EditText(_)
+            )
+        ) && self.external_edit_confirmation.take().is_some()
+        {
+            self.status = Some("external edit cancelled".into());
+            return Nav::Stay;
+        }
+        if matches!(
+            &action,
+            super::pointer_actions::SettingsPointerAction::Agents(
+                super::pointer_actions::AgentsAction::EditText(_)
+            )
+        ) && let Some(editor) = self.editing.as_mut()
+            && let Some(body) = self.editor_body.get()
+        {
+            editor.set_cursor_from_visible_cell(
+                usize::from(row.saturating_sub(body.y)),
+                usize::from(column.saturating_sub(body.x)),
+            );
+            return Nav::Stay;
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.confirm_reset = false;
+        self.disarm_guards();
+        self.external_edit_confirmation = None;
+        self.external_edit_ops.cancel();
+        self.pending_external_edit = None;
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -904,7 +1847,7 @@ impl SettingsPage for AgentsPage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::fs;
@@ -1550,8 +2493,839 @@ mod tests {
         );
         // Second drain is empty (taken).
         assert!(outer.take_pending_agent_edit().is_none());
-        // finish_agent_edit re-parses + refreshes without panicking.
-        outer.finish_agent_edit(None);
+        // A matching completion is accepted once; a duplicate is inert.
+        let effect = drained.unwrap();
+        let operation_id = effect.operation_id;
+        fs::write(&effect.path, &effect.text_before_launch).unwrap();
+        outer.finish_agent_edit(
+            operation_id,
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
+        outer.finish_agent_edit(
+            operation_id,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+            Some("late duplicate".into()),
+        );
+        if let super::super::Dialog::Settings(s) = &mut outer {
+            assert_ne!(page(s).status.as_deref(), Some("late duplicate"));
+        }
+    }
+
+    pub(crate) fn run_pointer_external_edit_exactly_once_regression() {
+        external_editor_request_is_drained_when_editor_set();
+
+        let _g = EditorEnv::with(Some("true"));
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("pointer-agent.md"),
+            "---\ndescription: pointer fixture\n---\nbody\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                agents_dir.join("pointer-agent.md"),
+                fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+        }
+        let mut dialog = agents_dialog(&tmp);
+        focus(&mut dialog, "pointer-agent");
+        dialog.handle_key(press(KeyCode::Enter));
+        dialog.handle_key(press(KeyCode::Char('e')));
+        assert!(page(&dialog).editing.is_some(), "detail opens raw editor");
+
+        let original = fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap();
+        let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+        let edit_text = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    super::super::shell::SettingsPointerAction::Page(
+                        super::super::pointer_actions::SettingsPointerAction::Agents(
+                            super::super::pointer_actions::AgentsAction::EditText(_)
+                        )
+                    )
+                )
+            })
+            .cloned()
+            .expect("raw editor publishes text body");
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            edit_text.rect.x,
+            edit_text.rect.y + 3,
+        ));
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            edit_text.rect.x,
+            edit_text.rect.y + 3,
+        ));
+        page_mut(&mut dialog)
+            .editing
+            .as_mut()
+            .expect("raw editor remains open after pointer placement")
+            .paste("X");
+        assert!(
+            page(&dialog)
+                .editing
+                .as_ref()
+                .unwrap()
+                .text()
+                .contains("\nXbody"),
+            "click row is relative to retained editor-body origin"
+        );
+
+        let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+        let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+        );
+        let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+        let begin = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .expect("raw editor publishes Open in $EDITOR");
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            begin.rect.x,
+            begin.rect.y,
+        ));
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            begin.rect.x,
+            begin.rect.y,
+        ));
+        assert_eq!(
+            page(&dialog).external_edit_confirmation.as_ref(),
+            Some(&agent),
+            "first activation only opens the named confirmation"
+        );
+        assert!(page(&dialog).pending_external_edit.is_none());
+        assert_eq!(
+            fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap(),
+            original,
+            "opening confirmation performs no eager file mutation"
+        );
+        let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+        assert!(
+            !dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .any(|target| {
+                    matches!(
+                        target.action,
+                        super::super::shell::SettingsPointerAction::Page(
+                            super::super::pointer_actions::SettingsPointerAction::Agents(
+                                super::super::pointer_actions::AgentsAction::EditText(_)
+                            )
+                        )
+                    )
+                }),
+            "confirmation suppresses the editor text target"
+        );
+        let confirm = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .expect("confirmation publishes named Open in $EDITOR");
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            confirm.rect.x,
+            confirm.rect.y,
+        ));
+        let operation = page(&dialog)
+            .pending_external_edit
+            .as_ref()
+            .expect("confirmed activation submits effect")
+            .id;
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            confirm.rect.x,
+            confirm.rect.y,
+        ));
+        assert_eq!(
+            page(&dialog)
+                .pending_external_edit
+                .as_ref()
+                .map(|pending| pending.id),
+            Some(operation),
+            "release preserves the one correlated operation"
+        );
+        assert_eq!(
+            fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap(),
+            original,
+            "submitting the injected effect still performs no reducer-side write"
+        );
+        assert_eq!(page(&dialog).external_edit_ops.pending(), Some(operation));
+
+        let request = page_mut(&mut dialog)
+            .take_external_edit_request()
+            .expect("effect request drains once");
+        assert_eq!(request.operation_id, operation);
+        assert_eq!(
+            request.text_before_launch,
+            "---\ndescription: pointer fixture\n---\nXbody\n"
+        );
+        assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
+        let cwd = dialog.cx.agents_cwd();
+        page_mut(&mut dialog).reduce_external_edit_result(
+            &cwd,
+            operation,
+            super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                super::super::pointer_actions::AgentId("replacement-agent".into()),
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+            ),
+            None,
+        );
+        assert!(
+            page(&dialog).pending_external_edit.is_some(),
+            "stale stable identity is inert"
+        );
+        dialog.finish_agent_external_edit(
+            PointerOperationId(operation.0 + 1),
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
+        assert!(
+            page(&dialog).pending_external_edit.is_some(),
+            "stale completion is inert"
+        );
+        fs::write(&request.path, &request.text_before_launch).unwrap();
+        let saved_result = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                agent.clone(),
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+            ),
+        );
+        super::super::pointer_acceptance_tests::record_source_action(&saved_result);
+        dialog.finish_agent_external_edit(
+            operation,
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
+        super::super::pointer_acceptance_tests::record_dispatched_action(&saved_result);
+        assert!(
+            fs::read_to_string(agents_dir.join("pointer-agent.md"))
+                .unwrap()
+                .contains("\nXbody"),
+            "Saved atomically commits the staged edit"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(agents_dir.join("pointer-agent.md"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640,
+                "atomic replacement preserves the original mode"
+            );
+        }
+        let status = page(&dialog).status.clone();
+        dialog.finish_agent_external_edit(
+            operation,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+            Some("duplicate".into()),
+        );
+        assert_eq!(
+            page(&dialog).status,
+            status,
+            "duplicate completion is inert"
+        );
+
+        for outcome in [
+            super::super::pointer_actions::ExternalEditOutcome::Cancelled,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+        ] {
+            let mut retry = agents_dialog(&tmp);
+            focus(&mut retry, "pointer-agent");
+            retry.handle_key(press(KeyCode::Enter));
+            retry.handle_key(press(KeyCode::Char('e')));
+            page_mut(&mut retry)
+                .editing
+                .as_mut()
+                .unwrap()
+                .paste("RETAINED");
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            {
+                let page = &mut retry.dialog.page;
+                let cx = &mut retry.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
+            let effect = page_mut(&mut retry)
+                .take_external_edit_request()
+                .expect("terminal outcome effect");
+            let operation = effect.operation_id;
+            fs::write(&effect.path, "externally changed staging").unwrap();
+            let result_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                    agent.clone(),
+                    outcome,
+                ),
+            );
+            super::super::pointer_acceptance_tests::record_source_action(&result_action);
+            retry.finish_agent_external_edit(operation, outcome, None);
+            super::super::pointer_acceptance_tests::record_dispatched_action(&result_action);
+            assert!(page(&retry).pending_external_edit.is_none());
+            assert!(
+                page(&retry)
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.text().contains("RETAINED")),
+                "{outcome:?} restores the exact retryable draft"
+            );
+            assert!(page(&retry).external_edit_ops.pending().is_none());
+            assert!(
+                !fs::read_to_string(agents_dir.join("pointer-agent.md"))
+                    .unwrap()
+                    .contains("RETAINED"),
+                "{outcome:?} never mutates the real agent path"
+            );
+        }
+
+        let replacement_cases: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
+        for &replacement in replacement_cases {
+            let target = agents_dir.join("pointer-agent.md");
+            fs::write(&target, "---\ndescription: pointer fixture\n---\nXbody\n").unwrap();
+            let mut conflict = agents_dialog(&tmp);
+            focus(&mut conflict, "pointer-agent");
+            conflict.handle_key(press(KeyCode::Enter));
+            conflict.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            {
+                let page = &mut conflict.dialog.page;
+                let cx = &mut conflict.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
+            let effect = page_mut(&mut conflict)
+                .take_external_edit_request()
+                .expect("regular-file conflict effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            let concurrent = b"---\ndescription: pointer fixture\n---\nYbody\n";
+            if replacement {
+                let replacement_path = agents_dir.join("replacement.md");
+                fs::write(&replacement_path, concurrent).unwrap();
+                fs::rename(replacement_path, &target).unwrap();
+            } else {
+                fs::write(&target, concurrent).unwrap();
+            }
+            conflict.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                concurrent,
+                "{} conflict keeps the concurrent file",
+                if replacement { "identity" } else { "content" }
+            );
+            assert!(page(&conflict).editing.is_some(), "conflict restores draft");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let target = agents_dir.join("pointer-agent.md");
+            let before = fs::read(&target).unwrap();
+            let mut chmod_race = agents_dialog(&tmp);
+            focus(&mut chmod_race, "pointer-agent");
+            chmod_race.handle_key(press(KeyCode::Enter));
+            chmod_race.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            {
+                let page = &mut chmod_race.dialog.page;
+                let cx = &mut chmod_race.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
+            let effect = page_mut(&mut chmod_race)
+                .take_external_edit_request()
+                .expect("chmod-race effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            // The suite may run under a process umask changed by another
+            // regression, and the identity-replacement case above creates a
+            // fresh inode. Choose a mode relative to the live target so this
+            // is always a real metadata race rather than occasionally a no-op.
+            let original_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            let concurrent_mode = if original_mode == 0o600 { 0o640 } else { 0o600 };
+            fs::set_permissions(&target, fs::Permissions::from_mode(concurrent_mode)).unwrap();
+            chmod_race.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                before,
+                "chmod conflict keeps bytes"
+            );
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                concurrent_mode,
+                "commit must not restore stale permissions after a concurrent chmod"
+            );
+            assert!(
+                page(&chmod_race).editing.is_some(),
+                "draft restored on chmod conflict"
+            );
+            assert!(
+                page(&chmod_race)
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("metadata changed"))
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let mut swapped = agents_dialog(&tmp);
+            focus(&mut swapped, "pointer-agent");
+            swapped.handle_key(press(KeyCode::Enter));
+            swapped.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            {
+                let page = &mut swapped.dialog.page;
+                let cx = &mut swapped.dialog.cx;
+                page.handle_pointer_control(cx, action.clone());
+                page.handle_pointer_control(cx, action);
+            }
+            let effect = page_mut(&mut swapped)
+                .take_external_edit_request()
+                .expect("symlink-swap effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            let target = agents_dir.join("pointer-agent.md");
+            let victim = tmp.path().join("symlink-victim.md");
+            fs::write(&victim, "victim stays unchanged").unwrap();
+            fs::remove_file(&target).unwrap();
+            symlink(&victim, &target).unwrap();
+            swapped.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "victim stays unchanged"
+            );
+            assert!(page(&swapped).editing.is_some(), "draft restored on swap");
+            assert!(
+                page(&swapped)
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("symbolic link"))
+            );
+        }
+    }
+
+    pub(crate) fn run_pointer_raw_editor_terminal_actions_regression() {
+        let _g = EditorEnv::with(Some("true"));
+        for terminal in ["save", "cancel"] {
+            let tmp = TempDir::new().unwrap();
+            let agents_dir = tmp.path().join(".cockpit/agents");
+            fs::create_dir_all(&agents_dir).unwrap();
+            fs::write(
+                agents_dir.join("pointer-agent.md"),
+                "---\ndescription: pointer fixture\n---\nbody\n",
+            )
+            .unwrap();
+            let mut dialog = agents_dialog(&tmp);
+            focus(&mut dialog, "pointer-agent");
+            dialog.handle_key(press(KeyCode::Enter));
+            dialog.handle_key(press(KeyCode::Char('e')));
+            page_mut(&mut dialog)
+                .editing
+                .as_mut()
+                .expect("raw editor opens")
+                .paste("changed-by-pointer\n");
+            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                if terminal == "save" {
+                    super::super::pointer_actions::AgentsAction::Save(agent)
+                } else {
+                    super::super::pointer_actions::AgentsAction::Cancel(agent)
+                },
+            );
+            let target = {
+                let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+                dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        target.enabled
+                            && target.action
+                                == super::super::shell::SettingsPointerAction::Page(action.clone())
+                    })
+                    .cloned()
+                    .expect("raw agent editor publishes its named terminal action")
+            };
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            assert!(
+                page(&dialog).editing.is_none(),
+                "{terminal} closes the raw editor through its real reducer"
+            );
+            let persisted = fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap();
+            if terminal == "save" {
+                assert!(
+                    persisted.contains("changed-by-pointer"),
+                    "Save persists the raw editor draft"
+                );
+            } else {
+                assert_eq!(
+                    persisted, "---\ndescription: pointer fixture\n---\nbody\n",
+                    "Cancel discards the raw editor draft"
+                );
+            }
+        }
+    }
+
+    fn populated_pointer_agents_dialog(tmp: &TempDir) -> TrustedAgentsDialog {
+        let agents_dir = tmp.path().join(".cockpit/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("pointer-agent.md"),
+            "---\ndescription: pointer fixture\ntools: [read, search, mcp]\n---\nbody\n",
+        )
+        .unwrap();
+        agents_dialog(tmp)
+    }
+
+    fn click_agent_action(
+        dialog: &mut SettingsDialog,
+        action: &super::super::pointer_actions::SettingsPointerAction,
+    ) {
+        let target = {
+            let _ = super::super::tests::render_settings_rows(dialog, 90, 28);
+            dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.enabled
+                        && target.action
+                            == super::super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                .cloned()
+                .expect("stable agent action rerenders from its fresh selected source")
+        };
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        ] {
+            dialog.handle_pointer(super::super::tests::settings_mouse(
+                kind,
+                target.rect.x,
+                target.rect.y,
+            ));
+        }
+    }
+
+    fn overridden_pointer_agent_dialog(tmp: &TempDir, name: &str) -> TrustedAgentsDialog {
+        let _editor = EditorEnv::unset();
+        let mut dialog = populated_pointer_agents_dialog(tmp);
+        focus(&mut dialog, name);
+        dialog.handle_key(press(KeyCode::Char('e')));
+        dialog.handle_key(press(KeyCode::Esc));
+        if let TestPageMut::Agents(page) = dialog.test_page_mut() {
+            *page = AgentsPage::new(tmp.path());
+        }
+        focus(&mut dialog, name);
+        assert!(
+            tmp.path()
+                .join(format!(".cockpit/agents/{name}.md"))
+                .exists()
+        );
+        dialog
+    }
+
+    pub(crate) fn run_pointer_agent_open_regression() {
+        let source_tmp = TempDir::new().unwrap();
+        let source = populated_pointer_agents_dialog(&source_tmp);
+        let identities = page(&source)
+            .rows
+            .iter()
+            .map(|row| super::super::pointer_actions::AgentId(row.name.clone()))
+            .collect::<Vec<_>>();
+        assert!(!identities.is_empty(), "populated Agents source has rows");
+
+        for agent in &identities {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, &agent.0);
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Open(agent.clone()),
+            );
+            click_agent_action(&mut dialog, &action);
+            assert!(
+                page(&dialog)
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.name == agent.0),
+                "Open reaches the real detail reducer for {agent:?}"
+            );
+        }
+
+        for agent in &identities {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, &agent.0);
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(agent.clone()),
+            );
+            click_agent_action(&mut dialog, &action);
+            assert!(
+                page(&dialog)
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.name == agent.0),
+                "Edit reaches the real raw-editor transition for {agent:?}"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        focus(&mut dialog, "pointer-agent");
+        let custom = super::super::pointer_actions::AgentId("pointer-agent".into());
+        let delete = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Delete(custom.clone()),
+        );
+        click_agent_action(&mut dialog, &delete);
+        assert!(page(&dialog).delete.is_pending());
+        assert!(tmp.path().join(".cockpit/agents/pointer-agent.md").exists());
+        click_agent_action(&mut dialog, &delete);
+        assert!(!tmp.path().join(".cockpit/agents/pointer-agent.md").exists());
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        let reset_all = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::ResetAll,
+        );
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(page(&dialog).confirm_reset);
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(!page(&dialog).confirm_reset);
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = populated_pointer_agents_dialog(&tmp);
+        click_agent_action(&mut dialog, &reset_all);
+        assert!(page(&dialog).confirm_reset);
+        let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Cancel(
+                super::super::pointer_actions::AgentId("reset-all".into()),
+            ),
+        );
+        click_agent_action(&mut dialog, &cancel);
+        assert!(!page(&dialog).confirm_reset);
+        assert!(
+            tmp.path().join(".cockpit/agents/pointer-agent.md").exists(),
+            "cancelling ResetAll preserves configured agents"
+        );
+
+        let builtin = super::super::pointer_actions::AgentId("Build".into());
+        let reset = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Reset(builtin.clone()),
+        );
+        let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Cancel(builtin),
+        );
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        click_agent_action(&mut dialog, &reset);
+        assert!(page(&dialog).reset_one.is_pending());
+        assert!(tmp.path().join(".cockpit/agents/Build.md").exists());
+        click_agent_action(&mut dialog, &cancel);
+        assert!(!page(&dialog).reset_one.is_pending());
+        assert!(
+            tmp.path().join(".cockpit/agents/Build.md").exists(),
+            "cancelling one-agent reset preserves its override"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        click_agent_action(&mut dialog, &reset);
+        assert!(page(&dialog).reset_one.is_pending());
+        click_agent_action(&mut dialog, &reset);
+        assert!(!page(&dialog).reset_one.is_pending());
+        assert!(
+            !tmp.path().join(".cockpit/agents/Build.md").exists(),
+            "the matching second Reset removes exactly the stable override"
+        );
+
+        for descriptor in cockpit_core::agents::tool_surface_catalog() {
+            let tool = descriptor.name;
+            for cycle_tier in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let mut dialog = populated_pointer_agents_dialog(&tmp);
+                focus(&mut dialog, "pointer-agent");
+                dialog.handle_key(press(KeyCode::Enter));
+                focus_tool(&mut dialog, tool);
+                let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+                let row = super::super::pointer_actions::AgentToolId(tool.into());
+                let (action, granted_before, tier_before) = {
+                    let detail = page(&dialog).detail.as_ref().expect("agent detail");
+                    let action = if cycle_tier {
+                        super::super::pointer_actions::AgentsAction::CycleTier(agent, row)
+                    } else {
+                        super::super::pointer_actions::AgentsAction::ToggleTool(agent, row)
+                    };
+                    (
+                        super::super::pointer_actions::SettingsPointerAction::Agents(action),
+                        detail.draft.granted(tool),
+                        detail.draft.tier(tool),
+                    )
+                };
+                let target = {
+                    let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
+                    dialog
+                        .pointer_surface
+                        .targets
+                        .borrow()
+                        .iter()
+                        .find(|target| {
+                            target.enabled
+                                && target.action
+                                    == super::super::shell::SettingsPointerAction::Page(
+                                        action.clone(),
+                                    )
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| panic!("{action:?} rerenders from selected tool {tool}"))
+                };
+                dialog.handle_pointer(super::super::tests::settings_mouse(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    target.rect.x,
+                    target.rect.y,
+                ));
+                assert!(
+                    page(&dialog).detail.is_some(),
+                    "detail remains after Down for {action:?}"
+                );
+                dialog.handle_pointer(super::super::tests::settings_mouse(
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    target.rect.x,
+                    target.rect.y,
+                ));
+                let detail = page(&dialog)
+                    .detail
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("detail remains after Up for {action:?}"));
+                if cycle_tier {
+                    let tier_after = detail.draft.tier(tool);
+                    if cockpit_core::agents::legal_tool_tiers(tool).len() > 1 {
+                        assert_ne!(tier_after, tier_before, "tier cycles for {tool}");
+                    } else {
+                        assert_eq!(
+                            tier_after, tier_before,
+                            "fixed tier remains stable for {tool}"
+                        );
+                    }
+                } else {
+                    assert_ne!(
+                        detail.draft.granted(tool),
+                        granted_before,
+                        "grant toggles for {tool}"
+                    );
+                }
+            }
+        }
+
+        for raw_editor in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = populated_pointer_agents_dialog(&tmp);
+            focus(&mut dialog, "pointer-agent");
+            dialog.handle_key(press(KeyCode::Enter));
+            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+            let action =
+                super::super::pointer_actions::SettingsPointerAction::Agents(if raw_editor {
+                    super::super::pointer_actions::AgentsAction::OpenRawEditor(agent)
+                } else {
+                    super::super::pointer_actions::AgentsAction::Save(agent)
+                });
+            click_agent_action(&mut dialog, &action);
+            if raw_editor {
+                assert!(page(&dialog).editing.is_some());
+            } else {
+                assert!(page(&dialog).detail.is_some());
+                let persisted =
+                    fs::read_to_string(tmp.path().join(".cockpit/agents/pointer-agent.md"))
+                        .unwrap();
+                assert!(persisted.contains("tools:"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_editor_rejects_initial_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        let link = tmp.path().join("link.md");
+        fs::write(&real, "real").unwrap();
+        symlink(&real, &link).unwrap();
+        let error = agent_external_edit_staging(&link)
+            .err()
+            .expect("symlink target must be rejected");
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "real");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn external_editor_metadata_detects_readonly_permission_change() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.md");
+        fs::write(&path, "agent").unwrap();
+        let original = AgentFileMetadata::capture(&fs::metadata(&path).unwrap());
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(!permissions.readonly());
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(!original.matches(&fs::metadata(&path).unwrap()));
     }
 
     #[test]

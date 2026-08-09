@@ -305,6 +305,39 @@ CREATE TABLE media_security_recovery_operations (
         REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
+CREATE TABLE media_local_path_registration_operations (
+    local_operation_id       TEXT PRIMARY KEY,
+    authoritative_operation_id TEXT NOT NULL,
+    session_id               TEXT NOT NULL,
+    canonical_project_digest TEXT NOT NULL,
+    client_draft_id          TEXT NOT NULL,
+    operation_request_digest TEXT NOT NULL,
+    semantic_command_digest  TEXT NOT NULL,
+    receipt_json             TEXT NOT NULL,
+    committed_at_unix_ms     INTEGER NOT NULL,
+    is_alias                 INTEGER NOT NULL CHECK (is_alias IN (0,1))
+);
+CREATE UNIQUE INDEX uq_media_local_path_registration_domain
+ON media_local_path_registration_operations(session_id, canonical_project_digest, client_draft_id)
+WHERE is_alias = 0;
+
+CREATE TABLE media_local_path_registration_evidence (
+    attachment_id             TEXT PRIMARY KEY,
+    canonical_path_digest     TEXT NOT NULL,
+    path_authority_digest     TEXT NOT NULL,
+    source_evidence_digest    TEXT NOT NULL,
+    source_mtime_unix_ns      TEXT NOT NULL,
+    reservation_id           TEXT NOT NULL,
+    reservation_digest       TEXT NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_local_path_registration_audit (
+    local_operation_id TEXT PRIMARY KEY,
+    outcome            TEXT NOT NULL,
+    committed_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;

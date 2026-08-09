@@ -25,6 +25,80 @@ pub enum MediaSourceKind {
     AuthenticatedSessionUpload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedLocalPathMediaKind {
+    Image,
+    Audio,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisterLocalPathMediaV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    pub requested_media_kind: RequestedLocalPathMediaKind,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPathRegistrationRejectionReason {
+    SourceUnavailable,
+    StableIdentityUnavailable,
+    ResourceLimit,
+    SourceChangedDuringRegistration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalPathRegistrationResultV1 {
+    Registered {
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_state: String,
+        availability_generation: u64,
+        reference_generation: u64,
+        reservation_id: String,
+        reservation_digest: String,
+        source_evidence_digest: String,
+    },
+    Rejected {
+        reason: LocalPathRegistrationRejectionReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalPathRegistrationReceiptV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub receipt_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    pub operation_request_digest: String,
+    pub semantic_command_digest: String,
+    pub result: LocalPathRegistrationResultV1,
+    pub committed_at_unix_ms: i64,
+}
+
 impl MediaSourceKind {
     fn is_borrowed(self) -> bool {
         self == Self::LocalPath

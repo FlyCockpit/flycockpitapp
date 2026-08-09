@@ -694,4 +694,54 @@ mod tests {
             "moving up within the visible padded window must not bottom-anchor"
         );
     }
+
+    #[test]
+    fn semantic_control_renderer_registers_visible_rows_only() {
+        let states = SettingsScrollStates::default();
+        let surface = SettingsPointerSurface::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                surface.clear_for_page(Rect::new(0, 0, 20, 3), 7);
+                states.render_control_lines(
+                    frame,
+                    Rect::new(0, 0, 20, 3),
+                    "controls",
+                    (0..8).map(|row| Line::from(format!("row {row}"))).collect(),
+                    Some(6),
+                    (0..8)
+                        .map(|row| Some((SettingsControlId(row), true, None)))
+                        .collect(),
+                    &surface,
+                    SettingsScrollRegionId("controls"),
+                );
+            })
+            .expect("draw controls");
+
+        let targets = surface.targets.borrow();
+        assert_eq!(targets.len(), 3);
+        assert!(targets.iter().all(|target| target.rect.bottom() <= 3));
+        assert!(
+            targets
+                .iter()
+                .all(|target| matches!(target.action, SettingsPointerAction::Page(_)))
+        );
+        assert_eq!(
+            surface.scroll_region_at(5, 2),
+            Some(SettingsScrollRegionId("controls"))
+        );
+        assert_eq!(surface.scroll_region_at(5, 3), None);
+    }
+
+    #[test]
+    fn hover_survives_same_surface_redraw_and_clears_on_transition() {
+        let surface = SettingsPointerSurface::default();
+        let area = Rect::new(1, 2, 20, 5);
+        surface.clear_for_page(area, 10);
+        surface.hover.set(Some(SettingsControlId(4)));
+        surface.clear_for_page(area, 10);
+        assert_eq!(surface.hover.get(), Some(SettingsControlId(4)));
+        surface.clear_for_page(area, 11);
+        assert_eq!(surface.hover.get(), None);
+    }
 }

@@ -26,6 +26,16 @@ pub(super) struct UtilityModelId(pub String);
 pub(super) struct RootNodeId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct StableRowId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ToolFieldId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct BuiltinToolId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct WizardStepId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct WizardControlId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct OAuthFlowId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ConfirmationChoice {
@@ -57,6 +67,38 @@ pub(super) enum LspEdit {
     DebounceMs,
     DocumentTimeoutMs,
     WorkspaceTimeoutMs,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum FetchAllChoice {
+    Apply,
+    Cancel,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum FetchOneChoice {
+    Apply,
+    KeepLocal,
+    Cancel,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum FetchFallbackChoice {
+    Retry,
+    KeepLocal,
+    Cancel,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum DeepFetchChoice {
+    Fetch,
+    Cancel,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ModelLifecycleAction {
+    Refresh,
+    Discard,
+    Retry,
+    Reload,
+    Reapply,
+    Rebind,
+    Dismiss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -125,11 +167,11 @@ pub(super) enum ToolsAction {
     EditUserToolCommand(UserToolId),
     AddUserTool,
     ToggleUserTool(UserToolId),
-    ResetToolField(StableRowId),
+    ResetToolField(ToolFieldId),
     McpJump,
     Reset,
     DeleteUserTool(UserToolId),
-    ReadOnlyBuiltin(StableRowId),
+    ReadOnlyBuiltin(BuiltinToolId),
     ReadOnlyMcpTool(McpServerId, McpToolId),
 }
 
@@ -160,7 +202,24 @@ pub(super) enum McpAction {
     ToggleEnabled(McpServerId),
     Authenticate(McpServerId),
     Delete(McpServerId),
-    EditField(StableRowId),
+    EditName,
+    ToggleEditorEnabled,
+    CycleTransport,
+    EditEndpoint,
+    EditCommand,
+    EditArgs,
+    EditBaseEnv,
+    CycleAuth,
+    EditHeaderName,
+    EditHeaderValue,
+    EditAuthEnv,
+    EditOauthAuthorizeUrl,
+    EditOauthTokenUrl,
+    EditOauthClientId,
+    EditOauthScopes,
+    EditCacheTtl,
+    EditConnectTimeout,
+    EditRequestTimeout,
     Save,
     Cancel,
 }
@@ -198,10 +257,14 @@ pub(super) enum ProvidersAction {
     RenameModel(ProviderId, ModelId),
     DeleteModel(ProviderId, ModelId),
     ModelSettings(ProviderId, ModelId),
-    WizardControl(StableRowId, StableRowId),
+    FetchAllConfirm(FetchAllChoice),
+    FetchOneConfirm(ProviderId, FetchOneChoice),
+    FetchFallbackConfirm(ProviderId, FetchFallbackChoice),
+    DeepFetchChoice(ProviderId, DeepFetchChoice),
+    WizardControl(WizardStepId, WizardControlId),
     RowEditor(StableRowId, StableRowId, StableRowId),
-    ModelLifecycle(StableRowId),
-    CopyOAuth(ProviderId, OAuthCopyKind),
+    ModelLifecycle(ModelLifecycleAction),
+    CopyOAuth(OAuthFlowId, OAuthCopyKind),
     CopilotConfirm(ProviderId, ConfirmationChoice),
 }
 

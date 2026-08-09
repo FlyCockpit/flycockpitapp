@@ -80,11 +80,11 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
             ProviderDeleteChoice::KeepSecrets,
         )),
         SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
-            provider(),
+            OAuthFlowId(1),
             OAuthCopyKind::AuthorizationUrl,
         )),
         SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
-            provider(),
+            OAuthFlowId(1),
             OAuthCopyKind::DeviceCode,
         )),
         SettingsPointerAction::Lsp(LspAction::ToggleEnabled),

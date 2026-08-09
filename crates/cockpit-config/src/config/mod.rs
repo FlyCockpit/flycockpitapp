@@ -97,26 +97,19 @@ pub struct TerminalIngressFileIdentity {
 #[derive(Debug)]
 pub struct VerifiedTerminalIngressFile {
     file: std::fs::File,
-    path: std::path::PathBuf,
     pub bytes: Vec<u8>,
     pub identity: TerminalIngressFileIdentity,
-    cleanup_armed: bool,
 }
 
 impl Drop for VerifiedTerminalIngressFile {
     fn drop(&mut self) {
-        if !self.cleanup_armed {
-            return;
-        }
         // The held exact object is scrubbed even if a same-user process renamed
-        // it after verification. Removal of the published name remains
-        // identity-gated and never follows a replacement.
+        // it after verification. Do not perform a later pathname unlink: POSIX
+        // has no conditional unlink-by-identity primitive, so check-then-unlink
+        // could delete a same-user replacement. Generation teardown owns the
+        // remaining private namespace; this handle cleanup targets only the
+        // proven object.
         let _ = self.file.set_len(0);
-        if let Ok(Some((_, _, current))) = files::read_file_nofollow_with_identity(&self.path)
-            && current == self.identity
-        {
-            let _ = files::remove_file_nofollow(&self.path);
-        }
     }
 }
 
@@ -136,10 +129,8 @@ pub fn hold_terminal_ingress_file_verified(
         files::read_file_nofollow_with_identity(path)?.map(|(file, bytes, identity)| {
             VerifiedTerminalIngressFile {
                 file,
-                path: path.to_path_buf(),
                 bytes,
                 identity,
-                cleanup_armed: true,
             }
         }),
     )

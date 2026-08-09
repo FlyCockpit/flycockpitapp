@@ -1285,6 +1285,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "tracing",
  "tree-sitter",
  "tree-sitter-c",

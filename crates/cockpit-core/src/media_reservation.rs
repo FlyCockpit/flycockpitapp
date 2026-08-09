@@ -2002,6 +2002,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_and_scheduler_claim_are_one_cas_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        let receipt = ledger
+            .reserve(request(
+                "cancel-promote-race",
+                vec![
+                    plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                    plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, Some(1)),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let cancel_ledger = ledger.clone();
+        let cancel_barrier = barrier.clone();
+        let cancel_id = receipt.reservation_id.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_barrier.wait().await;
+            cancel_ledger.request_cancellation(&cancel_id, 1, 2).await
+        });
+        let claim_ledger = ledger.clone();
+        let claim_barrier = barrier.clone();
+        let claim = tokio::spawn(async move {
+            claim_barrier.wait().await;
+            claim_ledger
+                .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+                .await
+        });
+        barrier.wait().await;
+        let cancel = cancel.await.unwrap();
+        let claim = claim.await.unwrap();
+        assert_ne!(
+            cancel.is_ok(),
+            claim.as_ref().is_ok_and(|value| value.is_some()),
+            "exactly one side wins the queued CAS"
+        );
+        let(state,cpu,queued)=db.read(|conn|Ok((
+            conn.query_row("SELECT state FROM media_reservations WHERE reservation_id='cancel-promote-race'",[],|row|row.get::<_,String>(0))?,
+            conn.query_row("SELECT COALESCE(MAX(charged),0) FROM media_resource_counters WHERE dimension='local_cpu_jobs_global'",[],|row|row_u64(row,0))?,
+            conn.query_row("SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension LIKE 'queued_operations_%'",[],|row|row_u64(row,0))?,
+        ))).await.unwrap();
+        assert_eq!(queued, 0);
+        match state.as_str() {
+            "released" => assert_eq!(cpu, 0),
+            "executing_local" => assert_eq!(cpu, 1),
+            other => panic!("unexpected race state {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn external_handoff_ticket_requires_journal_and_ledger_commit() {
         use crate::external_journal::keys::SpoolKeyRing;
         use crate::external_journal::projection::{

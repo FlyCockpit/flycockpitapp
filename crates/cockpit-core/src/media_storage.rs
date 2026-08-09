@@ -924,6 +924,16 @@ fn local_path_plans(
     .collect()
 }
 
+pub(crate) fn media_upload_reservation_digest(
+    policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+    declared_total_bytes: u64,
+) -> Result<String> {
+    digest_json(
+        b"media-upload-reservation-v1",
+        &local_path_plans(policy, declared_total_bytes)?,
+    )
+}
+
 fn modified_ns(metadata: &std::fs::Metadata) -> Result<u128> {
     Ok(metadata
         .modified()?

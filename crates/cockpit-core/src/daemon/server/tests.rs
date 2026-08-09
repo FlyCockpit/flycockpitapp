@@ -1502,6 +1502,225 @@ async fn media_security_recovery_denial_precedes_operation_table() {
     assert_eq!(rows, 0);
 }
 
+#[tokio::test]
+async fn media_upload_production_dispatch_cancel_finalize_and_status() {
+    use base64::Engine as _;
+    use cockpit_db::media_attachments::{
+        AppendMediaUploadChunkV1, GetMediaUploadStatusV1, LocalMediaActorRoleV1,
+        LocalMediaMutationPayloadV1, LocalMediaMutationV1, MediaUploadStateDetailV1,
+        RequestedLocalPathMediaKind,
+    };
+    use sha2::{Digest as _, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(db, &temp.path().join("media"))
+            .unwrap(),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let principal = super::run_invocation::principal_digest(&state.principal);
+    let bytes = b"dispatch upload";
+    let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+    let reservation_digest =
+        crate::media_storage::media_upload_reservation_digest(&policy, bytes.len() as u64).unwrap();
+
+    async fn begin_append(
+        ctx: &Arc<DaemonContext>,
+        state: &mut MutableClientState,
+        session_id: Uuid,
+        project_digest: &str,
+        principal: &str,
+        reservation_digest: &str,
+        bytes: &[u8],
+    ) -> (Uuid, Uuid, u64) {
+        let draft = Uuid::now_v7();
+        let begin = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: principal.into(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest: project_digest.into(),
+                client_draft_id: draft,
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: bytes.len() as u64,
+                reservation_digest: reservation_digest.into(),
+            },
+        };
+        let Response::LocalMediaMutation(began) =
+            handle_request(Request::BeginMediaUpload(begin), state, ctx)
+                .await
+                .unwrap()
+        else {
+            panic!("unexpected begin response")
+        };
+        let upload = began.subject_id;
+        let append = AppendMediaUploadChunkV1 {
+            mutation: LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: principal.into(),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Append {
+                    session_id,
+                    canonical_project_digest: project_digest.into(),
+                    client_draft_id: draft,
+                    upload_id: upload,
+                    upload_generation: 1,
+                    chunk_index: 0,
+                    chunk_length: bytes.len() as u32,
+                    chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                },
+            },
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        let Response::LocalMediaMutation(appended) =
+            handle_request(Request::AppendMediaUploadChunk(append), state, ctx)
+                .await
+                .unwrap()
+        else {
+            panic!("unexpected append response")
+        };
+        (
+            draft,
+            upload,
+            match appended.transition {
+                cockpit_db::media_attachments::LocalMediaMutationTransitionV1::Upload {
+                    generation_after,
+                    ..
+                } => generation_after,
+                _ => panic!("unexpected append transition"),
+            },
+        )
+    }
+
+    let (cancel_draft, cancel_upload, generation) = begin_append(
+        &ctx,
+        &mut state,
+        session_id,
+        &project_digest,
+        &principal,
+        &reservation_digest,
+        bytes,
+    )
+    .await;
+    let cancel = LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: principal.clone(),
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload: LocalMediaMutationPayloadV1::Cancel {
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            client_draft_id: cancel_draft,
+            upload_id: cancel_upload,
+            upload_generation: generation,
+        },
+    };
+    let Response::LocalMediaMutation(cancelled) =
+        handle_request(Request::CancelMediaUpload(cancel.clone()), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected cancel response")
+    };
+    let Response::LocalMediaMutation(cancel_replay) =
+        handle_request(Request::CancelMediaUpload(cancel), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected cancel replay")
+    };
+    assert_eq!(cancel_replay, cancelled);
+
+    let (draft, upload, generation) = begin_append(
+        &ctx,
+        &mut state,
+        session_id,
+        &project_digest,
+        &principal,
+        &reservation_digest,
+        bytes,
+    )
+    .await;
+    let finalize = LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: principal,
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload: LocalMediaMutationPayloadV1::Finalize {
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            client_draft_id: draft,
+            upload_id: upload,
+            upload_generation: generation,
+            chunk_count: 1,
+            total_bytes: bytes.len() as u64,
+            object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+        },
+    };
+    let Response::LocalMediaMutation(finalized) = handle_request(
+        Request::FinalizeMediaUpload(finalize.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected finalize response")
+    };
+    let Response::LocalMediaMutation(finalize_replay) =
+        handle_request(Request::FinalizeMediaUpload(finalize), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected finalize replay")
+    };
+    assert_eq!(finalize_replay, finalized);
+    let Response::MediaUploadStatus(status) = handle_request(
+        Request::GetMediaUploadStatus(GetMediaUploadStatusV1 {
+            schema_version: 1,
+            kind: "getMediaUploadStatus".into(),
+            session_id,
+            canonical_project_digest: project_digest,
+            client_draft_id: draft,
+            upload_id: upload,
+            upload_generation: generation + 1,
+        }),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected upload status")
+    };
+    assert!(matches!(
+        status.detail,
+        MediaUploadStateDetailV1::Materialized {
+            attachment_version: 1,
+            ..
+        }
+    ));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_authority() {

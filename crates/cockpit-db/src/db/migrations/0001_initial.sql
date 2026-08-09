@@ -671,6 +671,7 @@ CREATE TABLE message_operation_receipts (
     updated_at             INTEGER NOT NULL,
     PRIMARY KEY (session_id, operation_id),
     UNIQUE (session_id, client_submission_id),
+    UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
     CHECK (
       (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = 0) OR
       (actor_kind = 'remote_device' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation > 0)
@@ -693,9 +694,13 @@ CREATE TABLE message_submission_receipts (
     updated_at             INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
     UNIQUE (session_id, operation_id),
+    UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
     CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
     FOREIGN KEY (session_id, operation_id)
-      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE
+      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, operation_id, client_submission_id, message_request_digest)
+      REFERENCES message_operation_receipts(session_id, operation_id, client_submission_id, message_request_digest)
+      ON DELETE CASCADE
 );
 
 CREATE TABLE message_attachment_references (
@@ -703,7 +708,9 @@ CREATE TABLE message_attachment_references (
     client_submission_id BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
     ordinal              INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 16),
     attachment_id        BLOB NOT NULL CHECK (length(attachment_id) = 16 AND attachment_id <> zeroblob(16)),
-    attachment_version   INTEGER NOT NULL CHECK (attachment_version > 0),
+    -- Canonical unsigned big-endian u64. SQLite INTEGER cannot represent the
+    -- upper half of the wire domain without lossy signed coercion.
+    attachment_version   BLOB NOT NULL CHECK (length(attachment_version) = 8 AND attachment_version <> zeroblob(8)),
     checksum             BLOB NOT NULL CHECK (length(checksum) = 32),
     kind                 INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
     acquired_at          INTEGER NOT NULL,

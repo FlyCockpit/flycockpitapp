@@ -410,6 +410,34 @@ impl Model {
         .await
     }
 
+    /// Compact-utility dispatch: one transport attempt, no probe/backoff or
+    /// endpoint swap, and TTFT/idle deadlines are terminal even without a
+    /// configured backup. The compaction sampler exclusively owns retries.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_captured_compact_utility(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system, history, prompt, tools, params, agent_name, None, cancel, None, None, true,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_captured_with_pre_drain(
         &self,
@@ -423,6 +451,45 @@ impl Model {
         cancel: &CancellationToken,
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system,
+            history,
+            prompt,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            pre_drain,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_captured_with_pre_drain_mode(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        pre_drain: Option<PreDrainFuture>,
+        compact_utility: bool,
     ) -> Result<(
         (
             Option<String>,
@@ -450,6 +517,7 @@ impl Model {
             cancel,
             endpoint_recovery,
             pre_drain,
+            compact_utility,
         )
         .await
     }
@@ -480,6 +548,7 @@ impl Model {
         cancel: &CancellationToken,
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
+        compact_utility: bool,
     ) -> Result<(
         (
             Option<String>,
@@ -545,7 +614,7 @@ impl Model {
         };
 
         let timeout = self.timeout().clone();
-        let hard_timeout_on_stall = self.hard_timeout_on_stall();
+        let hard_timeout_on_stall = compact_utility || self.hard_timeout_on_stall();
         // Furthest lifecycle phase reached across (possibly several) retry
         // attempts; seeded at `Prep` (we got past assembly). A typed failure
         // reports the furthest phase, so e.g. a network blip that reached
@@ -683,7 +752,18 @@ impl Model {
                             }
                         }
                     };
-                    let result = if tried_swap {
+                    let result = if compact_utility {
+                        retry::with_retry_max(
+                            agent_name,
+                            &reconnect_target,
+                            event_tx,
+                            cancel,
+                            None::<&retry::TcpProbe>,
+                            1,
+                            attempt,
+                        )
+                        .await
+                    } else if tried_swap {
                         retry::with_retry_max(
                             agent_name,
                             &reconnect_target,
@@ -753,7 +833,8 @@ impl Model {
                             let alternate_not_incompatible =
                                 endpoint_observation(provider_id, model_id, &base_url, alternate)
                                     != EndpointObservation::Incompatible;
-                            if !tried_swap
+                            if !compact_utility
+                                && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
                                 && !self.is_live_wire_api_explicit()
@@ -769,7 +850,8 @@ impl Model {
                                 endpoint = confirmed;
                                 continue;
                             }
-                            let approved = if !tried_swap
+                            let approved = if !compact_utility
+                                && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
                                 && !self.is_live_wire_api_explicit()
@@ -856,15 +938,28 @@ impl Model {
                     )
                     .await
                 };
-                retry::with_retry(
-                    agent_name,
-                    &reconnect_target,
-                    event_tx,
-                    cancel,
-                    probe.as_ref(),
-                    attempt,
-                )
-                .await
+                if compact_utility {
+                    retry::with_retry_max(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        None::<&retry::TcpProbe>,
+                        1,
+                        attempt,
+                    )
+                    .await
+                } else {
+                    retry::with_retry(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        attempt,
+                    )
+                    .await
+                }
             }
             Model::Anthropic {
                 model,
@@ -902,15 +997,28 @@ impl Model {
                     )
                     .await
                 };
-                retry::with_retry(
-                    agent_name,
-                    &reconnect_target,
-                    event_tx,
-                    cancel,
-                    probe.as_ref(),
-                    attempt,
-                )
-                .await
+                if compact_utility {
+                    retry::with_retry_max(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        None::<&retry::TcpProbe>,
+                        1,
+                        attempt,
+                    )
+                    .await
+                } else {
+                    retry::with_retry(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        attempt,
+                    )
+                    .await
+                }
             }
         };
 

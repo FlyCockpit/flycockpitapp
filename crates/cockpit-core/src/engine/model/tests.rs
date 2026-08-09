@@ -38,6 +38,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
             &cancel,
             None,
             None,
+            false,
         )
         .await
         .expect_err("pre-cancelled dispatch should stop before network");
@@ -3230,6 +3231,7 @@ async fn capture_anthropic_body(
             &CancellationToken::new(),
             None,
             None,
+            false,
         )
         .await;
     assert!(result.is_err(), "capture server deliberately returns 400");

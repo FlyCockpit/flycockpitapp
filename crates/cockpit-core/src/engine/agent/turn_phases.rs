@@ -947,6 +947,7 @@ pub(crate) async fn run_turn(
             &cancel,
             endpoint_recovery,
             Some(pending_record.clone()),
+            false,
         )
         .await;
 

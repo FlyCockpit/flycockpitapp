@@ -9,7 +9,6 @@ use rig::message::{Message, ToolResultContent, UserContent};
 use super::driver::wire_token_total;
 
 pub(crate) const MIN_CLEAN_BRIEF_CHARS: usize = 500;
-pub(crate) const MAX_DRAFT_NODES: usize = 64;
 pub(crate) const MAX_WIRE_SAMPLES_PER_NODE: u8 = 2;
 const DIAGNOSTIC_LIMIT: usize = 240;
 

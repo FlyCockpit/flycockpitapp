@@ -1448,16 +1448,14 @@ async fn execute_compact_brief(
         let call_id = uuid::Uuid::new_v4();
         let sampled = draft
             .model
-            .complete_captured(
+            .complete_captured_compact_utility(
                 &draft.system,
                 &draft.history,
                 Message::user(prompt_text.clone()),
                 &[],
                 draft.params.clone(),
                 &draft.agent_name,
-                None,
                 cancel,
-                None,
             )
             .await;
         match sampled {

@@ -512,15 +512,15 @@ fn verify_all_handles(
     if snapshot.attachment.source_kind == cockpit_db::media_attachments::MediaSourceKind::LocalPath
     {
         let mut source = borrowed_source.context("borrowed source handle is required")?;
+        let before = stable_identity_digest(&source.file)?;
+        let (length, checksum) = read_full_digest(&mut source.file)?;
+        let after = stable_identity_digest(&source.file)?;
         ensure!(
-            source.evidence_digest
-                == source_evidence_digest(
-                    &mut source.file,
-                    &snapshot.attachment.source_identity_digest,
-                    snapshot.attachment.source_byte_length,
-                    &snapshot.attachment.source_sha256,
-                )?,
-            "borrowed source evidence changed"
+            before == after
+                && before == snapshot.attachment.source_identity_digest
+                && length == snapshot.attachment.source_byte_length
+                && checksum == snapshot.attachment.source_sha256,
+            "borrowed source changed while held"
         );
         ensure!(
             Some(source.evidence_digest.as_str()) == expected_borrowed_evidence,

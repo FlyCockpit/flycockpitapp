@@ -292,11 +292,9 @@ fn find_registry_entries(
     if node.kind() == "struct_expression" {
         let mut name = None;
         let mut run = None;
-        let mut cursor = node.walk();
-        for child in node
-            .children(&mut cursor)
-            .filter(|n| n.kind() == "field_initializer")
-        {
+        let mut initializers = Vec::new();
+        collect_struct_initializers(node, &mut initializers);
+        for child in initializers {
             let mut child_cursor = child.walk();
             let mut fields = child.named_children(&mut child_cursor);
             let key = fields.next().and_then(|n| n.utf8_text(source).ok());
@@ -317,6 +315,20 @@ fn find_registry_entries(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         find_registry_entries(child, source, command, found);
+    }
+}
+
+fn collect_struct_initializers<'tree>(
+    node: tree_sitter::Node<'tree>,
+    found: &mut Vec<tree_sitter::Node<'tree>>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "field_initializer" {
+            found.push(child);
+        } else if child.kind() != "struct_expression" {
+            collect_struct_initializers(child, found);
+        }
     }
 }
 
@@ -566,6 +578,18 @@ fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn production_slash_registry_entries_are_structurally_derived() {
+    let source = include_str!("slash.rs");
+    assert_eq!(
+        slash_registry_run(source, "curator").unwrap(),
+        "run_curator"
+    );
+    assert_eq!(slash_registry_run(source, "doctor").unwrap(), "run_doctor");
+    assert_eq!(slash_registry_run(source, "export").unwrap(), "run_export");
+    assert_eq!(slash_registry_run(source, "btw").unwrap(), "run_btw");
 }
 
 #[tokio::test]

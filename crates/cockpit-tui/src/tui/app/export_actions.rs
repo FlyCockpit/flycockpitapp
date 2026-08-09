@@ -8,11 +8,6 @@ use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response};
 use tokio::sync::mpsc;
 
 const EXPORT_ACTION_KEY: &str = "export";
-const EXPORT_TRANSCRIPT_ACTION: &str =
-    blocking_operations::BlockingOperationKind::ExportWrite.action_name_at(0);
-const EXPORT_DEBUG_ACTION: &str =
-    blocking_operations::BlockingOperationKind::ExportWrite.action_name_at(1);
-
 impl App {
     /// `/export` (default) — ask the attached daemon for a redacted
     /// transcript and write it asynchronously, overwriting any prior file.
@@ -21,8 +16,9 @@ impl App {
             self.push_plain("/export: no active session to export".to_string());
             return;
         };
+        let action = self.export_transcript_action_name();
         self.start_export_action(
-            EXPORT_TRANSCRIPT_ACTION,
+            action,
             "/export",
             session_id,
             file_stem,
@@ -39,8 +35,9 @@ impl App {
         file_stem: &str,
         exports_dir: &Path,
     ) {
+        let action = self.export_debug_action_name();
         self.start_export_action(
-            EXPORT_DEBUG_ACTION,
+            action,
             "/export debug",
             session_id,
             file_stem,
@@ -86,6 +83,12 @@ impl App {
         });
         let file_stem = file_stem.to_string();
         let exports_dir = exports_dir.to_path_buf();
+        let request = Request::ExportSessionData {
+            session_id,
+            kind,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        };
         self.async_actions.start_export(
             AsyncActionKind::Blocking(action),
             AsyncActionPolicy::Dedupe(export_key),
@@ -98,7 +101,7 @@ impl App {
                 }
                 export_via_attached_daemon(
                     attached_request.expect("export dispatch checked attached request"),
-                    session_id,
+                    request,
                     kind,
                     file_stem,
                     exports_dir,
@@ -114,7 +117,7 @@ impl App {
 
 async fn export_via_attached_daemon(
     attached_request: AttachedRequestBinding,
-    session_id: uuid::Uuid,
+    request: Request,
     kind: ExportSessionKind,
     file_stem: String,
     exports_dir: std::path::PathBuf,
@@ -124,12 +127,7 @@ async fn export_via_attached_daemon(
     let response = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
-        response = attached_request.request(Request::ExportSessionData {
-            session_id,
-            kind,
-            include_generated_artifacts: false,
-            include_sensitive: false,
-        }) => response,
+        response = attached_request.request(request) => response,
     }
     .map_err(|error| format!("{command}: daemon request failed: {error}"))?;
     let Response::ExportSessionData { data } = response else {
@@ -514,7 +512,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let task = tokio::spawn(export_via_attached_daemon(
             AttachedRequestBinding::new(tx, session_id, 0),
-            session_id,
+            Request::ExportSessionData {
+                session_id,
+                kind: ExportSessionKind::TranscriptJson,
+                include_generated_artifacts: false,
+                include_sensitive: false,
+            },
             ExportSessionKind::TranscriptJson,
             "x".to_string(),
             tmp.path().join("exports"),

@@ -340,6 +340,28 @@ impl AsyncActionCancellation {
             Err(error) => Err(error),
         }
     }
+
+    fn schedule_export_temp_cleanup_retry(&self) -> bool {
+        let path = self
+            .export_temp
+            .lock()
+            .expect("export temp owner poisoned")
+            .take();
+        let Some(path) = path else { return false };
+        // `spawn_blocking` work is not cancelled when its JoinHandle is
+        // dropped or aborted. This is the final in-process reaper after the
+        // bounded async shutdown phase, so runtime teardown cannot strand a
+        // partial merely by cancelling the export future.
+        tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "cockpit: export recovery could not remove {}: {error}",
+                path.display()
+            ),
+        });
+        true
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -349,6 +371,7 @@ pub struct AsyncActionShutdownReport {
     pub export_join_failed: usize,
     pub export_cleanup_failed: usize,
     pub export_cleanup_timed_out: usize,
+    pub export_cleanup_retry_scheduled: usize,
 }
 
 #[derive(Debug)]
@@ -828,8 +851,18 @@ impl AsyncActionRunner {
                     .await
                 {
                     Ok(Ok(())) => {}
-                    Ok(Err(_)) => report.export_cleanup_failed += 1,
-                    Err(_) => report.export_cleanup_timed_out += 1,
+                    Ok(Err(_)) => {
+                        report.export_cleanup_failed += 1;
+                        if cleanup_owner.schedule_export_temp_cleanup_retry() {
+                            report.export_cleanup_retry_scheduled += 1;
+                        }
+                    }
+                    Err(_) => {
+                        report.export_cleanup_timed_out += 1;
+                        if cleanup_owner.schedule_export_temp_cleanup_retry() {
+                            report.export_cleanup_retry_scheduled += 1;
+                        }
+                    }
                 }
             }
         }
@@ -1151,6 +1184,23 @@ mod tests {
         assert_eq!(report.export_cleanup_failed, 0);
         assert_eq!(report.export_cleanup_timed_out, 0);
         assert!(!partial.exists(), "aborted export left an orphaned partial");
+    }
+
+    #[tokio::test]
+    async fn export_cleanup_retry_eventually_removes_owned_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".retry.partial");
+        tokio::fs::write(&partial, b"partial").await.unwrap();
+        let owner = AsyncActionCancellation::default();
+        owner.own_export_temp(partial.clone());
+        assert!(owner.schedule_export_temp_cleanup_retry());
+        for _ in 0..100 {
+            if !partial.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("independent export cleanup retry left an orphan");
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

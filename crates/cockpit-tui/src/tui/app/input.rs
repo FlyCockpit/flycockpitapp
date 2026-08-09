@@ -3093,6 +3093,7 @@ impl App {
         }
         self.push_queue_edit_notice("retrieving queued messages…");
         let action_kind = self.queue_blocking_operation().action_kind();
+        let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
         self.async_actions.start_serialized(
             action_kind,
             AsyncActionKey::new("queue.edit"),
@@ -3106,7 +3107,7 @@ impl App {
                 }
                 attached_request
                     .expect("queue dispatch checked attached request")
-                    .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
+                    .request(request)
                     .await
                     .map(|response| AsyncActionPayload::DaemonResponse(Box::new(response)))
             },

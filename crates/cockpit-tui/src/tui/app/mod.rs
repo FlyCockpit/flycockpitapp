@@ -3590,7 +3590,15 @@ impl App {
         }) {
             self.close_btw_pane();
         }
-        self.async_actions.shutdown_and_reap().await;
+        let async_shutdown = self.async_actions.shutdown_and_reap().await;
+        if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
+            eprintln!(
+                "cockpit: export cleanup needed recovery (failed={}, timed_out={}, retry_scheduled={})",
+                async_shutdown.export_cleanup_failed,
+                async_shutdown.export_cleanup_timed_out,
+                async_shutdown.export_cleanup_retry_scheduled,
+            );
+        }
 
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous

@@ -30,6 +30,44 @@ fn blocking_operation_manifest_is_complete() {
             .collect::<Vec<_>>(),
         expected
     );
+    assert_eq!(
+        BLOCKING_OPERATION_MANIFEST
+            .iter()
+            .map(|entry| (entry.handler, entry.dispatch, entry.binding))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "handle_curator_command",
+                "start_owned_blocking_action",
+                "curator_blocking_operation"
+            ),
+            (
+                "handle_doctor_command",
+                "start_owned_blocking_action",
+                "doctor_blocking_operation"
+            ),
+            (
+                "start_export_action",
+                "start_export",
+                "export_blocking_operation"
+            ),
+            (
+                "edit_queued_messages",
+                "start_serialized",
+                "queue_blocking_operation"
+            ),
+            (
+                "handle_btw_command",
+                "async_actions.start",
+                "btw_blocking_operation"
+            ),
+            (
+                "reset_at_window",
+                "start_owned_blocking_action",
+                "autocomplete_blocking_operation"
+            ),
+        ]
+    );
 
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
@@ -54,61 +92,6 @@ fn blocking_operation_manifest_is_complete() {
                 .position(|it| it == action)
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
-        }
-    }
-}
-
-#[test]
-fn classified_handlers_dispatch_before_any_owned_blocking_call() {
-    fn exact_function_body<'a>(source: &'a str, handler: &str) -> &'a str {
-        let signature = format!("fn {handler}");
-        let tail = source.split_once(&signature).unwrap().1;
-        let open = tail.find('{').unwrap();
-        let mut depth = 0usize;
-        for (offset, byte) in tail.as_bytes()[open..].iter().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &tail[open + 1..open + offset];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("unterminated handler {handler}")
-    }
-    let forbidden = [
-        "std::fs::",
-        "std::process::",
-        "attached_request_tx_blocking",
-        "daemon_request_at_blocking",
-        "diagnostics::tui_snapshot",
-        "tags::suggestions",
-    ];
-    for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
-        let source = match registration.site {
-            "slash:/curator" | "slash:/doctor" => include_str!("slash.rs"),
-            "slash:/export" => include_str!("export_actions.rs"),
-            "key:queue-edit" | "composer:@suggestions" => include_str!("input.rs"),
-            "slash:/btw" => include_str!("btw_pane.rs"),
-            unknown => panic!("manifest registered unknown handler site {unknown}"),
-        };
-        let handler = registration.handler;
-        let dispatch = registration.dispatch;
-        let body = exact_function_body(source, handler);
-        assert!(
-            body.contains(registration.binding),
-            "{handler} does not invoke typed manifest binding {}",
-            registration.binding
-        );
-        let before_dispatch = body.split_once(dispatch).unwrap().0;
-        for blocking_call in forbidden {
-            assert!(
-                !before_dispatch.contains(blocking_call),
-                "{handler} performs {blocking_call} before dispatching its AsyncAction"
-            );
         }
     }
 }

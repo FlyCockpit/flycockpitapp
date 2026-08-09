@@ -11,7 +11,7 @@ pub(super) struct BlockingOperationRegistration {
 }
 
 macro_rules! blocking_operation_manifest {
-    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => $binding:ident => [$($action:literal),+ $(,)?] ),+ $(,)?) => {
+    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
@@ -33,18 +33,20 @@ macro_rules! blocking_operation_manifest {
         impl App {
             $(pub(super) const fn $binding(&self) -> BlockingOperationKind {
                 BlockingOperationKind::$kind
-            })+
+            }
+            $(#[allow(dead_code)]
+            pub(super) const fn $action_binding(&self) -> &'static str { $action })+)+
         }
     };
 }
 
 blocking_operation_manifest! {
-    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => curator_blocking_operation => ["curator.command"],
-    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => doctor_blocking_operation => ["doctor.snapshot"],
-    ExportWrite => "slash:/export" => "start_export_action" => "start_export" => export_blocking_operation => ["export.transcript", "export.debug"],
-    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => queue_blocking_operation => ["queue.edit"],
-    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => btw_blocking_operation => ["btw.teardown"],
-    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => autocomplete_blocking_operation => ["autocomplete.files"],
+    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => curator_blocking_operation => [curator_action_name => "curator.command"],
+    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
+    ExportWrite => "slash:/export" => "start_export_action" => "start_export" => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
+    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => queue_blocking_operation => [queue_action_name => "queue.edit"],
+    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => btw_blocking_operation => [btw_action_name => "btw.teardown"],
+    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
 }
 
 impl BlockingOperationKind {

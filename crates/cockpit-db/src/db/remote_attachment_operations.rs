@@ -557,6 +557,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn committed_goal_clear_survives_reopen_before_wake_and_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("goal-wake-crash.db");
+        let db = Db::open(&path).unwrap();
+        let session = db.create_session("p", "/repo", "Build").await.unwrap();
+        let session_id = session.session_id;
+        db.create_session_goal(session.session_id, "p", "finish", None, Some(100))
+            .await
+            .unwrap();
+        let request = || ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000011",
+            operation_id: "01890f3e-4c00-7000-8000-000000000096",
+            authenticated_device_id: "00000000-0000-4000-8000-000000000012",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::TransactionalMutation,
+            request_hash: [6; 32],
+            now_ms: 1,
+        };
+        let applied = db
+            .execute_transactional_remote_operation(request(), move |conn| {
+                assert!(Db::clear_session_goal_conn(conn, session_id)?);
+                Ok(TransactionalRemoteMutation {
+                    value: (),
+                    safe_response: b"cleared".to_vec(),
+                    outbox_kind: "clear_goal".into(),
+                    outbox_payload: b"cleared".to_vec(),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(applied, TransactionalRemoteOperationOutcome::Applied(()));
+
+        // Simulate process loss after commit and before the in-memory WakeGoal.
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        assert!(
+            reopened
+                .current_session_goal(session_id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let replay = reopened
+            .execute_transactional_remote_operation(request(), |_| {
+                panic!("reopen replay must not repeat goal transition")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            TransactionalRemoteOperationOutcome::Replay(b"cleared".to_vec())
+        );
+    }
+
     const ATTACHMENT: &str = "00000000-0000-4000-8000-000000000001";
     const DEVICE: &str = "00000000-0000-4000-8000-000000000002";
 

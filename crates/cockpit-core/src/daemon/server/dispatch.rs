@@ -856,6 +856,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .map_err(internal)?;
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => {
+                        // WakeGoal is a level-triggered reconciliation nudge: the driver
+                        // reloads the authoritative goal row and is safe to wake more than
+                        // once. Deliver it for Applied and Replay so a response retry closes
+                        // a crash/send-failure window after the durable commit.
                         if matches!(response, Response::GoalCleared { cleared: true })
                             && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
                         {
@@ -863,7 +867,15 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         }
                         Ok(response)
                     }
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => {
+                        let response: Response = serde_json::from_slice(&bytes).map_err(internal)?;
+                        if matches!(response, Response::GoalCleared { cleared: true })
+                            && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
+                        {
+                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(internal)?;
+                        }
+                        Ok(response)
+                    }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };

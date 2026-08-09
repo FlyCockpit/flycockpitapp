@@ -11433,6 +11433,23 @@ async fn acquiring_image_ref_does_not_start_or_refresh_transport_ttl() {
 }
 
 #[tokio::test]
+async fn disconnect_drain_preserves_session_owned_published_attachment() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+
+    drain_client_attachment_ownership(&mut state, &ctx, "disconnect")
+        .await
+        .unwrap();
+
+    assert!(
+        state.ready_attachments.contains_key(&image_ref.id),
+        "disconnect cannot exercise durable attachment cleanup authority"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_image_refs_are_rejected_without_consuming() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();

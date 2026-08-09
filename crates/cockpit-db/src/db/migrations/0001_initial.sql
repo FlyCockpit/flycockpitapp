@@ -165,6 +165,7 @@ CREATE TABLE media_attachments (
     updated_at_unix_ms             INTEGER NOT NULL,
     draft_expires_at_unix_ms       INTEGER,
     first_referenced_at_unix_ms    INTEGER,
+    UNIQUE (attachment_id, attachment_version),
     CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(source_identity_digest) = 64 AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
@@ -176,9 +177,25 @@ CREATE INDEX idx_media_attachments_session
 CREATE INDEX idx_media_attachments_cleanup
     ON media_attachments(availability, draft_expires_at_unix_ms);
 
+CREATE TRIGGER media_attachment_identity_immutable
+BEFORE UPDATE ON media_attachments
+WHEN NEW.attachment_id <> OLD.attachment_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.canonical_project_digest <> OLD.canonical_project_digest
+  OR NEW.media_kind <> OLD.media_kind
+  OR NEW.source_kind <> OLD.source_kind
+  OR NEW.attachment_version <> OLD.attachment_version
+  OR NEW.captured_capability_generation <> OLD.captured_capability_generation
+  OR NEW.source_identity_digest <> OLD.source_identity_digest
+  OR NEW.source_byte_length <> OLD.source_byte_length
+  OR NEW.source_sha256 <> OLD.source_sha256
+BEGIN
+    SELECT RAISE(ABORT, 'media attachment identity is immutable');
+END;
+
 CREATE TABLE media_attachment_components (
     component_id          TEXT PRIMARY KEY,
-    attachment_id         TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id         TEXT NOT NULL,
     attachment_version    TEXT NOT NULL,
     component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
     storage_id            TEXT NOT NULL UNIQUE,
@@ -193,22 +210,65 @@ CREATE TABLE media_attachment_components (
     updated_at_unix_ms    INTEGER NOT NULL,
     CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
-    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*'))
+    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_media_attachment_components_attachment
     ON media_attachment_components(attachment_id, component_id);
 
+CREATE TRIGGER media_attachment_component_compatibility_insert
+BEFORE INSERT ON media_attachment_components
+WHEN NOT EXISTS (
+    SELECT 1 FROM media_attachments a
+    WHERE a.attachment_id = NEW.attachment_id
+      AND a.attachment_version = NEW.attachment_version
+      AND (
+        (NEW.component_kind = 'quarantined_original' AND a.source_kind <> 'local_path') OR
+        (NEW.component_kind = 'upload_temporary' AND a.source_kind = 'authenticated_session_upload') OR
+        (NEW.component_kind IN ('image_model', 'browser_thumbnail') AND a.media_kind = 'image') OR
+        (NEW.component_kind = 'audio_model' AND a.media_kind = 'audio') OR
+        (NEW.component_kind = 'video_model' AND a.media_kind = 'video')
+      )
+      AND (NEW.lifecycle_state <> 'temporary' OR NEW.component_kind IN ('quarantined_original', 'upload_temporary'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media component incompatible with attachment');
+END;
+
+CREATE TRIGGER media_attachment_component_compatibility_update
+BEFORE UPDATE OF attachment_id, attachment_version, component_kind, lifecycle_state
+ON media_attachment_components
+WHEN NOT EXISTS (
+    SELECT 1 FROM media_attachments a
+    WHERE a.attachment_id = NEW.attachment_id
+      AND a.attachment_version = NEW.attachment_version
+      AND (
+        (NEW.component_kind = 'quarantined_original' AND a.source_kind <> 'local_path') OR
+        (NEW.component_kind = 'upload_temporary' AND a.source_kind = 'authenticated_session_upload') OR
+        (NEW.component_kind IN ('image_model', 'browser_thumbnail') AND a.media_kind = 'image') OR
+        (NEW.component_kind = 'audio_model' AND a.media_kind = 'audio') OR
+        (NEW.component_kind = 'video_model' AND a.media_kind = 'video')
+      )
+      AND (NEW.lifecycle_state <> 'temporary' OR NEW.component_kind IN ('quarantined_original', 'upload_temporary'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media component incompatible with attachment');
+END;
+
 CREATE TABLE media_attachment_references (
     reference_id          TEXT PRIMARY KEY,
-    attachment_id         TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id         TEXT NOT NULL,
     attachment_version    TEXT NOT NULL,
     consumer_kind         TEXT NOT NULL CHECK (consumer_kind IN ('message', 'tool', 'job')),
     consumer_id           TEXT NOT NULL,
     acquired_generation   TEXT NOT NULL,
     acquired_at_unix_ms   INTEGER NOT NULL,
     released_at_unix_ms   INTEGER,
-    UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id)
+    UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_media_attachment_references_live
@@ -216,7 +276,7 @@ CREATE INDEX idx_media_attachment_references_live
 
 CREATE TABLE media_attachment_cleanup_intents (
     intent_id                         TEXT PRIMARY KEY,
-    attachment_id                    TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id                    TEXT NOT NULL UNIQUE,
     attachment_version               TEXT NOT NULL,
     expected_availability_generation TEXT NOT NULL,
     expected_reference_generation    TEXT NOT NULL,
@@ -224,7 +284,9 @@ CREATE TABLE media_attachment_cleanup_intents (
     reason                           TEXT NOT NULL CHECK (reason IN ('discard', 'draft_expired', 'session_retention', 'session_deleted', 'security_recovery')),
     created_at_unix_ms               INTEGER NOT NULL,
     completed_at_unix_ms             INTEGER,
-    CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*')
+    CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);

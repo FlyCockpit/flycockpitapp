@@ -65,12 +65,13 @@ impl MediaAvailability {
         if common_processing {
             return true;
         }
+        if self == A::SecurityBlocked {
+            return false;
+        }
         if source.is_borrowed() {
             matches!(
                 (self, next),
-                (A::Registered, A::Probing)
-                    | (A::BorrowedDerivativesDeleted, A::MetadataDeleted)
-                    | (A::SecurityBlocked, A::BorrowedCleanupPending)
+                (A::Registered, A::Probing) | (A::BorrowedDerivativesDeleted, A::MetadataDeleted)
             ) || matches!(next, A::SourceChanged)
                 && matches!(
                     self,
@@ -120,7 +121,6 @@ impl MediaAvailability {
                             | A::Ready
                             | A::ModelDerivativeUnavailable
                             | A::Failed
-                            | A::SecurityBlocked
                     )
                 || self == A::OwnedCleanupPending && next == A::RetainedCopyDeleted
         }
@@ -212,7 +212,111 @@ pub struct MediaAttachmentComponent {
     pub updated_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBlockedComponent {
+    pub component_id: Uuid,
+    pub component_generation: u64,
+    pub recorded_evidence_digest: String,
+}
+
 impl super::Db {
+    /// The dedicated persistence reducer for an Owner-local, handle-verified
+    /// security recovery. Authorization and filesystem proofs happen before
+    /// this call; the complete component set and all generations are rechecked
+    /// atomically here. Generic availability transitions cannot leave
+    /// `security_blocked`.
+    pub fn resume_verified_security_blocked_cleanup_conn(
+        conn: &Connection,
+        attachment_id: Uuid,
+        expected_attachment_version: u64,
+        expected_availability_generation: u64,
+        affected_components: &[VerifiedBlockedComponent],
+        handles_and_checksums_verified: bool,
+        now_unix_ms: i64,
+    ) -> Result<MediaAttachmentRecord> {
+        ensure!(
+            handles_and_checksums_verified,
+            "security recovery proof was not verified"
+        );
+        ensure!(
+            !affected_components.is_empty() && affected_components.len() <= 256,
+            "security recovery requires 1..=256 components"
+        );
+        ensure!(
+            affected_components
+                .windows(2)
+                .all(|pair| pair[0].component_id < pair[1].component_id),
+            "security recovery components must be sorted and unique"
+        );
+        for component in affected_components {
+            ensure!(
+                component.component_generation > 0,
+                "security recovery component generation must be positive"
+            );
+            validate_digest(
+                &component.recorded_evidence_digest,
+                "recorded component evidence digest",
+            )?;
+        }
+        let parent = media_attachment_by_id(conn, attachment_id)?
+            .context("security-blocked media attachment unavailable")?;
+        ensure!(
+            parent.attachment_version == expected_attachment_version,
+            "stale attachment version"
+        );
+        ensure!(
+            parent.availability_generation == expected_availability_generation,
+            "stale availability generation"
+        );
+        ensure!(
+            parent.availability == MediaAvailability::SecurityBlocked,
+            "media attachment is not security blocked"
+        );
+        let live_references: i64 = conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL", [attachment_id.to_string()], |row| row.get(0))?;
+        ensure!(live_references == 0, "media attachment is in use");
+        let mut statement = conn.prepare("SELECT component_id,component_generation,stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state <> 'deleted' ORDER BY component_id")?;
+        let persisted = statement
+            .query_map([attachment_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            persisted.len() == affected_components.len(),
+            "security recovery component set is incomplete"
+        );
+        for ((id, generation, digest), expected) in persisted.iter().zip(affected_components) {
+            ensure!(
+                Uuid::parse_str(id)? == expected.component_id
+                    && parse_decimal(generation.clone(), "component generation")?
+                        == expected.component_generation
+                    && digest == &expected.recorded_evidence_digest,
+                "security recovery component evidence mismatch"
+            );
+        }
+        for component in affected_components {
+            let next = component
+                .component_generation
+                .checked_add(1)
+                .context("media component generation overflow")?;
+            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4", params![decimal(next)?,now_unix_ms,component.component_id.to_string(),decimal(component.component_generation)?])? == 1, "security recovery component CAS failed");
+        }
+        let next_generation = expected_availability_generation
+            .checked_add(1)
+            .context("media availability generation overflow")?;
+        let next_state = if parent.source_kind.is_borrowed() {
+            MediaAvailability::BorrowedCleanupPending
+        } else {
+            MediaAvailability::OwnedCleanupPending
+        };
+        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state.as_str(),decimal(next_generation)?,now_unix_ms,attachment_id.to_string(),decimal(expected_attachment_version)?,decimal(expected_availability_generation)?])? == 1, "security recovery aggregate CAS failed");
+        media_attachment_by_id(conn, attachment_id)?
+            .context("recovered media attachment disappeared")
+    }
+
     pub fn insert_media_attachment_component_conn(
         conn: &Connection,
         component: &MediaAttachmentComponent,
@@ -247,6 +351,20 @@ impl super::Db {
             "component identity digest",
         )?;
         validate_digest(&component.sha256, "component checksum")?;
+        let parent = media_attachment_by_id(conn, component.attachment_id)?
+            .context("media component parent unavailable")?;
+        ensure!(
+            parent.attachment_version == component.attachment_version,
+            "media component parent version mismatch"
+        );
+        ensure!(
+            component_kind_compatible(
+                &parent,
+                &component.component_kind,
+                &component.lifecycle_state
+            ),
+            "media component kind/lifecycle is incompatible with attachment source or media kind"
+        );
         conn.execute(
             "INSERT INTO media_attachment_components (component_id,attachment_id,attachment_version,component_kind,storage_id,lifecycle_state,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![component.component_id.to_string(),component.attachment_id.to_string(),decimal(component.attachment_version)?,component.component_kind,component.storage_id.to_string(),component.lifecycle_state,decimal(component.component_generation)?,component.stable_identity_digest,decimal(component.byte_length)?,component.sha256,component.reservation_id,component.created_at_unix_ms,component.updated_at_unix_ms],
@@ -412,6 +530,35 @@ impl super::Db {
             ),
             "invalid media cleanup reason"
         );
+        let parent = media_attachment_by_id(conn, intent.attachment_id)?
+            .context("media cleanup attachment unavailable")?;
+        ensure!(
+            parent.attachment_version == intent.attachment_version,
+            "media cleanup attachment version mismatch"
+        );
+        ensure!(
+            parent.availability_generation == intent.expected_availability_generation,
+            "media cleanup availability generation mismatch"
+        );
+        ensure!(
+            parent.reference_generation == intent.expected_reference_generation,
+            "media cleanup reference generation mismatch"
+        );
+        ensure!(
+            matches!(
+                parent.availability,
+                MediaAvailability::OwnedCleanupPending
+                    | MediaAvailability::BorrowedCleanupPending
+                    | MediaAvailability::SecurityBlocked
+            ),
+            "media cleanup intent requires cleanup-pending or recovery state"
+        );
+        let live_references: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL",
+            params![intent.attachment_id.to_string(), decimal(intent.attachment_version)?],
+            |row| row.get(0),
+        ).context("counting live media references")?;
+        ensure!(live_references == 0, "media attachment is in use");
         conn.execute(
             "INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![intent.intent_id.to_string(), intent.attachment_id.to_string(), decimal(intent.attachment_version)?, decimal(intent.expected_availability_generation)?, decimal(intent.expected_reference_generation)?, intent.component_set_digest, intent.reason, intent.created_at_unix_ms],
@@ -523,6 +670,28 @@ fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
         "audio stream is forbidden for images"
     );
     Ok(())
+}
+
+fn component_kind_compatible(
+    parent: &MediaAttachmentRecord,
+    component_kind: &str,
+    lifecycle_state: &str,
+) -> bool {
+    let kind_matches = match component_kind {
+        "quarantined_original" => !parent.source_kind.is_borrowed(),
+        "upload_temporary" => parent.source_kind == MediaSourceKind::AuthenticatedSessionUpload,
+        "image_model" | "browser_thumbnail" => parent.media_kind == MediaKind::Image,
+        "audio_model" => parent.media_kind == MediaKind::Audio,
+        "video_model" => parent.media_kind == MediaKind::Video,
+        _ => false,
+    };
+    kind_matches
+        && matches!(
+            lifecycle_state,
+            "temporary" | "ready" | "cleanup_pending" | "deleted" | "security_blocked"
+        )
+        && (lifecycle_state != "temporary"
+            || matches!(component_kind, "upload_temporary" | "quarantined_original"))
 }
 
 fn decimal(value: u64) -> Result<String> {
@@ -680,6 +849,14 @@ mod tests {
             !MediaAvailability::RetainedCopyDeleted
                 .permits_transition(MediaSourceKind::RetainedHttps, MediaAvailability::Ready)
         );
+        assert!(!MediaAvailability::SecurityBlocked.permits_transition(
+            MediaSourceKind::RetainedHttps,
+            MediaAvailability::OwnedCleanupPending
+        ));
+        assert!(!MediaAvailability::SecurityBlocked.permits_transition(
+            MediaSourceKind::LocalPath,
+            MediaAvailability::BorrowedCleanupPending
+        ));
     }
 
     #[test]
@@ -846,5 +1023,47 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn media_attachment_component_compatibility_is_source_and_kind_closed() {
+        let parent = MediaAttachmentRecord {
+            attachment_id: id(21),
+            session_id: id(22),
+            canonical_project_digest: "77".repeat(32),
+            media_kind: MediaKind::Audio,
+            source_kind: MediaSourceKind::LocalPath,
+            canonical_container: "wav".into(),
+            canonical_mime: "audio/wav".into(),
+            availability: MediaAvailability::Registered,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: "88".repeat(32),
+            source_byte_length: 1,
+            source_sha256: "99".repeat(32),
+            selected_video_stream: None,
+            selected_audio_stream: Some(SelectedMediaStream {
+                index: 0,
+                codec: "pcm_s16le".into(),
+            }),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        };
+        assert!(component_kind_compatible(&parent, "audio_model", "ready"));
+        assert!(!component_kind_compatible(&parent, "video_model", "ready"));
+        assert!(!component_kind_compatible(
+            &parent,
+            "quarantined_original",
+            "ready"
+        ));
+        assert!(!component_kind_compatible(
+            &parent,
+            "audio_model",
+            "temporary"
+        ));
     }
 }

@@ -36,7 +36,7 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> Prune
 pub(super) async fn drain_client_attachment_ownership(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
-    reason: &str,
+    _reason: &str,
 ) -> std::result::Result<(), ErrorPayload> {
     let pending: Vec<_> = state
         .pending_uploads
@@ -48,25 +48,10 @@ pub(super) async fn drain_client_attachment_ownership(
                 .map(|receipt| (*id, receipt))
         })
         .collect();
-    let ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| {
-            attachment
-                .media_reservation
-                .clone()
-                .map(|receipt| (*id, receipt))
-        })
-        .collect();
     let untracked_pending: Vec<_> = state
         .pending_uploads
         .iter()
         .filter_map(|(id, upload)| upload.media_reservation.is_none().then_some(*id))
-        .collect();
-    let untracked_ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| attachment.media_reservation.is_none().then_some(*id))
         .collect();
     let wall_ms = chrono::Utc::now()
         .timestamp_millis()
@@ -80,25 +65,13 @@ pub(super) async fn drain_client_attachment_ownership(
         state.pending_uploads.remove(&id);
         release_uploads(&state.upload_accounting, [id]);
     }
-    for (id, receipt) in ready {
-        ctx.media_ledger
-            .destroy_local_artifacts(
-                &receipt.reservation_id,
-                receipt.version,
-                &format!("attachment-{reason}-destroyed:{}", receipt.reservation_id),
-                wall_ms,
-            )
-            .await
-            .map_err(internal)?;
-        state.ready_attachments.remove(&id);
-    }
     for id in untracked_pending {
         state.pending_uploads.remove(&id);
         release_uploads(&state.upload_accounting, [id]);
     }
-    for id in untracked_ready {
-        state.ready_attachments.remove(&id);
-    }
+    // Published media is session-owned. Disconnect releases only this
+    // client's ephemeral view when `state` drops; retention/explicit discard
+    // remains the sole authority for bytes, reservations, and durable rows.
     Ok(())
 }
 

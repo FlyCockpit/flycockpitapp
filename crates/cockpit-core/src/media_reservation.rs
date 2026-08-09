@@ -12,6 +12,33 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+fn sqlite_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("sqlite integer overflow"))
+}
+
+fn sqlite_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    sqlite_u64(row.get::<_, i64>(index)?)
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
 pub trait MonotonicClock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
@@ -234,7 +261,7 @@ impl MediaReservationLedger {
             .ok_or(LedgerError::Overflow)?;
         let session = request.owner.session_id.clone();
         let receipt = self.db.transaction(move |conn| {
-            if let Some((recovery,state,version,sequence,stored_deadline))=conn.query_row("SELECT recovery_id,state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&request.reservation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,u64>(3)?,r.get::<_,u64>(4)?))).optional()? {
+            if let Some((recovery,state,version,sequence,stored_deadline))=conn.query_row("SELECT recovery_id,state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&request.reservation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,row_u64(r,2)?,row_u64(r,3)?,row_u64(r,4)?))).optional()? {
                 if recovery!=request.recovery_id{return Err(anyhow!("idempotency_conflict"));}
                 return Ok(ReservationReceipt{reservation_id:request.reservation_id,state:ReservationState::parse(&state)?,version,queue_sequence:sequence,deadline_monotonic_ms:stored_deadline});
             }
@@ -243,11 +270,11 @@ impl MediaReservationLedger {
                     return Err(anyhow!("accounting_blocked"));
                 }
             }
-            let queue_sequence: u64 = conn.query_row("UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1", [], |row| row.get(0))?;
+            let queue_sequence = conn.query_row("UPDATE media_queue_sequence SET next_value=next_value+1 WHERE singleton=1 RETURNING next_value-1", [], |row| row_u64(row, 0))?;
             let policy_version = request.plans[0].policy_version;
             conn.execute(
                 "INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'reserved_queued',1,?8,?9,?10)",
-                params![request.reservation_id, policy_version, request.owner.project_id, request.owner.session_id, request.operation, request.purpose, request.recovery_id, queue_sequence, deadline, request.wall_ms],
+                params![request.reservation_id, sqlite_i64(policy_version)?, request.owner.project_id, request.owner.session_id, request.operation, request.purpose, request.recovery_id, sqlite_i64(queue_sequence)?, sqlite_i64(deadline)?, sqlite_i64(request.wall_ms)?],
             )?;
             for plan in request.plans.iter().filter(|plan| reserves_at_enqueue(plan)) {
                 acquire(conn, &request, plan, 1, request.wall_ms)?;
@@ -268,15 +295,15 @@ impl MediaReservationLedger {
     ) -> Result<ReservationReceipt, LedgerError> {
         let id = id.to_owned();
         self.db.transaction(move |conn| {
-            let row = conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key,external_operation_id FROM media_reservations WHERE reservation_id=?1", [&id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,u64>(1)?,row.get::<_,u64>(2)?,row.get::<_,u64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?)))?;
+            let row = conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key,external_operation_id FROM media_reservations WHERE reservation_id=?1", [&id], |row| Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row_u64(row,2)?,row_u64(row,3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?)))?;
             let current = ReservationState::parse(&row.0)?;
             if row.1 != expected_version { return Err(anyhow!("stale_version")); }
             if !current.allows(next) { return Err(anyhow!("invalid_transition")); }
             if next==ReservationState::Released{return Err(anyhow!("verified_settlement_required"));}
             if next == ReservationState::DispatchingExternal && row.6.is_none() { return Err(anyhow!("external_journal_required")); }
             let version = expected_version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
-            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND version=?4", params![next.as_str(),version,id,expected_version])?;
-            conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'state_transition','operation',?1,0,0,0,'actual',?3)", params![id,version,wall_ms])?;
+            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND version=?4", params![next.as_str(),sqlite_i64(version)?,id,sqlite_i64(expected_version)?])?;
+            conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'state_transition','operation',?1,0,0,0,'actual',?3)", params![id,sqlite_i64(version)?,sqlite_i64(wall_ms)?])?;
             if next == ReservationState::AccountingCorrupt { conn.execute("INSERT INTO media_accounting_blocks(scope_kind,scope_id,generation,reason) VALUES('session',?1,1,'accounting_corrupt') ON CONFLICT(scope_kind,scope_id) DO UPDATE SET generation=generation+1,reason='accounting_corrupt'",[row.5.as_str()])?; }
             Ok(ReservationReceipt { reservation_id:id,state:next,version,queue_sequence:row.2,deadline_monotonic_ms:row.3 })
         }).await.map_err(classify_storage_error)
@@ -294,14 +321,14 @@ impl MediaReservationLedger {
         let journal = journal_operation_id.to_owned();
         let now = self.clock.now_ms();
         self.db.transaction(move |conn| {
-            let(state,version,sequence,deadline,project,session):(String,u64,u64,u64,String,String)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+            let(state,version,sequence,deadline,project,session)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?,r.get(4)?,r.get(5)?)))?;
             ensure_unblocked(conn,&session)?;if now>=deadline{return Err(anyhow!("deadline_expired"));}if version!=expected_version{return Err(anyhow!("stale_version"));}
             if !ReservationState::parse(&state)?.allows(ReservationState::DispatchingExternal){return Err(anyhow!("invalid_transition"));}
             let(journal_owner,journal_state):(String,String)=conn.query_row("SELECT owner_session_id,state FROM external_journal_operations WHERE operation_id=?1",[&journal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or_else(||anyhow!("external_journal_required"))?;
             if journal_owner!=session{return Err(anyhow!("external_journal_owner_mismatch"));}if journal_state!="prepared"{return Err(anyhow!("external_journal_not_prepared"));}
             let owner=MediaOwner{project_id:project,session_id:session};release_queued(conn,&id,&owner,version+1,wall_ms)?;
             for plan in &handoff_plans{if !matches!(plan.scope_policy.charge,MediaCharge::AcceptedOrPossiblyAccepted|MediaCharge::AtHandoff){return Err(anyhow!("invalid_handoff_plan"));}acquire_plan(conn,&id,&owner,plan,version+1,wall_ms)?;}
-            conn.execute("UPDATE media_reservations SET external_operation_id=?1,state='dispatching_external',version=version+1 WHERE reservation_id=?2 AND version=?3",params![journal,id,expected_version])?;
+            conn.execute("UPDATE media_reservations SET external_operation_id=?1,state='dispatching_external',version=version+1 WHERE reservation_id=?2 AND version=?3",params![journal,id,sqlite_i64(expected_version)?])?;
             Ok(ReservationReceipt{reservation_id:id,state:ReservationState::DispatchingExternal,version:version+1,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
     }
@@ -319,7 +346,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let now = self.clock.now_ms();
         self.db.transaction(move |conn| {
-            let (state, version, deadline, project, session, sequence): (String,u64,u64,String,String,u64) = conn.query_row("SELECT state,version,deadline_monotonic_ms,project_id,owner_session_key,queue_sequence FROM media_reservations WHERE reservation_id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+            let (state, version, deadline, project, session, sequence) = conn.query_row("SELECT state,version,deadline_monotonic_ms,project_id,owner_session_key,queue_sequence FROM media_reservations WHERE reservation_id=?1", [&id], |r| Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,r.get(3)?,r.get(4)?,row_u64(r,5)?)))?;
             if version != expected_version { return Err(anyhow!("stale_version")); }
             if ReservationState::parse(&state)? != ReservationState::ReservedQueued { return Err(anyhow!("invalid_transition")); }
             if now >= deadline { return Err(anyhow!("deadline_expired")); }
@@ -327,7 +354,7 @@ impl MediaReservationLedger {
             validate_mutation_policy(conn,&id,&execution_plan)?;
             acquire_plan(conn, &id, &owner, &execution_plan, version + 1, wall_ms)?;
             release_queued(conn, &id, &owner, version + 1, wall_ms)?;
-            conn.execute("UPDATE media_reservations SET state='executing_local',version=version+1 WHERE reservation_id=?1 AND version=?2", params![id,expected_version])?;
+            conn.execute("UPDATE media_reservations SET state='executing_local',version=version+1 WHERE reservation_id=?1 AND version=?2", params![id,sqlite_i64(expected_version)?])?;
             Ok(ReservationReceipt { reservation_id:id,state:ReservationState::ExecutingLocal,version:version+1,queue_sequence:sequence,deadline_monotonic_ms:deadline })
         }).await.map_err(classify_storage_error)
     }
@@ -342,7 +369,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let now = self.clock.now_ms();
         let cancellation_id = id.clone();
-        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline):(String,u64,u64,u64)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}conn.execute("UPDATE media_reservations SET state='cancellation_requested',version=?1 WHERE reservation_id=?2",params![version+1,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:version+1,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
+        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;conn.execute("UPDATE media_reservations SET state='cancellation_requested',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
         let cleanup_checksum = cleanup
             .kill_reap_and_cleanup(&id)
             .map_err(LedgerError::Storage)?;
@@ -369,9 +396,9 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let dimension_name = dimension_name(dimension);
         self.db.transaction(move |conn| {
-            let (state,version,project,session,sequence,deadline):(String,u64,String,String,u64,u64)=conn.query_row("SELECT state,version,project_id,owner_session_key,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+            let (state,version,project,session,sequence,deadline)=conn.query_row("SELECT state,version,project_id,owner_session_key,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,r.get(2)?,r.get(3)?,row_u64(r,4)?,row_u64(r,5)?)))?;
             if version != expected_version { return Err(anyhow!("stale_version")); }
-            let estimated:u64=conn.query_row("SELECT COALESCE(MAX(estimated),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name],|r|r.get(0))?;
+            let estimated=conn.query_row("SELECT COALESCE(MAX(estimated),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name],|r|row_u64(r,0))?;
             let owner=MediaOwner{project_id:project,session_id:session} ;
             let (scope_kind,scope_id)=scope_identity(dimension.scope_policy().scope,&owner,&id);
             let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
@@ -392,7 +419,7 @@ impl MediaReservationLedger {
                 let release=outstanding.checked_sub(target).ok_or_else(||anyhow!("accounting_overflow"))?.max(0);
                 if release>0{mutate_counter(conn,scope_kind,&scope_id,&dimension_name,-release)?;record_delta(conn,&id,next_version,&dimension_name,scope_kind,&scope_id,actual,-release,"cleanup",wall_ms)?;}
             }
-            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),next_version,id])?;
+            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),sqlite_i64(next_version)?,id])?;
             Ok(ReservationReceipt{reservation_id:id,state:next,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
     }
@@ -400,12 +427,13 @@ impl MediaReservationLedger {
     pub async fn recover_after_restart(&self, wall_ms: u64) -> Result<u64, LedgerError> {
         self.db.transaction(move |conn| {
             let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE state IN ('reserved_queued','executing_local','settling') OR (state='cancellation_requested' AND external_operation_id IS NULL)")?;
-            let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             drop(stmt);
             for (id,version,_) in &rows {
                 release_restart_dimensions(conn,id,version+1,wall_ms)?;
-                conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![version+1,id])?;
-                conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'restart_expiry','operation',?1,0,0,0,'cleanup',?3)",params![id,version+1,wall_ms])?;
+                let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+                conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,id])?;
+                conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'restart_expiry','operation',?1,0,0,0,'cleanup',?3)",params![id,sqlite_i64(next_version)?,sqlite_i64(wall_ms)?])?;
             }
             Ok(rows.len() as u64)
         }).await.map_err(classify_storage_error)
@@ -422,12 +450,12 @@ impl MediaReservationLedger {
     ) -> Result<ReservationReceipt, LedgerError> {
         let id = id.to_owned();
         self.db.transaction(move |conn| {
-            let (state,version,sequence,deadline):(String,u64,u64,u64)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            let (state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;
             if version!=expected_version{return Err(anyhow!("stale_version"));}
             let current=ReservationState::parse(&state)?;
             if current!=ReservationState::Settling&&!current.allows(ReservationState::Settling){return Err(anyhow!("invalid_transition"));}
             let settling_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            if current!=ReservationState::Settling{conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![settling_version,id])?;}
+            if current!=ReservationState::Settling{conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![sqlite_i64(settling_version)?,id])?;}
             let next_version=if current==ReservationState::Settling{settling_version}else{settling_version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?};
             for dimension in verified_dimensions {
                 if dimension.scope_policy().release==cockpit_config::config::media_budget::MediaRelease::Never{return Err(anyhow!("durable_charge_not_releasable"));}
@@ -436,7 +464,7 @@ impl MediaReservationLedger {
                 release_dimension_balance(conn,&id,next_version,&dimension_name(dimension),wall_ms)?;
             }
             let next=if has_releasable_balance(conn,&id)?{ReservationState::Settling}else{ReservationState::Released};
-            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),next_version,id])?;
+            conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),sqlite_i64(next_version)?,id])?;
             Ok(ReservationReceipt{reservation_id:id,state:next,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
     }
@@ -471,7 +499,7 @@ impl MediaReservationLedger {
             return Err(LedgerError::Storage(anyhow!("artifact checksum required")));
         }
         let dimension = dimension_name(dimension);
-        self.db.transaction(move|conn|{conn.execute("INSERT INTO media_artifact_facts(artifact_id,reservation_id,dimension,byte_count,checksum,quarantined) VALUES(?1,?2,?3,?4,?5,?6)",params![artifact,reservation,dimension,byte_count,checksum,quarantined])?;Ok(())}).await.map_err(LedgerError::Storage)
+        self.db.transaction(move|conn|{conn.execute("INSERT INTO media_artifact_facts(artifact_id,reservation_id,dimension,byte_count,checksum,quarantined) VALUES(?1,?2,?3,?4,?5,?6)",params![artifact,reservation,dimension,sqlite_i64(byte_count)?,checksum,quarantined])?;Ok(())}).await.map_err(LedgerError::Storage)
     }
 
     pub async fn record_verified_deletion(
@@ -515,21 +543,21 @@ impl MediaReservationLedger {
                 return Ok(parse_repair_outcome(result.as_deref().unwrap_or("accounting_repair_not_provable")));
             }
             let diagnosis=diagnose_connection(conn,&request.scope_kind,&request.scope_id)?;
-            conn.execute("INSERT INTO media_repair_attempts(attempt_id,scope_kind,scope_id,idempotency_key,request_digest,plan_digest,expected_block_generation,state,current_counter_digest,created_wall_ms,updated_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8,?9,?9)",params![request.attempt_id,request.scope_kind,request.scope_id,request.idempotency_key,request_digest,request.repair_plan_digest,request.expected_block_generation,diagnosis.current_counter_digest,request.wall_ms])?;
+            conn.execute("INSERT INTO media_repair_attempts(attempt_id,scope_kind,scope_id,idempotency_key,request_digest,plan_digest,expected_block_generation,state,current_counter_digest,created_wall_ms,updated_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'planned',?8,?9,?9)",params![request.attempt_id,request.scope_kind,request.scope_id,request.idempotency_key,request_digest,request.repair_plan_digest,sqlite_i64(request.expected_block_generation)?,diagnosis.current_counter_digest,sqlite_i64(request.wall_ms)?])?;
             if request.scope_kind=="project"{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::NotProvable,None,request.wall_ms);}
             if diagnosis.block_generation!=request.expected_block_generation||diagnosis.repair_plan_digest!=request.repair_plan_digest{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::SourceChanged,None,request.wall_ms);}
             if diagnosis.journal_blockers>0||diagnosis.manifest_blockers>0{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::NotProvable,None,request.wall_ms);}
-            conn.execute("UPDATE media_repair_attempts SET state='rebuilding',updated_wall_ms=?2 WHERE attempt_id=?1",params![request.attempt_id,request.wall_ms])?;
+            conn.execute("UPDATE media_repair_attempts SET state='rebuilding',updated_wall_ms=?2 WHERE attempt_id=?1",params![request.attempt_id,sqlite_i64(request.wall_ms)?])?;
             let rebuilt=match rebuild_counters(conn,&request.scope_kind,&request.scope_id){Ok(value)=>value,Err(error)=>{let outcome=if error.to_string().contains("overflow")||error.to_string().contains("out of range"){AccountingRepairOutcome::Overflow}else{AccountingRepairOutcome::NotProvable};return finish_repair(conn,&request.attempt_id,outcome,None,request.wall_ms);}};
-            for(dimension,charged)in &rebuilt{conn.execute("INSERT INTO media_counter_shadow(attempt_id,dimension,charged) VALUES(?1,?2,?3)",params![request.attempt_id,dimension,charged])?;}
-            conn.execute("UPDATE media_repair_attempts SET state='verifying',updated_wall_ms=?2 WHERE attempt_id=?1",params![request.attempt_id,request.wall_ms])?;
+            for(dimension,charged)in &rebuilt{conn.execute("INSERT INTO media_counter_shadow(attempt_id,dimension,charged) VALUES(?1,?2,?3)",params![request.attempt_id,dimension,sqlite_i64(*charged)?])?;}
+            conn.execute("UPDATE media_repair_attempts SET state='verifying',updated_wall_ms=?2 WHERE attempt_id=?1",params![request.attempt_id,sqlite_i64(request.wall_ms)?])?;
             let verify=diagnose_connection(conn,&request.scope_kind,&request.scope_id)?;
             if verify.repair_plan_digest!=diagnosis.repair_plan_digest||verify.block_generation!=diagnosis.block_generation{return finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::SourceChanged,None,request.wall_ms);}
-            let prior_generation:u64=conn.query_row("SELECT COALESCE(MAX(generation),0) FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2",params![request.scope_kind,request.scope_id],|r|r.get(0))?;
+            let prior_generation=conn.query_row("SELECT COALESCE(MAX(generation),0) FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2",params![request.scope_kind,request.scope_id],|r|row_u64(r,0))?;
             let repaired_generation=prior_generation.max(diagnosis.block_generation).checked_add(1).ok_or_else(||anyhow!("accounting_repair_overflow"))?;
             conn.execute("DELETE FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2",params![request.scope_kind,request.scope_id])?;
-            for(dimension,charged)in &rebuilt{conn.execute("INSERT INTO media_resource_counters(scope_kind,scope_id,dimension,charged,generation) VALUES(?1,?2,?3,?4,?5)",params![request.scope_kind,request.scope_id,dimension,charged,repaired_generation])?;}
-            conn.execute("DELETE FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2 AND generation=?3",params![request.scope_kind,request.scope_id,diagnosis.block_generation])?;
+            for(dimension,charged)in &rebuilt{conn.execute("INSERT INTO media_resource_counters(scope_kind,scope_id,dimension,charged,generation) VALUES(?1,?2,?3,?4,?5)",params![request.scope_kind,request.scope_id,dimension,sqlite_i64(*charged)?,sqlite_i64(repaired_generation)?])?;}
+            conn.execute("DELETE FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2 AND generation=?3",params![request.scope_kind,request.scope_id,sqlite_i64(diagnosis.block_generation)?])?;
             finish_repair(conn,&request.attempt_id,AccountingRepairOutcome::Committed,Some(stable_counter_digest(&rebuilt)),request.wall_ms)
         }).await.map_err(|error| if error.to_string().contains("overflow"){LedgerError::Overflow}else{LedgerError::Storage(error)})
     }
@@ -614,10 +642,10 @@ fn validate_mutation_policy(
     id: &str,
     plan: &MediaReservationPlan,
 ) -> Result<()> {
-    let version: u64 = conn.query_row(
+    let version = conn.query_row(
         "SELECT policy_version FROM media_reservations WHERE reservation_id=?1",
         [id],
-        |r| r.get(0),
+        |r| row_u64(r, 0),
     )?;
     if version != plan.policy_version {
         bail!("stale_policy_version");
@@ -674,13 +702,13 @@ fn acquire_plan(
     wall_ms: u64,
 ) -> Result<()> {
     validate_mutation_policy(conn, id, plan)?;
-    let reserved:u64=conn.query_row("SELECT COALESCE(MAX(estimated),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name(plan.dimension)],|r|r.get(0))?;
+    let reserved=conn.query_row("SELECT COALESCE(MAX(estimated),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name(plan.dimension)],|r|row_u64(r,0))?;
     if reserved > 0 && plan.requested > reserved {
         bail!("immutable_estimate_exceeded");
     }
     let name = dimension_name(plan.dimension);
     let (kind, scope_id) = scope_identity(plan.scope_policy.scope, owner, id);
-    let current:u64=conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2 AND dimension=?3",params![kind,scope_id,name],|r|r.get(0)).optional()?.unwrap_or(0);
+    let current=conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2 AND dimension=?3",params![kind,scope_id,name],|r|row_u64(r,0)).optional()?.unwrap_or(0);
     let next = current
         .checked_add(plan.requested)
         .ok_or_else(|| anyhow!("accounting_overflow"))?;
@@ -739,8 +767,8 @@ fn record_delta(
     fact: &str,
     wall_ms: u64,
 ) -> Result<()> {
-    let charged:u64=conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2 AND dimension=?3",params![kind,scope_id,dimension],|r|r.get(0)).optional()?.unwrap_or(0);
-    conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![reservation,version,dimension,kind,scope_id,estimated,delta,charged,fact,wall_ms])?;
+    let charged=conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2 AND dimension=?3",params![kind,scope_id,dimension],|r|row_u64(r,0)).optional()?.unwrap_or(0);
+    conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![reservation,sqlite_i64(version)?,dimension,kind,scope_id,sqlite_i64(estimated)?,delta,sqlite_i64(charged)?,fact,sqlite_i64(wall_ms)?])?;
     Ok(())
 }
 fn release_queued(
@@ -756,7 +784,7 @@ fn release_queued(
     ] {
         let name = dimension_name(dimension);
         let (kind, scope_id) = scope_identity(dimension.scope_policy().scope, owner, id);
-        let amount:u64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,name],|r|r.get(0))?;
+        let amount=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,name],|r|row_u64(r,0))?;
         if amount > 0 {
             mutate_counter(conn, kind, &scope_id, &name, -i64::try_from(amount)?)?;
             record_delta(
@@ -822,7 +850,7 @@ fn deletion_is_proven(conn: &rusqlite::Connection, id: &str, dimension: &str) ->
     {
         return Ok(true);
     }
-    let(total,deleted):(u64,u64)=conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN deletion_tombstone_checksum IS NOT NULL THEN 1 ELSE 0 END),0) FROM media_artifact_facts WHERE reservation_id=?1 AND dimension=?2",params![id,dimension],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let(total,deleted)=conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN deletion_tombstone_checksum IS NOT NULL THEN 1 ELSE 0 END),0) FROM media_artifact_facts WHERE reservation_id=?1 AND dimension=?2",params![id,dimension],|r|Ok((row_u64(r,0)?,row_u64(r,1)?)))?;
     Ok(total > 0 && total == deleted)
 }
 fn external_reconciliation_is_terminal(conn: &rusqlite::Connection, id: &str) -> Result<bool> {
@@ -927,7 +955,7 @@ pub fn stable_counter_digest(values: &BTreeMap<String, u64>) -> String {
         h.update([0]);
         h.update(v.to_be_bytes());
     }
-    format!("{:x}", h.finalize())
+    lowercase_hex(&h.finalize())
 }
 
 fn rebuild_counters(
@@ -957,7 +985,7 @@ fn diagnose_connection(
     let mut current = BTreeMap::new();
     let mut statement=conn.prepare("SELECT dimension,charged FROM media_resource_counters WHERE scope_kind=?1 AND scope_id=?2 ORDER BY dimension")?;
     for row in statement.query_map(params![kind, id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+        Ok((r.get::<_, String>(0)?, row_u64(r, 1)?))
     })? {
         let (k, v) = row?;
         current.insert(k, v);
@@ -965,16 +993,16 @@ fn diagnose_connection(
     let source_delta_rows = conn.query_row(
         "SELECT COUNT(*) FROM media_reservation_deltas WHERE scope_kind=?1 AND scope_id=?2",
         params![kind, id],
-        |r| r.get(0),
+        |r| row_u64(r, 0),
     )?;
-    let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|r.get(0))?;
-    let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|r.get(0))?;
-    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|r.get(0))?;
+    let artifact_rows=conn.query_row("SELECT COUNT(*) FROM media_artifact_facts a JOIN media_reservations r ON r.reservation_id=a.reservation_id WHERE (?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2)",params![kind,id],|r|row_u64(r,0))?;
+    let journal_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations WHERE state IN ('dispatching_external','external_pending','reconciling_external','cancellation_requested') AND ((?1='global') OR (?1='project' AND project_id=?2) OR (?1='session' AND owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
+    let manifest_blockers=conn.query_row("SELECT COUNT(*) FROM media_reservations r WHERE r.quarantined=1 AND NOT EXISTS(SELECT 1 FROM media_artifact_facts a WHERE a.reservation_id=r.reservation_id) AND ((?1='global') OR (?1='project' AND r.project_id=?2) OR (?1='session' AND r.owner_session_key=?2))",params![kind,id],|r|row_u64(r,0))?;
     let block_generation = conn
         .query_row(
             "SELECT generation FROM media_accounting_blocks WHERE scope_kind=?1 AND scope_id=?2",
             params![kind, id],
-            |r| r.get(0),
+            |r| row_u64(r, 0),
         )
         .optional()?
         .unwrap_or(0);
@@ -988,7 +1016,7 @@ fn diagnose_connection(
     hasher.update(source_delta_rows.to_be_bytes());
     hasher.update(artifact_rows.to_be_bytes());
     hasher.update(rebuilt_counter_digest.as_bytes());
-    let repair_plan_digest = format!("{:x}", hasher.finalize());
+    let repair_plan_digest = lowercase_hex(&hasher.finalize());
     Ok(AccountingDiagnosis {
         scope_kind: kind.into(),
         scope_id: id.into(),
@@ -1015,7 +1043,7 @@ fn repair_request_digest(request: &AccountingRepairRequest) -> String {
         h.update([0]);
     }
     h.update(request.expected_block_generation.to_be_bytes());
-    format!("{:x}", h.finalize())
+    lowercase_hex(&h.finalize())
 }
 fn finish_repair(
     conn: &rusqlite::Connection,
@@ -1032,13 +1060,13 @@ fn finish_repair(
     if current == "planned" {
         conn.execute(
             "UPDATE media_repair_attempts SET state='rebuilding',updated_wall_ms=?2 WHERE attempt_id=?1",
-            params![id, wall_ms],
+            params![id, sqlite_i64(wall_ms)?],
         )?;
     }
     if current != "verifying" {
         conn.execute(
             "UPDATE media_repair_attempts SET state='verifying',updated_wall_ms=?2 WHERE attempt_id=?1",
-            params![id, wall_ms],
+            params![id, sqlite_i64(wall_ms)?],
         )?;
     }
     let state = if outcome == AccountingRepairOutcome::Committed {
@@ -1046,7 +1074,7 @@ fn finish_repair(
     } else {
         "failed"
     };
-    conn.execute("UPDATE media_repair_attempts SET state=?1,outcome=?2,rebuilt_counter_digest=?3,updated_wall_ms=?4 WHERE attempt_id=?5",params![state,outcome.code(),digest,wall_ms,id])?;
+    conn.execute("UPDATE media_repair_attempts SET state=?1,outcome=?2,rebuilt_counter_digest=?3,updated_wall_ms=?4 WHERE attempt_id=?5",params![state,outcome.code(),digest,sqlite_i64(wall_ms)?,id])?;
     Ok(outcome)
 }
 fn parse_repair_outcome(code: &str) -> AccountingRepairOutcome {
@@ -1128,7 +1156,7 @@ mod tests {
             ledger.reserve(request("b", plans)).await,
             Err(LedgerError::Denied(_))
         ));
-        let charged:u64=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND dimension='queued_operations_global'",[],|r|r.get(0))?)).await.unwrap();
+        let charged=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND dimension='queued_operations_global'",[],|r|row_u64(r,0))?)).await.unwrap();
         assert_eq!(charged, 1);
     }
 

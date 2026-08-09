@@ -602,6 +602,26 @@ pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, Erro
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorizedCanonicalPathMode {
+    Existing,
+    WriteTarget,
+}
+
+/// Resolve an already-authorized request path through the same symlink-aware
+/// containment rules used by production filesystem handlers.
+pub(crate) fn resolve_authorized_canonical_path(
+    project_root: &str,
+    path: &str,
+    mode: AuthorizedCanonicalPathMode,
+) -> Result<PathBuf, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    match mode {
+        AuthorizedCanonicalPathMode::Existing => resolve_existing_path(&root, path),
+        AuthorizedCanonicalPathMode::WriteTarget => resolve_existing_or_parent_path(&root, path),
+    }
+}
+
 fn resolve_existing_path(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
     let rel = clean_relative_path(path)?;
     let joined = root.join(rel);
@@ -775,6 +795,39 @@ mod tests {
             .is_err()
         );
         assert!(resolve_existing_path(&root.canonicalize().unwrap(), "ok.txt").is_ok());
+    }
+
+    #[test]
+    fn authorized_resolver_distinguishes_existing_and_write_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("present.txt"), "ok").unwrap();
+        let root_text = root.to_str().unwrap();
+        let existing = resolve_authorized_canonical_path(
+            root_text,
+            "./present.txt",
+            AuthorizedCanonicalPathMode::Existing,
+        )
+        .unwrap();
+        assert_eq!(existing, root.canonicalize().unwrap().join("present.txt"));
+        assert!(
+            resolve_authorized_canonical_path(
+                root_text,
+                "missing.txt",
+                AuthorizedCanonicalPathMode::Existing,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_authorized_canonical_path(
+                root_text,
+                "missing.txt",
+                AuthorizedCanonicalPathMode::WriteTarget,
+            )
+            .unwrap(),
+            root.canonicalize().unwrap().join("missing.txt")
+        );
     }
 
     #[cfg(unix)]

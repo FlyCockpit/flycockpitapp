@@ -21,25 +21,7 @@ pub enum ImageProbeError {
 /// not change while read, decode only the closed browser format allowlist, and
 /// return a metadata-free RGBA PNG.
 pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> {
-    let mut file = open_no_follow(path)?;
-    let before = file
-        .metadata()
-        .map_err(|_| ImageProbeError::PasteUnavailable)?;
-    validate_metadata(&before)?;
-    let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
-        .take(MAX_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ImageProbeError::PasteUnavailable)?;
-    if bytes.len() as u64 > MAX_INPUT_BYTES {
-        return Err(ImageProbeError::PasteUnavailable);
-    }
-    let after = file
-        .metadata()
-        .map_err(|_| ImageProbeError::PasteUnavailable)?;
-    if !same_file(&before, &after) || after.len() != bytes.len() as u64 {
-        return Err(ImageProbeError::PasteUnavailable);
-    }
+    let bytes = read_stable_private_file(path, || {})?;
 
     let format = browser_format(&bytes)?;
     let extension = path
@@ -83,6 +65,33 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
         .write_to(&mut normalized, ImageFormat::Png)
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
     Ok(normalized.into_inner())
+}
+
+fn read_stable_private_file(
+    path: &Path,
+    after_read: impl FnOnce(),
+) -> Result<Vec<u8>, ImageProbeError> {
+    let mut file = open_no_follow(path)?;
+    let before = file
+        .metadata()
+        .map_err(|_| ImageProbeError::PasteUnavailable)?;
+    validate_metadata(&before)?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ImageProbeError::PasteUnavailable)?;
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageProbeError::PasteUnavailable);
+    }
+    after_read();
+    let after = file
+        .metadata()
+        .map_err(|_| ImageProbeError::PasteUnavailable)?;
+    if !same_file(&before, &after) || after.len() != bytes.len() as u64 {
+        return Err(ImageProbeError::PasteUnavailable);
+    }
+    Ok(bytes)
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), ImageProbeError> {
@@ -355,6 +364,10 @@ mod tests {
                 .unwrap();
             let normalized = normalize_private_image(&path).unwrap();
             assert!(normalized.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let decoded = image::load_from_memory_with_format(&normalized, ImageFormat::Png)
+                .expect("normalized output is a PNG");
+            assert_eq!(decoded.color(), image::ColorType::Rgba8);
+            assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [1, 2, 3, 255]);
             for literal in [
                 format!("'{}'", path.display()),
                 format!("\"{}\"", path.display()),
@@ -364,6 +377,30 @@ mod tests {
                     Some(path.clone())
                 );
             }
+            if format == ImageFormat::Gif {
+                let gif87a = binding.join("single-frame-gif87a.gif");
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[..6].copy_from_slice(b"GIF87a");
+                std::fs::write(&gif87a, bytes).unwrap();
+                assert!(normalize_private_image(&gif87a).is_ok());
+            }
+        }
+
+        let quoted_path = binding.join("space and ' apostrophe.png");
+        image::DynamicImage::ImageRgba8(image.clone())
+            .save_with_format(&quoted_path, ImageFormat::Png)
+            .unwrap();
+        assert!(normalize_private_image(&quoted_path).is_ok());
+        let path_text = quoted_path.to_string_lossy();
+        for literal in [
+            format!("'{}'", path_text.replace('\'', "'\\''")),
+            format!("'{}'", path_text.replace('\'', "''")),
+            format!("\"{path_text}\""),
+        ] {
+            assert_eq!(
+                crate::tui::structured_paste::parse_private_image_path_literal(&literal),
+                Some(quoted_path.clone())
+            );
         }
 
         let mismatch = binding.join("c234567c234567c234567c2345.jpg");
@@ -373,6 +410,15 @@ mod tests {
         std::fs::write(&oversized, vec![0; MAX_INPUT_BYTES as usize + 1]).unwrap();
         assert!(normalize_private_image(&oversized).is_err());
         assert!(normalize_private_image(&binding).is_err());
+        let mutating = binding.join("mutating.png");
+        std::fs::write(&mutating, b"before").unwrap();
+        assert!(
+            read_stable_private_file(&mutating, || {
+                std::fs::write(&mutating, b"after-and-longer").unwrap();
+            })
+            .is_err(),
+            "a file changed after the held-handle read must fail closed"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;

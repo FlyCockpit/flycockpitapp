@@ -153,6 +153,17 @@ fn tui_image_codec_dependency_inventory() {
                 package["rust_version"], expected_package["rustVersion"],
                 "{key} declared MSRV"
             );
+            assert!(
+                expected_package["source"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with("registry+")),
+                "{key} must retain its exact registry source"
+            );
+            if let Some(msrv) = expected_package["rustVersion"].as_str() {
+                let mut parts = msrv.split('.').map(|part| part.parse::<u32>().unwrap());
+                let version = (parts.next().unwrap(), parts.next().unwrap_or_default());
+                assert!(version <= (1, 95), "{key} requires Rust {msrv}");
+            }
             let actual_features = if id == image_id {
                 resolved_features
                     .iter()

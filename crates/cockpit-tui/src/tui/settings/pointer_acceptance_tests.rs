@@ -46,6 +46,7 @@ fn assert_rendered_action_matrix(actions: &[SettingsPointerAction]) {
     let surface = SettingsPointerSurface::default();
     surface.clear_for(Rect::new(4, 3, 40, actions.len() as u16));
     for (index, action) in actions.iter().cloned().enumerate() {
+        assert_source_action_family_is_exhaustive(&action);
         surface.register(SettingsPointerTarget {
             rect: Rect::new(4, 3 + index as u16, 40, 1),
             action: RenderAction::Page(action.clone()),
@@ -628,6 +629,12 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
             "one"
         };
         assert!(rows.contains(&format!("Delete {name}? [Delete] [Cancel]")));
+        click_target(&mut dialog, &delete);
+        assert_eq!(
+            list_len(&dialog, kind),
+            1,
+            "replaying the pre-confirmation row coordinate is inert"
+        );
         let cancel = dialog
             .pointer_surface
             .targets
@@ -732,6 +739,8 @@ fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
         click_target(&mut dialog, &delete);
         assert_eq!(len(&dialog), 1);
         let _ = render_settings_rows(&dialog, 90, 30);
+        click_target(&mut dialog, &delete);
+        assert_eq!(len(&dialog), 1, "original delete-row coordinate is inert");
         let cancel = dialog
             .pointer_surface
             .targets

@@ -764,7 +764,7 @@ fn render_grab_list(
         Line::default(),
     ];
     let mut controls = vec![None; lines.len()];
-    let mut cancel_lines = Vec::new();
+    let mut confirmation_lines = Vec::new();
     push_wrapped_text(&mut lines, area.width, intro, muted);
     controls.resize(lines.len(), None);
     lines.push(Line::default());
@@ -813,13 +813,15 @@ fn render_grab_list(
         } else {
             format!("    [Delete {item}]")
         }));
-        controls.push(Some((
-            SettingsPointerAction::List(ListAction::Delete(id)),
-            true,
-            None,
-        )));
         if pending {
-            cancel_lines.push((lines.len() - 1, 22 + item.chars().count()));
+            controls.push(None);
+            confirmation_lines.push((lines.len() - 1, 12 + item.chars().count(), id));
+        } else {
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Delete(id)),
+                true,
+                None,
+            )));
         }
     }
 
@@ -899,24 +901,29 @@ fn render_grab_list(
         SettingsScrollRegionId(key),
     );
     let offset = scroll_states.offset_for(key);
-    for (line, column) in cancel_lines {
+    for (line, delete_column, id) in confirmation_lines {
         if let Some(row) = line
             .checked_sub(offset)
             .filter(|row| *row < usize::from(area.height))
         {
-            pointer_surface.register(SettingsPointerTarget {
-                rect: Rect::new(
-                    area.x.saturating_add(column as u16),
-                    area.y.saturating_add(row as u16),
-                    8,
-                    1,
-                ),
-                action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
-                    ListAction::Cancel,
-                )),
-                enabled: true,
-                disabled_reason: None,
-            });
+            for (column, action) in [
+                (delete_column, ListAction::Delete(id.clone())),
+                (delete_column + 9, ListAction::Cancel),
+            ] {
+                pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(column as u16),
+                        area.y.saturating_add(row as u16),
+                        8,
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
+                        action,
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
         }
     }
 }

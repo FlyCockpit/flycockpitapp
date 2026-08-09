@@ -447,7 +447,7 @@ impl SettingsCx {
             Line::default(),
         ];
         let mut controls = vec![None; lines.len()];
-        let mut cancel_lines = Vec::new();
+        let mut confirmation_lines = Vec::new();
         push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
         controls.resize(lines.len(), None);
         lines.push(Line::default());
@@ -498,13 +498,21 @@ impl SettingsCx {
             } else {
                 format!("    [Delete {display}]")
             }));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Delete(string_list_row_id(p.kind, i, val))),
-                true,
-                None,
-            )));
             if pending {
-                cancel_lines.push((lines.len() - 1, 22 + display.chars().count()));
+                controls.push(None);
+                confirmation_lines.push((
+                    lines.len() - 1,
+                    12 + display.chars().count(),
+                    string_list_row_id(p.kind, i, val),
+                ));
+            } else {
+                controls.push(Some((
+                    SettingsPointerAction::List(ListAction::Delete(string_list_row_id(
+                        p.kind, i, val,
+                    ))),
+                    true,
+                    None,
+                )));
             }
         }
 
@@ -593,24 +601,29 @@ impl SettingsCx {
         );
         let key = format!("string-list:{:?}", p.kind);
         let offset = self.scroll_states.offset_for(&key);
-        for (line, column) in cancel_lines {
+        for (line, delete_column, id) in confirmation_lines {
             if let Some(row) = line
                 .checked_sub(offset)
                 .filter(|row| *row < usize::from(area.height))
             {
-                self.pointer_surface.register(SettingsPointerTarget {
-                    rect: Rect::new(
-                        area.x.saturating_add(column as u16),
-                        area.y.saturating_add(row as u16),
-                        8,
-                        1,
-                    ),
-                    action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
-                        ListAction::Cancel,
-                    )),
-                    enabled: true,
-                    disabled_reason: None,
-                });
+                for (column, action) in [
+                    (delete_column, ListAction::Delete(id.clone())),
+                    (delete_column + 9, ListAction::Cancel),
+                ] {
+                    self.pointer_surface.register(SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x.saturating_add(column as u16),
+                            area.y.saturating_add(row as u16),
+                            8,
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(
+                            SettingsPointerAction::List(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
             }
         }
     }

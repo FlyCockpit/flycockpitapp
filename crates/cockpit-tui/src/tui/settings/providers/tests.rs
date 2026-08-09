@@ -194,6 +194,91 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     standalone_oauth_link_region_survives_scroll_and_clipping();
     copilot_setup_effect_accepts_only_its_live_operation_once();
     oauth_copy_completion_is_flow_scoped_and_exactly_once();
+    pointer_enabled_list_and_edit_actions_dispatch_through_dialog();
+}
+
+fn click_rendered_provider_action(
+    dialog: &mut SettingsDialog,
+    action: &super::super::pointer_actions::SettingsPointerAction,
+) {
+    let _ = render_provider_rows(dialog, 110, 60);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled
+                && target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
+        })
+        .cloned()
+        .expect("source-derived provider action is rendered");
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            kind,
+            target.rect.x,
+            target.rect.y,
+        ));
+    }
+}
+
+#[test]
+fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
+    let config = one_provider_config(None);
+    let provider_id = "p".to_string();
+    let entry = config.providers[&provider_id].clone();
+
+    for edit in [false, true] {
+        let (_tmp, mut source) = dialog_with_config(config.clone());
+        source.page = if edit {
+            super::super::providers_page(ProvidersPage::Edit(EditState::new(
+                provider_id.clone(),
+                entry.clone(),
+            )))
+        } else {
+            super::super::providers_page(ProvidersPage::List {
+                cursor: 1,
+                status: None,
+                delete_pending: false,
+            })
+        };
+        let _ = render_provider_rows(&source, 110, 60);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ super::super::pointer_actions::SettingsPointerAction::Providers(_),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!actions.is_empty());
+        for action in actions {
+            let (_tmp, mut dialog) = dialog_with_config(config.clone());
+            dialog.page = if edit {
+                super::super::providers_page(ProvidersPage::Edit(EditState::new(
+                    provider_id.clone(),
+                    entry.clone(),
+                )))
+            } else {
+                super::super::providers_page(ProvidersPage::List {
+                    cursor: 1,
+                    status: None,
+                    delete_pending: false,
+                })
+            };
+            click_rendered_provider_action(&mut dialog, &action);
+        }
+    }
 }
 
 #[test]

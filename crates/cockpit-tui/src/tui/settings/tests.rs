@@ -520,7 +520,7 @@ fn grok_and_codex_oauth_render_register_link_regions() {
 use category::{Category, SettingId};
 
 /// Open a category page on `d` with the cursor on `id`'s row.
-fn open_category_on(d: &mut SettingsDialog, category: Category, id: SettingId) {
+pub(super) fn open_category_on(d: &mut SettingsDialog, category: Category, id: SettingId) {
     d.enter_category(category);
     if let TestPageMut::Category(p) = d.test_page_mut() {
         p.cursor = p

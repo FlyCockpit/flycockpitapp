@@ -420,6 +420,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::tests::run_pointer_dialog_regression_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
+    dispatch_enabled_category_descriptor_actions();
     ACTION_COVERAGE.with(|coverage| {
         let coverage = coverage.borrow();
         let missing = coverage
@@ -436,6 +437,55 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             "real rendered matrix collected no actions"
         );
     });
+}
+
+fn dispatch_enabled_category_descriptor_actions() {
+    use super::category::Category;
+    let tmp = TempDir::new().unwrap();
+    let mut source = fresh_dialog(&tmp);
+    super::tests::open_category_on(
+        &mut source,
+        Category::Interface,
+        super::category::SettingId::Mouse,
+    );
+    let _ = render_settings_rows(&source, 100, 50);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                RenderAction::Page(
+                    action @ SettingsPointerAction::Category(
+                        CategoryAction::DescriptorActivate(_) | CategoryAction::Reset,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!actions.is_empty());
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(
+            &mut dialog,
+            Category::Interface,
+            super::category::SettingId::Mouse,
+        );
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
+            .cloned()
+            .expect("source category descriptor action is rendered");
+        click_target(&mut dialog, &target);
+    }
 }
 
 /// No wildcard: adding a list action forces the rendered reducer fixtures to

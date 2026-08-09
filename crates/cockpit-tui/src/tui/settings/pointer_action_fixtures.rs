@@ -7,7 +7,7 @@
 //! it contains no debug strings, numeric variant counts, or surface tokens.
 
 use super::pointer_actions::*;
-use super::providers::oauth_flow::{OAuthOption, OAuthProvider};
+use super::providers::{OAuthOption, OAuthProvider};
 use cockpit_core::wizard::ProviderWizardStep;
 
 macro_rules! fixture_enum {

@@ -611,8 +611,12 @@ pub struct IntegrationHealthComposeInput {
     pub harnesses: Vec<ConfiguredCommandInput>,
     pub lsp_servers: Vec<ConfiguredCommandInput>,
     pub stdio_mcp: Vec<ConfiguredCommandInput>,
-    /// Per-invocation CLI override; `None` uses layered configuration.
+    /// Per-invocation CLI override; `None` leaves the captured mode enabled.
     pub sandbox_enabled: Option<bool>,
+    /// Layered sandbox mode captured by the config-owning caller.
+    pub sandbox_mode: crate::config::sandbox_mode::SandboxMode,
+    /// Layered computer-use policy captured by the config-owning caller.
+    pub computer_use_mode: Option<crate::config::extended::ComputerUseMode>,
     /// Catalog-owned features selected by resolved configuration.
     pub selected_features: BTreeSet<String>,
     /// Invocation-frozen engine selection. `None` resolves the current mode
@@ -680,7 +684,7 @@ pub(crate) fn compose_settings_doctor_health_for_invocation(
 /// invocation.  Deadline projection must retain this roster rather than
 /// consulting the process-global registry, whose configured rows may differ.
 pub(crate) fn invocation_descriptor_roster(
-    cwd: &Path,
+    _cwd: &Path,
     input: &IntegrationHealthComposeInput,
 ) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
     let registry = ExternalRuntimeRegistry::new();
@@ -698,21 +702,19 @@ pub(crate) fn invocation_descriptor_roster(
     registry.retain_configured_ids(&keep);
     let mut descriptors = registry.descriptors();
     descriptors.extend(super::safety_adapters::container_engine_descriptors(
-        resolved_container_engine_mode(cwd, input),
+        resolved_container_engine_mode(input),
     )?);
     descriptors.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(descriptors)
 }
 
 pub(crate) fn resolved_container_engine_mode(
-    cwd: &Path,
     input: &IntegrationHealthComposeInput,
 ) -> super::safety_adapters::ContainerEngineMode {
     if let Some(frozen) = input.container_engine_mode {
         return frozen;
     }
-    let extended = crate::config::extended::load_for_cwd(cwd);
-    if input.sandbox_enabled.unwrap_or(true) && extended.sandbox.default_mode.is_container() {
+    if input.sandbox_enabled.unwrap_or(true) && input.sandbox_mode.is_container() {
         super::safety_adapters::current_container_engine_mode()
     } else {
         super::safety_adapters::ContainerEngineMode::Disabled
@@ -783,14 +785,14 @@ fn compose_settings_doctor_health_internal(
         }
     }
     features.extend(input.selected_features.iter().cloned());
-    let extended = crate::config::extended::load_for_cwd(cwd);
     if input.sandbox_enabled.unwrap_or(true)
-        && extended.sandbox.default_mode.enabled()
-        && !extended.sandbox.default_mode.is_container()
+        && input.sandbox_mode.enabled()
+        && !input.sandbox_mode.is_container()
     {
         features.insert("shell-sandbox".to_string());
     }
-    if crate::config::extended::resolve_computer_use_policy_for_cwd(cwd)
+    if input
+        .computer_use_mode
         .is_some_and(|mode| !matches!(mode, crate::config::extended::ComputerUseMode::Disabled))
     {
         features.insert("computer-use".to_string());
@@ -798,7 +800,7 @@ fn compose_settings_doctor_health_internal(
     let platform = super::platform::detect_host_platform();
     // Container engine probes are applicable only when layered configuration
     // selects a container sandbox; the runtime mode then narrows the engine.
-    let engine_mode = resolved_container_engine_mode(cwd, input);
+    let engine_mode = resolved_container_engine_mode(input);
     if !matches!(
         engine_mode,
         super::safety_adapters::ContainerEngineMode::Disabled
@@ -1816,6 +1818,8 @@ mod tests {
             lsp_servers: vec![lsp],
             stdio_mcp: vec![mcp],
             sandbox_enabled: None,
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::default(),
+            computer_use_mode: None,
             selected_features: BTreeSet::new(),
             container_engine_mode: None,
         };
@@ -2036,6 +2040,8 @@ mod tests {
             )],
             stdio_mcp: vec![ConfiguredCommandInput::new("private-mcp", "mcp-server")],
             sandbox_enabled: Some(false),
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::default(),
+            computer_use_mode: None,
             selected_features: BTreeSet::new(),
             container_engine_mode: None,
         };
@@ -2096,6 +2102,7 @@ mod tests {
         );
         let mut input = IntegrationHealthComposeInput {
             sandbox_enabled: Some(true),
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::ContainerReadonly,
             ..Default::default()
         };
         let descriptors = invocation_descriptor_roster(tmp.path(), &input).unwrap();
@@ -2103,7 +2110,7 @@ mod tests {
             Some(super::super::safety_adapters::ContainerEngineMode::Auto);
         std::fs::write(&config_path, r#"{"sandbox":{"defaultMode":"off"}}"#).unwrap();
         assert_eq!(
-            resolved_container_engine_mode(tmp.path(), &input),
+            resolved_container_engine_mode(&input),
             super::super::safety_adapters::ContainerEngineMode::Auto,
             "the worker must honor the invocation freeze after config changes"
         );

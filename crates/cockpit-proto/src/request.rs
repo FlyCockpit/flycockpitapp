@@ -1858,6 +1858,128 @@ mod tests {
         }};
     }
 
+    macro_rules! fcor_source_rows {
+        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal);)+]) => {{
+            vec![$((stringify!($pattern), $tag, $fcor_schema)),+]
+        }};
+    }
+
+    fn request_source_field_schemas() -> std::collections::BTreeMap<String, String> {
+        let source = include_str!("request.rs");
+        let source = source
+            .split_once("pub enum Request {")
+            .expect("Request declaration")
+            .1
+            .split_once("\nimpl Request {")
+            .expect("Request impl boundary")
+            .0
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut source = source;
+        while let Some(start) = source.find("#[serde(") {
+            let end = source[start..].find(")]").expect("closed serde attribute") + 2;
+            source.replace_range(start..start + end, "");
+        }
+        let bytes = source.as_bytes();
+        let mut variants = std::collections::BTreeMap::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            while offset < bytes.len() && !bytes[offset].is_ascii_uppercase() {
+                offset += 1;
+            }
+            let start = offset;
+            while offset < bytes.len()
+                && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_')
+            {
+                offset += 1;
+            }
+            if start == offset {
+                break;
+            }
+            let variant = source[start..offset].to_owned();
+            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+                offset += 1;
+            }
+            if bytes.get(offset) != Some(&b'{') {
+                variants.insert(variant, "-".to_owned());
+                continue;
+            }
+            let body_start = offset + 1;
+            let mut depth = 1_i32;
+            offset += 1;
+            while offset < bytes.len() && depth > 0 {
+                match bytes[offset] {
+                    b'{' | b'(' | b'[' | b'<' => depth += 1,
+                    b'}' | b')' | b']' | b'>' => depth -= 1,
+                    _ => {}
+                }
+                offset += 1;
+            }
+            let mut body = source[body_start..offset - 1].to_owned();
+            body = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("///"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut fields = Vec::new();
+            let mut field_start = 0;
+            let mut nested = 0_i32;
+            for (index, character) in body.char_indices() {
+                match character {
+                    '<' | '(' | '[' | '{' => nested += 1,
+                    '>' | ')' | ']' | '}' => nested -= 1,
+                    ',' if nested == 0 => {
+                        fields.push(&body[field_start..index]);
+                        field_start = index + 1;
+                    }
+                    _ => {}
+                }
+            }
+            fields.push(&body[field_start..]);
+            let schema = fields
+                .into_iter()
+                .filter_map(|field| {
+                    let (name, ty) = field.split_once(':')?;
+                    Some(format!(
+                        "{}:{}",
+                        name.split_whitespace().collect::<String>(),
+                        ty.split_whitespace().collect::<String>()
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            variants.insert(
+                variant,
+                if schema.is_empty() {
+                    "-".into()
+                } else {
+                    schema
+                },
+            );
+        }
+        variants
+    }
+
+    #[test]
+    fn remote_operation_fcor_source_schema_cannot_drift() {
+        let declared = request_source_field_schemas();
+        for (pattern, tag, schema) in crate::command!(fcor_source_rows) {
+            let variant = pattern
+                .strip_prefix("Request :: ")
+                .unwrap_or(pattern)
+                .split([' ', '{'])
+                .next()
+                .unwrap();
+            assert_eq!(
+                declared.get(variant).map(String::as_str),
+                Some(schema),
+                "FCOR source schema drift for {tag} ({variant})"
+            );
+        }
+    }
+
     macro_rules! remote_evidence_json {
         () => {
             serde_json::Value::Null

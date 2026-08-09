@@ -3568,6 +3568,77 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
+/// Test-only adapter for the current daemon dispatch seam. Production accepts
+/// an envelope request id and a `Request`, but has no logical-attachment
+/// operation reservation API yet. Consequently every arrival reaches the
+/// side-effect closure, irrespective of any operation identity carried by a
+/// future remote transport.
+///
+/// Keep these characterizations beside the exhaustive dispatch matrix: the
+/// ledger implementation replaces this adapter with its production
+/// reservation seam. Until then, each assertion below must fail because the
+/// current dispatcher cannot linearize by `operation_id`.
+#[derive(Default)]
+struct CurrentDispatchWithoutOperationLedger {
+    side_effects: usize,
+}
+
+impl CurrentDispatchWithoutOperationLedger {
+    fn submit(
+        &mut self,
+        _request_id: Uuid,
+        _operation_id: Uuid,
+        _canonical_request_bytes: &[u8],
+    ) -> CharacterizedOperationOutcome {
+        self.side_effects += 1;
+        CharacterizedOperationOutcome::Applied(self.side_effects)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharacterizedOperationOutcome {
+    Applied(usize),
+    Conflict,
+}
+
+#[test]
+fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
+    let operation_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
+
+    let first = dispatch.submit(request_id, operation_id, b"canonical request");
+    let replay = dispatch.submit(request_id, operation_id, b"canonical request");
+
+    assert_eq!(replay, first, "same operation and bytes must replay");
+    assert_eq!(dispatch.side_effects, 1, "replay must not redispatch");
+}
+
+#[test]
+fn remote_operation_same_operation_different_bytes_conflicts() {
+    let operation_id = Uuid::new_v4();
+    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
+
+    let first = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request A");
+    let conflict = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request B");
+
+    assert_eq!(first, CharacterizedOperationOutcome::Applied(1));
+    assert_eq!(conflict, CharacterizedOperationOutcome::Conflict);
+    assert_eq!(dispatch.side_effects, 1, "conflict must not redispatch");
+}
+
+#[test]
+fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
+    let operation_id = Uuid::new_v4();
+    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
+
+    let first = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request");
+    let replay = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request");
+
+    assert_eq!(replay, first, "request id is transport-local correlation");
+    assert_eq!(dispatch.side_effects, 1, "fresh request id must not redispatch");
+}
+
 fn dispatch_matrix_class_for_command(
     kind: &'static str,
     authz: &'static str,

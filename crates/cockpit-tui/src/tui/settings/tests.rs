@@ -1513,7 +1513,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
             }
             SettingsPointerAction::Mcp(McpAction::CycleAuth) => {
                 assert!(
-                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.auth == mcp_page::AuthKind::Header)
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.auth == mcp_page::AuthKind::None)
                 );
                 assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }

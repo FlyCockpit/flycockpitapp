@@ -134,9 +134,12 @@ fn strip_optional_duplicate_marker<'a>(row: &'a str, context: &str) -> (&'a str,
 }
 
 fn validate_package_source_suffix(subject: &str, canonical: &str, context: &str, row: &str) {
-    let suffix = subject
+    let mut suffix = subject
         .strip_prefix(canonical)
         .unwrap_or_else(|| panic!("malformed {context} with trailing tokens: {row}"));
+    if let Some(without_proc_macro) = suffix.strip_prefix(" (proc-macro)") {
+        suffix = without_proc_macro;
+    }
     if suffix.is_empty() {
         return;
     }
@@ -147,7 +150,12 @@ fn validate_package_source_suffix(subject: &str, canonical: &str, context: &str,
     let source = suffix
         .strip_prefix(" (")
         .and_then(|suffix| suffix.strip_suffix(')'))
-        .filter(|source| !source.is_empty() && !source.contains('(') && !source.contains(')'))
+        .filter(|source| {
+            !source.is_empty()
+                && *source != "proc-macro"
+                && !source.contains('(')
+                && !source.contains(')')
+        })
         .unwrap_or_else(|| panic!("malformed {context} source-location suffix: {row}"));
     assert!(
         !source.chars().any(char::is_control),
@@ -213,6 +221,23 @@ fn tree_package_key_accepts_a_terminal_workspace_source_location() {
 #[should_panic(expected = "package row source-location suffix")]
 fn tree_package_key_rejects_nested_source_locations() {
     tree_package_key("cockpit-tui v0.1.0 ((/workspace/crates/cockpit-tui))");
+}
+
+#[test]
+fn tree_package_key_accepts_proc_macro_annotation_then_source() {
+    assert_eq!(
+        tree_package_key(
+            "monty-macros v0.0.18 (proc-macro) \
+             (https://github.com/pydantic/monty.git?rev=4cae0789#4cae0789)"
+        ),
+        "monty-macros@0.0.18"
+    );
+}
+
+#[test]
+#[should_panic(expected = "package row source-location suffix")]
+fn tree_package_key_rejects_repeated_proc_macro_annotations() {
+    tree_package_key("monty-macros v0.0.18 (proc-macro) (proc-macro)");
 }
 
 fn target_package_features(

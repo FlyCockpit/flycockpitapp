@@ -53,6 +53,42 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
     StoreCompressedResults(String),
 }
 
+#[derive(Debug)]
+pub(in crate::engine::driver) enum PrepareCompactionError {
+    Budget(crate::engine::compact::CompactBudgetError),
+    Draft(crate::engine::compact_draft::CompactDraftOutcome),
+}
+
+impl From<crate::engine::compact::CompactBudgetError> for PrepareCompactionError {
+    fn from(value: crate::engine::compact::CompactBudgetError) -> Self {
+        Self::Budget(value)
+    }
+}
+
+impl std::fmt::Display for PrepareCompactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::engine::compact_draft::CompactDraftOutcome as O;
+        match self {
+            Self::Budget(error) => error.fmt(f),
+            Self::Draft(O::Cancelled) => f.write_str("brief generation was cancelled"),
+            Self::Draft(O::ContextOverflow { .. }) => {
+                f.write_str("brief request did not fit the compact model")
+            }
+            Self::Draft(O::Deterministic { diagnostic }) => {
+                write!(f, "compact model rejected the brief request ({diagnostic})")
+            }
+            Self::Draft(O::TransientExhausted { diagnostic }) => write!(
+                f,
+                "compact model remained unavailable after a bounded retry ({diagnostic})"
+            ),
+            Self::Draft(O::Degenerate { .. }) => {
+                f.write_str("compact model returned an unusably short brief twice")
+            }
+            Self::Draft(O::Success(_)) => f.write_str("unexpected successful draft outcome"),
+        }
+    }
+}
+
 struct CompactBriefDraft {
     session: Arc<Session>,
     model: Arc<crate::engine::model::Model>,
@@ -664,17 +700,18 @@ impl Driver {
             self.shadow_brief = Some(ShadowBriefState::InFlight(task));
             return;
         }
-        let result = (&mut task.handle).await.ok().flatten();
+        let result = (&mut task.handle).await.ok();
         if task.generation == self.shadow_brief_generation
             && !task.cancel.is_cancelled()
-            && let Some(brief) = result
+            && let Some(crate::engine::compact_draft::CompactDraftOutcome::Success(success)) =
+                result
         {
             let ready = ShadowBriefReady {
                 generation: task.generation,
                 snapshot_history: task.snapshot_history,
                 snapshot_turns: task.snapshot_turns,
                 snapshot_tail_turns: task.snapshot_tail_turns,
-                brief,
+                brief: success.brief,
             };
             self.persist_ready_shadow_brief(&ready).await;
             self.shadow_brief = Some(ShadowBriefState::Ready(ready));
@@ -925,7 +962,7 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
         source: &'static str,
-    ) -> Result<PreparedCompaction, crate::engine::compact::CompactBudgetError> {
+    ) -> Result<PreparedCompaction, PrepareCompactionError> {
         use crate::engine::compact;
 
         let live_history = &self.stack.last().expect("stack never empty").history;
@@ -1046,10 +1083,10 @@ impl Driver {
                     ready.snapshot_tail_turns,
                 );
                 self.draft_brief_delta(tx, &tail_message_seqs, &ready.brief, revision_history)
-                    .await
+                    .await?
             } else {
                 self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
-                    .await
+                    .await?
             };
             let handoff =
                 compact::assemble_handoff(&brief, &appendix, &seed_tags, history_agent_available);
@@ -1061,7 +1098,7 @@ impl Driver {
                 self.effective_root_auto_compact_pct(&ctx_cfg),
             ) {
                 Ok(plan) => plan,
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
             if plan.tail_message_positions == tail_positions {
                 break (brief, handoff, plan);
@@ -1281,7 +1318,7 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
         history: Vec<Message>,
-    ) -> String {
+    ) -> Result<String, PrepareCompactionError> {
         let draft = self.compact_brief_draft(tx, history).await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
@@ -1295,9 +1332,7 @@ impl Driver {
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .unwrap_or_else(|| {
-            "(brief generation failed; rely on the state appendix below)".to_string()
-        })
+        .into_brief()
     }
 
     async fn draft_brief_delta(
@@ -1306,7 +1341,7 @@ impl Driver {
         tail_message_seqs: &[i64],
         shadow_brief: &str,
         new_turns: Vec<Message>,
-    ) -> String {
+    ) -> Result<String, PrepareCompactionError> {
         let draft = self.compact_brief_draft(tx, new_turns).await;
         let prompt_text = crate::engine::compact::shadow_delta_prompt(
             draft.prompt_override.as_deref(),
@@ -1320,9 +1355,20 @@ impl Driver {
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .unwrap_or_else(|| {
-            "(brief generation failed; rely on the state appendix below)".to_string()
-        })
+        .into_brief()
+    }
+}
+
+trait CompactDraftOutcomeExt {
+    fn into_brief(self) -> Result<String, PrepareCompactionError>;
+}
+
+impl CompactDraftOutcomeExt for crate::engine::compact_draft::CompactDraftOutcome {
+    fn into_brief(self) -> Result<String, PrepareCompactionError> {
+        match self {
+            Self::Success(success) => Ok(success.brief),
+            failure => Err(PrepareCompactionError::Draft(failure)),
+        }
     }
 }
 
@@ -1331,11 +1377,15 @@ async fn execute_compact_brief(
     prompt_text: String,
     purpose: &'static str,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Option<String> {
+) -> crate::engine::compact_draft::CompactDraftOutcome {
+    use crate::engine::compact_draft::{
+        CompactDraftOutcome as O, CompactDraftSuccess, CompactFitRung, CompactInputCoverage,
+        CompactSampleClass, MAX_WIRE_SAMPLES_PER_NODE,
+    };
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
         if cancel.is_cancelled() {
-            return None;
+            return O::Cancelled;
         }
         crate::sync::lock_or_recover(calls).push(TestCompactBriefCall {
             purpose,
@@ -1351,73 +1401,118 @@ async fn execute_compact_brief(
                 &serde_json::json!({ "usage": null, "purpose": purpose }),
             )
             .await;
-        return Some("test compact brief".to_string());
+        return O::Success(CompactDraftSuccess {
+            brief: "test compact brief".to_string(),
+            fit_rung: CompactFitRung::Verbatim,
+            input_coverage: CompactInputCoverage::Full,
+            attempts: 1,
+        });
     }
-    let call_id = uuid::Uuid::new_v4();
-    match draft
-        .model
-        .complete_captured(
-            &draft.system,
-            &draft.history,
-            Message::user(prompt_text),
-            &[],
-            draft.params,
-            &draft.agent_name,
-            None,
-            cancel,
-            None,
-        )
-        .await
-    {
-        Ok(((_, choice, usage), captured, _timing)) if !cancel.is_cancelled() => {
-            if let Err(e) = draft
-                .session
-                .record_inference_request(
-                    call_id,
-                    &captured,
-                    crate::db::session_log::InferenceRequestStatus::Completed,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "compact brief: record_inference_request failed");
+    let mut last_transient = String::new();
+    for attempt in 1..=MAX_WIRE_SAMPLES_PER_NODE {
+        let call_id = uuid::Uuid::new_v4();
+        let sampled = draft
+            .model
+            .complete_captured(
+                &draft.system,
+                &draft.history,
+                Message::user(prompt_text.clone()),
+                &[],
+                draft.params.clone(),
+                &draft.agent_name,
+                None,
+                cancel,
+                None,
+            )
+            .await;
+        match sampled {
+            Ok(((_, choice, usage), captured, _timing)) if !cancel.is_cancelled() => {
+                if let Err(e) = draft
+                    .session
+                    .record_inference_request(
+                        call_id,
+                        &captured,
+                        crate::db::session_log::InferenceRequestStatus::Completed,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "compact brief: record_inference_request failed");
+                }
+                if let Some(u) = usage
+                    && let Err(e) = draft.session.record_usage_utility(call_id, u).await
+                {
+                    tracing::warn!(error = %e, "compact brief: record_usage_utility failed");
+                }
+                let usage_json = usage.map(|u| {
+                    serde_json::json!({
+                        "input_tokens": u.input_tokens,
+                        "output_tokens": u.output_tokens,
+                        "cached_input_tokens": u.cached_input_tokens,
+                    })
+                });
+                if let Err(e) = draft
+                    .session
+                    .record_event(
+                        crate::db::session_log::SessionEventKind::InferenceRequest,
+                        Some(&draft.agent_name),
+                        Some(&call_id.to_string()),
+                        &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "compact brief: record inference_request event failed");
+                }
+                let text = crate::engine::message::extract_text(&choice);
+                let cleaned_chars = crate::engine::compact_draft::cleaned_brief_chars(&text);
+                if crate::engine::compact_draft::is_degenerate_brief(&text) {
+                    if attempt < MAX_WIRE_SAMPLES_PER_NODE {
+                        continue;
+                    }
+                    return O::Degenerate {
+                        non_whitespace_chars: cleaned_chars,
+                    };
+                }
+                return O::Success(CompactDraftSuccess {
+                    brief: text,
+                    fit_rung: CompactFitRung::Verbatim,
+                    input_coverage: CompactInputCoverage::Full,
+                    attempts: attempt,
+                });
             }
-            if let Some(u) = usage
-                && let Err(e) = draft.session.record_usage_utility(call_id, u).await
-            {
-                tracing::warn!(error = %e, "compact brief: record_usage_utility failed");
+            Ok(_) => return O::Cancelled,
+            Err(_) if cancel.is_cancelled() => return O::Cancelled,
+            Err(e) => {
+                tracing::warn!(error = %e, purpose, "compact: brief generation failed");
+                let diagnostic = crate::engine::compact_draft::bounded_diagnostic(&e.to_string());
+                let completion_error = e.downcast_ref::<rig::completion::CompletionError>();
+                let status =
+                    completion_error.and_then(crate::engine::model::rig_boundary::http_status_of);
+                let typed_timeout = completion_error
+                    .and_then(crate::engine::model::rig_boundary::stream_timeout_kind)
+                    .is_some();
+                match crate::engine::compact_draft::classify_sample_error(
+                    false,
+                    &e.to_string(),
+                    status,
+                    typed_timeout,
+                ) {
+                    CompactSampleClass::Cancelled => return O::Cancelled,
+                    CompactSampleClass::ContextOverflow => {
+                        return O::ContextOverflow { diagnostic };
+                    }
+                    CompactSampleClass::Deterministic => return O::Deterministic { diagnostic },
+                    CompactSampleClass::Transient if attempt < MAX_WIRE_SAMPLES_PER_NODE => {
+                        last_transient = diagnostic;
+                    }
+                    CompactSampleClass::Transient => {
+                        return O::TransientExhausted { diagnostic };
+                    }
+                }
             }
-            let usage_json = usage.map(|u| {
-                serde_json::json!({
-                    "input_tokens": u.input_tokens,
-                    "output_tokens": u.output_tokens,
-                    "cached_input_tokens": u.cached_input_tokens,
-                })
-            });
-            if let Err(e) = draft
-                .session
-                .record_event(
-                    crate::db::session_log::SessionEventKind::InferenceRequest,
-                    Some(&draft.agent_name),
-                    Some(&call_id.to_string()),
-                    &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "compact brief: record inference_request event failed");
-            }
-            let text = crate::engine::message::extract_text(&choice);
-            Some(if text.trim().is_empty() {
-                "(model produced no brief; rely on the state appendix below)".to_string()
-            } else {
-                text
-            })
         }
-        Ok(_) => None,
-        Err(_) if cancel.is_cancelled() => None,
-        Err(e) => {
-            tracing::warn!(error = %e, purpose, "compact: brief generation failed");
-            Some("(brief generation failed; rely on the state appendix below)".to_string())
-        }
+    }
+    O::TransientExhausted {
+        diagnostic: last_transient,
     }
 }
 /// Estimate the wire-side token total of a message history via the

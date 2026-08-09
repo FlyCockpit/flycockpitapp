@@ -938,7 +938,7 @@ struct ShadowBriefInFlight {
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
-    handle: tokio::task::JoinHandle<Option<String>>,
+    handle: tokio::task::JoinHandle<crate::engine::compact_draft::CompactDraftOutcome>,
 }
 
 struct ShadowBriefReady {

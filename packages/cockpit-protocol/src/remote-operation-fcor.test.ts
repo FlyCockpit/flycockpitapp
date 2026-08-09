@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
 import {
+  CanonicalParamsV1,
   checkedFcorV1Size,
   encodeFcorV1,
   hashFcorV1,
@@ -68,5 +69,26 @@ describe("FCOR v1", () => {
       if (shape.valid) expect(call(), shape.name).toBeInstanceOf(Uint8Array);
       else expect(call, shape.name).toThrow();
     }
+    const primitive = new CanonicalParamsV1();
+    primitive.pushU8(0xff);
+    primitive.pushBool(true);
+    primitive.pushU16(0x1234);
+    primitive.pushU32(0x01020304);
+    primitive.pushU64(0x0102030405060708n);
+    primitive.pushI64(-2n);
+    primitive.pushUuid(Uint8Array.from({ length: 16 }, (_, index) => index));
+    expect(Buffer.from(primitive.finish()).toString("hex")).toBe(
+      vector.canonicalParams.primitiveHex,
+    );
+    const map = new CanonicalParamsV1();
+    map.pushStringMap([
+      ["b", "y"],
+      ["a", "x"],
+    ]);
+    expect(Buffer.from(map.finish()).toString("hex")).toBe(
+      vector.canonicalParams.sortedStringMapHex,
+    );
+    expect(() => new CanonicalParamsV1().pushString("e\u0301")).toThrow();
+    expect(() => new CanonicalParamsV1().pushString("nul\0value")).toThrow();
   });
 });

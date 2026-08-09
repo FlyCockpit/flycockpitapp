@@ -26,6 +26,92 @@ export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 const U32_MAX = 0xffffffff;
 export const MAX_FCOR_V1_BYTES = U32_MAX;
 
+export class CanonicalParamsV1 {
+  readonly #bytes: number[] = [];
+  pushU8(value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > 0xff) throw new Error("u8 out of range");
+    this.#bytes.push(value);
+  }
+  pushBool(value: boolean): void {
+    this.pushU8(value ? 1 : 0);
+  }
+  pushU16(value: number): void {
+    this.pushFixed(value, 2);
+  }
+  pushU32(value: number): void {
+    this.pushFixed(value, 4);
+  }
+  pushU64(value: bigint): void {
+    this.pushBigFixed(value, 8);
+  }
+  pushI64(value: bigint): void {
+    this.pushBigFixed(BigInt.asUintN(64, value), 8);
+  }
+  pushUuid(value: Uint8Array): void {
+    if (value.length !== 16) throw new Error("UUID must be 16 raw bytes");
+    this.#bytes.push(...value);
+  }
+  pushBytes(value: Uint8Array): void {
+    if (value.length > U32_MAX) throw new Error("canonical bytes exceed u32 length");
+    this.pushU32(value.length);
+    this.#bytes.push(...value);
+  }
+  pushString(value: string): void {
+    if (value.includes("\0") || value.normalize("NFC") !== value) {
+      throw new Error("canonical string must be NUL-free NFC");
+    }
+    this.pushBytes(new TextEncoder().encode(value));
+  }
+  pushOptional<T>(
+    value: T | undefined,
+    encode: (params: CanonicalParamsV1, value: T) => void,
+  ): void {
+    this.pushU8(value === undefined ? 0 : 1);
+    if (value !== undefined) encode(this, value);
+  }
+  pushStringMap(entries: Iterable<readonly [string, string]>): void {
+    const encoded = [...entries].map(([key, value]) => {
+      const encodedKey = new CanonicalParamsV1();
+      encodedKey.pushString(key);
+      const encodedValue = new CanonicalParamsV1();
+      encodedValue.pushString(value);
+      return {
+        normalizedKey: key.normalize("NFC"),
+        key: encodedKey.finish(),
+        value: encodedValue.finish(),
+      };
+    });
+    encoded.sort((left, right) => compareBytes(left.key, right.key));
+    for (let index = 1; index < encoded.length; index += 1) {
+      if (encoded[index - 1].normalizedKey === encoded[index].normalizedKey)
+        throw new Error("duplicate NFC map key");
+    }
+    this.pushU32(encoded.length);
+    for (const entry of encoded) this.#bytes.push(...entry.key, ...entry.value);
+  }
+  finish(): Uint8Array {
+    return Uint8Array.from(this.#bytes);
+  }
+  private pushFixed(value: number, width: number): void {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 2 ** (width * 8) - 1)
+      throw new Error("integer out of range");
+    this.pushBigFixed(BigInt(value), width);
+  }
+  private pushBigFixed(value: bigint, width: number): void {
+    if (value < 0n || value >= 1n << BigInt(width * 8)) throw new Error("integer out of range");
+    for (let shift = width - 1; shift >= 0; shift -= 1)
+      this.#bytes.push(Number((value >> BigInt(shift * 8)) & 0xffn));
+  }
+}
+
+function compareBytes(left: Uint8Array, right: Uint8Array): number {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return left.length - right.length;
+}
+
 export function checkedFcorV1Size(
   requestKindLength: number,
   resourceValueLengths: readonly number[],

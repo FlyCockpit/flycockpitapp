@@ -2,6 +2,8 @@
 
 use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+use uuid::Uuid;
 
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
 pub const FCOR_SCHEMA_VERSION: u8 = 1;
@@ -39,6 +41,93 @@ pub fn checked_fcor_v1_size(
     }
     ensure!(total <= MAX_FCOR_V1_BYTES, "FCOR exceeds maximum size");
     Ok(total)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CanonicalParamsV1(Vec<u8>);
+
+impl CanonicalParamsV1 {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+    pub fn push_u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+    pub fn push_bool(&mut self, value: bool) {
+        self.push_u8(u8::from(value));
+    }
+    pub fn push_u16(&mut self, value: u16) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+    pub fn push_u32(&mut self, value: u32) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+    pub fn push_u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+    pub fn push_i64(&mut self, value: i64) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+    pub fn push_uuid(&mut self, value: Uuid) {
+        self.0.extend_from_slice(value.as_bytes());
+    }
+
+    pub fn push_bytes(&mut self, value: &[u8]) -> Result<()> {
+        self.push_u32(u32::try_from(value.len())?);
+        self.0.extend_from_slice(value);
+        Ok(())
+    }
+
+    pub fn push_string(&mut self, value: &str) -> Result<()> {
+        ensure!(!value.contains('\0'), "canonical string contains NUL");
+        ensure!(value.nfc().eq(value.chars()), "canonical string is not NFC");
+        self.push_bytes(value.as_bytes())
+    }
+
+    pub fn push_optional<T>(
+        &mut self,
+        value: Option<&T>,
+        encode: impl FnOnce(&mut Self, &T) -> Result<()>,
+    ) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.push_u8(1);
+                encode(self, value)
+            }
+            None => {
+                self.push_u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn push_string_map<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<()> {
+        let mut encoded = Vec::new();
+        for (key, value) in entries {
+            let mut key_bytes = Self::new();
+            key_bytes.push_string(key)?;
+            let mut value_bytes = Self::new();
+            value_bytes.push_string(value)?;
+            encoded.push((key.nfc().collect::<String>(), key_bytes.0, value_bytes.0));
+        }
+        encoded.sort_by(|left, right| left.1.cmp(&right.1));
+        ensure!(
+            encoded.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "duplicate NFC map key"
+        );
+        self.push_u32(u32::try_from(encoded.len())?);
+        for (_, key, value) in encoded {
+            self.0.extend(key);
+            self.0.extend(value);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +358,28 @@ mod tests {
             );
             assert_eq!(result.is_ok(), shape["valid"].as_bool().unwrap());
         }
+        let mut primitive = CanonicalParamsV1::new();
+        primitive.push_u8(0xff);
+        primitive.push_bool(true);
+        primitive.push_u16(0x1234);
+        primitive.push_u32(0x01020304);
+        primitive.push_u64(0x0102030405060708);
+        primitive.push_i64(-2);
+        primitive.push_uuid(Uuid::from_bytes(core::array::from_fn(|index| index as u8)));
+        assert_eq!(
+            hex(&primitive.into_bytes()),
+            fixture["canonicalParams"]["primitiveHex"].as_str().unwrap()
+        );
+        let mut map = CanonicalParamsV1::new();
+        map.push_string_map([("b", "y"), ("a", "x")]).unwrap();
+        assert_eq!(
+            hex(&map.into_bytes()),
+            fixture["canonicalParams"]["sortedStringMapHex"]
+                .as_str()
+                .unwrap()
+        );
+        assert!(CanonicalParamsV1::new().push_string("e\u{301}").is_err());
+        assert!(CanonicalParamsV1::new().push_string("nul\0value").is_err());
     }
 
     fn hex(bytes: &[u8]) -> String {

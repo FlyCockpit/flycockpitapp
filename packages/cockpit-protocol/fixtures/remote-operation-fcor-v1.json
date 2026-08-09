@@ -79,6 +79,10 @@
     { "name": "UUID 16", "kind": "session_uuid", "valueLength": 16, "valid": true },
     { "name": "UUID 17", "kind": "session_uuid", "valueLength": 17, "valid": false }
   ],
+  "canonicalParams": {
+    "primitiveHex": "ff011234010203040102030405060708fffffffffffffffe000102030405060708090a0b0c0d0e0f",
+    "sortedStringMapHex": "000000020000000161000000017800000001620000000179"
+  },
   "malformed": [
     { "name": "magic", "replaceByte": [0, 0] },
     { "name": "version", "replaceByte": [4, 2] },

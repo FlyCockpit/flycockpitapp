@@ -21,6 +21,43 @@ use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 impl App {
+    fn allocate_paste_request(
+        &mut self,
+        source: crate::tui::structured_paste::PasteSource,
+    ) -> Option<crate::tui::structured_paste::PasteRequest> {
+        let generation = self.next_paste_generation.checked_add(1)?;
+        self.next_paste_generation = generation;
+        let id = uuid::Uuid::new_v4();
+        let host = crate::tui::structured_paste::HostIdentity {
+            client_instance_id: self.paste_client_instance_id,
+            connection_epoch: self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| {
+                    runner
+                        .attachment_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or_default(),
+            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
+            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
+        };
+        let now = self.monotonic_origin.elapsed();
+        if self.paste_correlations.claim(id, host, now)
+            != crate::tui::structured_paste::DedupResult::Claimed
+        {
+            return None;
+        }
+        let _ = self.paste_correlations.commit(id, host, now);
+        Some(crate::tui::structured_paste::PasteRequest {
+            paste_generation: generation,
+            paste_correlation_id: id,
+            source,
+            host,
+        })
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         let composer_before = self.composer.text().to_string();
         let exit = self.handle_key_inner(key);
@@ -2216,7 +2253,7 @@ impl App {
             }
         });
         let host = crate::tui::structured_paste::HostIdentity {
-            client_instance_id: uuid::Uuid::nil(),
+            client_instance_id: self.paste_client_instance_id,
             connection_epoch: self
                 .agent_runner
                 .as_ref()
@@ -3007,35 +3044,18 @@ impl App {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
-            let Some(request_generation) = self.next_paste_generation.checked_add(1) else {
+            let Some(request) =
+                self.allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            self.next_paste_generation = request_generation;
-            let request_id = uuid::Uuid::new_v4();
+            let request_id = request.paste_correlation_id;
+            let request_generation = request.paste_generation;
             self.pending_paste_probes.insert(
                 request_id,
                 super::PendingPasteProbe {
-                    request: crate::tui::structured_paste::PasteRequest {
-                        paste_generation: request_generation,
-                        paste_correlation_id: request_id,
-                        source: crate::tui::structured_paste::PasteSource::NativePaste,
-                        host: crate::tui::structured_paste::HostIdentity {
-                            client_instance_id: uuid::Uuid::nil(),
-                            connection_epoch: self
-                                .agent_runner
-                                .as_ref()
-                                .and_then(|runner| runner.as_ref().ok())
-                                .map(|runner| {
-                                    runner
-                                        .attachment_epoch
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                })
-                                .unwrap_or_default(),
-                            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
-                            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
-                        },
-                    },
+                    request,
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),
@@ -3075,35 +3095,18 @@ impl App {
         if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data)
             .filter(|path| crate::tui::image_path_probe::is_generation_scoped(path))
         {
-            let Some(request_generation) = self.next_paste_generation.checked_add(1) else {
+            let Some(request) = self
+                .allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
+            else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            self.next_paste_generation = request_generation;
-            let request_id = uuid::Uuid::new_v4();
+            let request_id = request.paste_correlation_id;
+            let request_generation = request.paste_generation;
             self.pending_paste_probes.insert(
                 request_id,
                 super::PendingPasteProbe {
-                    request: crate::tui::structured_paste::PasteRequest {
-                        paste_generation: request_generation,
-                        paste_correlation_id: request_id,
-                        source: crate::tui::structured_paste::PasteSource::BracketedPty,
-                        host: crate::tui::structured_paste::HostIdentity {
-                            client_instance_id: uuid::Uuid::nil(),
-                            connection_epoch: self
-                                .agent_runner
-                                .as_ref()
-                                .and_then(|runner| runner.as_ref().ok())
-                                .map(|runner| {
-                                    runner
-                                        .attachment_epoch
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                })
-                                .unwrap_or_default(),
-                            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
-                            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
-                        },
-                    },
+                    request,
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),

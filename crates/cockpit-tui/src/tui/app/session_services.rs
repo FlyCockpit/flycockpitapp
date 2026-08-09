@@ -93,6 +93,47 @@ impl App {
             self.report_session_switch_busy("/new");
             return Ok(true);
         }
+        let (switch_sequence, switch_id) = match self.pending_session_switch_order {
+            Some(existing) => existing,
+            None => {
+                let switch_id = uuid::Uuid::new_v4();
+                let sequence = self
+                    .submission_order
+                    .enqueue(crate::tui::structured_paste::OrderedIntent::SessionSwitch(
+                        switch_id,
+                    ))
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                self.pending_session_switch_order = Some((sequence, switch_id));
+                (sequence, switch_id)
+            }
+        };
+        let cancelled = self
+            .submission_fences
+            .iter()
+            .filter_map(|(id, fence)| {
+                (fence.fence_sequence < switch_sequence
+                    && matches!(
+                        fence.lifecycle,
+                        crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
+                            | crate::tui::structured_paste::FenceLifecycle::Ready
+                    ))
+                .then_some((*id, fence.fence_sequence))
+            })
+            .collect::<Vec<_>>();
+        for (id, sequence) in cancelled {
+            self.submission_fences.remove(&id);
+            self.deferred_fence_dispatches.remove(&id);
+            self.pending_paste_probes
+                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.submission_order.cancel(sequence);
+        }
+        if !matches!(
+            self.submission_order.front(),
+            Some((sequence, crate::tui::structured_paste::OrderedIntent::SessionSwitch(id)))
+                if sequence == switch_sequence && id == switch_id
+        ) {
+            return Ok(changed);
+        }
         self.pending_new_session = false;
 
         let switch_task = match self.agent_runner.as_ref() {
@@ -119,6 +160,9 @@ impl App {
             // immediately and let the normal display/first-submit attach
             // create a fresh session from `session_id: None`.
             self.commit_new_session_without_swappable_runner();
+            let _ = self.submission_order.complete(switch_sequence);
+            self.pending_session_switch_order = None;
+            self.dispatch_next_ready_paste_fence();
             self.clear_terminal_after_committed_new_session(&mut clear_terminal);
         }
         Ok(true)

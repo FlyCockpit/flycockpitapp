@@ -916,14 +916,23 @@ mod tests {
             cache.claim(id, 1, host, Duration::from_millis(2_000)),
             DedupResult::Claimed
         );
+        assert_eq!(
+            cache.claim(id, 1, host, Duration::from_millis(2_001)),
+            DedupResult::Busy,
+            "the 2,000ms retry is a fresh claim with its own horizon"
+        );
 
         let mut full = PasteCorrelationCache::default();
-        for _ in 0..CORRELATION_CAPACITY {
+        for index in 0..CORRELATION_CAPACITY {
             assert_eq!(
                 full.claim(Uuid::new_v4(), 1, host, Duration::ZERO),
                 DedupResult::Claimed
             );
+            if index + 1 == 63 {
+                assert_eq!(full.entries.len(), 63);
+            }
         }
+        assert_eq!(full.entries.len(), 64);
         assert_eq!(
             full.claim(Uuid::new_v4(), 1, host, Duration::ZERO),
             DedupResult::Busy
@@ -1051,16 +1060,62 @@ mod tests {
 
     #[test]
     fn paste_fence_probe_and_fifo_completion() {
+        let host = HostIdentity {
+            client_instance_id: Uuid::new_v4(),
+            connection_epoch: 1,
+            session_id: Uuid::new_v4(),
+            terminal_generation: 2,
+        };
+        let mut fence = pending_fence(1, host);
+        let first = match &fence.slots[0] {
+            PasteSlotState::Pending { request, .. } => request.clone(),
+            _ => unreachable!(),
+        };
+        let mut second = first.clone();
+        second.paste_correlation_id = Uuid::new_v4();
+        second.paste_generation += 1;
+        let source_draft_generation = fence.source_draft_generation;
+        fence.slots.push(PasteSlotState::Pending {
+            request: second.clone(),
+            original_offset: 1,
+        });
+        assert!(fence.settle_slot(
+            second.paste_correlation_id,
+            second.paste_generation,
+            source_draft_generation,
+            Some(("second".into(), "second-wire".into(), None))
+        ));
+        assert_eq!(fence.lifecycle, FenceLifecycle::AwaitingProbes);
+        assert!(matches!(fence.slots[0], PasteSlotState::Pending { .. }));
+        assert!(matches!(
+            fence.slots[1],
+            PasteSlotState::Ready {
+                original_offset: 1,
+                ..
+            }
+        ));
+        assert!(fence.settle_slot(
+            first.paste_correlation_id,
+            first.paste_generation,
+            source_draft_generation,
+            None
+        ));
+        assert_eq!(fence.lifecycle, FenceLifecycle::Ready);
+        assert!(matches!(fence.slots[0], PasteSlotState::Unavailable));
+
         let mut coordinator = SubmissionOrderCoordinator::default();
-        let first = coordinator
+        let first_sequence = coordinator
             .enqueue(OrderedIntent::Fence(Uuid::new_v4()))
             .unwrap();
-        let second = coordinator
+        let second_sequence = coordinator
             .enqueue(OrderedIntent::ModelSwitch(Uuid::new_v4()))
             .unwrap();
-        assert!(!coordinator.complete(second));
-        assert!(coordinator.complete(first));
-        assert!(!coordinator.complete(second));
+        assert_eq!(coordinator.front().unwrap().0, first_sequence);
+        assert!(!coordinator.complete(second_sequence));
+        assert_eq!(coordinator.front().unwrap().0, first_sequence);
+        assert!(coordinator.complete(first_sequence));
+        assert!(coordinator.front().is_none());
+        assert!(!coordinator.complete(second_sequence));
     }
 
     #[test]
@@ -1109,6 +1164,35 @@ mod tests {
             let view_generation = fence.view_generation;
             assert!(fence.cancel_if_host_changed(changed, view_generation));
         }
+
+        let mut fence = pending_fence(1, baseline);
+        let (request_id, paste_generation) = match &fence.slots[0] {
+            PasteSlotState::Pending { request, .. } => {
+                (request.paste_correlation_id, request.paste_generation)
+            }
+            _ => unreachable!(),
+        };
+        let source_draft_generation = fence.source_draft_generation;
+        assert!(!fence.settle_slot(
+            Uuid::new_v4(),
+            paste_generation,
+            source_draft_generation,
+            None
+        ));
+        assert!(!fence.settle_slot(
+            request_id,
+            paste_generation + 1,
+            source_draft_generation,
+            None
+        ));
+        assert!(!fence.settle_slot(
+            request_id,
+            paste_generation,
+            source_draft_generation + 1,
+            None
+        ));
+        let next_view_generation = fence.view_generation + 1;
+        assert!(fence.cancel_if_host_changed(baseline, next_view_generation));
     }
 
     #[test]

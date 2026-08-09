@@ -1,5 +1,9 @@
 use super::*;
 
+fn next_active_model_state_generation(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 struct DefaultModelUpdateResult {
     outcome: crate::daemon::proto::DefaultModelUpdateOutcome,
     authoritative_selection: Option<crate::config::providers::ActiveModelRef>,
@@ -289,7 +293,7 @@ impl Driver {
         // ActiveModelState. Once the wire generation space is exhausted we
         // cannot preserve that fence, so fail closed before mutating either
         // the live model or its durable default.
-        if self.active_model_state_generation == u64::MAX {
+        if next_active_model_state_generation(self.active_model_state_generation).is_none() {
             self.emit_model_selection_result(
                 selection_id,
                 &target,
@@ -780,7 +784,9 @@ impl Driver {
             if transaction.correlation.session_id() != self.session.id {
                 continue;
             }
-            let Some(generation) = self.active_model_state_generation.checked_add(1) else {
+            let Some(generation) =
+                next_active_model_state_generation(self.active_model_state_generation)
+            else {
                 tracing::error!(
                     session_id = %self.session.id,
                     "cannot reconcile a recovered model transaction: active model state generation space is exhausted"
@@ -1398,8 +1404,7 @@ impl Driver {
                 }
                 Ok(DefaultModelUpdateResult::verified(
                     target.clone(),
-                    self.active_model_state_generation
-                        .checked_add(1)
+                    next_active_model_state_generation(self.active_model_state_generation)
                         .expect("model selection rejects an exhausted generation"),
                     "test".to_string(),
                     false,
@@ -1490,7 +1495,9 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         default_selection_override: Option<crate::config::providers::ActiveModelRef>,
     ) {
-        let Some(generation) = self.active_model_state_generation.checked_add(1) else {
+        let Some(generation) =
+            next_active_model_state_generation(self.active_model_state_generation)
+        else {
             tracing::error!(
                 session_id = %self.session.id,
                 "cannot emit active model state: generation space is exhausted"
@@ -1763,6 +1770,20 @@ impl Driver {
                 *content = rebuilt;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_paste_generation_tests {
+    use super::next_active_model_state_generation;
+
+    #[test]
+    fn paste_fence_model_generation_checked_overflow() {
+        assert_eq!(
+            next_active_model_state_generation(u64::MAX - 1),
+            Some(u64::MAX)
+        );
+        assert_eq!(next_active_model_state_generation(u64::MAX), None);
     }
 }
 

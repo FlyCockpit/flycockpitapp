@@ -791,12 +791,30 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             ) => Some(action.clone()),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        populated_actions.len(),
-        2,
-        "selected populated Harnesses row exposes Open and Delete"
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Open(
+            pointer_actions::StableRowId("alpha".into()),
+        )))
     );
+    assert!(
+        populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Delete(
+            pointer_actions::StableRowId("alpha".into()),
+        )))
+    );
+    for action in &populated_actions {
+        let SettingsPointerAction::Harnesses(
+            HarnessesAction::Open(id) | HarnessesAction::Delete(id),
+        ) = action
+        else {
+            unreachable!("populated source filter admitted a non-row action");
+        };
+        assert!(
+            populated.extended.harnesses.contains_key(&id.0),
+            "rendered Harnesses identity must name a live config entry: {}",
+            id.0
+        );
+    }
     for action in populated_actions {
         match &action {
             SettingsPointerAction::Harnesses(HarnessesAction::Open(id)) => {

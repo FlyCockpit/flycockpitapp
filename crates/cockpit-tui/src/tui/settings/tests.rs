@@ -1398,10 +1398,19 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
     let source_tmp = TempDir::new().unwrap();
     let source = fixture(&source_tmp);
     let list_actions = rendered_actions(&source);
+    let docs = pointer_actions::McpServerId("docs".into());
     assert_eq!(
-        list_actions.len(),
-        6,
-        "populated OAuth row publishes full list controls"
+        list_actions,
+        [
+            SettingsPointerAction::Mcp(McpAction::Open(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Add),
+            SettingsPointerAction::Mcp(McpAction::ToggleEnabled(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Authenticate(docs.clone())),
+            SettingsPointerAction::Mcp(McpAction::Delete(docs)),
+        ]
+        .into_iter()
+        .collect(),
+        "populated OAuth row publishes its exact initial control set"
     );
 
     for action in list_actions {

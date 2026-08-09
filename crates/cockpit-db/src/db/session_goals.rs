@@ -712,33 +712,65 @@ impl Db {
         serde_json::from_str::<serde_json::Value>(policy_json)
             .context("validating resolved goal policy")?;
         let policy_json = policy_json.to_owned();
-        self.write(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let conn = &tx;
-            let open_dispositiones = open_disposition_placeholders(2);
-            let existing_params = bind_session_and_open_dispositiones(session_id.to_string());
-            let existing_param_refs = param_refs(&existing_params);
-            let existing: Option<String> = conn
-                .query_row(
-                    &format!(
-                        "SELECT id FROM session_goals
+        self.transaction(move |conn| {
+            Self::create_session_goal_with_policy_conn(
+                conn,
+                session_id,
+                id,
+                now,
+                &project_id,
+                &objective,
+                context.as_deref(),
+                token_budget,
+                &policy_json,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_goal_with_policy_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        id: Uuid,
+        now: i64,
+        project_id: &str,
+        objective: &str,
+        context: Option<&str>,
+        token_budget: i64,
+        policy_json: &str,
+    ) -> Result<SessionGoal> {
+        anyhow::ensure!(
+            !objective.trim().is_empty(),
+            "goal objective must not be empty"
+        );
+        anyhow::ensure!(token_budget > 0, "token_budget must be positive");
+        serde_json::from_str::<serde_json::Value>(policy_json)
+            .context("validating resolved goal policy")?;
+        let open_dispositiones = open_disposition_placeholders(2);
+        let existing_params = bind_session_and_open_dispositiones(session_id.to_string());
+        let existing_param_refs = param_refs(&existing_params);
+        let existing: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT id FROM session_goals
                      WHERE session_id = ?1
                        AND disposition IN ({open_dispositiones})
                      LIMIT 1"
-                    ),
-                    existing_param_refs.as_slice(),
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("checking existing session goal")?;
-            if existing.is_some() {
-                anyhow::bail!("session already has an open goal");
-            }
-            let token_baseline: i64 = conn.query_row(
+                ),
+                existing_param_refs.as_slice(),
+                |row| row.get(0),
+            )
+            .optional()
+            .context("checking existing session goal")?;
+        if existing.is_some() {
+            anyhow::bail!("session already has an open goal");
+        }
+        let token_baseline: i64 = conn.query_row(
                 "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM inference_calls WHERE session_id = ?1",
                 params![session_id.to_string()], |row| row.get(0),
             )?;
-            conn.execute(
+        conn.execute(
                 "INSERT INTO session_goals
                     (id, session_id, project_id, objective, context, disposition, phase,
                      attempt_generation, resolved_policy_json, token_budget, token_accounting_baseline,
@@ -749,7 +781,7 @@ impl Db {
                     session_id.to_string(),
                     project_id,
                     objective,
-                    clean_opt(context.as_deref()),
+                    clean_opt(context),
                     policy_json,
                     token_budget,
                     token_baseline,
@@ -763,36 +795,32 @@ impl Db {
                 ],
             )
             .context("inserting session_goal")?;
-            let job_id = Uuid::new_v4();
-            let planner_request = serde_json::json!({
-                "goal_id": id,
-                "attempt_generation": 1,
-                "role": "planner",
-                "objective": objective,
-                "tool_policy": "read_only_workspace",
-                "instructions": "Investigate read-only. Return only one JSON object matching response_schema.",
-                "response_schema": {
-                    "kind": "non-empty string",
-                    "acceptance": ["small numbered observable outcomes"],
-                    "verification_gates": ["required pass/fail gates"],
-                    "evidence_collection": ["evidence to collect"],
-                    "non_goals": ["explicit exclusions"],
-                    "assumed_scope": ["scope assumptions"],
-                    "implementation_checklist": ["guidance-only steps"]
-                }
-            });
-            conn.execute(
+        let job_id = Uuid::new_v4();
+        let planner_request = serde_json::json!({
+            "goal_id": id,
+            "attempt_generation": 1,
+            "role": "planner",
+            "objective": objective,
+            "tool_policy": "read_only_workspace",
+            "instructions": "Investigate read-only. Return only one JSON object matching response_schema.",
+            "response_schema": {
+                "kind": "non-empty string",
+                "acceptance": ["small numbered observable outcomes"],
+                "verification_gates": ["required pass/fail gates"],
+                "evidence_collection": ["evidence to collect"],
+                "non_goals": ["explicit exclusions"],
+                "assumed_scope": ["scope assumptions"],
+                "implementation_checklist": ["guidance-only steps"]
+            }
+        });
+        conn.execute(
                 "INSERT INTO goal_control_jobs
                     (job_id, goal_id, attempt_generation, role, slot, request_json, state, created_at, updated_at)
                  VALUES (?1, ?2, 1, 'planner', 0, ?3, 'pending', ?4, ?4)",
                 params![job_id.to_string(), id.to_string(), planner_request.to_string(), now],
             )
             .context("registering initial goal planner")?;
-            let goal = load_goal(conn, session_id, id)?;
-            tx.commit()?;
-            Ok(goal)
-        })
-        .await
+        load_goal(conn, session_id, id)
     }
 
     pub async fn current_session_goal(

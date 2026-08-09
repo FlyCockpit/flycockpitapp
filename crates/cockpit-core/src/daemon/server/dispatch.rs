@@ -841,6 +841,69 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     message: "goal budget must be positive".to_string(),
                 });
             }
+            let policy_json = serde_json::to_string(&policy).map_err(internal)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::CreateGoal {
+                    session_id,
+                    objective: objective.clone(),
+                    token_budget,
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let project_id = session.project_id.clone();
+                let goal_id = Uuid::new_v4();
+                let now = chrono::Utc::now().timestamp();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let goal = crate::db::Db::create_session_goal_with_policy_conn(conn, session_id, goal_id, now, &project_id, &objective, None, budget, &policy_json)
+                            .map_err(|error| GoalMutationRejected(error.to_string()))?;
+                        let receipt = proto::RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
+                        let safe_response = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: "create_goal".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<GoalMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                let receipt = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if receipt.schema_version != 1
+                    || receipt.session_id != session_id
+                    || receipt.disposition != proto::GoalDisposition::Running
+                {
+                    return Err(internal(anyhow::anyhow!(
+                        "invalid remote create-goal receipt"
+                    )));
+                }
+                if let Some(attached) = state
+                    .attached
+                    .as_ref()
+                    .filter(|attached| attached.handle.session().id == session_id)
+                {
+                    attached
+                        .handle
+                        .send_work(SessionWork::WakeGoal)
+                        .await
+                        .map_err(internal)?;
+                }
+                return Ok(Response::RemoteGoalOutcome { outcome: receipt });
+            }
             ctx.db
                 .create_session_goal_with_policy(
                     session_id,
@@ -848,7 +911,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     &objective,
                     None,
                     Some(budget),
-                    &serde_json::to_string(&policy).map_err(internal)?,
+                    &policy_json,
                 )
                 .await
                 .map_err(|error| ErrorPayload {

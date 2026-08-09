@@ -1970,11 +1970,17 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .set_session_shared_with_collaborators(session_id, true)
             .await
             .unwrap();
-        ctx.db
-            .create_session_goal(session_id, "p", "finish safely", None, Some(100))
-            .await
-            .unwrap();
     }
+    ctx.db
+        .create_session_goal(
+            second_session.session_id,
+            "p",
+            "finish safely",
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
     let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "goal-writer".into(),
@@ -2003,6 +2009,90 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
     let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let create_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-cccccccccccc").unwrap(),
+    )
+    .unwrap();
+    let create_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let create_applied = match recv_writer_body(&mut writer_rx, "first goal create").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, create_id);
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected goal create: {other:?}"),
+    };
+    let create_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_replay_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal create replay").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, create_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), create_applied);
+        }
+        other => panic!("unexpected goal create replay: {other:?}"),
+    }
+    let create_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_conflict_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: second_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "goal create conflict").await,
+        Body::Error { id: Some(id), error } if id == create_conflict_id && error.code == ErrorCode::Conflict)
+    );
 
     let status_operation = proto::RemoteOperationIdentityV1::new(
         logical_attachment_id,
@@ -2177,6 +2267,33 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             );
         }
         other => panic!("unexpected late goal status replay: {other:?}"),
+    }
+    let late_create_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            late_create_replay_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal create replay after later clear").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, late_create_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), create_applied);
+        }
+        other => panic!("unexpected late goal create replay: {other:?}"),
     }
     let replay_id = Uuid::new_v4();
     handle_envelope(

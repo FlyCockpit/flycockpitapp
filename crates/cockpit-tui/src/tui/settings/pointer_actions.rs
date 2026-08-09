@@ -76,8 +76,6 @@ impl RootNodeId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct SuggestionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PickerOptionId(pub String);
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentToolId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct HarnessId(pub String);
@@ -261,8 +259,6 @@ pub(super) enum CategoryAction {
     SuggestionSelect(SettingId, SuggestionId),
     TextEditorSave(SettingId),
     TextEditorCancel(SettingId),
-    PickerSelect(SettingId, PickerOptionId),
-    Confirm(SettingId, ConfirmationChoice),
     Reset,
     ExternalEditBegin(SettingId, CategoryExternalSource),
     ExternalEditResult(SettingId, ExternalEditOutcome),

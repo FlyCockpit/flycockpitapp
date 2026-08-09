@@ -1448,6 +1448,9 @@ impl CategoryPathEditor {
                 17,
             ),
         ] {
+            if x.saturating_add(width) > area.width {
+                continue;
+            }
             surface.register(SettingsPointerTarget {
                 rect: Rect::new(
                     area.x + x,
@@ -3356,6 +3359,9 @@ impl SettingsCx {
                 (super::pointer_actions::ConfirmationChoice::Confirm, 0, 17),
                 (super::pointer_actions::ConfirmationChoice::Cancel, 19, 15),
             ] {
+                if area.height <= 4 || x.saturating_add(width) > area.width {
+                    continue;
+                }
                 self.pointer_surface.register(SettingsPointerTarget {
                     rect: Rect::new(area.x + x, area.y.saturating_add(4), width, 1),
                     action: SettingsPointerAction::Page(
@@ -3416,6 +3422,9 @@ impl SettingsCx {
                     17,
                 ),
             ] {
+                if x.saturating_add(width) > area.width {
+                    continue;
+                }
                 self.pointer_surface.register(SettingsPointerTarget {
                     rect: Rect::new(area.x + x, action_y, width, 1),
                     action: SettingsPointerAction::Page(
@@ -3640,6 +3649,9 @@ impl SettingsCx {
                         17,
                     ),
                 ] {
+                    if x.saturating_add(width) > settings_area.width {
+                        continue;
+                    }
                     self.pointer_surface.register(SettingsPointerTarget {
                         rect: Rect::new(
                             settings_area.x.saturating_add(x),
@@ -3662,12 +3674,13 @@ impl SettingsCx {
                 .offset_for(&format!("category:{:?}", p.category));
             if let Some(screen_row) = line.checked_sub(offset)
                 && screen_row < usize::from(settings_area.height)
+                && settings_area.width >= 26
             {
                 self.pointer_surface.register(SettingsPointerTarget {
                     rect: Rect::new(
                         settings_area.x,
                         settings_area.y.saturating_add(screen_row as u16),
-                        26.min(settings_area.width),
+                        26,
                         1,
                     ),
                     action: SettingsPointerAction::Page(

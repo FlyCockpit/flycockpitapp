@@ -1299,7 +1299,7 @@ impl Dialog {
     /// edit an agent and `$EDITOR` is set.
     pub(crate) fn take_pending_agent_edit(
         &mut self,
-    ) -> Option<(shell::PointerOperationId, PathBuf)> {
+    ) -> Option<agents_page::AgentExternalEditEffect> {
         let Dialog::Settings(s) = self else {
             return None;
         };

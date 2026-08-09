@@ -145,9 +145,11 @@ impl App {
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
-        let Some((operation_id, path)) = self.dialog.take_pending_agent_edit() else {
+        let Some(effect) = self.dialog.take_pending_agent_edit() else {
             return Ok(false);
         };
+        let operation_id = effect.operation_id;
+        let path = effect.path;
 
         let Some(editor) = std::env::var_os("EDITOR") else {
             // Env shifted between the page deciding to defer and now; the
@@ -156,6 +158,16 @@ impl App {
                 .finish_agent_edit(operation_id, Some("$EDITOR is no longer set".to_string()));
             return Ok(true);
         };
+
+        if let Some(text) = effect.text_before_launch
+            && let Err(error) = std::fs::write(&path, text)
+        {
+            self.dialog.finish_agent_edit(
+                operation_id,
+                Some(format!("write failed before launching $EDITOR: {error}")),
+            );
+            return Ok(true);
+        }
 
         let (outcome, live_mouse) = Self::run_external_editor_command(
             terminal,
@@ -172,19 +184,14 @@ impl App {
 
         let editor_error = match (&outcome.status, &outcome.restore) {
             (Ok(s), Ok(())) if s.success() => None,
-            (Ok(s), Ok(())) => Some(format!("editor exited with {s} — file left unchanged")),
-            (Ok(s), Err(restore)) if s.success() => {
-                Some(format!("terminal restore: {restore} — file left unchanged"))
-            }
+            (Ok(s), Ok(())) => Some(format!("editor exited with {s}")),
+            (Ok(s), Err(restore)) if s.success() => Some(format!("terminal restore: {restore}")),
             (Ok(s), Err(restore)) => Some(format!(
-                "editor exited with {s}; terminal restore: {restore} — file left unchanged"
+                "editor exited with {s}; terminal restore: {restore}"
             )),
-            (Err(e), Ok(())) => Some(format!(
-                "invoking `{}`: {e} — file left unchanged",
-                editor.to_string_lossy()
-            )),
+            (Err(e), Ok(())) => Some(format!("invoking `{}`: {e}", editor.to_string_lossy())),
             (Err(e), Err(restore)) => Some(format!(
-                "invoking `{}`: {e}; terminal restore: {restore} — file left unchanged",
+                "invoking `{}`: {e}; terminal restore: {restore}",
                 editor.to_string_lossy()
             )),
         };

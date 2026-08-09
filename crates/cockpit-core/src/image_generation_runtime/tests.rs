@@ -68,6 +68,18 @@ impl BoundConnector for ErrorConnector {
         })
     }
 }
+struct PendingConnector;
+impl BoundConnector for PendingConnector {
+    fn connect<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a [IpAddr],
+        _: AddressClass,
+        _: ProbeLimits,
+    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
 struct MismatchedConnector;
 impl BoundConnector for MismatchedConnector {
     fn connect<'a>(
@@ -122,6 +134,7 @@ impl ImageRuntimeAdapter for Adapter {
                 }),
                 model_or_workflow_digest: Some("digest".into()),
                 unavailable_reason: None,
+                body_bytes: 0,
             })
         })
     }
@@ -139,6 +152,9 @@ fn endpoint() -> ImageEndpoint {
         enabled: true,
         route_profile_version: 1,
     }
+}
+fn credential_digest(seed: u8) -> CredentialIdentityDigest {
+    CredentialIdentityDigest::from_sha256([seed; 32])
 }
 fn registry(clock: Arc<Clock>, adapter: Arc<Adapter>) -> ImageRuntimeRegistry {
     ImageRuntimeRegistry::new(
@@ -256,7 +272,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
         registry.apply_endpoint(&endpoint, 1, 1);
         assert!(matches!(
             registry
-                .refresh(endpoint.clone(), 1, 1, 1, RefreshKind::Health, "digest".into())
+                .refresh(endpoint.clone(), 1, 1, 1, RefreshKind::Health, credential_digest(1))
                 .await,
             Err(error) if error.code == code
         ));
@@ -273,12 +289,39 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
                 1,
                 2,
                 RefreshKind::Health,
-                "digest".into(),
+                credential_digest(1),
             )
             .await
             .unwrap();
-        assert_eq!(reused.request_id, 1);
+        assert_eq!(reused.request_id, 2);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn image_generation_runtime_enforces_connect_timeout_around_connector() {
+    let registry = ImageRuntimeRegistry::new(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(Dns("8.8.8.8".parse().unwrap())),
+        Arc::new(PendingConnector),
+        vec![Arc::new(Adapter {
+            kind: ImageAdapterKind::OpenaiImages,
+            calls: AtomicUsize::new(0),
+        })],
+    )
+    .unwrap();
+    let endpoint = endpoint();
+    registry.apply_endpoint(&endpoint, 1, 1);
+    let refresh = tokio::spawn(async move {
+        registry
+            .refresh(endpoint, 1, 1, 1, RefreshKind::Health, credential_digest(7))
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(CONNECT_TIMEOUT).await;
+    assert!(matches!(
+        refresh.await.unwrap(),
+        Err(error) if error.code == RuntimeErrorCode::ConnectTimeout
+    ));
 }
 
 #[test]
@@ -321,7 +364,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
             1,
             10,
             RefreshKind::Capabilities,
-            "credential-digest".into()
+            credential_digest(2)
         ),
         registry.refresh(
             endpoint.clone(),
@@ -329,7 +372,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
             1,
             11,
             RefreshKind::Capabilities,
-            "credential-digest".into()
+            credential_digest(2)
         )
     );
     assert!(a.is_ok() && b.is_ok());
@@ -359,7 +402,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
             1,
             1,
             RefreshKind::Capabilities,
-            "digest-only".into(),
+            credential_digest(3),
         )
         .await
         .unwrap();
@@ -369,7 +412,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     );
     assert!(
         registry
-            .revalidate_dispatch(&endpoint, "digest-only")
+            .revalidate_dispatch(&endpoint, &credential_digest(3))
             .await
             .is_ok()
     );
@@ -383,7 +426,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
             1,
             2,
             RefreshKind::Health,
-            "digest-only".into(),
+            credential_digest(3),
         )
         .await
         .unwrap();
@@ -393,7 +436,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     );
     assert!(
         registry
-            .revalidate_dispatch(&endpoint, "digest-only")
+            .revalidate_dispatch(&endpoint, &credential_digest(3))
             .await
             .is_err()
     );
@@ -416,7 +459,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
             1,
             1,
             RefreshKind::Capabilities,
-            "digest".into(),
+            credential_digest(4),
         )
         .await
         .unwrap();
@@ -428,7 +471,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
             1,
             2,
             RefreshKind::Health,
-            "digest".into(),
+            credential_digest(4),
         )
         .await
         .unwrap();
@@ -441,7 +484,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
             1,
             3,
             RefreshKind::Health,
-            "digest".into(),
+            credential_digest(4),
         )
         .await
         .unwrap();
@@ -467,6 +510,52 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
         .0
         .store(DISPLAY_STALE_TTL.as_millis() as u64 + 1, Ordering::SeqCst);
     assert!(registry.snapshot(&endpoint.id).is_none());
+}
+
+#[tokio::test]
+async fn image_generation_capability_cache_is_independent_and_waiters_keep_request_ids() {
+    let clock = Arc::new(Clock(AtomicU64::new(0)));
+    let adapter = Arc::new(Adapter {
+        kind: ImageAdapterKind::OpenaiImages,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = registry(clock.clone(), adapter.clone());
+    let endpoint = endpoint();
+    registry.apply_endpoint(&endpoint, 1, 1);
+    let first = registry
+        .refresh(
+            endpoint.clone(),
+            1,
+            1,
+            41,
+            RefreshKind::Capabilities,
+            credential_digest(6),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.request_id, 41);
+    clock.0.store(14 * 60 * 1_000, Ordering::SeqCst);
+    let cached = registry
+        .refresh(
+            endpoint,
+            1,
+            1,
+            42,
+            RefreshKind::Capabilities,
+            credential_digest(6),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.request_id, 42);
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn image_generation_credential_identity_is_typed_and_redacted() {
+    let digest = credential_digest(0x5a);
+    let rendered = format!("{digest:?}");
+    assert_eq!(rendered, "CredentialIdentityDigest(<redacted>)");
+    assert!(!rendered.contains("5a"));
 }
 
 #[tokio::test]
@@ -546,12 +635,14 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
             1,
             1,
             RefreshKind::Capabilities,
-            "digest".into(),
+            credential_digest(5),
         )
         .await
         .unwrap();
     assert!(matches!(
-        rebinding.revalidate_dispatch(&endpoint, "digest").await,
+        rebinding
+            .revalidate_dispatch(&endpoint, &credential_digest(5))
+            .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
     assert!(rebinding.snapshot(&endpoint.id).is_none());
@@ -566,7 +657,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
     mismatch.apply_endpoint(&endpoint, 1, 1);
     assert!(matches!(
         mismatch
-            .refresh(endpoint, 1, 1, 1, RefreshKind::Health, "digest".into())
+            .refresh(endpoint, 1, 1, 1, RefreshKind::Health, credential_digest(5))
             .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));

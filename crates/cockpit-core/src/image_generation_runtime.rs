@@ -17,6 +17,21 @@ use cockpit_config::config::image_generation::{
 use futures::FutureExt;
 use tokio::sync::Notify;
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CredentialIdentityDigest([u8; 32]);
+
+impl CredentialIdentityDigest {
+    pub const fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for CredentialIdentityDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialIdentityDigest(<redacted>)")
+    }
+}
+
 pub const SUCCESS_TTL: Duration = Duration::from_secs(30);
 pub const FAILURE_TTL: Duration = Duration::from_secs(5);
 pub const CAPABILITY_DISPATCH_TTL: Duration = Duration::from_secs(15 * 60);
@@ -358,7 +373,7 @@ pub struct ImageHealthSnapshot {
     pub model_or_workflow_digest: Option<String>,
     pub capability: Option<CapabilitySnapshot>,
     pub unavailable_reason: Option<RuntimeErrorCode>,
-    pub credential_identity_digest: Option<String>,
+    pub credential_identity_digest: Option<CredentialIdentityDigest>,
 }
 impl ImageHealthSnapshot {
     pub fn reusable_at(&self, now: u64) -> bool {
@@ -382,7 +397,7 @@ pub struct ProbeRequest {
     pub refresh_epoch: u64,
     pub request_id: u64,
     pub kind: RefreshKind,
-    pub credential_identity_digest: String,
+    pub credential_identity_digest: CredentialIdentityDigest,
     pub connection: ConnectionProof,
     pub limits: ProbeLimits,
 }
@@ -408,6 +423,9 @@ pub struct ProbeResult {
     pub capability: Option<CapabilitySnapshot>,
     pub model_or_workflow_digest: Option<String>,
     pub unavailable_reason: Option<RuntimeErrorCode>,
+    /// Bytes consumed from the bounded response body, as counted by the
+    /// transport-owned reader rather than inferred from parsed values.
+    pub body_bytes: usize,
 }
 pub trait ImageRuntimeAdapter: Send + Sync {
     fn kind(&self) -> ImageAdapterKind;
@@ -427,7 +445,7 @@ struct RefreshKey {
     generation: u64,
     epoch: u64,
     kind: RefreshKind,
-    credential_identity_digest: String,
+    credential_identity_digest: CredentialIdentityDigest,
 }
 #[derive(Clone)]
 struct CurrentIdentity {
@@ -547,7 +565,7 @@ impl ImageRuntimeRegistry {
         epoch: u64,
         request_id: u64,
         kind: RefreshKind,
-        credential_identity_digest: String,
+        credential_identity_digest: CredentialIdentityDigest,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
         if !endpoint.enabled {
             return Err(RuntimeError::new(
@@ -565,20 +583,19 @@ impl ImageRuntimeRegistry {
         if let Some(cached) = self.snapshot(&key.endpoint)
             && cached.config_generation == generation
             && cached.refresh_epoch == epoch
-            && cached.reusable_at(self.clock.now_millis())
-            && cached.credential_identity_digest.as_deref()
-                == Some(credential_identity_digest.as_str())
-            && (kind == RefreshKind::Health
-                || cached
-                    .capability
-                    .as_ref()
-                    .is_some_and(|capability| capability.dispatchable_at(self.clock.now_millis())))
+            && cached.credential_identity_digest.as_ref() == Some(&credential_identity_digest)
+            && ((kind == RefreshKind::Health && cached.reusable_at(self.clock.now_millis()))
+                || (kind == RefreshKind::Capabilities
+                    && cached.capability.as_ref().is_some_and(|capability| {
+                        capability.dispatchable_at(self.clock.now_millis())
+                    })))
         {
             let mut cached = cached;
             cached.provenance = SnapshotProvenance::Cache;
             if let Some(capability) = &mut cached.capability {
                 capability.provenance = SnapshotProvenance::Cache;
             }
+            cached.request_id = request_id;
             return Ok(cached);
         }
         let (flight, leader) = {
@@ -629,15 +646,18 @@ impl ImageRuntimeRegistry {
         if !flight.completed.load(Ordering::Acquire) {
             notified.await;
         }
-        flight
-            .result
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(Err(RuntimeError::new(
-                RuntimeErrorCode::Obsolete,
-                "The refresh did not produce a current result.",
-            )))
+        let mut result =
+            flight
+                .result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(Err(RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "The refresh did not produce a current result.",
+                )))?;
+        result.request_id = request_id;
+        Ok(result)
     }
     async fn run_refresh(
         &self,
@@ -646,8 +666,9 @@ impl ImageRuntimeRegistry {
         epoch: u64,
         request_id: u64,
         kind: RefreshKind,
-        credential_identity_digest: String,
+        credential_identity_digest: CredentialIdentityDigest,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
+        let header_deadline = tokio::time::Instant::now() + HEADER_TIMEOUT;
         let adapter = self.adapter(endpoint.adapter)?;
         let url = reqwest::Url::parse(&endpoint.origin).map_err(|_| {
             RuntimeError::new(
@@ -664,7 +685,16 @@ impl ImageRuntimeRegistry {
             ))?
             .to_owned();
         let authority = origin_authority(&url, &hostname);
-        let resolved = match self.dns.resolve(&hostname).await {
+        let resolved = match tokio::time::timeout_at(header_deadline, self.dns.resolve(&hostname))
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HeaderTimeout,
+                    "The provider did not return response headers in time.",
+                )
+            })
+            .and_then(|result| result)
+        {
             Ok(value) => value,
             Err(error) => {
                 let state = health_state_for_error(error.code);
@@ -705,10 +735,19 @@ impl ImageRuntimeRegistry {
         } else {
             ProbeLimits::health()
         };
-        let connection = match self
-            .connector
-            .connect(&authority, &allowed, wanted, limits)
-            .await
+        let connect_deadline = header_deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
+        let connection = match tokio::time::timeout_at(
+            connect_deadline,
+            self.connector.connect(&authority, &allowed, wanted, limits),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::ConnectTimeout,
+                "The provider connection did not complete in time.",
+            )
+        })
+        .and_then(|result| result)
         {
             Ok(value) => value,
             Err(error) => {
@@ -758,8 +797,9 @@ impl ImageRuntimeRegistry {
             )?;
             return Err(error);
         }
-        let result = match adapter
-            .probe(ProbeRequest {
+        let result = match tokio::time::timeout_at(
+            header_deadline,
+            adapter.probe(ProbeRequest {
                 endpoint: endpoint.clone(),
                 config_generation: generation,
                 refresh_epoch: epoch,
@@ -768,8 +808,16 @@ impl ImageRuntimeRegistry {
                 credential_identity_digest: credential_identity_digest.clone(),
                 connection: connection.clone(),
                 limits,
-            })
-            .await
+            }),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HeaderTimeout,
+                "The provider did not return response headers in time.",
+            )
+        })
+        .and_then(|result| result)
         {
             Ok(value) => value,
             Err(error) => {
@@ -786,6 +834,22 @@ impl ImageRuntimeRegistry {
                 return Err(error);
             }
         };
+        if result.body_bytes > limits.body_limit {
+            let error = RuntimeError::new(
+                RuntimeErrorCode::BodyLimit,
+                "The provider response exceeded the inspection limit.",
+            );
+            self.commit_failure(
+                &endpoint,
+                generation,
+                epoch,
+                request_id,
+                ImageHealthState::Unreachable,
+                error.code,
+                &credential_identity_digest,
+            )?;
+            return Err(error);
+        }
         let now = self.clock.now_millis();
         let ttl = if result.state.successful() {
             SUCCESS_TTL
@@ -812,8 +876,8 @@ impl ImageRuntimeRegistry {
                 .unwrap()
                 .get(&endpoint.id)
                 .and_then(|snapshot| {
-                    (snapshot.credential_identity_digest.as_deref()
-                        == Some(credential_identity_digest.as_str())
+                    (snapshot.credential_identity_digest.as_ref()
+                        == Some(&credential_identity_digest)
                         && snapshot.capability.as_ref().is_some_and(|capability| {
                             result.model_or_workflow_digest.as_deref()
                                 == Some(capability.model_or_workflow_digest.as_str())
@@ -932,7 +996,7 @@ impl ImageRuntimeRegistry {
         request_id: u64,
         state: ImageHealthState,
         code: RuntimeErrorCode,
-        credential_identity_digest: &str,
+        credential_identity_digest: &CredentialIdentityDigest,
     ) -> Result<(), RuntimeError> {
         let now = self.clock.now_millis();
         self.commit(
@@ -951,7 +1015,7 @@ impl ImageRuntimeRegistry {
                 model_or_workflow_digest: None,
                 capability: None,
                 unavailable_reason: Some(code),
-                credential_identity_digest: Some(credential_identity_digest.to_owned()),
+                credential_identity_digest: Some(credential_identity_digest.clone()),
             },
             generation,
             epoch,
@@ -1012,7 +1076,7 @@ impl ImageRuntimeRegistry {
     pub async fn revalidate_dispatch(
         &self,
         endpoint: &ImageEndpoint,
-        credential_identity_digest: &str,
+        credential_identity_digest: &CredentialIdentityDigest,
     ) -> Result<ConnectionProof, RuntimeError> {
         let snap = self.snapshot(&endpoint.id).ok_or(RuntimeError::new(
             RuntimeErrorCode::Obsolete,
@@ -1042,7 +1106,7 @@ impl ImageRuntimeRegistry {
                 "Refresh health and capabilities before dispatch.",
             ));
         }
-        if snap.credential_identity_digest.as_deref() != Some(credential_identity_digest) {
+        if snap.credential_identity_digest.as_ref() != Some(credential_identity_digest) {
             self.inner.cache.lock().unwrap().remove(&endpoint.id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Obsolete,

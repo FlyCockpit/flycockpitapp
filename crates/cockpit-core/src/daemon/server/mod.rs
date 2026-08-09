@@ -2830,35 +2830,10 @@ impl UploadAccounting {
             .sum()
     }
 
-    fn reserve(
-        &mut self,
-        upload_id: Uuid,
-        byte_len: usize,
-        limits: AttachmentUploadLimits,
-    ) -> std::result::Result<(), ErrorPayload> {
-        let retained_count = self.consumed_message_attachments.len();
-        if self.pending.len() + retained_count >= limits.global_uploads {
-            return Err(bad_request(format!(
-                "too many retained or pending attachment uploads: daemon has {} retained and {} pending, limit {}",
-                retained_count,
-                self.pending.len(),
-                limits.global_uploads
-            )));
-        }
-        let pending_bytes = self.pending_bytes();
-        let consumed_bytes = self.consumed_bytes();
-        if pending_bytes
-            .saturating_add(consumed_bytes)
-            .saturating_add(byte_len)
-            > limits.global_bytes
-        {
-            return Err(bad_request(format!(
-                "retained and pending attachment uploads exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
-                consumed_bytes, pending_bytes, byte_len, limits.global_bytes
-            )));
-        }
+    /// Track which in-memory upload owns bytes. Durable evaluated ledger plans
+    /// are the sole capacity/admission authority.
+    fn track_pending(&mut self, upload_id: Uuid, byte_len: usize) {
         self.pending.insert(upload_id, byte_len);
-        Ok(())
     }
 
     fn release(&mut self, upload_id: &Uuid) {

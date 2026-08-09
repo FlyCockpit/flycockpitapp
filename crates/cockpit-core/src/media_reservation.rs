@@ -296,7 +296,7 @@ impl MediaReservationLedger {
             for(id,version,state) in rows {
                 if ReservationState::parse(&state)? != ReservationState::Released {
                     let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-                    for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::LocalCpuJobsGlobal] {
+                    for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
                         let name=dimension_name(dimension);
                         conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,format!("downstream-invocation-destroyed:{invocation}:{id}"),sqlite_i64(wall_ms)?])?;
                         release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;
@@ -569,7 +569,7 @@ impl MediaReservationLedger {
             if version!=expected_version{return Err(anyhow!("stale_version"));}
             if !matches!(ReservationState::parse(&state)?,ReservationState::Settling|ReservationState::CancellationRequested|ReservationState::OverageQuarantined){return Err(anyhow!("invalid_transition"));}
             let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::LocalCpuJobsGlobal] {
+            for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
                 let name=dimension_name(dimension);
                 conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
                 release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;

@@ -166,7 +166,7 @@ pub(super) fn user_message_wire_fingerprint(
 
 pub(super) async fn validate_png_attachment(
     bytes: Vec<u8>,
-) -> std::result::Result<Vec<u8>, ErrorPayload> {
+) -> std::result::Result<ValidatedPngAttachment, ErrorPayload> {
     tokio::task::spawn_blocking(move || validate_png_attachment_blocking(bytes))
         .await
         .map_err(internal)?
@@ -174,7 +174,7 @@ pub(super) async fn validate_png_attachment(
 
 pub fn validate_png_attachment_blocking(
     bytes: Vec<u8>,
-) -> std::result::Result<Vec<u8>, ErrorPayload> {
+) -> std::result::Result<ValidatedPngAttachment, ErrorPayload> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
     limits.max_image_height = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
@@ -184,7 +184,7 @@ pub fn validate_png_attachment_blocking(
         image::ImageFormat::Png,
     );
     reader.limits(limits);
-    reader.decode().map_err(|err| match err {
+    let decoded = reader.decode().map_err(|err| match err {
         image::ImageError::Limits(_) => bad_request(format!(
             "attachment PNG exceeds the {} pixel or {} byte decode limit",
             proto::MAX_IMAGE_DIMENSION_PIXELS,
@@ -192,7 +192,17 @@ pub fn validate_png_attachment_blocking(
         )),
         _ => bad_request("attachment is not a valid PNG"),
     })?;
-    Ok(bytes)
+    Ok(ValidatedPngAttachment {
+        bytes,
+        width: u64::from(decoded.width()),
+        height: u64::from(decoded.height()),
+    })
+}
+
+pub struct ValidatedPngAttachment {
+    pub bytes: Vec<u8>,
+    pub width: u64,
+    pub height: u64,
 }
 
 pub(super) fn begin_attachment_upload(
@@ -211,7 +221,7 @@ pub(super) fn begin_attachment_upload_with_limits(
     byte_len: usize,
     sha256: String,
     purpose: proto::AttachmentPurpose,
-    limits: AttachmentUploadLimits,
+    _limits: AttachmentUploadLimits,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session_id = match purpose {
         proto::AttachmentPurpose::UserMessageImage => {
@@ -230,19 +240,6 @@ pub(super) fn begin_attachment_upload_with_limits(
     if byte_len == 0 {
         return Err(bad_request("attachment is empty"));
     }
-    if state.pending_uploads.len() >= limits.per_client_uploads {
-        return Err(bad_request(format!(
-            "too many pending attachment uploads for this client: {} pending, limit {}",
-            state.pending_uploads.len(),
-            limits.per_client_uploads
-        )));
-    }
-    if byte_len > limits.per_upload_bytes {
-        return Err(bad_request(format!(
-            "attachment upload is too large: {} bytes exceeds {} byte pending-upload limit",
-            byte_len, limits.per_upload_bytes
-        )));
-    }
     if byte_len > proto::MAX_SINGLE_IMAGE_BYTES {
         return Err(bad_request(format!(
             "image is too large: {} bytes exceeds {} byte limit",
@@ -258,7 +255,7 @@ pub(super) fn begin_attachment_upload_with_limits(
     let upload_id = Uuid::new_v4();
     {
         let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
-        accounting.reserve(upload_id, byte_len, limits)?;
+        accounting.track_pending(upload_id, byte_len);
     }
     state.pending_uploads.insert(
         upload_id,
@@ -317,6 +314,20 @@ pub(super) async fn begin_attachment_upload_admitted(
         (MediaDimension::QueuedOperationsPerSession, 1),
         (MediaDimension::EncodedBytesPerObject, byte_len as u64),
         (MediaDimension::RetainedBytesPerSession, byte_len as u64),
+        (
+            MediaDimension::DecodedEdgePixels,
+            policy.limits().get(MediaDimension::DecodedEdgePixels),
+        ),
+        (
+            MediaDimension::DecodedImagePixels,
+            policy.limits().get(MediaDimension::DecodedImagePixels),
+        ),
+        (
+            MediaDimension::AggregateDecodedPixelsPerRequest,
+            policy
+                .limits()
+                .get(MediaDimension::AggregateDecodedPixelsPerRequest),
+        ),
         (MediaDimension::LocalCpuJobsGlobal, 1),
         (
             MediaDimension::OperationDeadlineSeconds,
@@ -450,7 +461,7 @@ pub(super) async fn finish_attachment_upload(
     if actual != upload.sha256 {
         return Err(bad_request("attachment SHA-256 mismatch"));
     }
-    let bytes = validate_png_attachment(upload.bytes).await?;
+    let bytes = validate_png_attachment(upload.bytes).await?.bytes;
     match upload.purpose {
         proto::AttachmentPurpose::UserMessageImage => {
             let Some(session_id) = upload.session_id else {
@@ -558,8 +569,8 @@ pub(super) async fn finish_attachment_upload_admitted(
         validate_png_attachment(upload.bytes).await
     }
     .await;
-    let bytes = match validation {
-        Ok(bytes) => bytes,
+    let validated = match validation {
+        Ok(validated) => validated,
         Err(error) => {
             let cancelled = ctx
                 .media_ledger
@@ -578,11 +589,58 @@ pub(super) async fn finish_attachment_upload_admitted(
             return Err(error);
         }
     };
+    let pixels = validated
+        .width
+        .checked_mul(validated.height)
+        .ok_or_else(|| bad_request("attachment decoded pixel count overflows"))?;
+    let mut reconciled = executing;
+    for (dimension, actual) in [
+        (
+            cockpit_config::config::media_budget::MediaDimension::DecodedEdgePixels,
+            validated.width.max(validated.height),
+        ),
+        (
+            cockpit_config::config::media_budget::MediaDimension::DecodedImagePixels,
+            pixels,
+        ),
+        (
+            cockpit_config::config::media_budget::MediaDimension::AggregateDecodedPixelsPerRequest,
+            pixels,
+        ),
+    ] {
+        reconciled = ctx
+            .media_ledger
+            .reconcile_actual(
+                &reconciled.reservation_id,
+                reconciled.version,
+                dimension,
+                actual,
+                false,
+                wall_ms,
+            )
+            .await
+            .map_err(internal)?;
+        if reconciled.state == crate::media_reservation::ReservationState::OverageQuarantined {
+            ctx.media_ledger
+                .destroy_local_artifacts(
+                    &reconciled.reservation_id,
+                    reconciled.version,
+                    &format!("attachment-overage-destroyed:{upload_id}"),
+                    wall_ms,
+                )
+                .await
+                .map_err(internal)?;
+            return Err(bad_request(
+                "attachment exceeds decoded media resource policy",
+            ));
+        }
+    }
+    let bytes = validated.bytes;
     // This commit releases queue permits and makes retained byte charges
     // authoritative before the bytes become visible to another subsystem.
     let completed = ctx
         .media_ledger
-        .complete_local_allocation(&executing.reservation_id, executing.version, wall_ms)
+        .complete_local_allocation(&reconciled.reservation_id, reconciled.version, wall_ms)
         .await
         .map_err(internal)?;
     match upload.purpose {
@@ -737,40 +795,6 @@ pub(super) fn claim_message_image_refs(
 
     // Validation above is all-or-nothing. Move only after every ref and the
     // aggregate size have passed, with no await between validation and bind.
-    let newly_consumed: Vec<_> = refs
-        .iter()
-        .filter(|image_ref| state.ready_attachments.contains_key(&image_ref.id))
-        .collect();
-    let newly_consumed_bytes: usize = newly_consumed
-        .iter()
-        .filter_map(|image_ref| state.ready_attachments.get(&image_ref.id))
-        .map(|attachment| attachment.bytes.len())
-        .sum();
-    if accounting.pending.len()
-        + accounting.consumed_message_attachments.len()
-        + newly_consumed.len()
-        > state.upload_limits.global_uploads
-    {
-        return Err(bad_request(format!(
-            "too many retained or pending message attachments: daemon has {} retained and {} pending, adding {} exceeds limit {}",
-            accounting.consumed_message_attachments.len(),
-            accounting.pending.len(),
-            newly_consumed.len(),
-            state.upload_limits.global_uploads
-        )));
-    }
-    let retained_bytes = accounting.consumed_bytes();
-    let pending_bytes = accounting.pending_bytes();
-    if retained_bytes
-        .saturating_add(pending_bytes)
-        .saturating_add(newly_consumed_bytes)
-        > state.upload_limits.global_bytes
-    {
-        return Err(bad_request(format!(
-            "retained and pending message attachments exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
-            retained_bytes, pending_bytes, newly_consumed_bytes, state.upload_limits.global_bytes
-        )));
-    }
     for image_ref in refs {
         if let Some(attachment) = state.ready_attachments.remove(&image_ref.id) {
             accounting.consumed_message_attachments.insert(

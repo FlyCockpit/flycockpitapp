@@ -1,6 +1,7 @@
 -- This is intentionally append-only instead of being folded into 0001: deployed
--- databases persist the SHA-256 of 0001 and 0002, and amending either migration
--- makes the checksum-enforcing startup path reject an otherwise valid database.
+-- databases persist the SHA-256 of immutable 0001 and 0002, and amending either
+-- migration makes checksum-enforcing startup reject an otherwise valid database.
+-- This unreleased 0003 is finalized as one stable migration before merge.
 -- Durable authority for media admission. Limits are deliberately absent:
 -- every acquisition carries the evaluated config-policy plan/version.
 CREATE TABLE media_reservations (

@@ -38,6 +38,10 @@ pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
 pub struct UserSubmission {
     #[serde(default)]
     pub kind: UserSubmissionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_state_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     pub text: String,
     /// User-facing transcript form. `None` means the wire text is also the
     /// display text.
@@ -1065,6 +1069,17 @@ impl UserSubmission {
                 UserSubmissionKind::User => b"user",
                 UserSubmissionKind::Compact => b"compact",
             },
+        );
+        part(
+            &mut hasher,
+            &self.expected_model_state_generation.map_or_else(
+                || b"none".to_vec(),
+                |generation| generation.to_be_bytes().to_vec(),
+            ),
+        );
+        part(
+            &mut hasher,
+            &serde_json::to_vec(&self.expected_model).unwrap_or_default(),
         );
         part(&mut hasher, self.text.as_bytes());
         optional_part(&mut hasher, self.display_text.as_deref());

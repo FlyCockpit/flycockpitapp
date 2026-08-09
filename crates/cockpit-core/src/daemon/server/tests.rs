@@ -1096,6 +1096,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         let mut state = state;
         let result = handle_request(
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "first turn".into(),
                 display_text: None,
@@ -1172,6 +1174,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
         let mut state = state;
         handle_request(
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "second turn".into(),
                 display_text: None,
@@ -5203,6 +5207,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             label: "child".into(),
         },
         "send_user_message" => Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: Uuid::new_v4(),
             text: "authz".into(),
             display_text: None,
@@ -6852,6 +6858,8 @@ async fn assert_worker_delivery_happy(kind: &str) {
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: Uuid::new_v4(),
             text: "hello worker".into(),
             display_text: None,
@@ -7240,6 +7248,8 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
         session_id,
         work_rx,
         Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id,
             text: "must remain retryable".to_string(),
             display_text: Some("visible draft".to_string()),
@@ -7334,6 +7344,8 @@ async fn assert_attached_required_malformed(kind: &str) {
     let ctx = test_ctx();
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: Uuid::new_v4(),
             text: "detached".into(),
             display_text: None,
@@ -9385,6 +9397,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "hello".into(),
                 display_text: None,
@@ -10710,6 +10724,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let text = "must remain removed";
     let origin_principal = state.principal.tag();
     let submission = crate::engine::message::UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: crate::engine::message::UserSubmissionKind::User,
         text: text.to_string(),
         display_text: None,
@@ -10743,6 +10759,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
 
     let exact = handle_request(
         Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id,
             text: text.to_string(),
             display_text: None,
@@ -10765,6 +10783,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
 
     let conflict = handle_request(
         Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id,
             text: "different payload".to_string(),
             display_text: None,
@@ -10848,6 +10868,8 @@ async fn image_submission_exact_retry_case() {
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
     let client_submission_id = Uuid::new_v4();
     let request = |id, text: &str| Request::SendUserMessage {
+        expected_model_state_generation: None,
+        expected_model: None,
         client_submission_id: id,
         text: text.to_string(),
         display_text: Some("message with image".to_string()),
@@ -10954,6 +10976,8 @@ async fn image_submission_exact_retry_case() {
     let reuploaded_ref = finish_upload_for(&mut state, &sample_png()).await;
     let reuploaded = handle_request(
         Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id,
             text: "inspect this image".to_string(),
             display_text: Some("message with image".to_string()),
@@ -11015,6 +11039,8 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
     let first_id = Uuid::new_v4();
     let request = |id| Request::SendUserMessage {
+        expected_model_state_generation: None,
+        expected_model: None,
         client_submission_id: id,
         text: "ambiguous image delivery".to_string(),
         display_text: None,
@@ -13171,6 +13197,8 @@ async fn serialized_requests_apply_in_receipt_order() {
             Envelope::request(
                 message_id,
                 Request::SendUserMessage {
+                    expected_model_state_generation: None,
+                    expected_model: None,
                     client_submission_id: Uuid::new_v4(),
                     text: "after model switch".to_string(),
                     display_text: None,
@@ -14266,6 +14294,8 @@ async fn btw_concurrent_with_parent_turn() {
     let parent_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "parent work".to_string(),
                 display_text: None,
@@ -14318,6 +14348,8 @@ async fn btw_concurrent_with_parent_turn() {
     let btw_request = tokio::spawn(async move {
         handle_request(
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "btw work".to_string(),
                 display_text: None,
@@ -14710,6 +14742,8 @@ async fn send_user_message_refused_while_draining() {
 
     let err = handle_request(
         Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: Uuid::new_v4(),
             text: "hi".into(),
             display_text: None,

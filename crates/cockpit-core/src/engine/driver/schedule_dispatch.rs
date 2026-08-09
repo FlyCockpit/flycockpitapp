@@ -91,6 +91,8 @@ impl Driver {
                 // still flows through `scrub` — redaction stays non-bypassable.
                 self.run_user_input(
                     UserSubmission {
+                        expected_model_state_generation: None,
+                        expected_model: None,
                         kind: UserSubmissionKind::User,
                         text: injected,
                         display_text: None,

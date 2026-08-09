@@ -24,7 +24,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, features = ["png", "jpeg", "gif", "webp"] }
 ignore = { workspace = true }
 dirs = { workspace = true }
 rand = { workspace = true }

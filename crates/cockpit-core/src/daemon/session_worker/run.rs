@@ -1482,6 +1482,26 @@ pub(super) async fn run_worker(
                         )));
                         continue;
                     }
+                    if let (Some(expected_generation), Some(expected_model)) = (
+                        submission.expected_model_state_generation,
+                        submission.expected_model.as_ref(),
+                    ) {
+                        let current = authoritative_active_model_state
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let matches = current.as_ref().is_some_and(|current| {
+                            current.generation == expected_generation
+                                && &current.selection == expected_model
+                        });
+                        if !matches {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::ModelGenerationStale,
+                                message: "captured model generation is no longer active"
+                                    .to_string(),
+                            }));
+                            continue;
+                        }
+                    }
                     let (id, snapshot, outcome) = driver_input_queue
                         .push_idempotent(receipt, *submission, target)
                         .await;

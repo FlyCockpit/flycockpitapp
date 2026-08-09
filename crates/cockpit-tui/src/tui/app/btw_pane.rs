@@ -106,6 +106,10 @@ impl BtwPane {
         }
     }
 
+    pub(super) fn paste(&mut self, text: &str) {
+        self.composer.insert_str(text);
+    }
+
     fn remember_folded_queue_item_ids(&mut self, ids: impl IntoIterator<Item = Uuid>) {
         for id in ids {
             if self.folded_queue_item_ids.insert(id) {
@@ -474,6 +478,8 @@ impl BtwPane {
             return Err("btw pane is not attached".to_string());
         };
         let submission = UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: text.clone(),
             display_text: Some(text.clone()),

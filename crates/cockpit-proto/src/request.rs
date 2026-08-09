@@ -139,6 +139,14 @@ pub enum Request {
         /// When `run_invocation_options` is present this UUID is also the
         /// daemon-global run invocation id (no parallel identity exists).
         client_submission_id: Uuid,
+        /// For a fenced interactive submission, the exact daemon-owned model
+        /// generation captured by the client. Omitted by non-fenced clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_model_state_generation: Option<u64>,
+        /// Complete provider/model identity captured with the expected
+        /// generation. Both fields must be present or absent together.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
         text: String,
         /// User-facing transcript form. When absent, clients display `text`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1102,11 +1110,19 @@ impl Request {
             }
             Self::SendUserMessage {
                 client_submission_id,
+                expected_model_state_generation,
+                expected_model,
                 run_invocation_options,
                 ..
             } => {
                 if client_submission_id.is_nil() {
                     return Err("client_submission_id must not be nil".to_string());
+                }
+                if expected_model_state_generation.is_some() != expected_model.is_some() {
+                    return Err(
+                        "expected model generation and identity must be supplied together"
+                            .to_string(),
+                    );
                 }
                 if let Some(options) = run_invocation_options {
                     if options.max_turns == Some(0) {
@@ -1600,6 +1616,8 @@ mod tests {
     #[test]
     fn semantic_validation_rejects_ambiguous_model_flags_and_nil_submission_id() {
         let nil_submission = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: Uuid::nil(),
             text: "hello".to_string(),
             display_text: None,
@@ -1735,6 +1753,8 @@ mod tests {
         };
 
         let send = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "run me".into(),
             display_text: None,
@@ -1756,6 +1776,8 @@ mod tests {
         assert!(json["params"].get("remaining_ms").is_none());
 
         let bounded_send = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "run me".into(),
             display_text: None,
@@ -1780,6 +1802,8 @@ mod tests {
             approval_mode: Some(ApprovalMode::Yolo),
         };
         let mode_send = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "run me".into(),
             display_text: None,
@@ -1798,6 +1822,8 @@ mod tests {
         assert!(mode_json["params"].get("state_version").is_none());
 
         let non_run = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "interactive".into(),
             display_text: None,
@@ -1842,6 +1868,8 @@ mod tests {
 
         // Zero is never unbounded: semantic validation rejects it.
         let zero_turns = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "x".into(),
             display_text: None,
@@ -1861,6 +1889,8 @@ mod tests {
                 .contains("max_turns")
         );
         let zero_timeout = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "x".into(),
             display_text: None,
@@ -1889,6 +1919,45 @@ mod tests {
             } => assert_eq!(opts, bounded),
             other => panic!("expected SendUserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fenced_model_expectation_is_strict_and_round_trips() {
+        let model = cockpit_config::config::providers::ActiveModelRef {
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+        let request = Request::SendUserMessage {
+            expected_model_state_generation: Some(7),
+            expected_model: Some(model.clone()),
+            client_submission_id: Uuid::new_v4(),
+            text: "fenced".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        };
+        request.validate_semantics().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["expected_model_state_generation"], 7);
+        assert_eq!(json["params"]["expected_model"]["provider"], "openai");
+
+        let invalid = Request::SendUserMessage {
+            expected_model_state_generation: Some(7),
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            text: "invalid".to_string(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        };
+        assert!(invalid.validate_semantics().is_err());
     }
 }
 

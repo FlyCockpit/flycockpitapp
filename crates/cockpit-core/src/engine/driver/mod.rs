@@ -4710,6 +4710,8 @@ impl Driver {
             .await;
         let inbound_text = self.translate_inbound(&raw_text).await;
         Some(UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
             kind: UserSubmissionKind::User,
             text: inbound_text,
             display_text: submission.display_text,
@@ -4831,6 +4833,8 @@ impl Driver {
             }
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
+                expected_model_state_generation: None,
+                expected_model: None,
                 kind: UserSubmissionKind::User,
                 text: submission.text,
                 display_text: None,
@@ -6556,6 +6560,8 @@ impl Driver {
                 input_rx
                     .requeue_front_after(
                         UserSubmission {
+                            expected_model_state_generation: None,
+                            expected_model: None,
                             kind: submission_kind,
                             text: user_text,
                             display_text,
@@ -6675,6 +6681,8 @@ impl Driver {
         let mut next_prompt = if let Some((recovery_id, recovered_text)) = &retry_recovery {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
             crate::engine::message::build_user_message(UserSubmission {
+                expected_model_state_generation: None,
+                expected_model: None,
                 kind: UserSubmissionKind::User,
                 text: recovered_text.clone(),
                 display_text: None,
@@ -6692,6 +6700,8 @@ impl Driver {
             })
         } else {
             crate::engine::message::build_user_message(UserSubmission {
+                expected_model_state_generation: None,
+                expected_model: None,
                 kind: UserSubmissionKind::User,
                 text: if time_prelude_as_system {
                     user_text
@@ -7095,6 +7105,8 @@ impl Driver {
                                 self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
+                                        expected_model_state_generation: None,
+                                        expected_model: None,
                                         kind: UserSubmissionKind::User,
                                         text: self.with_time_prelude(prepared.text),
                                         display_text: None,
@@ -7176,6 +7188,8 @@ impl Driver {
                                 self.reset_delegation_retry_budget();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
+                                        expected_model_state_generation: None,
+                                        expected_model: None,
                                         kind: UserSubmissionKind::User,
                                         text: prepared.text,
                                         display_text: None,

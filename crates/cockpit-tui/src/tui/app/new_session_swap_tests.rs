@@ -167,6 +167,8 @@ fn runner_with_input(
 
 fn complete_submission(index: usize) -> UserSubmission {
     UserSubmission {
+        expected_model_state_generation: None,
+        expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),

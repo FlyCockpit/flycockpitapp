@@ -267,6 +267,8 @@ pub mod integration {
             match self
                 .inner
                 .request_ok(crate::daemon::proto::Request::SendUserMessage {
+                    expected_model_state_generation: None,
+                    expected_model: None,
                     client_submission_id: Uuid::new_v4(),
                     text: text.into(),
                     display_text,

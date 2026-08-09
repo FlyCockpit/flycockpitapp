@@ -449,6 +449,25 @@ impl App {
     pub(super) fn dispatch_optimistic_user_submission(
         &mut self,
         display: String,
+        submission: cockpit_core::engine::message::UserSubmission,
+        error_prefix: &str,
+        owns_working_span: bool,
+        tag_expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
+    ) -> DispatchOutcome {
+        self.dispatch_optimistic_user_submission_with_id(
+            uuid::Uuid::new_v4(),
+            display,
+            submission,
+            error_prefix,
+            owns_working_span,
+            tag_expansions,
+        )
+    }
+
+    pub(super) fn dispatch_optimistic_user_submission_with_id(
+        &mut self,
+        optimistic_submission_id: uuid::Uuid,
+        display: String,
         mut submission: cockpit_core::engine::message::UserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
@@ -461,7 +480,6 @@ impl App {
             submission.tag_expansions = tag_expansions.to_vec();
         }
         self.lock_pending_agent_switch_log();
-        let optimistic_submission_id = uuid::Uuid::new_v4();
         let optimistic_history_start = self.history.len();
         self.history.push(HistoryEntry::User {
             text: display,
@@ -763,6 +781,8 @@ impl App {
         self.pin_chat_to_tail();
         self.begin_working_span();
         let submission = cockpit_core::engine::message::UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: args.trim().to_string(),
             display_text: None,

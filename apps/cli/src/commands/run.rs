@@ -410,6 +410,8 @@ pub(crate) async fn attach_send_pump(
         // init/learn omit options and create no RunInvocationState.
         let send_result = client
             .request(Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id,
                 text: prompt,
                 display_text: None,
@@ -1767,6 +1769,8 @@ mod tests {
             approval_mode: Some(ApprovalMode::Yolo),
         };
         let send = Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
             client_submission_id: id,
             text: "go".into(),
             display_text: None,

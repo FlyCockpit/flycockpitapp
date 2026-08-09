@@ -125,6 +125,50 @@ impl App {
                     self.apply_startup_guidance_estimate(cwd, active_model, estimate);
                 }
             }
+            AsyncActionKind::Internal("paste.image_path_probe") => match result.payload {
+                Ok(AsyncActionPayload::ImagePathProbe {
+                    terminal_generation,
+                    original: _,
+                    composer_snapshot,
+                    cursor,
+                    png: Some(png),
+                }) if terminal_generation == self.terminal_input_generation
+                    && composer_snapshot == self.composer.text() =>
+                {
+                    self.composer.set_cursor(cursor);
+                    self.insert_image_block(png)
+                }
+                Ok(AsyncActionPayload::ImagePathProbe {
+                    terminal_generation,
+                    original: _,
+                    composer_snapshot,
+                    cursor: _,
+                    png: None,
+                }) if terminal_generation == self.terminal_input_generation
+                    && composer_snapshot == self.composer.text() =>
+                {
+                    self.show_toast("Paste unavailable", ToastKind::Error);
+                }
+                Err(_) => self.show_toast("Paste unavailable", ToastKind::Error),
+                Ok(_) => {}
+            },
+            AsyncActionKind::Internal("paste.native_image") => match result.payload {
+                Ok(AsyncActionPayload::NativeImagePaste {
+                    terminal_generation,
+                    composer_snapshot,
+                    cursor,
+                    png: Some(png),
+                }) if terminal_generation == self.terminal_input_generation
+                    && composer_snapshot == self.composer.text() =>
+                {
+                    self.composer.set_cursor(cursor);
+                    self.insert_image_block(png);
+                }
+                Ok(AsyncActionPayload::NativeImagePaste { png: None, .. }) | Err(_) => {
+                    self.show_toast("Paste unavailable", ToastKind::Error);
+                }
+                Ok(_) => {}
+            },
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {

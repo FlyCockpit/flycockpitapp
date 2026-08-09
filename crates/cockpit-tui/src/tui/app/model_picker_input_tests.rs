@@ -170,9 +170,12 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
         ok: true,
     };
     super::QueuedModelSubmission {
+        client_submission_id: uuid::Uuid::new_v4(),
         composer_text: "review @src/model.rs with image".to_string(),
         display: "review @src/model.rs with image".to_string(),
         submission: cockpit_core::engine::message::UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),

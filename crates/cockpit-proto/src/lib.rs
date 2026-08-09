@@ -981,6 +981,9 @@ pub enum ErrorCode {
     /// driver queue. Retrying the exact client submission id and payload is
     /// safe after the reported session condition is resolved.
     UserMessageNotAccepted,
+    /// A fenced TUI submission captured a model generation/identity that is
+    /// no longer authoritative. The message had zero queue/provider effect.
+    ModelGenerationStale,
     /// This exact client submission id reached a durable terminal disposition
     /// (removed, cancelled, or rejected by preflight) and must never be
     /// executed by a later worker epoch.
@@ -1046,6 +1049,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "lock_conflict" => Self::LockConflict,
             "workspace_trust" => Self::WorkspaceTrust,
             "user_message_not_accepted" => Self::UserMessageNotAccepted,
+            "model_generation_stale" => Self::ModelGenerationStale,
             "user_message_terminated" => Self::UserMessageTerminated,
             "unknown_agent" => Self::UnknownAgent,
             "inventory_too_large" => Self::InventoryTooLarge,
@@ -1080,6 +1084,7 @@ impl std::fmt::Display for ErrorCode {
             Self::LockConflict => "lock_conflict",
             Self::WorkspaceTrust => "workspace_trust",
             Self::UserMessageNotAccepted => "user_message_not_accepted",
+            Self::ModelGenerationStale => "model_generation_stale",
             Self::UserMessageTerminated => "user_message_terminated",
             Self::UnknownAgent => "unknown_agent",
             Self::InventoryTooLarge => "inventory_too_large",
@@ -2385,6 +2390,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             "protocol_version",
             "bad_request",
             "user_message_not_accepted",
+            "model_generation_stale",
             "user_message_terminated",
             "idempotency_conflict",
             "client_submission_id_unavailable",
@@ -3472,6 +3478,8 @@ mod tests {
         let env = Envelope::request(
             Uuid::new_v4(),
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: "hello".into(),
                 display_text: None,
@@ -3533,6 +3541,8 @@ mod tests {
         let env = Envelope::request(
             Uuid::new_v4(),
             Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
                 client_submission_id: Uuid::new_v4(),
                 text: IMAGE_PART_SENTINEL.to_string(),
                 display_text: None,

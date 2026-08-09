@@ -2135,6 +2135,18 @@ impl App {
             return false;
         }
 
+        // The Enter fence owns the durable identity before any submit
+        // sidecar is detached. Retry and reconciliation keep this exact ID.
+        let Some(fence_sequence) = self.next_submission_fence_sequence.checked_add(1) else {
+            self.show_toast(
+                "Submission ordering is unavailable",
+                super::ToastKind::Error,
+            );
+            return false;
+        };
+        self.next_submission_fence_sequence = fence_sequence;
+        let client_submission_id = uuid::Uuid::new_v4();
+
         // Build the paste-side wire from the live (untrimmed) buffer +
         // registry: text blocks inline their full content; image blocks
         // become real image parts on a vision model, or a terse text note
@@ -2208,6 +2220,11 @@ impl App {
             .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
         let submission = cockpit_core::engine::message::UserSubmission {
+            expected_model_state_generation: self
+                .active_model_selection
+                .as_ref()
+                .map(|_| self.active_model_state_generation),
+            expected_model: self.active_model_selection.clone(),
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
@@ -2229,6 +2246,7 @@ impl App {
                 pending.requested.provider, pending.requested.model
             );
             pending.queued_submission = Some(super::QueuedModelSubmission {
+                client_submission_id,
                 composer_text: self.composer.text().to_string(),
                 display: submitted,
                 submission,
@@ -2252,7 +2270,11 @@ impl App {
         // so it must never tear one down.
         let was_busy = self.busy;
         let optimistic_queue_item = if was_busy {
-            let item = optimistic_queue_item_with_display(wire.clone(), Some(submitted.clone()));
+            let item = optimistic_queue_item_with_id(
+                client_submission_id,
+                wire.clone(),
+                Some(submitted.clone()),
+            );
             self.queue.push(item.clone());
             Some(item)
         } else {
@@ -2275,7 +2297,8 @@ impl App {
         let owns_working_span = !was_busy;
 
         if owns_working_span {
-            self.dispatch_optimistic_user_submission(
+            self.dispatch_optimistic_user_submission_with_id(
+                client_submission_id,
                 submitted.clone(),
                 submission,
                 "engine",
@@ -2681,8 +2704,16 @@ pub(super) fn optimistic_queue_item_with_display(
     text: String,
     display_text: Option<String>,
 ) -> QueuedUserMessage {
+    optimistic_queue_item_with_id(uuid::Uuid::new_v4(), text, display_text)
+}
+
+pub(super) fn optimistic_queue_item_with_id(
+    id: uuid::Uuid,
+    text: String,
+    display_text: Option<String>,
+) -> QueuedUserMessage {
     QueuedUserMessage {
-        id: uuid::Uuid::new_v4(),
+        id,
         status: QueueItemStatus::Queued,
         text,
         display_text,
@@ -2754,6 +2785,12 @@ impl App {
     /// if the cursor sits at a matching text block's right edge, else
     /// condense-or-insert by the threshold rule.
     pub(super) fn handle_paste(&mut self, data: String) {
+        if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
+            if let Some(pane) = self.btw_pane.as_mut() {
+                pane.paste(&data);
+            }
+            return;
+        }
         // Route the paste the same way typed keys are routed (see
         // `handle_key`): a focused embedded PTY owns terminal input and
         // consumes paste before the composer/image clipboard path. If the
@@ -2771,11 +2808,14 @@ impl App {
                     | Overlay::Usage(_)
                     | Overlay::Sessions(_)
                     | Overlay::Skills(_)
+                    | Overlay::Tools(_)
+                    | Overlay::GoalSettings(_)
                     | Overlay::Permissions(_)
                     | Overlay::Resources(_)
                     | Overlay::Quick(_)
                     | Overlay::Context(_)
                     | Overlay::Diff(_)
+                    | Overlay::Help(_)
             )
             || self.context_menu.is_some()
             || self.pin_pick.is_some()
@@ -2815,23 +2855,74 @@ impl App {
             _ => {}
         }
 
-        // Image first: a clipboard image on the paste gesture becomes an
-        // image block regardless of `data`. SSH is out of scope — the read
-        // is local-clipboard only and silently yields `None` when there's
-        // no bitmap.
-        match crate::clipboard::read_image_as_png() {
-            Ok(Some(png)) => {
-                self.insert_image_block(png);
-                self.last_composer_edit_at = Some(Instant::now());
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "clipboard image read failed; treating paste as text");
-            }
+        if data.is_empty() {
+            let terminal_generation = self.terminal_input_generation;
+            let composer_snapshot = self.composer.text().to_string();
+            let cursor = self.composer.cursor();
+            self.async_actions.start(
+                crate::tui::async_action::AsyncActionKind::Internal("paste.native_image"),
+                crate::tui::async_action::AsyncActionPolicy::Replace(
+                    crate::tui::async_action::AsyncActionKey::new("paste.native_image"),
+                ),
+                async move {
+                    let png = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::task::spawn_blocking(crate::clipboard::read_image_as_png),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(Result::ok)
+                    .flatten();
+                    Ok(
+                        crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
+                            terminal_generation,
+                            composer_snapshot,
+                            cursor,
+                            png,
+                        },
+                    )
+                },
+            );
+            return;
         }
 
-        if data.is_empty() {
+        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
+            let kind =
+                crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+            if self.async_actions.pending_kind_count(&kind) >= 8 {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            }
+            let original = data.clone();
+            let terminal_generation = self.terminal_input_generation;
+            let composer_snapshot = self.composer.text().to_string();
+            let cursor = self.composer.cursor();
+            self.async_actions.start(
+                kind,
+                crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let normalized = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::task::spawn_blocking(move || {
+                            crate::tui::image_path_probe::normalize_private_image(&path)
+                        }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|joined| joined.ok())
+                    .and_then(Result::ok);
+                    Ok(
+                        crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
+                            terminal_generation,
+                            original,
+                            composer_snapshot,
+                            cursor,
+                            png: normalized,
+                        },
+                    )
+                },
+            );
             return;
         }
 
@@ -2861,6 +2952,39 @@ impl App {
         self.refresh_at_dismiss();
         self.reset_at_window();
         self.reset_slash_window();
+    }
+
+    pub(super) fn structured_paste_composer_eligible(&self) -> bool {
+        !self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            && !(self.pane_focused && self.pane.is_some())
+            && self.daemon_prompt.is_none()
+            && !matches!(
+                self.overlay,
+                Overlay::Stats(_)
+                    | Overlay::Usage(_)
+                    | Overlay::Sessions(_)
+                    | Overlay::Skills(_)
+                    | Overlay::Tools(_)
+                    | Overlay::GoalSettings(_)
+                    | Overlay::Permissions(_)
+                    | Overlay::Resources(_)
+                    | Overlay::Quick(_)
+                    | Overlay::Context(_)
+                    | Overlay::Diff(_)
+                    | Overlay::ModelPicker(_)
+                    | Overlay::Multireview(_)
+                    | Overlay::Notes(_)
+                    | Overlay::Help(_)
+            )
+            && self.question_dialog.is_none()
+            && !self.dialog.is_active()
+            && self.context_menu.is_none()
+            && self.pin_pick.is_none()
+            && self.fork_pick.is_none()
+            && self.copy_pick.is_none()
+            && self.pins_review.is_none()
+            && self.keys_overlay.is_none()
+            && self.transcript_find.is_none()
     }
 
     /// Insert raw (non-condensed) pasted text at the cursor, snapping the
@@ -2939,7 +3063,18 @@ impl App {
     /// Insert a pasted image as a `[Pasted image #N]` block. On a
     /// non-vision model, also toast that it'll be sent as a text note —
     /// the bytes are retained either way and re-evaluated at send time.
-    fn insert_image_block(&mut self, png: Vec<u8>) {
+    pub(super) fn insert_image_block(&mut self, png: Vec<u8>) {
+        let retained = self.paste_registry.image_payloads_by_number();
+        let total = retained
+            .values()
+            .try_fold(png.len(), |sum, image| sum.checked_add(image.len()));
+        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+            || total.is_none_or(|total| total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES)
+            || retained.len() >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+        {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
+            return;
+        }
         let at = self
             .paste_registry
             .resolve_insertion(self.composer.cursor());
@@ -4703,31 +4838,40 @@ mod paste_routing_tests {
         assert!(app.paste_registry.is_empty());
     }
 
+    #[test]
+    fn paste_noncomposer_literal_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        app.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::editing_for_test(
+            "", false,
+        ));
+        app.handle_paste("literal ' paste\n".to_string());
+        let Overlay::Notes(pane) = &app.overlay else {
+            panic!("notes pane stays open");
+        };
+        assert_eq!(pane.editor_text_for_test(), "literal ' paste\n");
+        assert!(app.composer.is_empty());
+        assert_eq!(
+            app.async_actions.pending_kind_count(
+                &crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe")
+            ),
+            0
+        );
+    }
+
     #[cfg(unix)]
-    fn spawn_cat_pane(app: &mut App, focused: bool) {
+    fn spawn_cat_pane(app: &mut App, focused: bool) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let argv = vec!["cat".to_string()];
         let cwd = std::env::temp_dir();
         let pane =
             crate::tui::pty::PtyPane::spawn(crate::tui::pty::PaneKind::Editor, &argv, &cwd, 24, 80)
                 .expect("spawn cat pty child");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pane = pane;
+        pane.install_input_observer(tx);
         app.pane = Some(pane);
         app.pane_focused = focused;
-    }
-
-    #[cfg(unix)]
-    fn wait_for_pane_text(app: &App, needle: &str) -> bool {
-        for _ in 0..50 {
-            let contains = app
-                .pane
-                .as_ref()
-                .map(|pane| pane.screen_contents_for_test().contains(needle))
-                .unwrap_or(false);
-            if contains {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        false
+        rx
     }
 
     #[cfg(unix)]
@@ -4735,11 +4879,11 @@ mod paste_routing_tests {
     fn paste_routes_to_focused_pty_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        spawn_cat_pane(&mut app, true);
+        let input = spawn_cat_pane(&mut app, true);
 
         app.handle_paste("hello\n".to_string());
 
-        assert!(wait_for_pane_text(&app, "hello"));
+        assert_eq!(input.recv().unwrap(), b"hello\n");
         assert!(app.composer.is_empty());
         assert!(app.paste_registry.is_empty());
         app.close_pane(true);
@@ -4750,11 +4894,11 @@ mod paste_routing_tests {
     fn paste_shortcut_chars_reach_focused_pty_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        spawn_cat_pane(&mut app, true);
+        let input = spawn_cat_pane(&mut app, true);
 
         app.handle_paste("cqjk\n".to_string());
 
-        assert!(wait_for_pane_text(&app, "cqjk"));
+        assert_eq!(input.recv().unwrap(), b"cqjk\n");
         assert!(app.composer.is_empty());
         app.close_pane(true);
     }
@@ -4764,11 +4908,12 @@ mod paste_routing_tests {
     fn paste_ignores_unfocused_pty_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
-        spawn_cat_pane(&mut app, false);
+        let input = spawn_cat_pane(&mut app, false);
 
         app.handle_paste("hello".to_string());
 
         assert_eq!(app.composer.text(), "hello");
+        assert!(input.try_recv().is_err());
         assert!(
             !app.pane
                 .as_ref()

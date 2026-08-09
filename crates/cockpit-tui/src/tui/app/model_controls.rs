@@ -490,6 +490,15 @@ impl App {
                 }
             }
         }
+        let Some(sequence) = self.next_submission_fence_sequence.checked_add(1) else {
+            self.show_model_selection_error(
+                &active,
+                trigger,
+                "Model switching is unavailable because local ordering was exhausted".to_string(),
+            );
+            return false;
+        };
+        self.next_submission_fence_sequence = sequence;
         let selection_id = uuid::Uuid::new_v4();
         let queued_submission = self
             .take_current_model_selection_retry()
@@ -932,6 +941,8 @@ impl App {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
                 self.begin_working_span();
                 let submission = cockpit_core::engine::message::UserSubmission {
+                    expected_model_state_generation: None,
+                    expected_model: None,
                     kind: cockpit_core::engine::message::UserSubmissionKind::User,
                     text: kickoff.clone(),
                     display_text: None,

@@ -58,6 +58,8 @@ pub struct PtyPane {
     /// exits on its own when the master is dropped (EOF), so we never
     /// join it (joining could block on a wedged child).
     _reader: JoinHandle<()>,
+    #[cfg(test)]
+    input_observer: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl PtyPane {
@@ -137,6 +139,8 @@ impl PtyPane {
             rows,
             cols,
             _reader: thread,
+            #[cfg(test)]
+            input_observer: None,
         })
     }
 
@@ -168,6 +172,15 @@ impl PtyPane {
         }
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+        #[cfg(test)]
+        if let Some(observer) = &self.input_observer {
+            let _ = observer.send(bytes.to_vec());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_input_observer(&mut self, observer: std::sync::mpsc::Sender<Vec<u8>>) {
+        self.input_observer = Some(observer);
     }
 
     /// Forward a key press to the child, encoding it back into terminal

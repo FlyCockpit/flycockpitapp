@@ -23,6 +23,8 @@ async fn handle_send_user_message(
     state: &mut MutableClientState,
     ctx: &Arc<DaemonContext>,
     client_submission_id: Uuid,
+    expected_model_state_generation: Option<u64>,
+    expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
     text: String,
     display_text: Option<String>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
@@ -49,6 +51,12 @@ async fn handle_send_user_message(
         &image_refs,
         forced_skill.as_deref(),
     );
+    if let (Some(generation), Some(model)) =
+        (expected_model_state_generation, expected_model.as_ref())
+    {
+        let model_json = serde_json::to_string(model).map_err(internal)?;
+        wire_fingerprint.push_str(&format!("|model:{generation}:{}", model_json));
+    }
     // Run marker acceptance is a durable barrier before queueing. Include
     // immutable options in the fingerprint so option drift conflicts.
     if let Some(options) = &run_invocation_options {
@@ -112,6 +120,8 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        expected_model_state_generation,
+        expected_model,
         kind: crate::engine::message::UserSubmissionKind::User,
         text,
         display_text,
@@ -145,7 +155,16 @@ async fn handle_send_user_message(
         })
         .await
         .map_err(internal)?;
-    let (item, queue) = response_rx.await.map_err(internal)??;
+    let actor_result = response_rx.await.map_err(internal)?;
+    let (item, queue) = match actor_result {
+        Ok(result) => result,
+        Err(error) => {
+            if error.code == ErrorCode::ModelGenerationStale {
+                release_message_image_refs(state, client_submission_id, &image_refs);
+            }
+            return Err(error);
+        }
+    };
     Ok(Response::UserMessageQueued { item, queue })
 }
 
@@ -290,6 +309,8 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::SendUserMessage {
+            expected_model_state_generation,
+            expected_model,
             client_submission_id,
             text,
             display_text,
@@ -302,6 +323,8 @@ pub(super) async fn handle_serialized_request(
                 state,
                 ctx,
                 client_submission_id,
+                expected_model_state_generation,
+                expected_model,
                 text,
                 display_text,
                 tag_expansions,

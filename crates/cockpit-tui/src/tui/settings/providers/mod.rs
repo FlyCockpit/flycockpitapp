@@ -2945,11 +2945,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:list",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:list"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:list"),
+            )
+                .into(),
         );
     }
 
@@ -3004,11 +3006,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:copilot-setup",
-            lines,
-            selected_line,
+            (lines, selected_line),
             controls,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:copilot-setup"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:copilot-setup"),
+            )
+                .into(),
         );
     }
 
@@ -3073,11 +3077,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:oauth-setup",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:oauth-setup"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:oauth-setup"),
+            )
+                .into(),
         );
         if let Some(links) = links {
             register_visible_link_regions(
@@ -3385,13 +3391,15 @@ impl SettingsCx {
             frame,
             area,
             "providers:add",
-            lines,
-            selected_line,
+            (lines, selected_line),
             controls.into_iter().filter_map(|(line, control)| {
                 provider_add_pointer_action(s, control).map(|action| (line, action))
             }),
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:add"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:add"),
+            )
+                .into(),
         );
         if let Some(links) = links {
             register_visible_link_regions(
@@ -3594,11 +3602,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:edit",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:edit"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:edit"),
+            )
+                .into(),
         );
     }
 
@@ -3644,11 +3654,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:headers",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:headers"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:headers"),
+            )
+                .into(),
         );
         if editor.is_editing() {
             render_header_edit_popup(frame, area, editor);
@@ -3751,11 +3763,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:models",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:models"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:models"),
+            )
+                .into(),
         );
         if editor.is_editing() {
             render_model_edit_popup(frame, area, editor);
@@ -4057,11 +4071,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:settings",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:settings"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:settings"),
+            )
+                .into(),
         );
     }
 
@@ -4169,11 +4185,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:fetch-all",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:fetch-all"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-all"),
+            )
+                .into(),
         );
     }
 
@@ -4260,11 +4278,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:fetch-one",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:fetch-one"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-one"),
+            )
+                .into(),
         );
     }
 
@@ -4326,11 +4346,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:fetch-fallback",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:fetch-fallback"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:fetch-fallback"),
+            )
+                .into(),
         );
     }
 }

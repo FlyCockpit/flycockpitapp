@@ -534,15 +534,7 @@ impl SettingsCx {
         self.build_tools_page_lines_with_bindings(width, p).0
     }
 
-    fn build_tools_page_lines_with_bindings(
-        &self,
-        width: u16,
-        p: &ToolsPage,
-    ) -> (
-        Vec<Line<'static>>,
-        Vec<(usize, super::pointer_actions::SettingsPointerAction)>,
-        Vec<(usize, super::pointer_actions::SettingsPointerAction)>,
-    ) {
+    fn build_tools_page_lines_with_bindings(&self, width: u16, p: &ToolsPage) -> ToolsPageLines {
         let muted = muted_style();
         let mut lines = Vec::new();
         let mut bindings = Vec::new();
@@ -735,12 +727,14 @@ impl SettingsCx {
             p,
             row_idx,
             bindings,
-            "provider",
-            &format!(
-                "{} (enter cycles Firecrawl, TinyFish, Custom)",
-                provider_label(self.extended.web.provider)
-            ),
-            muted_style(),
+            ToolRowContent {
+                label: "provider",
+                value: &format!(
+                    "{} (enter cycles Firecrawl, TinyFish, Custom)",
+                    provider_label(self.extended.web.provider)
+                ),
+                value_style: muted_style(),
+            },
         );
         match self.extended.web.provider {
             ConfigWebProvider::Firecrawl => {
@@ -750,12 +744,14 @@ impl SettingsCx {
                     p,
                     row_idx,
                     bindings,
-                    "api key",
-                    &format!(
-                        "{}; env wins over stored credentials",
-                        web_key_status_label(self.web_key_status(WebKeyProvider::Firecrawl))
-                    ),
-                    muted_style(),
+                    ToolRowContent {
+                        label: "api key",
+                        value: &format!(
+                            "{}; env wins over stored credentials",
+                            web_key_status_label(self.web_key_status(WebKeyProvider::Firecrawl))
+                        ),
+                        value_style: muted_style(),
+                    },
                 );
                 let env_override = (self.env_lookup)("FIRECRAWL_API_URL")
                     .filter(|v| !v.trim().is_empty())
@@ -767,16 +763,18 @@ impl SettingsCx {
                     p,
                     row_idx,
                     bindings,
-                    "base url",
-                    &format!(
-                        "{} ({env_override})",
-                        self.extended
-                            .web
-                            .firecrawl_base_url
-                            .as_deref()
-                            .unwrap_or("default")
-                    ),
-                    muted_style(),
+                    ToolRowContent {
+                        label: "base url",
+                        value: &format!(
+                            "{} ({env_override})",
+                            self.extended
+                                .web
+                                .firecrawl_base_url
+                                .as_deref()
+                                .unwrap_or("default")
+                        ),
+                        value_style: muted_style(),
+                    },
                 );
             }
             ConfigWebProvider::Tinyfish => {
@@ -786,15 +784,17 @@ impl SettingsCx {
                     p,
                     row_idx,
                     bindings,
-                    "api key",
-                    &format!(
-                        "{}; env wins over stored credentials",
-                        web_key_status_label(self.web_key_status(WebKeyProvider::TinyFish))
-                    ),
-                    if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    ToolRowContent {
+                        label: "api key",
+                        value: &format!(
+                            "{}; env wins over stored credentials",
+                            web_key_status_label(self.web_key_status(WebKeyProvider::TinyFish))
+                        ),
+                        value_style: if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
             }
@@ -806,12 +806,16 @@ impl SettingsCx {
                     p,
                     row_idx,
                     bindings,
-                    "webfetch",
-                    &web_command_status(fetch_command, "{url}"),
-                    if fetch_command.is_some_and(|command| !command.trim().is_empty()) {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    ToolRowContent {
+                        label: "webfetch",
+                        value: &web_command_status(fetch_command, "{url}"),
+                        value_style: if fetch_command
+                            .is_some_and(|command| !command.trim().is_empty())
+                        {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
                 let search_command = self.extended.web.custom.search_command.as_deref();
@@ -821,12 +825,16 @@ impl SettingsCx {
                     p,
                     row_idx,
                     bindings,
-                    "websearch",
-                    &web_command_status(search_command, "{query}"),
-                    if search_command.is_some_and(|command| !command.trim().is_empty()) {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    ToolRowContent {
+                        label: "websearch",
+                        value: &web_command_status(search_command, "{query}"),
+                        value_style: if search_command
+                            .is_some_and(|command| !command.trim().is_empty())
+                        {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
             }
@@ -860,9 +868,11 @@ impl SettingsCx {
                 p,
                 row_idx,
                 bindings,
-                tool.name,
-                &value,
-                muted_style(),
+                ToolRowContent {
+                    label: tool.name,
+                    value: &value,
+                    value_style: muted_style(),
+                },
             );
         }
     }
@@ -911,12 +921,14 @@ impl SettingsCx {
                 p,
                 row_idx,
                 bindings,
-                &name,
-                &value,
-                if tool.command.trim().is_empty() {
-                    warning_style()
-                } else {
-                    muted_style()
+                ToolRowContent {
+                    label: &name,
+                    value: &value,
+                    value_style: if tool.command.trim().is_empty() {
+                        warning_style()
+                    } else {
+                        muted_style()
+                    },
                 },
             );
         }
@@ -926,9 +938,11 @@ impl SettingsCx {
             p,
             row_idx,
             bindings,
-            "[+ add tool]",
-            "create a user-defined bash-command tool",
-            Style::default().add_modifier(Modifier::BOLD),
+            ToolRowContent {
+                label: "[+ add tool]",
+                value: "create a user-defined bash-command tool",
+                value_style: Style::default().add_modifier(Modifier::BOLD),
+            },
         );
     }
 
@@ -966,9 +980,11 @@ impl SettingsCx {
                         p,
                         row_idx,
                         bindings,
-                        &format!("{server_name}/{}", tool.name),
-                        first_line_or_default(&tool.description),
-                        muted_style(),
+                        ToolRowContent {
+                            label: &format!("{server_name}/{}", tool.name),
+                            value: first_line_or_default(&tool.description),
+                            value_style: muted_style(),
+                        },
                     );
                 }
             }
@@ -985,9 +1001,11 @@ impl SettingsCx {
             p,
             row_idx,
             bindings,
-            "configure in MCP ->",
-            "jump to MCP server settings",
-            Style::default().add_modifier(Modifier::BOLD),
+            ToolRowContent {
+                label: "configure in MCP ->",
+                value: "jump to MCP server settings",
+                value_style: Style::default().add_modifier(Modifier::BOLD),
+            },
         );
     }
 
@@ -998,11 +1016,9 @@ impl SettingsCx {
             frame,
             area,
             "tools",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("tools"),
+            (&self.pointer_surface, SettingsScrollRegionId("tools")).into(),
         );
         let offset = self.scroll_states.offset_for("tools");
         for (line, action) in read_only {
@@ -1026,6 +1042,9 @@ impl SettingsCx {
         }
     }
 }
+
+type ActionBinding = (usize, super::pointer_actions::SettingsPointerAction);
+type ToolsPageLines = (Vec<Line<'static>>, Vec<ActionBinding>, Vec<ActionBinding>);
 
 fn web_command_status(command: Option<&str>, placeholder: &str) -> String {
     match command.map(str::trim).filter(|value| !value.is_empty()) {
@@ -1060,9 +1079,7 @@ fn push_selectable_row(
     p: &ToolsPage,
     row_idx: &mut usize,
     bindings: &mut Vec<(usize, SettingsControlId)>,
-    label: &str,
-    value: &str,
-    value_style: Style,
+    content: ToolRowContent<'_>,
 ) {
     let first_line = lines.len();
     let selected = p.cursor == *row_idx;
@@ -1072,20 +1089,24 @@ fn push_selectable_row(
     } else {
         focused_field_style()
     };
-    push_tool_value_row(lines, width, marker, label, label_style, value, value_style);
+    push_tool_value_row(lines, width, marker, label_style, content);
     bindings
         .extend((first_line..lines.len()).map(|line| (line, SettingsControlId(*row_idx as u64))));
     *row_idx += 1;
+}
+
+struct ToolRowContent<'a> {
+    label: &'a str,
+    value: &'a str,
+    value_style: Style,
 }
 
 fn push_tool_value_row(
     lines: &mut Vec<Line<'static>>,
     width: u16,
     marker: &str,
-    label: &str,
     label_style: Style,
-    value: &str,
-    value_style: Style,
+    content: ToolRowContent<'_>,
 ) {
     push_wrapped_prefixed_value(
         lines,
@@ -1093,15 +1114,18 @@ fn push_tool_value_row(
         WrappedValueLayout {
             first_prefix: vec![
                 Span::raw(marker.to_string()),
-                Span::styled(format!("{:<TOOL_ROW_LABEL_WIDTH$}", label), label_style),
+                Span::styled(
+                    format!("{:<TOOL_ROW_LABEL_WIDTH$}", content.label),
+                    label_style,
+                ),
                 Span::raw(" ".repeat(TOOL_ROW_GAP_WIDTH)),
             ],
             prefix_width: TOOL_ROW_VALUE_INDENT,
             continuation_prefix: vec![Span::raw(" ".repeat(TOOL_ROW_VALUE_INDENT))],
             suffix: None,
         },
-        value,
-        value_style,
+        content.value,
+        content.value_style,
     );
 }
 

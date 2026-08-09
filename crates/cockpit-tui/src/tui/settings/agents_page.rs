@@ -1444,11 +1444,9 @@ impl SettingsCx {
             frame,
             area,
             "agents",
-            lines,
-            selected_line,
+            (lines, selected_line),
             controls,
-            &self.pointer_surface,
-            SettingsScrollRegionId("agents:list"),
+            (&self.pointer_surface, SettingsScrollRegionId("agents:list")).into(),
         );
     }
 
@@ -1468,8 +1466,7 @@ impl SettingsCx {
             frame,
             area,
             "agent-detail",
-            lines,
-            selected_line,
+            (lines, selected_line),
             semantic_rows
                 .iter()
                 .filter(|(_, _, enabled)| *enabled)
@@ -1488,8 +1485,11 @@ impl SettingsCx {
                         ),
                     )
                 }),
-            &self.pointer_surface,
-            SettingsScrollRegionId("agents:detail"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("agents:detail"),
+            )
+                .into(),
         );
         let offset = self.scroll_states.offset_for("agent-detail");
         let tier_width = area.width.min(12);
@@ -1793,11 +1793,10 @@ impl SettingsPage for AgentsPage {
             super::pointer_actions::SettingsPointerAction::Agents(
                 super::pointer_actions::AgentsAction::EditText(_)
             )
-        ) {
-            if self.external_edit_confirmation.take().is_some() {
-                self.status = Some("external edit cancelled".into());
-                return Nav::Stay;
-            }
+        ) && self.external_edit_confirmation.take().is_some()
+        {
+            self.status = Some("external edit cancelled".into());
+            return Nav::Stay;
         }
         if matches!(
             &action,

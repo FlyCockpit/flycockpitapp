@@ -776,11 +776,13 @@ impl SettingsCx {
             frame,
             area,
             "category:utility-picker",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("category:utility-picker"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("category:utility-picker"),
+            )
+                .into(),
         );
     }
 }
@@ -943,11 +945,9 @@ fn render_grab_list(
         frame,
         area,
         key,
-        lines,
-        selected_line,
+        (lines, selected_line),
         controls,
-        pointer_surface,
-        SettingsScrollRegionId(key),
+        (pointer_surface, SettingsScrollRegionId(key)).into(),
     );
     let offset = scroll_states.offset_for(key);
     for (line, delete_column, id) in confirmation_lines {

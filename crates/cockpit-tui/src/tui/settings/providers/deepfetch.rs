@@ -440,11 +440,13 @@ impl SettingsCx {
             frame,
             area,
             "providers:deep-fetch",
-            lines,
-            None,
+            (lines, None),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("providers:deep-fetch"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:deep-fetch"),
+            )
+                .into(),
         );
     }
 }

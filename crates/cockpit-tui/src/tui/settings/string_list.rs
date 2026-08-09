@@ -592,11 +592,9 @@ impl SettingsCx {
             frame,
             area,
             format!("string-list:{:?}", p.kind),
-            lines,
-            selected_line,
+            (lines, selected_line),
             controls,
-            &self.pointer_surface,
-            SettingsScrollRegionId("string-list"),
+            (&self.pointer_surface, SettingsScrollRegionId("string-list")).into(),
         );
         let key = format!("string-list:{:?}", p.kind);
         let offset = self.scroll_states.offset_for(&key);

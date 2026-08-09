@@ -417,11 +417,9 @@ impl SettingsCx {
             frame,
             area,
             "skills",
-            lines,
-            selected_line,
+            (lines, selected_line),
             controls,
-            &self.pointer_surface,
-            SettingsScrollRegionId("skills"),
+            (&self.pointer_surface, SettingsScrollRegionId("skills")).into(),
         );
     }
 }

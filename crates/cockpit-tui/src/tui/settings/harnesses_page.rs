@@ -641,11 +641,13 @@ impl SettingsCx {
             frame,
             area,
             "harnesses:list",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("harnesses:list"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("harnesses:list"),
+            )
+                .into(),
         );
     }
 
@@ -758,11 +760,13 @@ impl SettingsCx {
             frame,
             area,
             "harnesses:edit",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("harnesses:edit"),
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("harnesses:edit"),
+            )
+                .into(),
         );
     }
 }

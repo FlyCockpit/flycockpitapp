@@ -2777,7 +2777,7 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
         .map(|node| {
             Some((
                 pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
-                    node.id.clone(),
+                    node.id,
                 )),
                 true,
                 None,
@@ -2788,11 +2788,9 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
         frame,
         rows[0],
         "root",
-        list_lines,
-        Some(cursor),
+        (list_lines, Some(cursor)),
         controls,
-        &cx.pointer_surface,
-        shell::SettingsScrollRegionId("root"),
+        (&cx.pointer_surface, shell::SettingsScrollRegionId("root")).into(),
     );
 
     let desc = children[cursor].description;

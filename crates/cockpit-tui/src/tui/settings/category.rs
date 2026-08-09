@@ -3747,11 +3747,13 @@ impl SettingsCx {
             frame,
             settings_area,
             format!("category:{:?}", p.category),
-            lines,
-            Some(selected_line),
+            (lines, Some(selected_line)),
             controls,
-            &self.pointer_surface,
-            super::shell::SettingsScrollRegionId("category:settings"),
+            (
+                &self.pointer_surface,
+                super::shell::SettingsScrollRegionId("category:settings"),
+            )
+                .into(),
         );
         if let Some((line, id)) = inline_actions {
             let offset = self
@@ -4059,7 +4061,7 @@ impl SettingsPage for CategoryPage {
                     if self
                         .shadowed_global
                         .as_ref()
-                        .map_or(true, |prompt| category_pointer_id(prompt.setting) != id)
+                        .is_none_or(|prompt| category_pointer_id(prompt.setting) != id)
                     {
                         return Nav::Stay;
                     }

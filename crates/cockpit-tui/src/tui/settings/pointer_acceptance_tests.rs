@@ -13,13 +13,15 @@ use super::{SettingsPointerOutcome, TestPageRef};
 use std::cell::RefCell;
 use std::collections::HashSet;
 
+type ActionCoverage = (
+    HashSet<SettingsPointerAction>,
+    HashSet<SettingsPointerAction>,
+    HashSet<SettingsPointerAction>,
+    HashSet<SettingsPointerSurfaceKind>,
+);
+
 thread_local! {
-    static ACTION_COVERAGE: RefCell<(
-        HashSet<SettingsPointerAction>,
-        HashSet<SettingsPointerAction>,
-        HashSet<SettingsPointerAction>,
-        HashSet<SettingsPointerSurfaceKind>,
-    )> = RefCell::default();
+    static ACTION_COVERAGE: RefCell<ActionCoverage> = RefCell::default();
     static FIXTURE_COVERAGE: RefCell<(
         HashSet<super::pointer_action_fixtures::ActionFixtureKey>,
         HashSet<super::pointer_action_fixtures::ActionFixtureKey>,
@@ -476,13 +478,11 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
         );
         for expected in ["builtin", "mcp"] {
             assert!(
-                coverage.2.iter().any(|action| match (expected, action) {
-                    ("builtin", SettingsPointerAction::Tools(ToolsAction::ReadOnlyBuiltin(_))) =>
-                        true,
-                    ("mcp", SettingsPointerAction::Tools(ToolsAction::ReadOnlyMcpTool(_, _))) =>
-                        true,
-                    _ => false,
-                }),
+                coverage.2.iter().any(|action| matches!(
+                    (expected, action),
+                    ("builtin", SettingsPointerAction::Tools(ToolsAction::ReadOnlyBuiltin(_)))
+                        | ("mcp", SettingsPointerAction::Tools(ToolsAction::ReadOnlyMcpTool(_, _)))
+                )),
                 "disabled/read-only {expected} source payload was not rendered; disabled actions: {:?}",
                 coverage.2
             );

@@ -157,11 +157,13 @@ pub(crate) struct ToolSurfaceRender<'a> {
     pub(crate) block_safety_ungrant: bool,
 }
 
+pub(crate) type ToolSurfaceLines = (Vec<Line<'static>>, Option<usize>, Vec<(usize, usize, bool)>);
+
 pub(crate) fn tool_surface_lines(
     picker: &ToolSurfacePicker,
     draft: &ToolSurfaceDraft,
     opts: ToolSurfaceRender<'_>,
-) -> (Vec<Line<'static>>, Option<usize>, Vec<(usize, usize, bool)>) {
+) -> ToolSurfaceLines {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
     let red = Style::default().fg(Color::Red);

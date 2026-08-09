@@ -2877,7 +2877,7 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         let mut d = dialog_with_models(&tmp);
         open_utility_picker(&mut d);
         let _ = render_settings_rows(&d, 90, 24);
-        let wanted = if expected == "" {
+        let wanted = if expected.is_empty() {
             pointer_actions::SettingsPointerAction::UtilityModel(
                 pointer_actions::UtilityModelAction::Clear,
             )

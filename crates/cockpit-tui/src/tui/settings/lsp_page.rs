@@ -665,11 +665,9 @@ impl SettingsCx {
             frame,
             area,
             "lsp",
-            rows,
-            Some(selected_line),
+            (rows, Some(selected_line)),
             bindings,
-            &self.pointer_surface,
-            shell::SettingsScrollRegionId("lsp"),
+            (&self.pointer_surface, shell::SettingsScrollRegionId("lsp")).into(),
         );
         let offset = self.scroll_states.offset_for("lsp");
         if let Some(edit) = p.editing {

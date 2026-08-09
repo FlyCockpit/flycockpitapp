@@ -592,11 +592,9 @@ impl SettingsCx {
             frame,
             area,
             "mcp:list",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("mcp:list"),
+            (&self.pointer_surface, SettingsScrollRegionId("mcp:list")).into(),
         );
     }
 
@@ -851,11 +849,9 @@ impl SettingsCx {
             frame,
             area,
             "mcp:add",
-            lines,
-            selected_line,
+            (lines, selected_line),
             bindings,
-            &self.pointer_surface,
-            SettingsScrollRegionId("mcp:add"),
+            (&self.pointer_surface, SettingsScrollRegionId("mcp:add")).into(),
         );
     }
 }

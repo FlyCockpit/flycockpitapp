@@ -337,8 +337,7 @@ impl SettingsScrollStates {
         frame: &mut Frame,
         area: Rect,
         key: impl Into<String>,
-        lines: Vec<Line<'static>>,
-        selected_line: Option<usize>,
+        content: (Vec<Line<'static>>, Option<usize>),
         controls: Vec<
             Option<(
                 super::pointer_actions::SettingsPointerAction,
@@ -346,9 +345,10 @@ impl SettingsScrollStates {
                 Option<&'static str>,
             )>,
         >,
-        surface: &SettingsPointerSurface,
-        region: SettingsScrollRegionId,
+        pointer: PointerRenderContext<'_>,
     ) {
+        let (lines, selected_line) = content;
+        let PointerRenderContext { surface, region } = pointer;
         debug_assert_eq!(lines.len(), controls.len());
         let key = key.into();
         self.render_lines(frame, area, key.clone(), lines, selected_line);
@@ -390,30 +390,20 @@ impl SettingsScrollStates {
         frame: &mut Frame,
         area: Rect,
         key: impl Into<String>,
-        lines: Vec<Line<'static>>,
-        selected_line: Option<usize>,
+        content: (Vec<Line<'static>>, Option<usize>),
         bindings: impl IntoIterator<Item = (usize, A)>,
-        surface: &SettingsPointerSurface,
-        region: SettingsScrollRegionId,
+        pointer: PointerRenderContext<'_>,
     ) where
         A: Into<super::pointer_actions::SettingsPointerAction>,
     {
+        let (lines, selected_line) = content;
         let mut controls = vec![None; lines.len()];
         for (line, id) in bindings {
             if let Some(slot) = controls.get_mut(line) {
                 *slot = Some((id.into(), true, None));
             }
         }
-        self.render_control_lines(
-            frame,
-            area,
-            key,
-            lines,
-            selected_line,
-            controls,
-            surface,
-            region,
-        );
+        self.render_control_lines(frame, area, key, (lines, selected_line), controls, pointer);
     }
 
     pub(super) fn offset_for(&self, key: &str) -> usize {
@@ -422,6 +412,23 @@ impl SettingsScrollStates {
             .get(key)
             .map(ListState::offset)
             .unwrap_or(0)
+    }
+}
+
+pub(super) struct PointerRenderContext<'a> {
+    pub(super) surface: &'a SettingsPointerSurface,
+    pub(super) region: SettingsScrollRegionId,
+}
+
+impl<'a> PointerRenderContext<'a> {
+    pub(super) fn new(surface: &'a SettingsPointerSurface, region: SettingsScrollRegionId) -> Self {
+        Self { surface, region }
+    }
+}
+
+impl<'a> From<(&'a SettingsPointerSurface, SettingsScrollRegionId)> for PointerRenderContext<'a> {
+    fn from((surface, region): (&'a SettingsPointerSurface, SettingsScrollRegionId)) -> Self {
+        Self::new(surface, region)
     }
 }
 
@@ -786,8 +793,10 @@ mod tests {
                     frame,
                     Rect::new(0, 0, 20, 3),
                     "controls",
-                    (0..8).map(|row| Line::from(format!("row {row}"))).collect(),
-                    Some(6),
+                    (
+                        (0..8).map(|row| Line::from(format!("row {row}"))).collect(),
+                        Some(6),
+                    ),
                     (0..8)
                         .map(|row| {
                             let ids = [
@@ -802,17 +811,14 @@ mod tests {
                             ];
                             Some((
                                 super::super::pointer_actions::SettingsPointerAction::Root(
-                                    super::super::pointer_actions::RootAction::Open(
-                                        ids[row].clone(),
-                                    ),
+                                    super::super::pointer_actions::RootAction::Open(ids[row]),
                                 ),
                                 true,
                                 None,
                             ))
                         })
                         .collect(),
-                    &surface,
-                    SettingsScrollRegionId("controls"),
+                    (&surface, SettingsScrollRegionId("controls")).into(),
                 );
             })
             .expect("draw controls");

@@ -1482,10 +1482,13 @@ pub(super) async fn run_worker(
                         )));
                         continue;
                     }
-                    if let (Some(expected_generation), Some(expected_model)) = (
-                        submission.expected_model_state_generation,
-                        submission.expected_model.as_ref(),
-                    ) {
+                    let already_accepted = driver_input_queue.has_accepted(receipt.id).await;
+                    if !already_accepted
+                        && let (Some(expected_generation), Some(expected_model)) = (
+                            submission.expected_model_state_generation,
+                            submission.expected_model.as_ref(),
+                        )
+                    {
                         let current = authoritative_active_model_state
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());

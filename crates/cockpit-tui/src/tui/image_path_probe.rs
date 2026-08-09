@@ -91,7 +91,7 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
     Ok(normalized.into_inner())
 }
 
-fn is_generation_scoped(path: &Path) -> bool {
+pub(crate) fn is_generation_scoped(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let components = text
         .split(['/', '\\'])

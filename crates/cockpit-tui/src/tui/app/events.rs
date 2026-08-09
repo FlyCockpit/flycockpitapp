@@ -2011,6 +2011,7 @@ impl App {
             return;
         }
         self.active_model_state_generation = generation;
+        self.active_model_state_confirmed = true;
         let provider = selection.provider.clone();
         let model = selection.model.clone();
         self.active_model_selection = Some(selection);

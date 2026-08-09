@@ -225,6 +225,7 @@ impl App {
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;
+        self.active_model_state_confirmed = false;
         self.active_model_selection = None;
         self.launch.provider_line.clear();
         self.launch.active_model = None;

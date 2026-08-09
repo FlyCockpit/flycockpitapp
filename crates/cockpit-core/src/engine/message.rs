@@ -345,6 +345,12 @@ impl UserSubmissionQueue {
         (probe, snapshot_pending(&state))
     }
 
+    /// Whether this worker epoch already accepted `id`. Callers use this to
+    /// preserve lost-ack replay semantics before applying fresh-insert fences.
+    pub async fn has_accepted(&self, id: Uuid) -> bool {
+        self.inner.lock().await.accepted.contains_key(&id)
+    }
+
     pub async fn requeue_front(
         &self,
         submission: UserSubmission,

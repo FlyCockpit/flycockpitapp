@@ -2221,10 +2221,12 @@ impl App {
             .collect::<Vec<_>>();
         let submission = cockpit_core::engine::message::UserSubmission {
             expected_model_state_generation: self
-                .active_model_selection
-                .as_ref()
-                .map(|_| self.active_model_state_generation),
-            expected_model: self.active_model_selection.clone(),
+                .active_model_state_confirmed
+                .then_some(self.active_model_state_generation),
+            expected_model: self
+                .active_model_state_confirmed
+                .then(|| self.active_model_selection.clone())
+                .flatten(),
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
@@ -2887,7 +2889,9 @@ impl App {
             return;
         }
 
-        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
+        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data)
+            .filter(|path| crate::tui::image_path_probe::is_generation_scoped(path))
+        {
             let kind =
                 crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
             if self.async_actions.pending_kind_count(&kind) >= 8 {

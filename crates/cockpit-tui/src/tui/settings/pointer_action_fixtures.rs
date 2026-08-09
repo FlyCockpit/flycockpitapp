@@ -1003,7 +1003,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         }
         ProvidersAction::WizardControl(step, control) => wizard_key(*step, control),
         ProvidersAction::RowEditor(action) => row_key(action),
-        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Refresh) => {
+        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Refresh(_, _)) => {
             ProvidersFixture::ModelRefresh
         }
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Discard) => {

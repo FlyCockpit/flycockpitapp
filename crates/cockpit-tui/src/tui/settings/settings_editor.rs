@@ -1850,17 +1850,8 @@ impl SettingsEditor {
         if format!("{:?}", editor.refresh) == before_refresh {
             return; // superseded: no status mutation
         }
-        // Always clear the Refreshing… busy status on accepted success.
-        if let Some(line) = self
-            .multimodal
-            .as_ref()
-            .and_then(|m| m.accessibility_projection().first())
-            .cloned()
-        {
-            self.status = Some(line);
-        } else {
-            self.status = Some("media capabilities refreshed".into());
-        }
+        // Always clear the Refreshing… announcement on accepted success.
+        self.status = Some("media capabilities refreshed".into());
     }
 
     /// Complete a failed multimodal refresh without mutating drafts.

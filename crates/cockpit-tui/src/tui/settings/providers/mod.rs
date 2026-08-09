@@ -3815,6 +3815,23 @@ impl SettingsCx {
         ));
         lines.push(save_button_line("[save changes]", editor.on_save_row()));
 
+        if let (Some(_), super::settings_editor::SettingsScope::Model { model_id }) =
+            (editor.multimodal(), &editor.scope)
+        {
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::SettingsPointerAction::Providers(
+                    super::pointer_actions::ProvidersAction::ModelLifecycle(
+                        super::pointer_actions::ModelLifecycleAction::Refresh(
+                            super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                            super::pointer_actions::ModelId(model_id.clone()),
+                        ),
+                    ),
+                ),
+            ));
+            lines.push(Line::from("[refresh detected media capabilities]"));
+        }
+
         // Read-only model metadata, surfaced (not hidden) for completeness:
         // the `manual` marker and any preserved provider `extra` keys. These
         // are not editable here — `extra` is opaque vendor metadata kept
@@ -4977,6 +4994,27 @@ impl SettingsPage for ProvidersPage {
                 }
                 return cx.handle_providers_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
             }
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Refresh(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                );
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
         }
         if let (
             ProvidersPage::FetchOnePrompt(state),

@@ -48,6 +48,7 @@ pub mod inference_calls;
 pub mod installation_identity;
 pub mod lang;
 pub mod locks;
+pub mod message_attachments;
 pub mod needs_attention;
 pub mod org_sync;
 pub mod packages;

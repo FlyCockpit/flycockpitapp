@@ -705,6 +705,20 @@ CREATE TABLE message_submission_receipts (
       ON DELETE CASCADE
 );
 
+CREATE TABLE message_queue_items (
+    session_id           TEXT NOT NULL,
+    queue_item_id        BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    canonical_message    BLOB NOT NULL CHECK (typeof(canonical_message) = 'blob' AND length(canonical_message) <= 2631500),
+    state                TEXT NOT NULL CHECK (state IN ('accepted', 'folding', 'materialized', 'terminal_rejected', 'removed')),
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    PRIMARY KEY (session_id, queue_item_id),
+    UNIQUE (session_id, client_submission_id),
+    FOREIGN KEY (session_id, client_submission_id)
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+);
+
 CREATE TABLE message_attachment_references (
     session_id           TEXT NOT NULL,
     client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),

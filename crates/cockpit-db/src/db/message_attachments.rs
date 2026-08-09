@@ -1,0 +1,243 @@
+//! Atomic exactly-once persistence seam for typed user-message attachments.
+//!
+//! FCOR decoding, authority, model capability, and typed-media ownership remain
+//! owned by their respective layers. They are checked inside this transaction
+//! through [`MessageAcceptanceJoin`], so no receipt/reference can commit after
+//! a stale out-of-transaction decision.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
+
+use crate::db::Db;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageActor {
+    LocalOwner,
+    RemoteDevice { id: [u8; 16], generation: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageAttachmentReferenceInput {
+    pub attachment_id: [u8; 16],
+    pub attachment_version: u64,
+    pub checksum: [u8; 32],
+    pub kind: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptMessageInput {
+    pub session_id: Uuid,
+    pub operation_id: [u8; 16],
+    pub actor: MessageActor,
+    pub request_hash: [u8; 32],
+    pub message_request_digest: [u8; 32],
+    pub attachment_set_digest: [u8; 32],
+    pub client_submission_id: [u8; 16],
+    pub queue_item_id: [u8; 16],
+    pub canonical_message: Vec<u8>,
+    pub attachments: Vec<MessageAttachmentReferenceInput>,
+    pub safe_outcome: Vec<u8>,
+    pub outbox_sequence: i64,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptMessageResult {
+    Accepted,
+    Replayed { safe_outcome: Vec<u8> },
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalMessageState {
+    TerminalRejected,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageAttachmentReceiptIdentity {
+    pub client_submission_id: [u8; 16],
+    pub ordinal: u8,
+    pub attachment_id: [u8; 16],
+    pub attachment_version: u64,
+    pub checksum: [u8; 32],
+    pub kind: u8,
+}
+
+/// Prerequisite integrations invoked while the one SQLite writer transaction
+/// is open. Remote implementations reserve the FCOR ledger/outbox row here;
+/// local-owner implementations only recheck attachment/model admission.
+pub trait MessageAcceptanceJoin: Send + Sync {
+    fn validate_and_join(&self, conn: &Connection, input: &AcceptMessageInput) -> Result<()>;
+}
+
+impl Db {
+    pub async fn accept_message_with_attachments(
+        &self,
+        input: AcceptMessageInput,
+        join: Arc<dyn MessageAcceptanceJoin>,
+    ) -> Result<AcceptMessageResult> {
+        self.transaction(move |conn| accept_conn(conn, &input, join.as_ref()))
+            .await
+    }
+
+    pub async fn materialize_message_submissions(
+        &self,
+        session_id: Uuid,
+        submissions: Vec<[u8; 16]>,
+        history_data_json: String,
+        now_ms: i64,
+    ) -> Result<i64> {
+        self.transaction(move |conn| {
+            ensure!(!submissions.is_empty(), "no submissions to materialize");
+            conn.execute("INSERT INTO session_events (session_id,ts_ms,type,data_json) VALUES (?1,?2,'user_message',?3)", params![session_id.to_string(),now_ms,history_data_json])?;
+            let message_seq = conn.last_insert_rowid();
+            for (fold_ordinal, submission) in submissions.iter().enumerate() {
+                let changed = conn.execute("UPDATE message_submission_receipts SET state='materialized',message_seq=?3,fold_ordinal=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),message_seq,fold_ordinal as i64,now_ms])?;
+                ensure!(changed == 1, "message receipt is not accepted");
+                conn.execute("UPDATE message_operation_receipts SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+                conn.execute("UPDATE message_queue_items SET state='materialized',updated_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+            }
+            Ok(message_seq)
+        }).await
+    }
+
+    pub async fn terminate_accepted_message(
+        &self,
+        session_id: Uuid,
+        submission: [u8; 16],
+        state: TerminalMessageState,
+        safe_outcome: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.transaction(move |conn| {
+            let state = match state { TerminalMessageState::TerminalRejected => "terminal_rejected", TerminalMessageState::Removed => "removed" };
+            let changed = conn.execute("UPDATE message_submission_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
+            if changed == 0 { return Ok(false); }
+            conn.execute("UPDATE message_operation_receipts SET state=?3,safe_outcome=?4,updated_at=?5 WHERE session_id=?1 AND client_submission_id=?2 AND state='accepted'", params![session_id.to_string(),submission.as_slice(),state,safe_outcome,now_ms])?;
+            conn.execute("UPDATE message_queue_items SET state=?3,updated_at=?4 WHERE session_id=?1 AND client_submission_id=?2 AND state IN ('accepted','folding')", params![session_id.to_string(),submission.as_slice(),state,now_ms])?;
+            conn.execute("UPDATE message_attachment_references SET released_at=?3 WHERE session_id=?1 AND client_submission_id=?2 AND released_at IS NULL", params![session_id.to_string(),submission.as_slice(),now_ms])?;
+            Ok(true)
+        }).await
+    }
+
+    pub async fn message_attachment_receipts(
+        &self,
+        session_id: Uuid,
+        submission: [u8; 16],
+    ) -> Result<Vec<MessageAttachmentReceiptIdentity>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare("SELECT ordinal,attachment_id,attachment_version,checksum,kind FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2 ORDER BY ordinal")?;
+            let rows = stmt.query_map(params![session_id.to_string(),submission.as_slice()], |row| {
+                let attachment_id: Vec<u8> = row.get(1)?; let version: Vec<u8> = row.get(2)?; let checksum: Vec<u8> = row.get(3)?;
+                Ok(MessageAttachmentReceiptIdentity { client_submission_id: submission, ordinal: row.get::<_,i64>(0)? as u8, attachment_id: attachment_id.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, attachment_version: u64::from_be_bytes(version.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?), checksum: checksum.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, kind: row.get(4)? })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }).await
+    }
+}
+
+fn accept_conn(
+    conn: &Connection,
+    input: &AcceptMessageInput,
+    join: &dyn MessageAcceptanceJoin,
+) -> Result<AcceptMessageResult> {
+    ensure!(
+        input.canonical_message.len() <= 2_631_500,
+        "canonical message exceeds FCM2 maximum"
+    );
+    ensure!(
+        input.attachments.len() <= 16,
+        "too many message attachments"
+    );
+    ensure!(
+        input.operation_id != [0; 16] && input.client_submission_id != [0; 16],
+        "nil durable identity"
+    );
+    ensure!(
+        input.operation_id != input.client_submission_id,
+        "operation and submission identities must differ"
+    );
+    ensure!(input.outbox_sequence >= 0, "negative outbox sequence");
+    if let MessageActor::RemoteDevice { id, generation } = input.actor {
+        ensure!(
+            id != [0; 16] && generation > 0,
+            "invalid remote actor binding"
+        );
+    }
+    let mut attachment_ids = std::collections::HashSet::new();
+    for attachment in &input.attachments {
+        ensure!(
+            attachment.attachment_id != [0; 16],
+            "nil attachment identity"
+        );
+        ensure!(attachment.attachment_version > 0, "zero attachment version");
+        ensure!(
+            (1..=3).contains(&attachment.kind),
+            "unknown attachment kind"
+        );
+        ensure!(
+            attachment_ids.insert(attachment.attachment_id),
+            "duplicate attachment identity"
+        );
+    }
+    let session = input.session_id.to_string();
+    let existing = conn.query_row(
+        "SELECT actor_kind, actor_id, actor_generation, request_hash, message_request_digest, client_submission_id, safe_outcome
+           FROM message_operation_receipts WHERE session_id=?1 AND operation_id=?2",
+        params![session, input.operation_id.as_slice()],
+        |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<Vec<u8>>>(1)?, row.get::<_,Vec<u8>>(2)?, row.get::<_,Vec<u8>>(3)?, row.get::<_,Vec<u8>>(4)?, row.get::<_,Vec<u8>>(5)?, row.get::<_,Vec<u8>>(6)?)),
+    ).optional().context("reading message operation receipt")?;
+    if let Some((kind, id, generation, request_hash, message_digest, submission, outcome)) =
+        existing
+    {
+        let (expected_kind, expected_id, expected_generation) = actor_parts(input.actor);
+        if kind == expected_kind
+            && id.as_deref() == expected_id.as_deref()
+            && generation == expected_generation
+            && request_hash == input.request_hash
+            && message_digest == input.message_request_digest
+            && submission == input.client_submission_id
+        {
+            return Ok(AcceptMessageResult::Replayed {
+                safe_outcome: outcome,
+            });
+        }
+        return Ok(AcceptMessageResult::Conflict);
+    }
+    let paired_conflict: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM message_operation_receipts WHERE session_id=?1 AND client_submission_id=?2)",
+        params![session, input.client_submission_id.as_slice()], |row| row.get(0),
+    ).context("checking submission pairing")?;
+    if paired_conflict {
+        return Ok(AcceptMessageResult::Conflict);
+    }
+    join.validate_and_join(conn, input)?;
+    let (actor_kind, actor_id, actor_generation) = actor_parts(input.actor);
+    conn.execute("INSERT INTO message_operation_receipts
+      (session_id,operation_id,actor_kind,actor_id,actor_generation,request_hash,message_request_digest,client_submission_id,state,safe_outcome,outbox_sequence,created_at,updated_at)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,?11,?11)",
+      params![session,input.operation_id.as_slice(),actor_kind,actor_id,actor_generation,input.request_hash.as_slice(),input.message_request_digest.as_slice(),input.client_submission_id.as_slice(),input.safe_outcome,input.outbox_sequence,input.now_ms])?;
+    conn.execute("INSERT INTO message_submission_receipts
+      (session_id,client_submission_id,operation_id,message_request_digest,attachment_set_digest,state,queue_item_id,safe_outcome,created_at,updated_at)
+      VALUES (?1,?2,?3,?4,?5,'accepted',?6,?7,?8,?8)", params![session,input.client_submission_id.as_slice(),input.operation_id.as_slice(),input.message_request_digest.as_slice(),input.attachment_set_digest.as_slice(),input.queue_item_id.as_slice(),input.safe_outcome,input.now_ms])?;
+    conn.execute("INSERT INTO message_queue_items (session_id,queue_item_id,client_submission_id,canonical_message,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'accepted',?5,?5)", params![session,input.queue_item_id.as_slice(),input.client_submission_id.as_slice(),input.canonical_message,input.now_ms])?;
+    for (ordinal, attachment) in input.attachments.iter().enumerate() {
+        conn.execute("INSERT INTO message_attachment_references (session_id,client_submission_id,ordinal,attachment_id,attachment_version,checksum,kind,acquired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![session,input.client_submission_id.as_slice(),ordinal as i64,attachment.attachment_id.as_slice(),attachment.attachment_version.to_be_bytes().as_slice(),attachment.checksum.as_slice(),attachment.kind,input.now_ms])?;
+    }
+    Ok(AcceptMessageResult::Accepted)
+}
+
+fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) {
+    match actor {
+        MessageActor::LocalOwner => ("local_owner", None, 0u64.to_be_bytes().to_vec()),
+        MessageActor::RemoteDevice { id, generation } => (
+            "remote_device",
+            Some(id.to_vec()),
+            generation.to_be_bytes().to_vec(),
+        ),
+    }
+}

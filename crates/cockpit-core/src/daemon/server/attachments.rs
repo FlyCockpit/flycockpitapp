@@ -333,10 +333,6 @@ pub(super) async fn begin_attachment_upload_admitted(
             "media admission is unavailable while durable accounting recovery is incomplete",
         ));
     }
-    let response = begin_attachment_upload(state, mime, byte_len, sha256, purpose)?;
-    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
-        unreachable!()
-    };
     use cockpit_config::config::media_budget::{
         MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
     };
@@ -403,11 +399,14 @@ pub(super) async fn begin_attachment_upload_admitted(
     .collect::<Result<Vec<_>, _>>();
     let plans = match plans {
         Ok(plans) => plans,
-        Err(_) => {
-            state.pending_uploads.remove(&upload_id);
-            release_uploads(&state.upload_accounting, [upload_id]);
-            return Err(bad_request("attachment exceeds media resource policy"));
-        }
+        Err(_) => return Err(bad_request("attachment exceeds media resource policy")),
+    };
+    // All policy resolution and evaluation is complete before this call
+    // creates process-local pending state. Subsequent durable-admission errors
+    // have an exact upload id to roll back below.
+    let response = begin_attachment_upload(state, mime, byte_len, sha256, purpose)?;
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        unreachable!()
     };
     let (project_id, session) = state.attached.as_ref().map_or_else(
         || {

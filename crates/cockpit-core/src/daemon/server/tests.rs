@@ -11838,6 +11838,43 @@ async fn attachment_ledger_uses_authenticated_attached_project_identity() {
     assert_eq!(decoded_plan_count, 3);
 }
 
+#[tokio::test]
+async fn attachment_config_failure_leaves_no_pending_or_accounting_state() {
+    let saw_trust_policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_trust_policy_in_load = saw_trust_policy.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            saw_trust_policy_in_load.store(
+                crate::config::trust::current_workspace_trust_policy().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Err(anyhow::anyhow!("injected attachment config failure"))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let png = sample_png();
+
+    let result = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(saw_trust_policy.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(state.pending_uploads.is_empty());
+    let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    assert!(accounting.pending.is_empty());
+}
+
 async fn recv_body<S>(proto: &mut ProtoStream<S>) -> Body
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,

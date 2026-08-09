@@ -374,7 +374,8 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
             .active_model
             .as_ref()
             .and_then(|active| active.prompt_cache_retention),
-        Some(PromptCacheRetention::Extended)
+        None,
+        "dialog does not claim the staged default preference before daemon verification"
     );
     let staged = fresh.pending_default_model_update_id;
     assert!(matches!(
@@ -399,7 +400,7 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
             .active_model
             .as_ref()
             .and_then(|active| active.prompt_cache_retention),
-        Some(PromptCacheRetention::Default),
+        None,
         "default persistence remains daemon-owned until verified completion"
     );
 }

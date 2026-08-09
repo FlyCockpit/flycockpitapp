@@ -1,7 +1,9 @@
 use super::sessions::*;
 use super::*;
 
-pub(super) fn prune_expired_attachments(state: &mut MutableClientState) {
+pub(super) fn prune_expired_attachments(
+    state: &mut MutableClientState,
+) -> Vec<crate::media_reservation::ReservationReceipt> {
     let ttl = Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
     let now = Instant::now();
     let expired: Vec<_> = state
@@ -11,9 +13,11 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) {
             (now.duration_since(upload.created_at) > ttl).then_some(*upload_id)
         })
         .collect();
-    for upload_id in &expired {
-        state.pending_uploads.remove(upload_id);
-    }
+    let reservations = expired
+        .iter()
+        .filter_map(|upload_id| state.pending_uploads.remove(upload_id))
+        .filter_map(|upload| upload.media_reservation)
+        .collect();
     release_uploads(&state.upload_accounting, expired);
     state
         .ready_attachments
@@ -21,6 +25,7 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) {
     crate::sync::lock_or_recover(&state.upload_accounting)
         .consumed_message_attachments
         .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
+    reservations
 }
 
 pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
@@ -170,6 +175,7 @@ pub(super) fn begin_attachment_upload_with_limits(
     state.pending_uploads.insert(
         upload_id,
         PendingAttachmentUpload {
+            media_reservation: None,
             session_id,
             mime,
             byte_len,
@@ -183,6 +189,105 @@ pub(super) fn begin_attachment_upload_with_limits(
         upload_id,
         max_chunk_base64_bytes: proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES,
     })
+}
+
+pub(super) async fn begin_attachment_upload_admitted(
+    ctx: &DaemonContext,
+    state: &mut MutableClientState,
+    mime: String,
+    byte_len: usize,
+    sha256: String,
+    purpose: proto::AttachmentPurpose,
+) -> std::result::Result<Response, ErrorPayload> {
+    if !ctx
+        .media_admission_open
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(internal(
+            "media admission is unavailable while durable accounting recovery is incomplete",
+        ));
+    }
+    let response = begin_attachment_upload(state, mime, byte_len, sha256, purpose)?;
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        unreachable!()
+    };
+    use cockpit_config::config::media_budget::{
+        MediaDimension, MediaEvaluationRequest, MediaResourcePolicy, PASTE_IMAGE_PROFILE,
+    };
+    let policy = MediaResourcePolicy::default();
+    let plans = [
+        (MediaDimension::QueuedOperationsGlobal, 1),
+        (MediaDimension::QueuedOperationsPerSession, 1),
+        (MediaDimension::EncodedBytesPerObject, byte_len as u64),
+        (MediaDimension::RetainedBytesPerSession, byte_len as u64),
+        (
+            MediaDimension::OperationDeadlineSeconds,
+            proto::PENDING_ATTACHMENT_TTL_SECS,
+        ),
+    ]
+    .into_iter()
+    .map(|(dimension, requested)| {
+        policy.evaluate(MediaEvaluationRequest {
+            dimension,
+            requested: Some(requested),
+            current_scope: 0,
+            profile: Some(PASTE_IMAGE_PROFILE),
+            adapter_limit: None,
+            request_limit: None,
+        })
+    })
+    .collect::<Result<Vec<_>, _>>();
+    let plans = match plans {
+        Ok(plans) => plans,
+        Err(_) => {
+            state.pending_uploads.remove(&upload_id);
+            release_uploads(&state.upload_accounting, [upload_id]);
+            return Err(bad_request("attachment exceeds media resource policy"));
+        }
+    };
+    let session = state
+        .attached
+        .as_ref()
+        .map(|attached| attached.handle.session_id.to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "principal:{}",
+                state.principal.tag().unwrap_or_else(|| "local".into())
+            )
+        });
+    let reservation_id = format!("attachment:{upload_id}");
+    let admission = ctx
+        .media_ledger
+        .reserve(crate::media_reservation::ReserveRequest {
+            reservation_id: reservation_id.clone(),
+            recovery_id: reservation_id,
+            owner: crate::media_reservation::MediaOwner {
+                project_id: session.clone(),
+                session_id: session,
+            },
+            operation: "attachment_upload".into(),
+            purpose: "paste_image".into(),
+            plans,
+            wall_ms: chrono::Utc::now()
+                .timestamp_millis()
+                .try_into()
+                .unwrap_or(0),
+        })
+        .await;
+    let receipt = match admission {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            state.pending_uploads.remove(&upload_id);
+            release_uploads(&state.upload_accounting, [upload_id]);
+            return Err(internal(format!("media admission denied: {error}")));
+        }
+    };
+    state
+        .pending_uploads
+        .get_mut(&upload_id)
+        .expect("upload inserted before durable admission")
+        .media_reservation = Some(receipt);
+    Ok(response)
 }
 
 pub(super) fn upload_attachment_chunk(
@@ -264,6 +369,35 @@ pub(super) async fn finish_attachment_upload(
             state.terminal_host.paste_image(terminal_id, &bytes)
         }
     }
+}
+
+pub(super) async fn finish_attachment_upload_admitted(
+    ctx: &DaemonContext,
+    state: &mut MutableClientState,
+    upload_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let reservation = state
+        .pending_uploads
+        .get(&upload_id)
+        .and_then(|upload| upload.media_reservation.clone());
+    let result = finish_attachment_upload(state, upload_id).await;
+    if let Some(receipt) = reservation {
+        let wall_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .try_into()
+            .unwrap_or(0);
+        let ledger_result = if result.is_ok() {
+            ctx.media_ledger
+                .complete_local_allocation(&receipt.reservation_id, receipt.version, wall_ms)
+                .await
+        } else {
+            ctx.media_ledger
+                .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+                .await
+        };
+        ledger_result.map_err(internal)?;
+    }
+    result
 }
 
 #[cfg(test)]

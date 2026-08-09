@@ -1709,6 +1709,10 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// Shared durable media authority. Production media entry points consult
+    /// `media_admission_open` before accepting work.
+    pub media_ledger: crate::media_reservation::MediaReservationLedger,
+    pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
     pub started_at: Instant,
@@ -1845,11 +1849,24 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
+        struct DaemonMediaClock(Instant);
+        impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        let started_at = Instant::now();
+        let media_ledger = crate::media_reservation::MediaReservationLedger::new(
+            db.clone(),
+            Arc::new(DaemonMediaClock(started_at)),
+        );
         Self {
             db,
+            media_ledger,
+            media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
-            started_at: Instant::now(),
+            started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
@@ -2253,6 +2270,15 @@ pub(crate) async fn boot_with_db(
             "media reservation recovery awaits owner-specific cleanup evidence; retained charges remain admission-blocking"
         );
         timer.phase("media_reservation_recovery_blocked");
+    }
+    let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
+    ctx.media_admission_open
+        .store(recovery_complete, std::sync::atomic::Ordering::Release);
+    if recovery_complete {
+        timer.phase("media_reservation_admission_open");
+    } else {
+        tracing::warn!("media admission is closed until durable reservations are recovered");
+        timer.phase("media_reservation_admission_blocked");
     }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
@@ -2810,6 +2836,7 @@ where
 }
 
 struct PendingAttachmentUpload {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Option<Uuid>,
     mime: String,
     byte_len: usize,

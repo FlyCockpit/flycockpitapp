@@ -244,6 +244,18 @@ impl MediaReservationLedger {
         Self { db, clock }
     }
 
+    /// Startup admission remains closed while any non-terminal reservation
+    /// still requires owner-specific recovery or external reconciliation.
+    pub async fn recovery_complete(&self) -> Result<bool, LedgerError> {
+        self.db.read(|conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM media_reservations WHERE state NOT IN ('released','accounting_corrupt')",
+                [], |row| row_u64(row, 0),
+            )?;
+            Ok(count == 0)
+        }).await.map_err(LedgerError::Storage)
+    }
+
     pub async fn reserve(
         &self,
         request: ReserveRequest,
@@ -374,6 +386,29 @@ impl MediaReservationLedger {
                 params![next.as_str(), sqlite_i64(next_version)?, id, sqlite_i64(expected_version)?],
             )?;
             Ok(ReservationReceipt { reservation_id: id, state: next, version: next_version, queue_sequence: sequence, deadline_monotonic_ms: deadline })
+        }).await.map_err(classify_storage_error)
+    }
+
+    /// Completes an in-process allocation phase. Queue permits are released,
+    /// while byte-retention charges remain until artifact cleanup is proved.
+    pub async fn complete_local_allocation(
+        &self,
+        id: &str,
+        expected_version: u64,
+        wall_ms: u64,
+    ) -> Result<ReservationReceipt, LedgerError> {
+        let id = id.to_owned();
+        self.db.transaction(move |conn| {
+            let (state,version,sequence,deadline,project,session)=conn.query_row(
+                "SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1", [&id],
+                |row| Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row_u64(row,2)?,row_u64(row,3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?;
+            if version != expected_version { return Err(anyhow!("stale_version")); }
+            if ReservationState::parse(&state)? != ReservationState::ReservedQueued { return Err(anyhow!("invalid_transition")); }
+            let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+            release_queued(conn,&id,&MediaOwner{project_id:project,session_id:session},next_version,wall_ms)?;
+            conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2 AND version=?3",
+                params![sqlite_i64(next_version)?,id,sqlite_i64(version)?])?;
+            Ok(ReservationReceipt{reservation_id:id,state:ReservationState::Settling,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
     }
 
@@ -1482,6 +1517,71 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_gate_stays_closed_until_every_nonterminal_row_is_resolved() {
+        let ledger = MediaReservationLedger::new(
+            Db::open_in_memory().unwrap(),
+            Arc::new(Clock(AtomicU64::new(0))),
+        );
+        assert!(ledger.recovery_complete().await.unwrap());
+        let receipt = ledger
+            .reserve(request(
+                "startup-blocker",
+                vec![
+                    plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                    plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(!ledger.recovery_complete().await.unwrap());
+        ledger
+            .request_cancellation(&receipt.reservation_id, receipt.version, 2)
+            .await
+            .unwrap();
+        assert!(ledger.recovery_complete().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn completed_allocation_releases_queue_but_retains_bytes() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        let receipt = ledger
+            .reserve(request(
+                "allocated",
+                vec![
+                    plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                    plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::EncodedBytesPerObject, 7, None),
+                    plan(MediaDimension::RetainedBytesPerSession, 7, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let completed = ledger
+            .complete_local_allocation(&receipt.reservation_id, receipt.version, 2)
+            .await
+            .unwrap();
+        assert_eq!(completed.state, ReservationState::Settling);
+        let counters = db
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT dimension,charged FROM media_resource_counters ORDER BY dimension",
+                )?;
+                Ok(statement
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await
+            .unwrap();
+        assert!(counters.contains(&("queued_operations_global".into(), 0)));
+        assert!(counters.contains(&("queued_operations_per_session".into(), 0)));
+        assert!(counters.contains(&("encoded_bytes_per_object".into(), 7)));
+        assert!(counters.contains(&("retained_bytes_per_session".into(), 7)));
     }
 
     #[tokio::test]

@@ -309,6 +309,7 @@ pub struct CapturedModel {
     pub model_id: String,
     pub active_model_state_generation: u64,
     pub image_capability_generation: u64,
+    pub supports_images: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -894,6 +895,7 @@ mod tests {
                 model_id: "m".into(),
                 active_model_state_generation: 11,
                 image_capability_generation: 4,
+                supports_images: true,
             },
             slots: vec![PasteSlotState::Pending {
                 request,

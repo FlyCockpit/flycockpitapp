@@ -535,13 +535,16 @@ impl App {
                             (deferred.waiting_model_selection == Some(selection_id)).then_some(*id)
                         })
                         .collect::<Vec<_>>();
-                    for id in cancelled {
-                        self.deferred_fence_dispatches.remove(&id);
-                        if let Some(fence) = self.submission_fences.remove(&id) {
+                    for id in &cancelled {
+                        self.deferred_fence_dispatches.remove(id);
+                        if let Some(fence) = self.submission_fences.remove(id) {
                             self.submission_order.cancel(fence.fence_sequence);
                         }
                         self.pending_paste_probes
-                            .retain(|_, probe| probe.owner_fence != Some(id));
+                            .retain(|_, probe| probe.owner_fence != Some(*id));
+                    }
+                    if !cancelled.is_empty() {
+                        self.show_toast("Paste unavailable", ToastKind::Error);
                     }
                 }
                 if applied && let Some(default_update) = default_update {

@@ -420,7 +420,7 @@ impl std::fmt::Display for CompactBudgetError {
 /// Select the last `keep` complete user-to-assistant exchanges. A tool result
 /// is not a new exchange boundary, so assistant tool calls and their following
 /// user tool results can never be split by this selector.
-fn complete_exchange_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn complete_exchange_ranges(history: &[Message]) -> Vec<std::ops::Range<usize>> {
     use rig::message::UserContent;
 
     let starts = history

@@ -26,6 +26,7 @@ pub mod agent;
 pub mod bash_hints;
 pub mod builtin;
 pub mod compact;
+pub(crate) mod compact_draft;
 pub mod deferred;
 pub mod deleg_shrink;
 pub mod delegation_prompt_prune;

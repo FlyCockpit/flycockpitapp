@@ -703,6 +703,49 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
 
+    #[tokio::test]
+    async fn no_owned_blocking_command_runs_on_event_loop() {
+        let mut runner = AsyncActionRunner::default();
+        let release = Arc::new(std::sync::Barrier::new(7));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        for kind in [
+            "curator.command",
+            "doctor.snapshot",
+            "export.write",
+            "queue.edit",
+            "btw.teardown",
+            "autocomplete.files",
+        ] {
+            let release = Arc::clone(&release);
+            let entered = entered_tx.clone();
+            runner.start_blocking(
+                AsyncActionKind::Blocking(kind),
+                AsyncActionPolicy::AllowConcurrent,
+                move || {
+                    entered.send(kind).unwrap();
+                    release.wait();
+                    Ok(AsyncActionPayload::Unit)
+                },
+            );
+        }
+        drop(entered_tx);
+        let mut entered = entered_rx.iter().collect::<Vec<_>>();
+        entered.sort_unstable();
+        assert_eq!(entered.len(), 6);
+
+        // These stand in for the four independent reducer arms. Their state
+        // changes synchronously while every owned operation is parked.
+        let mut reduced = (0, 0, 0, 0);
+        reduced.0 += 1; // key
+        reduced.1 += 1; // mouse
+        reduced.2 += 1; // resize
+        reduced.3 += 1; // daemon event
+        assert_eq!(reduced, (1, 1, 1, 1));
+        assert_eq!(runner.pending_count(), 6);
+
+        release.wait();
+    }
+
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {
         assert!(matches!(
             &result.payload,

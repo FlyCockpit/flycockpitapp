@@ -1,22 +1,19 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupDisclosureIdentity<'a> {
+    project_root: &'a str,
+    generation: u64,
+    socket: Option<&'a std::path::Path>,
+    launch_session_id: Option<uuid::Uuid>,
+    attachment: Option<(uuid::Uuid, u64)>,
+}
+
 fn startup_disclosure_completion_is_current(
-    current_project_root: &str,
-    completed_project_root: &str,
-    current_generation: u64,
-    completed_generation: u64,
-    current_socket: Option<&std::path::Path>,
-    completed_socket: Option<&std::path::Path>,
-    current_launch_session_id: Option<uuid::Uuid>,
-    completed_launch_session_id: Option<uuid::Uuid>,
-    current_attachment: Option<(uuid::Uuid, u64)>,
-    completed_attachment: Option<(uuid::Uuid, u64)>,
+    current: StartupDisclosureIdentity<'_>,
+    completed: StartupDisclosureIdentity<'_>,
 ) -> bool {
-    current_project_root == completed_project_root
-        && current_generation == completed_generation
-        && current_socket == completed_socket
-        && current_launch_session_id == completed_launch_session_id
-        && current_attachment == completed_attachment
+    current == completed
 }
 
 fn reconnectable_session_switch_error(error: &str) -> bool {
@@ -332,16 +329,20 @@ impl App {
                         .filter(|runner| runner.has_attached_client())
                         .map(|runner| (runner.session_id(), runner.attachment_epoch()));
                     if startup_disclosure_completion_is_current(
-                        &self.launch.cwd.to_string_lossy(),
-                        &project_root,
-                        self.startup_disclosures_generation,
-                        request_generation,
-                        self.startup_background.daemon_socket.as_deref(),
-                        socket.as_deref(),
-                        self.launch.session_id,
-                        launch_session_id,
-                        current_attachment,
-                        session_id.zip(attachment_epoch),
+                        StartupDisclosureIdentity {
+                            project_root: &self.launch.cwd.to_string_lossy(),
+                            generation: self.startup_disclosures_generation,
+                            socket: self.startup_background.daemon_socket.as_deref(),
+                            launch_session_id: self.launch.session_id,
+                            attachment: current_attachment,
+                        },
+                        StartupDisclosureIdentity {
+                            project_root: &project_root,
+                            generation: request_generation,
+                            socket: socket.as_deref(),
+                            launch_session_id,
+                            attachment: session_id.zip(attachment_epoch),
+                        },
                     ) {
                         self.startup_disclosures_ready = true;
                         self.org_sync_disclosure = org;
@@ -1063,86 +1064,60 @@ impl App {
 
 #[cfg(test)]
 mod startup_disclosure_generation_tests {
-    use super::startup_disclosure_completion_is_current;
+    use super::{StartupDisclosureIdentity, startup_disclosure_completion_is_current};
     use std::path::Path;
     use uuid::Uuid;
 
     #[test]
     fn stale_or_detached_disclosure_completions_are_rejected_for_same_project() {
+        fn identity<'a>(
+            project_root: &'a str,
+            generation: u64,
+            socket: Option<&'a Path>,
+            launch_session_id: Option<Uuid>,
+            attachment: Option<(Uuid, u64)>,
+        ) -> StartupDisclosureIdentity<'a> {
+            StartupDisclosureIdentity {
+                project_root,
+                generation,
+                socket,
+                launch_session_id,
+                attachment,
+            }
+        }
+
         let session = Uuid::new_v4();
         let current = Some((session, 4));
         let socket = Some(Path::new("/tmp/cockpit.sock"));
+        let completed = identity("/repo", 8, socket, Some(session), current);
         assert!(startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            8,
-            8,
-            socket,
-            socket,
-            Some(session),
-            Some(session),
-            current,
-            current,
+            completed, completed
         ));
         assert!(!startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            9,
-            8,
-            socket,
-            socket,
-            Some(session),
-            Some(session),
-            current,
-            current,
+            identity("/repo", 9, socket, Some(session), current),
+            completed,
         ));
         assert!(!startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            8,
-            8,
-            socket,
-            socket,
-            Some(session),
-            Some(session),
-            None,
-            current,
+            identity("/repo", 8, socket, Some(session), None),
+            completed,
         ));
         assert!(!startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            8,
-            8,
-            socket,
-            socket,
-            Some(session),
-            Some(session),
-            Some((session, 5)),
-            current,
+            identity("/repo", 8, socket, Some(session), Some((session, 5))),
+            completed,
         ));
         assert!(!startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            8,
-            8,
-            Some(Path::new("/tmp/replacement.sock")),
-            socket,
-            Some(session),
-            Some(session),
-            current,
-            current,
+            identity(
+                "/repo",
+                8,
+                Some(Path::new("/tmp/replacement.sock")),
+                Some(session),
+                current,
+            ),
+            completed,
         ));
         assert!(!startup_disclosure_completion_is_current(
-            "/repo",
-            "/repo",
-            8,
-            8,
-            socket,
-            socket,
-            None,
-            Some(session),
-            current,
-            current,
+            identity("/repo", 8, socket, None, current),
+            completed,
         ));
     }
 }

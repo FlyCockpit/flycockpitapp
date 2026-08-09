@@ -2160,6 +2160,12 @@ impl SettingsDialog {
 
     fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
         let surface_token = self.page.pointer_surface_token();
+        self.pointer_surface
+            .enabled
+            .set(self.extended.tui.mouse_capture);
+        if !self.extended.tui.mouse_capture {
+            self.pointer_surface.hover.set(None);
+        }
         self.pointer_surface.clear_for_page(area, surface_token);
         let title = self.title();
         let block = Block::default()
@@ -2205,7 +2211,11 @@ impl SettingsDialog {
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }
-        let help = format!("{}  click: activate  wheel: scroll", self.help_text());
+        let help = if self.pointer_surface.enabled.get() {
+            format!("{}  click: activate  wheel: scroll", self.help_text())
+        } else {
+            self.help_text().to_string()
+        };
         frame.render_widget(help_line(&help), layout[2]);
     }
 

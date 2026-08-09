@@ -181,13 +181,27 @@ pub(super) struct SettingsPointerTarget {
     pub disabled_reason: Option<&'static str>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SettingsPointerSurface {
     pub area: std::cell::Cell<Option<Rect>>,
     page_token: std::cell::Cell<Option<u64>>,
     pub targets: RefCell<Vec<SettingsPointerTarget>>,
     pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
     pub hover: std::cell::Cell<Option<SettingsControlId>>,
+    pub enabled: std::cell::Cell<bool>,
+}
+
+impl Default for SettingsPointerSurface {
+    fn default() -> Self {
+        Self {
+            area: std::cell::Cell::new(None),
+            page_token: std::cell::Cell::new(None),
+            targets: RefCell::new(Vec::new()),
+            scroll_regions: RefCell::new(Vec::new()),
+            hover: std::cell::Cell::new(None),
+            enabled: std::cell::Cell::new(true),
+        }
+    }
 }
 
 impl SettingsPointerSurface {
@@ -208,6 +222,9 @@ impl SettingsPointerSurface {
     }
 
     pub fn register(&self, target: SettingsPointerTarget) {
+        if !self.enabled.get() {
+            return;
+        }
         self.targets.borrow_mut().push(target);
     }
 
@@ -221,6 +238,9 @@ impl SettingsPointerSurface {
     }
 
     pub fn register_scroll_region(&self, rect: Rect, id: SettingsScrollRegionId) {
+        if !self.enabled.get() {
+            return;
+        }
         self.scroll_regions.borrow_mut().push((rect, id));
     }
 

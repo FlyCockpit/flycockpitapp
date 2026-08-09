@@ -659,7 +659,8 @@ impl SettingId {
             }
             SettingId::Mouse => {
                 "Capture mouse events. On (default) gives click-to-position in the \
-                 composer, in-app drag-select, and clickable chips; hold \
+                 composer, in-app drag-select, clickable chips, and click/wheel \
+                 navigation and editing throughout Settings; hold \
                  Shift/Option/Fn for your terminal's native selection. Off hands \
                  selection and copy back to the terminal entirely."
             }

@@ -166,11 +166,9 @@ pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Pat
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".cleanup-deferred")
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".cleanup-deferred") || name.ends_with(".partial") {
             match tokio::fs::remove_file(entry.path()).await {
                 Ok(()) => eprintln!(
                     "cockpit: recovered deferred export cleanup {}",

@@ -1884,6 +1884,9 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    // Declared after `async_actions`: Rust drops fields in declaration order,
+    // so every export owner is released before the process reaper drains.
+    pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
@@ -3267,6 +3270,7 @@ impl App {
             agent_runner: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             startup_background: StartupBackground {
@@ -3484,7 +3488,7 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let _export_reaper_guard = crate::tui::async_action::ExportTempReaperGuard::new();
+        crate::tui::async_action::recover_persisted_export_records().await;
         export_actions::recover_deferred_export_cleanup(
             &self.launch.cwd.join(".cockpit").join("exports"),
         )

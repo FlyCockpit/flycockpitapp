@@ -173,6 +173,28 @@ async fn export_writes_off_the_loop_thread() {
 }
 
 #[tokio::test]
+async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let partial = tmp.path().join(".cancelled-app.partial");
+    let worker_partial = partial.clone();
+    let (owned_tx, owned_rx) = tokio::sync::oneshot::channel();
+    let mut app = App::new(None, false);
+    app.async_actions.start_export(
+        AsyncActionKind::Blocking("export.transcript"),
+        AsyncActionPolicy::AllowConcurrent,
+        move |owner| async move {
+            std::fs::write(&worker_partial, b"partial").unwrap();
+            owner.own_export_temp(worker_partial);
+            owned_tx.send(()).unwrap();
+            std::future::pending::<Result<AsyncActionPayload, String>>().await
+        },
+    );
+    owned_rx.await.unwrap();
+    drop(app);
+    assert!(!partial.exists());
+}
+
+#[tokio::test]
 async fn queue_edit_does_not_block_key_handler() {
     let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
     let mut app = App::new(None, false);

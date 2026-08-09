@@ -328,7 +328,10 @@ fn export_temp_reaper() -> &'static ExportReaper {
                                     let deferred = path.with_extension("partial.cleanup-deferred");
                                     match std::fs::rename(&path, &deferred) {
                                         Ok(()) => eprintln!("cockpit: CleanupDeferred — export recovery recorded at {}", deferred.display()),
-                                        Err(rename_error) => eprintln!("cockpit: CleanupDeferred — could not quarantine {} after {error}: {rename_error}", path.display()),
+                                        Err(rename_error) => {
+                                            let record = persist_export_recovery_record(&path);
+                                            eprintln!("cockpit: CleanupDeferred — could not quarantine {} after {error}: {rename_error}; recovery_record={}", path.display(), record.as_ref().map_or_else(|e| format!("failed:{e}"), |p| p.display().to_string()));
+                                        }
                                     }
                                 }
                             }
@@ -353,13 +356,66 @@ fn export_temp_reaper() -> &'static ExportReaper {
     })
 }
 
+fn persist_export_recovery_record(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let dir = std::env::temp_dir().join("cockpit-export-recovery");
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let record = dir.join(format!("{}.record", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&record)?;
+    use std::io::Write as _;
+    file.write_all(path.to_string_lossy().as_bytes())?;
+    file.sync_all()?;
+    std::fs::File::open(&dir)?.sync_all()?;
+    Ok(record)
+}
+
+pub(crate) async fn recover_persisted_export_records() {
+    let dir = std::env::temp_dir().join("cockpit-export-recovery");
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(path) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        match tokio::fs::remove_file(path.trim()).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+            Err(error) => eprintln!(
+                "cockpit: CleanupDeferred remains for {}: {error}",
+                path.trim()
+            ),
+        }
+    }
+}
+
 fn enqueue_export_temp_reap(path: std::path::PathBuf) {
-    let sent = export_temp_reaper()
+    let tx = export_temp_reaper()
         .tx
         .lock()
         .expect("export reaper lock poisoned")
         .as_ref()
-        .is_some_and(|tx| tx.send(ExportReaperMessage::Reap(path.clone())).is_ok());
+        .cloned();
+    enqueue_export_temp_reap_with(path, tx);
+}
+
+fn enqueue_export_temp_reap_with(
+    path: std::path::PathBuf,
+    tx: Option<std::sync::mpsc::Sender<ExportReaperMessage>>,
+) {
+    let sent = tx.is_some_and(|tx| tx.send(ExportReaperMessage::Reap(path.clone())).is_ok());
     if !sent {
         synchronous_export_cleanup_fallback(&path);
     }
@@ -904,6 +960,7 @@ impl AsyncActionRunner {
         for (id, pending) in self.pending.drain() {
             if let Some(shutdown) = &pending.shutdown {
                 shutdown.cancel();
+                shutdown.schedule_export_temp_cleanup_retry();
             }
             pending.handle.abort();
             self.cancelled.push(AsyncActionResult {
@@ -1380,7 +1437,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let partial = tmp.path().join(".spawn-failure.partial");
         std::fs::write(&partial, b"partial").unwrap();
-        synchronous_export_cleanup_fallback(&partial);
+        enqueue_export_temp_reap_with(partial.clone(), None);
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn reaper_closed_channel_fallback_removes_partial_synchronously() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".closed-channel.partial");
+        std::fs::write(&partial, b"partial").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        enqueue_export_temp_reap_with(partial.clone(), Some(tx));
         assert!(!partial.exists());
     }
 

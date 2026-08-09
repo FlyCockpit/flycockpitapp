@@ -17,8 +17,8 @@ use super::health::{ExternalRuntimeSnapshot, HealthEntry, HealthState};
 use super::platform::{common_platform_remedy, configured_command_remedy, package_remedy_table};
 use super::registry::{ExternalRuntimeRegistry, RegistryError};
 use super::schema::{
-    Applicability, DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId,
-    HostPlatform, ProbePolicy, RemedyKind, VersionParser,
+    Applicability, CompatibilityRule, DependencyImportance, ExternalRuntimeDescriptor,
+    ExternalRuntimeId, HostPlatform, ProbePolicy, RemedyKind, VersionParser,
 };
 use crate::capabilities::ExecutionTarget;
 
@@ -48,6 +48,10 @@ pub const ID_ACCEL_FD: &str = "accel.fd";
 pub const ID_ACCEL_GSED: &str = "accel.gsed";
 /// Host `jq` only for features the built-in Cockpit jq applet cannot serve.
 pub const ID_JQ_EXTERNAL: &str = "jq.external";
+/// FFmpeg decoder used for selected audio and video attachments.
+pub const ID_MEDIA_FFMPEG: &str = "media.ffmpeg";
+/// FFprobe metadata reader paired with FFmpeg.
+pub const ID_MEDIA_FFPROBE: &str = "media.ffprobe";
 
 /// Closed exact roster of known trusted-catalog integration adapters.
 ///
@@ -67,12 +71,43 @@ pub fn known_catalog_adapter_ids() -> &'static [&'static str] {
         ID_ACCEL_FD,
         ID_ACCEL_GSED,
         ID_JQ_EXTERNAL,
+        ID_MEDIA_FFMPEG,
+        ID_MEDIA_FFPROBE,
     ]
 }
 
 /// Known harness preset names that receive trusted-catalog recipes.
 pub fn known_harness_preset_names() -> &'static [&'static str] {
     &["claude", "codex", "gemini", "opencode"]
+}
+
+/// Fail-closed compatibility gate for selected audio/video media.
+///
+/// FFmpeg and FFprobe must both be available and report the same release major.
+/// Missing or unparsable version evidence is not treated as compatible.
+pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> bool {
+    fn major(entry: Option<&HealthEntry>) -> Option<u64> {
+        let HealthState::Available {
+            version_evidence: Some(version),
+            ..
+        } = &entry?.state
+        else {
+            return None;
+        };
+        version
+            .split(|character: char| !character.is_ascii_digit())
+            .find(|part| !part.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    match (
+        major(snapshot.get(ID_MEDIA_FFMPEG)),
+        major(snapshot.get(ID_MEDIA_FFPROBE)),
+    ) {
+        (Some(ffmpeg), Some(ffprobe)) => ffmpeg == ffprobe,
+        _ => false,
+    }
 }
 
 // ── ID builders for configured commands ─────────────────────────────────────
@@ -301,6 +336,30 @@ pub fn catalog_adapter_descriptors() -> Vec<ExternalRuntimeDescriptor> {
             "jq",
             "Install host jq only when a feature cannot use Cockpit's bundled `cockpit jq` applet.",
         ),
+        trusted_descriptor(
+            ID_MEDIA_FFMPEG,
+            "media.decode",
+            &["ffmpeg"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffmpeg",
+            "Install FFmpeg from https://ffmpeg.org/download.html and verify it with `ffmpeg -version`. Cockpit never downloads or bundles it.",
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
+        trusted_descriptor(
+            ID_MEDIA_FFPROBE,
+            "media.decode",
+            &["ffprobe"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffprobe",
+            "Install FFprobe with FFmpeg from https://ffmpeg.org/download.html and verify it with `ffprobe -version`. Cockpit never downloads or bundles it.",
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
     ]
 }
 

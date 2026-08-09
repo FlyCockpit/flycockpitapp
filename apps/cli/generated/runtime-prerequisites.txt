@@ -1,0 +1,7 @@
+Cockpit external runtime notice
+
+Cockpit does not install host dependencies. Missing Bubblewrap is a warning and
+does not fail installation. Selected audio/video inputs require a compatible
+FFmpeg and FFprobe pair; images decode natively. Diagnose with:
+  cockpit doctor --dependencies-json
+Documentation: https://docs.flycockpit.com/reference/runtime-prerequisites/

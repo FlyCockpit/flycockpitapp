@@ -54,7 +54,11 @@ def patch_homebrew_formula(path: Path) -> None:
 
 
 def main() -> int:
+    if Path.cwd() != Path(__file__).resolve().parents[3]:
+        raise SystemExit("patch-dist-assets.py must run from the repository root")
     distrib = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("target/distrib")
+    if distrib != Path("target/distrib"):
+        raise SystemExit("cargo-dist assets must remain in target/distrib")
     patch_shell_installer(distrib / "cockpit-cli-installer.sh")
     patch_homebrew_formula(distrib / "cockpit.rb")
     return 0

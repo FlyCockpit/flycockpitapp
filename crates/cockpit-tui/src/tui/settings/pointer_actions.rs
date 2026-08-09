@@ -76,6 +76,8 @@ impl RootNodeId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct SuggestionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct PickerOptionId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentToolId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct HarnessId(pub String);
@@ -159,6 +161,13 @@ pub(super) enum ExternalEditOutcome {
     Saved,
     Cancelled,
     Failed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum CategoryExternalSource {
+    Cursor,
+    Inline,
+    PathEditor,
+    TextEditor,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum CredentialKind {
@@ -252,7 +261,11 @@ pub(super) enum CategoryAction {
     SuggestionSelect(SettingId, SuggestionId),
     TextEditorSave(SettingId),
     TextEditorCancel(SettingId),
+    PickerSelect(SettingId, PickerOptionId),
+    Confirm(SettingId, ConfirmationChoice),
     Reset,
+    ExternalEditBegin(SettingId, CategoryExternalSource),
+    ExternalEditResult(SettingId, ExternalEditOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

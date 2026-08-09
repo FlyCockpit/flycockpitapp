@@ -3807,6 +3807,10 @@ impl SettingsPage for CategoryPage {
                 }
                 CategoryAction::InlineEditCommit(_)
                 | CategoryAction::InlineEditCancel(_)
+                | CategoryAction::PickerSelect(_, _)
+                | CategoryAction::Confirm(_, _)
+                | CategoryAction::ExternalEditBegin(_, _)
+                | CategoryAction::ExternalEditResult(_, _)
                 | CategoryAction::PathEditCommit(_)
                 | CategoryAction::PathEditCancel(_)
                 | CategoryAction::TextEditorSave(_)

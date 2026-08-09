@@ -32,7 +32,17 @@ fixture_enum!(CategoryFixture {
     SuggestionSelect,
     TextEditorSave,
     TextEditorCancel,
-    Reset
+    PickerSelect,
+    ConfirmConfirm,
+    ConfirmCancel,
+    Reset,
+    ExternalEditBeginCursor,
+    ExternalEditBeginInline,
+    ExternalEditBeginPathEditor,
+    ExternalEditBeginTextEditor,
+    ExternalEditResultSaved,
+    ExternalEditResultCancelled,
+    ExternalEditResultFailed
 });
 fixture_enum!(AgentsFixture {
     Open,
@@ -452,10 +462,13 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
             | CategoryAction::PathEditCommit(id)
             | CategoryAction::PathEditCancel(id)
             | CategoryAction::TextEditorSave(id)
-            | CategoryAction::TextEditorCancel(id) => {
+            | CategoryAction::TextEditorCancel(id)
+            | CategoryAction::Confirm(id, _)
+            | CategoryAction::ExternalEditBegin(id, _)
+            | CategoryAction::ExternalEditResult(id, _) => {
                 vec![PayloadFixtureKey::CategorySetting(*id)]
             }
-            CategoryAction::SuggestionSelect(id, _) => {
+            CategoryAction::SuggestionSelect(id, _) | CategoryAction::PickerSelect(id, _) => {
                 vec![PayloadFixtureKey::CategorySetting(*id)]
             }
             CategoryAction::Reset => Vec::new(),
@@ -615,7 +628,25 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
             CategoryAction::SuggestionSelect(_, _) => CategoryFixture::SuggestionSelect,
             CategoryAction::TextEditorSave(_) => CategoryFixture::TextEditorSave,
             CategoryAction::TextEditorCancel(_) => CategoryFixture::TextEditorCancel,
+            CategoryAction::PickerSelect(_, _) => CategoryFixture::PickerSelect,
+            CategoryAction::Confirm(_, ConfirmationChoice::Confirm) => {
+                CategoryFixture::ConfirmConfirm
+            }
+            CategoryAction::Confirm(_, ConfirmationChoice::Cancel) => {
+                CategoryFixture::ConfirmCancel
+            }
             CategoryAction::Reset => CategoryFixture::Reset,
+            CategoryAction::ExternalEditBegin(_, source) => match source {
+                CategoryExternalSource::Cursor => CategoryFixture::ExternalEditBeginCursor,
+                CategoryExternalSource::Inline => CategoryFixture::ExternalEditBeginInline,
+                CategoryExternalSource::PathEditor => CategoryFixture::ExternalEditBeginPathEditor,
+                CategoryExternalSource::TextEditor => CategoryFixture::ExternalEditBeginTextEditor,
+            },
+            CategoryAction::ExternalEditResult(_, result) => match result {
+                ExternalEditOutcome::Saved => CategoryFixture::ExternalEditResultSaved,
+                ExternalEditOutcome::Cancelled => CategoryFixture::ExternalEditResultCancelled,
+                ExternalEditOutcome::Failed => CategoryFixture::ExternalEditResultFailed,
+            },
         }),
         SettingsPointerAction::Agents(action) => K::Agents(match action {
             AgentsAction::Open(_) => AgentsFixture::Open,

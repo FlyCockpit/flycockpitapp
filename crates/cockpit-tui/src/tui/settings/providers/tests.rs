@@ -250,6 +250,9 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let mut config = one_provider_config(None);
+        config.providers.get_mut("p").unwrap().models[0]
+            .capabilities
+            .prompt_cache_retention = cockpit_config::providers::CapabilityStatus::Supported;
         config.active_model = Some(ActiveModelRef {
             provider: "p".into(),
             model: "stale".into(),

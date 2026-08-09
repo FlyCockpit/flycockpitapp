@@ -1592,6 +1592,69 @@ impl CategoryPage {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn pointer_surface_fixture(mode: usize, cwd: &std::path::Path) -> Self {
+        use super::ui_page::PickerMode;
+
+        let mut page = Self::new(Category::Interface);
+        match mode {
+            0 => {}
+            1 => {
+                page.editing = Some(SettingId::ExitTailLines);
+                page.buf = TextField::new("7");
+            }
+            2 => {
+                page.path_editor = Some(CategoryPathEditor::new(
+                    SettingId::PackagesDir,
+                    cwd.display().to_string(),
+                    PathSuggestMode::Directories,
+                    cwd,
+                ));
+            }
+            3 => {
+                page.text_editor = Some(CategoryTextEditor::new(
+                    SettingId::CompactPrompt,
+                    "echo fixture".into(),
+                    false,
+                ));
+            }
+            4 => {
+                page.pending_external_edit = Some(CategoryExternalEdit {
+                    operation_id: PointerOperationId(1),
+                    id: SettingId::CompactPrompt,
+                    path: tempfile::NamedTempFile::new()
+                        .expect("category external-edit fixture")
+                        .into_temp_path(),
+                    source: CategoryExternalSource::TextEditor,
+                    servicing: false,
+                });
+            }
+            5 => {
+                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                    entries: Vec::new(),
+                    current: None,
+                    mode: PickerMode::List {
+                        cursor: 0,
+                        scroll: 0,
+                    },
+                }));
+                page.utility_picker_target = Some(SettingId::UtilityModel);
+            }
+            6 => {
+                page.utility_picker = Some(Box::new(UtilityModelPicker {
+                    entries: Vec::new(),
+                    current: None,
+                    mode: PickerMode::Custom {
+                        buf: TextField::new("p:model"),
+                    },
+                }));
+                page.utility_picker_target = Some(SettingId::UtilityModel);
+            }
+            _ => panic!("unknown category pointer surface mode {mode}"),
+        }
+        page
+    }
+
     pub(super) fn is_path_editing(&self) -> bool {
         self.path_editor.is_some()
     }

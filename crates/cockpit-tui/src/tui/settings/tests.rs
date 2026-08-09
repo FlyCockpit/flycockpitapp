@@ -635,6 +635,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// suites. Keeping these here lets them share the same concrete page fixtures
 /// as the keyboard contract instead of rebuilding synthetic registries.
 pub(super) fn run_pointer_dialog_regression_matrix() {
+    render_all_non_provider_pointer_surface_variants();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -648,6 +649,84 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+/// Render the concrete nested states whose discriminants form the strict
+/// pointer-surface inventory. Mouse capture is disabled for this inventory
+/// pass: enabled controls are exercised by the reducer matrices below, while
+/// this pass proves that every state variant itself remains constructible and
+/// renderable through production navigation.
+fn render_all_non_provider_pointer_surface_variants() {
+    // Harnesses: list, add-name editor, harness editor, field editor.
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_harnesses_from_root(&mut d);
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Char('a')));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    let (_, harness) = cockpit_config::extended::builtin_harness_presets()
+        .into_iter()
+        .next()
+        .expect("built-in harness fixture");
+    d.extended.harnesses.insert("fixture".into(), harness);
+    enter_harnesses_from_root(&mut d);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    // Agents: list, structured detail, and the in-TUI source editor.
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Agents");
+    let _ = render_settings_rows(&d, 100, 40);
+    d.handle_key(press(KeyCode::Enter));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    let _editor = EditorEnv::unset();
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Agents");
+    d.handle_key(press(KeyCode::Char('e')));
+    let _ = render_settings_rows(&d, 100, 40);
+
+    // Every StringListKind in both browse and grab/edit modes.
+    let constructors: [fn() -> StringListPage; 5] = [
+        StringListPage::agent_dirs,
+        StringListPage::extra_dotenv_paths,
+        StringListPage::redact_denylist,
+        StringListPage::redact_allowlist,
+        StringListPage::gitignore_allow,
+    ];
+    for construct in constructors {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.tui.mouse_capture = false;
+        d.set_test_page(Page::StringList(Box::new(construct())));
+        let _ = render_settings_rows(&d, 100, 40);
+        d.handle_key(press(KeyCode::Enter));
+        let _ = render_settings_rows(&d, 100, 40);
+    }
+
+    // Category base, inline, path, full-text, external, picker-list, and
+    // picker-custom modes. The fixture constructor uses the same production
+    // editor/picker types as normal descriptor activation.
+    for mode in 0..=6 {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.extended.tui.mouse_capture = false;
+        d.set_test_page(Page::Category(Box::new(
+            category::CategoryPage::pointer_surface_fixture(mode, tmp.path()),
+        )));
+        let _ = render_settings_rows(&d, 100, 40);
+    }
 }
 
 pub(super) fn run_pointer_text_layout_matrix() {

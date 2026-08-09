@@ -168,6 +168,7 @@ export async function verifyRemoteAdminRegistration(input: {
   const values = new Map<number, number | Uint8Array>();
   for (let index = 0; index < 5; index++) {
     const key = readCborInteger(data, offset);
+    if (values.has(key)) throw new Error("webauthn_cose_duplicate_member");
     values.set(
       key,
       key === -2 || key === -3 ? readCborBytes(data, offset) : readCborInteger(data, offset),

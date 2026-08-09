@@ -396,7 +396,7 @@ async fn run_io(
                             Body::Event { event } => {
                                 try_forward_event(&event_tx, event, &mut dropped_events);
                             }
-                            Body::Request { id, request } => {
+                            Body::Request { id, request, .. } => {
                                 tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
                             }
                             Body::Unknown => {
@@ -1093,7 +1093,7 @@ mod tests {
             daemon.set_negotiated_version(proto::MIN_SUPPORTED_PROTOCOL_VERSION);
             let request_id = match daemon.recv().await.unwrap().unwrap() {
                 proto::RecvFrame::Envelope(env) => match env.body {
-                    Body::Request { id, request } => {
+                    Body::Request { id, request, .. } => {
                         match request {
                             Request::Attach {
                                 client_protocol_version,

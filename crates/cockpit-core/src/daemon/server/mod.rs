@@ -3595,7 +3595,40 @@ async fn handle_envelope(
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
     match env.body {
-        Body::Request { id, request } => {
+        Body::Request {
+            id,
+            operation,
+            request,
+        } => {
+            if request
+                .remote_operation_class()
+                .is_ok_and(|class| class != proto::RemoteOperationClass::ReadOnly)
+                && let ClientPrincipal::Remote(remote) = &state.principal
+            {
+                let valid = remote
+                    .actor_binding
+                    .as_ref()
+                    .zip(operation.as_ref())
+                    .is_some_and(|(actor, operation)| {
+                        operation.schema_version == 1
+                            && operation.operation_id.get_version_num() == 7
+                            && !operation.operation_id.is_nil()
+                            && actor.schema_version == 1
+                            && actor.device_generation > 0
+                            && actor.logical_attachment_id == operation.logical_attachment_id
+                    });
+                if !valid {
+                    let envelope = Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "remote mutations require a live actor-bound v2 attachment and UUIDv7 operation identity".to_string(),
+                        },
+                    );
+                    let _ = send_writer_envelope(writer_tx, envelope).await;
+                    return Ok(());
+                }
+            }
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());

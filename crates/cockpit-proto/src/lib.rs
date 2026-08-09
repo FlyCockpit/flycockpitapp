@@ -641,7 +641,26 @@ impl Envelope {
     pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
         Self {
             v,
-            body: Body::Request { id, request },
+            body: Body::Request {
+                id,
+                operation: None,
+                request,
+            },
+        }
+    }
+
+    pub fn remote_request(
+        id: Uuid,
+        operation: RemoteOperationIdentityV1,
+        request: Request,
+    ) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            body: Body::Request {
+                id,
+                operation: Some(operation),
+                request,
+            },
         }
     }
 
@@ -688,6 +707,8 @@ pub enum Body {
     #[serde(rename = "req")]
     Request {
         id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<RemoteOperationIdentityV1>,
         #[serde(flatten)]
         request: Request,
     },
@@ -712,6 +733,33 @@ pub enum Body {
     },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteOperationIdentityV1 {
+    pub schema_version: u8,
+    pub logical_attachment_id: Uuid,
+    pub operation_id: Uuid,
+}
+
+impl RemoteOperationIdentityV1 {
+    pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
+        anyhow::ensure!(
+            !logical_attachment_id.is_nil(),
+            "logical attachment id must be nonnil"
+        );
+        anyhow::ensure!(!operation_id.is_nil(), "operation id must be nonnil");
+        anyhow::ensure!(
+            operation_id.get_version_num() == 7,
+            "operation id must be UUIDv7"
+        );
+        Ok(Self {
+            schema_version: 1,
+            logical_attachment_id,
+            operation_id,
+        })
+    }
 }
 
 // ---- Requests --------------------------------------------------------------

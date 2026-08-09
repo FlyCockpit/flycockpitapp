@@ -1334,126 +1334,126 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::Attach { session_id, .. }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy");
-            (Request::SubagentTranscript { session_id, .. }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String");
-            (Request::SendUserMessage { .. }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>");
-            (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid");
-            (Request::CancelRunInvocation { .. }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid");
-            (Request::SteerDelegation { session_id, .. }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|task_call_id:String|label:String|message:String");
-            (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "mime:String|byte_len:usize|sha256:String|purpose:AttachmentPurpose");
-            (Request::UploadAttachmentChunk { .. }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid|offset:usize|data_base64:String");
-            (Request::FinishAttachmentUpload { .. }, "finish_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
-            (Request::CancelAttachmentUpload { .. }, "cancel_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
-            (Request::RemoveQueuedUserMessage { .. }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid");
-            (Request::RemoveNewestQueuedUserMessage { .. }, "remove_newest_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>");
-            (Request::RemoveEditableQueuedUserMessages { .. }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>");
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy");
+            (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String");
+            (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>");
+            (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid");
+            (Request::CancelRunInvocation { client_submission_id }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid");
+            (Request::SteerDelegation { session_id, task_call_id, label, message }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|task_call_id:String|label:String|message:String");
+            (Request::BeginAttachmentUpload { mime, byte_len, sha256, purpose }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "mime:String|byte_len:usize|sha256:String|purpose:AttachmentPurpose");
+            (Request::UploadAttachmentChunk { upload_id, offset, data_base64 }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid|offset:usize|data_base64:String");
+            (Request::FinishAttachmentUpload { upload_id }, "finish_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
+            (Request::CancelAttachmentUpload { upload_id }, "cancel_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
+            (Request::RemoveQueuedUserMessage { queue_item_id }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid");
+            (Request::RemoveNewestQueuedUserMessage { target_id }, "remove_newest_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>");
+            (Request::RemoveEditableQueuedUserMessages { target_id }, "remove_editable_queued_user_messages", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "target_id:Option<String>");
             (Request::ResumePausedWork { session_id }, "resume_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
             (Request::CancelPausedWork { session_id }, "cancel_paused_work", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
             (Request::RepairResume { session_id }, "repair_resume", session_writer, field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
             (Request::GoalStatus { session_id }, "goal_status", session_row_reader(session_id), field(session_id), false, read_only, none, serialized, none, "session_id:Uuid");
-            (Request::CreateGoal { session_id, .. }, "create_goal", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|objective:String|token_budget:Option<i64>");
-            (Request::SetGoalStatus { session_id, .. }, "set_goal_status", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|status:GoalDisposition");
+            (Request::CreateGoal { session_id, objective, token_budget }, "create_goal", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|objective:String|token_budget:Option<i64>");
+            (Request::SetGoalStatus { session_id, status }, "set_goal_status", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|status:GoalDisposition");
             (Request::ClearGoal { session_id }, "clear_goal", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
-            (Request::PinMessage { session_id, .. }, "pin_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
-            (Request::UnpinMessage { session_id, .. }, "unpin_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
-            (Request::TogglePinnedMessage { session_id, .. }, "toggle_pinned_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
+            (Request::PinMessage { session_id, seq }, "pin_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
+            (Request::UnpinMessage { session_id, seq }, "unpin_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
+            (Request::TogglePinnedMessage { session_id, seq }, "toggle_pinned_message", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|seq:i64");
             (Request::CountPinnedMessages { session_id }, "count_pinned_messages", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid");
             (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid");
             (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid");
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid");
             (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid");
-            (Request::DeleteSealedValue { session_id, .. }, "delete_sealed_value", owner_only, field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|value_id:String");
+            (Request::DeleteSealedValue { session_id, value_id }, "delete_sealed_value", owner_only, field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|value_id:String");
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, read_only, none, serialized, path(project_root), "project_root:String");
-            (Request::CreateProjectNote { project_root, .. }, "create_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|name:String");
-            (Request::SetProjectNoteContent { project_root, .. }, "set_project_note_content", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid|content:String");
-            (Request::RenameProjectNote { project_root, .. }, "rename_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid|name:String");
-            (Request::DeleteProjectNote { project_root, .. }, "delete_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid");
-            (Request::SetWorkspaceTrust { project_root, .. }, "set_workspace_trust", owner_only, none, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64");
+            (Request::CreateProjectNote { project_root, name }, "create_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|name:String");
+            (Request::SetProjectNoteContent { project_root, id, content }, "set_project_note_content", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid|content:String");
+            (Request::RenameProjectNote { project_root, id, name }, "rename_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid|name:String");
+            (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|id:Uuid");
+            (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64");
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String");
-            (Request::GetAppFlag { .. }, "get_app_flag", owner_only, none, false, read_only, none, serialized, none, "key:AppFlagKey");
-            (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "key:AppFlagKey|expected_version:u64");
-            (Request::ResolveAssistantSession { project_root, .. }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode");
+            (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, read_only, none, serialized, none, "key:AppFlagKey");
+            (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "key:AppFlagKey|expected_version:u64");
+            (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode");
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-");
-            (Request::UpsertAssistant { .. }, "upsert_assistant", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String");
-            (Request::CreateAssistantSession { .. }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>");
+            (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String");
+            (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>");
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid");
-            (Request::ExportSessionData { session_id, .. }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool");
-            (Request::ImportSessionArchive { .. }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool");
-            (Request::WriteBulkTransferChunk { .. }, "write_bulk_transfer_chunk", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String");
-            (Request::ReadBulkTransferChunk { .. }, "read_bulk_transfer_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32");
-            (Request::Curator { project_root, .. }, "curator", owner_only, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, path(project_root), "project_root:String|action:CuratorAction");
+            (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool");
+            (Request::ImportSessionArchive { transfer, as_new }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool");
+            (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String");
+            (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32");
+            (Request::Curator { project_root, action }, "curator", owner_only, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, path(project_root), "project_root:String|action:CuratorAction");
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-");
-            (Request::FsList { project_root, .. }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool");
-            (Request::FsStat { project_root, .. }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String");
-            (Request::FsRead { project_root, .. }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool");
-            (Request::FsWrite { project_root, path, .. }, "fs_write", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String|content:String|base_hash:Option<String>");
+            (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool");
+            (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String");
+            (Request::FsRead { project_root, path, base64 }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool");
+            (Request::FsWrite { project_root, path, content, base_hash }, "fs_write", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String|content:String|base_hash:Option<String>");
             (Request::FsCreateDir { project_root, path }, "fs_create_dir", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String");
             (Request::FsRename { project_root, from_path, to_path }, "fs_rename", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, rename(from_path, to_path), "project_root:String|from_path:String|to_path:String");
-            (Request::FsDelete { path, .. }, "fs_delete", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String");
+            (Request::FsDelete { project_root, path }, "fs_delete", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String");
             (Request::GitStatus { project_root }, "git_status", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String");
             (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, read_only, none, concurrent, path(path), "project_root:String|path:String");
-            (Request::OpenTerminal { .. }, "open_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "cwd:Option<String>|cols:u16|rows:u16");
-            (Request::AttachTerminal { .. }, "attach_terminal", terminal, none, false, read_only, none, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16");
-            (Request::TerminalInput { .. }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>");
-            (Request::TerminalResize { .. }, "terminal_resize", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16");
-            (Request::CloseTerminal { .. }, "close_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "terminal_id:Uuid");
-            (Request::LspControl { .. }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction");
-            (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse");
-            (Request::ListSessions { .. }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>");
-            (Request::ReadSessionMessages { session_id, .. }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32");
-            (Request::ReadClientSubmissionReceipt { session_id, .. }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid");
-            (Request::ReadHistoryPage { session_id, .. }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32");
-            (Request::ReadSubagentHistoryPage { session_id, .. }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32");
-            (Request::SessionLiveStatus { .. }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>");
-            (Request::ArchiveSession { session_id, .. }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool");
+            (Request::OpenTerminal { cwd, cols, rows }, "open_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "cwd:Option<String>|cols:u16|rows:u16");
+            (Request::AttachTerminal { terminal_id, cols, rows }, "attach_terminal", terminal, none, false, read_only, none, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16");
+            (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>");
+            (Request::TerminalResize { terminal_id, cols, rows }, "terminal_resize", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16");
+            (Request::CloseTerminal { terminal_id }, "close_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "terminal_id:Uuid");
+            (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction");
+            (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse");
+            (Request::ListSessions { project_id, parent_session_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>");
+            (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32");
+            (Request::ReadClientSubmissionReceipt { session_id, client_submission_id }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid");
+            (Request::ReadHistoryPage { session_id, before_seq, limit }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32");
+            (Request::ReadSubagentHistoryPage { session_id, task_call_id, label, before_seq, limit }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32");
+            (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>");
+            (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool");
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
-            (Request::ForkSession { parent_session_id, .. }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool");
+            (Request::ForkSession { parent_session_id, fork_point_turn_id, ephemeral }, "fork_session", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool");
             (Request::DiscardSession { session_id }, "discard_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
-            (Request::CreateBtwFork { parent_session_id, .. }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|tangent:bool");
+            (Request::CreateBtwFork { parent_session_id, tangent }, "btw_create", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid|tangent:bool");
             (Request::EndBtwFork { parent_session_id }, "btw_end", session_row_writer(parent_session_id), field(parent_session_id), true, transactional_mutation, sql_transaction, serialized, none, "parent_session_id:Uuid");
-            (Request::RenameSession { session_id, .. }, "rename_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|title:String");
-            (Request::ShareSession { session_id, .. }, "share_session", owner_only, field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|shared:bool");
-            (Request::RecordSessionNote { session_id, .. }, "record_session_note", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|text:String");
-            (Request::DeleteSession { session_id, .. }, "delete_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
-            (Request::GetInventoryBundle { session_id, project_root, .. }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String");
+            (Request::RenameSession { session_id, title }, "rename_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|title:String");
+            (Request::ShareSession { session_id, shared }, "share_session", owner_only, field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|shared:bool");
+            (Request::RecordSessionNote { session_id, text }, "record_session_note", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|text:String");
+            (Request::DeleteSession { session_id }, "delete_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid");
+            (Request::GetInventoryBundle { project_root, session_id, selected_agent }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String");
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, read_only, none, concurrent, none, "-");
-            (Request::PromoteResource { session_id, .. }, "promote_resource", owner_only, option_field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "request_id:String|session_id:Option<Uuid>");
-            (Request::CreateScheduledJob { .. }, "create_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "job:ScheduledJobCreate");
-            (Request::ListScheduledJobs { .. }, "list_scheduled_jobs", owner_only, none, false, read_only, none, concurrent, none, "owner:Option<String>");
-            (Request::DeleteScheduledJob { .. }, "delete_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String");
-            (Request::SetScheduledJobEnabled { .. }, "set_scheduled_job_enabled", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String|enabled:bool");
-            (Request::RunScheduledJob { .. }, "run_scheduled_job", owner_only, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "id:String");
-            (Request::SetModelFavorite { .. }, "set_model_favorite", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "provider:String|model:String|favorite:bool");
-            (Request::SetDefaultModel { .. }, "set_default_model", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool");
-            (Request::SetActiveModel { .. }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>");
-            (Request::SetAgent { .. }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String");
-            (Request::SetLlmMode { .. }, "set_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:Option<LlmMode>");
-            (Request::SetSessionLlmMode { .. }, "set_session_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:LlmMode");
-            (Request::SetToolSurfaceOverride { .. }, "set_tool_surface_override", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>");
-            (Request::SetGoalSettingsOverride { .. }, "set_goal_settings_override", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "override_json:Option<String>|persist_session:bool");
-            (Request::SetApprovalMode { .. }, "set_approval_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:ApprovalMode");
-            (Request::SetDelegationRecursion { .. }, "set_delegation_recursion", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:bool|default_depth:u32");
-            (Request::SetSandbox { .. }, "set_sandbox", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:Option<SandboxMode>|container_network_enabled:Option<bool>");
-            (Request::SetSandboxEscalation { .. }, "set_sandbox_escalation", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:bool");
-            (Request::SetPreflight { .. }, "set_preflight", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
-            (Request::SetLongcache { .. }, "set_longcache", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
-            (Request::SetRedaction { .. }, "set_redaction", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>");
-            (Request::SetTandemModels { .. }, "set_tandem_models", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "models:Vec<(String, String)>");
-            (Request::SetCaffeinate { .. }, "set_caffeinate", owner_only, none, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:CaffeinateMode");
-            (Request::CancelSchedule { .. }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String");
+            (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "request_id:String|session_id:Option<Uuid>");
+            (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "job:ScheduledJobCreate");
+            (Request::ListScheduledJobs { owner }, "list_scheduled_jobs", owner_only, none, false, read_only, none, concurrent, none, "owner:Option<String>");
+            (Request::DeleteScheduledJob { id }, "delete_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String");
+            (Request::SetScheduledJobEnabled { id, enabled }, "set_scheduled_job_enabled", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String|enabled:bool");
+            (Request::RunScheduledJob { id }, "run_scheduled_job", owner_only, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "id:String");
+            (Request::SetModelFavorite { provider, model, favorite }, "set_model_favorite", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "provider:String|model:String|favorite:bool");
+            (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool");
+            (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>");
+            (Request::SetAgent { name }, "set_agent", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "name:String");
+            (Request::SetLlmMode { mode }, "set_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:Option<LlmMode>");
+            (Request::SetSessionLlmMode { mode }, "set_session_llm_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:LlmMode");
+            (Request::SetToolSurfaceOverride { override_json, persist_session, prune_after_switch, monty_nudge }, "set_tool_surface_override", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>");
+            (Request::SetGoalSettingsOverride { override_json, persist_session }, "set_goal_settings_override", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "override_json:Option<String>|persist_session:bool");
+            (Request::SetApprovalMode { mode }, "set_approval_mode", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:ApprovalMode");
+            (Request::SetDelegationRecursion { enabled, default_depth }, "set_delegation_recursion", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:bool|default_depth:u32");
+            (Request::SetSandbox { mode, container_network_enabled }, "set_sandbox", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:Option<SandboxMode>|container_network_enabled:Option<bool>");
+            (Request::SetSandboxEscalation { enabled }, "set_sandbox_escalation", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:bool");
+            (Request::SetPreflight { enabled }, "set_preflight", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
+            (Request::SetLongcache { enabled }, "set_longcache", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
+            (Request::SetRedaction { scan_environment, scan_dotenv, scan_ssh_keys }, "set_redaction", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>");
+            (Request::SetTandemModels { models }, "set_tandem_models", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "models:Vec<(String, String)>");
+            (Request::SetCaffeinate { mode }, "set_caffeinate", owner_only, none, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:CaffeinateMode");
+            (Request::CancelSchedule { job_id }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String");
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-");
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-");
-            (Request::Pin { .. }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String");
-            (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "credential:StoredFlycockpitCredential");
+            (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String");
+            (Request::StoreFlycockpitCredential { credential }, "store_flycockpit_credential", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "credential:StoredFlycockpitCredential");
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "-");
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-");
-            (Request::RefreshEnv { .. }, "refresh_env", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "vars:HashMap<String, String>");
+            (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "vars:HashMap<String, String>");
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "-");
-            (Request::RecordUsage { .. }, "record_usage", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>");
-            (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>");
-            (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool");
-            (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>");
-            (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "grace_secs:Option<u64>");
+            (Request::RecordUsage { kind, key, project_id }, "record_usage", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>");
+            (Request::GetUsageCounts { project_id }, "get_usage_counts", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>");
+            (Request::StatsRollup { project_id, range, by_role }, "stats_rollup", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool");
+            (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>");
+            (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "grace_secs:Option<u64>");
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-");
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-");
         ] }
@@ -1865,119 +1865,79 @@ mod tests {
     }
 
     fn request_source_field_schemas() -> std::collections::BTreeMap<String, String> {
-        let source = include_str!("request.rs");
-        let source = source
-            .split_once("pub enum Request {")
-            .expect("Request declaration")
-            .1
-            .split_once("\nimpl Request {")
-            .expect("Request impl boundary")
-            .0
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut source = source;
-        while let Some(start) = source.find("#[serde(") {
-            let end = source[start..].find(")]").expect("closed serde attribute") + 2;
-            source.replace_range(start..start + end, "");
-        }
-        let bytes = source.as_bytes();
-        let mut variants = std::collections::BTreeMap::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            while offset < bytes.len() && !bytes[offset].is_ascii_uppercase() {
-                offset += 1;
-            }
-            let start = offset;
-            while offset < bytes.len()
-                && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_')
-            {
-                offset += 1;
-            }
-            if start == offset {
-                break;
-            }
-            let variant = source[start..offset].to_owned();
-            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
-                offset += 1;
-            }
-            if bytes.get(offset) != Some(&b'{') {
-                variants.insert(variant, "-".to_owned());
-                continue;
-            }
-            let body_start = offset + 1;
-            let mut depth = 1_i32;
-            offset += 1;
-            while offset < bytes.len() && depth > 0 {
-                match bytes[offset] {
-                    b'{' | b'(' | b'[' | b'<' => depth += 1,
-                    b'}' | b')' | b']' | b'>' => depth -= 1,
-                    _ => {}
-                }
-                offset += 1;
-            }
-            let mut body = source[body_start..offset - 1].to_owned();
-            body = body
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("///"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let mut fields = Vec::new();
-            let mut field_start = 0;
-            let mut nested = 0_i32;
-            for (index, character) in body.char_indices() {
-                match character {
-                    '<' | '(' | '[' | '{' => nested += 1,
-                    '>' | ')' | ']' | '}' => nested -= 1,
-                    ',' if nested == 0 => {
-                        fields.push(&body[field_start..index]);
-                        field_start = index + 1;
+        use quote::ToTokens;
+        let syntax = syn::parse_file(include_str!("request.rs")).expect("request.rs parses");
+        let request = syntax
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "Request" => Some(item),
+                _ => None,
+            })
+            .expect("Request enum declaration");
+        request
+            .variants
+            .into_iter()
+            .map(|variant| {
+                let schema = match variant.fields {
+                    syn::Fields::Unit => "-".to_owned(),
+                    syn::Fields::Unnamed(_) => {
+                        panic!("Request tuple variants are unsupported: {}", variant.ident)
                     }
-                    _ => {}
-                }
-            }
-            fields.push(&body[field_start..]);
-            let schema = fields
-                .into_iter()
-                .filter_map(|field| {
-                    let (name, ty) = field.split_once(':')?;
-                    Some(format!(
-                        "{}:{}",
-                        name.split_whitespace().collect::<String>(),
-                        ty.split_whitespace().collect::<String>()
-                    ))
-                })
-                .collect::<Vec<_>>()
-                .join("|");
-            variants.insert(
-                variant,
-                if schema.is_empty() {
-                    "-".into()
-                } else {
-                    schema
-                },
-            );
-        }
-        variants
+                    syn::Fields::Named(fields) => fields
+                        .named
+                        .into_iter()
+                        .map(|field| {
+                            let name = field.ident.expect("named Request field");
+                            let ty = field.ty.into_token_stream().to_string().replace(' ', "");
+                            format!("{name}:{ty}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                };
+                (variant.ident.to_string(), schema)
+            })
+            .collect()
     }
 
     #[test]
     fn remote_operation_fcor_source_schema_cannot_drift() {
         let declared = request_source_field_schemas();
-        for (pattern, tag, schema) in crate::command!(fcor_source_rows) {
+        let rows = crate::command!(fcor_source_rows);
+        assert_eq!(
+            declared.len(),
+            rows.len(),
+            "enum/command row count mismatch"
+        );
+        let mut variants = std::collections::BTreeSet::new();
+        let mut tags = std::collections::BTreeSet::new();
+        for (pattern, tag, schema) in rows {
+            assert!(
+                !pattern.contains(".."),
+                "FCOR pattern conceals fields: {pattern}"
+            );
             let variant = pattern
                 .strip_prefix("Request :: ")
                 .unwrap_or(pattern)
                 .split([' ', '{'])
                 .next()
                 .unwrap();
+            assert!(
+                variants.insert(variant),
+                "duplicate command variant {variant}"
+            );
+            assert!(tags.insert(tag), "duplicate command tag {tag}");
             assert_eq!(
                 declared.get(variant).map(String::as_str),
                 Some(schema),
                 "FCOR source schema drift for {tag} ({variant})"
             );
         }
+        assert_eq!(
+            variants.len(),
+            declared.len(),
+            "not every Request variant was consumed"
+        );
     }
 
     macro_rules! remote_evidence_json {

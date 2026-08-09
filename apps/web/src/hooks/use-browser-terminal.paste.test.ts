@@ -85,12 +85,9 @@ describe("browser terminal paste source contracts", () => {
     );
     expect(packageJson.scripts.test).toBe("pnpm run test:node && pnpm run test:browser");
     expect(JSON.stringify(packageJson.scripts)).not.toContain("passWithNoTests");
-    expect(hook.indexOf("terminal.open(element)")).toBeLessThan(
-      hook.indexOf("installTerminalPasteInterceptor"),
-    );
-    expect(hook.indexOf("installTerminalPasteInterceptor")).toBeLessThan(
-      hook.indexOf("terminal.onData"),
-    );
+    const interceptorCall = hook.indexOf("= installTerminalPasteInterceptor");
+    expect(hook.indexOf("terminal.open(element)")).toBeLessThan(interceptorCall);
+    expect(interceptorCall).toBeLessThan(hook.indexOf("terminal.onData"));
     expect(hook.indexOf("terminal.onData")).toBeLessThan(hook.indexOf("client.connect()"));
     expect(interceptor).toContain('addEventListener("paste", listener, { capture: true })');
     expect(interceptor).toContain('removeEventListener("paste", listener, { capture: true })');
@@ -117,12 +114,9 @@ describe("browser terminal paste source contracts", () => {
       "utf8",
     );
     expect(hook).toContain("const textarea = terminal.textarea");
-    expect(hook.indexOf("terminal.open(element)")).toBeLessThan(
-      hook.indexOf("installTerminalPasteInterceptor"),
-    );
-    expect(hook.indexOf("installTerminalPasteInterceptor")).toBeLessThan(
-      hook.indexOf("client.connect()"),
-    );
+    const interceptorCall = hook.indexOf("= installTerminalPasteInterceptor");
+    expect(hook.indexOf("terminal.open(element)")).toBeLessThan(interceptorCall);
+    expect(interceptorCall).toBeLessThan(hook.indexOf("client.connect()"));
     expect(interceptor).toContain("event.stopImmediatePropagation()");
   });
 });

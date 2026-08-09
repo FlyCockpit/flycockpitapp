@@ -136,7 +136,7 @@ describe("browser terminal native paste ownership", () => {
     const second = new File(["2"], "same.png", { type: "image/png" });
     data.items.add("before", "text/plain");
     data.items.add(first);
-    data.items.add("between", "text/plain");
+    data.items.add("between", "text/html");
     data.items.add(second);
     Object.defineProperty(data, "files", {
       get: () => {

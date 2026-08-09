@@ -51,6 +51,7 @@ use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+    selected_style,
 };
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
@@ -745,6 +746,24 @@ impl SettingsCx {
         // The in-TUI editor takes the whole page area when open.
         if let Some(editor) = &p.editing {
             editor.render(frame, area);
+            let action_y = area.bottom().saturating_sub(1);
+            for (id, x, width) in [(2000, 0, 6), (2001, 8, 8)] {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(area.x + x, action_y, width, 1),
+                        action: super::shell::SettingsPointerAction::Page(SettingsControlId(id)),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
+            frame.render_widget(
+                Line::from(vec![
+                    Span::styled("[Save]", selected_style()),
+                    Span::raw("  "),
+                    Span::styled("[Cancel]", selected_style()),
+                ]),
+                Rect::new(area.x, action_y, area.width, 1),
+            );
             return;
         }
         if let Some(detail) = &p.detail {
@@ -926,6 +945,18 @@ impl SettingsPage for AgentsPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        if self.editing.is_some() {
+            return match index {
+                2000 => cx.handle_agents_page_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    self,
+                ),
+                2001 => {
+                    cx.handle_agents_page_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), self)
+                }
+                _ => Nav::Stay,
+            };
+        }
         if let Some(detail) = self.detail.as_mut() {
             if index >= cockpit_core::agents::tool_surface_catalog().len() {
                 return Nav::Stay;
@@ -934,7 +965,7 @@ impl SettingsPage for AgentsPage {
             return cx
                 .handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self);
         }
-        if self.editing.is_some() || index >= self.rows.len() {
+        if index >= self.rows.len() {
             return Nav::Stay;
         }
         self.cursor = index;

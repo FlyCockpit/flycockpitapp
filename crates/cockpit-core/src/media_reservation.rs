@@ -326,7 +326,7 @@ impl MediaReservationLedger {
         wall_ms: u64,
     ) -> Result<u64, LedgerError> {
         let invocations=self.db.read(|conn| {
-            let mut statement=conn.prepare("SELECT DISTINCT o.invocation_id FROM media_downstream_ownership o JOIN client_submission_terminal_receipts t ON t.client_submission_id=o.invocation_id WHERE o.released_wall_ms IS NULL")?;
+            let mut statement=conn.prepare("SELECT DISTINCT o.invocation_id FROM media_downstream_ownership o WHERE o.released_wall_ms IS NULL AND (EXISTS(SELECT 1 FROM client_submission_terminal_receipts t WHERE t.client_submission_id=o.invocation_id) OR NOT EXISTS(SELECT 1 FROM session_events e,json_each(e.data_json,'$.client_submissions') receipt WHERE e.type='user_message' AND json_extract(receipt.value,'$.id')=o.invocation_id))")?;
             Ok(statement.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
         }).await.map_err(LedgerError::Storage)?;
         let mut released = 0_u64;
@@ -1923,6 +1923,53 @@ mod tests {
             0,
             "terminal cleanup replays without double release"
         );
+        let orphan = ledger
+            .reserve(request(
+                "rejected-before-queue",
+                vec![
+                    plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                    plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::EncodedBytesPerObject, 3, None),
+                    plan(MediaDimension::RetainedBytesPerSession, 3, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+        let orphan = ledger
+            .complete_local_allocation(&orphan.reservation_id, orphan.version, 6)
+            .await
+            .unwrap();
+        ledger
+            .authorize_publication(&orphan.reservation_id)
+            .await
+            .unwrap();
+        ledger
+            .bind_downstream_ownership(
+                vec![orphan.reservation_id.clone()],
+                "never-queued-invocation",
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .reconcile_terminal_downstream_ownership(8)
+                .await
+                .unwrap(),
+            1,
+            "restart sweep releases ownership with neither durable acceptance nor terminal row"
+        );
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT state FROM media_reservations WHERE reservation_id='rejected-before-queue'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?))
+            .await
+            .unwrap(),
+            "released"
+        );
     }
 
     #[tokio::test]
@@ -2253,7 +2300,7 @@ mod tests {
         };
         use crate::external_journal::spool::{Spool, SpoolAccess};
         let temp = tempfile::TempDir::new().unwrap();
-        let db = Db::open(temp.path().join("handoff.db")).unwrap();
+        let db = Db::open(&temp.path().join("handoff.db")).unwrap();
         let journal = crate::external_journal::ExternalJournal::new(
             db.clone(),
             Spool::open_at(&temp.path().join("spool"), SpoolAccess::Create).unwrap(),

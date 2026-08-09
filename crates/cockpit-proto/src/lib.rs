@@ -1383,6 +1383,43 @@ pub enum AssistantSessionResolutionMode {
     MostRecentOrCreate,
 }
 
+#[cfg(test)]
+mod tui_ownership_rpc_contract_tests {
+    use super::*;
+
+    #[test]
+    fn missing_rpc_protocol_contract_rejects_open_ended_policy_values() {
+        assert!(serde_json::from_str::<AppFlagKey>(r#""arbitrary-string""#).is_err());
+        assert!(serde_json::from_str::<WorkspaceTrustMode>(r#""future-mode""#).is_err());
+        assert!(
+            serde_json::from_str::<AssistantSessionResolutionMode>(r#""create-always""#).is_err()
+        );
+    }
+
+    #[test]
+    fn missing_rpc_protocol_contract_has_exact_request_fields() {
+        let trust = serde_json::to_value(Request::SetWorkspaceTrust {
+            project_root: "/workspace".into(),
+            mode: WorkspaceTrustMode::IgnoreConfig,
+            expected_config_generation: 9,
+        })
+        .unwrap();
+        assert_eq!(trust["request"], "set_workspace_trust");
+        assert_eq!(trust["params"]["project_root"], "/workspace");
+        assert_eq!(trust["params"]["mode"], "ignore_config");
+        assert_eq!(trust["params"]["expected_config_generation"], 9);
+
+        let assistant = serde_json::to_value(Request::ResolveAssistantSession {
+            assistant_id: "helper".into(),
+            project_root: "/workspace".into(),
+            mode: AssistantSessionResolutionMode::MostRecentOrCreate,
+        })
+        .unwrap();
+        assert_eq!(assistant["params"]["assistant_id"], "helper");
+        assert_eq!(assistant["params"]["mode"], "most_recent_or_create");
+    }
+}
+
 /// Metadata for a session sealed value.  The literal is deliberately absent
 /// from this wire type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

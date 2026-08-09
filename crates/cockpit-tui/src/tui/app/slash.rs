@@ -1759,6 +1759,7 @@ impl App {
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             mode: cockpit_core::daemon::proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         };
+        let source_session_id = self.launch.session_id;
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
@@ -1767,6 +1768,7 @@ impl App {
                     session, ..
                 } => Ok(AsyncActionPayload::AssistantSessionResolved {
                     session_id: session.session_id,
+                    source_session_id,
                 }),
                 other => Err(format!("unexpected assistant response: {other:?}")),
             },

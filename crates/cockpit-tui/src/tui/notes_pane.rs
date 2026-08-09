@@ -110,6 +110,7 @@ enum NotesRpcActionKind {
 
 #[derive(Debug, Clone)]
 pub struct NotesRpcResult {
+    project_root: String,
     notes: Vec<ProjectNote>,
     keep: Option<Uuid>,
     enter_edit: bool,
@@ -119,6 +120,7 @@ impl NotesRpcAction {
     pub async fn run(self) -> anyhow::Result<NotesRpcResult> {
         let socket = self.daemon_socket;
         let project_root = self.project_root;
+        let response_project_root = project_root.clone();
         let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
         match self.kind {
             NotesRpcActionKind::Load { keep } => {
@@ -127,6 +129,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    project_root: response_project_root,
                     notes,
                     keep,
                     enter_edit: false,
@@ -143,6 +146,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    project_root: response_project_root,
                     notes,
                     keep: Some(id),
                     enter_edit: false,
@@ -159,6 +163,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    project_root: response_project_root,
                     notes,
                     keep: Some(id),
                     enter_edit: false,
@@ -177,6 +182,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    project_root: response_project_root,
                     notes,
                     keep: Some(note.id),
                     enter_edit: true,
@@ -192,6 +198,7 @@ impl NotesRpcAction {
                     other => anyhow::bail!("unexpected notes response: {other:?}"),
                 };
                 Ok(NotesRpcResult {
+                    project_root: response_project_root,
                     notes,
                     keep: None,
                     enter_edit: false,
@@ -299,6 +306,9 @@ impl NotesPane {
     pub fn apply_rpc_result(&mut self, result: Result<NotesRpcResult, String>) {
         match result {
             Ok(result) => {
+                if result.project_root != self.project_root {
+                    return;
+                }
                 self.notes = result.notes;
                 if let Some(id) = result.keep
                     && let Some(idx) = self.notes.iter().position(|n| n.id == id)

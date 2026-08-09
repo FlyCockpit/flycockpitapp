@@ -159,7 +159,7 @@ impl App {
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
             move || {
                 let request = cockpit_core::daemon::proto::Request::GetStartupDisclosures {
-                    project_root: disclosure_root,
+                    project_root: disclosure_root.clone(),
                 };
                 let response = match disclosure_socket.as_deref() {
                     Some(socket) => agent_runner::daemon_request_at_blocking(socket, request),
@@ -171,6 +171,7 @@ impl App {
                         connector,
                         ..
                     } => Ok(AsyncActionPayload::RemoteDisclosures {
+                        project_root: disclosure_root,
                         org: org_sync,
                         connector,
                     }),

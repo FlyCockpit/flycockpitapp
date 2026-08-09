@@ -296,15 +296,25 @@ impl App {
                 }
             }
             AsyncActionKind::Internal("startup.remote_disclosures") => {
-                if let Ok(AsyncActionPayload::RemoteDisclosures { org, connector }) = result.payload
+                if let Ok(AsyncActionPayload::RemoteDisclosures {
+                    project_root,
+                    org,
+                    connector,
+                }) = result.payload
+                    && self.launch.cwd.to_string_lossy() == project_root
                 {
                     self.org_sync_disclosure = org;
                     self.connector_disclosure = connector;
                 }
             }
             AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
-                Ok(AsyncActionPayload::AssistantSessionResolved { session_id }) => {
-                    self.resume_session(session_id);
+                Ok(AsyncActionPayload::AssistantSessionResolved {
+                    session_id,
+                    source_session_id,
+                }) => {
+                    if self.launch.session_id == source_session_id {
+                        self.resume_session(session_id);
+                    }
                 }
                 Ok(_) => self.push_plain("/assistant: unexpected daemon response".to_string()),
                 Err(error) => self.push_plain(format!("/assistant: Unavailable — {error}; Retry")),

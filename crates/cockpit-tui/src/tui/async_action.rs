@@ -74,11 +74,13 @@ pub enum AsyncActionPayload {
     SideSessionReturned(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
+        project_root: String,
         org: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
         connector: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
     },
     AssistantSessionResolved {
         session_id: uuid::Uuid,
+        source_session_id: Option<uuid::Uuid>,
     },
     StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
     SubagentHistory {

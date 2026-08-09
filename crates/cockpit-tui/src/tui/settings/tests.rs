@@ -957,6 +957,16 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
 /// this pass proves that every state variant itself remains constructible and
 /// renderable through production navigation.
 fn render_all_non_provider_pointer_surface_variants() {
+    // Render each standalone root child explicitly. Surface coverage must be
+    // owned by this acceptance run, never inherited accidentally from some
+    // earlier test that happened to execute on the same thread-local worker.
+    for title in ["Tools", "Skills", "MCP", "LSP"] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_root_node(&mut d, title);
+        let _ = render_settings_rows(&d, 100, 40);
+    }
+
     // Harnesses: list, add-name editor, harness editor, field editor.
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);

@@ -1858,6 +1858,103 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .unwrap()
             .is_some()
     );
+
+    for session_id in [first_session.session_id, second_session.session_id] {
+        ctx.db
+            .upsert_paused_session_work(session_id, "Build", "/repo", "approval", 1, "test")
+            .await
+            .unwrap();
+    }
+    let resume_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-777777777777").unwrap(),
+    )
+    .unwrap();
+    let resume_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first paused-work resume").await,
+        Body::Response { id, response } if id == resume_id && matches!(*response, Response::Ack)
+    ));
+    let resume_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_replay_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "paused-work resume replay").await,
+        Body::Response { id, response } if id == resume_replay_id && matches!(*response, Response::Ack)
+    ));
+    let resume_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_conflict_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: second_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "paused-work resume conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == resume_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        ctx.db
+            .paused_session_work(first_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::paused_work::PausedWorkStatus::Resumed,
+    );
+    assert_eq!(
+        ctx.db
+            .paused_session_work(second_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::paused_work::PausedWorkStatus::Paused,
+    );
 }
 
 fn table_for(secret: &str) -> Arc<RedactionTable> {

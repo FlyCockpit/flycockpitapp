@@ -2177,6 +2177,7 @@ pub(super) async fn handle_serialized_request(
             })
         }
         Request::RecoverSecurityBlockedMedia(request) => {
+            use sha2::{Digest as _, Sha256};
             let expected_owner = super::run_invocation::principal_digest(&state.principal);
             if request.owner_principal_digest != expected_owner {
                 return Err(authorization_error(
@@ -2190,10 +2191,41 @@ pub(super) async fn handle_serialized_request(
                     code: ErrorCode::Internal,
                     message: "media storage authority is unavailable".into(),
                 })?;
+            let att = require_attached(state).map_err(|_| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            })?;
+            let project_text = att
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "media_attachment_unavailable".into(),
+                })?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
             let receipt = recovery
-                .recover(request, None, chrono::Utc::now().timestamp_millis())
+                .recover(
+                    request,
+                    att.handle.session_id,
+                    project_digest,
+                    None,
+                    chrono::Utc::now().timestamp_millis(),
+                )
                 .await
-                .map_err(internal)?;
+                .map_err(|error| {
+                    if error
+                        .to_string()
+                        .contains("security-blocked media attachment unavailable")
+                    {
+                        ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: "media_attachment_unavailable".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
             Ok(Response::MediaOwnerRecovery(receipt))
         }
         Request::Unknown => Err(proto::unsupported_request_error(

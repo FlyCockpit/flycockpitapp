@@ -65,17 +65,23 @@ impl MediaStorageRecovery {
     pub(crate) async fn recover(
         &self,
         request: RecoverSecurityBlockedMediaV1,
+        owner_session_id: Uuid,
+        canonical_project_digest: String,
         borrowed_source: Option<BorrowedSourceHandle>,
         now_unix_ms: i64,
     ) -> Result<LocalMediaOwnerReceiptV1> {
         let root = self.owned_root.clone();
         self.db
             .transaction(move |conn| {
-                let snapshot =
-                    match cockpit_db::Db::security_recovery_snapshot_conn(conn, &request)? {
-                        SecurityRecoverySnapshotResult::Replay(receipt) => return Ok(receipt),
-                        SecurityRecoverySnapshotResult::Current(snapshot) => snapshot,
-                    };
+                let snapshot = match cockpit_db::Db::security_recovery_snapshot_conn(
+                    conn,
+                    &request,
+                    owner_session_id,
+                    &canonical_project_digest,
+                )? {
+                    SecurityRecoverySnapshotResult::Replay(receipt) => return Ok(receipt),
+                    SecurityRecoverySnapshotResult::Current(snapshot) => snapshot,
+                };
                 cockpit_db::Db::validate_recover_security_blocked_media_v1(
                     &request,
                     snapshot.attachment.source_kind,
@@ -98,8 +104,15 @@ impl MediaStorageRecovery {
                         }
                     }
                 };
-                let receipt =
-                    commit_security_recovery(conn, &request, &snapshot, verified, now_unix_ms)?;
+                let receipt = commit_security_recovery(
+                    conn,
+                    &request,
+                    &snapshot,
+                    owner_session_id,
+                    &canonical_project_digest,
+                    verified,
+                    now_unix_ms,
+                )?;
                 drop(held_proof);
                 Ok(receipt)
             })
@@ -111,10 +124,17 @@ fn commit_security_recovery(
     conn: &Connection,
     request: &RecoverSecurityBlockedMediaV1,
     snapshot: &SecurityRecoverySnapshot,
+    owner_session_id: Uuid,
+    canonical_project_digest: &str,
     held_handles_verified: bool,
     now_unix_ms: i64,
 ) -> Result<LocalMediaOwnerReceiptV1> {
-    let current = match cockpit_db::Db::security_recovery_snapshot_conn(conn, request)? {
+    let current = match cockpit_db::Db::security_recovery_snapshot_conn(
+        conn,
+        request,
+        owner_session_id,
+        canonical_project_digest,
+    )? {
         SecurityRecoverySnapshotResult::Replay(receipt) => return Ok(receipt),
         SecurityRecoverySnapshotResult::Current(current) => current,
     };
@@ -405,6 +425,8 @@ mod tests {
         db: cockpit_db::Db,
         request: RecoverSecurityBlockedMediaV1,
         storage_id: Uuid,
+        session_id: Uuid,
+        project_digest: String,
     }
 
     async fn fixture() -> Fixture {
@@ -420,6 +442,8 @@ mod tests {
 
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
+        let project_digest = "11".repeat(32);
+        let inserted_project_digest = project_digest.clone();
         let attachment_id = Uuid::now_v7();
         let component_id = Uuid::now_v7();
         let component = MediaAttachmentComponent {
@@ -443,7 +467,7 @@ mod tests {
             cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
                 attachment_id,
                 session_id,
-                canonical_project_digest: "11".repeat(32),
+                canonical_project_digest: inserted_project_digest,
                 media_kind: MediaKind::Image,
                 source_kind: MediaSourceKind::RetainedHttps,
                 canonical_container: "png".into(),
@@ -499,6 +523,8 @@ mod tests {
             db,
             request,
             storage_id,
+            session_id,
+            project_digest,
         }
     }
 
@@ -526,7 +552,13 @@ mod tests {
         let fixture = fixture().await;
         let recovery = MediaStorageRecovery::open(fixture.db.clone(), &fixture.root_path).unwrap();
         let receipt = recovery
-            .recover(fixture.request.clone(), None, 10)
+            .recover(
+                fixture.request.clone(),
+                fixture.session_id,
+                fixture.project_digest.clone(),
+                None,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -535,7 +567,13 @@ mod tests {
         );
         assert_eq!(receipt.availability_generation_after, 3);
         let replay = recovery
-            .recover(fixture.request.clone(), None, 99)
+            .recover(
+                fixture.request.clone(),
+                fixture.session_id,
+                fixture.project_digest.clone(),
+                None,
+                99,
+            )
             .await
             .unwrap();
         assert_eq!(replay, receipt);
@@ -543,7 +581,13 @@ mod tests {
         conflict.disposition = MediaSecurityRecoveryDisposition::RetainBlocked;
         assert!(
             recovery
-                .recover(conflict, None, 100)
+                .recover(
+                    conflict,
+                    fixture.session_id,
+                    fixture.project_digest.clone(),
+                    None,
+                    100
+                )
                 .await
                 .unwrap_err()
                 .to_string()
@@ -552,7 +596,16 @@ mod tests {
         drop(recovery);
         let reopened = MediaStorageRecovery::open(fixture.db, &fixture.root_path).unwrap();
         assert_eq!(
-            reopened.recover(fixture.request, None, 101).await.unwrap(),
+            reopened
+                .recover(
+                    fixture.request,
+                    fixture.session_id,
+                    fixture.project_digest,
+                    None,
+                    101
+                )
+                .await
+                .unwrap(),
             receipt
         );
     }
@@ -568,7 +621,13 @@ mod tests {
             .unwrap();
         let recovery = MediaStorageRecovery::open(fixture.db.clone(), &fixture.root_path).unwrap();
         let receipt = recovery
-            .recover(fixture.request.clone(), None, 10)
+            .recover(
+                fixture.request.clone(),
+                fixture.session_id,
+                fixture.project_digest.clone(),
+                None,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -584,7 +643,16 @@ mod tests {
             receipt.components[0].generation_after
         );
         assert_eq!(
-            recovery.recover(fixture.request, None, 11).await.unwrap(),
+            recovery
+                .recover(
+                    fixture.request,
+                    fixture.session_id,
+                    fixture.project_digest,
+                    None,
+                    11
+                )
+                .await
+                .unwrap(),
             receipt
         );
     }

@@ -229,6 +229,7 @@ pub struct VerifiedBlockedComponent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoverSecurityBlockedComponentV1 {
+    #[serde(with = "strict_uuid_v7")]
     pub component_id: Uuid,
     pub component_kind: String,
     pub component_generation: u64,
@@ -250,6 +251,7 @@ pub struct RecoverSecurityBlockedMediaV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_request_id: Uuid,
     pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
     pub attachment_id: Uuid,
     pub attachment_version: u64,
     pub expected_availability_generation: u64,
@@ -272,6 +274,7 @@ pub enum MediaSecurityRecoveryOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MediaSecurityRecoveryComponentTransitionV1 {
+    #[serde(with = "strict_uuid_v7")]
     pub component_id: Uuid,
     pub component_kind: String,
     pub generation_before: u64,
@@ -288,6 +291,7 @@ pub struct LocalMediaOwnerReceiptV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_request_id: Uuid,
     pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
     pub attachment_id: Uuid,
     pub attachment_version: u64,
     pub disposition: MediaSecurityRecoveryDisposition,
@@ -361,8 +365,12 @@ impl super::Db {
             "invalid recovery request schema or kind"
         );
         ensure!(
-            request.local_request_id.get_version_num() == 7,
-            "local recovery request id must be UUIDv7"
+            is_strict_uuid_v7(request.local_request_id),
+            "local recovery request id must be canonical RFC UUIDv7"
+        );
+        ensure!(
+            is_strict_uuid_v7(request.attachment_id),
+            "attachment id must be UUIDv7"
         );
         validate_digest(&request.owner_principal_digest, "owner principal digest")?;
         ensure!(
@@ -381,6 +389,10 @@ impl super::Db {
             "security recovery components must be sorted and unique"
         );
         for component in &request.affected_components {
+            ensure!(
+                is_strict_uuid_v7(component.component_id),
+                "component id must be UUIDv7"
+            );
             ensure!(
                 component.component_generation > 0,
                 "component generation must be positive"
@@ -408,9 +420,16 @@ impl super::Db {
     pub fn security_recovery_snapshot_conn(
         conn: &Connection,
         request: &RecoverSecurityBlockedMediaV1,
+        owner_session_id: Uuid,
+        canonical_project_digest: &str,
     ) -> Result<SecurityRecoverySnapshotResult> {
-        let parent = media_attachment_by_id(conn, request.attachment_id)?
-            .context("security-blocked media attachment unavailable")?;
+        let parent = Self::media_attachment_for_owner_conn(
+            conn,
+            request.attachment_id,
+            owner_session_id,
+            canonical_project_digest,
+        )?
+        .context("security-blocked media attachment unavailable")?;
         Self::validate_recover_security_blocked_media_v1(request, parent.source_kind)?;
         let request_digest = security_recovery_request_digest(request)?;
         if let Some((stored_digest, receipt_json)) = conn.query_row(
@@ -954,6 +973,10 @@ fn validate_digest(value: &str, field: &str) -> Result<()> {
         "{field} must be lowercase SHA-256"
     );
     Ok(())
+}
+
+fn is_strict_uuid_v7(value: Uuid) -> bool {
+    !value.is_nil() && value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
 }
 
 fn stream_json(stream: &Option<SelectedMediaStream>) -> Result<Option<String>> {

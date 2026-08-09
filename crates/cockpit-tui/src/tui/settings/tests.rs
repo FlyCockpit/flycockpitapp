@@ -639,6 +639,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
     pointer_harness_list_actions_dispatch_from_fresh_sources();
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
+    pointer_redact_pattern_rows_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -652,6 +653,65 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn redact_patterns_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.page = Box::new(RedactPatternsPage::new());
+    dialog
+}
+
+fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, SettingsPointerAction};
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = redact_patterns_pointer_fixture(&source_tmp);
+    let expected_values = source.extended.redact.dotenv_patterns.clone();
+    assert_eq!(expected_values, [".env", ".env.local"]);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::List(
+                        ListAction::Edit(_) | ListAction::Delete(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(actions.len(), expected_values.len() * 2);
+
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = redact_patterns_pointer_fixture(&tmp);
+        match &action {
+            SettingsPointerAction::List(ListAction::Edit(_)) => {
+                click_settings_action(&mut dialog, &action);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::RedactPatterns(page) if page.grabbed.is_some()
+                ));
+            }
+            SettingsPointerAction::List(ListAction::Delete(_)) => {
+                click_settings_action(&mut dialog, &action);
+                assert_eq!(dialog.extended.redact.dotenv_patterns, expected_values);
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::RedactPatterns(page) if page.delete.is_pending_for(page.cursor)
+                ));
+                click_settings_action(&mut dialog, &action);
+                assert_eq!(dialog.extended.redact.dotenv_patterns.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {

@@ -1354,8 +1354,8 @@ impl RemoteQueueMutationReceiptV1 {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.schema_version == 1, "unsupported queue receipt schema");
         anyhow::ensure!(
-            self.removed_count <= 1,
-            "queue receipt removed_count exceeds one"
+            self.removed_count <= 10_000,
+            "queue receipt removed_count exceeds bound"
         );
         let removed = matches!(self.reason, proto::RemoveQueuedUserMessageReason::Removed);
         anyhow::ensure!(
@@ -1363,7 +1363,7 @@ impl RemoteQueueMutationReceiptV1 {
             "queue receipt applied/reason mismatch"
         );
         anyhow::ensure!(
-            removed == (self.removed_count == 1),
+            removed == (self.removed_count > 0),
             "queue receipt count mismatch"
         );
         Ok(())
@@ -1408,12 +1408,14 @@ pub enum SessionWork {
     },
     RemoveNewestQueuedUserMessage {
         target_id: Option<String>,
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveEditableQueuedUserMessages {
         target_id: Option<String>,
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
         >,

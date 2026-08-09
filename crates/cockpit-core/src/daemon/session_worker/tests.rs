@@ -40,6 +40,14 @@ fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
         .validate()
         .is_err()
     );
+    RemoteQueueMutationReceiptV1 {
+        schema_version: 1,
+        applied: true,
+        reason: proto::RemoveQueuedUserMessageReason::Removed,
+        removed_count: 2,
+    }
+    .validate()
+    .unwrap();
 }
 
 #[tokio::test]
@@ -620,6 +628,80 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         assert!(
             released.applied,
             "conflict must release the staged queue claim"
+        );
+
+        async fn remove_newest(
+            handle: &SessionWorkerHandle,
+            operation: RemoteQueueOperation,
+        ) -> Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload> {
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::RemoveNewestQueuedUserMessage {
+                    target_id: Some("root".into()),
+                    remote_operation: Some(operation),
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            response.await.unwrap()
+        }
+        let newest_operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000031".into(),
+            operation_id: "01890f3e-4c00-7000-8000-000000000093".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000032".into(),
+            authenticated_device_generation: 1,
+            request_hash: [2; 32],
+        };
+        let newest = remove_newest(&handle, newest_operation.clone())
+            .await
+            .unwrap();
+        assert!(newest.applied && newest.queue.is_empty() && newest.removed_item.is_none());
+        let newest_replay = remove_newest(&handle, newest_operation).await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&newest).unwrap(),
+            serde_json::to_vec(&newest_replay).unwrap()
+        );
+
+        let _ = enqueue(
+            &handle,
+            crate::engine::message::UserSubmission::text("editable one"),
+        )
+        .await;
+        let _ = enqueue(
+            &handle,
+            crate::engine::message::UserSubmission::text("editable two"),
+        )
+        .await;
+        async fn remove_editable(
+            handle: &SessionWorkerHandle,
+            operation: RemoteQueueOperation,
+        ) -> Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload> {
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::RemoveEditableQueuedUserMessages {
+                    target_id: Some("root".into()),
+                    remote_operation: Some(operation),
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            response.await.unwrap()
+        }
+        let editable_operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000031".into(),
+            operation_id: "01890f3e-4c00-7000-8000-000000000092".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000032".into(),
+            authenticated_device_generation: 1,
+            request_hash: [1; 32],
+        };
+        let editable = remove_editable(&handle, editable_operation.clone())
+            .await
+            .unwrap();
+        assert!(editable.applied && editable.queue.is_empty() && editable.removed_items.is_empty());
+        let editable_replay = remove_editable(&handle, editable_operation).await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&editable).unwrap(),
+            serde_json::to_vec(&editable_replay).unwrap()
         );
 
         handle.send_work(SessionWork::Cancel).await.unwrap();

@@ -8673,6 +8673,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_newest_queued_user_message",
                     SessionWork::RemoveNewestQueuedUserMessage {
                         target_id,
+                        remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -8690,6 +8691,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_editable_queued_user_messages",
                     SessionWork::RemoveEditableQueuedUserMessages {
                         target_id,
+                        remote_operation: _,
                         respond_to,
                     },
                 ) => {

@@ -551,6 +551,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::RemoveQueuedUserMessage { queue_item_id } => {
             let att = require_attached(state)?;
             let remote_queue_operation = if let Some(operation) = remote_operation {
+                if target_id.is_none() {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "remote newest queue removal requires an explicit target_id"
+                            .into(),
+                    });
+                }
                 let request = Request::RemoveQueuedUserMessage { queue_item_id };
                 let params = request
                     .canonical_remote_operation_params_v1()
@@ -586,10 +593,37 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveNewestQueuedUserMessage { target_id } => {
             let att = require_attached(state)?;
+            let remote_queue_operation = if let Some(operation) = remote_operation {
+                if target_id.is_none() {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "remote editable queue removal requires an explicit target_id"
+                            .into(),
+                    });
+                }
+                let request = Request::RemoveNewestQueuedUserMessage {
+                    target_id: target_id.clone(),
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                Some(crate::daemon::session_worker::RemoteQueueOperation {
+                    logical_attachment_id: operation.logical_attachment_id.to_string(),
+                    operation_id: operation.operation_id.to_string(),
+                    authenticated_device_id: operation.authenticated_device_id.to_string(),
+                    authenticated_device_generation: operation.authenticated_device_generation,
+                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
+                        .map_err(internal)?,
+                })
+            } else {
+                None
+            };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    remote_operation: remote_queue_operation,
                     respond_to,
                 })
                 .await
@@ -604,10 +638,30 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveEditableQueuedUserMessages { target_id } => {
             let att = require_attached(state)?;
+            let remote_queue_operation = if let Some(operation) = remote_operation {
+                let request = Request::RemoveEditableQueuedUserMessages {
+                    target_id: target_id.clone(),
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                Some(crate::daemon::session_worker::RemoteQueueOperation {
+                    logical_attachment_id: operation.logical_attachment_id.to_string(),
+                    operation_id: operation.operation_id.to_string(),
+                    authenticated_device_id: operation.authenticated_device_id.to_string(),
+                    authenticated_device_generation: operation.authenticated_device_generation,
+                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
+                        .map_err(internal)?,
+                })
+            } else {
+                None
+            };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    remote_operation: remote_queue_operation,
                     respond_to,
                 })
                 .await

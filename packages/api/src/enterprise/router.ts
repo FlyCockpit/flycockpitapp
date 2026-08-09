@@ -6,7 +6,7 @@ import {
   remoteAdminOperationRequiresDualControl,
   tagProtocolIdBytes,
 } from "@flycockpit/cockpit-protocol";
-import prisma from "@flycockpit/db";
+import prisma, { type Prisma } from "@flycockpit/db";
 import { env } from "@flycockpit/env/server";
 import { enterpriseLogExportQueue } from "@flycockpit/queue";
 import { ORPCError } from "@orpc/server";
@@ -107,6 +107,102 @@ const base64urlBytes = (value: string, expectedLength?: number) => {
   return bytes;
 };
 
+type ActiveApproval = {
+  principalId: string;
+  role: "OWNER" | "SECURITY_ADMIN" | "MEMBER";
+  credentialIdHash: Uint8Array;
+};
+async function assertApproversRemainCurrent(
+  tx: Prisma.TransactionClient,
+  orgId: string,
+  registryGeneration: bigint,
+  approvals: ActiveApproval[],
+) {
+  for (const approval of approvals) {
+    const [member, credential] = await Promise.all([
+      tx.enterpriseOrgMember.findUnique({
+        where: { orgId_userId: { orgId, userId: approval.principalId } },
+      }),
+      tx.remoteAdminCredential.findUnique({
+        where: {
+          orgId_credentialIdHash: {
+            orgId,
+            credentialIdHash: Buffer.from(approval.credentialIdHash),
+          },
+        },
+      }),
+    ]);
+    if (
+      member?.role !== approval.role ||
+      credential?.principalId !== approval.principalId ||
+      credential.role !== approval.role ||
+      credential.state !== "ACTIVE" ||
+      credential.registryGeneration > registryGeneration
+    )
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "An approval credential or membership is no longer current.",
+      });
+  }
+}
+async function consumeCurrentStepUp(
+  tx: Prisma.TransactionClient,
+  input: {
+    reference: string;
+    orgId: string;
+    principalId: string;
+    role: "OWNER" | "SECURITY_ADMIN";
+    action: string;
+    sessionId: string;
+    now: Date;
+  },
+) {
+  const id = parseStepUpReference(input.reference);
+  const stepUp = await tx.remoteAdminStepUp.findUnique({ where: { id } });
+  if (
+    !stepUp ||
+    stepUp.orgId !== input.orgId ||
+    stepUp.principalId !== input.principalId ||
+    stepUp.role !== input.role ||
+    stepUp.action !== input.action ||
+    stepUp.sessionId !== input.sessionId ||
+    stepUp.consumedAt ||
+    stepUp.expiresAt < input.now
+  )
+    throw new ORPCError("UNAUTHORIZED", { message: "Fresh passkey step-up is required." });
+  const registry = await tx.remoteAdminRegistry.findUnique({ where: { orgId: input.orgId } });
+  const [member, credential] = await Promise.all([
+    tx.enterpriseOrgMember.findUnique({
+      where: { orgId_userId: { orgId: input.orgId, userId: input.principalId } },
+    }),
+    tx.remoteAdminCredential.findUnique({
+      where: {
+        orgId_credentialIdHash: {
+          orgId: input.orgId,
+          credentialIdHash: stepUp.credentialIdHash,
+        },
+      },
+    }),
+  ]);
+  if (
+    !registry ||
+    stepUp.registryGeneration !== registry.generation ||
+    member?.role !== input.role ||
+    credential?.principalId !== input.principalId ||
+    credential.role !== input.role ||
+    credential.state !== "ACTIVE"
+  )
+    throw new ORPCError("UNAUTHORIZED", { message: "Passkey step-up is stale." });
+  if (
+    (
+      await tx.remoteAdminStepUp.updateMany({
+        where: { id, consumedAt: null, expiresAt: { gte: input.now } },
+        data: { consumedAt: input.now },
+      })
+    ).count !== 1
+  )
+    throw new ORPCError("CONFLICT", { message: "Passkey step-up was already consumed." });
+}
+
 export const enterpriseRouter = {
   authorizeRemotePolicyRevision: protectedProcedure
     .input(
@@ -170,6 +266,7 @@ export const enterpriseRouter = {
               message: "Security administrator approval is required.",
             });
           }
+          await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -313,6 +410,7 @@ export const enterpriseRouter = {
             throw new ORPCError("FORBIDDEN", {
               message: "An approving administrator must initiate registration.",
             });
+          await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -422,6 +520,7 @@ export const enterpriseRouter = {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Dual role approvals are required.",
             });
+          await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -480,28 +579,24 @@ export const enterpriseRouter = {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Credential registry is not sealed.",
             });
-          if (
-            (
-              await tx.remoteAdminStepUp.updateMany({
-                where: {
-                  id: parseStepUpReference(input.stepUp),
-                  orgId: input.orgId,
-                  principalId: context.session.user.id,
-                  role: "SECURITY_ADMIN",
-                  action: "tenant_signer_configuration",
-                  sessionId: context.session.session.id,
-                  consumedAt: null,
-                  expiresAt: { gte: now },
-                },
-                data: { consumedAt: now },
-              })
-            ).count !== 1
-          )
-            throw new ORPCError("UNAUTHORIZED", {
-              message: "Security administrator step-up is required.",
-            });
+          await consumeCurrentStepUp(tx, {
+            reference: input.stepUp,
+            orgId: input.orgId,
+            principalId: context.session.user.id,
+            role: "SECURITY_ADMIN",
+            action: "tenant_signer_configuration",
+            sessionId: context.session.session.id,
+            now,
+          });
           const credentials = await tx.remoteAdminCredential.findMany({
             where: { orgId: input.orgId, role: { in: ["OWNER", "SECURITY_ADMIN"] } },
+          });
+          credentials.sort((left, right) => {
+            const principals = Buffer.compare(
+              Buffer.from(left.principalProtocolId),
+              Buffer.from(right.principalProtocolId),
+            );
+            return principals || Buffer.compare(left.credentialIdHash, right.credentialIdHash);
           });
           const bytes = encodeRemoteCredentialRegistryV1({
             tenantId: tagProtocolIdBytes("tenant", new Uint8Array(registry.tenantProtocolId)),
@@ -593,6 +688,7 @@ export const enterpriseRouter = {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Dual credential approvals are required.",
             });
+          await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
           const remaining = await tx.remoteAdminCredential.count({
             where: {
               orgId: input.orgId,
@@ -696,6 +792,7 @@ export const enterpriseRouter = {
             approvals.some((approval) => approval.registryGeneration !== registry.generation)
           )
             throw new ORPCError("CONFLICT", { message: "Recovery approvals are stale." });
+          await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
           const active = await tx.remoteAdminCredential.count({
             where: {
               orgId: input.orgId,
@@ -791,24 +888,15 @@ export const enterpriseRouter = {
             });
           const role =
             proposal.ownerPrincipalId === context.session.user.id ? "OWNER" : "SECURITY_ADMIN";
-          if (
-            (
-              await tx.remoteAdminStepUp.updateMany({
-                where: {
-                  id: parseStepUpReference(input.stepUp),
-                  orgId: proposal.orgId,
-                  principalId: context.session.user.id,
-                  role,
-                  action: "recovery",
-                  sessionId: context.session.session.id,
-                  consumedAt: null,
-                  expiresAt: { gte: now },
-                },
-                data: { consumedAt: now },
-              })
-            ).count !== 1
-          )
-            throw new ORPCError("UNAUTHORIZED", { message: "Fresh recovery step-up is required." });
+          await consumeCurrentStepUp(tx, {
+            reference: input.stepUp,
+            orgId: proposal.orgId,
+            principalId: context.session.user.id,
+            role,
+            action: "recovery",
+            sessionId: context.session.session.id,
+            now,
+          });
           const data =
             role === "OWNER" ? { ownerReconfirmedAt: now } : { securityReconfirmedAt: now };
           const updated = await tx.remoteAdminRecoveryProposal.update({
@@ -855,24 +943,15 @@ export const enterpriseRouter = {
             now > proposal.expiresAt
           )
             throw new ORPCError("FORBIDDEN", { message: "Recovery cannot be cancelled." });
-          if (
-            (
-              await tx.remoteAdminStepUp.updateMany({
-                where: {
-                  id: parseStepUpReference(input.stepUp),
-                  orgId: proposal.orgId,
-                  principalId: context.session.user.id,
-                  role: "OWNER",
-                  action: "recovery",
-                  sessionId: context.session.session.id,
-                  consumedAt: null,
-                  expiresAt: { gte: now },
-                },
-                data: { consumedAt: now },
-              })
-            ).count !== 1
-          )
-            throw new ORPCError("UNAUTHORIZED", { message: "Fresh owner step-up is required." });
+          await consumeCurrentStepUp(tx, {
+            reference: input.stepUp,
+            orgId: proposal.orgId,
+            principalId: context.session.user.id,
+            role: "OWNER",
+            action: "recovery",
+            sessionId: context.session.session.id,
+            now,
+          });
           const cancelled = await tx.remoteAdminRecoveryProposal.update({
             where: { id: proposal.id },
             data: { state: "CANCELLED", cancelledById: context.session.user.id },
@@ -1204,6 +1283,33 @@ export const enterpriseRouter = {
       const evidenceText = Buffer.from(evidenceBytes).toString("base64url");
       const accepted = await prisma.$transaction(
         async (tx) => {
+          const [currentRegistry, currentCredential, currentMember] = await Promise.all([
+            tx.remoteAdminRegistry.findUnique({ where: { orgId: ceremony.orgId! } }),
+            tx.remoteAdminCredential.findUnique({
+              where: {
+                orgId_credentialIdHash: {
+                  orgId: ceremony.orgId!,
+                  credentialIdHash: credential.credentialIdHash,
+                },
+              },
+            }),
+            tx.enterpriseOrgMember.findUnique({
+              where: {
+                orgId_userId: { orgId: ceremony.orgId!, userId: context.session.user.id },
+              },
+            }),
+          ]);
+          if (
+            !currentRegistry ||
+            currentRegistry.generation !== registry.generation ||
+            currentCredential?.state !== "ACTIVE" ||
+            currentCredential.principalId !== context.session.user.id ||
+            currentCredential.role !== credential.role ||
+            currentMember?.role !== credential.role
+          )
+            throw new ORPCError("UNAUTHORIZED", {
+              message: "Approval credential or membership changed.",
+            });
           if (
             (
               await tx.remoteAdminCeremony.updateMany({
@@ -1322,21 +1428,15 @@ export const enterpriseRouter = {
         challengeId = randomUUID();
       await prisma.$transaction(
         async (tx) => {
-          const consumed = await tx.remoteAdminStepUp.updateMany({
-            where: {
-              id: parseStepUpReference(input.stepUp),
-              orgId: input.orgId,
-              principalId: context.session.user.id,
-              role: "OWNER",
-              action: "credential_governance",
-              sessionId: context.session.session.id,
-              consumedAt: null,
-              expiresAt: { gte: now },
-            },
-            data: { consumedAt: now },
+          await consumeCurrentStepUp(tx, {
+            reference: input.stepUp,
+            orgId: input.orgId,
+            principalId: context.session.user.id,
+            role: "OWNER",
+            action: "credential_governance",
+            sessionId: context.session.session.id,
+            now,
           });
-          if (consumed.count !== 1)
-            throw new ORPCError("UNAUTHORIZED", { message: "Owner step-up is invalid." });
           const digest = createHash("sha256")
             .update(
               JSON.stringify({
@@ -2033,6 +2133,33 @@ export const enterpriseRouter = {
       const stepUpId = randomBytes(32).toString("base64url");
       await prisma.$transaction(
         async (tx) => {
+          const [currentRegistry, currentCredential, currentMember] = await Promise.all([
+            tx.remoteAdminRegistry.findUnique({ where: { orgId: ceremony.orgId! } }),
+            tx.remoteAdminCredential.findUnique({
+              where: {
+                orgId_credentialIdHash: {
+                  orgId: ceremony.orgId!,
+                  credentialIdHash: credential.credentialIdHash,
+                },
+              },
+            }),
+            tx.enterpriseOrgMember.findUnique({
+              where: {
+                orgId_userId: { orgId: ceremony.orgId!, userId: context.session.user.id },
+              },
+            }),
+          ]);
+          if (
+            !currentRegistry ||
+            currentRegistry.generation !== registry.generation ||
+            currentCredential?.state !== "ACTIVE" ||
+            currentCredential.principalId !== context.session.user.id ||
+            currentCredential.role !== credential.role ||
+            currentMember?.role !== credential.role
+          )
+            throw new ORPCError("UNAUTHORIZED", {
+              message: "Passkey credential or membership changed.",
+            });
           const consumed = await tx.remoteAdminCeremony.updateMany({
             where: { id: ceremony.id, consumedAt: null, expiresAt: { gte: now } },
             data: { consumedAt: now },
@@ -2048,7 +2175,7 @@ export const enterpriseRouter = {
               principalId: context.session.user.id,
               role: credential.role,
               credentialIdHash: credential.credentialIdHash,
-              registryGeneration: credential.registryGeneration,
+              registryGeneration: registry.generation,
               action: ceremony.action,
               sessionId: context.session.session.id,
               challengeId: ceremony.id,

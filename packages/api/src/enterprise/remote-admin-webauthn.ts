@@ -116,8 +116,10 @@ function readCborInteger(bytes: Uint8Array, offset: { value: number }): number {
   const additional = initial & 31;
   let value: number;
   if (additional < 24) value = additional;
-  else if (additional === 24) value = bytes[offset.value++]!;
-  else throw new Error("webauthn_cose_noncanonical");
+  else if (additional === 24) {
+    value = bytes[offset.value++]!;
+    if (value < 24) throw new Error("webauthn_cose_noncanonical");
+  } else throw new Error("webauthn_cose_noncanonical");
   if (major === 0) return value;
   if (major === 1) return -1 - value;
   throw new Error("webauthn_cose_integer_required");
@@ -289,6 +291,7 @@ export async function verifyPortableRemoteAdminApproval(input: {
   credential: RemoteCredentialRegistryEntryV1;
   policy: WebAuthnPolicy;
   expectedChallenge: Uint8Array;
+  expectedChallengeId: Uint8Array;
 }): Promise<{ signCount: bigint }> {
   const { evidence, credential, policy } = input;
   if (evidence.coseAlg !== -7 || credential.coseAlg !== -7 || credential.state !== 1)
@@ -303,6 +306,8 @@ export async function verifyPortableRemoteAdminApproval(input: {
     throw new Error("remote_admin_approval_rp_origin_mismatch");
   if (!equal(evidence.challengeHash, await sha256(input.expectedChallenge)))
     throw new Error("remote_admin_approval_challenge_hash_mismatch");
+  if (!equal(evidence.challengeId, input.expectedChallengeId))
+    throw new Error("remote_admin_approval_challenge_id_mismatch");
   const client = strictClientData(evidence.clientDataJson);
   if (
     client.type !== "webauthn.get" ||

@@ -79,8 +79,6 @@ const base64url = (bytes: Uint8Array) => {
   }
   return out;
 };
-const bytesEqual = (a: Uint8Array, b: Uint8Array) =>
-  a.length === b.length && a.every((value, index) => value === b[index]);
 const concat = (...parts: Uint8Array[]) => {
   const result = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
   let offset = 0;
@@ -164,12 +162,12 @@ export function encodeRemoteCredentialRegistryV1(value: RemoteCredentialRegistry
   fixed(value.tenantId, 16, "tenant_id");
   const [rp, origin] = validatedRpOrigin(value.rpId, value.origin);
   if (value.entries.length < 1 || value.entries.length > 1024) throw new Error("entry_count");
-  const sorted = [...value.entries].sort((a, b) => compareUnsigned(entryKey(a), entryKey(b)));
-  for (let i = 1; i < sorted.length; i++) {
-    if (bytesEqual(entryKey(sorted[i - 1]!), entryKey(sorted[i]!)))
-      throw new Error("duplicate_entry");
+  for (let i = 1; i < value.entries.length; i++) {
+    const order = compareUnsigned(entryKey(value.entries[i - 1]!), entryKey(value.entries[i]!));
+    if (order === 0) throw new Error("duplicate_entry");
+    if (order > 0) throw new Error("entries_unsorted");
   }
-  const entries = sorted.map((entry) => {
+  const entries = value.entries.map((entry) => {
     fixed(entry.principalId, 16, "principal_id");
     fixed(entry.credentialIdHash, 32, "credential_id_hash");
     fixed(entry.p256X, 32, "p256_x");

@@ -110,6 +110,10 @@ describe("remote_admin_webauthn_registration_assertion", () => {
     expect(() => encodeRemoteCredentialRegistryV1({ ...base, entries: [entry, entry] })).toThrow(
       "duplicate_entry",
     );
+    const earlier = { ...entry, principalId: tagProtocolIdBytes("account", bytes(16, 1)) };
+    expect(() => encodeRemoteCredentialRegistryV1({ ...base, entries: [entry, earlier] })).toThrow(
+      "entries_unsorted",
+    );
     expect(() =>
       encodeRemoteCredentialRegistryV1({ ...base, rpId: "UPPER.example", entries: [entry] }),
     ).toThrow("rp_id_invalid");

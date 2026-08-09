@@ -331,6 +331,7 @@ describe("remote_admin_webauthn_registration_assertion", () => {
         credential,
         policy: { rpId, origin },
         expectedChallenge: challenge,
+        expectedChallengeId: new Uint8Array(16),
         evidence: {
           tenantId: tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3)),
           principalId: credential.principalId,
@@ -358,6 +359,7 @@ describe("remote_admin_webauthn_registration_assertion", () => {
         credential,
         policy: { rpId, origin },
         expectedChallenge: challenge,
+        expectedChallengeId: new Uint8Array(16),
         evidence: {
           tenantId: tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3)),
           principalId: tagProtocolIdBytes("account", new Uint8Array(16).fill(4)),
@@ -380,6 +382,34 @@ describe("remote_admin_webauthn_registration_assertion", () => {
         },
       }),
     ).rejects.toThrow("credential_mismatch");
+    await expect(
+      verifyPortableRemoteAdminApproval({
+        credential,
+        policy: { rpId, origin },
+        expectedChallenge: challenge,
+        expectedChallengeId: new Uint8Array(16).fill(9),
+        evidence: {
+          tenantId: tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3)),
+          principalId: credential.principalId,
+          role: 1,
+          registryGeneration: 1n,
+          credentialIdHash: credential.credentialIdHash,
+          operation: 5,
+          canonicalRequestDigest: new Uint8Array(32),
+          operationEpoch: 1n,
+          issuedAt: 1n,
+          expiresAt: 2n,
+          challengeId: new Uint8Array(16),
+          challengeHash: new Uint8Array(await crypto.subtle.digest("SHA-256", challenge)),
+          rpId,
+          origin,
+          authenticatorData,
+          clientDataJson,
+          coseAlg: -7,
+          signatureP1363,
+        },
+      }),
+    ).rejects.toThrow("challenge_id_mismatch");
   });
 });
 

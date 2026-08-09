@@ -39,6 +39,7 @@ const safeI64NumberSchema = z
   .int()
   .min(Number.MIN_SAFE_INTEGER)
   .max(Number.MAX_SAFE_INTEGER);
+const positiveSafeU64NumberSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 
 export const bulkTransferRefSchema = z
   .object({
@@ -100,7 +101,7 @@ export const activeModelStateSchema = z
     diverged: z.boolean(),
     // Monotonic only inside one attachment/worker epoch. An attach snapshot
     // is authoritative generation zero, so clients reset before merging it.
-    generation: z.number().int().nonnegative(),
+    generation: safeU64NumberSchema,
   })
   .passthrough();
 export type ActiveModelState = z.infer<typeof activeModelStateSchema>;
@@ -271,7 +272,7 @@ const requestParamSchemas = {
   attach: z
     .object({
       session_id: optionalUuidSchema,
-      since_seq: z.number().int().nonnegative().optional(),
+      since_seq: safeU64NumberSchema.optional(),
       project_root: z.string().optional(),
       no_sandbox: z.boolean().optional(),
       interactive: z.boolean().optional(),
@@ -330,7 +331,7 @@ const requestParamSchemas = {
   read_history_page: z
     .object({
       session_id: uuidSchema,
-      before_seq: z.number().int().nonnegative().nullable().optional(),
+      before_seq: safeU64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
@@ -339,14 +340,14 @@ const requestParamSchemas = {
       session_id: uuidSchema,
       task_call_id: z.string().min(1),
       label: z.string().min(1),
-      before_seq: z.number().int().nonnegative().nullable().optional(),
+      before_seq: safeU64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
   read_session_messages: z
     .object({
       session_id: uuidSchema,
-      before_seq: z.number().int().nonnegative().nullable().optional(),
+      before_seq: safeU64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
     })
     .strict(),
@@ -367,7 +368,7 @@ const requestParamSchemas = {
       run_invocation_options: z
         .object({
           max_turns: z.number().int().positive().optional(),
-          timeout_ms: z.number().int().positive().optional(),
+          timeout_ms: positiveSafeU64NumberSchema.optional(),
           approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
         })
         .strict()
@@ -588,14 +589,14 @@ export const runInvocationStatusV1Schema = z
     schema_version: z.literal(1),
     client_submission_id: uuidSchema,
     state: runInvocationLifecycleStateSchema,
-    state_version: z.number().int().nonnegative(),
-    created_at_wall_ms: z.number().int(),
-    updated_at_wall_ms: z.number().int(),
+    state_version: safeU64NumberSchema,
+    created_at_wall_ms: safeI64NumberSchema,
+    updated_at_wall_ms: safeI64NumberSchema,
     max_turns: z.number().int().positive().nullable().optional(),
-    timeout_ms: z.number().int().positive().nullable().optional(),
-    remaining_ms: z.number().int().nonnegative().nullable().optional(),
+    timeout_ms: positiveSafeU64NumberSchema.nullable().optional(),
+    remaining_ms: safeU64NumberSchema.nullable().optional(),
     reserved_turns: z.number().int().nonnegative(),
-    terminal_at_wall_ms: z.number().int().nullable().optional(),
+    terminal_at_wall_ms: safeI64NumberSchema.nullable().optional(),
     terminal_reason: runInvocationTerminalReasonSchema.nullable().optional(),
   })
   .strict();
@@ -606,7 +607,7 @@ export const runInvocationCancelResultV1Schema = z
     client_submission_id: uuidSchema,
     outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal"]),
     state: runInvocationLifecycleStateSchema,
-    state_version: z.number().int().nonnegative(),
+    state_version: safeU64NumberSchema,
   })
   .strict();
 export type RunInvocationCancelResultV1 = z.infer<typeof runInvocationCancelResultV1Schema>;
@@ -652,8 +653,8 @@ const responseBaseSchema = {
 } as const;
 export const sessionMessageSchema = z
   .object({
-    seq: z.number().int(),
-    ts_ms: z.number().int(),
+    seq: safeI64NumberSchema,
+    ts_ms: safeI64NumberSchema,
     role: z.enum(["user", "agent"]),
     text: z.string(),
   })
@@ -673,7 +674,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
     .object({
       role: z.literal("interrupt_decision"),
       decision: interruptDecisionSchema,
-      seq: z.number().int().optional(),
+      seq: safeI64NumberSchema.optional(),
     })
     .passthrough(),
   z
@@ -683,8 +684,8 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       display_text: z.string().optional(),
       tag_expansions: z.array(passthroughObjectSchema).optional(),
       client_submission_ids: z.array(uuidSchema).optional(),
-      ts_ms: z.number().int().optional(),
-      seq: z.number().int().optional(),
+      ts_ms: safeI64NumberSchema.optional(),
+      seq: safeI64NumberSchema.optional(),
       origin_principal: z.string().optional(),
     })
     .passthrough(),
@@ -692,8 +693,8 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
     .object({
       role: z.literal("user_note"),
       text: z.string(),
-      ts_ms: z.number().int().optional(),
-      seq: z.number().int().optional(),
+      ts_ms: safeI64NumberSchema.optional(),
+      seq: safeI64NumberSchema.optional(),
     })
     .passthrough(),
   z
@@ -702,14 +703,14 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       agent: z.string(),
       text: z.string(),
       reasoning: z.string().optional(),
-      ts_ms: z.number().int().optional(),
-      seq: z.number().int().optional(),
+      ts_ms: safeI64NumberSchema.optional(),
+      seq: safeI64NumberSchema.optional(),
     })
     .passthrough(),
   z
     .object({
       role: z.literal("tool_call"),
-      seq: z.number().int().optional(),
+      seq: safeI64NumberSchema.optional(),
       agent: z.string(),
       call_id: z.string(),
       parent_call_id: z.string().nullable().optional(),
@@ -731,7 +732,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
   z
     .object({
       role: z.literal("inference_error"),
-      seq: z.number().int().optional(),
+      seq: safeI64NumberSchema.optional(),
       summary: z.string(),
       detail: z.string().optional(),
     })
@@ -739,7 +740,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
   z
     .object({
       role: z.literal("compact_boundary"),
-      seq: z.number().int().optional(),
+      seq: safeI64NumberSchema.optional(),
       predecessor_short_id: z.string(),
       seed_tool_count: z.number().int().nonnegative(),
       seed_tool_tokens: z.number().int().nonnegative(),
@@ -757,7 +758,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
   z
     .object({
       role: z.literal("subagent"),
-      seq: z.number().int().optional(),
+      seq: safeI64NumberSchema.optional(),
       parent: z.string(),
       child: z.string(),
       task_call_id: z.string(),
@@ -770,9 +771,9 @@ const sessionSummaryWireSchema = z
     session_id: uuidSchema,
     project_root: projectRootSchema,
     project_id: z.string(),
-    started_at: z.number().int(),
-    last_active_at: z.number().int(),
-    turns: z.number().int().nonnegative(),
+    started_at: safeI64NumberSchema,
+    last_active_at: safeI64NumberSchema,
+    turns: safeU64NumberSchema,
     active_agent: z.string(),
   })
   .passthrough();
@@ -781,7 +782,7 @@ const fsEntryWireSchema = z
     name: z.string(),
     path: z.string(),
     kind: z.enum(["file", "directory", "symlink", "other"]),
-    size: z.number().int().nonnegative(),
+    size: safeU64NumberSchema,
     gitignored: z.boolean(),
     blocked: z.boolean(),
   })
@@ -829,7 +830,7 @@ export const resumeRepairStateSchema = z
     wire_api: z.string(),
     failure_kind: z.string().min(1),
     failing_tool_call_ids: z.array(z.string()),
-    safe_last_turn_seq: z.number().int().optional(),
+    safe_last_turn_seq: safeI64NumberSchema.optional(),
     suggested_actions: z.array(resumeRepairActionSchema),
     detail: z.string(),
   })
@@ -844,7 +845,7 @@ export const pausedWorkSummarySchema = z
     pending_tool_count: z.number().int(),
     daemon_version: z.string(),
     client_version: z.string().optional(),
-    updated_at: z.number().int(),
+    updated_at: safeI64NumberSchema,
   })
   .passthrough();
 export type PausedWorkSummary = z.infer<typeof pausedWorkSummarySchema>;
@@ -885,7 +886,7 @@ export const btwForkInfoSchema = z
     parent_session_id: uuidSchema,
     short_id: z.string().optional(),
     tangent: z.boolean(),
-    created_at: z.number().int(),
+    created_at: safeI64NumberSchema,
     message_count: z.number().int().nonnegative(),
   })
   .passthrough();
@@ -1038,7 +1039,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         session_id: uuidSchema,
         entries: z.array(historyEntryWireSchema),
         has_more: z.boolean(),
-        oldest_seq: z.number().int().nullable().optional(),
+        oldest_seq: safeI64NumberSchema.nullable().optional(),
       })
       .passthrough(),
   ),
@@ -1051,7 +1052,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         label: z.string(),
         entries: z.array(historyEntryWireSchema),
         has_more: z.boolean(),
-        oldest_seq: z.number().int().nullable().optional(),
+        oldest_seq: safeI64NumberSchema.nullable().optional(),
       })
       .passthrough(),
   ),
@@ -1128,9 +1129,9 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
           )
           .min(0),
         selected_agent: z.string().min(1),
-        config_generation: z.number().int().nonnegative(),
-        inventory_generation: z.number().int().nonnegative(),
-        session_generation: z.number().int().nonnegative(),
+        config_generation: safeU64NumberSchema,
+        inventory_generation: safeU64NumberSchema,
+        session_generation: safeU64NumberSchema,
       })
       .passthrough(),
   ),
@@ -1296,7 +1297,7 @@ const historyReplayDataSchema = z
   .object({
     session_id: uuidSchema,
     entries: z.array(historyEntryWireSchema),
-    max_seq: z.number().int(),
+    max_seq: safeI64NumberSchema,
   })
   .passthrough();
 const interruptResolvedDataSchema = z
@@ -1304,19 +1305,19 @@ const interruptResolvedDataSchema = z
     session_id: uuidSchema,
     interrupt_id: uuidSchema,
     decision: interruptDecisionSchema.optional(),
-    seq: z.number().int().optional(),
+    seq: safeI64NumberSchema.optional(),
   })
   .passthrough();
 const eventStreamLaggedDataSchema = z
   .object({
     session_id: uuidSchema.optional(),
-    dropped: z.number().int().nonnegative(),
+    dropped: safeU64NumberSchema,
   })
   .passthrough();
 const userMessageRecordedDataSchema = z
   .object({
     session_id: uuidSchema,
-    seq: z.number().int(),
+    seq: safeI64NumberSchema,
     client_submission_ids: z.array(uuidSchema),
     preflight_cleaned: z.string().nullable().optional(),
   })
@@ -1348,7 +1349,7 @@ export const queuedUserMessagesFoldedDataSchema = z
     tag_expansions: z.array(passthroughObjectSchema).optional(),
     queue_item_ids: z.array(uuidSchema),
     target: queueTargetSchema,
-    seq: z.number().int().optional(),
+    seq: safeI64NumberSchema.optional(),
     preflight_cleaned: z.string().optional(),
   })
   .passthrough();
@@ -1371,7 +1372,7 @@ export const defaultModelUpdateOutcomeSchema = z.discriminatedUnion("status", [
     .object({
       status: z.literal("verified"),
       selection: activeModelRefSchema,
-      generation: z.number().int().nonnegative(),
+      generation: safeU64NumberSchema,
       scope_label: z.string(),
       // Absent means false: the effective default already matched and no
       // bytes were written.
@@ -1388,7 +1389,7 @@ export const defaultModelStandaloneOutcomeSchema = z.discriminatedUnion("status"
       status: z.literal("applied"),
       // Null when the default was cleared and nothing is inherited.
       selection: activeModelRefSchema.nullable().optional(),
-      generation: z.number().int().nonnegative(),
+      generation: safeU64NumberSchema,
       scope_label: z.string(),
       unchanged: z.boolean().optional(),
     })
@@ -1520,9 +1521,9 @@ export const sessionSummarySchema = z
     short_id: z.string().optional(),
     project_root: projectRootSchema,
     project_id: z.string(),
-    started_at: z.number().int(),
-    last_active_at: z.number().int(),
-    turns: z.number().int().nonnegative(),
+    started_at: safeI64NumberSchema,
+    last_active_at: safeI64NumberSchema,
+    turns: safeU64NumberSchema,
     active_agent: z.string(),
     title: z.string().nullable().optional(),
     parent_session_id: uuidSchema.nullable().optional(),
@@ -1539,8 +1540,8 @@ export const fsEntrySchema = z
     name: z.string(),
     path: z.string(),
     kind: fsEntryKindSchema,
-    size: z.number().int().nonnegative(),
-    mtime_ms: z.number().int().nullable().optional(),
+    size: safeU64NumberSchema,
+    mtime_ms: safeI64NumberSchema.nullable().optional(),
     gitignored: z.boolean().optional(),
     blocked: z.boolean().optional(),
     symlink_target: z.string().nullable().optional(),
@@ -1565,7 +1566,7 @@ export const historyPageResultSchema = z
     session_id: uuidSchema,
     entries: z.array(historyEntrySchema),
     has_more: z.boolean(),
-    oldest_seq: z.number().int().nullable().optional(),
+    oldest_seq: safeI64NumberSchema.nullable().optional(),
   })
   .passthrough();
 export const subagentHistoryPageResultSchema = z
@@ -1575,7 +1576,7 @@ export const subagentHistoryPageResultSchema = z
     label: z.string(),
     entries: z.array(historyEntrySchema),
     has_more: z.boolean(),
-    oldest_seq: z.number().int().nullable().optional(),
+    oldest_seq: safeI64NumberSchema.nullable().optional(),
   })
   .passthrough();
 export const fsListResultSchema = z

@@ -483,5 +483,30 @@ describe("cockpit-proto daemon wire schemas", () => {
         data: { ...responsesFixture.config_refreshed.data, applied_generation: 1e100 },
       }).success,
     ).toBe(false);
+
+    for (const field of [
+      "config_generation",
+      "inventory_generation",
+      "session_generation",
+    ] as const) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...responsesFixture.inventory_bundle,
+          data: {
+            ...responsesFixture.inventory_bundle.data,
+            [field]: Number.MAX_SAFE_INTEGER,
+          },
+        }).success,
+      ).toBe(true);
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...responsesFixture.inventory_bundle,
+          data: {
+            ...responsesFixture.inventory_bundle.data,
+            [field]: Number.MAX_SAFE_INTEGER + 1,
+          },
+        }).success,
+      ).toBe(false);
+    }
   });
 });

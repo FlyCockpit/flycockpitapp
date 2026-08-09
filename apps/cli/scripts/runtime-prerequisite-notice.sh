@@ -1,6 +1,7 @@
 #!/bin/sh
 # Read-only, best-effort post-install guidance. Never install or invoke remedies.
-if [ "$(uname -s 2>/dev/null)" != Linux ]; then
+uname_s=${COCKPIT_INSTALLER_TEST_UNAME:-$(uname -s 2>/dev/null)}
+if [ "$uname_s" != Linux ]; then
     exit 0
 fi
 if command -v bwrap >/dev/null 2>&1; then
@@ -8,9 +9,10 @@ if command -v bwrap >/dev/null 2>&1; then
 fi
 
 family=unknown
-if [ -r /etc/os-release ]; then
+os_release=${COCKPIT_INSTALLER_TEST_OS_RELEASE:-/etc/os-release}
+if [ -r "$os_release" ]; then
     # Values are data only; do not source the host-controlled file.
-    os_like=$(sed -n 's/^ID_LIKE="\{0,1\}\([^"]*\).*/\1/p; s/^ID="\{0,1\}\([^"]*\).*/\1/p' /etc/os-release 2>/dev/null | tr '\n' ' ')
+    os_like=$(sed -n 's/^ID_LIKE="\{0,1\}\([^"]*\).*/\1/p; s/^ID="\{0,1\}\([^"]*\).*/\1/p' "$os_release" 2>/dev/null | tr '\n' ' ')
     case " $os_like " in
         *" debian "*|*" ubuntu "*) family=debian ;;
         *" fedora "*|*" rhel "*|*" centos "*) family=fedora ;;

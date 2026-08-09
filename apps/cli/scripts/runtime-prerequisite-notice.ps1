@@ -1,10 +1,12 @@
 # Read-only, best-effort post-install guidance. Never install or invoke remedies.
-if (-not $IsLinux) { exit 0 }
+$isLinuxHost = if ($env:COCKPIT_INSTALLER_TEST_UNAME) { $env:COCKPIT_INSTALLER_TEST_UNAME -eq "Linux" } else { $IsLinux }
+if (-not $isLinuxHost) { exit 0 }
 if (Get-Command bwrap -ErrorAction SilentlyContinue) { exit 0 }
 
 $family = "unknown"
-if (Test-Path -LiteralPath "/etc/os-release" -PathType Leaf) {
-    $osRelease = Get-Content -LiteralPath "/etc/os-release" -ErrorAction SilentlyContinue
+$osReleasePath = if ($env:COCKPIT_INSTALLER_TEST_OS_RELEASE) { $env:COCKPIT_INSTALLER_TEST_OS_RELEASE } else { "/etc/os-release" }
+if (Test-Path -LiteralPath $osReleasePath -PathType Leaf) {
+    $osRelease = Get-Content -LiteralPath $osReleasePath -ErrorAction SilentlyContinue
     $identity = ($osRelease | Where-Object { $_ -match '^(ID|ID_LIKE)=' }) -join ' '
     if ($identity -match '(debian|ubuntu)') { $family = "debian" }
     elseif ($identity -match '(fedora|rhel|centos)') { $family = "fedora" }

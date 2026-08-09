@@ -1132,6 +1132,7 @@ fn failed_cleanup_does_not_overwrite_an_already_preserved_payload() {
     let mut later = exact_queued_submission();
     later.submission.text = "later payload".to_string();
     let pending = super::PendingModelSelection {
+        order_sequence: 0,
         session_id: app.launch.session_id,
         selection_id: uuid::Uuid::new_v4(),
         requested: selection("p", "a"),
@@ -1257,6 +1258,7 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     let requested = preference_bearing_selection("p", "a");
     let selection_id = uuid::Uuid::new_v4();
     app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence: 0,
         session_id: Some(session_id),
         selection_id,
         requested: requested.clone(),
@@ -1320,6 +1322,7 @@ fn second_submit_waiting_on_model_preserves_all_unconsumed_metadata() {
     let held = exact_queued_submission();
     let expected_held = queued_submission_value(&held);
     app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence: 0,
         session_id: Some(uuid::Uuid::new_v4()),
         selection_id: uuid::Uuid::new_v4(),
         requested: preference_bearing_selection("p", "a"),
@@ -1602,6 +1605,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     app.composer.set(queued.composer_text.clone());
     let old_selection_id = uuid::Uuid::new_v4();
     app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence: 0,
         session_id: Some(old_session_id),
         selection_id: old_selection_id,
         requested: pending_requested.clone(),
@@ -1824,6 +1828,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
     let expected_submission = serde_json::to_value(&queued.submission).unwrap();
     let old_selection_id = uuid::Uuid::new_v4();
     app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence: 0,
         session_id: Some(old_session_id),
         selection_id: old_selection_id,
         requested: requested.clone(),

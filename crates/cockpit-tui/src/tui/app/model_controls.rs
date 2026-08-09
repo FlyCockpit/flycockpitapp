@@ -490,7 +490,10 @@ impl App {
                 }
             }
         }
-        let Some(sequence) = self.next_submission_fence_sequence.checked_add(1) else {
+        let selection_id = uuid::Uuid::new_v4();
+        let Ok(sequence) = self.submission_order.enqueue(
+            crate::tui::structured_paste::OrderedIntent::ModelSwitch(selection_id),
+        ) else {
             self.show_model_selection_error(
                 &active,
                 trigger,
@@ -498,12 +501,11 @@ impl App {
             );
             return false;
         };
-        self.next_submission_fence_sequence = sequence;
-        let selection_id = uuid::Uuid::new_v4();
         let queued_submission = self
             .take_current_model_selection_retry()
             .and_then(|retry| retry.queued_submission);
         self.pending_model_selection = Some(super::PendingModelSelection {
+            order_sequence: sequence,
             session_id: self.launch.session_id,
             selection_id,
             requested: active.clone(),
@@ -834,7 +836,11 @@ impl App {
                 } if pending_id == selection_id
             )
         });
-        self.pending_model_selection.take()
+        let pending = self.pending_model_selection.take();
+        if let Some(pending) = pending.as_ref() {
+            let _ = self.submission_order.complete(pending.order_sequence);
+        }
+        pending
     }
 
     pub(super) fn preserve_failed_model_selection(

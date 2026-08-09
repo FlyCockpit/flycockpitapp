@@ -299,6 +299,7 @@ pub(crate) struct PendingControlRequest {
 }
 
 pub(crate) struct PendingModelSelection {
+    pub order_sequence: u64,
     /// The session this request was issued for. A reattach/session replacement
     /// invalidates this local intent rather than letting a late result release
     /// input into a different conversation.
@@ -1636,6 +1637,7 @@ fn providers_from_view(
 
 #[allow(private_interfaces)]
 pub struct App {
+    pub(super) monotonic_origin: Instant,
     pub(super) launch: LaunchInfo,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
@@ -1975,7 +1977,11 @@ pub struct App {
     pub(super) paste_registry: crate::tui::paste::PasteRegistry,
     pub(super) terminal_paste_classifier: crate::tui::structured_paste::TerminalPasteClassifier,
     pub(super) terminal_input_generation: Option<u64>,
-    pub(super) next_submission_fence_sequence: u64,
+    pub(super) submission_order: crate::tui::structured_paste::SubmissionOrderCoordinator,
+    /// Immutable snapshots retained through dispatch/reconciliation. Entries
+    /// are keyed by the durable wire identity, never by mutable draft text.
+    pub(super) submission_fences:
+        std::collections::HashMap<uuid::Uuid, crate::tui::structured_paste::SubmissionFenceV1>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
     /// `Some(false)` after `i` (inner), in operator-pending / visual
     /// contexts; the next char picks the object (`w`, `"`, `(`, …). `None`
@@ -2927,6 +2933,7 @@ struct StartupFirstPaintTiming {
 impl StartupFirstPaintTiming {
     fn new(launch_start: Option<Instant>) -> Self {
         Self {
+            monotonic_origin: Instant::now(),
             launch_start,
             logged: false,
         }
@@ -3248,7 +3255,8 @@ impl App {
             terminal_paste_classifier:
                 crate::tui::structured_paste::TerminalPasteClassifier::default(),
             terminal_input_generation: None,
-            next_submission_fence_sequence: 0,
+            submission_order: Default::default(),
+            submission_fences: Default::default(),
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,

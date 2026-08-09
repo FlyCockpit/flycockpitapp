@@ -2137,15 +2137,19 @@ impl App {
 
         // The Enter fence owns the durable identity before any submit
         // sidecar is detached. Retry and reconciliation keep this exact ID.
-        let Some(fence_sequence) = self.next_submission_fence_sequence.checked_add(1) else {
+        let client_submission_id = uuid::Uuid::new_v4();
+        let Ok(fence_sequence) =
+            self.submission_order
+                .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(
+                    client_submission_id,
+                ))
+        else {
             self.show_toast(
                 "Submission ordering is unavailable",
                 super::ToastKind::Error,
             );
             return false;
         };
-        self.next_submission_fence_sequence = fence_sequence;
-        let client_submission_id = uuid::Uuid::new_v4();
 
         // Build the paste-side wire from the live (untrimmed) buffer +
         // registry: text blocks inline their full content; image blocks
@@ -2163,9 +2167,64 @@ impl App {
             return false;
         }
         if let Err(message) = validate_pasted_images_for_submit(&paste_images) {
+            let _ = self.submission_order.complete(fence_sequence);
             self.show_toast(message, super::ToastKind::Error);
             return false;
         }
+
+        let captured_model = self.active_model_selection.clone().unwrap_or_else(|| {
+            cockpit_config::providers::ActiveModelRef {
+                provider: self
+                    .launch
+                    .active_model
+                    .as_ref()
+                    .map(|value| value.0.clone())
+                    .unwrap_or_default(),
+                model: self
+                    .launch
+                    .active_model
+                    .as_ref()
+                    .map(|value| value.1.clone())
+                    .unwrap_or_default(),
+            }
+        });
+        let host = crate::tui::structured_paste::HostIdentity {
+            client_instance_id: uuid::Uuid::nil(),
+            connection_epoch: self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| {
+                    runner
+                        .attachment_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or_default(),
+            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
+            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
+        };
+        self.submission_fences.insert(
+            client_submission_id,
+            crate::tui::structured_paste::SubmissionFenceV1 {
+                client_submission_id,
+                fence_sequence,
+                host,
+                view_generation: self.config_snapshot.generation,
+                source_draft_generation: self.draft_generation,
+                created_at: self.monotonic_origin.elapsed(),
+                captured_composer: self.composer.text().to_string(),
+                accepted_tags: self.accepted_tags.clone(),
+                pending_git_blocks: self.pending_git_blocks.clone(),
+                model: crate::tui::structured_paste::CapturedModel {
+                    provider_id: captured_model.provider,
+                    model_id: captured_model.model,
+                    active_model_state_generation: self.active_model_state_generation,
+                    image_capability_generation: self.config_snapshot.generation,
+                },
+                slots: Vec::new(),
+                lifecycle: crate::tui::structured_paste::FenceLifecycle::Ready,
+            },
+        );
         self.lock_pending_agent_switch_log();
 
         // `/compact` review-then-commit (T6.e): the composer holds the
@@ -2380,6 +2439,12 @@ impl App {
         if self.composer.vim_enabled() {
             self.composer.set_vim_mode(VimMode::Insert);
         }
+        if let Some(fence) = self.submission_fences.get_mut(&client_submission_id)
+            && fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::Ready
+        {
+            fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+        }
+        let _ = self.submission_order.complete(fence_sequence);
         false
     }
 
@@ -4488,6 +4553,7 @@ mod paste_routing_tests {
             .insert("p".to_string(), provider);
         app.launch.active_model = Some(("p".to_string(), "old-model".to_string()));
         app.pending_model_selection = Some(PendingModelSelection {
+            order_sequence: 0,
             session_id: app.launch.session_id,
             selection_id: uuid::Uuid::new_v4(),
             requested: cockpit_config::providers::ActiveModelRef {

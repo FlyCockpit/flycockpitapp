@@ -523,7 +523,16 @@ pub fn compose_settings_doctor_health_with_executor(
     executor: &dyn super::probe::ProbeExecutor,
     path_env: Option<&str>,
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
-    compose_settings_doctor_health_internal(cwd, input, executor, path_env, None, true, |_| {})
+    compose_settings_doctor_health_internal(
+        cwd,
+        input,
+        executor,
+        path_env,
+        None,
+        true,
+        None,
+        |_| {},
+    )
 }
 
 /// Invocation-owned composition used by bounded diagnostics. It reports
@@ -532,6 +541,7 @@ pub(crate) fn compose_settings_doctor_health_for_invocation(
     cwd: &Path,
     input: &IntegrationHealthComposeInput,
     cancel: &super::probe::CancelToken,
+    generation: u64,
     observer: impl FnMut(&ExternalRuntimeSnapshot),
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
     compose_settings_doctor_health_internal(
@@ -541,8 +551,53 @@ pub(crate) fn compose_settings_doctor_health_for_invocation(
         None,
         Some(cancel),
         false,
+        Some(generation),
         observer,
     )
+}
+
+/// Build the exact descriptor roster used by one private diagnostics
+/// invocation.  Deadline projection must retain this roster rather than
+/// consulting the process-global registry, whose configured rows may differ.
+pub(crate) fn invocation_descriptor_roster(
+    input: &IntegrationHealthComposeInput,
+) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
+    let registry = ExternalRuntimeRegistry::new();
+    ensure_integration_adapters_registered(&registry)?;
+    let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
+    let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
+    let lsp_ids = upsert_lsp_servers(&registry, input.lsp_servers.clone())?;
+    let mcp_ids = upsert_stdio_mcp_servers(&registry, input.stdio_mcp.clone())?;
+    let keep = harness_ids
+        .iter()
+        .chain(lsp_ids.iter())
+        .chain(mcp_ids.iter())
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    registry.retain_configured_ids(&keep);
+    Ok(registry.descriptors())
+}
+
+/// Make a Settings invocation's configured roster authoritative for the
+/// process before its completed snapshot is published. Contextual projections
+/// therefore use the same descriptors (including version requirements).
+pub(crate) fn publish_invocation_descriptor_roster(
+    input: &IntegrationHealthComposeInput,
+) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
+    let registry = super::registry::global_registry();
+    ensure_integration_adapters_registered(&registry)?;
+    let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
+    let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
+    let lsp_ids = upsert_lsp_servers(&registry, input.lsp_servers.clone())?;
+    let mcp_ids = upsert_stdio_mcp_servers(&registry, input.stdio_mcp.clone())?;
+    let keep = harness_ids
+        .iter()
+        .chain(lsp_ids.iter())
+        .chain(mcp_ids.iter())
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    registry.retain_configured_ids(&keep);
+    Ok(registry.descriptors())
 }
 
 fn compose_settings_doctor_health_internal(
@@ -552,6 +607,7 @@ fn compose_settings_doctor_health_internal(
     path_env: Option<&str>,
     invocation_cancel: Option<&super::probe::CancelToken>,
     publish_global: bool,
+    generation_override: Option<u64>,
     mut observer: impl FnMut(&ExternalRuntimeSnapshot),
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
     let registry = if publish_global {
@@ -610,7 +666,9 @@ fn compose_settings_doctor_health_internal(
     }
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
-    let generation = if publish_global {
+    let generation = if let Some(generation) = generation_override {
+        generation
+    } else if publish_global {
         store.begin_refresh()
     } else {
         store
@@ -1728,5 +1786,54 @@ mod tests {
         // Forbidden argv detection works.
         assert!(discovery_probe_argv_is_safe(&["auth".into(), "login".into()]).is_err());
         assert!(discovery_probe_argv_is_safe(&["--version".into()]).is_ok());
+    }
+
+    #[test]
+    fn invocation_roster_retains_configured_rows_for_deadline_projection() {
+        let input = IntegrationHealthComposeInput {
+            harnesses: vec![ConfiguredCommandInput::new("private", "private-harness")],
+            lsp_servers: vec![ConfiguredCommandInput::new(
+                "private-lsp",
+                "language-server",
+            )],
+            stdio_mcp: vec![ConfiguredCommandInput::new("private-mcp", "mcp-server")],
+            sandbox_enabled: Some(false),
+            selected_features: BTreeSet::new(),
+        };
+        let descriptors = invocation_descriptor_roster(&input).unwrap();
+        for id in [
+            "harness.custom.private",
+            "lsp.private-lsp",
+            "mcp.stdio.private-mcp",
+        ] {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing invocation-private descriptor {id}"));
+            let mut snapshot = ExternalRuntimeSnapshot::empty(7, HostPlatform::GenericLinux);
+            snapshot.entries.insert(
+                id.to_owned(),
+                HealthEntry {
+                    id: descriptor.id.clone(),
+                    state: HealthState::Pending,
+                    importance: descriptor.importance,
+                    target: descriptor.target,
+                    remedy: Some(descriptor.remedy.clone()),
+                    platform: HostPlatform::GenericLinux,
+                },
+            );
+            let frozen = super::super::projection::freeze_pending_as_timed_out(&snapshot);
+            let projection = super::super::projection::project_dependencies(
+                Some(&frozen),
+                std::slice::from_ref(descriptor),
+            );
+            assert_eq!(projection.rows[0].id, id);
+            assert_eq!(
+                projection.rows[0].state,
+                super::super::projection::DependencyViewState::TimedOut
+            );
+            assert_eq!(projection.rows[0].target, descriptor.target);
+            assert!(projection.rows[0].remedy.is_some());
+        }
     }
 }

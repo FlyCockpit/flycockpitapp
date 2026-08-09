@@ -20,7 +20,6 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use adapters::compose_settings_doctor_health_for_invocation;
 pub use adapters::{
     ConfiguredCommandInput, GhAuthState, ID_ACCEL_FD, ID_ACCEL_GSED, ID_ACCEL_RG, ID_GH, ID_GIT,
     ID_HARNESS_CLAUDE, ID_HARNESS_CODEX, ID_HARNESS_GEMINI, ID_HARNESS_OPENCODE, ID_JQ_EXTERNAL,
@@ -38,6 +37,10 @@ pub use adapters::{
     require_live_available_for_launch_with_cancel, stdio_mcp_id, upsert_custom_harness,
     upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers, upsert_stdio_mcp,
     upsert_stdio_mcp_servers,
+};
+pub(crate) use adapters::{
+    compose_settings_doctor_health_for_invocation, invocation_descriptor_roster,
+    publish_invocation_descriptor_roster,
 };
 pub use health::{
     ExternalRuntimeSnapshot, GroupHealth, HealthCause, HealthEntry, HealthSnapshotStore,

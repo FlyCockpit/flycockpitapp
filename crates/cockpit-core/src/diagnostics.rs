@@ -989,11 +989,22 @@ fn one_line(value: &str) -> String {
 /// the shared health store and refreshes a generation-tagged snapshot.
 fn compose_doctor_integration_health(
     cwd: &Path,
-    harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
-    sandbox_enabled: bool,
+    compose: &crate::external_runtime::IntegrationHealthComposeInput,
     cancel: &crate::external_runtime::CancelToken,
+    generation: u64,
     observer: impl FnMut(&crate::external_runtime::ExternalRuntimeSnapshot),
 ) -> Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>> {
+    crate::external_runtime::compose_settings_doctor_health_for_invocation(
+        cwd, compose, cancel, generation, observer,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+fn doctor_integration_input(
+    cwd: &Path,
+    harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
+    sandbox_enabled: bool,
+) -> crate::external_runtime::IntegrationHealthComposeInput {
     let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
         harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
         lsp_servers: Vec::new(),
@@ -1040,10 +1051,7 @@ fn compose_doctor_integration_health(
                 &server.args,
             ));
     }
-    crate::external_runtime::compose_settings_doctor_health_for_invocation(
-        cwd, &compose, cancel, observer,
-    )
-    .map_err(anyhow::Error::new)
+    compose
 }
 
 /// Bounded, daemon-independent dependency snapshot used by CLI doctor and the
@@ -1053,13 +1061,31 @@ pub fn dependency_projection_with_deadline(
     cwd: PathBuf,
     deadline: Duration,
 ) -> Result<crate::external_runtime::DependencyProjection> {
-    dependency_projection_with_deadline_for_run(cwd, deadline, true)
+    dependency_projection_with_deadline_internal(cwd, deadline, true, false)
+}
+
+/// Settings refresh variant: the bounded, frozen result becomes the shared
+/// latest complete in-memory snapshot used by contextual projections.
+pub fn dependency_projection_with_deadline_and_publish(
+    cwd: PathBuf,
+    deadline: Duration,
+) -> Result<crate::external_runtime::DependencyProjection> {
+    dependency_projection_with_deadline_internal(cwd, deadline, true, true)
 }
 
 pub fn dependency_projection_with_deadline_for_run(
     cwd: PathBuf,
     deadline: Duration,
     sandbox_enabled: bool,
+) -> Result<crate::external_runtime::DependencyProjection> {
+    dependency_projection_with_deadline_internal(cwd, deadline, sandbox_enabled, false)
+}
+
+fn dependency_projection_with_deadline_internal(
+    cwd: PathBuf,
+    deadline: Duration,
+    sandbox_enabled: bool,
+    publish_complete: bool,
 ) -> Result<crate::external_runtime::DependencyProjection> {
     let expires = std::time::Instant::now() + deadline;
     enum WorkerUpdate {
@@ -1077,6 +1103,20 @@ pub fn dependency_projection_with_deadline_for_run(
     let worker_cancel = cancel.clone();
     let worker_cwd = cwd.clone();
     let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
+    let compose = doctor_integration_input(&worker_cwd, &harnesses, sandbox_enabled);
+    let descriptors = if publish_complete {
+        crate::external_runtime::publish_invocation_descriptor_roster(&compose)
+    } else {
+        crate::external_runtime::invocation_descriptor_roster(&compose)
+    }
+    .map_err(anyhow::Error::new)?;
+    let generation = if publish_complete {
+        crate::external_runtime::global_health_store().begin_refresh()
+    } else {
+        crate::external_runtime::global_health_store()
+            .current()
+            .map_or(1, |value| value.generation.saturating_add(1))
+    };
     let selected_harnesses: std::collections::BTreeSet<String> = harnesses
         .iter()
         .filter(|(name, config)| {
@@ -1091,9 +1131,9 @@ pub fn dependency_projection_with_deadline_for_run(
             let progress_tx = tx.clone();
             let result = compose_doctor_integration_health(
                 &worker_cwd,
-                &harnesses,
-                sandbox_enabled,
+                &compose,
                 &worker_cancel,
+                generation,
                 move |snapshot| {
                     let _ = progress_tx.send(WorkerUpdate::Progress {
                         completed_at: std::time::Instant::now(),
@@ -1123,9 +1163,13 @@ pub fn dependency_projection_with_deadline_for_run(
                 result,
             }) if completed_at <= expires => {
                 let snapshot = result?;
+                if publish_complete {
+                    let _ = crate::external_runtime::global_health_store()
+                        .publish(snapshot.as_ref().clone());
+                }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(snapshot.as_ref()),
-                    &crate::external_runtime::global_registry().descriptors(),
+                    &descriptors,
                 ));
             }
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1143,24 +1187,21 @@ pub fn dependency_projection_with_deadline_for_run(
                             result,
                         } if completed_at <= expires => {
                             let snapshot = result?;
+                            if publish_complete {
+                                let _ = crate::external_runtime::global_health_store()
+                                    .publish(snapshot.as_ref().clone());
+                            }
                             return Ok(crate::external_runtime::project_dependencies(
                                 Some(snapshot.as_ref()),
-                                &crate::external_runtime::global_registry().descriptors(),
+                                &descriptors,
                             ));
                         }
                         _ => {}
                     }
                 }
-                let descriptors = crate::external_runtime::global_registry().descriptors();
                 let platform = crate::external_runtime::detect_host_platform();
-                let next_generation = crate::external_runtime::global_health_store()
-                    .current()
-                    .map_or(1, |value| value.generation.saturating_add(1));
                 let mut snapshot = latest.unwrap_or_else(|| {
-                    crate::external_runtime::ExternalRuntimeSnapshot::empty(
-                        next_generation,
-                        platform,
-                    )
+                    crate::external_runtime::ExternalRuntimeSnapshot::empty(generation, platform)
                 });
                 for descriptor in &descriptors {
                     snapshot
@@ -1186,6 +1227,10 @@ pub fn dependency_projection_with_deadline_for_run(
                         });
                 }
                 let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
+                if publish_complete {
+                    let _ =
+                        crate::external_runtime::global_health_store().publish(snapshot.clone());
+                }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(&snapshot),
                     &descriptors,

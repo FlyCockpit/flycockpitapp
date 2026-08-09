@@ -257,15 +257,9 @@ pub fn print(project: Option<&Path>) {
     // Headless splash: no event loop to fill the branch pill in later, so
     // fetch git status synchronously here.
     let info = load(project, true);
-    // A fresh headless process has no daemon-held snapshot. Construct the
-    // invocation-local projection before applying the welcome policy so
-    // startup behavior does not silently depend on earlier process state.
-    let startup_projection = crate::diagnostics::dependency_projection_with_deadline(
-        info.cwd.clone(),
-        std::time::Duration::from_secs(2),
-    )
-    .ok();
-    print_header_with_projection(&info, startup_projection.as_ref());
+    // Headless output is immediate. It may project an already-complete shared
+    // snapshot, but never waits for dependency probes before its first byte.
+    print_header(&info);
     println!();
     println!("{INPUT_PREFIX}");
     println!("{}", info.agent_name);

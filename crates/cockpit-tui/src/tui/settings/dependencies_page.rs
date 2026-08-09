@@ -27,7 +27,7 @@ pub(super) fn page(cwd: PathBuf) -> PageBox {
     let generation = state.begin_refresh();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = cockpit_core::diagnostics::dependency_projection_with_deadline(
+        let result = cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish(
             cwd,
             std::time::Duration::from_secs(2),
         )

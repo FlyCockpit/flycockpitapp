@@ -1887,6 +1887,9 @@ pub struct App {
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
     startup_daemon_notice: Option<String>,
+    /// Non-blocking projection of the latest complete dependency snapshot.
+    /// Startup never probes here; Settings owns background refreshes.
+    startup_dependency_notice: Option<String>,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
     /// click-to-expand works on thinking blocks.
@@ -3129,6 +3132,10 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
+        let startup_dependency_notice =
+            cockpit_core::external_runtime::current_startup_dependency_policy()
+                .and_then(|policy| policy.summary)
+                .map(|summary| format!("Dependency warning: {summary}"));
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -3260,6 +3267,7 @@ impl App {
                 started: false,
             },
             startup_daemon_notice: daemon_state.notice,
+            startup_dependency_notice,
             chat_area: None,
             input_area: None,
             suggestion_box_area: None,
@@ -3487,6 +3495,11 @@ impl App {
                 }
                 _ => self.show_toast(notice, ToastKind::Info),
             }
+        }
+        // Apply the latest completed dependency policy after any one-shot
+        // daemon notice so the required-dependency warning remains visible.
+        if let Some(notice) = self.startup_dependency_notice.take() {
+            self.show_toast(notice, ToastKind::Warning);
         }
 
         // The launch banner now renders *inside* the alt screen as the

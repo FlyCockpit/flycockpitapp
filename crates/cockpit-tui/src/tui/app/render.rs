@@ -5463,6 +5463,8 @@ mod slash_popup_full_list_tests {
         );
 
         app.composer.set("@alpha".to_string());
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         terminal
             .draw(|frame| {
                 app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));

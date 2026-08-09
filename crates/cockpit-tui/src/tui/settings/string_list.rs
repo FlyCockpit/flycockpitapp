@@ -16,7 +16,7 @@
 //! Esc reverts both text and position; `d` deletes a row in browse mode.
 //! Each commit/delete persists `config.json`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -26,7 +26,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
 use super::secret_display;
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::ui_page::GrabState;
 use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
@@ -451,8 +453,11 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
         push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
         let values = self.string_list_values(p.kind);
         for (i, val) in values.iter().enumerate() {
@@ -464,6 +469,7 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     p.kind.empty_hint(),
                 )));
+                controls.push(Some((SettingsControlId(i as u64), true, None)));
                 continue;
             }
             let marker = if on_cursor {
@@ -480,6 +486,7 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled(string_list_display_value(p.kind, i, val), style),
             ]));
+            controls.push(Some((SettingsControlId(i as u64), true, None)));
         }
 
         if p.grabbed.is_none() {
@@ -499,25 +506,33 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled("[+ add]".to_string(), style),
             ]));
+            controls.push(Some((SettingsControlId(add_idx as u64), true, None)));
         }
 
         if p.grabbed.is_some() {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
+            controls.push(None);
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states.render_lines(
+        self.scroll_states.render_control_lines(
             frame,
             area,
             format!("string-list:{:?}", p.kind),
             lines,
             selected_line,
+            controls,
+            &self.pointer_surface,
+            SettingsScrollRegionId("string-list"),
         );
     }
 }
@@ -529,6 +544,30 @@ impl SettingsPage for StringListPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_string_list_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let values = cx.string_list_values(self.kind);
+        let index = control.0 as usize;
+        if index > values.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_string_list_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("string-list") && self.grabbed.is_none() {
+            let last = cx.string_list_values(self.kind).len();
+            self.delete.disarm();
+            self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

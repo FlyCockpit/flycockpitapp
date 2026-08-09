@@ -2010,7 +2010,7 @@ mod tests {
                 stringify!($pattern),
                 $tag,
                 $fcor_schema,
-                vec![$((stringify!($fcor_field), stringify!($fcor_type))),*],
+                vec![$((stringify!($fcor_field), stringify!($fcor_type), concat!(stringify!($fcor_role), $("(", stringify!($($fcor_role_arg),*), ")")?))),*],
             )),+]
         }};
     }
@@ -2087,12 +2087,46 @@ mod tests {
                 "-".to_owned()
             } else {
                 typed_fields
-                    .into_iter()
-                    .map(|(name, ty)| format!("{name}:{}", ty.replace(' ', "")))
+                    .iter()
+                    .map(|(name, ty, _)| format!("{name}:{}", ty.replace(' ', "")))
                     .collect::<Vec<_>>()
                     .join("|")
             };
             assert_eq!(typed_schema, schema, "typed FCOR token drift for {tag}");
+            let field_names = typed_fields
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect::<std::collections::BTreeSet<_>>();
+            for (name, ty, role) in &typed_fields {
+                let valid = match role.split_once('(').map(|(head, _)| head).unwrap_or(role) {
+                    "param" | "legacy_message" => true,
+                    "session" => matches!(*ty, "Uuid" | "Option<Uuid>"),
+                    "project" => *ty == "Option<String>",
+                    "project_root" => *ty == "String",
+                    "project_root_effective" => *ty == "Option<String>",
+                    "file_existing" | "file_write_target" => *ty == "String",
+                    "terminal" | "upload" | "interrupt" | "queue" => *ty == "Uuid",
+                    "provider_model_left" | "provider_model_right" => {
+                        matches!(*ty, "String" | "Option<String>")
+                    }
+                    "scheduled" => *ty == "ScheduledJobCreate",
+                    _ => false,
+                };
+                assert!(valid, "invalid FCOR role {role} for {tag}.{name}:{ty}");
+                if let Some((_, argument)) = role.split_once('(') {
+                    let counterpart = argument.trim_end_matches(')');
+                    assert!(
+                        field_names.contains(counterpart),
+                        "missing FCOR role counterpart {tag}.{counterpart}"
+                    );
+                    if role.starts_with("provider_model_left") {
+                        let expected = format!("provider_model_right({name})");
+                        assert!(typed_fields.iter().any(|(other, _, other_role)| {
+                            *other == counterpart && *other_role == expected
+                        }));
+                    }
+                }
+            }
             assert!(
                 canonical_remote_operation_fcor_schema_for_tag(tag).is_some(),
                 "unsupported canonical FCOR type in {tag}: {schema}"
@@ -2128,6 +2162,11 @@ mod tests {
                 "fcorSchema": $fcor_schema,
                 "fcorCanonicalSchema": canonical_remote_operation_fcor_schema_for_tag($tag)
                     .expect("registered canonical FCOR schema"),
+                "fcorRoles": [$({
+                    "field": stringify!($fcor_field),
+                    "type": stringify!($fcor_type).replace(' ', ""),
+                    "role": concat!(stringify!($fcor_role), $("(", stringify!($($fcor_role_arg),*), ")")?),
+                }),*],
             })),+]
         }};
     }

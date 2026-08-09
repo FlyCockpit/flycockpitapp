@@ -30,6 +30,7 @@ use crate::config::providers::{
 use crate::envref;
 use crate::providers::registry::{
     OAuthCredential, ProviderCredentialKind, ProviderRegistry, ProviderRequestKind,
+    ResolvedProviderOrigin,
 };
 
 const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
@@ -69,14 +70,19 @@ impl fmt::Debug for ResolvedHeader {
 pub struct ResolvedRequest {
     pub base_url: String,
     pub headers: Vec<ResolvedHeader>,
+    #[cfg(not(test))]
+    pub(crate) origin: ResolvedProviderOrigin,
 }
 
 impl fmt::Debug for ResolvedRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResolvedRequest")
+        let mut debug = f.debug_struct("ResolvedRequest");
+        debug
             .field("base_url", &self.base_url)
-            .field("headers", &self.headers)
-            .finish()
+            .field("headers", &self.headers);
+        #[cfg(not(test))]
+        debug.field("origin", &self.origin);
+        debug.finish()
     }
 }
 
@@ -320,15 +326,7 @@ fn resolve_provider_request_inner_with_sources(
     secret_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
     crate::config::providers::validate_provider_headers(provider_id, &entry.headers)?;
-    let openrouter_origin = match entry.template.as_deref() {
-        Some(template) => {
-            if crate::providers::template_by_id(template).is_none() {
-                anyhow::bail!("provider `{provider_id}` references unknown template `{template}`");
-            }
-            request_kind == ProviderRequestKind::Template && template == "openrouter"
-        }
-        None => false,
-    };
+    let origin = ProviderRegistry::standard().resolve_origin(provider_id, entry)?;
     let is_copilot = request_kind == ProviderRequestKind::Copilot;
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
     let mut missing_other: Vec<String> = Vec::new();
@@ -449,19 +447,23 @@ fn resolve_provider_request_inner_with_sources(
     // 401 from `fetch_models`.
 
     validate_resolved_provider_headers(provider_id, &headers)?;
-    if openrouter_origin {
+    if origin.is_template("openrouter") {
         merge_openrouter_attribution(&mut headers);
     }
 
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, is_copilot, env_lookup)?,
         headers,
+        #[cfg(not(test))]
+        origin,
     })
 }
 
 fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHeader]) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
     for header in headers {
-        if reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+        if !names.insert(header.name.to_ascii_lowercase())
+            || reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
             || reqwest::header::HeaderValue::from_str(&header.value).is_err()
         {
             return Err(
@@ -518,6 +520,8 @@ pub(crate) fn resolve_codex_model_list_request(
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url_with_env(provider_id, entry, false, lookup)?,
         headers,
+        #[cfg(not(test))]
+        origin: ProviderRegistry::standard().resolve_origin(provider_id, entry)?,
     })
 }
 
@@ -2016,6 +2020,21 @@ mod tests {
         assert!(
             resolve_provider_request_with_sources("custom", &unknown, |_| None, |_| None).is_err()
         );
+
+        let conflicting_special = ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://api.githubcopilot.com".into(),
+            credential_ref: Some("copilot".into()),
+            ..ProviderEntry::default()
+        };
+        let error = resolve_provider_request_with_sources(
+            "renamed-openrouter",
+            &conflicting_special,
+            |_| None,
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicting template"));
     }
 
     #[test]
@@ -2058,6 +2077,29 @@ mod tests {
             );
             assert!(!format!("{error:#}").contains("secret-value"));
         }
+
+        let dynamic = ProviderEntry {
+            headers: vec![HeaderSpec {
+                name: "X-Dynamic".into(),
+                value: "$secret:header-value".into(),
+            }],
+            ..ProviderEntry::default()
+        };
+        let error = resolve_provider_request_with_sources(
+            "safe-id",
+            &dynamic,
+            |_| None,
+            |name| (name == "header-value").then(|| "secret\nvalue".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::config::providers::ProviderHeaderConfigError>()
+                .unwrap()
+                .code(),
+            "provider_header_invalid"
+        );
+        assert!(!format!("{error:#}").contains("secret"));
     }
 
     #[test]

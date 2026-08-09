@@ -355,35 +355,59 @@ fn descend_provider(
     }
 }
 
+fn nested_provider_fixture(
+    config: ProvidersConfig,
+    path: usize,
+) -> (tempfile::TempDir, SettingsDialog) {
+    let (tmp, mut dialog) = edit_fixture(config);
+    match path {
+        0 => descend_provider(&mut dialog, "EditAction::Models", |action| {
+            matches!(
+                action,
+                super::super::pointer_actions::ProvidersAction::ManageModels(_)
+            )
+        }),
+        1 => descend_provider(&mut dialog, "EditAction::Settings", |action| {
+            matches!(
+                action,
+                super::super::pointer_actions::ProvidersAction::ProviderSettings(_)
+            )
+        }),
+        2 => {
+            descend_provider(&mut dialog, "EditAction::Models", |action| {
+                matches!(
+                    action,
+                    super::super::pointer_actions::ProvidersAction::ManageModels(_)
+                )
+            });
+            descend_provider(&mut dialog, "ModelEditor::ModelOpen", |action| {
+                matches!(
+                    action,
+                    super::super::pointer_actions::ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::ModelOpen(_)
+                    )
+                )
+            });
+        }
+        _ => unreachable!("nested source path"),
+    }
+    (tmp, dialog)
+}
+
 #[test]
 fn pointer_reachable_nested_surfaces_render_and_dispatch() {
     use super::super::pointer_actions::ProvidersAction;
     let config = one_provider_config(None);
     for path in [0, 1, 2, 3] {
-        let (_tmp, mut dialog) = edit_fixture(config.clone());
-        match path {
-            0 => descend_provider(&mut dialog, "EditAction::Models", |action| {
-                matches!(action, ProvidersAction::ManageModels(_))
-            }),
-            1 => descend_provider(&mut dialog, "EditAction::Settings", |action| {
-                matches!(action, ProvidersAction::ProviderSettings(_))
-            }),
-            2 => {
-                descend_provider(&mut dialog, "EditAction::Models", |action| {
-                    matches!(action, ProvidersAction::ManageModels(_))
-                });
-                descend_provider(&mut dialog, "ModelEditor::ModelOpen", |action| {
-                    matches!(
-                        action,
-                        ProvidersAction::RowEditor(ProviderRowEditorAction::ModelOpen(_))
-                    )
-                });
-            }
-            3 => descend_provider(&mut dialog, "EditAction::DeepFetch", |action| {
+        let (_tmp, mut dialog) = if path == 3 {
+            let (tmp, mut dialog) = edit_fixture(config.clone());
+            descend_provider(&mut dialog, "EditAction::DeepFetch", |action| {
                 matches!(action, ProvidersAction::DeepFetchConfirm(_))
-            }),
-            _ => unreachable!(),
-        }
+            });
+            (tmp, dialog)
+        } else {
+            nested_provider_fixture(config.clone(), path)
+        };
         let _ = render_provider_rows(&dialog, 110, 60);
         let actions = dialog
             .pointer_surface
@@ -407,7 +431,49 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
             !actions.is_empty(),
             "nested provider surface {path} has no enabled controls"
         );
-        if path == 3 {
+        if path < 3 {
+            for action in actions {
+                let (_tmp, mut fresh) = nested_provider_fixture(config.clone(), path);
+                click_rendered_provider_action(&mut fresh, &action);
+                match &action {
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::ModelOpen(id)),
+                    ) => assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::ModelSettings { models, .. })
+                            if models.rows().iter().any(|row| row.id == id.0)
+                    )),
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::ModelAdd),
+                    ) => assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::Models { editor, .. })
+                            if !editor.is_browsing()
+                    )),
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::ModelSave),
+                    ) => assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::Edit(_))
+                    )),
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::SettingSave),
+                    ) => assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::Edit(_))
+                            | TestPageRef::Providers(ProvidersPage::Models { .. })
+                    )),
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::SettingEdit(_)),
+                    ) => assert!(matches!(
+                        fresh.test_page(),
+                        TestPageRef::Providers(ProvidersPage::ProviderSettings { .. })
+                            | TestPageRef::Providers(ProvidersPage::ModelSettings { .. })
+                    )),
+                    _ => {}
+                }
+            }
+        } else {
             for action in actions {
                 let super::super::pointer_actions::SettingsPointerAction::Providers(
                     ProvidersAction::DeepFetchChoice(_, choice),
@@ -642,6 +708,67 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
         ));
         click_rendered_provider_action(&mut dialog, &action);
     }
+
+    // The Codex device-code state publishes Poll rather than Login. Exercise
+    // that independently from the initial OAuth source above.
+    let (_tmp, mut poll_source) = dialog_with_config(oauth.clone());
+    let mut poll_state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    poll_state.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
+        "https://example.test/device",
+        "CODE-123",
+    ));
+    poll_source.page =
+        super::super::providers_page(standalone_oauth_page(OAuthProvider::Codex, poll_state));
+    let poll = super::super::pointer_actions::SettingsPointerAction::Providers(
+        super::super::pointer_actions::ProvidersAction::OAuthOption(
+            super::super::pointer_actions::ProviderId("codex-oauth".into()),
+            OAuthOption::Poll,
+        ),
+    );
+    let _ = render_provider_rows(&poll_source, 110, 60);
+    assert!(
+        poll_source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                target.enabled
+                    && target.action
+                        == super::super::shell::SettingsPointerAction::Page(poll.clone())
+            })
+    );
+    click_rendered_provider_action(&mut poll_source, &poll);
+    assert!(matches!(
+        poll_source.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. }) if state.pending
+    ));
+}
+
+fn pointer_delete_choice_fixture() -> (tempfile::TempDir, SettingsDialog) {
+    let mut cfg = one_provider_config(None);
+    cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
+        name: "Authorization".into(),
+        value: "$secret:p".into(),
+    }];
+    let (tmp, mut dialog) = dialog_with_config(cfg);
+    let store_path = tmp.path().join("credentials.json");
+    dialog.credential_store_path = Some(store_path.clone());
+    let mut store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    store.set_named_secret("p", "sk-provider-secret-value");
+    store.save().unwrap();
+    let entry = dialog.config.providers["p"].clone();
+    dialog.page =
+        super::super::providers_page(ProvidersPage::Edit(EditState::new("p".into(), entry)));
+    click_rendered_provider_action(
+        &mut dialog,
+        &super::super::pointer_actions::SettingsPointerAction::Providers(
+            super::super::pointer_actions::ProvidersAction::BeginDelete(
+                super::super::pointer_actions::ProviderId("p".into()),
+            ),
+        ),
+    );
+    (tmp, dialog)
 }
 
 #[test]
@@ -712,6 +839,51 @@ pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
         dialog.test_page(),
         TestPageRef::Providers(ProvidersPage::Edit(state)) if !state.delete_pending
     ));
+
+    let (_tmp, source) = pointer_delete_choice_fixture();
+    let _ = render_provider_rows(&source, 100, 40);
+    let choices = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::Delete(_, _),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        choices.len(),
+        3,
+        "unshared secret offers all delete choices"
+    );
+    for action in choices {
+        let choice = match &action {
+            super::super::pointer_actions::SettingsPointerAction::Providers(
+                super::super::pointer_actions::ProvidersAction::Delete(_, choice),
+            ) => *choice,
+            _ => unreachable!(),
+        };
+        let (_tmp, mut fresh) = pointer_delete_choice_fixture();
+        click_rendered_provider_action(&mut fresh, &action);
+        match choice {
+            super::super::pointer_actions::ProviderDeleteChoice::Cancel => assert!(
+                fresh.config.providers.contains_key("p")
+                    && matches!(fresh.test_page(), TestPageRef::Providers(ProvidersPage::Edit(state)) if !state.delete_pending)
+            ),
+            super::super::pointer_actions::ProviderDeleteChoice::RemoveSecrets
+            | super::super::pointer_actions::ProviderDeleteChoice::KeepSecrets => {
+                assert!(!fresh.config.providers.contains_key("p"))
+            }
+        }
+    }
 }
 
 #[test]

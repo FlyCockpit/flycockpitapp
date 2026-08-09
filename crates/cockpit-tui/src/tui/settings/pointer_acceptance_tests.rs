@@ -557,15 +557,12 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
 
 fn dispatch_enabled_category_descriptor_actions() {
     use super::category::Category;
+    use super::category::SettingId;
     let tmp = TempDir::new().unwrap();
     let mut source = fresh_dialog(&tmp);
-    super::tests::open_category_on(
-        &mut source,
-        Category::Interface,
-        super::category::SettingId::Mouse,
-    );
+    super::tests::open_category_on(&mut source, Category::Interface, SettingId::Mouse);
     let _ = render_settings_rows(&source, 100, 50);
-    let actions = source
+    let interface_actions = source
         .pointer_surface
         .targets
         .borrow()
@@ -582,15 +579,11 @@ fn dispatch_enabled_category_descriptor_actions() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(!actions.is_empty());
-    for action in actions {
+    assert!(!interface_actions.is_empty());
+    for action in interface_actions {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
-        super::tests::open_category_on(
-            &mut dialog,
-            Category::Interface,
-            super::category::SettingId::Mouse,
-        );
+        super::tests::open_category_on(&mut dialog, Category::Interface, SettingId::Mouse);
         let _ = render_settings_rows(&dialog, 100, 50);
         let target = dialog
             .pointer_surface
@@ -599,8 +592,40 @@ fn dispatch_enabled_category_descriptor_actions() {
             .iter()
             .find(|target| target.enabled && target.action == RenderAction::Page(action.clone()))
             .cloned()
+            .expect("source interface descriptor action is rendered");
+        click_target(&mut dialog, &target);
+    }
+
+    for (category, setting) in [
+        (Category::Behavior, SettingId::Instructions),
+        (Category::Behavior, SettingId::CompactPrompt),
+        (Category::Behavior, SettingId::AgentDirs),
+        (Category::Behavior, SettingId::PackagesDir),
+        (Category::Behavior, SettingId::TimeInjectionInterval),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        super::tests::open_category_on(&mut dialog, category, setting);
+        let _ = render_settings_rows(&dialog, 100, 50);
+        let target = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.enabled
+                    && target.action
+                        == RenderAction::Page(SettingsPointerAction::Category(
+                            CategoryAction::DescriptorActivate(setting),
+                        ))
+            })
+            .cloned()
             .expect("source category descriptor action is rendered");
         click_target(&mut dialog, &target);
+        assert!(
+            !matches!(dialog.test_page(), TestPageRef::Category(page) if !page.is_editing()),
+            "descriptor activation had no observable outcome for {setting:?}"
+        );
     }
 }
 

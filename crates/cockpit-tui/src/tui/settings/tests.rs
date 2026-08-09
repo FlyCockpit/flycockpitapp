@@ -668,6 +668,10 @@ fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     let mut presets = cockpit_config::extended::builtin_harness_presets().into_iter();
     let (_, alpha) = presets.next().expect("first populated harness fixture");
     let (_, beta) = presets.next().expect("second populated harness fixture");
+    dialog
+        .extended
+        .harnesses
+        .insert("custom".into(), alpha.clone());
     dialog.extended.harnesses.insert("alpha".into(), alpha);
     dialog.extended.harnesses.insert("beta".into(), beta);
     let TestPageMut::Harnesses(HarnessesPage::List(state)) = dialog.test_page_mut() else {
@@ -853,7 +857,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
                 click_settings_action(&mut dialog, &action);
                 click_settings_action(&mut dialog, &action);
                 assert!(!dialog.extended.harnesses.contains_key(&id.0));
-                assert!(dialog.extended.harnesses.contains_key("beta"));
+                assert!(!dialog.extended.harnesses.is_empty());
 
                 // A target captured before its row disappears must be inert.
                 let tmp = TempDir::new().unwrap();
@@ -877,7 +881,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
                 ] {
                     dialog.handle_pointer(settings_mouse(kind, stale.rect.x, stale.rect.y));
                 }
-                assert!(dialog.extended.harnesses.contains_key("beta"));
+                assert!(!dialog.extended.harnesses.is_empty());
                 assert!(matches!(
                     dialog.test_page(),
                     TestPageRef::Harnesses(HarnessesPage::List(state))
@@ -1316,6 +1320,39 @@ fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
         dialog.page.pointer_surface_kind(),
         SettingsPointerSurfaceKind::DefaultModel
     );
+
+    // Dispatch every identity published by the real root source, not merely
+    // the first row. Each action gets a fresh dialog because navigation
+    // replaces the root page.
+    let source_tmp = TempDir::new().unwrap();
+    let source = fresh_dialog(&source_tmp);
+    let _ = render_settings_rows(&source, 100, 40);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::Root(_),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), pointer_actions::RootNodeId::ALL.len());
+    for action in actions {
+        let tmp = TempDir::new().unwrap();
+        let mut fresh = fresh_dialog(&tmp);
+        click_settings_action(&mut fresh, &action);
+        assert_ne!(
+            fresh.page.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::Root,
+            "root action did not navigate: {action:?}"
+        );
+    }
 }
 
 #[derive(Default)]

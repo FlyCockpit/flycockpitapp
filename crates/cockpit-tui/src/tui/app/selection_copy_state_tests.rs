@@ -84,7 +84,7 @@ fn app_with_selection() -> App {
 }
 
 #[test]
-fn copy_selection_prefers_single_user_message_markdown_source() {
+fn copy_selection_uses_visible_user_semantics_without_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     app.history = vec![HistoryEntry::User {
@@ -113,12 +113,12 @@ fn copy_selection_prefers_single_user_message_markdown_source() {
         Ok(copy_outcome())
     });
 
-    assert_eq!(copied.as_deref(), Some("- **item**\n    code"));
+    assert_eq!(copied.as_deref(), Some("- item\n  code"));
     assert!(app.selection.is_none());
 }
 
 #[test]
-fn copy_selection_prefers_single_agent_message_markdown_source() {
+fn copy_selection_uses_visible_agent_semantics_without_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     app.history = vec![HistoryEntry::Agent {
@@ -147,7 +147,7 @@ fn copy_selection_prefers_single_agent_message_markdown_source() {
         Ok(copy_outcome())
     });
 
-    assert_eq!(copied.as_deref(), Some("> **quoted**"));
+    assert_eq!(copied.as_deref(), Some("quoted"));
 }
 
 #[test]

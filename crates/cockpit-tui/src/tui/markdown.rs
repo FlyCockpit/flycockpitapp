@@ -188,7 +188,6 @@ pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
                         logical_line += 1;
                     }
                 }
-                pending_block_break = 0;
                 let visible = math_render::render_display(&text, width)
                     .map(|rows| rows.join("\n"))
                     .unwrap_or_else(|| {

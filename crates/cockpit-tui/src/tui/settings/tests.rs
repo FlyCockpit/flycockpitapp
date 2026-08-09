@@ -678,7 +678,7 @@ fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
         panic!("populated Harnesses fixture did not enter its list page");
     };
     state.cursor = 0;
-    assert_eq!(dialog.extended.harnesses.len(), 2);
+    assert_eq!(dialog.extended.harnesses.len(), 3);
     dialog
 }
 
@@ -857,7 +857,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
                 click_settings_action(&mut dialog, &action);
                 click_settings_action(&mut dialog, &action);
                 assert!(!dialog.extended.harnesses.contains_key(&id.0));
-                assert!(!dialog.extended.harnesses.is_empty());
+                assert_eq!(dialog.extended.harnesses.len(), 2);
 
                 // A target captured before its row disappears must be inert.
                 let tmp = TempDir::new().unwrap();
@@ -881,7 +881,7 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
                 ] {
                     dialog.handle_pointer(settings_mouse(kind, stale.rect.x, stale.rect.y));
                 }
-                assert!(!dialog.extended.harnesses.is_empty());
+                assert_eq!(dialog.extended.harnesses.len(), 2);
                 assert!(matches!(
                     dialog.test_page(),
                     TestPageRef::Harnesses(HarnessesPage::List(state))

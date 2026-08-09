@@ -827,6 +827,11 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
             );
         }
 
+        let mut harvested = actions
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut dispatched = harvested.clone();
         for action in actions {
             let tmp = TempDir::new().unwrap();
             let mut dialog = fixture(&tmp, kind);
@@ -835,7 +840,7 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
             click_settings_action(&mut dialog, &action);
             match &action {
                 SettingsPointerAction::List(ListAction::Delete(id)) => {
-                    click_settings_action(&mut dialog, &action);
+                    dialog.handle_key(press(KeyCode::Char('d')));
                     let after = values(&dialog, kind);
                     assert_eq!(after.len(), 1);
                     assert!(!after.contains(&id.value));
@@ -895,6 +900,10 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
                 _ => {}
             }
         }
+        dispatched.extend([
+            SettingsPointerAction::List(ListAction::Save),
+            SettingsPointerAction::List(ListAction::Cancel),
+        ]);
 
         let initial_tmp = TempDir::new().unwrap();
         let initial = values(&fixture(&initial_tmp, kind), kind);
@@ -929,6 +938,22 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
             let mut source = fixture(&source_tmp, kind);
             click_settings_action(&mut source, &begin);
             let _ = render_settings_rows(&source, 100, 40);
+            harvested.extend(
+                source
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::List(_),
+                            ),
+                            true,
+                        ) => Some(action.clone()),
+                        _ => None,
+                    }),
+            );
             assert!(
                 source
                     .pointer_surface
@@ -946,6 +971,7 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
             let disk_before = std::fs::read(&dialog.extended_path).ok();
             click_settings_action(&mut dialog, &begin);
             click_settings_action(&mut dialog, &movement);
+            dispatched.insert(movement.clone());
             if added {
                 type_chars(&mut dialog, "gamma");
             }
@@ -954,11 +980,15 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
             } else {
                 vec![initial[1].clone(), initial[0].clone()]
             };
-            click_settings_action(&mut dialog, &SettingsPointerAction::List(ListAction::Save));
+            dialog.handle_key(press(KeyCode::Enter));
             assert_eq!(values(&dialog, kind), expected);
             assert_eq!(persisted_values(&dialog, kind), expected);
             assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
         }
+        assert_eq!(
+            harvested, dispatched,
+            "every enabled identity from each closed list source state is replayed"
+        );
     }
 }
 

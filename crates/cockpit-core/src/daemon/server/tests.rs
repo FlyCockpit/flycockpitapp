@@ -1406,6 +1406,140 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     }
 }
 
+#[tokio::test]
+async fn remote_session_note_applies_replays_and_conflicts_before_second_event() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id) = attached_state(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222223").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "remote-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-333333333333").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let first_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            first_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "durable note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let first = match recv_writer_body(&mut writer_rx, "first note").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, first_id);
+            assert!(matches!(&*response, Response::NoteRecorded { .. }));
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected first note result: {other:?}"),
+    };
+
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "durable note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "replayed note").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), first);
+        }
+        other => panic!("unexpected note replay: {other:?}"),
+    }
+
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "changed note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "note conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    let count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                     WHERE session_id = ?1 AND type = 'user_note'",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting remote session notes")
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "replay and conflict must not append another note");
+}
+
 fn table_for(secret: &str) -> Arc<RedactionTable> {
     let cfg = crate::config::extended::RedactConfig {
         enabled: true,

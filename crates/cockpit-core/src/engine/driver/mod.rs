@@ -3503,90 +3503,83 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        loop {
-            if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
-                let worker_evidence = self
-                    .stack
-                    .first()
-                    .and_then(|frame| {
-                        let start = frame.history.len().saturating_sub(12);
-                        serde_json::to_string(&frame.history[start..]).ok()
-                    })
-                    .unwrap_or_else(|| "successful root turn; transcript unavailable".to_string());
-                let worker_evidence = self.schedule.redaction_table().scrub(&worker_evidence);
-                if let Some(goal) = self
-                    .session
-                    .db
-                    .finish_goal_root_turn_with_evidence(
-                        goal_id,
-                        generation,
-                        turn_id,
-                        &worker_evidence,
-                    )
-                    .await?
-                {
-                    self.maybe_start_goal_supervision_round(&goal, tx).await?;
-                }
-                return Ok(());
-            }
-            let Some(goal) = self
+        if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+            let worker_evidence = self
+                .stack
+                .first()
+                .and_then(|frame| {
+                    let start = frame.history.len().saturating_sub(12);
+                    serde_json::to_string(&frame.history[start..]).ok()
+                })
+                .unwrap_or_else(|| "successful root turn; transcript unavailable".to_string());
+            let worker_evidence = self.schedule.redaction_table().scrub(&worker_evidence);
+            if let Some(goal) = self
                 .session
                 .db
-                .current_session_goal(self.session.id, false)
+                .finish_goal_root_turn_with_evidence(goal_id, generation, turn_id, &worker_evidence)
                 .await?
-            else {
-                if self.goal_was_active_recently {
-                    self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
-                }
-                if let Some(scratch) = self.goal_scratch.take() {
-                    let _ = scratch.cleanup();
-                }
-                self.reset_goal_progress_tracking().await;
-                self.clear_goal_idle_intervention();
-                return Ok(());
-            };
-            if goal.disposition != crate::db::session_goals::GoalDisposition::Running {
-                self.reset_goal_progress_tracking().await;
-                self.clear_goal_idle_intervention();
-                return Ok(());
+            {
+                self.maybe_start_goal_supervision_round(&goal, tx).await?;
             }
-            self.goal_was_active_recently = true;
-            self.goal_usage_limit_auto_resume_attempts = 0;
-            if goal.tokens_used >= goal.token_budget {
-                if self.goal_stall_budget_context_active() {
-                    self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
-                    return Ok(());
-                }
-                let _ = self
-                    .session
-                    .db
-                    .update_session_goal(
-                        self.session.id,
-                        crate::db::session_goals::GoalDisposition::BudgetLimited,
-                        None,
-                        None,
-                        Some("token budget exhausted"),
-                    )
-                    .await;
-                self.reset_goal_progress_tracking().await;
-                self.clear_goal_idle_intervention();
+            return Ok(());
+        }
+        let Some(goal) = self
+            .session
+            .db
+            .current_session_goal(self.session.id, false)
+            .await?
+        else {
+            if self.goal_was_active_recently {
+                self.pending_idle_reason = Some(crate::engine::IdleReason::GoalComplete);
+            }
+            if let Some(scratch) = self.goal_scratch.take() {
+                let _ = scratch.cleanup();
+            }
+            self.reset_goal_progress_tracking().await;
+            self.clear_goal_idle_intervention();
+            return Ok(());
+        };
+        if goal.disposition != crate::db::session_goals::GoalDisposition::Running {
+            self.reset_goal_progress_tracking().await;
+            self.clear_goal_idle_intervention();
+            return Ok(());
+        }
+        self.goal_was_active_recently = true;
+        self.goal_usage_limit_auto_resume_attempts = 0;
+        if goal.tokens_used >= goal.token_budget {
+            if self.goal_stall_budget_context_active() {
+                self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
                 return Ok(());
             }
-            match goal.phase {
-                Some(crate::db::session_goals::GoalPhase::Planning)
-                | Some(crate::db::session_goals::GoalPhase::Evaluating)
-                | Some(crate::db::session_goals::GoalPhase::Verifying) => {
-                    self.maybe_start_goal_supervision_round(&goal, tx).await?;
-                    return Ok(());
-                }
-                Some(crate::db::session_goals::GoalPhase::Executing) => {
-                    if self.schedule.snapshot().is_empty() {
-                        self.dispatch_goal_root_turn(&goal, input_rx, tx).await?;
-                    }
-                    return Ok(());
-                }
-                None => return Ok(()),
+            let _ = self
+                .session
+                .db
+                .update_session_goal(
+                    self.session.id,
+                    crate::db::session_goals::GoalDisposition::BudgetLimited,
+                    None,
+                    None,
+                    Some("token budget exhausted"),
+                )
+                .await;
+            self.reset_goal_progress_tracking().await;
+            self.clear_goal_idle_intervention();
+            return Ok(());
+        }
+        match goal.phase {
+            Some(crate::db::session_goals::GoalPhase::Planning)
+            | Some(crate::db::session_goals::GoalPhase::Evaluating)
+            | Some(crate::db::session_goals::GoalPhase::Verifying) => {
+                self.maybe_start_goal_supervision_round(&goal, tx).await?;
+                return Ok(());
             }
+            Some(crate::db::session_goals::GoalPhase::Executing) => {
+                if self.schedule.snapshot().is_empty() {
+                    self.dispatch_goal_root_turn(&goal, input_rx, tx).await?;
+                }
+                return Ok(());
+            }
+            None => return Ok(()),
         }
     }
 

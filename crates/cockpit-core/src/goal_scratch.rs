@@ -70,8 +70,7 @@ impl GoalScratchRoot {
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .ok_or_else(|| anyhow::anyhow!("invalid goal scratch root name"))?;
-            return unlinkat_dir(&self.parent_handle, name)
-                .context("removing terminal goal scratch root");
+            unlinkat_dir(&self.parent_handle, name).context("removing terminal goal scratch root")
         }
         #[cfg(not(unix))]
         {
@@ -209,50 +208,6 @@ fn unlinkat_dir(parent: &std::fs::File, name: &str) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("removing goal scratch directory");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn goal_scratch_root_rejects_symlink_and_cleans_terminal_root() {
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let parent = temp.path().join("goals");
-        let scratch = GoalScratchRoot::create_in(&parent, Uuid::nil()).unwrap();
-        let root = scratch.root.clone();
-        let target = temp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::remove_dir(root.join("planner")).unwrap();
-        symlink(&target, root.join("planner")).unwrap();
-        assert!(scratch.role("planner").is_err());
-        std::fs::remove_file(root.join("planner")).unwrap();
-        std::fs::create_dir(root.join("planner")).unwrap();
-        set_private(&root.join("planner")).unwrap();
-        scratch.cleanup().unwrap();
-        assert!(!root.exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn goal_scratch_root_rejects_windows_reparse_point() {
-        let temp = tempfile::tempdir().unwrap();
-        let scratch = GoalScratchRoot::create_in(&temp.path().join("goals"), Uuid::nil()).unwrap();
-        let planner = scratch.root.join("planner");
-        std::fs::remove_dir(&planner).unwrap();
-        let target = temp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        let status = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&planner)
-            .arg(&target)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert!(scratch.role("planner").is_err());
-    }
 }
 
 #[cfg(not(unix))]
@@ -541,3 +496,47 @@ fn current_windows_user_sid() -> Result<String> {
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("goal scratch security requires an owner-check implementation");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_scratch_root_rejects_symlink_and_cleans_terminal_root() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("goals");
+        let scratch = GoalScratchRoot::create_in(&parent, Uuid::nil()).unwrap();
+        let root = scratch.root.clone();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::remove_dir(root.join("planner")).unwrap();
+        symlink(&target, root.join("planner")).unwrap();
+        assert!(scratch.role("planner").is_err());
+        std::fs::remove_file(root.join("planner")).unwrap();
+        std::fs::create_dir(root.join("planner")).unwrap();
+        set_private(&root.join("planner")).unwrap();
+        scratch.cleanup().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn goal_scratch_root_rejects_windows_reparse_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = GoalScratchRoot::create_in(&temp.path().join("goals"), Uuid::nil()).unwrap();
+        let planner = scratch.root.join("planner");
+        std::fs::remove_dir(&planner).unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&planner)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(scratch.role("planner").is_err());
+    }
+}

@@ -1429,4 +1429,78 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[tokio::test]
+    async fn outbox_delivery_lease_survives_process_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery-reopen.sqlite3");
+        let attachment = "00000000-0000-4000-8000-000000000081";
+        let operation = "01890f3e-4c00-7000-8000-000000000082";
+        let delivery = "00000000-0000-4000-8000-000000000083";
+        {
+            let db = Db::open(&path).unwrap();
+            db.reserve_remote_attachment_operation(ReserveRemoteOperation {
+                logical_attachment_id: attachment,
+                operation_id: operation,
+                authenticated_device_id: "00000000-0000-4000-8000-000000000084",
+                authenticated_device_generation: 1,
+                operation_class: RemoteOperationClass::TransactionalMutation,
+                request_hash: [8; 32],
+                now_ms: 1,
+            })
+            .await
+            .unwrap();
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: attachment,
+                operation_id: operation,
+                safe_response: b"ack",
+                outbox_delivery_id: delivery,
+                outbox_kind: "restart_effect",
+                outbox_payload: b"payload",
+                now_ms: 2,
+            })
+            .await
+            .unwrap();
+            let lease = db
+                .claim_remote_outbox_delivery("worker", "restart_effect", 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.attempts, 1);
+            // Dropping the DB models process death after effect dispatch and
+            // before acknowledgement; no shutdown path clears this lease.
+        }
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(
+                db.claim_remote_outbox_delivery("worker", "restart_effect", 109, 100)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let lease = db
+                .claim_remote_outbox_delivery("worker", "restart_effect", 110, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.delivery_id, delivery);
+            assert_eq!(lease.attempts, 2);
+            assert!(db.ack_remote_outbox_delivery(
+                attachment, delivery, "worker", &lease.lease_id, 111,
+            ).await.unwrap());
+            let attachment_owned = attachment.to_owned();
+            assert!(
+                db.write(move |conn| {
+                    conn.execute(
+                        "DELETE FROM remote_attachment_outbox WHERE logical_attachment_id=?1",
+                        [&attachment_owned],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .is_err(),
+                "delivery ack must not become compaction authority after reopen"
+            );
+        }
+    }
 }

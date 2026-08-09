@@ -180,5 +180,51 @@ mod tests {
                 .unwrap()
         );
         assert!(drain_kind_once(&ctx, "unregistered_kind").await.is_err());
+
+        let poison_operation = "01890f3e-4c00-7000-8000-000000000075";
+        ctx.db
+            .reserve_remote_attachment_operation(ReserveRemoteOperation {
+                logical_attachment_id: attachment,
+                operation_id: poison_operation,
+                authenticated_device_id: "00000000-0000-4000-8000-000000000073",
+                authenticated_device_generation: 1,
+                operation_class: RemoteOperationClass::TransactionalMutation,
+                request_hash: [8; 32],
+                now_ms: 3,
+            })
+            .await
+            .unwrap();
+        ctx.db
+            .commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: attachment,
+                operation_id: poison_operation,
+                safe_response: b"ack",
+                outbox_delivery_id: "00000000-0000-4000-8000-000000000076",
+                outbox_kind: "cancel_run_invocation",
+                outbox_payload: b"not-json",
+                now_ms: 4,
+            })
+            .await
+            .unwrap();
+        assert!(
+            drain_kind_once(&ctx, "cancel_run_invocation")
+                .await
+                .is_err()
+        );
+        let reclaimed = ctx
+            .db
+            .claim_remote_outbox_delivery(
+                CONSUMER,
+                "cancel_run_invocation",
+                chrono::Utc::now().timestamp_millis() + LEASE_MS + 1,
+                LEASE_MS,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reclaimed.attempts, 2,
+            "poison is retained for bounded retry"
+        );
     }
 }

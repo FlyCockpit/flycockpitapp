@@ -34,6 +34,16 @@ impl AutoCompactGate {
         matches!(self, Self::Committed { activity_epoch } if *activity_epoch == self.activity_epoch())
     }
 
+    fn suppresses(&self, coverage: &PreparedCompactionCoverage) -> bool {
+        match self {
+            Self::BoundarySuppressed { key } => {
+                key.activity_epoch == self.activity_epoch() && key.coverage == *coverage
+            }
+            Self::UntilActivity { .. } | Self::Committed { .. } => true,
+            Self::Eligible { .. } => false,
+        }
+    }
+
     fn mark_committed(&mut self) {
         *self = Self::Committed {
             activity_epoch: self.activity_epoch(),
@@ -43,6 +53,32 @@ impl AutoCompactGate {
     pub(in crate::engine::driver) fn external_activity(&mut self) {
         *self = Self::Eligible {
             activity_epoch: self.activity_epoch().wrapping_add(1),
+        };
+    }
+
+    fn record_failure(
+        &mut self,
+        outcome: &PrepareCompactionError,
+        coverage: PreparedCompactionCoverage,
+    ) {
+        use crate::engine::compact_draft::CompactDraftOutcome as O;
+        let epoch = self.activity_epoch();
+        *self = match outcome {
+            PrepareCompactionError::Draft(O::Cancelled) => Self::Eligible {
+                activity_epoch: epoch,
+            },
+            PrepareCompactionError::Draft(O::TransientExhausted { .. } | O::Degenerate { .. }) => {
+                Self::BoundarySuppressed {
+                    key: BoundaryKey {
+                        activity_epoch: epoch,
+                        coverage,
+                    },
+                }
+            }
+            _ => Self::UntilActivity {
+                activity_epoch: epoch,
+                reason: outcome.to_string(),
+            },
         };
     }
 }
@@ -943,7 +979,8 @@ impl Driver {
         // on this (now-abandoned) session would loop. Agent-requested compact
         // above intentionally bypasses this auto-trigger latch, matching manual
         // `/compact` semantics.
-        if self.auto_compact_gate.is_committed_current() {
+        let boundary_coverage = prepared_compaction_coverage(&self.stack[0].history);
+        if self.auto_compact_gate.suppresses(&boundary_coverage) {
             return false;
         }
         let ctx_cfg = self.resolve_context_config();
@@ -993,6 +1030,12 @@ impl Driver {
         let prepared = match self.prepare_compaction_with_source(tx, source).await {
             Ok(prepared) => prepared,
             Err(error) => {
+                if source == "auto" {
+                    let coverage = prepared_compaction_coverage(
+                        &self.stack.last().expect("stack never empty").history,
+                    );
+                    self.auto_compact_gate.record_failure(&error, coverage);
+                }
                 let _ = tx
                     .send(TurnEvent::Notice {
                         text: format!("/compact: {error}; history was left unchanged"),

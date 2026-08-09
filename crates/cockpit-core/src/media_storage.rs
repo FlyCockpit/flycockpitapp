@@ -1721,8 +1721,58 @@ mod tests {
                 object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
             },
         };
+        db.transaction(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_upload_attachment_insert BEFORE INSERT ON media_attachments BEGIN SELECT RAISE(ABORT,'injected upload attachment failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            recovery
+                .finalize_media_upload(finalize.clone(), 42)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected upload attachment failure")
+        );
+        let failed_counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM local_media_operations WHERE action='finalize'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM media_uploads WHERE upload_id=?1",
+                        [second_upload.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed_counts, (0, 0, "open".to_string()));
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("media"))
+                .unwrap()
+                .count(),
+            1,
+            "failed publication restores exactly the upload temporary"
+        );
+        db.transaction(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_upload_attachment_insert")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         let finalized = recovery
-            .finalize_media_upload(finalize.clone(), 42)
+            .finalize_media_upload(finalize.clone(), 43)
             .await
             .unwrap();
         assert!(matches!(
@@ -1736,9 +1786,35 @@ mod tests {
             }
         ));
         assert_eq!(
-            recovery.finalize_media_upload(finalize, 43).await.unwrap(),
+            recovery.finalize_media_upload(finalize, 44).await.unwrap(),
             finalized
         );
+        let finalized_status = db
+            .read(move |conn| {
+                cockpit_db::Db::media_upload_status_for_owner_conn(
+                    conn,
+                    &cockpit_db::media_attachments::GetMediaUploadStatusV1 {
+                        schema_version: 1,
+                        kind: "getMediaUploadStatus".into(),
+                        session_id,
+                        canonical_project_digest: "22".repeat(32),
+                        client_draft_id: second_draft,
+                        upload_id: second_upload,
+                        upload_generation: 3,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finalized_status.acknowledged_bytes, 7);
+        assert!(matches!(
+            finalized_status.detail,
+            cockpit_db::media_attachments::MediaUploadStateDetailV1::Materialized {
+                attachment_id: _,
+                attachment_version: 1,
+            }
+        ));
         let counts = db
             .read(|conn| {
                 Ok((

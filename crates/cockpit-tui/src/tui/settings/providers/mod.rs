@@ -2876,6 +2876,7 @@ impl SettingsCx {
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut controls = Vec::new();
 
         match s.run.current_step_id() {
             Some("template") => {
@@ -2891,6 +2892,7 @@ impl SettingsCx {
                     } else {
                         Style::default().fg(Color::White)
                     };
+                    controls.push((lines.len(), i));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
                         Span::styled(t.display.to_string(), style),
@@ -2912,8 +2914,13 @@ impl SettingsCx {
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
-                render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                let id_line = render_field_row(&mut lines, "id", &s.id_field, s.is_step("id"));
+                let url_line = render_field_row(&mut lines, "url", &s.url_field, s.is_step("url"));
+                if s.is_step("id") {
+                    controls.push((id_line, 0));
+                } else if s.is_step("url") {
+                    controls.push((url_line, 0));
+                }
                 if s.is_step("auth-method") {
                     lines.push(Line::default());
                     let options = [
@@ -2932,6 +2939,7 @@ impl SettingsCx {
                         } else {
                             Style::default().fg(Color::White)
                         };
+                        controls.push((lines.len(), index));
                         lines.push(Line::from(vec![
                             Span::raw(marker),
                             Span::styled((*label).to_string(), style),
@@ -2947,6 +2955,7 @@ impl SettingsCx {
                     } else {
                         "••••••••"
                     };
+                    controls.push((lines.len(), 0));
                     lines.push(Line::from(vec![
                         Span::styled("api key: ", muted),
                         Span::styled(masked.to_string(), Style::default().fg(Color::White)),
@@ -2960,11 +2969,16 @@ impl SettingsCx {
                 }
                 if s.is_step("env-var") {
                     lines.push(Line::default());
-                    render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    let line = render_field_row(&mut lines, "env var", &s.env_var_field, true);
+                    controls.push((line, 0));
                 }
                 if s.is_step("headers") {
                     lines.push(Line::default());
-                    let _ = render_header_editor(&mut lines, &s.headers);
+                    controls.extend(
+                        render_header_editor(&mut lines, &s.headers)
+                            .into_iter()
+                            .map(|(line, id)| (line, id.0 as usize)),
+                    );
                 }
                 if s.is_step("url")
                     && let Some(hint) = t.hint
@@ -3052,6 +3066,7 @@ impl SettingsCx {
                     } else {
                         Style::default().fg(Color::White)
                     };
+                    controls.push((lines.len(), index));
                     lines.push(Line::from(vec![
                         Span::raw(marker),
                         Span::styled((*label).to_string(), style),
@@ -3115,8 +3130,18 @@ impl SettingsCx {
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
             .unwrap_or_default();
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:add", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:add",
+            lines,
+            selected_line,
+            controls
+                .into_iter()
+                .map(|(line, control)| (line, SettingsControlId(control as u64))),
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:add"),
+        );
         if let Some(links) = links {
             register_visible_link_regions(
                 links,
@@ -4149,7 +4174,13 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextField, active: bool) {
+fn render_field_row(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    field: &TextField,
+    active: bool,
+) -> usize {
+    let line = lines.len();
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let value_style = if active {
         Style::default().fg(Color::White)
@@ -4181,6 +4212,7 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
         spans.push(Span::styled(field.text().to_string(), value_style));
     }
     lines.push(Line::from(spans));
+    line
 }
 
 /// Build the `ProvidersPage` for `/model-settings`: the active model's
@@ -4381,6 +4413,25 @@ impl SettingsPage for ProvidersPage {
             {
                 state.cursor = index;
             }
+            ProvidersPage::Add(state) => match state.run.current_step_id() {
+                Some("template") if index < templates::TEMPLATES.len() => {
+                    state.template_cursor = index;
+                }
+                Some("auth-method") if index < 3 => state.auth_method_cursor = index,
+                Some("headers") if !state.headers.is_editing() => {
+                    let last = state
+                        .headers
+                        .continue_idx()
+                        .unwrap_or_else(|| state.headers.add_row_idx());
+                    if index > last {
+                        return Nav::Stay;
+                    }
+                    state.headers.cursor = index;
+                }
+                Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
+                Some("id" | "url" | "api-key" | "env-var") => return Nav::Stay,
+                _ => return Nav::Stay,
+            },
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4472,6 +4523,33 @@ impl SettingsPage for ProvidersPage {
                 {
                     let last = state.option_count(OAuthHost::Standalone).saturating_sub(1);
                     state.cursor = state.cursor.saturating_add_signed(delta).min(last);
+                }
+                ProvidersPage::Add(state) if region == SettingsScrollRegionId("providers:add") => {
+                    match state.run.current_step_id() {
+                        Some("template") => {
+                            state.template_cursor = state
+                                .template_cursor
+                                .saturating_add_signed(delta)
+                                .min(templates::TEMPLATES.len().saturating_sub(1));
+                        }
+                        Some("auth-method") => {
+                            state.auth_method_cursor =
+                                state.auth_method_cursor.saturating_add_signed(delta).min(2);
+                        }
+                        Some("headers") if !state.headers.is_editing() => {
+                            let last = state
+                                .headers
+                                .continue_idx()
+                                .unwrap_or_else(|| state.headers.add_row_idx());
+                            state.headers.cursor =
+                                state.headers.cursor.saturating_add_signed(delta).min(last);
+                        }
+                        Some("test-key-choice") => {
+                            state.test_choice_cursor =
+                                state.test_choice_cursor.saturating_add_signed(delta).min(1);
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }

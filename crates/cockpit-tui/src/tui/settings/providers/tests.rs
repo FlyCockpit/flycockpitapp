@@ -309,6 +309,17 @@ fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) 
     (tmp, dialog)
 }
 
+fn deep_fetch_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
+    let (tmp, mut dialog) = dialog_with_config(config);
+    let entry = dialog.config.providers["p"].clone();
+    let state = DeepFetchState::prepare(&dialog.config_path, "p").expect("deep-fetch fixture");
+    dialog.page = super::super::providers_page(ProvidersPage::DeepFetch {
+        state,
+        parent: Box::new(EditState::new("p".into(), entry)),
+    });
+    (tmp, dialog)
+}
+
 fn descend_provider(
     dialog: &mut SettingsDialog,
     requested: &'static str,
@@ -396,6 +407,35 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
             !actions.is_empty(),
             "nested provider surface {path} has no enabled controls"
         );
+        if path == 3 {
+            for action in actions {
+                let super::super::pointer_actions::SettingsPointerAction::Providers(
+                    ProvidersAction::DeepFetchChoice(_, choice),
+                ) = &action
+                else {
+                    continue;
+                };
+                let choice = *choice;
+                let (_tmp, mut fresh) = deep_fetch_fixture(config.clone());
+                click_rendered_provider_action(&mut fresh, &action);
+                match choice {
+                    super::super::pointer_actions::DeepFetchChoice::Fetch => {
+                        assert!(matches!(
+                            fresh.test_page(),
+                            TestPageRef::Providers(ProvidersPage::DeepFetch { state, .. })
+                                if state.is_running()
+                        ));
+                    }
+                    super::super::pointer_actions::DeepFetchChoice::Cancel => {
+                        assert!(matches!(
+                            fresh.test_page(),
+                            TestPageRef::Providers(ProvidersPage::Edit(state))
+                                if state.status.as_deref() == Some("deep fetch cancelled")
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 

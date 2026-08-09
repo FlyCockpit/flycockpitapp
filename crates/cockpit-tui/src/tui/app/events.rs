@@ -514,6 +514,34 @@ impl App {
                 if !matching {
                     return;
                 }
+                if applied {
+                    for deferred in self
+                        .deferred_fence_dispatches
+                        .values_mut()
+                        .filter(|deferred| deferred.waiting_model_selection == Some(selection_id))
+                    {
+                        deferred.submission.expected_model_state_generation = Some(generation);
+                        deferred.submission.expected_model =
+                            applied_state.as_ref().map(|state| state.selection.clone());
+                        deferred.waiting_model_selection = None;
+                    }
+                } else {
+                    let cancelled = self
+                        .deferred_fence_dispatches
+                        .iter()
+                        .filter_map(|(id, deferred)| {
+                            (deferred.waiting_model_selection == Some(selection_id)).then_some(*id)
+                        })
+                        .collect::<Vec<_>>();
+                    for id in cancelled {
+                        self.deferred_fence_dispatches.remove(&id);
+                        if let Some(fence) = self.submission_fences.remove(&id) {
+                            self.submission_order.cancel(fence.fence_sequence);
+                        }
+                        self.pending_paste_probes
+                            .retain(|_, probe| probe.owner_fence != Some(id));
+                    }
+                }
                 if applied && let Some(default_update) = default_update {
                     match default_update {
                         cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested => {
@@ -587,6 +615,7 @@ impl App {
                     }
                     let _ = self.submission_order.complete(queued.fence_sequence);
                 }
+                self.dispatch_next_ready_paste_fence();
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
                 self.apply_config_snapshot(*snapshot);

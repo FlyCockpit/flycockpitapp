@@ -133,6 +133,8 @@ pub enum AsyncActionPayload {
         tokens: usize,
     },
     ImagePathProbe {
+        request_id: uuid::Uuid,
+        request_generation: u64,
         terminal_generation: Option<u64>,
         original: String,
         source_draft_generation: u64,
@@ -140,6 +142,8 @@ pub enum AsyncActionPayload {
         png: Option<Vec<u8>>,
     },
     NativeImagePaste {
+        request_id: uuid::Uuid,
+        request_generation: u64,
         terminal_generation: Option<u64>,
         source_draft_generation: u64,
         cursor: usize,

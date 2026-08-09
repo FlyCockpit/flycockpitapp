@@ -2077,7 +2077,16 @@ impl App {
             .expand_display(self.composer.text())
             .trim()
             .to_string();
-        if submitted.is_empty() && self.paste_registry.is_empty() {
+        let pending_probe_ids = self
+            .pending_paste_probes
+            .iter()
+            .filter_map(|(id, probe)| {
+                (probe.source_draft_generation == self.draft_generation
+                    && probe.owner_fence.is_none())
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        if submitted.is_empty() && self.paste_registry.is_empty() && pending_probe_ids.is_empty() {
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.
@@ -2163,7 +2172,7 @@ impl App {
         let (paste_wire, paste_images) =
             self.paste_registry.build_wire(self.composer.text(), vision);
         let paste_wire = paste_wire.trim().to_string();
-        if paste_wire.is_empty() && paste_images.is_empty() {
+        if paste_wire.is_empty() && paste_images.is_empty() && pending_probe_ids.is_empty() {
             let _ = self.submission_order.complete(fence_sequence);
             return false;
         }
@@ -2207,6 +2216,25 @@ impl App {
             session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
             terminal_generation: self.terminal_input_generation.unwrap_or_default(),
         };
+        let slots = pending_probe_ids
+            .iter()
+            .filter_map(|id| self.pending_paste_probes.get(id))
+            .map(
+                |probe| crate::tui::structured_paste::PasteSlotState::Pending {
+                    request: probe.request.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        for id in &pending_probe_ids {
+            if let Some(probe) = self.pending_paste_probes.get_mut(id) {
+                probe.owner_fence = Some(client_submission_id);
+            }
+        }
+        let fence_lifecycle = if slots.is_empty() {
+            crate::tui::structured_paste::FenceLifecycle::Ready
+        } else {
+            crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
+        };
         self.submission_fences.insert(
             client_submission_id,
             crate::tui::structured_paste::SubmissionFenceV1 {
@@ -2225,8 +2253,8 @@ impl App {
                     active_model_state_generation: self.active_model_state_generation,
                     image_capability_generation: self.config_snapshot.generation,
                 },
-                slots: Vec::new(),
-                lifecycle: crate::tui::structured_paste::FenceLifecycle::Ready,
+                slots,
+                lifecycle: fence_lifecycle,
             },
         );
         self.lock_pending_agent_switch_log();
@@ -2308,6 +2336,27 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
+        if !pending_probe_ids.is_empty() {
+            self.deferred_fence_dispatches.insert(
+                client_submission_id,
+                super::DeferredFenceDispatch {
+                    display: submitted,
+                    submission,
+                    tag_expansions,
+                    waiting_model_selection: self
+                        .pending_model_selection
+                        .as_ref()
+                        .map(|pending| pending.selection_id),
+                },
+            );
+            self.composer.clear();
+            self.paste_registry.clear();
+            self.draft_generation = self.draft_generation.saturating_add(1);
+            self.at_dismissed = false;
+            self.at_selected = 0;
+            self.at_scroll = 0;
+            return false;
+        }
         if let Some(pending) = self.pending_model_selection.as_mut() {
             let status = format!(
                 "Switching to {}/{}; message will send when ready.",
@@ -2932,6 +2981,39 @@ impl App {
         }
 
         if data.is_empty() {
+            let Some(request_generation) = self.next_paste_generation.checked_add(1) else {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            };
+            self.next_paste_generation = request_generation;
+            let request_id = uuid::Uuid::new_v4();
+            self.pending_paste_probes.insert(
+                request_id,
+                super::PendingPasteProbe {
+                    request: crate::tui::structured_paste::PasteRequest {
+                        paste_generation: request_generation,
+                        paste_correlation_id: request_id,
+                        source: crate::tui::structured_paste::PasteSource::NativePaste,
+                        host: crate::tui::structured_paste::HostIdentity {
+                            client_instance_id: uuid::Uuid::nil(),
+                            connection_epoch: self
+                                .agent_runner
+                                .as_ref()
+                                .and_then(|runner| runner.as_ref().ok())
+                                .map(|runner| {
+                                    runner
+                                        .attachment_epoch
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                })
+                                .unwrap_or_default(),
+                            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
+                            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
+                        },
+                    },
+                    source_draft_generation: self.draft_generation,
+                    owner_fence: None,
+                },
+            );
             let terminal_generation = self.terminal_input_generation;
             let source_draft_generation = self.draft_generation;
             let cursor = self.composer.cursor();
@@ -2952,6 +3034,8 @@ impl App {
                     .flatten();
                     Ok(
                         crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
+                            request_id,
+                            request_generation,
                             terminal_generation,
                             source_draft_generation,
                             cursor,
@@ -2966,9 +3050,43 @@ impl App {
         if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data)
             .filter(|path| crate::tui::image_path_probe::is_generation_scoped(path))
         {
+            let Some(request_generation) = self.next_paste_generation.checked_add(1) else {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            };
+            self.next_paste_generation = request_generation;
+            let request_id = uuid::Uuid::new_v4();
+            self.pending_paste_probes.insert(
+                request_id,
+                super::PendingPasteProbe {
+                    request: crate::tui::structured_paste::PasteRequest {
+                        paste_generation: request_generation,
+                        paste_correlation_id: request_id,
+                        source: crate::tui::structured_paste::PasteSource::BracketedPty,
+                        host: crate::tui::structured_paste::HostIdentity {
+                            client_instance_id: uuid::Uuid::nil(),
+                            connection_epoch: self
+                                .agent_runner
+                                .as_ref()
+                                .and_then(|runner| runner.as_ref().ok())
+                                .map(|runner| {
+                                    runner
+                                        .attachment_epoch
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                })
+                                .unwrap_or_default(),
+                            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
+                            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
+                        },
+                    },
+                    source_draft_generation: self.draft_generation,
+                    owner_fence: None,
+                },
+            );
             let kind =
                 crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
             if self.async_actions.pending_kind_count(&kind) >= 8 {
+                self.pending_paste_probes.remove(&request_id);
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
@@ -2992,6 +3110,8 @@ impl App {
                     .and_then(Result::ok);
                     Ok(
                         crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
+                            request_id,
+                            request_generation,
                             terminal_generation,
                             original,
                             source_draft_generation,
@@ -3939,7 +4059,7 @@ fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
     !after.contains('\n')
 }
 
-fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
+pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
     if images.is_empty() {
         return Ok(());
     }

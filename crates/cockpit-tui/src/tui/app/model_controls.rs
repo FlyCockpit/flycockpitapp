@@ -840,6 +840,7 @@ impl App {
         if let Some(pending) = pending.as_ref() {
             let _ = self.submission_order.complete(pending.order_sequence);
         }
+        self.dispatch_next_ready_paste_fence();
         pending
     }
 

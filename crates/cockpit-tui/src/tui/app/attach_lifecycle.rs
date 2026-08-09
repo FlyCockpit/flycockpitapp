@@ -231,11 +231,13 @@ impl App {
         state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
     ) {
         let mut cancelled_sequences = Vec::new();
+        let mut cancelled_fences = Vec::new();
         self.submission_fences
-            .retain(|_, fence| match fence.lifecycle {
+            .retain(|id, fence| match fence.lifecycle {
                 crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
                 | crate::tui::structured_paste::FenceLifecycle::Ready => {
                     cancelled_sequences.push(fence.fence_sequence);
+                    cancelled_fences.push(*id);
                     false
                 }
                 crate::tui::structured_paste::FenceLifecycle::PossiblySent => {
@@ -247,6 +249,11 @@ impl App {
             });
         for sequence in cancelled_sequences {
             self.submission_order.cancel(sequence);
+        }
+        for id in cancelled_fences {
+            self.deferred_fence_dispatches.remove(&id);
+            self.pending_paste_probes
+                .retain(|_, probe| probe.owner_fence != Some(id));
         }
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();

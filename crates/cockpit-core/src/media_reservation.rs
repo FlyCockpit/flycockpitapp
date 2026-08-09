@@ -253,6 +253,10 @@ impl MediaReservationLedger {
         Self { db, clock }
     }
 
+    pub fn clock_now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     /// Startup admission remains closed while any non-terminal reservation
     /// still requires owner-specific recovery or external reconciliation.
     pub async fn recovery_complete(&self) -> Result<bool, LedgerError> {
@@ -273,11 +277,54 @@ impl MediaReservationLedger {
     ) -> Result<(), LedgerError> {
         let invocation_id = invocation_id.to_owned();
         self.db.transaction(move|conn| {
-            for id in reservation_ids {
-                let(state,published):(String,bool)=conn.query_row("SELECT state,published FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?)))?;
-                if ReservationState::parse(&state)?!=ReservationState::Settling||!published{return Err(anyhow!("downstream_ownership_requires_published_settling"));}
-                conn.execute("INSERT INTO media_downstream_ownership(reservation_id,invocation_id,bound_wall_ms) VALUES(?1,?2,?3) ON CONFLICT(reservation_id) DO UPDATE SET invocation_id=excluded.invocation_id WHERE media_downstream_ownership.invocation_id=excluded.invocation_id",params![id,invocation_id,sqlite_i64(wall_ms)?])?;
+            let aggregate = dimension_name(MediaDimension::AggregateDecodedPixelsPerRequest);
+            let mut total = 0u64;
+            let mut limit = None;
+            for id in &reservation_ids {
+                let plan_json:String=conn.query_row("SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",params![id,aggregate],|row|row.get(0))?;
+                let plan:MediaReservationPlan=serde_json::from_str(&plan_json)?;
+                limit=Some(limit.map_or(plan.effective_limit,|value:u64|value.min(plan.effective_limit)));
+                let pixels:i64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension='decoded_image_pixels'",[id],|row|row.get(0))?;
+                total=total.checked_add(u64::try_from(pixels.max(0))?).ok_or_else(||anyhow!("accounting_overflow"))?;
             }
+            let effective=limit.unwrap_or(0);
+            if total>effective { return Err(anyhow!("media_denied:aggregate_decoded_pixels_per_request:{total}:{effective}:0:request:policy")); }
+            for (index,id) in reservation_ids.iter().enumerate() {
+                let(state,published,version):(String,bool,u64)=conn.query_row("SELECT state,published,version FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?)))?;
+                if ReservationState::parse(&state)?!=ReservationState::Settling||!published{return Err(anyhow!("downstream_ownership_requires_published_settling"));}
+                if let Some(existing)=conn.query_row("SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",[id],|row|row.get::<_,String>(0)).optional()? { if existing!=invocation_id{return Err(anyhow!("downstream_ownership_conflict"));} }
+                let rows:Vec<(String,String,i64)>=conn.prepare("SELECT scope_kind,scope_id,delta FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2")?.query_map(params![id,aggregate],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+                for (kind,scope,delta) in rows { if delta!=0 { mutate_counter(conn,&kind,&scope,&aggregate,-delta)?; } }
+                conn.execute("UPDATE media_reservation_deltas SET delta=0,charged_after=0 WHERE reservation_id=?1 AND dimension=?2",params![id,aggregate])?;
+                let target=if index==0{total}else{0};
+                if target>0 { mutate_counter(conn,"request",&invocation_id,&aggregate,i64::try_from(target)?)?; record_delta(conn,id,version,&aggregate,"request",&invocation_id,target,i64::try_from(target)?,"downstream_aggregate",wall_ms)?; }
+                conn.execute("INSERT INTO media_downstream_ownership(reservation_id,invocation_id,bound_wall_ms) VALUES(?1,?2,?3) ON CONFLICT(reservation_id) DO NOTHING",params![id,invocation_id,sqlite_i64(wall_ms)?])?;
+            }
+            Ok(())
+        }).await.map_err(classify_storage_error)
+    }
+
+    /// Cancellation-safe cleanup for local work whose owning future vanished.
+    pub async fn abandon_local_operation(
+        &self,
+        id: &str,
+        checksum: &str,
+        wall_ms: u64,
+    ) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        let checksum = checksum.to_owned();
+        self.db.transaction(move|conn| {
+            let row:Option<(String,u64)>=conn.query_row("SELECT state,version FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?))).optional()?;
+            let Some((state,version))=row else{return Ok(())};
+            if matches!(ReservationState::parse(&state)?,ReservationState::Released|ReservationState::AccountingCorrupt){return Ok(())}
+            conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1",[&id])?;
+            let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+            for dimension in [MediaDimension::QueuedOperationsGlobal,MediaDimension::QueuedOperationsPerSession,MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::AggregateDecodedPixelsPerRequest,MediaDimension::LocalCpuJobsGlobal] {
+                let name=dimension_name(dimension);
+                conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
+                release_dimension_balance(conn,&id,next,&name,wall_ms)?;
+            }
+            conn.execute("UPDATE media_reservations SET state='released',cancellation_requested=1,published=0,version=?1 WHERE reservation_id=?2",params![sqlite_i64(next)?,id])?;
             Ok(())
         }).await.map_err(classify_storage_error)
     }
@@ -2255,6 +2302,201 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn downstream_binding_sums_decoded_pixels_once_and_is_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        for (id, pixels) in [("image-a", 40), ("image-b", 60)] {
+            let receipt = ledger
+                .reserve(request(
+                    id,
+                    vec![
+                        plan(MediaDimension::DecodedImagePixels, 100, Some(100)),
+                        plan(
+                            MediaDimension::AggregateDecodedPixelsPerRequest,
+                            100,
+                            Some(100),
+                        ),
+                        plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                        plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let executing = ledger
+                .promote(
+                    id,
+                    receipt.version,
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                    2,
+                )
+                .await
+                .unwrap();
+            let decoded = ledger
+                .reconcile_actual(
+                    id,
+                    executing.version,
+                    MediaDimension::DecodedImagePixels,
+                    pixels,
+                    false,
+                    3,
+                )
+                .await
+                .unwrap();
+            let aggregate = ledger
+                .reconcile_actual(
+                    id,
+                    decoded.version,
+                    MediaDimension::AggregateDecodedPixelsPerRequest,
+                    pixels,
+                    false,
+                    3,
+                )
+                .await
+                .unwrap();
+            let settling = ledger
+                .complete_local_allocation(id, aggregate.version, 4)
+                .await
+                .unwrap();
+            ledger
+                .authorize_publication(&settling.reservation_id)
+                .await
+                .unwrap();
+        }
+        let ids = vec!["image-a".to_string(), "image-b".to_string()];
+        ledger
+            .bind_downstream_ownership(ids.clone(), "submission", 5)
+            .await
+            .unwrap();
+        ledger
+            .bind_downstream_ownership(ids, "submission", 6)
+            .await
+            .unwrap();
+        let charged=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='request' AND scope_id='submission' AND dimension='aggregate_decoded_pixels_per_request'",[],|r|row_u64(r,0))?)).await.unwrap();
+        assert_eq!(charged, 100);
+    }
+
+    #[tokio::test]
+    async fn downstream_binding_rejects_multi_image_aggregate_overage_atomically() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        for id in ["over-a", "over-b"] {
+            let receipt = ledger
+                .reserve(request(
+                    id,
+                    vec![
+                        plan(MediaDimension::DecodedImagePixels, 100, Some(100)),
+                        plan(
+                            MediaDimension::AggregateDecodedPixelsPerRequest,
+                            100,
+                            Some(100),
+                        ),
+                        plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                        plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let executing = ledger
+                .promote(
+                    id,
+                    receipt.version,
+                    plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                    2,
+                )
+                .await
+                .unwrap();
+            let decoded = ledger
+                .reconcile_actual(
+                    id,
+                    executing.version,
+                    MediaDimension::DecodedImagePixels,
+                    60,
+                    false,
+                    3,
+                )
+                .await
+                .unwrap();
+            let aggregate = ledger
+                .reconcile_actual(
+                    id,
+                    decoded.version,
+                    MediaDimension::AggregateDecodedPixelsPerRequest,
+                    60,
+                    false,
+                    3,
+                )
+                .await
+                .unwrap();
+            let settling = ledger
+                .complete_local_allocation(id, aggregate.version, 4)
+                .await
+                .unwrap();
+            ledger
+                .authorize_publication(&settling.reservation_id)
+                .await
+                .unwrap();
+        }
+        assert!(
+            ledger
+                .bind_downstream_ownership(
+                    vec!["over-a".into(), "over-b".into()],
+                    "over-submission",
+                    5
+                )
+                .await
+                .is_err()
+        );
+        let ownership=db.read(|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_downstream_ownership WHERE invocation_id='over-submission'",[],|r|row_u64(r,0))?)).await.unwrap();
+        assert_eq!(ownership, 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_ready_and_promoted_work_release_scheduler_and_cpu_state() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        let plans = vec![
+            plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+            plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+            plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+        ];
+        let ready = ledger
+            .reserve(request("abandoned-ready", plans.clone()))
+            .await
+            .unwrap();
+        ledger
+            .mark_execution_ready(&ready.reservation_id, 2)
+            .await
+            .unwrap();
+        ledger
+            .abandon_local_operation(&ready.reservation_id, "drop-before-promotion", 3)
+            .await
+            .unwrap();
+        let promoted = ledger
+            .reserve(request("abandoned-promoted", plans))
+            .await
+            .unwrap();
+        let executing = ledger
+            .promote(
+                &promoted.reservation_id,
+                promoted.version,
+                plan(MediaDimension::LocalCpuJobsGlobal, 1, None),
+                4,
+            )
+            .await
+            .unwrap();
+        ledger
+            .abandon_local_operation(&executing.reservation_id, "drop-after-promotion", 5)
+            .await
+            .unwrap();
+        let (ready_rows,cpu,queued)=db.read(|conn|Ok((
+            conn.query_row("SELECT COUNT(*) FROM media_execution_ready",[],|r|row_u64(r,0))?,
+            conn.query_row("SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='local_cpu_jobs_global'",[],|r|row_u64(r,0))?,
+            conn.query_row("SELECT COALESCE(SUM(charged),0) FROM media_resource_counters WHERE dimension='queued_operations_global'",[],|r|row_u64(r,0))?,
+        ))).await.unwrap();
+        assert_eq!((ready_rows, cpu, queued), (0, 0, 0));
     }
 
     #[tokio::test]

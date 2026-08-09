@@ -503,10 +503,40 @@ pub(super) async fn finish_attachment_upload_admitted(
         .media_reservation
         .take()
         .ok_or_else(|| internal("attachment upload is missing its durable media reservation"))?;
+    struct AbandonOnDrop {
+        ledger: crate::media_reservation::MediaReservationLedger,
+        reservation_id: Option<String>,
+        wall_ms: u64,
+    }
+    impl Drop for AbandonOnDrop {
+        fn drop(&mut self) {
+            let Some(id) = self.reservation_id.take() else {
+                return;
+            };
+            let ledger = self.ledger.clone();
+            let wall_ms = self.wall_ms;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = ledger
+                        .abandon_local_operation(
+                            &id,
+                            &format!("abandoned-upload-destroyed:{id}"),
+                            wall_ms,
+                        )
+                        .await;
+                });
+            }
+        }
+    }
     let wall_ms = chrono::Utc::now()
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
+    let mut abandon = AbandonOnDrop {
+        ledger: ctx.media_ledger.clone(),
+        reservation_id: Some(receipt.reservation_id.clone()),
+        wall_ms,
+    };
     let config_root = state
         .attached
         .as_ref()
@@ -538,6 +568,9 @@ pub(super) async fn finish_attachment_upload_admitted(
         return Err(internal(error));
     }
     let executing = loop {
+        if ctx.media_ledger.clock_now_ms() >= receipt.deadline_monotonic_ms {
+            return Err(bad_request("attachment media execution deadline expired"));
+        }
         match ctx
             .media_ledger
             .claim_ready_fair(&receipt.reservation_id, execution_plan.clone(), wall_ms)
@@ -545,7 +578,7 @@ pub(super) async fn finish_attachment_upload_admitted(
         {
             Ok(Some(value)) => break value,
             Ok(None) | Err(crate::media_reservation::LedgerError::Denied(_)) => {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             Err(error) => {
                 ctx.media_ledger
@@ -677,6 +710,7 @@ pub(super) async fn finish_attachment_upload_admitted(
                     created_at: Instant::now(),
                 },
             );
+            abandon.reservation_id = None;
             Ok(Response::AttachmentUploaded { image_ref })
         }
         proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
@@ -691,6 +725,7 @@ pub(super) async fn finish_attachment_upload_admitted(
                 )
                 .await
                 .map_err(internal)?;
+            abandon.reservation_id = None;
             response
         }
     }
@@ -845,7 +880,12 @@ pub(super) async fn claim_message_image_refs_admitted(
         .await
     {
         release_message_image_refs(state, client_submission_id, refs);
-        return Err(internal(error));
+        return Err(match error {
+            crate::media_reservation::LedgerError::Denied(_) => {
+                bad_request("attachments exceed aggregate decoded media resource policy")
+            }
+            other => internal(other),
+        });
     }
     Ok(images)
 }

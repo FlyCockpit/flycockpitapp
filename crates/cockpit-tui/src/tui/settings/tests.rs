@@ -960,11 +960,26 @@ fn render_all_non_provider_pointer_surface_variants() {
     // Render each standalone root child explicitly. Surface coverage must be
     // owned by this acceptance run, never inherited accidentally from some
     // earlier test that happened to execute on the same thread-local worker.
-    for title in ["Tools", "Skills", "MCP", "LSP"] {
+    for (title, expected_surface) in [
+        ("Tools", SettingsPointerSurfaceKind::Tools),
+        ("Skills", SettingsPointerSurfaceKind::Skills),
+        ("MCP", SettingsPointerSurfaceKind::Mcp),
+        ("LSP", SettingsPointerSurfaceKind::Lsp),
+    ] {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_root_node(&mut d, title);
         let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(
+            actual_surface, expected_surface,
+            "rendered {title} source page"
+        );
+        // Keep the acceptance recorder tied to the verified source page in
+        // addition to the production render hook. This makes the fixture
+        // deterministic under the parallel libtest harness instead of
+        // relying on a render-hook thread-local surviving the draw closure.
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
     }
 
     // Harnesses: list, add-name editor, harness editor, field editor.

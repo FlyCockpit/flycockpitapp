@@ -664,7 +664,7 @@ pub struct Driver {
     /// session (the client re-attaches), so re-firing on the abandoned old
     /// session would loop. Reset would only matter across sessions, and each
     /// session gets its own driver.
-    auto_compacted: bool,
+    auto_compact_gate: AutoCompactGate,
     /// Rolling effectiveness ledger of recent **auto** prunes at the root
     /// frame, for the escalate-to-compaction policy
     /// (implementation note). Each entry is one auto-prune
@@ -1340,7 +1340,7 @@ impl Driver {
             appended_hints: self.appended_hints.clone(),
             emitted_command_capability_notices: self.emitted_command_capability_notices.clone(),
             prune_watermark: self.prune_watermark.clone(),
-            auto_compacted: self.auto_compacted,
+            auto_compact_gate: self.auto_compact_gate.clone(),
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
             shadow_brief_generation: 0,
@@ -1650,7 +1650,7 @@ impl Driver {
             appended_hints: std::collections::HashSet::new(),
             emitted_command_capability_notices: HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
-            auto_compacted: false,
+            auto_compact_gate: AutoCompactGate::default(),
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
             shadow_brief_generation: 0,

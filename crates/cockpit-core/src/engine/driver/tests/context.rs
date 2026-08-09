@@ -2296,7 +2296,7 @@ async fn compact_tail_prompt_uses_durable_session_event_seqs() {
 async fn request_compact_honored_at_safe_boundary() {
     let (mut driver, _tmp) = test_driver(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-    driver.auto_compacted = true;
+    driver.auto_compact_gate = AutoCompactGate::Committed { activity_epoch: 0 };
     driver.session.request_agent_compact();
 
     assert!(

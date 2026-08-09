@@ -1,5 +1,52 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::engine::driver) struct BoundaryKey {
+    activity_epoch: u64,
+    coverage: PreparedCompactionCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::engine::driver) enum AutoCompactGate {
+    Eligible { activity_epoch: u64 },
+    BoundarySuppressed { key: BoundaryKey },
+    UntilActivity { activity_epoch: u64, reason: String },
+    Committed { activity_epoch: u64 },
+}
+
+impl Default for AutoCompactGate {
+    fn default() -> Self {
+        Self::Eligible { activity_epoch: 0 }
+    }
+}
+
+impl AutoCompactGate {
+    fn activity_epoch(&self) -> u64 {
+        match self {
+            Self::Eligible { activity_epoch }
+            | Self::UntilActivity { activity_epoch, .. }
+            | Self::Committed { activity_epoch } => *activity_epoch,
+            Self::BoundarySuppressed { key } => key.activity_epoch,
+        }
+    }
+
+    fn is_committed_current(&self) -> bool {
+        matches!(self, Self::Committed { activity_epoch } if *activity_epoch == self.activity_epoch())
+    }
+
+    fn mark_committed(&mut self) {
+        *self = Self::Committed {
+            activity_epoch: self.activity_epoch(),
+        };
+    }
+
+    pub(in crate::engine::driver) fn external_activity(&mut self) {
+        *self = Self::Eligible {
+            activity_epoch: self.activity_epoch().wrapping_add(1),
+        };
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreparedCompactionCoverage {
     pub history_len: usize,
@@ -759,7 +806,10 @@ impl Driver {
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> bool {
-        if !self.at_safe_boundary() || self.stack.len() != 1 || self.auto_compacted {
+        if !self.at_safe_boundary()
+            || self.stack.len() != 1
+            || self.auto_compact_gate.is_committed_current()
+        {
             return false;
         }
         self.settle_shadow_brief().await;
@@ -893,7 +943,7 @@ impl Driver {
         // on this (now-abandoned) session would loop. Agent-requested compact
         // above intentionally bypasses this auto-trigger latch, matching manual
         // `/compact` semantics.
-        if self.auto_compacted {
+        if self.auto_compact_gate.is_committed_current() {
             return false;
         }
         let ctx_cfg = self.resolve_context_config();
@@ -923,7 +973,6 @@ impl Driver {
         {
             return false;
         }
-        self.auto_compacted = true;
         self.do_compact_with_source(tx, "auto").await;
         true
     }
@@ -1238,6 +1287,7 @@ impl Driver {
         }
 
         self.session.reset_compact_self_nudge_latch();
+        self.auto_compact_gate.mark_committed();
         let _ = tx
             .send(TurnEvent::CompactReady {
                 new_session_id: self.session.id,

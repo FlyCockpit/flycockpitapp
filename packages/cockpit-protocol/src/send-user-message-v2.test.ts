@@ -20,6 +20,15 @@ const fromHex = (value: string) =>
   Uint8Array.from(value.match(/../g)!, (pair) => Number.parseInt(pair, 16));
 const toHex = (value: Uint8Array) =>
   Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+function exactError(action: () => unknown): string {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return (error as Error).message;
+  }
+  throw new Error("expected action to throw");
+}
 function compactBytes(vector: {
   segments?: { hex: string; repeat: number }[];
   prefix_hex?: string;
@@ -73,9 +82,10 @@ describe("send_user_message_v2_canonical_vectors", () => {
       else if (testCase.mutation === "invalid_skill") value.request.forced_skill = "bad/skill";
       else if (testCase.mutation === "multibyte_tool")
         value.request.tag_expansions[0].tool = "é".repeat(65);
-      expect(() => encodeCanonicalSendUserMessageV2(value), testCase.name).toThrow(
-        testCase.error_code,
-      );
+      expect(
+        exactError(() => encodeCanonicalSendUserMessageV2(value)),
+        testCase.name,
+      ).toBe(testCase.error_code);
     }
   });
 
@@ -160,13 +170,19 @@ describe("send_user_message_v2_canonical_vectors", () => {
     expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many attachments");
     maximum.request.attachments.pop();
     maximum.request.tag_expansions[0]!.tool += "t";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_tag_tool_too_long");
+    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+      "fcm2_tag_tool_too_long",
+    );
     maximum.request.tag_expansions[0]!.tool = "t";
     maximum.request.tag_expansions[0]!.path += "p";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_tag_path_too_long");
+    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+      "fcm2_tag_path_too_long",
+    );
     maximum.request.tag_expansions[0]!.path = "p";
     maximum.request.forced_skill += "s";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_forced_skill_too_long");
+    expect(exactError(() => encodeCanonicalSendUserMessageV2(maximum))).toBe(
+      "fcm2_forced_skill_too_long",
+    );
     expect(() => validateFcm2Length(FCM2_MAX_BYTES + 1)).toThrow(/maximum/);
   });
 });

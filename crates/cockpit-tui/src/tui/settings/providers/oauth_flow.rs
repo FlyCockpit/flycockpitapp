@@ -660,6 +660,19 @@ pub(super) fn render_oauth_body(
     }
 }
 
+pub(super) fn render_oauth_body_with_controls(
+    lines: &mut Vec<Line<'static>>,
+    flow: OAuthFlowView<'_>,
+    host: OAuthHost,
+) -> Vec<(usize, usize)> {
+    let mut controls = Vec::new();
+    match flow {
+        OAuthFlowView::Copilot(s) => render_copilot_body(lines, s),
+        OAuthFlowView::OAuth(s) => render_provider_oauth(lines, s, host, Some(&mut controls)),
+    }
+    controls
+}
+
 pub(super) fn handle_oauth_flow_key(
     key: KeyEvent,
     s: &mut OAuthFlowState,

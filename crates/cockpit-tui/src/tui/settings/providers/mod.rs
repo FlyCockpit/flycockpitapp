@@ -37,6 +37,7 @@ pub(crate) use oauth_flow::{
 use oauth_flow::{
     OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend,
     oauth_setup_lines, oauth_setup_lines_with_controls, render_oauth_body,
+    render_oauth_body_with_controls,
 };
 
 use chrono::Utc;
@@ -3041,11 +3042,11 @@ impl SettingsCx {
                     Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::default());
-                render_oauth_body(
+                controls.extend(render_oauth_body_with_controls(
                     &mut lines,
                     OAuthFlowView::OAuth(state),
                     OAuthHost::AddWizard,
-                );
+                ));
             }
             Some("test-key-choice") => {
                 lines.push(Line::from(Span::styled(
@@ -3127,7 +3128,10 @@ impl SettingsCx {
             .flatten()
             .map(OAuthFlowView::OAuth);
         if oauth_flow.is_some() {
-            lines = wrap_oauth_render_lines(lines, area.width);
+            let (wrapped, remapped) =
+                wrap_oauth_render_lines_with_controls(lines, controls, area.width);
+            lines = wrapped;
+            controls = remapped;
         }
         let link_regions = oauth_flow
             .and_then(|flow| prepare_oauth_link_regions(&mut lines, area, flow, links.as_deref()))
@@ -4432,6 +4436,17 @@ impl SettingsPage for ProvidersPage {
                     state.headers.cursor = index;
                 }
                 Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
+                Some("grok-oauth" | "codex-oauth")
+                    if state.oauth_auth.as_ref().is_some_and(|oauth| {
+                        !oauth.paste_focused && index < oauth.option_count(OAuthHost::AddWizard)
+                    }) =>
+                {
+                    state
+                        .oauth_auth
+                        .as_mut()
+                        .expect("guarded OAuth state")
+                        .cursor = index;
+                }
                 Some("id" | "url" | "api-key" | "env-var") => return Nav::Stay,
                 _ => return Nav::Stay,
             },
@@ -4578,6 +4593,15 @@ impl SettingsPage for ProvidersPage {
                         Some("test-key-choice") => {
                             state.test_choice_cursor =
                                 state.test_choice_cursor.saturating_add_signed(delta).min(1);
+                        }
+                        Some("grok-oauth" | "codex-oauth") => {
+                            if let Some(oauth) = state.oauth_auth.as_mut()
+                                && !oauth.paste_focused
+                            {
+                                let last =
+                                    oauth.option_count(OAuthHost::AddWizard).saturating_sub(1);
+                                oauth.cursor = oauth.cursor.saturating_add_signed(delta).min(last);
+                            }
                         }
                         _ => {}
                     }

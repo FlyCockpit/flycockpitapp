@@ -110,6 +110,28 @@ pub struct MessageAttachmentReceiptIdentity {
     pub kind: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReceiptStatus {
+    pub operation_id: [u8; 16],
+    pub client_submission_id: [u8; 16],
+    pub actor_kind: String,
+    pub actor_generation: u64,
+    pub request_hash: [u8; 32],
+    pub message_request_digest: [u8; 32],
+    pub state: String,
+    pub safe_outcome: MessageSafeOutcome,
+    pub message_seq: Option<i64>,
+    pub fold_ordinal: Option<i64>,
+    pub attachments: Vec<MessageAttachmentReceiptIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedMessageQueueRow {
+    pub queue_item_id: [u8; 16],
+    pub client_submission_id: [u8; 16],
+    pub canonical_message: Vec<u8>,
+}
+
 /// Prerequisite integrations invoked while the one SQLite writer transaction
 /// is open. Remote implementations reserve the FCOR ledger/outbox row here;
 /// local-owner implementations only recheck attachment/model admission.
@@ -182,6 +204,38 @@ impl Db {
                 Ok(MessageAttachmentReceiptIdentity { client_submission_id: submission, ordinal: row.get::<_,i64>(0)? as u8, attachment_id: attachment_id.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, attachment_version: u64::from_be_bytes(version.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?), checksum: checksum.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, kind: row.get(4)? })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }).await
+    }
+
+    pub async fn accepted_message_queue(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<AcceptedMessageQueueRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare("SELECT queue_item_id,client_submission_id,canonical_message FROM message_queue_items WHERE session_id=?1 AND state='accepted' ORDER BY created_at,queue_item_id")?;
+            let rows = stmt.query_map([session_id.to_string()], |row| {
+                let queue: Vec<u8> = row.get(0)?; let submission: Vec<u8> = row.get(1)?;
+                Ok(AcceptedMessageQueueRow { queue_item_id: queue.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, client_submission_id: submission.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, canonical_message: row.get(2)? })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }).await
+    }
+
+    pub async fn message_receipt_status(
+        &self,
+        session_id: Uuid,
+        operation_id: [u8; 16],
+    ) -> Result<Option<MessageReceiptStatus>> {
+        self.read(move |conn| {
+            let row = conn.query_row("SELECT o.client_submission_id,o.actor_kind,o.actor_generation,o.request_hash,o.message_request_digest,o.state,o.safe_outcome,s.message_seq,s.fold_ordinal FROM message_operation_receipts o JOIN message_submission_receipts s ON s.session_id=o.session_id AND s.operation_id=o.operation_id WHERE o.session_id=?1 AND o.operation_id=?2", params![session_id.to_string(),operation_id.as_slice()], |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,Vec<u8>>(3)?,row.get::<_,Vec<u8>>(4)?,row.get::<_,String>(5)?,row.get::<_,Vec<u8>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,Option<i64>>(8)?))).optional()?;
+            let Some((submission,actor_kind,generation,request_hash,message_digest,state,outcome,message_seq,fold_ordinal)) = row else { return Ok(None); };
+            let submission: [u8;16] = submission.try_into().map_err(|_| anyhow::anyhow!("invalid stored submission id"))?;
+            let mut stmt = conn.prepare("SELECT ordinal,attachment_id,attachment_version,checksum,kind FROM message_attachment_references WHERE session_id=?1 AND client_submission_id=?2 ORDER BY ordinal")?;
+            let attachments = stmt.query_map(params![session_id.to_string(),submission.as_slice()], |row| {
+                let id:Vec<u8>=row.get(1)?;let version:Vec<u8>=row.get(2)?;let checksum:Vec<u8>=row.get(3)?;
+                Ok(MessageAttachmentReceiptIdentity { client_submission_id:submission, ordinal:row.get::<_,i64>(0)? as u8, attachment_id:id.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?, attachment_version:u64::from_be_bytes(version.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?), checksum:checksum.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?, kind:row.get(4)? })
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Some(MessageReceiptStatus { operation_id, client_submission_id:submission, actor_kind, actor_generation:u64::from_be_bytes(generation.try_into().map_err(|_|anyhow::anyhow!("invalid stored actor generation"))?), request_hash:request_hash.try_into().map_err(|_|anyhow::anyhow!("invalid stored request hash"))?, message_request_digest:message_digest.try_into().map_err(|_|anyhow::anyhow!("invalid stored message digest"))?, state, safe_outcome:MessageSafeOutcome::decode(&outcome)?, message_seq, fold_ordinal, attachments }))
         }).await
     }
 }
@@ -409,6 +463,17 @@ mod tests {
                 .len(),
             1
         );
+        let queue = db.accepted_message_queue(session.session_id).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].canonical_message, b"FCM2");
+        let status = db
+            .message_receipt_status(session.session_id, original.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.actor_kind, "local_owner");
+        assert_eq!(status.actor_generation, 0);
+        assert_eq!(status.attachments[0].attachment_version, u64::MAX);
         assert!(
             db.terminate_accepted_message(
                 session.session_id,

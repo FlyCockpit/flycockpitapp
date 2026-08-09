@@ -33,6 +33,17 @@ export function consumeStepUp(
     throw new Error("remote_admin_step_up_scope_mismatch");
   row.consumedAt = now;
 }
+export function assertCeremonyRetryScope(
+  ceremony: { kind: string; principalId: string; sessionId: string | null },
+  expected: { kinds: readonly string[]; principalId: string; sessionId?: string },
+) {
+  if (
+    !expected.kinds.includes(ceremony.kind) ||
+    ceremony.principalId !== expected.principalId ||
+    (expected.sessionId !== undefined && ceremony.sessionId !== expected.sessionId)
+  )
+    throw new Error("remote_admin_ceremony_retry_scope_mismatch");
+}
 
 export type CounterState = {
   lastAcceptedSignCount: bigint;

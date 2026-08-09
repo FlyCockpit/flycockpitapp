@@ -29,6 +29,7 @@ import {
 } from "./orgs";
 import { classifyRemotePolicyRevision } from "./remote-admin-policy";
 import { REMOTE_ADMIN_ACTIONS, roleCanStartAction } from "./remote-admin-roles";
+import { assertCeremonyRetryScope } from "./remote-admin-state";
 import {
   approvalChallenge,
   REMOTE_ADMIN_CEREMONY_TTL_MS,
@@ -1026,14 +1027,18 @@ export const enterpriseRouter = {
         where: { id: input.challengeId },
         include: { EnterpriseOrg: { include: { RemoteAdminRegistry: true } } },
       });
-      if (
-        ceremony &&
-        (ceremony.kind !== "APPROVAL" ||
-          ceremony.orgId === null ||
-          ceremony.principalId !== context.session.user.id ||
-          ceremony.sessionId !== context.session.session.id)
-      )
-        throw new ORPCError("UNAUTHORIZED", { message: "Approval ceremony scope is invalid." });
+      if (ceremony) {
+        try {
+          assertCeremonyRetryScope(ceremony, {
+            kinds: ["APPROVAL"],
+            principalId: context.session.user.id,
+            sessionId: context.session.session.id,
+          });
+          if (ceremony.orgId === null) throw new Error("missing_org");
+        } catch {
+          throw new ORPCError("UNAUTHORIZED", { message: "Approval ceremony scope is invalid." });
+        }
+      }
       if (ceremony?.consumedAt && ceremony.committedResult) {
         if (
           !ceremony.committedDigest ||
@@ -1367,13 +1372,16 @@ export const enterpriseRouter = {
       const ceremony = await prisma.remoteAdminCeremony.findUnique({
         where: { id: input.challengeId },
       });
-      if (
-        ceremony &&
-        (ceremony.kind !== "OWNER_BOOTSTRAP" ||
-          ceremony.principalId !== context.session.user.id ||
-          ceremony.sessionId !== context.session.session.id)
-      )
-        throw new ORPCError("UNAUTHORIZED", { message: "Owner bootstrap scope is invalid." });
+      if (ceremony)
+        try {
+          assertCeremonyRetryScope(ceremony, {
+            kinds: ["OWNER_BOOTSTRAP"],
+            principalId: context.session.user.id,
+            sessionId: context.session.session.id,
+          });
+        } catch {
+          throw new ORPCError("UNAUTHORIZED", { message: "Owner bootstrap scope is invalid." });
+        }
       if (ceremony?.consumedAt && ceremony.committedResult) {
         if (
           !ceremony.committedDigest ||
@@ -1582,13 +1590,16 @@ export const enterpriseRouter = {
         where: { id: input.challengeId },
         include: { EnterpriseOrg: { include: { RemoteAdminRegistry: true } } },
       });
-      if (
-        ceremony &&
-        (ceremony.principalId !== context.session.user.id ||
-          ceremony.nomineeId !== context.session.user.id ||
-          !["SECURITY_ADMIN_BOOTSTRAP", "REGISTRATION"].includes(ceremony.kind))
-      )
-        throw new ORPCError("UNAUTHORIZED", { message: "Security bootstrap scope is invalid." });
+      if (ceremony)
+        try {
+          assertCeremonyRetryScope(ceremony, {
+            kinds: ["SECURITY_ADMIN_BOOTSTRAP", "REGISTRATION"],
+            principalId: context.session.user.id,
+          });
+          if (ceremony.nomineeId !== context.session.user.id) throw new Error("wrong_nominee");
+        } catch {
+          throw new ORPCError("UNAUTHORIZED", { message: "Security bootstrap scope is invalid." });
+        }
       if (ceremony?.consumedAt && ceremony.committedResult) {
         if (
           !ceremony.committedDigest ||

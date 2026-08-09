@@ -10,6 +10,7 @@ import {
   roleCanStartAction,
 } from "./remote-admin-roles";
 import {
+  assertCeremonyRetryScope,
   consumeStepUp,
   evaluateAndAdvanceCounter,
   RECOVERY_COOLING_DEFAULT_SECONDS,
@@ -84,6 +85,30 @@ describe("remote_admin_roles_corrected_tests_first", () => {
 });
 
 describe("remote_admin_step_up_scope", () => {
+  it("denies exact-retry result disclosure across principals and sessions", () => {
+    const ceremony = { kind: "APPROVAL", principalId: "owner", sessionId: "session-a" };
+    expect(() =>
+      assertCeremonyRetryScope(ceremony, {
+        kinds: ["APPROVAL"],
+        principalId: "owner",
+        sessionId: "session-a",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertCeremonyRetryScope(ceremony, {
+        kinds: ["APPROVAL"],
+        principalId: "attacker",
+        sessionId: "session-a",
+      }),
+    ).toThrow("scope_mismatch");
+    expect(() =>
+      assertCeremonyRetryScope(ceremony, {
+        kinds: ["APPROVAL"],
+        principalId: "owner",
+        sessionId: "session-b",
+      }),
+    ).toThrow("scope_mismatch");
+  });
   it("binds five minute step-up to exact scope and consumes once", () => {
     const row = {
       id: "opaque",

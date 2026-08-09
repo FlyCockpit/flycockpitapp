@@ -321,10 +321,10 @@ impl MediaReservationLedger {
         let journal = journal_operation_id.to_owned();
         let now = self.clock.now_ms();
         self.db.transaction(move |conn| {
-            let(state,version,sequence,deadline,project,session)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?,r.get(4)?,r.get(5)?)))?;
+            let(state,version,sequence,deadline,project,session)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?;
             ensure_unblocked(conn,&session)?;if now>=deadline{return Err(anyhow!("deadline_expired"));}if version!=expected_version{return Err(anyhow!("stale_version"));}
             if !ReservationState::parse(&state)?.allows(ReservationState::DispatchingExternal){return Err(anyhow!("invalid_transition"));}
-            let(journal_owner,journal_state):(String,String)=conn.query_row("SELECT owner_session_id,state FROM external_journal_operations WHERE operation_id=?1",[&journal],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or_else(||anyhow!("external_journal_required"))?;
+            let(journal_owner,journal_state):(String,String)=conn.query_row("SELECT owner_session_id,state FROM external_journal_operations WHERE operation_id=?1",[&journal],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?.ok_or_else(||anyhow!("external_journal_required"))?;
             if journal_owner!=session{return Err(anyhow!("external_journal_owner_mismatch"));}if journal_state!="prepared"{return Err(anyhow!("external_journal_not_prepared"));}
             let owner=MediaOwner{project_id:project,session_id:session};release_queued(conn,&id,&owner,version+1,wall_ms)?;
             for plan in &handoff_plans{if !matches!(plan.scope_policy.charge,MediaCharge::AcceptedOrPossiblyAccepted|MediaCharge::AtHandoff){return Err(anyhow!("invalid_handoff_plan"));}acquire_plan(conn,&id,&owner,plan,version+1,wall_ms)?;}
@@ -346,7 +346,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let now = self.clock.now_ms();
         self.db.transaction(move |conn| {
-            let (state, version, deadline, project, session, sequence) = conn.query_row("SELECT state,version,deadline_monotonic_ms,project_id,owner_session_key,queue_sequence FROM media_reservations WHERE reservation_id=?1", [&id], |r| Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,r.get(3)?,r.get(4)?,row_u64(r,5)?)))?;
+            let (state, version, deadline, project, session, sequence) = conn.query_row("SELECT state,version,deadline_monotonic_ms,project_id,owner_session_key,queue_sequence FROM media_reservations WHERE reservation_id=?1", [&id], |r| Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,row_u64(r,5)?)))?;
             if version != expected_version { return Err(anyhow!("stale_version")); }
             if ReservationState::parse(&state)? != ReservationState::ReservedQueued { return Err(anyhow!("invalid_transition")); }
             if now >= deadline { return Err(anyhow!("deadline_expired")); }
@@ -369,7 +369,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let now = self.clock.now_ms();
         let cancellation_id = id.clone();
-        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;conn.execute("UPDATE media_reservations SET state='cancellation_requested',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
+        let cancelled=self.db.transaction(move|conn|{let(state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&cancellation_id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;if version!=expected_version{return Err(anyhow!("stale_version"));}if now<deadline{return Err(anyhow!("invalid_transition"));}let current=ReservationState::parse(&state)?;if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal){return Err(anyhow!("invalid_transition"));}let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;conn.execute("UPDATE media_reservations SET state='cancellation_requested',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,cancellation_id])?;Ok(ReservationReceipt{reservation_id:cancellation_id,state:ReservationState::CancellationRequested,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})}).await.map_err(classify_storage_error)?;
         let cleanup_checksum = cleanup
             .kill_reap_and_cleanup(&id)
             .map_err(LedgerError::Storage)?;
@@ -396,7 +396,7 @@ impl MediaReservationLedger {
         let id = id.to_owned();
         let dimension_name = dimension_name(dimension);
         self.db.transaction(move |conn| {
-            let (state,version,project,session,sequence,deadline)=conn.query_row("SELECT state,version,project_id,owner_session_key,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,r.get(2)?,r.get(3)?,row_u64(r,4)?,row_u64(r,5)?)))?;
+            let (state,version,project,session,sequence,deadline)=conn.query_row("SELECT state,version,project_id,owner_session_key,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,row_u64(r,4)?,row_u64(r,5)?)))?;
             if version != expected_version { return Err(anyhow!("stale_version")); }
             let estimated=conn.query_row("SELECT COALESCE(MAX(estimated),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension=?2",params![id,dimension_name],|r|row_u64(r,0))?;
             let owner=MediaOwner{project_id:project,session_id:session} ;
@@ -450,7 +450,7 @@ impl MediaReservationLedger {
     ) -> Result<ReservationReceipt, LedgerError> {
         let id = id.to_owned();
         self.db.transaction(move |conn| {
-            let (state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;
+            let (state,version,sequence,deadline)=conn.query_row("SELECT state,version,queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,row_u64(r,2)?,row_u64(r,3)?)))?;
             if version!=expected_version{return Err(anyhow!("stale_version"));}
             let current=ReservationState::parse(&state)?;
             if current!=ReservationState::Settling&&!current.allows(ReservationState::Settling){return Err(anyhow!("invalid_transition"));}
@@ -514,7 +514,7 @@ impl MediaReservationLedger {
         if tombstone.is_empty() {
             return Err(LedgerError::Storage(anyhow!("deletion tombstone required")));
         }
-        self.db.transaction(move|conn|{let (stored,prior):(String,Option<String>)=conn.query_row("SELECT checksum,deletion_tombstone_checksum FROM media_artifact_facts WHERE artifact_id=?1",[&artifact],|r|Ok((r.get(0)?,r.get(1)?)))?;if stored!=expected{return Err(anyhow!("artifact checksum mismatch"));}if let Some(prior)=prior{if prior==tombstone{return Ok(());}return Err(anyhow!("deletion tombstone conflict"));}conn.execute("UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE artifact_id=?2 AND deletion_tombstone_checksum IS NULL",params![tombstone,artifact])?;Ok(())}).await.map_err(LedgerError::Storage)
+        self.db.transaction(move|conn|{let (stored,prior):(String,Option<String>)=conn.query_row("SELECT checksum,deletion_tombstone_checksum FROM media_artifact_facts WHERE artifact_id=?1",[&artifact],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?;if stored!=expected{return Err(anyhow!("artifact checksum mismatch"));}if let Some(prior)=prior{if prior==tombstone{return Ok(());}return Err(anyhow!("deletion tombstone conflict"));}conn.execute("UPDATE media_artifact_facts SET deletion_tombstone_checksum=?1 WHERE artifact_id=?2 AND deletion_tombstone_checksum IS NULL",params![tombstone,artifact])?;Ok(())}).await.map_err(LedgerError::Storage)
     }
 
     pub async fn publication_allowed(&self, reservation_id: &str) -> Result<bool, LedgerError> {
@@ -565,7 +565,7 @@ impl MediaReservationLedger {
     pub async fn next_fair_candidate(&self) -> Result<Option<String>, LedgerError> {
         self.db.transaction(|conn| {
             let last:Option<String>=conn.query_row("SELECT last_session_id FROM media_scheduler_cursor WHERE singleton=1",[],|r|r.get(0))?;
-            let candidate:Option<(String,String)>=conn.query_row("WITH heads AS (SELECT owner_session_key,MIN(queue_sequence) sequence FROM media_reservations WHERE state='reserved_queued' GROUP BY owner_session_key) SELECT h.owner_session_key,r.reservation_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",[last.as_deref().unwrap_or("")],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let candidate:Option<(String,String)>=conn.query_row("WITH heads AS (SELECT owner_session_key,MIN(queue_sequence) sequence FROM media_reservations WHERE state='reserved_queued' GROUP BY owner_session_key) SELECT h.owner_session_key,r.reservation_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",[last.as_deref().unwrap_or("")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
             if let Some((session,id))=candidate{conn.execute("UPDATE media_scheduler_cursor SET last_session_id=?1 WHERE singleton=1",[session])?;Ok(Some(id))}else{Ok(None)}
         }).await.map_err(LedgerError::Storage)
     }
@@ -1252,8 +1252,10 @@ mod tests {
                 let mut s = conn.prepare(
                     "SELECT dimension,charged FROM media_resource_counters ORDER BY dimension",
                 )?;
-                Ok(s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?)
+                Ok(
+                    s.query_map([], |r| Ok((r.get::<_, String>(0)?, row_u64(r, 1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                )
             })
             .await
             .unwrap();

@@ -112,6 +112,12 @@ model RemoteAdminRegistry {
   recoveryProposalTtlSeconds   Int                            @default(604800)
   recoveryGovernanceDigest     Bytes?
   recoveryGovernanceEvidence   Bytes?
+  remoteMinimumProtocolVersion Int                            @default(1)
+  remoteMinimumKeyBits         Int                            @default(256)
+  remoteSessionTtlSeconds      Int                            @default(300)
+  remoteAttemptGrantTtlSeconds Int                            @default(60)
+  remoteRequireDeviceTrust     Boolean                        @default(true)
+  remoteRequireDaemonTrust     Boolean                        @default(true)
   createdAt                    DateTime                       @default(now())
   updatedAt                    DateTime                       @updatedAt
   EnterpriseOrg                EnterpriseOrg                  @relation(fields: [orgId], references: [id], onDelete: Cascade)

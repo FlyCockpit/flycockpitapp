@@ -33,6 +33,7 @@ import {
   approvalChallenge,
   REMOTE_ADMIN_CEREMONY_TTL_MS,
   verifyRemoteAdminAssertion,
+  verifyRemoteAdminRegistration,
 } from "./remote-admin-webauthn";
 
 const orgIdInput = z.object({ orgId: z.string().min(1) });
@@ -49,6 +50,34 @@ const remotePolicyStrengthSchema = z.object({
   requireDeviceTrust: z.boolean(),
   requireDaemonTrust: z.boolean(),
 });
+const storedRemotePolicy = (registry: {
+  remoteMinimumProtocolVersion: number;
+  remoteMinimumKeyBits: number;
+  remoteSessionTtlSeconds: number;
+  remoteAttemptGrantTtlSeconds: number;
+  remoteRequireDeviceTrust: boolean;
+  remoteRequireDaemonTrust: boolean;
+}) => ({
+  minimumProtocolVersion: registry.remoteMinimumProtocolVersion,
+  minimumKeyBits: registry.remoteMinimumKeyBits,
+  sessionTtlSeconds: registry.remoteSessionTtlSeconds,
+  attemptGrantTtlSeconds: registry.remoteAttemptGrantTtlSeconds,
+  requireDeviceTrust: registry.remoteRequireDeviceTrust,
+  requireDaemonTrust: registry.remoteRequireDaemonTrust,
+});
+const remotePolicyDigest = (policy: z.infer<typeof remotePolicyStrengthSchema>) =>
+  createHash("sha256")
+    .update(
+      JSON.stringify({
+        attemptGrantTtlSeconds: policy.attemptGrantTtlSeconds,
+        minimumKeyBits: policy.minimumKeyBits,
+        minimumProtocolVersion: policy.minimumProtocolVersion,
+        requireDaemonTrust: policy.requireDaemonTrust,
+        requireDeviceTrust: policy.requireDeviceTrust,
+        sessionTtlSeconds: policy.sessionTtlSeconds,
+      }),
+    )
+    .digest();
 const uuidBytes = (uuid: string) => new Uint8Array(Buffer.from(uuid.replaceAll("-", ""), "hex"));
 const u64Bytes = (value: bigint) => {
   const bytes = new Uint8Array(8);
@@ -90,17 +119,10 @@ export const enterpriseRouter = {
       }),
     )
     .handler(async ({ input }) => {
-      const classification = classifyRemotePolicyRevision(input.current, input.proposed);
-      // Until the signer-owned policy snapshot is available here, policy operation 4
-      // is conservatively dual-controlled. Never let caller-supplied comparison data
-      // downgrade the approval cardinality.
-      const expectedCount = 2;
-      if (input.approvalIds.length !== expectedCount)
-        throw new ORPCError("PRECONDITION_FAILED", {
-          message: "Policy approval cardinality is invalid.",
-        });
       const now = new Date(),
         digest = base64urlBytes(input.canonicalRequestDigest, 32);
+      if (!remotePolicyDigest(input.proposed).equals(Buffer.from(digest)))
+        throw new ORPCError("BAD_REQUEST", { message: "Remote policy digest is not canonical." });
       return prisma.$transaction(
         async (tx) => {
           const registry = await tx.remoteAdminRegistry.findUnique({
@@ -108,6 +130,15 @@ export const enterpriseRouter = {
           });
           if (!registry)
             throw new ORPCError("NOT_FOUND", { message: "Remote policy registry not found." });
+          const current = storedRemotePolicy(registry);
+          if (JSON.stringify(input.current) !== JSON.stringify(current))
+            throw new ORPCError("CONFLICT", { message: "Remote policy snapshot is stale." });
+          const classification = classifyRemotePolicyRevision(current, input.proposed);
+          const expectedCount = classification === "weakening" ? 2 : 1;
+          if (input.approvalIds.length !== expectedCount)
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Policy approval cardinality is invalid.",
+            });
           const approvals = await tx.remoteAdminApproval.findMany({
             where: {
               id: { in: input.approvalIds },
@@ -125,12 +156,17 @@ export const enterpriseRouter = {
               message: "Current policy approval is required.",
             });
           if (
-            approvals[0]!.principalId === approvals[1]!.principalId ||
-            !approvals.some((approval) => approval.role === "OWNER") ||
-            !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
+            classification === "weakening" &&
+            (approvals[0]!.principalId === approvals[1]!.principalId ||
+              !approvals.some((approval) => approval.role === "OWNER") ||
+              !approvals.some((approval) => approval.role === "SECURITY_ADMIN"))
           ) {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Dual policy approval is invalid.",
+            });
+          } else if (classification !== "weakening" && approvals[0]!.role !== "SECURITY_ADMIN") {
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Security administrator approval is required.",
             });
           }
           if (
@@ -142,6 +178,17 @@ export const enterpriseRouter = {
             ).count !== expectedCount
           )
             throw new ORPCError("CONFLICT", { message: "Policy approval was already consumed." });
+          await tx.remoteAdminRegistry.update({
+            where: { id: registry.id },
+            data: {
+              remoteMinimumProtocolVersion: input.proposed.minimumProtocolVersion,
+              remoteMinimumKeyBits: input.proposed.minimumKeyBits,
+              remoteSessionTtlSeconds: input.proposed.sessionTtlSeconds,
+              remoteAttemptGrantTtlSeconds: input.proposed.attemptGrantTtlSeconds,
+              remoteRequireDeviceTrust: input.proposed.requireDeviceTrust,
+              remoteRequireDaemonTrust: input.proposed.requireDaemonTrust,
+            },
+          });
           return {
             authorized: true as const,
             classification,
@@ -878,6 +925,8 @@ export const enterpriseRouter = {
         canonicalRequestDigest: z.string().max(64),
         operationEpoch: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
         policyWeakening: z.boolean().default(false),
+        currentPolicy: remotePolicyStrengthSchema.optional(),
+        proposedPolicy: remotePolicyStrengthSchema.optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -891,9 +940,6 @@ export const enterpriseRouter = {
           orgId_userId: { orgId: input.orgId, userId: context.session.user.id },
         },
       });
-      const dual = remoteAdminOperationRequiresDualControl(operation) || operation === 4;
-      if (!member || member.role === "MEMBER" || (!dual && member.role !== "SECURITY_ADMIN"))
-        throw new ORPCError("FORBIDDEN", { message: "This role cannot approve the operation." });
       const registry = await prisma.remoteAdminRegistry.findUnique({
         where: { orgId: input.orgId },
       });
@@ -901,12 +947,30 @@ export const enterpriseRouter = {
         throw new ORPCError("PRECONDITION_FAILED", {
           message: "Security administration is not activated.",
         });
+      const policyClassification =
+        operation === 4
+          ? input.currentPolicy &&
+            input.proposedPolicy &&
+            JSON.stringify(input.currentPolicy) === JSON.stringify(storedRemotePolicy(registry))
+            ? classifyRemotePolicyRevision(storedRemotePolicy(registry), input.proposedPolicy)
+            : null
+          : null;
+      if (operation === 4 && policyClassification === null)
+        throw new ORPCError("CONFLICT", {
+          message: "Authoritative policy comparison is required.",
+        });
+      if (operation === 4 && !remotePolicyDigest(input.proposedPolicy!).equals(Buffer.from(digest)))
+        throw new ORPCError("BAD_REQUEST", { message: "Remote policy digest is not canonical." });
+      const dual =
+        remoteAdminOperationRequiresDualControl(operation) || policyClassification === "weakening";
+      if (!member || member.role === "MEMBER" || (!dual && member.role !== "SECURITY_ADMIN"))
+        throw new ORPCError("FORBIDDEN", { message: "This role cannot approve the operation." });
       const nonce = randomBytes(32);
       const operationBytes = new Uint8Array([
         operation,
         ...digest,
         ...u64Bytes(epoch),
-        operation === 4 ? 1 : 0,
+        policyClassification === "weakening" ? 1 : 0,
       ]);
       const challenge = await approvalChallenge(operationBytes, nonce);
       const challengeId = randomUUID(),
@@ -923,7 +987,7 @@ export const enterpriseRouter = {
           requestPayload: {
             operation,
             operationEpoch: input.operationEpoch,
-            policyWeakening: operation === 4,
+            policyWeakening: policyClassification === "weakening",
           },
           challengeHash: createHash("sha256").update(challenge).digest(),
           challengeBytes: Buffer.from(challenge),
@@ -1238,6 +1302,8 @@ export const enterpriseRouter = {
       z.object({
         challengeId: z.string().uuid(),
         rawCredentialId: z.string().min(1).max(1400),
+        registrationAuthenticatorData: z.string().max(1400),
+        registrationClientDataJson: z.string().max(5500),
         credentialIdHash: z.string().max(64),
         publicKeySpki: z.string().max(256),
         declaredCustody: z.enum(["SYNCED_PASSKEY", "EXTERNAL_SECURITY_KEY", "UNKNOWN"]),
@@ -1322,6 +1388,15 @@ export const enterpriseRouter = {
       const principalProtocolId = randomBytes(16),
         tenantProtocolId = randomBytes(16);
       const publicOrigin = new URL(env.BETTER_AUTH_URL);
+      await verifyRemoteAdminRegistration({
+        authenticatorData: base64urlBytes(input.registrationAuthenticatorData),
+        clientDataJson: base64urlBytes(input.registrationClientDataJson),
+        rawCredentialId,
+        expectedChallenge: challenge,
+        policy: { rpId: publicOrigin.hostname, origin: publicOrigin.origin },
+        expectedP256X: p256X,
+        expectedP256Y: p256Y,
+      });
       await verifyRemoteAdminAssertion({
         assertion: {
           credentialIdHash,
@@ -1434,6 +1509,8 @@ export const enterpriseRouter = {
         challengeId: z.string().uuid(),
         accept: z.literal(true),
         rawCredentialId: z.string().min(1).max(1400),
+        registrationAuthenticatorData: z.string().max(1400),
+        registrationClientDataJson: z.string().max(5500),
         credentialIdHash: z.string().max(64),
         publicKeySpki: z.string().max(256),
         declaredCustody: z.enum(["SYNCED_PASSKEY", "EXTERNAL_SECURITY_KEY", "UNKNOWN"]),
@@ -1516,6 +1593,15 @@ export const enterpriseRouter = {
       )
         throw new ORPCError("UNAUTHORIZED", { message: "Passkey challenge mismatch." });
       const principalProtocolId = randomBytes(16);
+      await verifyRemoteAdminRegistration({
+        authenticatorData: base64urlBytes(input.registrationAuthenticatorData),
+        clientDataJson: base64urlBytes(input.registrationClientDataJson),
+        rawCredentialId,
+        expectedChallenge: challenge,
+        policy: { rpId: registry.rpId, origin: registry.origin },
+        expectedP256X: p256X,
+        expectedP256Y: p256Y,
+      });
       await verifyRemoteAdminAssertion({
         assertion: {
           credentialIdHash,

@@ -20,6 +20,7 @@ import {
 import {
   normalizeCanonicalLowSDerSignature,
   verifyPortableRemoteAdminApproval,
+  verifyRemoteAdminRegistration,
 } from "./remote-admin-webauthn";
 
 describe("remote_admin_roles_corrected_tests_first", () => {
@@ -167,6 +168,60 @@ describe("remote_admin_policy_weakening", () => {
 });
 
 describe("remote_admin_webauthn_registration_assertion", () => {
+  it("binds create client data, RP, UV, credential id, and ES256 COSE key", async () => {
+    const rpId = "admin.example.com";
+    const origin = "https://admin.example.com";
+    const challenge = new Uint8Array(32).fill(9);
+    const rawCredentialId = new Uint8Array([1, 2, 3]);
+    const x = new Uint8Array(32).fill(4);
+    const y = new Uint8Array(32).fill(5);
+    const rpHash = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rpId)),
+    );
+    const cose = new Uint8Array([
+      0xa5,
+      0x01,
+      0x02,
+      0x03,
+      0x26,
+      0x20,
+      0x01,
+      0x21,
+      0x58,
+      0x20,
+      ...x,
+      0x22,
+      0x58,
+      0x20,
+      ...y,
+    ]);
+    const authenticatorData = new Uint8Array(55 + rawCredentialId.length + cose.length);
+    authenticatorData.set(rpHash);
+    authenticatorData[32] = 0x45;
+    new DataView(authenticatorData.buffer).setUint16(53, rawCredentialId.length);
+    authenticatorData.set(rawCredentialId, 55);
+    authenticatorData.set(cose, 55 + rawCredentialId.length);
+    const clientDataJson = new TextEncoder().encode(
+      JSON.stringify({
+        type: "webauthn.create",
+        challenge: Buffer.from(challenge).toString("base64url"),
+        origin,
+      }),
+    );
+    const registration = {
+      authenticatorData,
+      clientDataJson,
+      rawCredentialId,
+      expectedChallenge: challenge,
+      policy: { rpId, origin },
+      expectedP256X: x,
+      expectedP256Y: y,
+    };
+    await expect(verifyRemoteAdminRegistration(registration)).resolves.toBeUndefined();
+    await expect(
+      verifyRemoteAdminRegistration({ ...registration, rawCredentialId: new Uint8Array([8]) }),
+    ).rejects.toThrow("credential_mismatch");
+  });
   it("strictly normalizes only canonical low-S DER", () => {
     const normalized = normalizeCanonicalLowSDerSignature(
       Uint8Array.of(0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01),

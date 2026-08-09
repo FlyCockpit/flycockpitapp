@@ -61,6 +61,8 @@ async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId
     credentialIdHash: toBase64Url(credentialIdHash),
     publicKeySpki: toBase64Url(publicKey),
     declaredCustody: "UNKNOWN" as const,
+    registrationAuthenticatorData: toBase64Url(created.response.getAuthenticatorData()),
+    registrationClientDataJson: toBase64Url(created.response.clientDataJSON),
     authenticatorData: toBase64Url(asserted.response.authenticatorData),
     clientDataJson: toBase64Url(asserted.response.clientDataJSON),
     signatureDer: toBase64Url(asserted.response.signature),

@@ -110,6 +110,80 @@ function strictClientData(bytes: Uint8Array): { type: string; challenge: string;
   return { type: record.type, challenge: record.challenge, origin: record.origin };
 }
 
+function readCborInteger(bytes: Uint8Array, offset: { value: number }): number {
+  const initial = bytes[offset.value++]!;
+  const major = initial >> 5;
+  const additional = initial & 31;
+  let value: number;
+  if (additional < 24) value = additional;
+  else if (additional === 24) value = bytes[offset.value++]!;
+  else throw new Error("webauthn_cose_noncanonical");
+  if (major === 0) return value;
+  if (major === 1) return -1 - value;
+  throw new Error("webauthn_cose_integer_required");
+}
+function readCborBytes(bytes: Uint8Array, offset: { value: number }): Uint8Array {
+  const initial = bytes[offset.value++]!;
+  if (initial >> 5 !== 2) throw new Error("webauthn_cose_bytes_required");
+  const additional = initial & 31;
+  const length = additional < 24 ? additional : additional === 24 ? bytes[offset.value++]! : -1;
+  if (length < 24 || offset.value + length > bytes.length)
+    throw new Error("webauthn_cose_noncanonical");
+  const value = bytes.slice(offset.value, offset.value + length);
+  offset.value += length;
+  return value;
+}
+export async function verifyRemoteAdminRegistration(input: {
+  authenticatorData: Uint8Array;
+  clientDataJson: Uint8Array;
+  rawCredentialId: Uint8Array;
+  expectedChallenge: Uint8Array;
+  policy: WebAuthnPolicy;
+  expectedP256X: Uint8Array;
+  expectedP256Y: Uint8Array;
+}) {
+  const data = input.authenticatorData;
+  if (data.length < 55 || !equal(data.slice(0, 32), await sha256(text.encode(input.policy.rpId))))
+    throw new Error("webauthn_registration_rp_id_mismatch");
+  if ((data[32]! & 0x45) !== 0x45) throw new Error("webauthn_registration_uv_at_required");
+  const client = strictClientData(input.clientDataJson);
+  if (
+    client.type !== "webauthn.create" ||
+    client.origin !== input.policy.origin ||
+    client.challenge !== b64url(input.expectedChallenge)
+  )
+    throw new Error("webauthn_registration_client_data_mismatch");
+  const credentialLength = new DataView(data.buffer, data.byteOffset + 53, 2).getUint16(0);
+  const credentialStart = 55;
+  const credentialEnd = credentialStart + credentialLength;
+  if (
+    credentialLength < 1 ||
+    credentialEnd >= data.length ||
+    !equal(data.slice(credentialStart, credentialEnd), input.rawCredentialId)
+  )
+    throw new Error("webauthn_registration_credential_mismatch");
+  const offset = { value: credentialEnd };
+  const map = data[offset.value++]!;
+  if (map >> 5 !== 5 || (map & 31) !== 5) throw new Error("webauthn_cose_map_invalid");
+  const values = new Map<number, number | Uint8Array>();
+  for (let index = 0; index < 5; index++) {
+    const key = readCborInteger(data, offset);
+    values.set(
+      key,
+      key === -2 || key === -3 ? readCborBytes(data, offset) : readCborInteger(data, offset),
+    );
+  }
+  if (
+    values.get(1) !== 2 ||
+    values.get(3) !== -7 ||
+    values.get(-1) !== 1 ||
+    !equal(values.get(-2) as Uint8Array, input.expectedP256X) ||
+    !equal(values.get(-3) as Uint8Array, input.expectedP256Y) ||
+    offset.value !== data.length
+  )
+    throw new Error("webauthn_registration_cose_invalid");
+}
+
 export async function approvalChallenge(canonicalOperationBytes: Uint8Array, nonce32: Uint8Array) {
   if (nonce32.length !== 32) throw new Error("remote_admin_nonce_length");
   return sha256(

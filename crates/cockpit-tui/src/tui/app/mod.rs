@@ -3599,6 +3599,7 @@ impl App {
                 async_shutdown.export_cleanup_retry_scheduled,
             );
         }
+        crate::tui::async_action::drain_export_temp_reaper();
 
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous

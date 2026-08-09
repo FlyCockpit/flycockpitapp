@@ -289,49 +289,108 @@ pub struct AsyncActionCancellation {
     export_temp: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
-fn export_temp_reaper() -> &'static std::sync::mpsc::Sender<std::path::PathBuf> {
-    static REAPER: std::sync::OnceLock<std::sync::mpsc::Sender<std::path::PathBuf>> =
-        std::sync::OnceLock::new();
+enum ExportReaperMessage {
+    Reap(std::path::PathBuf),
+    DrainAndStop(std::sync::mpsc::Sender<()>),
+}
+
+struct ExportReaper {
+    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<ExportReaperMessage>>>,
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+fn export_temp_reaper() -> &'static ExportReaper {
+    static REAPER: std::sync::OnceLock<ExportReaper> = std::sync::OnceLock::new();
     REAPER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
-        let retry_tx = tx.clone();
-        let _ = std::thread::Builder::new()
+        let (tx, rx) = std::sync::mpsc::channel::<ExportReaperMessage>();
+        let handle = std::thread::Builder::new()
             .name("cockpit-export-temp-reaper".to_string())
             .spawn(move || {
-                while let Ok(path) = rx.recv() {
-                    let mut attempt = 0u32;
-                    loop {
+                let mut pending = std::collections::VecDeque::new();
+                let mut stop = None;
+                loop {
+                    while let Ok(message) = rx.try_recv() {
+                        match message {
+                            ExportReaperMessage::Reap(path) => pending.push_back(path),
+                            ExportReaperMessage::DrainAndStop(done) => stop = Some(done),
+                        }
+                    }
+                    if let Some(path) = pending.pop_front() {
                         match std::fs::remove_file(&path) {
-                            Ok(()) => break,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => {
-                                attempt = attempt.saturating_add(1);
                                 eprintln!(
-                                    "cockpit: export recovery retry {attempt} could not remove {}: {error}",
+                                    "cockpit: export recovery retained {}: {error}",
                                     path.display()
                                 );
-                                std::thread::sleep(Duration::from_millis(
-                                    100u64.saturating_mul(u64::from(attempt.min(50))),
-                                ));
-                                if retry_tx.send(path.clone()).is_err() {
-                                    eprintln!(
-                                        "cockpit: export recovery queue closed with {} still owned",
-                                        path.display()
-                                    );
-                                }
-                                break;
+                                pending.push_back(path);
+                                std::thread::sleep(Duration::from_millis(100));
                             }
                         }
+                        continue;
+                    }
+                    if let Some(done) = stop.take() {
+                        let _ = done.send(());
+                        break;
+                    }
+                    match rx.recv() {
+                        Ok(ExportReaperMessage::Reap(path)) => pending.push_back(path),
+                        Ok(ExportReaperMessage::DrainAndStop(done)) => stop = Some(done),
+                        Err(_) => break,
                     }
                 }
             });
-        tx
+        ExportReaper {
+            tx: std::sync::Mutex::new(handle.as_ref().ok().map(|_| tx)),
+            handle: std::sync::Mutex::new(handle.ok()),
+        }
     })
 }
 
 fn enqueue_export_temp_reap(path: std::path::PathBuf) {
-    if let Err(error) = export_temp_reaper().send(path) {
-        eprintln!("cockpit: export temporary-file reaper unavailable: {error}");
+    let sent = export_temp_reaper()
+        .tx
+        .lock()
+        .expect("export reaper lock poisoned")
+        .as_ref()
+        .is_some_and(|tx| tx.send(ExportReaperMessage::Reap(path.clone())).is_ok());
+    if !sent {
+        synchronous_export_cleanup_fallback(&path);
+    }
+}
+
+fn synchronous_export_cleanup_fallback(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "cockpit: synchronous export cleanup failed for {}: {error}",
+            path.display()
+        );
+    }
+}
+
+pub(crate) fn drain_export_temp_reaper() {
+    let reaper = export_temp_reaper();
+    let tx = reaper
+        .tx
+        .lock()
+        .expect("export reaper lock poisoned")
+        .take();
+    if let Some(tx) = tx {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let _ = tx.send(ExportReaperMessage::DrainAndStop(done_tx));
+        drop(tx);
+        let _ = done_rx.recv();
+    }
+    if let Some(handle) = reaper
+        .handle
+        .lock()
+        .expect("export reaper lock poisoned")
+        .take()
+    {
+        let _ = handle.join();
     }
 }
 
@@ -1286,14 +1345,23 @@ mod tests {
         );
         owned_rx.await.unwrap();
         drop(runner);
-
-        for _ in 0..100 {
-            if !partial.exists() {
-                return;
-            }
+        for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        panic!("runner drop stranded an owned export partial");
+        drain_export_temp_reaper();
+        assert!(
+            !partial.exists(),
+            "reaper drain left an owned export partial"
+        );
+    }
+
+    #[test]
+    fn reaper_spawn_failure_fallback_removes_partial_synchronously() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".spawn-failure.partial");
+        std::fs::write(&partial, b"partial").unwrap();
+        synchronous_export_cleanup_fallback(&partial);
+        assert!(!partial.exists());
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

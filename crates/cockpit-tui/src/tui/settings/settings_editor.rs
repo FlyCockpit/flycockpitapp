@@ -1936,6 +1936,10 @@ impl SettingsEditor {
             self.status = Some("media capability draft discarded".into());
             return true;
         }
+        if action == "Reload" {
+            self.status = Some("media capability draft reloaded".into());
+            return true;
+        }
         if let Some(line) = self
             .multimodal
             .as_ref()

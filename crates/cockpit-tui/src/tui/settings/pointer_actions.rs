@@ -234,7 +234,7 @@ pub(super) enum ModelLifecycleAction {
     Refresh(ProviderId, ModelId),
     Discard(ProviderId, ModelId),
     Retry(ProviderId, ModelId),
-    Reload,
+    Reload(ProviderId, ModelId),
     Reapply,
     Rebind,
     Dismiss,

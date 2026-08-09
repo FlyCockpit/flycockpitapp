@@ -3864,6 +3864,23 @@ impl SettingsCx {
                 ));
                 lines.push(Line::from("[retry media capability action]"));
             }
+            if editor
+                .multimodal()
+                .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reload"))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::ModelLifecycle(
+                            super::pointer_actions::ModelLifecycleAction::Reload(
+                                super::pointer_actions::ProviderId(parent.provider_id.clone()),
+                                super::pointer_actions::ModelId(model_id.clone()),
+                            ),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("[reload media capability draft]"));
+            }
         }
 
         // Read-only model metadata, surfaced (not hidden) for completeness:
@@ -5045,6 +5062,30 @@ impl SettingsPage for ProvidersPage {
             if matches_source {
                 return cx.handle_providers_page_key(
                     KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    self,
+                );
+            }
+            return Nav::Stay;
+        }
+        if let (
+            ProvidersPage::ModelSettings { editor, parent, .. },
+            super::pointer_actions::ProvidersAction::ModelLifecycle(
+                super::pointer_actions::ModelLifecycleAction::Reload(provider, model),
+            ),
+        ) = (&*self, &provider_action)
+        {
+            let matches_source = parent.provider_id == provider.0
+                && matches!(
+                    &editor.scope,
+                    super::settings_editor::SettingsScope::Model { model_id }
+                        if model_id == &model.0
+                )
+                && editor
+                    .multimodal()
+                    .is_some_and(|multimodal| multimodal.available_actions().contains(&"Reload"));
+            if matches_source {
+                return cx.handle_providers_page_key(
+                    KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
                     self,
                 );
             }

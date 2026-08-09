@@ -230,6 +230,17 @@ impl App {
         new_session_id: Option<uuid::Uuid>,
         state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
     ) {
+        // A submission held by the pending model transaction is not an
+        // independently dispatchable paste fence. Keep it intact while the
+        // model control is converted into a session-scoped retry below; that
+        // path parks its order sequence and recreates it behind the retried
+        // model switch. Generic epoch cleanup would otherwise delete the
+        // fence first and leave the retained payload with nothing to release.
+        let model_held_fence = self
+            .pending_model_selection
+            .as_ref()
+            .and_then(|pending| pending.queued_submission.as_ref())
+            .map(|queued| queued.client_submission_id);
         let mut cancelled_sequences = Vec::new();
         let mut cancelled_fences = Vec::new();
         let reconciling_fences = self
@@ -248,6 +259,9 @@ impl App {
             .retain(|id, fence| match fence.lifecycle {
                 crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
                 | crate::tui::structured_paste::FenceLifecycle::Ready => {
+                    if Some(*id) == model_held_fence {
+                        return true;
+                    }
                     cancelled_sequences.push(fence.fence_sequence);
                     cancelled_fences.push(*id);
                     false

@@ -163,6 +163,14 @@ fn write_config(path: &std::path::Path) {
 }
 
 fn exact_queued_submission() -> super::QueuedModelSubmission {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
     let tag = cockpit_core::daemon::proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/model.rs".to_string(),
@@ -181,7 +189,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],
-            images: vec![vec![0x89, b'P', b'N', b'G']],
+            images: vec![png.into_inner()],
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-1".to_string()),
@@ -1681,6 +1689,10 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         },
     );
 
+    let automatically_retried = matches!(
+        path,
+        ModelEpochPath::SameRunnerReconnect | ModelEpochPath::EventStreamLagResync
+    );
     match path {
         ModelEpochPath::AdoptReplacement | ModelEpochPath::AdoptSameSession => {
             app.adopt_runner(Ok(attached_runner.take().unwrap()));
@@ -1731,22 +1743,33 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         Some(&attached_selection)
     );
     assert_eq!(app.launch.session_id, Some(new_session_id));
-    assert!(app.pending_model_selection.is_none());
-    assert!(app.pending_control_requests.is_empty());
-    let preserved_retry = app
-        .retry_model_selections
-        .get(&Some(old_session_id))
-        .expect("runner epoch change retains retry intent for its owning session");
-    assert_eq!(preserved_retry.requested, pending_requested);
+    assert_eq!(app.pending_model_selection.is_some(), automatically_retried);
     assert_eq!(
-        queued_submission_value(
-            preserved_retry
-                .queued_submission
-                .as_ref()
-                .expect("runner epoch change retains queued submission"),
-        ),
-        expected_queued
+        !app.pending_control_requests.is_empty(),
+        automatically_retried
     );
+    let preserved = if automatically_retried {
+        let pending = app
+            .pending_model_selection
+            .as_ref()
+            .expect("reconnect immediately retries the retained model intent");
+        assert_eq!(pending.requested, pending_requested);
+        pending
+            .queued_submission
+            .as_ref()
+            .expect("automatic retry retains queued submission")
+    } else {
+        let retry = app
+            .retry_model_selections
+            .get(&Some(old_session_id))
+            .expect("runner epoch change retains retry intent for its owning session");
+        assert_eq!(retry.requested, pending_requested);
+        retry
+            .queued_submission
+            .as_ref()
+            .expect("runner epoch change retains queued submission")
+    };
+    assert_eq!(queued_submission_value(preserved), expected_queued);
     if old_session_id != new_session_id {
         assert!(
             app.current_model_selection_retry().is_none(),
@@ -1769,17 +1792,18 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         assert!(input_rx.try_recv().is_err());
         return;
     }
-    app.open_model_picker();
-    assert!(matches!(&app.overlay, Overlay::ModelPicker(picker)
-        if picker.draft_active_model() == Some(&pending_requested)));
-
     let requested = pending_requested;
-    assert!(app.request_model_selection(
-        "/quick",
-        requested.clone(),
-        false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-    ));
+    if !automatically_retried {
+        app.open_model_picker();
+        assert!(matches!(&app.overlay, Overlay::ModelPicker(picker)
+            if picker.draft_active_model() == Some(&requested)));
+        assert!(app.request_model_selection(
+            "/quick",
+            requested.clone(),
+            false,
+            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        ));
+    }
     let selection_id = app
         .pending_model_selection
         .as_ref()

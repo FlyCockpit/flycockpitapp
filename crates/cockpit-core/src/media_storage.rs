@@ -54,14 +54,49 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let rows = self.db.read(|conn| {
-            let mut statement = conn.prepare("SELECT upload_id,temporary_storage_id,acknowledged_bytes,upload_generation,expires_at_unix_ms,reservation_id FROM media_uploads WHERE state='open' ORDER BY creation_sequence")?;
-            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?)))?;
+            let mut statement = conn.prepare("SELECT upload_id,temporary_storage_id,acknowledged_bytes,upload_generation,expires_at_unix_ms,reservation_id,state,terminal_reason FROM media_uploads WHERE state IN ('open','finalizing') ORDER BY creation_sequence")?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?)))?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         }).await?;
         let mut repaired = 0usize;
-        for (upload_id, storage_id, acknowledged, generation, expires, reservation_id) in rows {
+        for (
+            upload_id,
+            storage_id,
+            acknowledged,
+            generation,
+            expires,
+            reservation_id,
+            state,
+            terminal_reason,
+        ) in rows
+        {
             let acknowledged = acknowledged.parse::<u64>()?;
             let generation = generation.parse::<u64>()?;
+            if state == "finalizing" {
+                let target = match terminal_reason.as_deref() {
+                    Some("client_cancelled") => "cancelled",
+                    Some("draft_expired") => "expired",
+                    _ => anyhow::bail!("invalid upload cleanup intent"),
+                };
+                if let Ok(file) = self.owned_root.open_file_verified(&storage_id) {
+                    self.owned_root
+                        .remove_file(&storage_id)
+                        .map_err(anyhow::Error::new)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt as _;
+                        ensure!(
+                            file.metadata()?.nlink() == 0,
+                            "intended upload temporary was not deleted"
+                        );
+                    }
+                }
+                let upload = upload_id.clone();
+                let reservation = reservation_id.clone();
+                self.db.transaction(move|conn|{let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='finalizing'",params![target,next.to_string(),now_unix_ms,upload,generation.to_string()])?;ensure!(changed==1,"upload cleanup intent lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
+                repaired += 1;
+                continue;
+            }
             let opened = self.owned_root.open_file_verified(&storage_id);
             let mut file = match opened {
                 Ok(file) => file,
@@ -115,6 +150,22 @@ impl MediaStorageRecovery {
             }
             let identity = stable_identity_digest(&file)?;
             let (_, checksum) = read_full_digest(&mut file)?;
+            let evidence = crate::intel::hex_lower(&Sha256::digest(
+                format!("media-upload-expire-v1\0{identity}\0{acknowledged}\0{checksum}")
+                    .as_bytes(),
+            ));
+            let transition = MediaUploadLastTransitionV1::System {
+                action: MediaUploadSystemActionV1::Expire,
+                outcome: RemoteMediaOperationOutcomeV1::Applied,
+            };
+            let intent_upload = upload_id.clone();
+            let intent_transition = serde_json::to_string(&transition)?;
+            let intent_evidence = evidence.clone();
+            self.db.transaction(move |conn| {
+                let changed = conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='draft_expired',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,intent_upload,generation.to_string()])?;
+                ensure!(changed == 1, "upload expiry intent lost compare-and-swap");
+                Ok(())
+            }).await?;
             self.owned_root
                 .remove_file(&storage_id)
                 .map_err(anyhow::Error::new)?;
@@ -126,14 +177,6 @@ impl MediaStorageRecovery {
                     "expired upload temporary was not deleted"
                 );
             }
-            let evidence = crate::intel::hex_lower(&Sha256::digest(
-                format!("media-upload-expire-v1\0{identity}\0{acknowledged}\0{checksum}")
-                    .as_bytes(),
-            ));
-            let transition = MediaUploadLastTransitionV1::System {
-                action: MediaUploadSystemActionV1::Expire,
-                outcome: RemoteMediaOperationOutcomeV1::Applied,
-            };
             self.commit_upload_reconcile(
                 upload_id,
                 generation,
@@ -164,7 +207,7 @@ impl MediaStorageRecovery {
         self.db.transaction(move |conn| {
             let next = generation.checked_add(1).context("upload generation overflow")?;
             let changed = conn.execute(
-                "UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,terminal_reason=?3,cleanup_evidence_digest=?4,last_transition_json=?5,updated_at_unix_ms=?6 WHERE upload_id=?7 AND upload_generation=?8 AND state='open'",
+                "UPDATE media_uploads SET state=?1,upload_generation=?2,next_chunk_index=NULL,terminal_reason=?3,cleanup_evidence_digest=?4,last_transition_json=?5,updated_at_unix_ms=?6 WHERE upload_id=?7 AND upload_generation=?8 AND state IN ('open','finalizing')",
                 params![state,next.to_string(),reason,evidence,serde_json::to_string(&transition)?,now_unix_ms,upload_id,generation.to_string()],
             )?;
             ensure!(changed == 1, "upload reconcile lost compare-and-swap");
@@ -380,6 +423,23 @@ impl MediaStorageRecovery {
             })
             .await?
         {
+            let replay_upload = upload.to_string();
+            let pending = self
+                .db
+                .read(move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT state='finalizing' FROM media_uploads WHERE upload_id=?1",
+                            [replay_upload],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .optional()?
+                        .unwrap_or(false))
+                })
+                .await?;
+            if pending {
+                self.reconcile_media_uploads(now_unix_ms).await?;
+            }
             return Ok(receipt);
         }
         let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,state,upload_generation,reservation_id FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
@@ -397,17 +457,6 @@ impl MediaStorageRecovery {
             "upload temporary length mismatch"
         );
         let identity = stable_identity_digest(&file)?;
-        self.owned_root
-            .remove_file(&snapshot.0)
-            .map_err(anyhow::Error::new)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            ensure!(
-                file.metadata()?.nlink() == 0,
-                "held upload temporary was not deleted"
-            )
-        }
         let evidence = crate::intel::hex_lower(&Sha256::digest(
             format!("media-upload-delete-v1\0{identity}\0{length}\0{checksum}").as_bytes(),
         ));
@@ -417,7 +466,47 @@ impl MediaStorageRecovery {
             local_operation_id: mutation.local_operation_id,
             outcome: RemoteMediaOperationOutcomeV1::Applied,
         };
-        self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok(receipt)}let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET state='cancelled',upload_generation=?1,next_chunk_index=NULL,terminal_reason='client_cancelled',cleanup_evidence_digest=?2,last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),evidence,serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&snapshot.4,u64::try_from(now_unix_ms)?)?;let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"cancel".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:generation,generation_after:next},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok(receipt)}).await
+        let next = generation
+            .checked_add(1)
+            .context("upload generation overflow")?;
+        let receipt = LocalMediaMutationReceiptV1 {
+            schema_version: 1,
+            kind: "localMediaMutationReceipt".into(),
+            receipt_id: Uuid::now_v7(),
+            local_operation_id: mutation.local_operation_id,
+            actor_principal_digest: mutation.actor_principal_digest,
+            action: "cancel".into(),
+            subject_kind: LocalMediaSubjectKindV1::Upload,
+            subject_id: upload,
+            operation_request_digest: request_digest.clone(),
+            semantic_command_digest: semantic_digest.clone(),
+            outcome: LocalMediaMutationOutcomeV1::Applied,
+            transition: LocalMediaMutationTransitionV1::Upload {
+                generation_before: generation,
+                generation_after: next,
+            },
+            discard_result: None,
+            discard_result_digest: None,
+            committed_at_unix_ms: now_unix_ms,
+        };
+        let intent_receipt = receipt.clone();
+        let intent_transition = serde_json::to_string(&transition)?;
+        let intent_evidence = evidence.clone();
+        self.db.transaction(move|conn|{if let Some(replay)=preflight_local_operation(conn,mutation.local_operation_id,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok(replay)}let changed=conn.execute("UPDATE media_uploads SET state='finalizing',terminal_reason='client_cancelled',cleanup_evidence_digest=?1,last_transition_json=?2,updated_at_unix_ms=?3 WHERE upload_id=?4 AND upload_generation=?5 AND state='open'",params![intent_evidence,intent_transition,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel intent lost compare-and-swap");commit_local_operation(conn,&intent_receipt,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok(intent_receipt)}).await?;
+        self.owned_root
+            .remove_file(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            ensure!(
+                file.metadata()?.nlink() == 0,
+                "held upload temporary was not deleted"
+            );
+        }
+        let reservation = snapshot.4;
+        self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_uploads SET state='cancelled',upload_generation=?1,next_chunk_index=NULL,updated_at_unix_ms=?2 WHERE upload_id=?3 AND upload_generation=?4 AND state='finalizing' AND terminal_reason='client_cancelled'",params![next.to_string(),now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel completion lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&reservation,u64::try_from(now_unix_ms)?)?;Ok(())}).await?;
+        Ok(receipt)
     }
     pub(crate) async fn append_media_upload_chunk(
         &self,
@@ -1468,11 +1557,12 @@ mod tests {
     async fn media_upload_begin_is_atomic_replayable_and_domain_unique() {
         use base64::Engine as _;
         use cockpit_db::media_attachments::{
-            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationTransitionV1,
-            LocalMediaMutationV1,
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaMutationV1,
         };
         let temp = tempfile::TempDir::new().unwrap();
-        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let database_path = temp.path().join("cockpit.db");
+        let db = cockpit_db::Db::open(&database_path).unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
         let recovery =
@@ -1624,10 +1714,35 @@ mod tests {
                 upload_generation: 2,
             },
         };
-        let cancelled = recovery
-            .cancel_media_upload(cancel.clone(), 30)
+        db.transaction(|conn| {conn.execute_batch("CREATE TRIGGER fail_cancel_completion BEFORE UPDATE OF state ON media_uploads WHEN NEW.state='cancelled' BEGIN SELECT RAISE(ABORT,'injected cancel completion crash'); END;")?;Ok(())}).await.unwrap();
+        assert!(
+            recovery
+                .cancel_media_upload(cancel.clone(), 30)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected cancel completion crash")
+        );
+        let cancel_operation = cancel.local_operation_id.to_string();
+        let cancelled: LocalMediaMutationReceiptV1 = db
+            .read(move |conn| {
+                Ok(serde_json::from_str(&conn.query_row(
+                    "SELECT receipt_json FROM local_media_operations WHERE local_operation_id=?1",
+                    [cancel_operation],
+                    |row| row.get::<_, String>(0),
+                )?)?)
+            })
             .await
             .unwrap();
+        db.transaction(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_cancel_completion")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(recovery);
+        let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media")).unwrap();
+        assert_eq!(recovery.reconcile_media_uploads(31).await.unwrap(), 1);
         assert!(matches!(
             cancelled.transition,
             LocalMediaMutationTransitionV1::Upload {
@@ -1636,7 +1751,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            recovery.cancel_media_upload(cancel, 31).await.unwrap(),
+            recovery.cancel_media_upload(cancel, 32).await.unwrap(),
             cancelled
         );
         let status = db
@@ -1936,7 +2051,8 @@ mod tests {
             MediaUploadStateDetailV1, MediaUploadTerminalReasonV1,
         };
         let temp = tempfile::TempDir::new().unwrap();
-        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let database_path = temp.path().join("expiry.db");
+        let db = cockpit_db::Db::open(&database_path).unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| {
             conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
@@ -1973,7 +2089,24 @@ mod tests {
             )
             .await
             .unwrap();
+        db.transaction(|conn|{conn.execute_batch("CREATE TRIGGER fail_expiry_completion BEFORE UPDATE OF state ON media_uploads WHEN NEW.state='expired' BEGIN SELECT RAISE(ABORT,'injected expiry completion crash'); END;")?;Ok(())}).await.unwrap();
+        assert!(
+            recovery
+                .reconcile_media_uploads(86_400_010)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected expiry completion crash")
+        );
+        db.transaction(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_expiry_completion")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         drop(recovery);
+        drop(db);
+        let db = cockpit_db::Db::open(&database_path).unwrap();
         let reopened = MediaStorageRecovery::open(db.clone(), &root).unwrap();
         assert_eq!(
             reopened.reconcile_media_uploads(86_400_010).await.unwrap(),

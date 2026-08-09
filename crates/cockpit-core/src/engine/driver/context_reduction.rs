@@ -34,7 +34,10 @@ impl AutoCompactGate {
         matches!(self, Self::Committed { activity_epoch } if *activity_epoch == self.activity_epoch())
     }
 
-    fn suppresses(&self, coverage: &PreparedCompactionCoverage) -> bool {
+    pub(in crate::engine::driver) fn suppresses(
+        &self,
+        coverage: &PreparedCompactionCoverage,
+    ) -> bool {
         match self {
             Self::BoundarySuppressed { key } => {
                 key.activity_epoch == self.activity_epoch() && key.coverage == *coverage
@@ -56,7 +59,7 @@ impl AutoCompactGate {
         };
     }
 
-    fn record_failure(
+    pub(in crate::engine::driver) fn record_failure(
         &mut self,
         outcome: &PrepareCompactionError,
         coverage: PreparedCompactionCoverage,
@@ -174,20 +177,56 @@ impl std::fmt::Display for PrepareCompactionError {
     }
 }
 
-struct CompactBriefDraft {
+#[derive(Clone)]
+pub(in crate::engine::driver) struct CompactBriefDraft {
     session: Arc<Session>,
-    model: Arc<crate::engine::model::Model>,
+    pub(in crate::engine::driver) model: Arc<crate::engine::model::Model>,
     system: String,
     history: Vec<Message>,
     params: crate::engine::model::ModelParams,
     agent_name: String,
     prompt_override: Option<String>,
-    context_window: Option<u32>,
+    pub(in crate::engine::driver) context_window: Option<u32>,
+    quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     #[cfg(test)]
     test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
+    #[cfg(test)]
+    test_script: Option<Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
 }
 
-fn prepared_compaction_coverage(history: &[Message]) -> PreparedCompactionCoverage {
+#[derive(Debug, Default)]
+pub(in crate::engine::driver) struct CompactPreparationQuota {
+    pub(in crate::engine::driver) draft_nodes: usize,
+    pub(in crate::engine::driver) wire_samples: usize,
+}
+
+impl CompactPreparationQuota {
+    fn claim_node(&mut self) -> Result<(), String> {
+        if self.draft_nodes >= crate::engine::compact_draft::MAX_DRAFT_NODES {
+            return Err(format!(
+                "compaction preparation exhausted {} draft nodes / {} wire samples",
+                self.draft_nodes, self.wire_samples
+            ));
+        }
+        self.draft_nodes += 1;
+        Ok(())
+    }
+
+    fn claim_wire_sample(&mut self) -> Result<(), String> {
+        if self.wire_samples >= crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES {
+            return Err(format!(
+                "compaction preparation exhausted {} draft nodes / {} wire samples",
+                self.draft_nodes, self.wire_samples
+            ));
+        }
+        self.wire_samples += 1;
+        Ok(())
+    }
+}
+
+pub(in crate::engine::driver) fn prepared_compaction_coverage(
+    history: &[Message],
+) -> PreparedCompactionCoverage {
     use sha2::{Digest, Sha256};
 
     let serialized = serde_json::to_vec(history).unwrap_or_default();
@@ -899,7 +938,13 @@ impl Driver {
         .map(|plan| plan.tail_kept)
         .unwrap_or(ctx_cfg.compact_keep_recent_turns);
         let tail_message_seqs = self.compact_tail_message_seqs(snapshot_tail_turns).await;
-        let draft = self.compact_brief_draft(tx, snapshot_history.clone()).await;
+        let draft = self
+            .compact_brief_draft(
+                tx,
+                snapshot_history.clone(),
+                Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+            )
+            .await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
         prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
@@ -1175,6 +1220,7 @@ impl Driver {
         let initial_tail_trimmed = candidate_tail.tail_trimmed;
         let mut keep = initial_tail_kept;
         let mut tail_positions = candidate_tail.tail_message_positions;
+        let draft_quota = Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default()));
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
             let brief = if let Some(ready) = shadow.as_ref() {
@@ -1183,11 +1229,22 @@ impl Driver {
                     &filtered_history,
                     ready.snapshot_tail_turns,
                 );
-                self.draft_brief_delta(tx, &tail_message_seqs, &ready.brief, revision_history)
-                    .await?
+                self.draft_brief_delta(
+                    tx,
+                    &tail_message_seqs,
+                    &ready.brief,
+                    revision_history,
+                    draft_quota.clone(),
+                )
+                .await?
             } else {
-                self.draft_brief(tx, &tail_message_seqs, filtered_history.clone())
-                    .await?
+                self.draft_brief(
+                    tx,
+                    &tail_message_seqs,
+                    filtered_history.clone(),
+                    draft_quota.clone(),
+                )
+                .await?
             };
             let handoff =
                 compact::assemble_handoff(&brief, &appendix, &seed_tags, history_agent_available);
@@ -1352,10 +1409,11 @@ impl Driver {
         Ok(())
     }
 
-    async fn compact_brief_draft(
+    pub(in crate::engine::driver) async fn compact_brief_draft(
         &self,
         tx: &mpsc::Sender<TurnEvent>,
         history: Vec<Message>,
+        quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     ) -> CompactBriefDraft {
         let top = self.stack.last().expect("stack never empty");
         // Resolve the two `extended.*` compaction knobs from the config
@@ -1363,14 +1421,19 @@ impl Driver {
         // `compact_prompt` (the brief-prompt override) and `compact_model`
         // (the dedicated drafting model).
         #[cfg(test)]
-        let (extended, providers) = if let Some((providers, _, _)) = &self.test_providers_override {
-            (
-                crate::config::extended::ExtendedConfig::default(),
-                providers.clone(),
-            )
-        } else {
-            self.config.configs()
-        };
+        let (mut extended, providers) =
+            if let Some((providers, _, _)) = &self.test_providers_override {
+                (
+                    crate::config::extended::ExtendedConfig::default(),
+                    providers.clone(),
+                )
+            } else {
+                self.config.configs()
+            };
+        #[cfg(test)]
+        if let Some(model_ref) = &self.test_compact_model_ref {
+            extended.compact_model = Some(model_ref.clone());
+        }
         #[cfg(not(test))]
         let (extended, providers) = self.config.configs();
         // Two-level model precedence: a configured `compact_model` (when it
@@ -1402,6 +1465,13 @@ impl Driver {
         let model = compact_model
             .map(Arc::new)
             .unwrap_or_else(|| top.agent.model.clone());
+        let context_window = providers
+            .resolve_effective_model_capabilities(
+                model.provider_id(),
+                model.model_id_ref(),
+                providers.resolution_generation,
+            )
+            .context_tokens;
         CompactBriefDraft {
             session: self.session.clone(),
             model,
@@ -1413,9 +1483,12 @@ impl Driver {
             // Model metadata is resolved through the same driver accounting
             // path used by trigger and post-compact planning. Unknown remains
             // unknown: the fitter will allow one verbatim attempt only.
-            context_window: self.active_model_context_length(),
+            context_window,
+            quota,
             #[cfg(test)]
             test_calls: self.test_compact_brief_calls.clone(),
+            #[cfg(test)]
+            test_script: self.test_compact_brief_script.clone(),
         }
     }
 
@@ -1424,21 +1497,172 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
         history: Vec<Message>,
+        quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     ) -> Result<String, PrepareCompactionError> {
-        let draft = self.compact_brief_draft(tx, history).await;
+        let draft = self.compact_brief_draft(tx, history.clone(), quota).await;
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
         prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
             tail_message_seqs,
         ));
-        execute_compact_brief(
-            draft,
-            prompt_text,
+        let direct = execute_compact_brief(
+            draft.clone(),
+            prompt_text.clone(),
             "compact_brief",
             &tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .into_brief()
+        .await;
+        match direct {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(success)
+                if success.input_coverage
+                    == crate::engine::compact_draft::CompactInputCoverage::Full =>
+            {
+                return Ok(success.brief);
+            }
+            crate::engine::compact_draft::CompactDraftOutcome::Success(_)
+            | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {}
+            failure => return Err(PrepareCompactionError::Draft(failure)),
+        }
+
+        let Some(window) = draft.context_window else {
+            return Err(PrepareCompactionError::Draft(
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                    diagnostic: "full history overflowed with no declared context window"
+                        .to_string(),
+                },
+            ));
+        };
+        let budget = crate::engine::compact_draft::CompactRequestBudget::new(
+            window,
+            &draft.system,
+            &prompt_text,
+            &history,
+        );
+        let plan = crate::engine::compact_draft::plan_chunked_synthesis(
+            &history,
+            budget.history_allowance(),
+        )
+        .map_err(|diagnostic| {
+            PrepareCompactionError::Draft(
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { diagnostic },
+            )
+        })?;
+        if plan.draft_nodes.saturating_add(1) > crate::engine::compact_draft::MAX_DRAFT_NODES {
+            return Err(PrepareCompactionError::Draft(
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                    diagnostic: format!(
+                        "chunked synthesis exhausted {} draft nodes / {} wire samples",
+                        crate::engine::compact_draft::MAX_DRAFT_NODES,
+                        crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES
+                    ),
+                },
+            ));
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let chunk_instruction = "Summarize this chronological source chunk faithfully. Preserve decisions, constraints, tool findings, failures, and the next action. A deterministic appendix will be appended by the host after final synthesis; do not invent or reproduce it.";
+        let mut summaries = Vec::with_capacity(plan.chunks.len());
+        for chunk in plan.chunks {
+            let mut node = draft.clone();
+            node.history = chunk;
+            let outcome = execute_compact_brief(
+                node,
+                chunk_instruction.to_string(),
+                "compact_chunk_brief",
+                &cancel,
+            )
+            .await;
+            match outcome {
+                crate::engine::compact_draft::CompactDraftOutcome::Success(success)
+                    if success.input_coverage
+                        == crate::engine::compact_draft::CompactInputCoverage::Full =>
+                {
+                    summaries.push(success.brief)
+                }
+                crate::engine::compact_draft::CompactDraftOutcome::Success(_) => {
+                    return Err(PrepareCompactionError::Draft(
+                        crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                            diagnostic: "chunk leaf could not retain its complete exchange set"
+                                .to_string(),
+                        },
+                    ));
+                }
+                failure => return Err(PrepareCompactionError::Draft(failure)),
+            }
+        }
+        let merge_instruction = "Merge these adjacent chronological chunk summaries without dropping information or changing chronology. Preserve decisions, constraints, tool findings, failures, and next actions. A deterministic appendix will be appended later by the host.";
+        while summaries.len() > 1 {
+            let mut merged = Vec::with_capacity(summaries.len().div_ceil(2));
+            let mut iter = summaries.into_iter();
+            while let Some(left) = iter.next() {
+                let Some(right) = iter.next() else {
+                    merged.push(left);
+                    break;
+                };
+                let mut node = draft.clone();
+                node.history = vec![
+                    Message::user(format!("<earlier_chunk>\n{left}\n</earlier_chunk>")),
+                    Message::user(format!("<later_chunk>\n{right}\n</later_chunk>")),
+                ];
+                let outcome = execute_compact_brief(
+                    node,
+                    merge_instruction.to_string(),
+                    "compact_chunk_merge",
+                    &cancel,
+                )
+                .await;
+                match outcome {
+                    crate::engine::compact_draft::CompactDraftOutcome::Success(success)
+                        if success.input_coverage
+                            == crate::engine::compact_draft::CompactInputCoverage::Full =>
+                    {
+                        merged.push(success.brief)
+                    }
+                    crate::engine::compact_draft::CompactDraftOutcome::Success(_) => {
+                        return Err(PrepareCompactionError::Draft(
+                            crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                                diagnostic: "recursive chunk merge could not retain both inputs"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                    failure => return Err(PrepareCompactionError::Draft(failure)),
+                }
+            }
+            summaries = merged;
+        }
+        let mut final_node = draft;
+        final_node.history = vec![Message::user(format!(
+            "<complete_ordered_chunk_synthesis>\n{}\n</complete_ordered_chunk_synthesis>",
+            summaries.pop().expect("chunk plan is non-empty")
+        ))];
+        if let Some(range) = crate::engine::compact::complete_exchange_ranges(&history).pop() {
+            final_node.history.extend_from_slice(&history[range]);
+        }
+        let final_outcome = execute_compact_brief(
+            final_node,
+            prompt_text,
+            "compact_chunk_final_synthesis",
+            &cancel,
+        )
+        .await;
+        match final_outcome {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(mut success)
+                if success.input_coverage
+                    == crate::engine::compact_draft::CompactInputCoverage::Full =>
+            {
+                success.fit_rung = crate::engine::compact_draft::CompactFitRung::ChunkedSynthesis;
+                Ok(success.brief)
+            }
+            crate::engine::compact_draft::CompactDraftOutcome::Success(_) => {
+                Err(PrepareCompactionError::Draft(
+                    crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                        diagnostic: "final chunk synthesis did not fit with full coverage"
+                            .to_string(),
+                    },
+                ))
+            }
+            failure => Err(PrepareCompactionError::Draft(failure)),
+        }
     }
 
     async fn draft_brief_delta(
@@ -1446,49 +1670,46 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         tail_message_seqs: &[i64],
         shadow_brief: &str,
-        new_turns: Vec<Message>,
+        revision_history: Vec<Message>,
+        quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
     ) -> Result<String, PrepareCompactionError> {
-        let draft = self.compact_brief_draft(tx, new_turns).await;
+        let draft = self
+            .compact_brief_draft(tx, revision_history.clone(), quota.clone())
+            .await;
         let prompt_text = crate::engine::compact::shadow_delta_prompt(
             draft.prompt_override.as_deref(),
             shadow_brief,
             tail_message_seqs,
         );
-        execute_compact_brief(
+        let outcome = execute_compact_brief(
             draft,
             prompt_text,
             "compact_brief_delta",
             &tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .into_brief()
-    }
-}
-
-trait CompactDraftOutcomeExt {
-    fn into_brief(self) -> Result<String, PrepareCompactionError>;
-}
-
-impl CompactDraftOutcomeExt for crate::engine::compact_draft::CompactDraftOutcome {
-    fn into_brief(self) -> Result<String, PrepareCompactionError> {
-        match self {
-            Self::Success(success)
+        .await;
+        match outcome {
+            crate::engine::compact_draft::CompactDraftOutcome::Success(success)
                 if success.input_coverage
                     == crate::engine::compact_draft::CompactInputCoverage::Full =>
             {
                 Ok(success.brief)
             }
-            Self::Success(_) => Err(PrepareCompactionError::Draft(
-                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
-                    diagnostic: "full-source synthesis required".to_string(),
-                },
-            )),
+            crate::engine::compact_draft::CompactDraftOutcome::Success(_)
+            | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {
+                // A fitted delta is only a partial precursor. Re-run from the
+                // complete assembled revision history so the foreground path
+                // enters the same full-coverage chunk synthesis as a non-shadow
+                // compact instead of promoting the partial shadow.
+                self.draft_brief(tx, tail_message_seqs, revision_history, quota)
+                    .await
+            }
             failure => Err(PrepareCompactionError::Draft(failure)),
         }
     }
 }
 
-async fn execute_compact_brief(
+pub(in crate::engine::driver) async fn execute_compact_brief(
     mut draft: CompactBriefDraft,
     prompt_text: String,
     purpose: &'static str,
@@ -1498,6 +1719,9 @@ async fn execute_compact_brief(
         CompactDraftOutcome as O, CompactDraftSuccess, CompactSampleClass,
         MAX_WIRE_SAMPLES_PER_NODE,
     };
+    if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_node() {
+        return O::ContextOverflow { diagnostic };
+    }
     let fitted = match crate::engine::compact_draft::fit_compact_request(
         &draft.history,
         &draft.system,
@@ -1512,32 +1736,146 @@ async fn execute_compact_brief(
     let mut input_coverage = fitted.coverage;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
-        if cancel.is_cancelled() {
-            return O::Cancelled;
+        for attempt in 1..=MAX_WIRE_SAMPLES_PER_NODE {
+            if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_wire_sample()
+            {
+                return O::ContextOverflow { diagnostic };
+            }
+            if cancel.is_cancelled() {
+                return O::Cancelled;
+            }
+            crate::sync::lock_or_recover(calls).push(TestCompactBriefCall {
+                purpose,
+                prompt: prompt_text.clone(),
+                history: draft.history.clone(),
+                attempt,
+                fit_rung,
+            });
+            let scripted = draft
+                .test_script
+                .as_ref()
+                .and_then(|script| crate::sync::lock_or_recover(script).pop_front());
+            let Some(scripted) = scripted else {
+                record_compact_sample_observation(
+                    &draft, purpose, attempt, fit_rung, "success", None,
+                )
+                .await;
+                return O::Success(CompactDraftSuccess {
+                    brief: "test compact brief".to_string(),
+                    fit_rung,
+                    input_coverage,
+                    attempts: attempt,
+                });
+            };
+            match scripted {
+                TestCompactSample::Success(text) => {
+                    let chars = crate::engine::compact_draft::cleaned_brief_chars(&text);
+                    if crate::engine::compact_draft::is_degenerate_brief(&text) {
+                        record_compact_sample_observation(
+                            &draft,
+                            purpose,
+                            attempt,
+                            fit_rung,
+                            "degenerate",
+                            Some(&format!("{chars} non-whitespace characters")),
+                        )
+                        .await;
+                        if attempt < MAX_WIRE_SAMPLES_PER_NODE {
+                            continue;
+                        }
+                        return O::Degenerate {
+                            non_whitespace_chars: chars,
+                        };
+                    }
+                    record_compact_sample_observation(
+                        &draft, purpose, attempt, fit_rung, "success", None,
+                    )
+                    .await;
+                    return O::Success(CompactDraftSuccess {
+                        brief: text,
+                        fit_rung,
+                        input_coverage,
+                        attempts: attempt,
+                    });
+                }
+                TestCompactSample::Cancelled => {
+                    record_compact_sample_observation(
+                        &draft,
+                        purpose,
+                        attempt,
+                        fit_rung,
+                        "cancelled",
+                        None,
+                    )
+                    .await;
+                    return O::Cancelled;
+                }
+                TestCompactSample::Error {
+                    message,
+                    status,
+                    typed_timeout,
+                } => {
+                    let classification = crate::engine::compact_draft::classify_sample_error(
+                        false,
+                        &message,
+                        status,
+                        typed_timeout,
+                    );
+                    record_compact_sample_observation(
+                        &draft,
+                        purpose,
+                        attempt,
+                        fit_rung,
+                        match classification {
+                            CompactSampleClass::Cancelled => "cancelled",
+                            CompactSampleClass::ContextOverflow => "context_overflow",
+                            CompactSampleClass::Deterministic => "deterministic",
+                            CompactSampleClass::Transient => "transient",
+                        },
+                        Some(&compact_diagnostic(&draft, &message)),
+                    )
+                    .await;
+                    match classification {
+                        CompactSampleClass::Cancelled => return O::Cancelled,
+                        CompactSampleClass::ContextOverflow => {
+                            if draft.context_window.is_some()
+                                && attempt < MAX_WIRE_SAMPLES_PER_NODE
+                                && let Some(smaller) =
+                                    crate::engine::compact_draft::next_smaller_whole_exchange_fit(
+                                        &draft.history,
+                                    )
+                            {
+                                draft.history = smaller.history;
+                                fit_rung = smaller.rung;
+                                input_coverage = smaller.coverage;
+                                continue;
+                            }
+                            return O::ContextOverflow {
+                                diagnostic: compact_diagnostic(&draft, &message),
+                            };
+                        }
+                        CompactSampleClass::Deterministic => {
+                            return O::Deterministic {
+                                diagnostic: compact_diagnostic(&draft, &message),
+                            };
+                        }
+                        CompactSampleClass::Transient if attempt < MAX_WIRE_SAMPLES_PER_NODE => {}
+                        CompactSampleClass::Transient => {
+                            return O::TransientExhausted {
+                                diagnostic: compact_diagnostic(&draft, &message),
+                            };
+                        }
+                    }
+                }
+            }
         }
-        crate::sync::lock_or_recover(calls).push(TestCompactBriefCall {
-            purpose,
-            prompt: prompt_text.clone(),
-            history: draft.history.clone(),
-        });
-        let _ = draft
-            .session
-            .record_event(
-                crate::db::session_log::SessionEventKind::InferenceRequest,
-                Some(&draft.agent_name),
-                None,
-                &serde_json::json!({ "usage": null, "purpose": purpose }),
-            )
-            .await;
-        return O::Success(CompactDraftSuccess {
-            brief: "test compact brief".to_string(),
-            fit_rung,
-            input_coverage,
-            attempts: 1,
-        });
+        unreachable!("compact test sampler has a fixed non-zero attempt budget");
     }
     let mut last_transient = String::new();
     for attempt in 1..=MAX_WIRE_SAMPLES_PER_NODE {
+        if let Err(diagnostic) = crate::sync::lock_or_recover(&draft.quota).claim_wire_sample() {
+            return O::ContextOverflow { diagnostic };
+        }
         let call_id = uuid::Uuid::new_v4();
         let sampled = draft
             .model
@@ -1582,7 +1920,13 @@ async fn execute_compact_brief(
                         crate::db::session_log::SessionEventKind::InferenceRequest,
                         Some(&draft.agent_name),
                         Some(&call_id.to_string()),
-                        &serde_json::json!({ "usage": usage_json, "purpose": purpose }),
+                        &serde_json::json!({
+                            "usage": usage_json,
+                            "purpose": purpose,
+                            "attempt": attempt,
+                            "fit_rung": format!("{fit_rung:?}"),
+                            "classification": if crate::engine::compact_draft::is_degenerate_brief(&crate::engine::message::extract_text(&choice)) { "degenerate" } else { "success" },
+                        }),
                     )
                     .await
                 {
@@ -1591,6 +1935,15 @@ async fn execute_compact_brief(
                 let text = crate::engine::message::extract_text(&choice);
                 let cleaned_chars = crate::engine::compact_draft::cleaned_brief_chars(&text);
                 if crate::engine::compact_draft::is_degenerate_brief(&text) {
+                    record_compact_sample_observation(
+                        &draft,
+                        purpose,
+                        attempt,
+                        fit_rung,
+                        "degenerate",
+                        Some(&format!("{cleaned_chars} non-whitespace characters")),
+                    )
+                    .await;
                     if attempt < MAX_WIRE_SAMPLES_PER_NODE {
                         continue;
                     }
@@ -1609,26 +1962,42 @@ async fn execute_compact_brief(
             Err(_) if cancel.is_cancelled() => return O::Cancelled,
             Err(e) => {
                 tracing::warn!(error = %e, purpose, "compact: brief generation failed");
-                let diagnostic = crate::engine::compact_draft::bounded_diagnostic(&e.to_string());
+                let diagnostic = compact_diagnostic(&draft, &e.to_string());
                 let completion_error = e.downcast_ref::<rig::completion::CompletionError>();
                 let status =
                     completion_error.and_then(crate::engine::model::rig_boundary::http_status_of);
                 let typed_timeout = completion_error
                     .and_then(crate::engine::model::rig_boundary::stream_timeout_kind)
                     .is_some();
-                match crate::engine::compact_draft::classify_sample_error(
+                let classification = crate::engine::compact_draft::classify_sample_error(
                     false,
                     &e.to_string(),
                     status,
                     typed_timeout,
-                ) {
+                );
+                record_compact_sample_observation(
+                    &draft,
+                    purpose,
+                    attempt,
+                    fit_rung,
+                    match classification {
+                        CompactSampleClass::Cancelled => "cancelled",
+                        CompactSampleClass::ContextOverflow => "context_overflow",
+                        CompactSampleClass::Deterministic => "deterministic",
+                        CompactSampleClass::Transient => "transient",
+                    },
+                    Some(&diagnostic),
+                )
+                .await;
+                match classification {
                     CompactSampleClass::Cancelled => return O::Cancelled,
                     CompactSampleClass::ContextOverflow => {
                         // Provider accounting can be stricter than the local
                         // estimator. Spend the node's one remaining wire
                         // sample only on a strictly smaller whole-exchange
                         // suffix; never retry the known-overflowing input.
-                        if attempt < MAX_WIRE_SAMPLES_PER_NODE
+                        if draft.context_window.is_some()
+                            && attempt < MAX_WIRE_SAMPLES_PER_NODE
                             && let Some(smaller) =
                                 crate::engine::compact_draft::next_smaller_whole_exchange_fit(
                                     &draft.history,
@@ -1656,19 +2025,38 @@ async fn execute_compact_brief(
         diagnostic: last_transient,
     }
 }
-/// Estimate the wire-side token total of a message history via the
-/// cl100k_base fallback counter over each message's serialized form. Used
-/// only for the `context_pruned` timeline event's before/after figures
-/// (session-log-export Part C) — a faithful proxy, the same basis the
-/// tokenizer-calibration sampler uses, not an exact provider count.
-pub(in crate::engine::driver) fn wire_token_total(history: &[Message]) -> u64 {
-    history
-        .iter()
-        .map(|m| match serde_json::to_string(m) {
-            Ok(s) => crate::tokens::count(&s) as u64,
-            Err(_) => 0,
-        })
-        .sum()
+
+async fn record_compact_sample_observation(
+    draft: &CompactBriefDraft,
+    purpose: &'static str,
+    attempt: u8,
+    fit_rung: crate::engine::compact_draft::CompactFitRung,
+    classification: &'static str,
+    diagnostic: Option<&str>,
+) {
+    let diagnostic = diagnostic.map(crate::engine::compact_draft::bounded_diagnostic);
+    if let Err(error) = draft
+        .session
+        .record_event(
+            crate::db::session_log::SessionEventKind::InferenceRequest,
+            Some(&draft.agent_name),
+            None,
+            &serde_json::json!({
+                "purpose": purpose,
+                "attempt": attempt,
+                "fit_rung": format!("{fit_rung:?}"),
+                "classification": classification,
+                "diagnostic": diagnostic,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(%error, "compact brief: record sample observation failed");
+    }
+}
+
+fn compact_diagnostic(draft: &CompactBriefDraft, text: &str) -> String {
+    crate::engine::compact_draft::bounded_diagnostic(&draft.model.scrub_diagnostic(text))
 }
 
 /// Context-fill metrics for the auto-prune/auto-compact triggers

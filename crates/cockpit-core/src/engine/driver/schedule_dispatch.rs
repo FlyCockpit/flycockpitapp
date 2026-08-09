@@ -92,6 +92,7 @@ impl Driver {
                 self.run_user_input(
                     UserSubmission {
                         kind: UserSubmissionKind::User,
+                        origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
                         text: injected,
                         display_text: None,
                         tag_expansions: Vec::new(),

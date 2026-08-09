@@ -933,6 +933,7 @@ impl App {
                 self.begin_working_span();
                 let submission = cockpit_core::engine::message::UserSubmission {
                     kind: cockpit_core::engine::message::UserSubmissionKind::User,
+                    origin: cockpit_core::engine::message::SubmissionOrigin::AutoContinue,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),

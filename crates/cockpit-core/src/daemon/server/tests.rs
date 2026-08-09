@@ -10711,6 +10711,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let origin_principal = state.principal.tag();
     let submission = crate::engine::message::UserSubmission {
         kind: crate::engine::message::UserSubmissionKind::User,
+        origin: Default::default(),
         text: text.to_string(),
         display_text: None,
         tag_expansions: Vec::new(),

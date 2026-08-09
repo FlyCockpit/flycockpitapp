@@ -2209,6 +2209,7 @@ impl App {
             .collect::<Vec<_>>();
         let submission = cockpit_core::engine::message::UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),

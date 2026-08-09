@@ -21,9 +21,10 @@ mod schedule_dispatch;
 mod skills_seed;
 mod swap;
 
+use crate::engine::compact_draft::wire_token_total;
 #[cfg(test)]
 use context_reduction::*;
-use context_reduction::{PruneEffectiveness, wire_token_total};
+use context_reduction::{AutoCompactGate, PruneEffectiveness};
 pub(crate) use delegation_helpers::scoped_write_refusal;
 use delegation_helpers::*;
 use inbound::injection_check_prompt_target;
@@ -910,6 +911,11 @@ pub struct Driver {
     #[cfg(test)]
     test_compact_brief_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
     #[cfg(test)]
+    test_compact_brief_script:
+        Option<Arc<std::sync::Mutex<std::collections::VecDeque<TestCompactSample>>>>,
+    #[cfg(test)]
+    test_compact_model_ref: Option<String>,
+    #[cfg(test)]
     test_compaction_apply_trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
@@ -957,6 +963,20 @@ struct TestCompactBriefCall {
     purpose: &'static str,
     prompt: String,
     history: Vec<Message>,
+    attempt: u8,
+    fit_rung: crate::engine::compact_draft::CompactFitRung,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TestCompactSample {
+    Success(String),
+    Cancelled,
+    Error {
+        message: String,
+        status: Option<u16>,
+        typed_timeout: bool,
+    },
 }
 
 enum ShadowBriefState {
@@ -1407,6 +1427,10 @@ impl Driver {
             #[cfg(test)]
             test_compact_brief_calls: self.test_compact_brief_calls.clone(),
             #[cfg(test)]
+            test_compact_brief_script: self.test_compact_brief_script.clone(),
+            #[cfg(test)]
+            test_compact_model_ref: self.test_compact_model_ref.clone(),
+            #[cfg(test)]
             test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
@@ -1713,6 +1737,12 @@ impl Driver {
             test_reject_next_submission_preflight: false,
             #[cfg(test)]
             test_compact_brief_calls: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            #[cfg(test)]
+            test_compact_brief_script: Some(Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            ))),
+            #[cfg(test)]
+            test_compact_model_ref: None,
             #[cfg(test)]
             test_compaction_apply_trace: None,
             redaction_scan_environment_override: None,
@@ -4713,6 +4743,7 @@ impl Driver {
         let inbound_text = self.translate_inbound(&raw_text).await;
         Some(UserSubmission {
             kind: UserSubmissionKind::User,
+            origin: submission.origin,
             text: inbound_text,
             display_text: submission.display_text,
             tag_expansions: submission.tag_expansions,
@@ -4834,6 +4865,7 @@ impl Driver {
             leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
             leading_history.push(crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
+                origin: submission.origin,
                 text: submission.text,
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -6355,6 +6387,9 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        if submission.origin.advances_activity_epoch() {
+            self.auto_compact_gate.external_activity();
+        }
         // Shadow drafting is utility work: a foreground user turn always wins.
         // Preserve a task that already completed, but cancel an unfinished one
         // before assembling or dispatching the user's inference.
@@ -6559,6 +6594,7 @@ impl Driver {
                     .requeue_front_after(
                         UserSubmission {
                             kind: submission_kind,
+                            origin: crate::engine::message::SubmissionOrigin::Internal,
                             text: user_text,
                             display_text,
                             tag_expansions,
@@ -6678,6 +6714,7 @@ impl Driver {
             self.record_failed_turn_retry_started(recovery_id, tx).await;
             crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
+                origin: crate::engine::message::SubmissionOrigin::RetryRecovery,
                 text: recovered_text.clone(),
                 display_text: None,
                 tag_expansions: Vec::new(),
@@ -6695,6 +6732,7 @@ impl Driver {
         } else {
             crate::engine::message::build_user_message(UserSubmission {
                 kind: UserSubmissionKind::User,
+                origin: crate::engine::message::SubmissionOrigin::Internal,
                 text: if time_prelude_as_system {
                     user_text
                 } else {
@@ -7098,6 +7136,8 @@ impl Driver {
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
+                                        origin:
+                                            crate::engine::message::SubmissionOrigin::AutoContinue,
                                         text: self.with_time_prelude(prepared.text),
                                         display_text: None,
                                         tag_expansions: Vec::new(),
@@ -7179,6 +7219,7 @@ impl Driver {
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         kind: UserSubmissionKind::User,
+                                        origin: crate::engine::message::SubmissionOrigin::GoalContinuation,
                                         text: prepared.text,
                                         display_text: None,
                                         tag_expansions: Vec::new(),

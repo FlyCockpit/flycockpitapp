@@ -150,6 +150,7 @@ fn runner_with_input(
 fn complete_submission(index: usize) -> UserSubmission {
     UserSubmission {
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {

@@ -3947,6 +3947,7 @@ mod tests {
     fn complete_test_submission() -> cockpit_core::engine::message::UserSubmission {
         cockpit_core::engine::message::UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: Default::default(),
             text: "wire text with expanded tag and image sentinel".to_string(),
             display_text: Some("visible @src/lib.rs [image]".to_string()),
             tag_expansions: vec![proto::TagExpansionMeta {

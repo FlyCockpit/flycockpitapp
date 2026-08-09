@@ -861,11 +861,265 @@ async fn staleness_rule_has_one_implementation() {
 }
 
 #[tokio::test]
+async fn compact_draft_retries_only_transient_or_degenerate() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let _cancel_fixture = TestCompactSample::Cancelled;
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    append_complete_test_turns(&mut driver, 1);
+    let script = driver.test_compact_brief_script.as_ref().unwrap();
+    crate::sync::lock_or_recover(script).extend([
+        TestCompactSample::Error {
+            message: "temporary network failure".to_string(),
+            status: None,
+            typed_timeout: false,
+        },
+        TestCompactSample::Success("usable compact synthesis ".repeat(40)),
+    ]);
+    let history = driver.stack.last().unwrap().history.clone();
+    let draft = driver
+        .compact_brief_draft(
+            &tx,
+            history,
+            Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+        )
+        .await;
+    let outcome = execute_compact_brief(
+        draft,
+        "summarize".to_string(),
+        "compact_script_test",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let crate::engine::compact_draft::CompactDraftOutcome::Success(success) = outcome else {
+        panic!("scripted retry should recover")
+    };
+    assert_eq!(success.attempts, 2);
+    let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
+    let scripted = calls
+        .iter()
+        .filter(|call| call.purpose == "compact_script_test")
+        .collect::<Vec<_>>();
+    assert_eq!(scripted.len(), 2);
+    assert_eq!(scripted[0].attempt, 1);
+    assert_eq!(scripted[1].attempt, 2);
+    assert_eq!(scripted[0].fit_rung, scripted[1].fit_rung);
+    drop(calls);
+    assert_eq!(
+        compact_inference_purposes(&driver)
+            .await
+            .into_iter()
+            .filter(|purpose| purpose == "compact_script_test")
+            .count(),
+        2,
+        "each scripted wire sample has its own observable classification event"
+    );
+}
+
+#[tokio::test]
+async fn compact_override_uses_selected_models_context_window() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        100_000,
+    );
+    let (providers, _, _) = driver.test_providers_override.as_mut().unwrap();
+    let provider = providers.providers.get_mut("lmstudio").unwrap();
+    let mut compact = provider.models[0].clone();
+    compact.id = "compact".to_string();
+    compact.context_length = Some(4_096);
+    provider.models.push(compact);
+    driver.test_compact_model_ref = Some("lmstudio:compact".to_string());
+    let draft = driver
+        .compact_brief_draft(
+            &tx,
+            vec![Message::user("history")],
+            Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+        )
+        .await;
+    assert_eq!(draft.model.model_id_ref(), "compact");
+    assert_eq!(draft.context_window, Some(4_096));
+}
+
+#[tokio::test]
+async fn compact_preparation_quota_is_shared_across_draft_calls() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    let quota = Arc::new(std::sync::Mutex::new(CompactPreparationQuota {
+        draft_nodes: crate::engine::compact_draft::MAX_DRAFT_NODES - 1,
+        wire_samples: crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES - 1,
+    }));
+    let first = driver
+        .compact_brief_draft(&tx, vec![Message::user("first")], quota.clone())
+        .await;
+    assert!(matches!(
+        execute_compact_brief(
+            first,
+            "summarize".to_string(),
+            "quota_first",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await,
+        crate::engine::compact_draft::CompactDraftOutcome::Success(_)
+    ));
+    let second = driver
+        .compact_brief_draft(&tx, vec![Message::user("second")], quota.clone())
+        .await;
+    let outcome = execute_compact_brief(
+        second,
+        "summarize".to_string(),
+        "quota_second",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. }
+    ));
+    let quota = crate::sync::lock_or_recover(&quota);
+    assert_eq!(
+        quota.draft_nodes,
+        crate::engine::compact_draft::MAX_DRAFT_NODES
+    );
+    assert_eq!(
+        quota.wire_samples,
+        crate::engine::compact_draft::MAX_COMPACTION_WIRE_SAMPLES
+    );
+}
+
+#[tokio::test]
+async fn compact_unknown_window_overflow_never_advances_to_smaller_rung() {
+    use crate::config::providers::{CacheMode, ContextConfig};
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    let history = vec![
+        Message::user("older request"),
+        Message::assistant("older response"),
+        Message::user("newest request"),
+        Message::assistant("newest response"),
+    ];
+    crate::sync::lock_or_recover(driver.test_compact_brief_script.as_ref().unwrap()).extend([
+        TestCompactSample::Error {
+            message: "maximum context length exceeded".to_string(),
+            status: Some(400),
+            typed_timeout: false,
+        },
+        TestCompactSample::Success("must never be sampled ".repeat(40)),
+    ]);
+    let mut draft = driver
+        .compact_brief_draft(
+            &tx,
+            history.clone(),
+            Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default())),
+        )
+        .await;
+    draft.context_window = None;
+    let outcome = execute_compact_brief(
+        draft,
+        "summarize".to_string(),
+        "unknown_window_overflow",
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. }
+    ));
+    let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
+    let calls = calls
+        .iter()
+        .filter(|call| call.purpose == "unknown_window_overflow")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].attempt, 1);
+    assert_eq!(
+        calls[0].fit_rung,
+        crate::engine::compact_draft::CompactFitRung::Verbatim
+    );
+    assert_eq!(calls[0].history, history);
+}
+
+#[test]
+fn compact_auto_gate_has_exact_boundary_activity_origin_and_ingress_transitions() {
+    use crate::engine::message::SubmissionOrigin;
+    let coverage = prepared_compaction_coverage(&[Message::user("one")]);
+    let mut gate = AutoCompactGate::default();
+    let failure = PrepareCompactionError::Draft(
+        crate::engine::compact_draft::CompactDraftOutcome::Deterministic {
+            diagnostic: "rejected".to_string(),
+        },
+    );
+    gate.record_failure(&failure, coverage.clone());
+    assert!(gate.suppresses(&coverage));
+    for origin in [
+        SubmissionOrigin::GoalContinuation,
+        SubmissionOrigin::ScheduledJob,
+        SubmissionOrigin::AutoContinue,
+        SubmissionOrigin::RetryRecovery,
+        SubmissionOrigin::ToolResult,
+        SubmissionOrigin::CompactNotice,
+        SubmissionOrigin::Internal,
+    ] {
+        if origin.advances_activity_epoch() {
+            gate.external_activity();
+        }
+        assert!(gate.suppresses(&coverage), "{origin:?}");
+    }
+    if SubmissionOrigin::ExternalRoot.advances_activity_epoch() {
+        gate.external_activity();
+    }
+    assert!(!gate.suppresses(&coverage));
+
+    gate.record_failure(
+        &PrepareCompactionError::Draft(
+            crate::engine::compact_draft::CompactDraftOutcome::TransientExhausted {
+                diagnostic: "network".to_string(),
+            },
+        ),
+        coverage.clone(),
+    );
+    assert!(gate.suppresses(&coverage));
+    let changed = prepared_compaction_coverage(&[Message::user("one"), Message::assistant("two")]);
+    assert!(!gate.suppresses(&changed));
+}
+
+#[tokio::test]
 async fn manual_compact_cancels_shadow() {
     use crate::config::providers::{CacheMode, ContextConfig};
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
-    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+    // This test owns shadow pre-emption, not the known-oversized-request
+    // branch. Give the compact request enough framing space so the asserted
+    // fallback sample is real; a 100-token window correctly skips sampling.
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
     let cancel = tokio_util::sync::CancellationToken::new();
     let observed_cancel = cancel.clone();
     driver.shadow_brief_generation = 1;

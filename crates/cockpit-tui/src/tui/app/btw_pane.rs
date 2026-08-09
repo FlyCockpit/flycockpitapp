@@ -475,6 +475,7 @@ impl BtwPane {
         };
         let submission = UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
             text: text.clone(),
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),

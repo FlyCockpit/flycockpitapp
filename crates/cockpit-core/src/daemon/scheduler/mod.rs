@@ -832,6 +832,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
         handle
             .send_work(SessionWork::UserMessage {
                 submission: Box::new(crate::engine::message::UserSubmission {
+                    origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
                     kind: crate::engine::message::UserSubmissionKind::User,
                     text: prompt,
                     display_text: None,

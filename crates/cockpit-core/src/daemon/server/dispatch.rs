@@ -157,6 +157,7 @@ async fn handle_send_user_message(
     };
     let (respond_to, response_rx) = tokio::sync::oneshot::channel();
     let mut submission = crate::engine::message::UserSubmission {
+        origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
         kind: crate::engine::message::UserSubmissionKind::User,
         text,
         display_text,

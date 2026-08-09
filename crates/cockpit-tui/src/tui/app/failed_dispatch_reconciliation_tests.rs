@@ -1045,6 +1045,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
     });
     let exact_submission = UserSubmission {
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: "exact wire text".to_string(),
         display_text: Some("visible side draft".to_string()),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
@@ -1149,6 +1150,7 @@ fn error_lines(app: &App) -> Vec<&str> {
 fn complete_dispatch_submission(marker: &str) -> UserSubmission {
     UserSubmission {
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!("wire-{marker}"),
         display_text: Some(format!("visible-{marker}")),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
@@ -1944,6 +1946,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
 
     let exact_submission = UserSubmission {
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!(
             "wire-before{}wire-after",
             cockpit_core::engine::message::IMAGE_PART_SENTINEL

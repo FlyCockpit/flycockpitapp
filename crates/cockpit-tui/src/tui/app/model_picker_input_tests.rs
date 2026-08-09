@@ -174,6 +174,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
         display: "review @src/model.rs with image".to_string(),
         submission: cockpit_core::engine::message::UserSubmission {
             kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+            origin: Default::default(),
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],

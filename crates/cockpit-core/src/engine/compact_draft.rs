@@ -6,10 +6,21 @@
 
 use rig::message::{Message, ToolResultContent, UserContent};
 
-use super::driver::wire_token_total;
+pub(crate) fn wire_token_total(history: &[Message]) -> u64 {
+    history
+        .iter()
+        .map(|message| match serde_json::to_string(message) {
+            Ok(serialized) => crate::tokens::count(&serialized) as u64,
+            Err(_) => 0,
+        })
+        .sum()
+}
 
 pub(crate) const MIN_CLEAN_BRIEF_CHARS: usize = 500;
 pub(crate) const MAX_WIRE_SAMPLES_PER_NODE: u8 = 2;
+pub(crate) const MAX_DRAFT_NODES: usize = 64;
+pub(crate) const MAX_COMPACTION_WIRE_SAMPLES: usize =
+    MAX_DRAFT_NODES * MAX_WIRE_SAMPLES_PER_NODE as usize;
 const DIAGNOSTIC_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -191,7 +202,12 @@ pub(crate) fn fit_compact_request(
     }
     fit_whole_exchange_suffix(history, budget.history_allowance())
         .or_else(|| truncate_newest_exchange_to_fit(history, budget.history_allowance()))
+        .or_else(|| emergency_history_to_fit(history, budget.history_allowance()))
         .ok_or_else(|| "newest complete exchange does not fit the compact model".to_string())
+}
+
+pub(crate) fn is_real_user_message(message: &Message) -> bool {
+    matches!(message, Message::User { content } if content.iter().any(|part| !matches!(part, UserContent::ToolResult(_))))
 }
 
 /// Select the richest provider-valid whole-exchange suffix that fits.  The
@@ -341,6 +357,132 @@ pub(crate) fn truncate_newest_exchange_to_fit(
     })
 }
 
+/// Last-resort provider-valid request retaining the newest real user turn and
+/// only its adjacent complete exchange context. Unlike ordinary selection,
+/// this rung may shorten eligible tool-result payloads even when later
+/// provider-only exchanges exist.
+pub(crate) fn emergency_history_to_fit(
+    history: &[Message],
+    allowance: u64,
+) -> Option<FittedCompactHistory> {
+    let newest_user = history.iter().rposition(is_real_user_message)?;
+    let range = super::compact::complete_exchange_ranges(history)
+        .into_iter()
+        .find(|range| range.contains(&newest_user))?;
+    let exchange = &history[range];
+    if wire_token_total(exchange) <= allowance {
+        super::rehydrate::validate_pairing(exchange).ok()?;
+        return Some(FittedCompactHistory {
+            history: exchange.to_vec(),
+            rung: CompactFitRung::Emergency,
+            coverage: CompactInputCoverage::Partial,
+        });
+    }
+    let max_payload = exchange
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|part| match part {
+            UserContent::ToolResult(result) => Some(&result.content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|payload| match payload {
+            ToolResultContent::Text(text) => Some(text.text.len()),
+            _ => None,
+        })
+        .max()?;
+    let mut low = 0;
+    let mut high = max_payload;
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let (candidate, changed) = truncate_tool_payloads(exchange, mid);
+        if changed && wire_token_total(&candidate) <= allowance {
+            best = Some(candidate);
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let history = best?;
+    super::rehydrate::validate_pairing(&history).ok()?;
+    Some(FittedCompactHistory {
+        history,
+        rung: CompactFitRung::Emergency,
+        coverage: CompactInputCoverage::Partial,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChunkedSynthesisPlan {
+    pub chunks: Vec<Vec<Message>>,
+    /// Number of recursive adjacent-merge layers after leaf drafting.
+    pub merge_depth: usize,
+    /// Leaves, recursive merges, and the final synthesis node.
+    pub draft_nodes: usize,
+    pub max_wire_samples: usize,
+}
+
+/// Partition all exchanges chronologically into provider-valid request-sized
+/// leaves, then account for a balanced adjacent merge tree and final synthesis
+/// under the fixed quota boundary. No source exchange is silently dropped.
+pub(crate) fn plan_chunked_synthesis(
+    history: &[Message],
+    allowance: u64,
+) -> Result<ChunkedSynthesisPlan, String> {
+    let ranges = super::compact::complete_exchange_ranges(history);
+    if ranges.is_empty() {
+        return Err("no complete exchanges available for chunked synthesis".to_string());
+    }
+    let mut chunks: Vec<Vec<Message>> = Vec::new();
+    for range in ranges {
+        let exchange = &history[range];
+        if wire_token_total(exchange) > allowance {
+            return Err(
+                "an exchange cannot fit a full-coverage chunk leaf without omitting source bytes"
+                    .to_string(),
+            );
+        }
+        let exchange = exchange.to_vec();
+        super::rehydrate::validate_pairing(&exchange)
+            .map_err(|error| format!("invalid chunk leaf: {error}"))?;
+        if let Some(last) = chunks.last_mut() {
+            let mut candidate = last.clone();
+            candidate.extend(exchange.clone());
+            if wire_token_total(&candidate) <= allowance {
+                *last = candidate;
+                continue;
+            }
+        }
+        chunks.push(exchange);
+    }
+    let leaves = chunks.len();
+    let recursive_merges = leaves.saturating_sub(1);
+    let draft_nodes = leaves.saturating_add(recursive_merges).saturating_add(1);
+    if draft_nodes > MAX_DRAFT_NODES {
+        return Err(format!(
+            "chunked synthesis requires {draft_nodes} draft nodes; limit is {MAX_DRAFT_NODES}"
+        ));
+    }
+    let merge_depth = if leaves <= 1 {
+        0
+    } else {
+        usize::BITS as usize - (leaves - 1).leading_zeros() as usize
+    };
+    Ok(ChunkedSynthesisPlan {
+        chunks,
+        merge_depth,
+        draft_nodes,
+        max_wire_samples: draft_nodes * MAX_WIRE_SAMPLES_PER_NODE as usize,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +619,105 @@ mod tests {
         assert!(serialized.contains("call-1"));
         assert!(serialized.contains("provider-call-1"));
         assert!(serialized.contains("large.json"));
+    }
+
+    #[test]
+    fn compact_fitting_keeps_newest_real_user_turn() {
+        let history = vec![
+            Message::user("old request ".repeat(100)),
+            Message::assistant("old response ".repeat(100)),
+            Message::user("newest real request"),
+            Message::assistant("newest response"),
+        ];
+        let allowance = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, allowance).unwrap();
+        assert!(fitted.history.iter().any(|message| {
+            is_real_user_message(message)
+                && serde_json::to_string(message)
+                    .unwrap()
+                    .contains("newest real request")
+        }));
+    }
+
+    #[test]
+    fn compact_fitting_ladder_is_monotonic_and_bounded() {
+        let history = vec![
+            Message::user("old ".repeat(500)),
+            Message::assistant("answer ".repeat(500)),
+            Message::user("new request"),
+            Message::assistant("new response"),
+        ];
+        let full = wire_token_total(&history);
+        let selected = fit_whole_exchange_suffix(&history, full / 2).unwrap();
+        assert!(wire_token_total(&selected.history) <= full);
+        assert_eq!(selected.rung, CompactFitRung::HistorySelected);
+        assert!(fit_compact_request(&history, "system", "instruction", Some(1)).is_err());
+    }
+
+    #[test]
+    fn compact_chunked_synthesis_covers_every_exchange_and_enforces_node_cap() {
+        let history = (0..4)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request-{index} {}", "x".repeat(200))),
+                    Message::assistant(format!("response-{index} {}", "y".repeat(200))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let one_exchange = wire_token_total(&history[..2]);
+        let plan = plan_chunked_synthesis(&history, one_exchange).unwrap();
+        assert_eq!(plan.chunks.len(), 4);
+        assert_eq!(plan.draft_nodes, 8);
+        assert_eq!(
+            plan.max_wire_samples,
+            plan.draft_nodes * MAX_WIRE_SAMPLES_PER_NODE as usize
+        );
+        let flattened = plan.chunks.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(flattened, history);
+
+        let oversized = (0..33)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request-{index} {}", "x".repeat(200))),
+                    Message::assistant(format!("response-{index} {}", "y".repeat(200))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(plan_chunked_synthesis(&oversized, one_exchange).is_err());
+    }
+
+    #[test]
+    fn compact_chunk_leaf_never_promotes_truncated_source_to_full_coverage() {
+        let call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "call-large".into(),
+                call_id: Some("provider-large".into()),
+                function: ToolFunction {
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "large.json"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        };
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "call-large".into(),
+                call_id: Some("provider-large".into()),
+                content: OneOrMany::one(ToolResultContent::text("x".repeat(20_000))),
+            })),
+        };
+        let history = vec![Message::user("inspect"), call, result];
+        let truncated = truncate_newest_exchange_to_fit(
+            &history,
+            wire_token_total(&history).saturating_sub(100),
+        )
+        .expect("the partial ladder may truncate an intermediate input");
+        assert_eq!(truncated.coverage, CompactInputCoverage::Partial);
+        assert!(
+            plan_chunked_synthesis(&history, wire_token_total(&truncated.history)).is_err(),
+            "full-coverage synthesis must fail instead of relabeling omitted bytes as full"
+        );
     }
 }

@@ -511,6 +511,12 @@ impl Model {
         }
     }
 
+    /// Scrub diagnostic text using this model's resolved custody policy
+    /// without exposing the underlying redaction table.
+    pub(crate) fn scrub_diagnostic(&self, text: &str) -> String {
+        self.redact().scrub(text)
+    }
+
     /// The resolved inference-stream timeouts (TTFT + idle) for this model
     /// (implementation note).
     fn timeout(&self) -> &crate::config::providers::TimeoutConfig {

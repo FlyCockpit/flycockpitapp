@@ -38,6 +38,11 @@ pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
 pub struct UserSubmission {
     #[serde(default)]
     pub kind: UserSubmissionKind,
+    /// Trustworthy construction-site classification for compaction activity
+    /// gating. Transport retries preserve this value; they never reclassify
+    /// retained work as fresh user activity.
+    #[serde(default)]
+    pub origin: SubmissionOrigin,
     pub text: String,
     /// User-facing transcript form. `None` means the wire text is also the
     /// display text.
@@ -131,6 +136,26 @@ pub enum UserSubmissionKind {
     #[default]
     User,
     Compact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionOrigin {
+    ExternalRoot,
+    GoalContinuation,
+    ScheduledJob,
+    AutoContinue,
+    RetryRecovery,
+    ToolResult,
+    CompactNotice,
+    #[default]
+    Internal,
+}
+
+impl SubmissionOrigin {
+    pub fn advances_activity_epoch(self) -> bool {
+        matches!(self, Self::ExternalRoot)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1034,6 +1059,7 @@ impl UserSubmission {
     pub fn compact_notice() -> Self {
         Self {
             kind: UserSubmissionKind::Compact,
+            origin: SubmissionOrigin::CompactNotice,
             text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_string(),
             ..Self::default()
         }
@@ -1289,6 +1315,26 @@ mod tests {
         let parts = user_parts(&msg);
         assert_eq!(parts.len(), 1);
         assert!(matches!(parts[0], UserContent::Text(_)));
+    }
+
+    #[test]
+    fn submission_origin_only_external_root_advances_compaction_activity() {
+        assert!(SubmissionOrigin::ExternalRoot.advances_activity_epoch());
+        for origin in [
+            SubmissionOrigin::GoalContinuation,
+            SubmissionOrigin::ScheduledJob,
+            SubmissionOrigin::AutoContinue,
+            SubmissionOrigin::RetryRecovery,
+            SubmissionOrigin::ToolResult,
+            SubmissionOrigin::CompactNotice,
+            SubmissionOrigin::Internal,
+        ] {
+            assert!(!origin.advances_activity_epoch(), "{origin:?}");
+        }
+        assert_eq!(
+            UserSubmission::compact_notice().origin,
+            SubmissionOrigin::CompactNotice
+        );
     }
 
     #[test]

@@ -287,6 +287,28 @@ describe("remote_authority_three_digest_rollout", () => {
         localDigest: digests[2]!,
       }).ready,
     ).toBe(false);
+    const validLeases = [lease("a", digests[1]!), lease("b", digests[1]!)],
+      rolloutInput = {
+        now: "10",
+        issuerDigest: "issuer",
+        deploymentId: cfg.deploymentId,
+        snapshot,
+        plan: digests as [string, string, string],
+        rings,
+        localDigest: digests[1]!,
+      };
+    for (const badLease of [
+      { ...validLeases[0]!, issuerDigest: "other" },
+      { ...validLeases[0]!, deploymentId: "other" },
+      { ...validLeases[0]!, currentKid: "wrong" },
+      { ...validLeases[0]!, digest: "f".repeat(64) },
+    ])
+      expect(
+        reduceAuthorityRollout({
+          ...rolloutInput,
+          leases: [badLease, validLeases[1]!],
+        }).ready,
+      ).toBe(false);
   });
 });
 describe("remote_authority_jwks_and_status_public_only", () => {
@@ -325,6 +347,12 @@ describe("remote_authority_jwks_and_status_public_only", () => {
       },
     );
     expect(verified.header.kid).toBe("k0");
+    await expect(
+      createRemoteAuthorityStatusJws({ ...verified.payload, revokedKids: ["z", "a"] }, signer),
+    ).rejects.toThrow();
+    await expect(
+      createRemoteAuthorityStatusJws({ ...verified.payload, revokedKids: ["a", "a"] }, signer),
+    ).rejects.toThrow();
     const parts = status.split("."),
       rejectTampered = async (headerChanges: Record<string, unknown>, payloadChanges = {}) => {
         const header = {
@@ -354,6 +382,36 @@ describe("remote_authority_jwks_and_status_public_only", () => {
     await rejectTampered({}, { aud: "wrong" });
     await rejectTampered({}, { deploymentId: "other" });
     await rejectTampered({}, { iss: "https://other.example" });
+    await expect(
+      verifyRemoteAuthorityStatusJws(
+        `${parts[0]}.${parts[1]}.${Buffer.alloc(63).toString("base64url")}`,
+        new RingAuthorityVerifier(value, "100"),
+        {
+          issuer: cfg.issuer,
+          deploymentId: cfg.deploymentId,
+          ringDigest: digest,
+          authorityEpoch: "1",
+          minimumGeneration: "1",
+          now: "100",
+          authorizedSignerKid: "k0",
+        },
+      ),
+    ).rejects.toThrow();
+    await expect(
+      verifyRemoteAuthorityStatusJws(
+        `${parts[0]}.${"a".repeat(16_385)}.${parts[2]}`,
+        new RingAuthorityVerifier(value, "100"),
+        {
+          issuer: cfg.issuer,
+          deploymentId: cfg.deploymentId,
+          ringDigest: digest,
+          authorityEpoch: "1",
+          minimumGeneration: "1",
+          now: "100",
+          authorizedSignerKid: "k0",
+        },
+      ),
+    ).rejects.toThrow();
     const revokedStatus = await createRemoteAuthorityStatusJws(
       { ...verified.payload, revokedKids: ["k0"] },
       signer,

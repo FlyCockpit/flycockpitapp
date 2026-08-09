@@ -19,6 +19,7 @@ import {
   type RemoteAuthorityStatusV1,
   RingAuthorityVerifier,
   reduceAuthorityRollout,
+  type SigningJournalEntry,
   verifyRemoteAuthorityStatusJws,
 } from "./remote-authority";
 import {
@@ -98,6 +99,7 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     };
     let finalized: FinalizedAuthorityStatus | null = null;
     let reservations = 0;
+    let reservedMint: SigningJournalEntry | undefined;
     const publicRing = publicAuthorityRing(ring, { issuer, deploymentId });
     const store = {
       bootstrapAuthority: async () => undefined,
@@ -125,13 +127,21 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
       prepareLifecycleTransition: async () => false,
       markTransitionStatusSigned: async () => false,
       commitLifecycleTransition: async () => false,
-      reserveMint: async () => {
-        throw new Error("not used");
+      reserveMint: async (args) => {
+        reservedMint = { ...args, state: "reserved" };
+        return reservedMint;
       },
       ensureOpenSigningFence: async () => true,
       closeAndFreezeSigningFence: async () => true,
-      finalizeMint: async () => {
-        throw new Error("not used");
+      finalizeMint: async (args) => {
+        if (!reservedMint) throw new Error("mint was not reserved");
+        reservedMint = {
+          ...reservedMint,
+          ...args,
+          state: "finalized",
+          signedAt: now,
+        };
+        return reservedMint;
       },
     } satisfies AuthorityRuntimeStore;
     const observations = {
@@ -166,6 +176,16 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     expect((await runtime.tick()).ready).toBe(true);
     expect(reservations).toBe(2);
     expect(finalized?.status.statusGeneration).toBe("2");
+    const minted = await runtime.mint("mint-1", Buffer.from("claims"), (signature) =>
+      Buffer.from(signature).toString("base64url"),
+    );
+    expect(minted).toBe(reservedMint?.compactJws);
+    expect(reservedMint).toMatchObject({
+      mintId: "mint-1",
+      kid: "k0",
+      signingGeneration: "1",
+      state: "finalized",
+    });
     let releaseRedis!: () => void;
     redisGate = new Promise((resolve) => {
       releaseRedis = resolve;

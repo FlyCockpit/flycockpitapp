@@ -115,7 +115,11 @@ export interface AuthorityRuntimeStore {
     kid: string;
     signingGeneration: string;
   }): Promise<boolean>;
-  closeAndFreezeSigningFence(deploymentId: string, kid: string): Promise<boolean>;
+  closeAndFreezeSigningFence(
+    deploymentId: string,
+    kid: string,
+    custody: "in_process_file",
+  ): Promise<boolean>;
   finalizeMint(args: {
     mintId: string;
     signingGeneration: string;
@@ -464,6 +468,7 @@ export class RemoteAuthorityRuntime {
         !(await this.options.store.closeAndFreezeSigningFence(
           this.config.deploymentId,
           d1.currentKid,
+          "in_process_file",
         ))
       )
         return this.#fail("prior_signing_fence_not_frozen");

@@ -498,7 +498,8 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       { isolationLevel: "Serializable" },
     );
   }
-  async closeAndFreezeSigningFence(deploymentId: string, kid: string) {
+  async closeAndFreezeSigningFence(deploymentId: string, kid: string, custody: "in_process_file") {
+    if (custody !== "in_process_file") throw new Error("unsupported signer custody");
     return this.db.$transaction(
       async (tx) => {
         await tx.$executeRawUnsafe(
@@ -549,7 +550,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
       kid,
     );
     const seconds = (value: unknown) =>
-        Math.floor(new Date(value as string).getTime() / 1000).toString(),
+        Math.ceil(new Date(value as string).getTime() / 1000).toString(),
       frozenAt = fences
         .map((item) => BigInt(seconds(item.updatedAt)))
         .reduce((left, right) => (left > right ? left : right))

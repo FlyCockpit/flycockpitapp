@@ -118,7 +118,7 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
           ];
         return [
           { mintId: "m1", state: "finalized", signedAt: new Date(19_000) },
-          { mintId: "m2", state: "finalized", signedAt: new Date(20_000) },
+          { mintId: "m2", state: "finalized", signedAt: new Date(20_001) },
         ];
       },
     } satisfies SqlClient;
@@ -127,7 +127,7 @@ describe("PostgresAuthorityRuntimeStore raw fence behavior", () => {
       "prod_1",
       "k0",
     );
-    expect(proof.cutoff).toBe("20");
+    expect(proof.cutoff).toBe("21");
     expect(proof.frozenAt).toBe("22");
     expect(queries[0]?.query).toContain('ORDER BY "signingGeneration"');
     expect(queries[1]?.query).not.toContain('"signingGeneration"=$3::numeric');

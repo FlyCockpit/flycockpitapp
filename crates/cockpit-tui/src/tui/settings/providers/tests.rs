@@ -303,6 +303,20 @@ fn descend_provider(
     dialog: &mut SettingsDialog,
     matches: impl Fn(&super::super::pointer_actions::ProvidersAction) -> bool,
 ) {
+    if let Some(ProvidersPage::Edit(state)) = dialog.page.downcast_mut::<ProvidersPage>()
+        && let Some(index) = edit_menu_actions(&state.provider_id, &state.entry)
+            .iter()
+            .position(|source| {
+                let super::super::pointer_actions::SettingsPointerAction::Providers(action) =
+                    provider_edit_pointer_action(state, *source)
+                else {
+                    return false;
+                };
+                matches(&action)
+            })
+    {
+        state.cursor = index;
+    }
     let _ = render_provider_rows(dialog, 110, 60);
     let target = dialog.pointer_surface.targets.borrow().iter().find(|target| {
         matches!(&target.action, super::super::shell::SettingsPointerAction::Page(super::super::pointer_actions::SettingsPointerAction::Providers(action)) if target.enabled && matches(action))

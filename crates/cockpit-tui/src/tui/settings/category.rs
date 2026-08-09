@@ -3459,6 +3459,19 @@ impl SettingsCx {
             }
         }
 
+        let inline_actions = p.editing.map(|id| {
+            lines.push(Line::default());
+            controls.push(None);
+            let line = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled("[Save]", selected_style()),
+                Span::raw("  "),
+                Span::styled("[Cancel]", selected_style()),
+            ]));
+            controls.push(None);
+            (line, id)
+        });
+
         if let Some(label) = p.category.reset_label() {
             lines.push(Line::default());
             controls.push(None);
@@ -3495,6 +3508,45 @@ impl SettingsCx {
             &self.pointer_surface,
             super::shell::SettingsScrollRegionId("category:settings"),
         );
+        if let Some((line, id)) = inline_actions {
+            let offset = self
+                .scroll_states
+                .offset_for(&format!("category:{:?}", p.category));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(settings_area.height)
+            {
+                for (action, x, width) in [
+                    (
+                        super::pointer_actions::CategoryAction::InlineEditCommit(
+                            category_pointer_id(id),
+                        ),
+                        0,
+                        6,
+                    ),
+                    (
+                        super::pointer_actions::CategoryAction::InlineEditCancel(
+                            category_pointer_id(id),
+                        ),
+                        8,
+                        8,
+                    ),
+                ] {
+                    self.pointer_surface.register(SettingsPointerTarget {
+                        rect: Rect::new(
+                            settings_area.x.saturating_add(x),
+                            settings_area.y.saturating_add(screen_row as u16),
+                            width,
+                            1,
+                        ),
+                        action: SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Category(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
+            }
+        }
 
         let mut help: Vec<Line<'static>> = Vec::new();
         help.push(Line::from(Span::styled(
@@ -3722,6 +3774,26 @@ impl SettingsPage for CategoryPage {
                         .position(|candidate| *candidate == setting)
                         .unwrap_or(self.cursor);
                     Nav::Stay
+                }
+                CategoryAction::InlineEditCommit(id)
+                    if self
+                        .editing
+                        .is_some_and(|editing| category_pointer_id(editing) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditCancel(id)
+                    if self
+                        .editing
+                        .is_some_and(|editing| category_pointer_id(editing) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
                 }
                 CategoryAction::Reset => {
                     let Some(index) = self.reset_cursor() else {

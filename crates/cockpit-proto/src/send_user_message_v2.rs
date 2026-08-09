@@ -14,6 +14,7 @@ pub const MAX_MESSAGE_TEXT_SCALARS: usize = 262_144;
 pub const MAX_TAG_EXPANSIONS: usize = 64;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";
+const ATTACHMENT_SET_DIGEST_DOMAIN: &[u8] = b"flycockpit-message-attachment-set-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -278,7 +279,7 @@ impl CanonicalSendUserMessageV2 {
             bytes.extend_from_slice(&a.checksum);
             bytes.push(a.kind.code());
         }
-        Ok(digest_parts(&[&bytes]))
+        Ok(digest_parts(&[ATTACHMENT_SET_DIGEST_DOMAIN, &bytes]))
     }
 }
 

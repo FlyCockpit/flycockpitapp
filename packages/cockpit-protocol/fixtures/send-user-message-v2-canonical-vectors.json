@@ -22,7 +22,7 @@
       ],
       "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02",
       "message_request_digest_hex": "9cd8ee995bfe07fbfc5ed30e612e27ea45c8f1196bf99c2229b5a3e0a35efaca",
-      "attachment_set_digest_hex": "01f8f33c7decc3b3f022f2c606c9ec90e581be6ecabe98192288f72e552f6c71"
+      "attachment_set_digest_hex": "af88c07ea4ec09776dda48b9e4746a18570da6776e3440538b36f6408ffbf4b5"
     }
   ],
   "predicate_vectors": [
@@ -35,15 +35,30 @@
     { "text": "é", "has_message_text": true },
     { "text": "😀", "has_message_text": true }
   ],
-  "malformed": [
-    "old_image_refs_field",
-    "trailing_bytes",
-    "unknown_kind",
-    "zero_attachment_version",
-    "duplicate_attachment_id",
-    "nil_uuid",
-    "invalid_utf8",
-    "unpaired_utf16_surrogate",
-    "one_byte_over_maximum"
+  "malformed_fcm2": [
+    {
+      "name": "trailing_bytes",
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0200"
+    },
+    {
+      "name": "unknown_kind",
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccff"
+    },
+    {
+      "name": "zero_attachment_version",
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+    },
+    {
+      "name": "nil_client_submission_uuid",
+      "fcm2_hex": "46434d32020000000000000000000000000000000022222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+    },
+    {
+      "name": "invalid_utf8",
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000001ff0000000001333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+    },
+    {
+      "name": "duplicate_attachment_id",
+      "fcm2_hex": "46434d32021111111111114111811111111111111122222222222242228222222222222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000005bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000000000000000002333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02333333333333433383333333333333330000000000000007cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc02"
+    }
   ]
 }

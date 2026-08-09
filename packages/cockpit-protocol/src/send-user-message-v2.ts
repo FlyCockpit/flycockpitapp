@@ -76,8 +76,10 @@ function scalars(value: string) {
   return n;
 }
 function uuid(value: string) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value))
+    throw new Error("UUID must use canonical lowercase hyphenated spelling");
   const hex = value.replaceAll("-", "");
-  if (!/^[0-9a-fA-F]{32}$/.test(hex) || /^0{32}$/.test(hex)) throw new Error("invalid nonnil UUID");
+  if (/^0{32}$/.test(hex)) throw new Error("invalid nonnil UUID");
   return Uint8Array.from(hex.match(/../g)!, (x) => parseInt(x, 16));
 }
 function uuidString(value: Uint8Array) {
@@ -88,6 +90,8 @@ const kindCode = (k: MessageAttachmentKind) => ({ image: 1, audio: 2, video: 3 }
 function validate(v: CanonicalSendUserMessageV2) {
   uuid(v.session_id);
   uuid(v.request.client_submission_id);
+  if (v.model_config_generation < 0n || v.model_config_generation > 0xffffffffffffffffn)
+    throw new Error("model config generation exceeds u64");
   if (v.canonical_project_digest.length !== 32 || !v.canonical_project_digest.some(Boolean))
     throw new Error("invalid project digest");
   if (v.canonical_model_digest.length !== 32 || !v.canonical_model_digest.some(Boolean))
@@ -124,21 +128,29 @@ function validate(v: CanonicalSendUserMessageV2) {
   return text;
 }
 class Writer {
-  parts: number[] = [];
+  parts: Uint8Array[] = [];
+  length = 0;
   raw(v: Uint8Array) {
-    this.parts.push(...v);
+    const next = this.length + v.length;
+    if (!Number.isSafeInteger(next) || next > FCM2_MAX_BYTES)
+      throw new Error("FCM2 exceeds maximum size");
+    this.parts.push(v);
+    this.length = next;
   }
   u8(v: number) {
-    this.parts.push(v);
+    this.raw(Uint8Array.of(v));
   }
   u16(v: number) {
-    this.parts.push(v >>> 8, v & 255);
+    this.raw(Uint8Array.of(v >>> 8, v & 255));
   }
   u32(v: number) {
-    this.parts.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255);
+    this.raw(Uint8Array.of((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255));
   }
   u64(v: bigint) {
-    for (let n = 7; n >= 0; n--) this.parts.push(Number((v >> BigInt(n * 8)) & 255n));
+    if (v < 0n || v > 0xffffffffffffffffn) throw new Error("integer exceeds u64");
+    const out = new Uint8Array(8);
+    for (let n = 7; n >= 0; n--) out[7 - n] = Number((v >> BigInt(n * 8)) & 255n);
+    this.raw(out);
   }
   text16(v: string) {
     const b = bytes(v, 65535, "string");
@@ -151,8 +163,13 @@ class Writer {
     this.raw(b);
   }
   done() {
-    if (this.parts.length > FCM2_MAX_BYTES) throw new Error("FCM2 exceeds maximum size");
-    return Uint8Array.from(this.parts);
+    const out = new Uint8Array(this.length);
+    let offset = 0;
+    for (const part of this.parts) {
+      out.set(part, offset);
+      offset += part.length;
+    }
+    return out;
   }
 }
 export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) {
@@ -306,5 +323,10 @@ export async function attachmentSetDigest(v: CanonicalSendUserMessageV2) {
     w.raw(a.checksum);
     w.u8(kindCode(a.kind));
   }
-  return sha256(w.done());
+  const domain = encoder.encode("flycockpit-message-attachment-set-v1\0"),
+    body = w.done(),
+    all = new Uint8Array(domain.length + body.length);
+  all.set(domain);
+  all.set(body, domain.length);
+  return sha256(all);
 }

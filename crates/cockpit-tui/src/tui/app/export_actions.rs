@@ -173,6 +173,7 @@ pub(super) async fn write_export_no_clobber(
             .open(&temp)
             .await
             .map_err(|error| format!("{command}: creating export failed: {error}"))?;
+        shutdown.own_export_temp(temp.clone());
         file.write_all(bytes)
             .await
             .map_err(|error| format!("{command}: writing export failed: {error}"))?;
@@ -197,7 +198,10 @@ pub(super) async fn write_export_no_clobber(
     .await;
     let cleanup = tokio::fs::remove_file(&temp).await;
     match (result, cleanup) {
-        (result, Ok(())) => result,
+        (result, Ok(())) => {
+            shutdown.release_export_temp();
+            result
+        }
         (Err(error), Err(cleanup_error)) => Err(format!(
             "{error}; cleaning partial export failed: {cleanup_error}"
         )),

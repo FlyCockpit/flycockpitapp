@@ -286,6 +286,7 @@ struct PendingAction {
 pub struct AsyncActionCancellation {
     cancelled: std::sync::atomic::AtomicBool,
     notify: Notify,
+    export_temp: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl AsyncActionCancellation {
@@ -308,6 +309,37 @@ impl AsyncActionCancellation {
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
+
+    pub fn own_export_temp(&self, path: std::path::PathBuf) {
+        *self.export_temp.lock().expect("export temp owner poisoned") = Some(path);
+    }
+
+    pub fn release_export_temp(&self) {
+        self.export_temp
+            .lock()
+            .expect("export temp owner poisoned")
+            .take();
+    }
+
+    async fn cleanup_export_temp(&self) -> std::io::Result<()> {
+        let path = self
+            .export_temp
+            .lock()
+            .expect("export temp owner poisoned")
+            .clone();
+        let Some(path) = path else { return Ok(()) };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                self.release_export_temp();
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.release_export_temp();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -315,6 +347,8 @@ pub struct AsyncActionShutdownReport {
     pub export_reaped: usize,
     pub export_reap_timed_out: usize,
     pub export_join_failed: usize,
+    pub export_cleanup_failed: usize,
+    pub export_cleanup_timed_out: usize,
 }
 
 #[derive(Debug)]
@@ -747,6 +781,15 @@ impl AsyncActionRunner {
         &mut self,
         export_reap_timeout: Duration,
     ) -> AsyncActionShutdownReport {
+        self.shutdown_and_reap_with_timeouts(export_reap_timeout, export_reap_timeout)
+            .await
+    }
+
+    async fn shutdown_and_reap_with_timeouts(
+        &mut self,
+        export_reap_timeout: Duration,
+        cleanup_timeout: Duration,
+    ) -> AsyncActionShutdownReport {
         let mut export_handles = Vec::new();
         for (id, pending) in self.pending.drain() {
             let is_export = matches!(
@@ -757,7 +800,7 @@ impl AsyncActionRunner {
                 if let Some(shutdown) = &pending.shutdown {
                     shutdown.cancel();
                 }
-                export_handles.push(pending.handle);
+                export_handles.push((pending.handle, pending.shutdown));
             } else {
                 pending.handle.abort();
             }
@@ -770,7 +813,7 @@ impl AsyncActionRunner {
         self.keyed.clear();
         self.serialized.clear();
         let mut report = AsyncActionShutdownReport::default();
-        for mut handle in export_handles {
+        for (mut handle, cleanup_owner) in export_handles {
             match tokio::time::timeout(export_reap_timeout, &mut handle).await {
                 Ok(Ok(())) => report.export_reaped += 1,
                 Ok(Err(_)) => report.export_join_failed += 1,
@@ -778,6 +821,15 @@ impl AsyncActionRunner {
                     report.export_reap_timed_out += 1;
                     handle.abort();
                     let _ = handle.await;
+                }
+            }
+            if let Some(cleanup_owner) = cleanup_owner {
+                match tokio::time::timeout(cleanup_timeout, cleanup_owner.cleanup_export_temp())
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => report.export_cleanup_failed += 1,
+                    Err(_) => report.export_cleanup_timed_out += 1,
                 }
             }
         }
@@ -1070,6 +1122,35 @@ mod tests {
         assert_eq!(report.export_reap_timed_out, 1);
         assert_eq!(report.export_reaped, 0);
         assert_eq!(runner.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_abort_reaps_temp_owned_outside_export_future() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".export.partial");
+        let worker_partial = partial.clone();
+        let (owned_tx, owned_rx) = oneshot::channel();
+        let mut runner = AsyncActionRunner::default();
+        runner.start_export(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::AllowConcurrent,
+            move |shutdown| async move {
+                tokio::fs::write(&worker_partial, b"partial").await.unwrap();
+                shutdown.own_export_temp(worker_partial);
+                owned_tx.send(()).unwrap();
+                std::future::pending::<Result<AsyncActionPayload, String>>().await
+            },
+        );
+        owned_rx.await.unwrap();
+
+        let report = runner
+            .shutdown_and_reap_with_timeouts(Duration::ZERO, Duration::from_secs(1))
+            .await;
+
+        assert_eq!(report.export_reap_timed_out, 1);
+        assert_eq!(report.export_cleanup_failed, 0);
+        assert_eq!(report.export_cleanup_timed_out, 0);
+        assert!(!partial.exists(), "aborted export left an orphaned partial");
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

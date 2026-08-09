@@ -1444,13 +1444,6 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
-        #[cfg(test)]
-        if self.dispatch_owned_test_barrier(
-            blocking_operations::BlockingOperationKind::CuratorMaintenance,
-        ) {
-            self.push_plain("/curator: pending".to_string());
-            return;
-        }
         let Some(socket) = self.startup_background.daemon_socket.clone() else {
             self.push_plain(
                 "/curator: Unavailable — reconnect to the daemon, then Retry".to_string(),
@@ -1952,13 +1945,6 @@ impl App {
     }
 
     pub(super) fn handle_doctor_command(&mut self) {
-        #[cfg(test)]
-        if self
-            .dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::DoctorSnapshot)
-        {
-            self.push_plain("/doctor: collecting diagnostics…".to_string());
-            return;
-        }
         let input = self.doctor_snapshot_input();
         let clipboard_recovery = self.clipboard_recovery;
         self.push_plain("/doctor: collecting diagnostics…".to_string());

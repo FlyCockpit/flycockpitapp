@@ -1633,13 +1633,6 @@ impl App {
     pub(super) fn reset_at_window(&mut self) {
         self.at_selected = 0;
         self.at_scroll = 0;
-        #[cfg(test)]
-        if self.dispatch_owned_test_barrier(
-            blocking_operations::BlockingOperationKind::FileAutocomplete,
-        ) {
-            self.at_suggestions_loading = true;
-            return;
-        }
         let Some(query) = self.composer.at_query().map(str::to_string) else {
             self.at_cache.borrow_mut().take();
             self.at_suggestions_loading = false;
@@ -3077,25 +3070,41 @@ pub(super) enum QueueEditOutcome {
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
         #[cfg(test)]
-        if self
-            .dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::QueueMutation)
-        {
-            self.push_queue_edit_notice("retrieving queued messages…");
-            return true;
-        }
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => {
+        let barrier =
+            self.take_owned_test_barrier(blocking_operations::BlockingOperationKind::QueueMutation);
+        let attached_request = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.attached_request_binding());
+        if attached_request.is_none() {
+            #[cfg(test)]
+            if barrier.is_some() {
+                // The injected callable is the external-work boundary.
+            } else {
                 self.push_queue_edit_notice("not connected to the session");
                 return true;
             }
-        };
+            #[cfg(not(test))]
+            {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+        }
         self.push_queue_edit_notice("retrieving queued messages…");
         self.async_actions.start_serialized(
             blocking_operations::BlockingOperationKind::QueueMutation.action_kind(),
             AsyncActionKey::new("queue.edit"),
             async move {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
                 attached_request
+                    .expect("queue dispatch checked attached request")
                     .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
                     .await
                     .map(|response| AsyncActionPayload::DaemonResponse(Box::new(response)))

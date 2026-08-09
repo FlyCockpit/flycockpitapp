@@ -68,9 +68,7 @@ impl BlockingOperationKind {
 impl App {
     #[cfg(test)]
     pub(super) fn dispatch_owned_test_barrier(&mut self, operation: BlockingOperationKind) -> bool {
-        let Some(barrier) =
-            TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().remove(&operation))
-        else {
+        let Some(barrier) = self.take_owned_test_barrier(operation) else {
             return false;
         };
         self.async_actions.start_blocking(
@@ -84,6 +82,14 @@ impl App {
         true
     }
 
+    #[cfg(test)]
+    pub(super) fn take_owned_test_barrier(
+        &self,
+        operation: BlockingOperationKind,
+    ) -> Option<std::sync::Arc<std::sync::Barrier>> {
+        TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().remove(&operation))
+    }
+
     pub(super) fn start_owned_blocking_action<F>(
         &mut self,
         operation: BlockingOperationKind,
@@ -93,8 +99,17 @@ impl App {
     where
         F: FnOnce() -> Result<AsyncActionPayload, String> + Send + 'static,
     {
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
         self.async_actions
-            .start_blocking(operation.action_kind(), policy, work)
+            .start_blocking(operation.action_kind(), policy, move || {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    barrier.wait();
+                    return Ok(AsyncActionPayload::Unit);
+                }
+                work()
+            })
     }
 }
 

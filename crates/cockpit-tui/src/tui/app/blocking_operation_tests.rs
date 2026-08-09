@@ -92,6 +92,7 @@ fn classified_handlers_dispatch_before_any_owned_blocking_call() {
 #[tokio::test]
 async fn no_owned_blocking_command_runs_on_event_loop() {
     let mut app = App::new(None, false);
+    app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     let release = std::sync::Arc::new(std::sync::Barrier::new(7));
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
         blocking_operations::install_owned_test_barrier(
@@ -147,6 +148,7 @@ fn owned_barrier(kind: BlockingOperationKind) -> std::sync::Arc<std::sync::Barri
 async fn curator_command_is_async_with_pending_line() {
     let barrier = owned_barrier(BlockingOperationKind::CuratorMaintenance);
     let mut app = App::new(None, false);
+    app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.handle_curator_command("status");
     assert!(
         matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/curator: pending")

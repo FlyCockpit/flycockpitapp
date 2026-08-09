@@ -1483,16 +1483,15 @@ pub(super) async fn run_worker(
                         continue;
                     }
                     let already_accepted = driver_input_queue.has_accepted(receipt.id).await;
-                    if !already_accepted
-                        && let (Some(expected_generation), Some(expected_model)) = (
-                            submission.expected_model_state_generation,
-                            submission.expected_model.as_ref(),
-                        )
-                    {
+                    if let (Some(expected_generation), Some(expected_model)) = (
+                        submission.expected_model_state_generation,
+                        submission.expected_model.as_ref(),
+                    ) {
                         let current = authoritative_active_model_state
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let matches = model_expectation_matches(
+                        let matches = model_fence_allows_insert(
+                            already_accepted,
                             current.as_ref(),
                             expected_generation,
                             expected_model,
@@ -2805,6 +2804,15 @@ pub(super) fn model_expectation_matches(
     current.is_some_and(|current| {
         current.generation == expected_generation && &current.selection == expected_model
     })
+}
+
+pub(super) fn model_fence_allows_insert(
+    already_accepted: bool,
+    current: Option<&proto::ActiveModelState>,
+    expected_generation: u64,
+    expected_model: &cockpit_config::providers::ActiveModelRef,
+) -> bool {
+    already_accepted || model_expectation_matches(current, expected_generation, expected_model)
 }
 
 fn update_authoritative_active_model_state(

@@ -792,18 +792,6 @@ mod tests {
                 ..
             }
         ));
-        let native = PasteRequest {
-            paste_generation: 1,
-            paste_correlation_id: Uuid::new_v4(),
-            source: PasteSource::NativePaste,
-            host: HostIdentity {
-                client_instance_id: Uuid::new_v4(),
-                connection_epoch: 1,
-                session_id: Uuid::new_v4(),
-                terminal_generation: 1,
-            },
-        };
-        assert_eq!(native.source, PasteSource::NativePaste);
     }
 
     #[test]

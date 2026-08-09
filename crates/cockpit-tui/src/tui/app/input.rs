@@ -5092,6 +5092,26 @@ mod paste_routing_tests {
         );
     }
 
+    #[test]
+    fn paste_native_authoritative_source_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        app.terminal_input_generation = Some(9);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            .expect("native intake allocates one request");
+        assert_eq!(
+            request.source,
+            crate::tui::structured_paste::PasteSource::NativePaste
+        );
+        assert_eq!(
+            request.host.client_instance_id,
+            app.paste_client_instance_id
+        );
+        assert_eq!(request.host.terminal_generation, 9);
+        assert_eq!(request.paste_generation, app.next_paste_generation);
+    }
+
     #[cfg(unix)]
     fn spawn_cat_pane(app: &mut App, focused: bool) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let argv = vec!["cat".to_string()];

@@ -96,10 +96,11 @@ impl MediaStorageRecovery {
         ));
         let semantic_digest = crate::intel::hex_lower(&Sha256::digest(
             format!(
-                "local-path-semantic-v1\0{}\0{}\0{}\0{}",
+                "local-path-semantic-v1\0{}\0{}\0{}\0{}\0{}",
                 request.session_id,
                 request.canonical_project_digest,
                 request.client_draft_id,
+                serde_json::to_string(&request.requested_media_kind)?,
                 evidence_digest
             )
             .as_bytes(),
@@ -389,6 +390,8 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
 
 #[cfg(windows)]
 fn open_project_source(root: &Path, relative: &str) -> Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
     use std::path::Component;
     ensure!(
         Path::new(relative)
@@ -396,13 +399,63 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
             .all(|c| matches!(c, Component::Normal(_))),
         "media_attachment_unavailable"
     );
-    let path = root.join(relative);
-    let canonical = path.canonicalize()?;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut core::ffi::c_void,
+            creation: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut current = root.canonicalize()?;
+    let mut held = Vec::new();
+    crate::goal_scratch::verify_private_dacl(&current)
+        .context("project root DACL is not protected")?;
+    for component in Path::new(relative).components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("media_attachment_unavailable")
+        };
+        current.push(name);
+        let wide: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        ensure!(raw as isize != -1, "media_attachment_unavailable");
+        let file = unsafe { File::from_raw_handle(raw) };
+        let meta = file.metadata()?;
+        use std::os::windows::fs::MetadataExt as _;
+        ensure!(
+            meta.file_attributes() & 0x400 == 0,
+            "media_attachment_unavailable"
+        );
+        crate::goal_scratch::verify_private_dacl(&current)
+            .context("source component DACL is not protected")?;
+        held.push(file);
+    }
+    let final_file = held.pop().context("media_attachment_unavailable")?;
     ensure!(
-        canonical.starts_with(root.canonicalize()?),
+        final_file.metadata()?.is_file(),
         "media_attachment_unavailable"
     );
-    Ok(std::fs::OpenOptions::new().read(true).open(canonical)?)
+    Ok(final_file)
 }
 
 fn commit_security_recovery(
@@ -703,6 +756,125 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn local_path_registration_reserves_atomically_replays_and_conflicts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("source.bin"), b"held borrowed source").unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
+        let recovery =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let request = RegisterLocalPathMediaV1 {
+            schema_version: 1,
+            kind: "registerLocalPathMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            path: "source.bin".into(),
+        };
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let first = recovery
+            .register_local_path(request.clone(), &project, &policy, 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery
+                .register_local_path(request.clone(), &project, &policy, 2, 11)
+                .await
+                .unwrap(),
+            first
+        );
+        std::fs::remove_file(project.join("source.bin")).unwrap();
+        assert_eq!(
+            recovery
+                .register_local_path(request.clone(), &project, &policy, 3, 12)
+                .await
+                .unwrap(),
+            first,
+            "exact replay must not reopen the path"
+        );
+        let mut conflict = request;
+        conflict.requested_media_kind = RequestedLocalPathMediaKind::Audio;
+        assert!(
+            recovery
+                .register_local_path(conflict, &project, &policy, 4, 13)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("idempotency_conflict")
+        );
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn local_path_registration_fault_rolls_back_reservation_and_attachment() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("source.bin"), b"source").unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch("CREATE TRIGGER fail_local_evidence BEFORE INSERT ON media_local_path_registration_evidence BEGIN SELECT RAISE(ABORT,'injected registration fault'); END;")?;Ok(())}).await.unwrap();
+        let recovery =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let request = RegisterLocalPathMediaV1 {
+            schema_version: 1,
+            kind: "registerLocalPathMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            path: "source.bin".into(),
+        };
+        assert!(
+            recovery
+                .register_local_path(
+                    request,
+                    &project,
+                    &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                    1,
+                    10
+                )
+                .await
+                .is_err()
+        );
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,

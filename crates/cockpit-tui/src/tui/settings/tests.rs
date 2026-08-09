@@ -698,6 +698,15 @@ fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
                     dialog.test_page(),
                     TestPageRef::RedactPatterns(page) if page.grabbed.is_some()
                 ));
+                click_settings_action(
+                    &mut dialog,
+                    &SettingsPointerAction::List(ListAction::Cancel),
+                );
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
+                ));
+                assert_eq!(dialog.extended.redact.dotenv_patterns, expected_values);
             }
             SettingsPointerAction::List(ListAction::Delete(_)) => {
                 click_settings_action(&mut dialog, &action);

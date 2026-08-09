@@ -2628,9 +2628,26 @@ END;
 -- Canonical request bytes and transport metadata are deliberately absent.
 -- The daemon retains only their SHA-256 digest and a bounded safe response.
 CREATE TABLE remote_attachment_operations (
-    logical_attachment_id          TEXT    NOT NULL,
-    operation_id                   TEXT    NOT NULL,
-    authenticated_device_id        TEXT    NOT NULL,
+    logical_attachment_id          TEXT    NOT NULL CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    operation_id                   TEXT    NOT NULL CHECK (
+        length(operation_id) = 36 AND operation_id = lower(operation_id)
+        AND substr(operation_id, 9, 1) = '-' AND substr(operation_id, 14, 1) = '-'
+        AND substr(operation_id, 15, 1) = '7'
+        AND substr(operation_id, 19, 1) = '-' AND substr(operation_id, 20, 1) GLOB '[89ab]'
+        AND substr(operation_id, 24, 1) = '-'
+        AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    authenticated_device_id        TEXT    NOT NULL CHECK (
+        length(authenticated_device_id) = 36 AND authenticated_device_id = lower(authenticated_device_id)
+        AND substr(authenticated_device_id, 9, 1) = '-' AND substr(authenticated_device_id, 14, 1) = '-'
+        AND substr(authenticated_device_id, 19, 1) = '-' AND substr(authenticated_device_id, 24, 1) = '-'
+        AND replace(authenticated_device_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation > 0),
     operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
     operation_class                TEXT    NOT NULL CHECK (operation_class IN (
@@ -2646,6 +2663,11 @@ CREATE TABLE remote_attachment_operations (
     created_at_ms                  INTEGER NOT NULL,
     updated_at_ms                  INTEGER NOT NULL,
     retire_at_ms                   INTEGER,
+    CHECK (
+        (state = 'reserved' AND safe_response IS NULL AND event_high_water_mark IS NULL)
+        OR (state IN ('committed', 'rejected') AND safe_response IS NOT NULL AND event_high_water_mark IS NOT NULL)
+        OR (state = 'outcome_unknown' AND safe_response IS NOT NULL)
+    ),
     PRIMARY KEY (logical_attachment_id, operation_id),
     UNIQUE (logical_attachment_id, operation_seq)
 );
@@ -2653,6 +2675,13 @@ CREATE TABLE remote_attachment_operations (
 CREATE INDEX idx_remote_attachment_operations_retire
     ON remote_attachment_operations (retire_at_ms)
     WHERE retire_at_ms IS NOT NULL;
+
+CREATE TRIGGER remote_attachment_operation_reservation_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'remote operation insert must be a bounded reservation');
+END;
 
 CREATE TRIGGER remote_attachment_operation_capacity_insert
 BEFORE INSERT ON remote_attachment_operations
@@ -2701,6 +2730,12 @@ WHEN (OLD.state <> 'reserved' AND NEW.state <> OLD.state)
       AND (NEW.event_high_water_mark IS NULL OR NEW.event_high_water_mark < OLD.event_high_water_mark))
   OR (OLD.retire_at_ms IS NOT NULL
       AND (NEW.retire_at_ms IS NULL OR NEW.retire_at_ms <> OLD.retire_at_ms))
+  OR (NEW.state IN ('committed', 'rejected') AND NOT EXISTS (
+      SELECT 1 FROM remote_attachment_outbox
+      WHERE logical_attachment_id = OLD.logical_attachment_id
+        AND operation_seq = OLD.operation_seq
+        AND event_seq = NEW.event_high_water_mark
+  ))
 BEGIN
     SELECT RAISE(ABORT, 'illegal remote attachment operation transition');
 END;
@@ -2708,7 +2743,13 @@ END;
 CREATE TABLE remote_attachment_outbox (
     logical_attachment_id TEXT    NOT NULL,
     event_seq              INTEGER NOT NULL CHECK (event_seq > 0),
-    delivery_id            TEXT    NOT NULL,
+    delivery_id            TEXT    NOT NULL CHECK (
+        length(delivery_id) = 36 AND delivery_id = lower(delivery_id)
+        AND substr(delivery_id, 9, 1) = '-' AND substr(delivery_id, 14, 1) = '-'
+        AND substr(delivery_id, 19, 1) = '-' AND substr(delivery_id, 20, 1) GLOB '[89ab]'
+        AND substr(delivery_id, 24, 1) = '-'
+        AND replace(delivery_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     operation_seq          INTEGER CHECK (operation_seq IS NULL OR operation_seq > 0),
     kind                   TEXT    NOT NULL CHECK (length(kind) BETWEEN 1 AND 255),
     canonical_payload      BLOB    NOT NULL CHECK (length(canonical_payload) <= 524288),
@@ -2743,8 +2784,22 @@ BEGIN
 END;
 
 CREATE TABLE remote_attachment_outbox_snapshots (
-    logical_attachment_id       TEXT PRIMARY KEY,
+    logical_attachment_id       TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     compacted_through_event_seq INTEGER NOT NULL CHECK (compacted_through_event_seq >= 0),
     snapshot_high_water_mark    INTEGER NOT NULL CHECK (snapshot_high_water_mark >= compacted_through_event_seq),
     updated_at_ms               INTEGER NOT NULL
 );
+
+CREATE TRIGGER remote_attachment_snapshot_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_snapshots
+WHEN NEW.compacted_through_event_seq < OLD.compacted_through_event_seq
+  OR NEW.snapshot_high_water_mark < OLD.snapshot_high_water_mark
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment snapshot cursor is monotonic');
+END;

@@ -518,52 +518,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_states_replay_and_transition_trigger_is_final() {
-        for (index, state) in ["committed", "rejected", "outcome_unknown"]
-            .into_iter()
-            .enumerate()
-        {
-            let db = Db::open_in_memory().unwrap();
-            let operation = format!("01890f3e-4c00-7000-8000-{:012}", index + 20);
-            db.reserve_remote_attachment_operation(reserve(&operation, [4; 32]))
+    async fn concurrent_distinct_operations_get_distinct_contiguous_sequences() {
+        let db = Db::open_in_memory().unwrap();
+        let left = db.clone();
+        let right = db.clone();
+        let (left, right) = tokio::join!(
+            left.reserve_remote_attachment_operation(reserve(
+                "01890f3e-4c00-7000-8000-000000000011",
+                [1; 32]
+            )),
+            right.reserve_remote_attachment_operation(reserve(
+                "01890f3e-4c00-7000-8000-000000000012",
+                [2; 32]
+            )),
+        );
+        let mut sequences = [left.unwrap(), right.unwrap()].map(|outcome| match outcome {
+            ReserveRemoteOperationOutcome::Reserved(row) => row.operation_seq,
+            other => panic!("unexpected distinct reservation: {other:?}"),
+        });
+        sequences.sort_unstable();
+        assert_eq!(sequences, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_cursors_and_timestamp_are_monotonic() {
+        let db = Db::open_in_memory().unwrap();
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_snapshots
+                 (logical_attachment_id, compacted_through_event_seq,
+                  snapshot_high_water_mark, updated_at_ms) VALUES (?1, 5, 8, 10)",
+                [ATTACHMENT],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        for sql in [
+            "UPDATE remote_attachment_outbox_snapshots SET compacted_through_event_seq = 4 WHERE logical_attachment_id = ?1",
+            "UPDATE remote_attachment_outbox_snapshots SET snapshot_high_water_mark = 7 WHERE logical_attachment_id = ?1",
+            "UPDATE remote_attachment_outbox_snapshots SET updated_at_ms = 9 WHERE logical_attachment_id = ?1",
+        ] {
+            assert!(
+                db.write(move |conn| {
+                    conn.execute(sql, [ATTACHMENT])?;
+                    Ok(())
+                })
                 .await
-                .unwrap();
-            let attachment = ATTACHMENT.to_owned();
-            let operation_for_write = operation.clone();
-            let state_for_write = state.to_owned();
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_first_write_is_rejected_and_atomic_commit_is_final() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000020";
+        db.reserve_remote_attachment_operation(reserve(operation, [4; 32]))
+            .await
+            .unwrap();
+        let attachment = ATTACHMENT.to_owned();
+        let operation_for_write = operation.to_owned();
+        assert!(
             db.write(move |conn| {
                 conn.execute(
-                    "UPDATE remote_attachment_operations SET state = ?3, updated_at_ms = 11
+                    "UPDATE remote_attachment_operations
+                     SET state = 'committed', safe_response = X'01', event_high_water_mark = 1,
+                         updated_at_ms = 11
                      WHERE logical_attachment_id = ?1 AND operation_id = ?2",
-                    params![attachment, operation_for_write, state_for_write],
+                    params![attachment, operation_for_write],
                 )?;
                 Ok(())
             })
             .await
-            .unwrap();
-            let ReserveRemoteOperationOutcome::Replay(replay) = db
-                .reserve_remote_attachment_operation(reserve(&operation, [4; 32]))
-                .await
-                .unwrap()
-            else {
-                panic!("terminal state must replay")
-            };
-            assert_eq!(replay.state, state);
-            let attachment = ATTACHMENT.to_owned();
-            let operation_for_write = operation.clone();
-            assert!(
-                db.write(move |conn| {
-                    conn.execute(
-                        "UPDATE remote_attachment_operations SET state = 'reserved', updated_at_ms = 12
-                         WHERE logical_attachment_id = ?1 AND operation_id = ?2",
-                        params![attachment, operation_for_write],
-                    )?;
-                    Ok(())
-                })
-                .await
-                .is_err(),
-                "terminal {state} must be final"
-            );
-        }
+            .is_err(),
+            "a terminal write without its outbox evidence must fail"
+        );
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"committed",
+            outbox_delivery_id: "00000000-0000-4000-8000-000000000021",
+            outbox_kind: "committed",
+            outbox_payload: b"event",
+            now_ms: 12,
+        })
+        .await
+        .unwrap();
+        let attachment = ATTACHMENT.to_owned();
+        let operation_for_write = operation.to_owned();
+        assert!(
+            db.write(move |conn| {
+                conn.execute(
+                    "UPDATE remote_attachment_operations SET state = 'reserved', updated_at_ms = 13
+                     WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                    params![attachment, operation_for_write],
+                )?;
+                Ok(())
+            })
+            .await
+            .is_err(),
+            "committed state must be final"
+        );
     }
 }

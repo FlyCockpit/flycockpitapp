@@ -243,6 +243,10 @@ struct StoreInner {
     next_generation: u64,
     current: Option<Arc<ExternalRuntimeSnapshot>>,
     descriptors: Vec<ExternalRuntimeDescriptor>,
+    /// True only after a full roster refresh. A live launch-gate publication
+    /// from an empty store is useful evidence but not a complete first-paint
+    /// catalog.
+    current_is_complete: bool,
 }
 
 impl HealthSnapshotStore {
@@ -268,12 +272,31 @@ impl HealthSnapshotStore {
         self.publish_bundle(snapshot, Vec::new())
     }
 
-    /// Publish a completed snapshot and its exact descriptor roster as one
-    /// generation-gated bundle.
+    /// Publish a generation-gated partial snapshot and its exact roster.
+    /// Safety-only refreshes use this path and must not masquerade as a full
+    /// Settings/doctor catalog.
     pub fn publish_bundle(
         &self,
         snapshot: ExternalRuntimeSnapshot,
         descriptors: Vec<ExternalRuntimeDescriptor>,
+    ) -> bool {
+        self.publish_bundle_with_completeness(snapshot, descriptors, false)
+    }
+
+    /// Publish a generation-gated full Settings/doctor roster.
+    pub fn publish_complete_bundle(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+    ) -> bool {
+        self.publish_bundle_with_completeness(snapshot, descriptors, true)
+    }
+
+    fn publish_bundle_with_completeness(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+        complete: bool,
     ) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Must be the latest reserved generation — supersedes older in-flight work.
@@ -287,6 +310,7 @@ impl HealthSnapshotStore {
         }
         inner.current = Some(Arc::new(snapshot));
         inner.descriptors = descriptors;
+        inner.current_is_complete = complete;
         true
     }
 
@@ -300,6 +324,21 @@ impl HealthSnapshotStore {
         &self,
     ) -> Option<(Arc<ExternalRuntimeSnapshot>, Vec<ExternalRuntimeDescriptor>)> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner
+            .current
+            .clone()
+            .map(|snapshot| (snapshot, inner.descriptors.clone()))
+    }
+
+    /// Return a bundle only when it originated from a complete roster
+    /// refresh (possibly followed by atomic live-entry updates).
+    pub fn current_complete_bundle(
+        &self,
+    ) -> Option<(Arc<ExternalRuntimeSnapshot>, Vec<ExternalRuntimeDescriptor>)> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.current_is_complete {
+            return None;
+        }
         inner
             .current
             .clone()
@@ -354,5 +393,6 @@ impl HealthSnapshotStore {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.current = None;
         inner.descriptors.clear();
+        inner.current_is_complete = false;
     }
 }

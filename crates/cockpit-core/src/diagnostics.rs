@@ -1177,7 +1177,7 @@ fn dependency_projection_with_deadline_internal(
                 let snapshot = result?;
                 if publish_complete {
                     let _ = crate::external_runtime::global_health_store()
-                        .publish_bundle(snapshot.as_ref().clone(), descriptors.clone());
+                        .publish_complete_bundle(snapshot.as_ref().clone(), descriptors.clone());
                 }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(snapshot.as_ref()),
@@ -1201,7 +1201,10 @@ fn dependency_projection_with_deadline_internal(
                             let snapshot = result?;
                             if publish_complete {
                                 let _ = crate::external_runtime::global_health_store()
-                                    .publish_bundle(snapshot.as_ref().clone(), descriptors.clone());
+                                    .publish_complete_bundle(
+                                        snapshot.as_ref().clone(),
+                                        descriptors.clone(),
+                                    );
                             }
                             return Ok(crate::external_runtime::project_dependencies(
                                 Some(snapshot.as_ref()),
@@ -1241,7 +1244,7 @@ fn dependency_projection_with_deadline_internal(
                 let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
                 if publish_complete {
                     let _ = crate::external_runtime::global_health_store()
-                        .publish_bundle(snapshot.clone(), descriptors.clone());
+                        .publish_complete_bundle(snapshot.clone(), descriptors.clone());
                 }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(&snapshot),

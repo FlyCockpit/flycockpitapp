@@ -18,18 +18,34 @@ type DependencyRefreshResult = Result<cockpit_core::external_runtime::Dependency
 type PendingDependencyRefresh = Option<(u64, mpsc::Receiver<DependencyRefreshResult>)>;
 
 pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
-    let bundle = cockpit_core::external_runtime::global_health_store().current_bundle();
-    let mut state = match bundle {
+    let store = cockpit_core::external_runtime::global_health_store();
+    let mut state = match store.current_complete_bundle() {
         Some((snapshot, descriptors)) => {
             cockpit_core::external_runtime::DependenciesPageState::first_paint(
                 Some(snapshot.as_ref()),
                 &descriptors,
             )
         }
-        None => cockpit_core::external_runtime::DependenciesPageState::first_paint(
-            None,
-            &cockpit_core::external_runtime::global_registry().descriptors(),
-        ),
+        None => {
+            let partial = store.current_bundle();
+            let mut descriptors = cockpit_core::external_runtime::global_registry().descriptors();
+            if let Some((_, live_descriptors)) = &partial {
+                for descriptor in live_descriptors {
+                    if let Some(existing) = descriptors
+                        .iter_mut()
+                        .find(|existing| existing.id == descriptor.id)
+                    {
+                        *existing = descriptor.clone();
+                    } else {
+                        descriptors.push(descriptor.clone());
+                    }
+                }
+            }
+            cockpit_core::external_runtime::DependenciesPageState::first_paint(
+                partial.as_ref().map(|(snapshot, _)| snapshot.as_ref()),
+                &descriptors,
+            )
+        }
     };
     let generation = state.begin_refresh();
     let (tx, rx) = mpsc::sync_channel(1);

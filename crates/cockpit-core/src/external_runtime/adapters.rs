@@ -765,7 +765,7 @@ fn compose_settings_doctor_health_internal(
     if !scope.publish_global {
         return Ok(Arc::new(snapshot));
     }
-    if !store.publish_bundle(snapshot.clone(), descriptors) {
+    if !store.publish_complete_bundle(snapshot.clone(), descriptors) {
         // A newer full refresh or live handoff superseded this composition;
         // surface the current published snapshot when available.
         if let Some(current) = store.current() {

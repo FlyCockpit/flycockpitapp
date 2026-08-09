@@ -1003,11 +1003,11 @@ fn external_dependency_snapshot_atomicity() {
         .probe_policy(ProbePolicy::configured_command("new", None))
         .build()
         .unwrap();
-    assert!(!store.publish_bundle(snap1.clone(), vec![descriptor1.clone()]));
+    assert!(!store.publish_complete_bundle(snap1.clone(), vec![descriptor1.clone()]));
     assert!(store.current().is_none());
 
     // Latest reserved generation publishes.
-    assert!(store.publish_bundle(snap2.clone(), vec![descriptor2.clone()]));
+    assert!(store.publish_complete_bundle(snap2.clone(), vec![descriptor2.clone()]));
     let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
     assert_eq!(descriptors, vec![descriptor2.clone()]);
@@ -1017,13 +1017,13 @@ fn external_dependency_snapshot_atomicity() {
     ));
 
     // Late older generation discarded — readers still see complete g2 only
-    assert!(!store.publish_bundle(snap1, vec![descriptor1]));
+    assert!(!store.publish_complete_bundle(snap1, vec![descriptor1]));
     let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
     assert_eq!(descriptors, vec![descriptor2.clone()]);
 
     // Equal/stale generation rejected
-    assert!(!store.publish_bundle(snap2, vec![]));
+    assert!(!store.publish_complete_bundle(snap2, vec![]));
     assert_eq!(store.current_bundle().unwrap().1, vec![descriptor2]);
 
     // Readers never observe a partial generation: only complete Arc snapshots.
@@ -1059,12 +1059,49 @@ fn external_dependency_snapshot_atomicity() {
         .build()
         .unwrap();
     store.publish_live_entry(live_entry.clone(), live_old, HostPlatform::GenericLinux);
+    assert!(
+        store.current_complete_bundle().is_none(),
+        "a live entry from an empty store is partial, not a complete catalog"
+    );
     assert_eq!(store.current_bundle().unwrap().1[0].owner.feature, "old");
     store.publish_live_entry(live_entry, live_new, HostPlatform::GenericLinux);
     let (snapshot, descriptors) = store.current_bundle().unwrap();
     assert!(snapshot.get("live").is_some());
     assert_eq!(descriptors.len(), 1);
     assert_eq!(descriptors[0].owner.feature, "new");
+
+    let complete_generation = store.begin_refresh();
+    let complete = ExternalRuntimeSnapshot::empty(complete_generation, HostPlatform::GenericLinux);
+    assert!(store.publish_complete_bundle(complete, Vec::new()));
+    store.publish_live_entry(
+        HealthEntry {
+            id: ExternalRuntimeId::new("after-complete"),
+            state: HealthState::Missing,
+            importance: DependencyImportance::OptionalIntegration,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+        ExternalRuntimeDescriptor::builder("after-complete")
+            .owner("test", "live")
+            .probe_policy(ProbePolicy::configured_command("live", None))
+            .build()
+            .unwrap(),
+        HostPlatform::GenericLinux,
+    );
+    assert!(
+        store.current_complete_bundle().is_some(),
+        "atomic live updates preserve an existing complete roster"
+    );
+    let partial_generation = store.begin_refresh();
+    assert!(store.publish_bundle(
+        ExternalRuntimeSnapshot::empty(partial_generation, HostPlatform::GenericLinux),
+        Vec::new(),
+    ));
+    assert!(
+        store.current_complete_bundle().is_none(),
+        "a later partial refresh must invalidate prior catalog completeness"
+    );
 }
 
 #[test]

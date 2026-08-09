@@ -1506,6 +1506,10 @@ mod tests {
         )
         .expect("latest safety refresh publishes");
         let (bundled, descriptors) = bundled_store.current_bundle().expect("atomic bundle");
+        assert!(
+            bundled_store.current_complete_bundle().is_none(),
+            "a safety-only refresh is not a complete dependency catalog"
+        );
         assert_eq!(bundled, std::sync::Arc::new(published));
         let descriptor_ids: std::collections::BTreeSet<_> = descriptors
             .iter()

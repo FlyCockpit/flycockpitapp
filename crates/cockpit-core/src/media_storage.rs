@@ -345,14 +345,14 @@ impl MediaStorageRecovery {
         );
         let (canonical_container, canonical_mime) =
             probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
-        let normalized = if canonical_container == "png" {
+        let normalized = if media_kind_from_text(&snapshot.6)? == MediaKind::Image {
             held.seek(SeekFrom::Start(0))?;
             let mut bytes = Vec::new();
             held.by_ref()
                 .take(10 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
-            Some(normalize_png_image(&bytes)?)
+            Some(normalize_image(&bytes, canonical_container)?)
         } else {
             None
         };
@@ -1238,18 +1238,36 @@ struct NormalizedImageDerivatives {
     thumbnail_height: u32,
 }
 
-fn normalize_png_image(bytes: &[u8]) -> Result<NormalizedImageDerivatives> {
+fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
     use image::{
         DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, ImageReader, Limits,
     };
-    reject_png_color_metadata(bytes)?;
-    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Png);
+    let format = match container {
+        "png" => {
+            reject_png_color_metadata(bytes)?;
+            ImageFormat::Png
+        }
+        "jpeg" => {
+            reject_jpeg_metadata(bytes)?;
+            ImageFormat::Jpeg
+        }
+        "gif" => {
+            reject_gif_structure(bytes)?;
+            ImageFormat::Gif
+        }
+        "webp" => {
+            reject_webp_metadata(bytes)?;
+            ImageFormat::WebP
+        }
+        _ => anyhow::bail!("ambiguous_or_unsupported_container"),
+    };
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), format);
     let mut limits = Limits::default();
     limits.max_image_width = Some(8_192);
     limits.max_image_height = Some(8_192);
     limits.max_alloc = Some(160_000_000);
     reader.limits(limits);
-    let decoder = reader.into_decoder().context("invalid_media")?;
+    let mut decoder = reader.into_decoder().context("invalid_media")?;
     let (width, height) = decoder.dimensions();
     ensure!(
         width > 0 && height > 0 && width <= 8_192 && height <= 8_192,
@@ -1261,9 +1279,10 @@ fn normalize_png_image(bytes: &[u8]) -> Result<NormalizedImageDerivatives> {
             .is_some_and(|p| p <= 40_000_000),
         "resource_limit"
     );
-    let mut rgba = DynamicImage::from_decoder(decoder)
-        .context("decode_failed")?
-        .into_rgba8();
+    let orientation = decoder.orientation().context("invalid_media")?;
+    let mut decoded = DynamicImage::from_decoder(decoder).context("decode_failed")?;
+    decoded.apply_orientation(orientation);
+    let mut rgba = decoded.into_rgba8();
     for pixel in rgba.pixels_mut() {
         if pixel[3] == 0 {
             *pixel = image::Rgba([0, 0, 0, 0]);
@@ -1295,6 +1314,84 @@ fn normalize_png_image(bytes: &[u8]) -> Result<NormalizedImageDerivatives> {
         thumbnail_width,
         thumbnail_height,
     })
+}
+
+fn reject_jpeg_metadata(bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.starts_with(b"\xff\xd8"), "invalid_media");
+    let mut offset = 2usize;
+    let mut exif = 0usize;
+    while offset + 4 <= bytes.len() {
+        ensure!(bytes[offset] == 0xff, "invalid_media");
+        let marker = bytes[offset + 1];
+        offset += 2;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if matches!(marker, 0x01 | 0xd0..=0xd7) {
+            continue;
+        }
+        let length = u16::from_be_bytes(bytes[offset..offset + 2].try_into()?) as usize;
+        ensure!(
+            length >= 2 && offset + length <= bytes.len(),
+            "invalid_media"
+        );
+        let payload = &bytes[offset + 2..offset + length];
+        if marker == 0xe2 && payload.starts_with(b"ICC_PROFILE\0") {
+            anyhow::bail!("unsupported_color_profile");
+        }
+        if marker == 0xee && payload.starts_with(b"Adobe") {
+            anyhow::bail!("unsupported_color_profile");
+        }
+        if marker == 0xe1 && payload.starts_with(b"Exif\0\0") {
+            exif += 1;
+            ensure!(exif == 1, "unsupported_color_profile");
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            ensure!(
+                payload.len() >= 6 && payload[5] == 3,
+                "unsupported_color_profile"
+            );
+        }
+        offset += length;
+    }
+    Ok(())
+}
+
+fn reject_gif_structure(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "invalid_media"
+    );
+    ensure!(bytes.len() >= 13, "invalid_media");
+    Ok(())
+}
+
+fn reject_webp_metadata(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "invalid_media"
+    );
+    if &bytes[12..16] == b"VP8X" {
+        ensure!(bytes.len() >= 21, "invalid_media");
+        let flags = bytes[20];
+        ensure!(flags & 0x28 == 0, "unsupported_color_profile");
+        ensure!(flags & 0x02 == 0, "invalid_media");
+    }
+    Ok(())
 }
 
 fn encode_canonical_png(image: &image::RgbaImage) -> Result<Vec<u8>> {
@@ -1815,8 +1912,8 @@ mod tests {
         image::DynamicImage::ImageRgba8(source)
             .write_to(&mut input, image::ImageFormat::Png)
             .unwrap();
-        let first = normalize_png_image(input.get_ref()).unwrap();
-        let second = normalize_png_image(input.get_ref()).unwrap();
+        let first = normalize_image(input.get_ref(), "png").unwrap();
+        let second = normalize_image(input.get_ref(), "png").unwrap();
         assert_eq!(first.model_png, second.model_png);
         assert_eq!((first.width, first.height), (2, 1));
         assert_eq!((first.thumbnail_width, first.thumbnail_height), (2, 1));
@@ -1828,6 +1925,31 @@ mod tests {
                 .unwrap()
                 .into_rgba8();
         assert_eq!(decoded.get_pixel(1, 0).0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn jpeg_gif_and_webp_decode_to_the_same_canonical_contract() {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([12, 34, 56, 255]),
+        ));
+        for (container, format) in [
+            ("jpeg", image::ImageFormat::Jpeg),
+            ("gif", image::ImageFormat::Gif),
+            ("webp", image::ImageFormat::WebP),
+        ] {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            source.write_to(&mut encoded, format).unwrap();
+            let first = normalize_image(encoded.get_ref(), container).unwrap();
+            let second = normalize_image(encoded.get_ref(), container).unwrap();
+            assert_eq!(first.model_png, second.model_png);
+            assert_eq!((first.width, first.height), (3, 2));
+            assert_eq!(
+                png_chunk_names(&first.model_png),
+                vec![*b"IHDR", *b"sRGB", *b"IDAT", *b"IEND"]
+            );
+        }
     }
 
     fn png_chunk_names(bytes: &[u8]) -> Vec<[u8; 4]> {

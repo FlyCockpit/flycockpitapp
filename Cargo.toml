@@ -41,7 +41,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 jsonc-parser = { version = "0.33.0", default-features = false }
 jsonschema = { version = "0.46", default-features = false }
 jaq-core = "3.1.0"

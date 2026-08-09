@@ -3598,7 +3598,7 @@ impl Driver {
             self.emit_goal_supervision_progress(tx).await;
             return Ok(());
         }
-        let cfg = self.effective_goal_supervision_config();
+        let cfg = self.goal_supervision_config_for(goal)?;
         if self.goal_scratch.is_none() {
             self.goal_scratch = Some(crate::goal_scratch::GoalScratchRoot::create(goal.id)?);
         }
@@ -3689,18 +3689,16 @@ impl Driver {
         Ok(())
     }
 
-    fn effective_goal_supervision_config(&self) -> crate::config::extended::GoalSupervisionConfig {
-        let agent_name = self
-            .stack
-            .first()
-            .map(|frame| frame.agent.name.as_str())
-            .unwrap_or("Build");
-        let session_override = self.session.goal_settings_override();
-        crate::agents::effective_goal_supervision_for_agent(
-            &self.cwd,
-            agent_name,
-            session_override.as_ref(),
-            self.config.extended().goal_supervision,
+    fn goal_supervision_config_for(
+        &self,
+        goal: &crate::db::session_goals::SessionGoal,
+    ) -> Result<crate::config::extended::GoalSupervisionConfig> {
+        // Model selection, panel size, and attempt limits are creation-time
+        // policy. A config reload may only exercise the live master switch;
+        // otherwise an existing goal changes authority mid-flight.
+        resolved_goal_supervision_config(
+            &goal.resolved_policy_json,
+            self.config.extended().goal_supervision.enabled,
         )
     }
 
@@ -3739,7 +3737,12 @@ impl Driver {
                 "attempt_generation": goal.attempt_generation,
                 "immutable_contract": contract,
                 "lifecycle": { "disposition": goal.disposition, "phase": goal.phase },
-                "usage": { "tokens_used": goal.tokens_used, "token_budget": goal.token_budget, "remaining": goal.token_budget.saturating_sub(goal.tokens_used) },
+                "usage": {
+                    "tokens_used": goal.tokens_used,
+                    "token_budget": goal.token_budget,
+                    "remaining": goal.token_budget.saturating_sub(goal.tokens_used),
+                    "elapsed_active_ms": goal.elapsed_active_ms
+                },
                 "unresolved_verifier_gaps": gaps,
                 "next_checklist_guidance": next,
                 "safety": "Do not bypass approvals, sandbox restrictions, usage limits, or no-progress safeguards. The host alone decides completion."
@@ -8195,6 +8198,16 @@ impl Driver {
     fn foreground_swarm_depth(&self) -> u32 {
         0
     }
+}
+
+fn resolved_goal_supervision_config(
+    persisted: &str,
+    live_enabled: bool,
+) -> Result<crate::config::extended::GoalSupervisionConfig> {
+    if !live_enabled {
+        anyhow::bail!("goal supervision disabled while goal is running");
+    }
+    serde_json::from_str(persisted).context("decoding persisted resolved goal supervision policy")
 }
 
 /// How many consecutive auto-prunes must each save below

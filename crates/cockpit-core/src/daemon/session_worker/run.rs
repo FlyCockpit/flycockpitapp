@@ -2189,10 +2189,7 @@ pub(super) async fn run_worker(
                         .goal_supervision
                         .enabled;
                     if changed && !supervision_enabled {
-                        let _ = session
-                            .db
-                            .pause_open_goal_for_operator_disable(session_id)
-                            .await;
+                        let _ = session.db.pause_all_goals_for_operator_disable().await;
                     }
                     let generation = send_config_snapshot_event_if_changed(
                         &event_tx,

@@ -536,6 +536,10 @@ pub struct SessionGoal {
     pub blocker_key_streak: i64,
     pub token_budget: i64,
     pub tokens_used: i64,
+    /// Persisted active time plus the live interval beginning at `active_since`.
+    pub elapsed_active_ms: i64,
+    pub active_since: Option<i64>,
+    pub lifecycle_history: Vec<GoalLifecycleHistoryEntry>,
     pub blocked_attempts: i64,
     pub completion_evidence: Option<String>,
     pub verification_rounds: i64,
@@ -543,6 +547,46 @@ pub struct SessionGoal {
     pub cleared_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalLifecycleHistoryEntry {
+    pub at: i64,
+    pub disposition: GoalDisposition,
+    pub phase: Option<GoalPhase>,
+    pub reason: Option<GoalPauseReason>,
+}
+
+const MAX_GOAL_LIFECYCLE_HISTORY: usize = 32;
+
+fn append_lifecycle_history(encoded: &str, entry: GoalLifecycleHistoryEntry) -> Result<String> {
+    let mut history: Vec<GoalLifecycleHistoryEntry> =
+        serde_json::from_str(encoded).context("decoding goal lifecycle history")?;
+    history.push(entry);
+    if history.len() > MAX_GOAL_LIFECYCLE_HISTORY {
+        history.drain(..history.len() - MAX_GOAL_LIFECYCLE_HISTORY);
+    }
+    Ok(serde_json::to_string(&history)?)
+}
+
+fn record_lifecycle_history(
+    conn: &rusqlite::Connection,
+    goal_id: Uuid,
+    entry: GoalLifecycleHistoryEntry,
+) -> Result<()> {
+    let encoded: String = conn.query_row(
+        "SELECT lifecycle_history_json FROM session_goals WHERE id = ?1",
+        params![goal_id.to_string()],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "UPDATE session_goals SET lifecycle_history_json = ?1 WHERE id = ?2",
+        params![
+            append_lifecycle_history(&encoded, entry)?,
+            goal_id.to_string()
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,7 +649,8 @@ const GOAL_SELECT: &str = "id, session_id, project_id, objective, context,
     disposition, phase, resume_phase, pause_reason, attempt_generation,
     contract_json, resolved_policy_json, evaluator_outcome_json, verifier_outcome_json,
     unresolved_gaps_json, gap_fingerprints_json, blocker_key, blocker_key_streak,
-    token_budget, tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+    token_budget, tokens_used, elapsed_active_ms, active_since, lifecycle_history_json,
+    blocked_attempts, completion_evidence, verification_rounds,
     last_read_at, cleared_at, created_at, updated_at";
 
 impl Db {
@@ -682,8 +727,9 @@ impl Db {
             conn.execute(
                 "INSERT INTO session_goals
                     (id, session_id, project_id, objective, context, disposition, phase,
-                     attempt_generation, resolved_policy_json, token_budget, token_accounting_baseline, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'planning', 1, ?6, ?7, ?8, ?9, ?9)",
+                     attempt_generation, resolved_policy_json, token_budget, token_accounting_baseline,
+                     active_since, lifecycle_history_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'planning', 1, ?6, ?7, ?8, ?9, ?10, ?9, ?9)",
                 params![
                     id.to_string(),
                     session_id.to_string(),
@@ -694,6 +740,12 @@ impl Db {
                     token_budget,
                     token_baseline,
                     now,
+                    serde_json::to_string(&vec![GoalLifecycleHistoryEntry {
+                        at: now,
+                        disposition: GoalDisposition::Running,
+                        phase: Some(GoalPhase::Planning),
+                        reason: None,
+                    }])?,
                 ],
             )
             .context("inserting session_goal")?;
@@ -814,6 +866,8 @@ impl Db {
                         pause_reason = ?4,
                         context = COALESCE(?2, context),
                         blocked_attempts = CASE WHEN ?1 = 'blocked' THEN ?3 ELSE 0 END,
+                        elapsed_active_ms = elapsed_active_ms + CASE WHEN active_since IS NULL THEN 0 ELSE MAX(0, ?5 - active_since) * 1000 END,
+                        active_since = NULL,
                         updated_at = ?5
                   WHERE id = ?6 AND session_id = ?7",
                 params![
@@ -980,6 +1034,12 @@ impl Db {
                  WHERE id = ?2 AND disposition = 'running' AND phase = 'executing' AND attempt_generation = ?4",
                 params![now, goal_id.to_string(), next_generation, attempt_generation],
             )?;
+            record_lifecycle_history(conn, goal_id, GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::Running,
+                phase: Some(GoalPhase::Evaluating),
+                reason: None,
+            })?;
             let goal = load_goal(conn, Uuid::parse_str(&session_id)?, goal_id)?;
             tx.commit()?;
             Ok(Some(goal))
@@ -1014,7 +1074,9 @@ impl Db {
             if changed == 1 {
                 tx.execute(
                     "UPDATE session_goals SET disposition = 'infra_paused', resume_phase = 'executing',
-                            phase = NULL, pause_reason = 'root_turn_failure', updated_at = ?1
+                            phase = NULL, pause_reason = 'root_turn_failure',
+                            elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000,
+                            active_since = NULL, updated_at = ?1
                      WHERE id = ?2 AND attempt_generation = ?3 AND disposition = 'running' AND phase = 'executing'",
                     params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation],
                 )?;
@@ -1052,7 +1114,9 @@ impl Db {
             if changed == 1 {
                 conn.execute(
                     "UPDATE session_goals SET disposition = 'user_paused', resume_phase = 'executing',
-                            phase = NULL, pause_reason = 'user', updated_at = ?1
+                            phase = NULL, pause_reason = 'user',
+                            elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000,
+                            active_since = NULL, updated_at = ?1
                      WHERE id = ?2 AND attempt_generation = ?3 AND disposition = 'running' AND phase = 'executing'",
                     params![now, goal_id.to_string(), attempt_generation],
                 )?;
@@ -1110,9 +1174,17 @@ impl Db {
             )?;
             conn.execute(
                 "UPDATE session_goals SET disposition = 'user_paused', resume_phase = phase,
-                        phase = NULL, pause_reason = 'restart', updated_at = ?1 WHERE id = ?2",
+                        phase = NULL, pause_reason = 'restart',
+                        elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000,
+                        active_since = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, goal.id.to_string()],
             )?;
+            record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::UserPaused,
+                phase: None,
+                reason: Some(GoalPauseReason::Restart),
+            })?;
             Ok(Some(load_goal(conn, session_id, goal.id)?))
         }).await
     }
@@ -1128,9 +1200,64 @@ impl Db {
             let now = Utc::now().timestamp();
             conn.execute("UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'operator_disabled', updated_at = ?1 WHERE goal_id = ?2 AND state IN ('pending', 'leased')", params![now, goal.id.to_string()])?;
             conn.execute("UPDATE goal_root_turns SET state = 'cancelled', updated_at = ?1 WHERE goal_id = ?2 AND state IN ('pending', 'leased')", params![now, goal.id.to_string()])?;
-            conn.execute("UPDATE session_goals SET disposition = 'user_paused', resume_phase = phase, phase = NULL, pause_reason = 'operator_disabled', updated_at = ?1 WHERE id = ?2", params![now, goal.id.to_string()])?;
+            conn.execute("UPDATE session_goals SET disposition = 'user_paused', resume_phase = phase, phase = NULL, pause_reason = 'operator_disabled', elapsed_active_ms = elapsed_active_ms + MAX(0, ?1 - COALESCE(active_since, ?1)) * 1000, active_since = NULL, updated_at = ?1 WHERE id = ?2", params![now, goal.id.to_string()])?;
+            record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::UserPaused, phase: None, reason: Some(GoalPauseReason::OperatorDisabled) })?;
             Ok(Some(load_goal(conn, session_id, goal.id)?))
         }).await
+    }
+
+    /// Atomically parks every running supervised goal, including detached
+    /// sessions that have no worker to receive a config-refresh message.
+    pub async fn pause_all_goals_for_operator_disable(&self) -> Result<usize> {
+        self.transaction(move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "UPDATE goal_control_jobs SET state = 'cancelled', cancel_reason = 'operator_disabled', updated_at = ?1
+                 WHERE state IN ('pending', 'leased') AND goal_id IN
+                   (SELECT id FROM session_goals WHERE disposition = 'running')",
+                params![now],
+            )?;
+            conn.execute(
+                "UPDATE goal_root_turns SET state = 'cancelled', updated_at = ?1
+                 WHERE state IN ('pending', 'leased') AND goal_id IN
+                   (SELECT id FROM session_goals WHERE disposition = 'running')",
+                params![now],
+            )?;
+            let mut rows = conn.prepare(
+                "SELECT id, phase, lifecycle_history_json FROM session_goals WHERE disposition = 'running'",
+            )?;
+            let goals = rows
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(rows);
+            for (id, phase, history) in &goals {
+                let history = append_lifecycle_history(
+                    history,
+                    GoalLifecycleHistoryEntry {
+                        at: now,
+                        disposition: GoalDisposition::UserPaused,
+                        phase: None,
+                        reason: Some(GoalPauseReason::OperatorDisabled),
+                    },
+                )?;
+                conn.execute(
+                    "UPDATE session_goals SET disposition = 'user_paused', resume_phase = ?1,
+                         phase = NULL, pause_reason = 'operator_disabled',
+                         elapsed_active_ms = elapsed_active_ms + MAX(0, ?2 - COALESCE(active_since, ?2)) * 1000,
+                         active_since = NULL, lifecycle_history_json = ?3, updated_at = ?2
+                     WHERE id = ?4 AND disposition = 'running'",
+                    params![phase, now, history, id],
+                )?;
+            }
+            Ok(goals.len())
+        })
+        .await
     }
 
     pub async fn purge_cleared_goal_tombstones(&self, now: i64) -> Result<usize> {
@@ -1193,6 +1320,12 @@ impl Db {
                          WHERE id = ?4 AND disposition = 'running' AND phase = 'planning' AND attempt_generation = ?5",
                         params![serde_json::to_string(&contract)?, transition.lifecycle.attempt_generation, now, goal.id.to_string(), job.attempt_generation],
                     )?;
+                    record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry {
+                        at: now,
+                        disposition: GoalDisposition::Running,
+                        phase: Some(GoalPhase::Executing),
+                        reason: None,
+                    })?;
                 }
                 GoalControlRole::Evaluator => {
                     let decision = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalEvaluatorDecision>(raw).ok()).filter(|decision| decision.validate().is_ok());
@@ -1208,6 +1341,7 @@ impl Db {
                         GoalEvaluatorDecision::Continue { .. } => {
                             let transition = goal.transition(GoalLifecycleEvent::EvaluatorContinue)?;
                             conn.execute("UPDATE session_goals SET phase = 'executing', attempt_generation = ?1, evaluator_outcome_json = ?2, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5", params![transition.lifecycle.attempt_generation, decision_json, now, goal.id.to_string(), job.attempt_generation])?;
+                            record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::Running, phase: Some(GoalPhase::Executing), reason: None })?;
                         }
                         GoalEvaluatorDecision::Blocked { blocker_key, .. } => {
                             let key = sanitize_goal_finding(&blocker_key);
@@ -1217,13 +1351,16 @@ impl Db {
                             })?;
                             if streak >= 3 {
                                 conn.execute("UPDATE session_goals SET disposition = 'blocked', phase = NULL, resume_phase = 'executing', evaluator_outcome_json = ?1, blocker_key = ?2, blocker_key_streak = ?3, updated_at = ?4 WHERE id = ?5 AND attempt_generation = ?6", params![decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
+                                record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::Blocked, phase: None, reason: None })?;
                             } else {
                                 conn.execute("UPDATE session_goals SET phase = 'executing', attempt_generation = ?1, evaluator_outcome_json = ?2, blocker_key = ?3, blocker_key_streak = ?4, updated_at = ?5 WHERE id = ?6 AND attempt_generation = ?7", params![transition.lifecycle.attempt_generation, decision_json, key, streak, now, goal.id.to_string(), job.attempt_generation])?;
+                                record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::Running, phase: Some(GoalPhase::Executing), reason: None })?;
                             }
                         }
                         GoalEvaluatorDecision::CandidateComplete { .. } => {
                             let transition = goal.transition(GoalLifecycleEvent::EvaluatorCandidateComplete)?;
                             conn.execute("UPDATE session_goals SET phase = 'verifying', attempt_generation = ?1, evaluator_outcome_json = ?2, verification_rounds = verification_rounds + 1, blocker_key = NULL, blocker_key_streak = 0, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5", params![transition.lifecycle.attempt_generation, decision_json, now, goal.id.to_string(), job.attempt_generation])?;
+                            record_lifecycle_history(conn, goal.id, GoalLifecycleHistoryEntry { at: now, disposition: GoalDisposition::Running, phase: Some(GoalPhase::Verifying), reason: None })?;
                             let verifying = load_goal(conn, goal.session_id, goal.id)?;
                             register_verification_jobs(conn, &verifying, &decision_json, now)?;
                         }
@@ -1295,9 +1432,20 @@ impl Db {
         )?;
         let changed = conn.execute(
             "UPDATE session_goals SET disposition = 'cleared', phase = NULL, resume_phase = NULL,
-                    cleared_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    elapsed_active_ms = elapsed_active_ms + CASE WHEN active_since IS NULL THEN 0 ELSE MAX(0, ?1 - active_since) * 1000 END,
+                    active_since = NULL, cleared_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![now, goal.id.to_string()],
         ).context("clearing session goal")?;
+        record_lifecycle_history(
+            conn,
+            goal.id,
+            GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::Cleared,
+                phase: None,
+                reason: None,
+            },
+        )?;
         Ok(changed > 0)
     }
 
@@ -1344,7 +1492,10 @@ impl Db {
         conn.execute(
             "UPDATE session_goals SET disposition = ?1, phase = ?2, resume_phase = ?3,
                     pause_reason = CASE WHEN ?1 = 'user_paused' THEN 'user' ELSE NULL END,
-                    attempt_generation = ?4, updated_at = ?5 WHERE id = ?6",
+                    attempt_generation = ?4,
+                    elapsed_active_ms = elapsed_active_ms + CASE WHEN ?1 = 'user_paused' AND active_since IS NOT NULL THEN MAX(0, ?5 - active_since) * 1000 ELSE 0 END,
+                    active_since = CASE WHEN ?1 = 'running' THEN ?5 ELSE NULL END,
+                    updated_at = ?5 WHERE id = ?6",
             params![
                 disposition.as_str(),
                 lifecycle.phase.map(GoalPhase::as_str),
@@ -1355,6 +1506,17 @@ impl Db {
             ],
         )
         .context("setting session goal disposition")?;
+        record_lifecycle_history(
+            conn,
+            goal.id,
+            GoalLifecycleHistoryEntry {
+                at: now,
+                disposition,
+                phase: lifecycle.phase,
+                reason: (disposition == GoalDisposition::UserPaused)
+                    .then_some(GoalPauseReason::User),
+            },
+        )?;
         let updated = load_goal(conn, session_id, goal.id)?;
         if disposition == GoalDisposition::Running {
             match updated.phase {
@@ -1421,14 +1583,22 @@ impl Db {
         let open_dispositiones = open_disposition_placeholders(2);
         let bind = bind_session_and_open_dispositiones(session_id.to_string());
         let bind_refs = param_refs(&bind);
+        // `inference_calls` can be compacted or replaced. Treat the persisted
+        // baseline as the last observed counter and add only positive deltas;
+        // a reset starts a new epoch instead of erasing already charged usage.
         conn.execute(
             &format!(
                 "UPDATE session_goals
-                SET tokens_used = MAX(tokens_used, MAX(0, COALESCE((
+                SET tokens_used = tokens_used + MAX(0, COALESCE((
                     SELECT SUM(input_tokens + output_tokens)
                     FROM inference_calls
                     WHERE session_id = session_goals.session_id
-                ), 0) - token_accounting_baseline))
+                ), 0) - token_accounting_baseline),
+                    token_accounting_baseline = COALESCE((
+                    SELECT SUM(input_tokens + output_tokens)
+                    FROM inference_calls
+                    WHERE session_id = session_goals.session_id
+                ), 0)
               WHERE session_id = ?1
                 AND disposition IN ({open_dispositiones})"
             ),
@@ -1468,7 +1638,9 @@ fn pause_goal_for_failure(
     )?;
     conn.execute(
         "UPDATE session_goals SET disposition = 'infra_paused', phase = NULL, resume_phase = ?1,
-                pause_reason = ?2, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5",
+                pause_reason = ?2,
+                elapsed_active_ms = elapsed_active_ms + MAX(0, ?3 - COALESCE(active_since, ?3)) * 1000,
+                active_since = NULL, updated_at = ?3 WHERE id = ?4 AND attempt_generation = ?5",
         params![
             phase.as_str(),
             reason,
@@ -1476,6 +1648,16 @@ fn pause_goal_for_failure(
             goal.id.to_string(),
             goal.attempt_generation
         ],
+    )?;
+    record_lifecycle_history(
+        conn,
+        goal.id,
+        GoalLifecycleHistoryEntry {
+            at: now,
+            disposition: GoalDisposition::InfraPaused,
+            phase: None,
+            reason: Some(GoalPauseReason::parse(reason)?),
+        },
     )?;
     Ok(())
 }
@@ -1602,9 +1784,21 @@ fn apply_verification_if_terminal(
         goal.transition(GoalLifecycleEvent::VerificationApproved)?;
         conn.execute(
             "UPDATE session_goals SET disposition = 'complete', phase = NULL, resume_phase = NULL,
-                    verifier_outcome_json = ?1, updated_at = ?2
+                    verifier_outcome_json = ?1,
+                    elapsed_active_ms = elapsed_active_ms + MAX(0, ?2 - COALESCE(active_since, ?2)) * 1000,
+                    active_since = NULL, updated_at = ?2
              WHERE id = ?3 AND disposition = 'running' AND phase = 'verifying' AND attempt_generation = ?4",
             params![serde_json::json!({"approved": true, "cold_approvals": approvals, "cold_total": cold_total}).to_string(), now, goal.id.to_string(), goal.attempt_generation],
+        )?;
+        record_lifecycle_history(
+            conn,
+            goal.id,
+            GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::Complete,
+                phase: None,
+                reason: None,
+            },
         )?;
         return Ok(());
     }
@@ -1644,8 +1838,19 @@ fn apply_verification_if_terminal(
             "UPDATE session_goals SET disposition = 'no_progress_paused', phase = NULL,
                     resume_phase = 'executing', pause_reason = ?1, unresolved_gaps_json = ?2,
                     gap_fingerprints_json = ?3, previous_gap_set_hash = ?4, verifier_outcome_json = ?5,
-                    updated_at = ?6 WHERE id = ?7 AND attempt_generation = ?8",
+                    elapsed_active_ms = elapsed_active_ms + MAX(0, ?6 - COALESCE(active_since, ?6)) * 1000,
+                    active_since = NULL, updated_at = ?6 WHERE id = ?7 AND attempt_generation = ?8",
             params![reason, findings_json, fingerprints_json, set_hash, serde_json::json!({"approved": false}).to_string(), now, goal.id.to_string(), goal.attempt_generation],
+        )?;
+        record_lifecycle_history(
+            conn,
+            goal.id,
+            GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::NoProgressPaused,
+                phase: None,
+                reason: Some(GoalPauseReason::parse(reason)?),
+            },
         )?;
     } else {
         let transition = goal.transition(GoalLifecycleEvent::VerificationRefuted)?;
@@ -1664,6 +1869,16 @@ fn apply_verification_if_terminal(
                 goal.id.to_string(),
                 goal.attempt_generation
             ],
+        )?;
+        record_lifecycle_history(
+            conn,
+            goal.id,
+            GoalLifecycleHistoryEntry {
+                at: now,
+                disposition: GoalDisposition::Running,
+                phase: Some(GoalPhase::Executing),
+                reason: None,
+            },
         )?;
     }
     Ok(())
@@ -1769,15 +1984,29 @@ fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
     let contract: Option<String> = row.get(10)?;
     let unresolved_gaps: String = row.get(14)?;
     let gap_fingerprints: String = row.get(15)?;
+    let lifecycle_history: String = row.get(22)?;
+    let disposition_value = GoalDisposition::parse(&disposition).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
+    })?;
+    let active_since: Option<i64> = row.get(21)?;
+    let persisted_elapsed: i64 = row.get(20)?;
+    let elapsed_active_ms = if disposition_value == GoalDisposition::Running {
+        persisted_elapsed.saturating_add(
+            Utc::now()
+                .timestamp()
+                .saturating_sub(active_since.unwrap_or_else(|| row.get(29).unwrap_or_default()))
+                .saturating_mul(1_000),
+        )
+    } else {
+        persisted_elapsed
+    };
     Ok(SessionGoal {
         id: Uuid::parse_str(&id).map_err(decode_err)?,
         session_id: Uuid::parse_str(&session_id).map_err(decode_err)?,
         project_id: row.get(2)?,
         objective: row.get(3)?,
         context: row.get(4)?,
-        disposition: GoalDisposition::parse(&disposition).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
-        })?,
+        disposition: disposition_value,
         phase: phase
             .map(|value| GoalPhase::parse(&value).map_err(decode_err))
             .transpose()?,
@@ -1800,13 +2029,16 @@ fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
         blocker_key_streak: row.get(17)?,
         token_budget: row.get(18)?,
         tokens_used: row.get(19)?,
-        blocked_attempts: row.get(20)?,
-        completion_evidence: row.get(21)?,
-        verification_rounds: row.get(22)?,
-        last_read_at: row.get(23)?,
-        cleared_at: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        elapsed_active_ms,
+        active_since,
+        lifecycle_history: serde_json::from_str(&lifecycle_history).map_err(decode_err)?,
+        blocked_attempts: row.get(23)?,
+        completion_evidence: row.get(24)?,
+        verification_rounds: row.get(25)?,
+        last_read_at: row.get(26)?,
+        cleared_at: row.get(27)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -2081,6 +2313,121 @@ mod tests {
         (db, goal, job)
     }
 
+    fn inference_row(
+        goal: &SessionGoal,
+        tokens: i64,
+    ) -> crate::db::inference_calls::InferenceCallRow {
+        crate::db::inference_calls::InferenceCallRow {
+            call_id: Uuid::new_v4(),
+            session_id: goal.session_id,
+            project_id: goal.project_id.clone(),
+            project_root: "/tmp/goal-supervision".into(),
+            model: "test".into(),
+            provider: "test".into(),
+            timestamp: Utc::now().timestamp(),
+            input_tokens: tokens,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_usage_accumulates_positive_deltas_across_counter_resets() {
+        let (db, goal, _) = planning_fixture().await;
+        db.insert_inference_call(&inference_row(&goal, 10))
+            .await
+            .unwrap();
+        db.refresh_session_goal_usage(goal.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.current_session_goal(goal.session_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            10
+        );
+
+        let session_id = goal.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM inference_calls WHERE session_id = ?1",
+                params![session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.refresh_session_goal_usage(goal.session_id)
+            .await
+            .unwrap();
+        db.insert_inference_call(&inference_row(&goal, 4))
+            .await
+            .unwrap();
+        db.refresh_session_goal_usage(goal.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.current_session_goal(goal.session_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens_used,
+            14
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_disable_sweep_is_transactional_and_includes_detached_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_session("p", "/tmp/a", "Build").await.unwrap();
+        let second = db.create_session("p", "/tmp/b", "Build").await.unwrap();
+        let first_goal = db
+            .create_session_goal(first.session_id, "p", "a", None, Some(10))
+            .await
+            .unwrap();
+        let second_goal = db
+            .create_session_goal(second.session_id, "p", "b", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(db.pause_all_goals_for_operator_disable().await.unwrap(), 2);
+        for goal in [first_goal, second_goal] {
+            let paused = db
+                .current_session_goal(goal.session_id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(paused.disposition, GoalDisposition::UserPaused);
+            assert_eq!(paused.pause_reason, Some(GoalPauseReason::OperatorDisabled));
+            assert!(paused.active_since.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_history_is_bounded_and_elapsed_survives_pause_resume() {
+        let (db, goal, _) = planning_fixture().await;
+        for _ in 0..20 {
+            db.set_session_goal_status(goal.session_id, GoalDisposition::UserPaused)
+                .await
+                .unwrap();
+            db.set_session_goal_status(goal.session_id, GoalDisposition::Running)
+                .await
+                .unwrap();
+        }
+        let current = db
+            .current_session_goal(goal.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.lifecycle_history.len(), MAX_GOAL_LIFECYCLE_HISTORY);
+        assert!(current.active_since.is_some());
+        assert!(current.elapsed_active_ms >= 0);
+    }
+
     #[tokio::test]
     async fn goal_planning_requires_valid_contract() {
         let (db, goal, job) = planning_fixture().await;
@@ -2140,6 +2487,9 @@ mod tests {
             blocker_key_streak: 0,
             token_budget: 100,
             tokens_used: 1,
+            elapsed_active_ms: 0,
+            active_since: Some(0),
+            lifecycle_history: vec![],
             blocked_attempts: 0,
             completion_evidence: None,
             verification_rounds: 0,

@@ -1532,7 +1532,13 @@ impl App {
             }
             _ => {
                 self.swap_primary_agent("Build");
-                let (token_budget, objective) = Self::parse_goal_create_args(trimmed);
+                let (token_budget, objective) = match Self::parse_goal_create_args(trimmed) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        self.push_plain(format!("/goal: {message}"));
+                        return;
+                    }
+                };
                 if objective.is_empty() {
                     self.push_plain("/goal: objective must not be empty".to_string());
                     return;
@@ -1542,18 +1548,33 @@ impl App {
         }
     }
 
-    fn parse_goal_create_args(input: &str) -> (Option<i64>, String) {
+    fn parse_goal_create_args(input: &str) -> Result<(Option<i64>, String), String> {
         let mut words = input.split_whitespace();
         let mut budget = None;
         let mut objective = Vec::new();
         while let Some(word) = words.next() {
             if word == "--budget" {
-                budget = words.next().and_then(|value| value.parse::<i64>().ok());
+                if budget.is_some() {
+                    return Err("--budget may be specified only once".to_string());
+                }
+                let value = words
+                    .next()
+                    .ok_or_else(|| "--budget requires a positive integer".to_string())?;
+                if value.starts_with("--") {
+                    return Err("--budget requires a positive integer".to_string());
+                }
+                let parsed = value
+                    .parse::<i64>()
+                    .map_err(|_| "--budget requires a positive integer".to_string())?;
+                if parsed <= 0 {
+                    return Err("--budget requires a positive integer".to_string());
+                }
+                budget = Some(parsed);
             } else {
                 objective.push(word);
             }
         }
-        (budget, objective.join(" "))
+        Ok((budget, objective.join(" ")))
     }
 
     /// `/skill <skill-name> [task]` — the universal dispatcher
@@ -3227,6 +3248,23 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn goal_budget_parser_rejects_missing_malformed_nonpositive_and_duplicate_values() {
+        for input in [
+            "--budget ship",
+            "--budget nope ship",
+            "--budget 0 ship",
+            "--budget -4 ship",
+            "--budget 4 --budget 5 ship",
+        ] {
+            assert!(App::parse_goal_create_args(input).is_err(), "{input}");
+        }
+        assert_eq!(
+            App::parse_goal_create_args("--budget 42 ship the feature").unwrap(),
+            (Some(42), "ship the feature".to_string())
+        );
     }
 
     async fn answer_goal_request(

@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn existing_goal_dispatch_uses_persisted_policy_except_for_live_kill_switch() {
+    let persisted = crate::config::extended::GoalSupervisionConfig {
+        cold_skeptic_count: 1,
+        max_verification_attempts: 9,
+        evaluator_model: Some("provider/persisted-evaluator".into()),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_string(&persisted).unwrap();
+    let resolved = resolved_goal_supervision_config(&encoded, true).unwrap();
+    assert_eq!(resolved, persisted);
+    assert!(resolved_goal_supervision_config(&encoded, false).is_err());
+}
+
 #[tokio::test]
 async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
     let (mut driver, _tmp) = test_driver(1);

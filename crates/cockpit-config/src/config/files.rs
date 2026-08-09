@@ -641,8 +641,10 @@ pub(crate) fn read_file_nofollow_with_identity(
 fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetSecurityDescriptorControl,
-        SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, IsWellKnownSid, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
     };
     let mut needed = 0u32;
     unsafe {
@@ -680,6 +682,60 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     }
     if control & SE_DACL_PROTECTED == 0 {
         anyhow::bail!("terminal ingress DACL is not protected");
+    }
+    let mut owner = std::ptr::null_mut();
+    let mut owner_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor.as_mut_ptr().cast(),
+            &mut owner,
+            &mut owner_defaulted,
+        )
+    } == 0
+        || owner.is_null()
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut dacl_present = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_mut_ptr().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+        || dacl_present == 0
+        || dacl.is_null()
+    {
+        anyhow::bail!("terminal ingress file has no protected DACL");
+    }
+    let ace_count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(ace_count) {
+        let mut raw_ace = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let header = raw_ace.cast::<windows_sys::Win32::Security::ACE_HEADER>();
+        let ace_type = unsafe { (*header).AceType };
+        // ACCESS_ALLOWED_ACE_TYPE is zero. Fail closed on object/callback
+        // allow ACE shapes because their SID offsets differ.
+        if ace_type == 0 {
+            let allowed = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            let sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
+            let approved = unsafe {
+                EqualSid(sid, owner) != 0
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+            };
+            if !approved {
+                anyhow::bail!("terminal ingress DACL grants an unapproved SID");
+            }
+        } else if matches!(ace_type, 5 | 9 | 11) {
+            anyhow::bail!("terminal ingress DACL contains an unsupported allow ACE");
+        }
     }
     Ok(())
 }
@@ -1161,6 +1217,7 @@ fn open_windows_directory_nofollow_with_final_access(
                 ) {
                     Ok(directory) => {
                         protect_windows_dacl(&directory)?;
+                        verify_windows_protected_dacl(&directory)?;
                         directory
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -1,4 +1,21 @@
 use super::*;
+
+#[cfg(test)]
+static EXPORT_WRITE_THREAD_OBSERVER: std::sync::Mutex<
+    Option<(
+        std::path::PathBuf,
+        tokio::sync::oneshot::Sender<std::thread::ThreadId>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn observe_export_write_thread(
+    target: std::path::PathBuf,
+) -> tokio::sync::oneshot::Receiver<std::thread::ThreadId> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    *EXPORT_WRITE_THREAD_OBSERVER.lock().unwrap() = Some((target, sender));
+    receiver
+}
 #[cfg(test)]
 use crate::tui::agent_runner::AttachedRequest;
 use crate::tui::agent_runner::AttachedRequestBinding;
@@ -163,8 +180,39 @@ async fn export_via_attached_daemon(
 
 pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Path) {
     let records = exports_dir.join(".cockpit-export-recovery");
+    let records_secure = std::fs::symlink_metadata(&records).is_ok_and(|metadata| {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    });
+    if !records_secure {
+        return;
+    }
     if let Ok(mut entries) = tokio::fs::read_dir(&records).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
+            let record_name = entry.file_name();
+            let Some(record_text) = record_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".record"))
+            else {
+                continue;
+            };
+            let Ok(record_id) = uuid::Uuid::parse_str(record_text) else {
+                continue;
+            };
+            if record_id.get_version_num() != 7 || record_id.to_string() != record_text {
+                continue;
+            }
             let Ok(record) = tokio::fs::read_to_string(entry.path()).await else {
                 continue;
             };
@@ -175,49 +223,34 @@ pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Pat
             let owned = name
                 .strip_suffix(".partial")
                 .and_then(|stem| stem.rsplit_once('.'))
-                .is_some_and(|(target, id)| {
-                    target.starts_with('.') && target.len() > 1 && uuid::Uuid::parse_str(id).is_ok()
+                .is_some_and(|(target, id_text)| {
+                    uuid::Uuid::parse_str(id_text).is_ok_and(|id| {
+                        target.starts_with('.')
+                            && target.len() > 1
+                            && id.get_version_num() == 7
+                            && id.to_string() == id_text
+                    })
                 });
             let candidate = exports_dir.join(name);
-            let regular = tokio::fs::symlink_metadata(&candidate)
-                .await
-                .is_ok_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink());
-            if owned && regular && tokio::fs::remove_file(&candidate).await.is_ok() {
+            if !owned {
+                continue;
+            }
+            let cleanup = tokio::task::spawn_blocking(move || {
+                crate::tui::async_action::secure_unlink_owned_temp(&candidate)
+            })
+            .await;
+            let cleaned = match cleanup {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+                Err(_) => false,
+            };
+            if cleaned {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
         let records = records.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::File::open(records)?.sync_all()).await;
     }
-    let Ok(mut entries) = tokio::fs::read_dir(exports_dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let partial = name.strip_suffix(".cleanup-deferred").unwrap_or(&name);
-        let owned = partial
-            .strip_suffix(".partial")
-            .and_then(|stem| stem.rsplit_once('.'))
-            .is_some_and(|(target, id)| {
-                target.starts_with('.') && target.len() > 1 && uuid::Uuid::parse_str(id).is_ok()
-            });
-        let regular = entry.file_type().await.is_ok_and(|kind| kind.is_file());
-        if owned && regular {
-            match tokio::fs::remove_file(entry.path()).await {
-                Ok(()) => eprintln!(
-                    "cockpit: recovered deferred export cleanup {}",
-                    entry.path().display()
-                ),
-                Err(error) => eprintln!(
-                    "cockpit: CleanupDeferred remains at {}: {error}",
-                    entry.path().display()
-                ),
-            }
-        }
-    }
-    let root = exports_dir.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || std::fs::File::open(root)?.sync_all()).await;
 }
 
 /// Publish through an owned temporary file and a no-replace hard link.  The
@@ -227,46 +260,61 @@ pub(super) async fn write_export_no_clobber(
     out_path: &std::path::Path,
     bytes: &[u8],
     command: &'static str,
-    shutdown: &AsyncActionCancellation,
+    shutdown: &std::sync::Arc<AsyncActionCancellation>,
 ) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt as _;
-
     let file_name = out_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{command}: invalid export path"))?;
-    let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::new_v4()));
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
+    let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::now_v7()));
+    let worker_temp = temp.clone();
+    let worker_out = out_path.to_path_buf();
+    let worker_bytes = bytes.to_vec();
+    let worker_shutdown = std::sync::Arc::clone(shutdown);
+    shutdown.own_export_temp(temp.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp)
-            .await
+            .open(&worker_temp)
             .map_err(|error| format!("{command}: creating export failed: {error}"))?;
-        shutdown.own_export_temp(temp.clone());
-        file.write_all(bytes)
-            .await
+        #[cfg(test)]
+        {
+            let mut observer = EXPORT_WRITE_THREAD_OBSERVER.lock().unwrap();
+            if observer
+                .as_ref()
+                .is_some_and(|(target, _)| target == &worker_out)
+                && let Some((_, sender)) = observer.take()
+            {
+                let _ = sender.send(std::thread::current().id());
+            }
+        }
+        file.write_all(&worker_bytes)
             .map_err(|error| format!("{command}: writing export failed: {error}"))?;
-        if shutdown.is_cancelled() {
+        if worker_shutdown.is_cancelled() {
             return Err(format!("{command}: export cancelled by shutdown"));
         }
         file.sync_all()
-            .await
             .map_err(|error| format!("{command}: syncing export failed: {error}"))?;
         drop(file);
-        tokio::fs::hard_link(&temp, out_path)
-            .await
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    format!("{command}: export already exists: {}", out_path.display())
-                } else {
-                    format!("{command}: publishing export failed: {error}")
-                }
-            })?;
+        std::fs::hard_link(&worker_temp, &worker_out).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{command}: export already exists: {}", worker_out.display())
+            } else {
+                format!("{command}: publishing export failed: {error}")
+            }
+        })?;
         Ok(())
-    }
-    .await;
-    let cleanup = tokio::fs::remove_file(&temp).await;
+    })
+    .await
+    .map_err(|error| format!("{command}: export worker failed: {error}"))?;
+    let cleanup_temp = temp.clone();
+    let cleanup = tokio::task::spawn_blocking(move || {
+        crate::tui::async_action::secure_unlink_owned_temp(&cleanup_temp)
+    })
+    .await
+    .map_err(|error| format!("{command}: cleanup worker failed: {error}"))?;
     match (result, cleanup) {
         (result, Ok(())) => {
             shutdown.release_export_temp();
@@ -567,6 +615,53 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_writes_off_the_loop_thread() {
+        let event_loop_thread = std::thread::current().id();
+        let tmp = tempfile::tempdir().unwrap();
+        let exports = tmp.path().join("exports");
+        let target = exports.join("threaded.json");
+        let write_thread = observe_export_write_thread(target.clone());
+        let session_id = uuid::Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut app = App::new(Some(tmp.path()), false);
+        app.agent_runner = Some(Ok(runner(session_id, tx)));
+
+        app.export_transcript_json("threaded", &exports);
+        let request = rx.recv().await.unwrap();
+        assert!(matches!(
+            request.request,
+            Request::ExportSessionData {
+                session_id: requested,
+                kind: ExportSessionKind::TranscriptJson,
+                include_sensitive: false,
+                ..
+            } if requested == session_id
+        ));
+        request
+            .response_tx
+            .send(Ok(response(
+                session_id,
+                ExportSessionKind::TranscriptJson,
+                "json",
+                b"complete",
+            )))
+            .unwrap();
+        serve_bulk_chunk(&mut rx, b"complete").await;
+
+        assert_ne!(write_thread.await.unwrap(), event_loop_thread);
+        drain_until_idle(&mut app).await;
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"complete");
+        assert_eq!(
+            std::fs::read_dir(&exports)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
+                .count(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn malformed_export_data_is_a_decode_failure_without_a_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -613,7 +708,7 @@ mod tests {
         let target = tmp.path().join("existing.json");
         tokio::fs::write(&target, b"original").await.unwrap();
 
-        let cancellation = AsyncActionCancellation::default();
+        let cancellation = std::sync::Arc::new(AsyncActionCancellation::default());
         let error = write_export_no_clobber(&target, b"replacement", "/export", &cancellation)
             .await
             .unwrap_err();
@@ -628,16 +723,24 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn next_export_start_clears_deferred_cleanup_record() {
         let tmp = tempfile::tempdir().unwrap();
-        let deferred = tmp.path().join(format!(
-            ".old.json.{}.partial.cleanup-deferred",
-            uuid::Uuid::new_v4()
-        ));
+        use std::os::unix::fs::PermissionsExt as _;
+        let name = format!(".old.json.{}.partial", uuid::Uuid::now_v7());
+        let deferred = tmp.path().join(&name);
         tokio::fs::write(&deferred, b"partial").await.unwrap();
+        let records = tmp.path().join(".cockpit-export-recovery");
+        tokio::fs::create_dir(&records).await.unwrap();
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = records.join(format!("{}.record", uuid::Uuid::now_v7()));
+        tokio::fs::write(&record, format!("v1\n{name}\n"))
+            .await
+            .unwrap();
         recover_deferred_export_cleanup(tmp.path()).await;
         assert!(!deferred.exists());
+        assert!(!record.exists());
     }
 
     #[tokio::test]

@@ -325,14 +325,8 @@ fn export_temp_reaper() -> &'static ExportReaper {
                                     pending.push_back((path, attempts + 1));
                                     std::thread::sleep(Duration::from_millis(10));
                                 } else {
-                                    let deferred = path.with_extension("partial.cleanup-deferred");
-                                    match std::fs::rename(&path, &deferred) {
-                                        Ok(()) => eprintln!("cockpit: CleanupDeferred — export recovery recorded at {}", deferred.display()),
-                                        Err(rename_error) => {
-                                            let record = persist_export_recovery_record(&path);
-                                            eprintln!("cockpit: CleanupDeferred — could not quarantine {} after {error}: {rename_error}; recovery_record={}", path.display(), record.as_ref().map_or_else(|e| format!("failed:{e}"), |p| p.display().to_string()));
-                                        }
-                                    }
+                                    let record = persist_export_recovery_record(&path);
+                                    eprintln!("cockpit: CleanupDeferred — export recovery for {} after {error}; recovery_record={}", path.display(), record.as_ref().map_or_else(|e| format!("failed:{e}"), |p| p.display().to_string()));
                                 }
                             }
                         }
@@ -426,7 +420,7 @@ fn synchronous_export_cleanup_fallback(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
@@ -476,8 +470,11 @@ fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::remove_file(path)
+pub(crate) fn secure_unlink_owned_temp(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure export cleanup is unavailable on this platform",
+    ))
 }
 
 pub(crate) fn drain_export_temp_reaper() {

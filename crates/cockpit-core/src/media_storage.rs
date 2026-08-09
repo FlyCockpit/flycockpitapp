@@ -467,9 +467,14 @@ mod tests {
         storage_id: Uuid,
         session_id: Uuid,
         project_digest: String,
+        borrowed_source: Option<BorrowedSourceHandle>,
     }
 
     async fn fixture() -> Fixture {
+        fixture_for(false).await
+    }
+
+    async fn fixture_for(borrowed: bool) -> Fixture {
         let temp = tempfile::TempDir::new().unwrap();
         let root_path = temp.path().join("media");
         let root = DirGuard::open_root(&root_path, true).unwrap();
@@ -479,6 +484,45 @@ mod tests {
         file.sync_all().unwrap();
         let identity = stable_identity_digest(&file).unwrap();
         let (byte_length, checksum) = read_full_digest(&mut file).unwrap();
+        let (
+            source_kind,
+            source_identity,
+            source_length,
+            source_checksum,
+            source_evidence,
+            borrowed_source,
+        ) = if borrowed {
+            let source_path = temp.path().join("borrowed-source.bin");
+            std::fs::write(&source_path, b"borrowed source bytes").unwrap();
+            let mut source = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&source_path)
+                .unwrap();
+            let identity = stable_identity_digest(&source).unwrap();
+            let (length, checksum) = read_full_digest(&mut source).unwrap();
+            let evidence =
+                source_evidence_digest(&mut source, &identity, length, &checksum).unwrap();
+            (
+                MediaSourceKind::LocalPath,
+                identity,
+                length,
+                checksum,
+                Some(evidence.clone()),
+                Some(BorrowedSourceHandle {
+                    file: source,
+                    evidence_digest: evidence,
+                }),
+            )
+        } else {
+            (
+                MediaSourceKind::RetainedHttps,
+                "22".repeat(32),
+                1,
+                "33".repeat(32),
+                None,
+                None,
+            )
+        };
 
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
@@ -502,6 +546,13 @@ mod tests {
             updated_at_unix_ms: 1,
         };
         let inserted = component.clone();
+        let initial_availability = if borrowed {
+            MediaAvailability::Registered
+        } else {
+            MediaAvailability::Quarantined
+        };
+        let inserted_source_identity = source_identity.clone();
+        let inserted_source_checksum = source_checksum.clone();
         db.transaction(move |conn| {
             conn.execute("INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)", [session_id.to_string()])?;
             cockpit_db::Db::insert_media_attachment_conn(conn, &MediaAttachmentRecord {
@@ -509,17 +560,17 @@ mod tests {
                 session_id,
                 canonical_project_digest: inserted_project_digest,
                 media_kind: MediaKind::Image,
-                source_kind: MediaSourceKind::RetainedHttps,
+                source_kind,
                 canonical_container: "png".into(),
                 canonical_mime: "image/png".into(),
-                availability: MediaAvailability::Quarantined,
+                availability: initial_availability,
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
                 captured_capability_generation: 1,
-                source_identity_digest: "22".repeat(32),
-                source_byte_length: 1,
-                source_sha256: "33".repeat(32),
+                source_identity_digest: inserted_source_identity,
+                source_byte_length: source_length,
+                source_sha256: inserted_source_checksum,
                 selected_video_stream: None,
                 selected_audio_stream: None,
                 created_at_unix_ms: 1,
@@ -554,7 +605,7 @@ mod tests {
                 component_generation: 1,
                 recorded_evidence_digest: recorded_evidence_digest(&proof_component),
             }],
-            borrowed_source_evidence_digest: None,
+            borrowed_source_evidence_digest: source_evidence,
             disposition: MediaSecurityRecoveryDisposition::ResumeVerifiedCleanup,
         };
         Fixture {
@@ -565,6 +616,7 @@ mod tests {
             storage_id,
             session_id,
             project_digest,
+            borrowed_source,
         }
     }
 
@@ -694,6 +746,65 @@ mod tests {
                 .await
                 .unwrap(),
             receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn borrowed_media_recovery_uses_registered_handle_and_replays() {
+        let mut fixture = fixture_for(true).await;
+        let recovery = MediaStorageRecovery::open(fixture.db.clone(), &fixture.root_path).unwrap();
+        recovery
+            .register_local_path_source(
+                fixture.request.attachment_id,
+                fixture.borrowed_source.take().unwrap(),
+            )
+            .unwrap();
+        let receipt = recovery
+            .recover(
+                fixture.request.clone(),
+                fixture.session_id,
+                fixture.project_digest.clone(),
+                None,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            MediaSecurityRecoveryOutcome::CleanupResumed
+        );
+        assert_eq!(
+            recovery
+                .recover(
+                    fixture.request,
+                    fixture.session_id,
+                    fixture.project_digest,
+                    None,
+                    21
+                )
+                .await
+                .unwrap(),
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn borrowed_media_recovery_without_registered_handle_is_rejected() {
+        let fixture = fixture_for(true).await;
+        let recovery = MediaStorageRecovery::open(fixture.db, &fixture.root_path).unwrap();
+        let receipt = recovery
+            .recover(
+                fixture.request,
+                fixture.session_id,
+                fixture.project_digest,
+                None,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            MediaSecurityRecoveryOutcome::RejectedUnverifiable
         );
     }
 }

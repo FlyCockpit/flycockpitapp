@@ -211,7 +211,6 @@ fixture_enum!(ProvidersFixture {
     WizardCodexAcknowledge,
     WizardCopilotContinue,
     WizardCopilotNoControl,
-    WizardSavingNoControl,
     WizardTestKeyNoControl,
     WizardTestSkippedNoControl,
     WizardFetchingNoControl,
@@ -424,11 +423,7 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
             super::string_list::StringListKind::GitignoreAllow,
         )),
     ]);
-    all.extend(
-        ProviderWizardStep::ALL
-            .into_iter()
-            .map(PayloadFixtureKey::WizardStep),
-    );
+    all.extend(wizard_pointer_source_steps().map(PayloadFixtureKey::WizardStep));
     all.extend(
         WizardPayloadControlKey::ALL
             .iter()
@@ -448,6 +443,32 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
         .map(PayloadFixtureKey::OAuthOption),
     );
     all
+}
+
+/// Wizard lifecycle states that can survive long enough to be rendered by the
+/// settings dialog. `Saving` is submitted through synchronously by
+/// `save_and_fetch_provider`, so it is not a pointer source.
+pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWizardStep> {
+    ProviderWizardStep::ALL
+        .into_iter()
+        .filter(|step| match step {
+            ProviderWizardStep::Saving => false,
+            ProviderWizardStep::Template
+            | ProviderWizardStep::ProviderId
+            | ProviderWizardStep::Url
+            | ProviderWizardStep::Headers
+            | ProviderWizardStep::AuthMethod
+            | ProviderWizardStep::ApiKey
+            | ProviderWizardStep::EnvVar
+            | ProviderWizardStep::CopilotAuth
+            | ProviderWizardStep::GrokOAuth
+            | ProviderWizardStep::CodexOAuth
+            | ProviderWizardStep::TestKeyChoice
+            | ProviderWizardStep::TestKey
+            | ProviderWizardStep::TestSkipped
+            | ProviderWizardStep::Fetching
+            | ProviderWizardStep::Done => true,
+        })
 }
 
 pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFixtureKey> {
@@ -513,7 +534,6 @@ impl ActionFixtureKey {
             }
             Self::Providers(
                 ProvidersFixture::WizardCopilotNoControl
-                | ProvidersFixture::WizardSavingNoControl
                 | ProvidersFixture::WizardTestKeyNoControl
                 | ProvidersFixture::WizardTestSkippedNoControl
                 | ProvidersFixture::WizardFetchingNoControl

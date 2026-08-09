@@ -580,7 +580,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     });
     WIZARD_SOURCE_COVERAGE.with(|coverage| {
         let coverage = coverage.borrow();
-        for step in cockpit_core::wizard::ProviderWizardStep::ALL {
+        for step in super::pointer_action_fixtures::wizard_pointer_source_steps() {
             assert!(
                 coverage.contains(&step),
                 "provider wizard source step was not rendered: {step:?}"

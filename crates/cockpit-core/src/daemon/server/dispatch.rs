@@ -208,14 +208,19 @@ async fn handle_send_user_message(
     let (item, queue) = match actor_result {
         Ok(result) => result,
         Err(error) => {
-            if let Err(cleanup_error) = ctx
+            match ctx
                 .media_ledger
                 .return_downstream_ownership(&client_submission_id.to_string())
                 .await
             {
-                tracing::warn!(%cleanup_error,invocation=%client_submission_id,"rejected user submission could not return media ownership");
+                Ok(_) => release_message_image_refs(state, client_submission_id, &image_refs),
+                Err(cleanup_error) => {
+                    // Keep refs in the consumed/quarantined map. Re-exposing
+                    // them while durable ownership still names the rejected
+                    // invocation would permit two owners for one reservation.
+                    tracing::warn!(%cleanup_error,invocation=%client_submission_id,"rejected user submission could not return media ownership; refs remain quarantined");
+                }
             }
-            release_message_image_refs(state, client_submission_id, &image_refs);
             return Err(error);
         }
     };

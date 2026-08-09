@@ -288,24 +288,27 @@ impl MediaReservationLedger {
         wall_ms: u64,
     ) -> Result<u64, LedgerError> {
         let invocation = invocation_id.to_owned();
-        let rows=self.db.read(move|conn| {
-            let mut statement=conn.prepare("SELECT o.reservation_id,r.version FROM media_downstream_ownership o JOIN media_reservations r ON r.reservation_id=o.reservation_id WHERE o.invocation_id=?1 AND o.released_wall_ms IS NULL")?;
-            Ok(statement.query_map([invocation],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
-        }).await.map_err(LedgerError::Storage)?;
-        let mut released = 0_u64;
-        for (id, version) in rows {
-            self.destroy_local_artifacts(
-                &id,
-                version,
-                &format!("downstream-invocation-destroyed:{invocation_id}:{id}"),
-                wall_ms,
-            )
-            .await?;
-            let id_for_update = id.clone();
-            self.db.transaction(move|conn|{conn.execute("UPDATE media_downstream_ownership SET released_wall_ms=?1 WHERE reservation_id=?2 AND released_wall_ms IS NULL",params![sqlite_i64(wall_ms)?,id_for_update])?;Ok(())}).await.map_err(LedgerError::Storage)?;
-            released = released.checked_add(1).ok_or(LedgerError::Overflow)?;
-        }
-        Ok(released)
+        self.db.transaction(move|conn| {
+            let mut statement=conn.prepare("SELECT o.reservation_id,r.version,r.state FROM media_downstream_ownership o JOIN media_reservations r ON r.reservation_id=o.reservation_id WHERE o.invocation_id=?1 AND o.released_wall_ms IS NULL")?;
+            let rows=statement.query_map([&invocation],|row|Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let mut released=0_u64;
+            for(id,version,state) in rows {
+                if ReservationState::parse(&state)? != ReservationState::Released {
+                    let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+                    for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels] {
+                        let name=dimension_name(dimension);
+                        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,format!("downstream-invocation-destroyed:{invocation}:{id}"),sqlite_i64(wall_ms)?])?;
+                        release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;
+                    }
+                    let next=if has_releasable_balance(conn,&id)?{ReservationState::Settling}else{ReservationState::Released};
+                    conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),sqlite_i64(next_version)?,id])?;
+                }
+                conn.execute("UPDATE media_downstream_ownership SET released_wall_ms=?1 WHERE reservation_id=?2 AND released_wall_ms IS NULL",params![sqlite_i64(wall_ms)?,id])?;
+                released=released.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
+            }
+            Ok(released)
+        }).await.map_err(classify_storage_error)
     }
 
     pub async fn return_downstream_ownership(
@@ -316,6 +319,26 @@ impl MediaReservationLedger {
         self.db.transaction(move|conn|Ok(u64::try_from(conn.execute(
             "DELETE FROM media_downstream_ownership WHERE invocation_id=?1 AND released_wall_ms IS NULL",
             [invocation])?)?)).await.map_err(LedgerError::Storage)
+    }
+
+    pub async fn reconcile_terminal_downstream_ownership(
+        &self,
+        wall_ms: u64,
+    ) -> Result<u64, LedgerError> {
+        let invocations=self.db.read(|conn| {
+            let mut statement=conn.prepare("SELECT DISTINCT o.invocation_id FROM media_downstream_ownership o JOIN client_submission_terminal_receipts t ON t.client_submission_id=o.invocation_id WHERE o.released_wall_ms IS NULL")?;
+            Ok(statement.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await.map_err(LedgerError::Storage)?;
+        let mut released = 0_u64;
+        for invocation in invocations {
+            released = released
+                .checked_add(
+                    self.complete_downstream_invocation(&invocation, wall_ms)
+                        .await?,
+                )
+                .ok_or(LedgerError::Overflow)?;
+        }
+        Ok(released)
     }
 
     /// Releases abandoned daemon uploads whose only storage was process

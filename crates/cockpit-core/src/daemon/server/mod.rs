@@ -2282,6 +2282,13 @@ pub(crate) async fn boot_with_db(
     {
         tracing::warn!(%error, "ephemeral attachment reservation recovery failed");
     }
+    if let Err(error) = ctx
+        .media_ledger
+        .reconcile_terminal_downstream_ownership(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "terminal downstream media ownership reconciliation failed");
+    }
     let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
     ctx.media_admission_open
         .store(recovery_complete, std::sync::atomic::Ordering::Release);

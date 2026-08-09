@@ -410,6 +410,9 @@ pub struct SettingsCx {
     /// Active launch/session project root for side effects that must operate on
     /// a project while this dialog may be editing a home/global config file.
     pub(super) active_project_root: Option<PathBuf>,
+    /// Per-session launch policy (`false` for `--no-sandbox`) used by
+    /// dependency applicability. This is runtime state, never persisted.
+    pub(super) sandbox_enabled: bool,
     /// Set by Root's back action to ask the outer [`Dialog`] to
     /// re-open the picker on the next `true` return from `handle_key`.
     pub(super) back_to_picker: bool,
@@ -681,6 +684,12 @@ impl Dialog {
 
     pub fn is_workspace_trust(&self) -> bool {
         matches!(self, Dialog::WorkspaceTrust { .. })
+    }
+
+    pub(crate) fn set_runtime_sandbox_enabled(&mut self, enabled: bool) {
+        if let Dialog::Settings(settings) = self {
+            settings.cx.sandbox_enabled = enabled;
+        }
     }
 
     #[cfg(test)]
@@ -1583,6 +1592,7 @@ impl SettingsDialog {
                 extended_warnings,
                 picker_cwd: None,
                 active_project_root: None,
+                sandbox_enabled: true,
                 back_to_picker: false,
                 command_installed: |cmd| {
                     cockpit_core::harness::preflight::which_on_path(cmd).is_some()
@@ -2030,7 +2040,9 @@ impl SettingsPage for RootPage {
                         status: None,
                         delete_pending: false,
                     })),
-                    "Dependencies" => Some(dependencies_page::page(cx.agents_cwd())),
+                    "Dependencies" => {
+                        Some(dependencies_page::page(cx.agents_cwd(), cx.sandbox_enabled))
+                    }
                     "Agents" => Some(agents_page(AgentsPage::new(&cx.agents_cwd()))),
                     "Interface" => {
                         cx.reload_extended();

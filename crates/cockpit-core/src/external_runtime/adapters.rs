@@ -495,6 +495,10 @@ pub struct IntegrationHealthComposeInput {
     pub sandbox_enabled: Option<bool>,
     /// Catalog-owned features selected by resolved configuration.
     pub selected_features: BTreeSet<String>,
+    /// Invocation-frozen engine selection. `None` resolves the current mode
+    /// once at the caller boundary; bounded diagnostics set this before
+    /// spawning so roster construction and probing cannot diverge.
+    pub container_engine_mode: Option<super::safety_adapters::ContainerEngineMode>,
 }
 
 /// Compose catalog + configured integrations into the process-global health
@@ -560,6 +564,7 @@ pub(crate) fn compose_settings_doctor_health_for_invocation(
 /// invocation.  Deadline projection must retain this roster rather than
 /// consulting the process-global registry, whose configured rows may differ.
 pub(crate) fn invocation_descriptor_roster(
+    cwd: &Path,
     input: &IntegrationHealthComposeInput,
 ) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
     let registry = ExternalRuntimeRegistry::new();
@@ -575,7 +580,27 @@ pub(crate) fn invocation_descriptor_roster(
         .map(|id| id.as_str().to_owned())
         .collect();
     registry.retain_configured_ids(&keep);
-    Ok(registry.descriptors())
+    let mut descriptors = registry.descriptors();
+    descriptors.extend(super::safety_adapters::container_engine_descriptors(
+        resolved_container_engine_mode(cwd, input),
+    )?);
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(descriptors)
+}
+
+pub(crate) fn resolved_container_engine_mode(
+    cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+) -> super::safety_adapters::ContainerEngineMode {
+    if let Some(frozen) = input.container_engine_mode {
+        return frozen;
+    }
+    let extended = crate::config::extended::load_for_cwd(cwd);
+    if input.sandbox_enabled.unwrap_or(true) && extended.sandbox.default_mode.is_container() {
+        super::safety_adapters::current_container_engine_mode()
+    } else {
+        super::safety_adapters::ContainerEngineMode::Disabled
+    }
 }
 
 fn compose_settings_doctor_health_internal(
@@ -609,12 +634,12 @@ fn compose_settings_doctor_health_internal(
     }
     registry.retain_configured_ids(&keep);
 
-    let descriptors = registry.descriptors();
+    let base_descriptors = registry.descriptors();
     let mut features = BTreeSet::new();
     // Registration is inventory, not selection. Only configured entries in
     // this composition make their owning feature applicable.
     for id in &keep {
-        if let Some(desc) = descriptors.iter().find(|desc| desc.id.as_str() == id) {
+        if let Some(desc) = base_descriptors.iter().find(|desc| desc.id.as_str() == id) {
             features.insert(desc.owner.feature.clone());
         }
     }
@@ -634,14 +659,18 @@ fn compose_settings_doctor_health_internal(
     let platform = super::platform::detect_host_platform();
     // Container engine probes are applicable only when layered configuration
     // selects a container sandbox; the runtime mode then narrows the engine.
-    let engine_mode = if extended.sandbox.default_mode.is_container() {
-        super::safety_adapters::current_container_engine_mode()
-    } else {
+    let engine_mode = resolved_container_engine_mode(cwd, input);
+    if !matches!(
+        engine_mode,
         super::safety_adapters::ContainerEngineMode::Disabled
-    };
-    if extended.sandbox.default_mode.is_container() {
+    ) {
         features.insert("container-sandbox".to_string());
     }
+    let mut descriptors = base_descriptors.clone();
+    descriptors.extend(super::safety_adapters::container_engine_descriptors(
+        engine_mode,
+    )?);
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
     let generation = if let Some(generation) = generation_override {
@@ -657,7 +686,7 @@ fn compose_settings_doctor_health_internal(
     let cancel = invocation_cancel.unwrap_or(&local_cancel);
     let mut snapshot = super::probe::refresh_snapshot_with_observer(
         generation,
-        &descriptors,
+        &base_descriptors,
         executor,
         path_env,
         cwd,
@@ -678,6 +707,11 @@ fn compose_settings_doctor_health_internal(
     {
         use super::safety_adapters::{ContainerEngineMode, ID_DOCKER, ID_PODMAN};
         if !matches!(engine_mode, ContainerEngineMode::Disabled) {
+            let engine_ids: BTreeSet<String> = descriptors
+                .iter()
+                .filter(|descriptor| [ID_DOCKER, ID_PODMAN].contains(&descriptor.id.as_str()))
+                .map(|descriptor| descriptor.id.as_str().to_owned())
+                .collect();
             let engine_reg = super::registry::ExternalRuntimeRegistry::new();
             let base_snapshot = snapshot.clone();
             let engine_snap = super::safety_adapters::refresh_safety_snapshot_with_observer(
@@ -692,13 +726,19 @@ fn compose_settings_doctor_health_internal(
                 engine_mode,
                 |engine_progress| {
                     let mut progress = base_snapshot.clone();
-                    progress.entries.extend(engine_progress.entries.clone());
+                    progress.entries.extend(
+                        engine_progress
+                            .entries
+                            .iter()
+                            .filter(|(id, _)| engine_ids.contains(*id))
+                            .map(|(id, entry)| (id.clone(), entry.clone())),
+                    );
                     observer(&progress);
                 },
             );
-            for id in [ID_DOCKER, ID_PODMAN] {
+            for id in &engine_ids {
                 if let Some(entry) = engine_snap.get(id) {
-                    snapshot.entries.insert(id.to_string(), entry.clone());
+                    snapshot.entries.insert(id.clone(), entry.clone());
                 }
             }
         }
@@ -1563,6 +1603,7 @@ mod tests {
             stdio_mcp: vec![mcp],
             sandbox_enabled: None,
             selected_features: BTreeSet::new(),
+            container_engine_mode: None,
         };
         // Isolate global store between tests that share the process registry.
         global_health_store().clear();
@@ -1777,8 +1818,9 @@ mod tests {
             stdio_mcp: vec![ConfiguredCommandInput::new("private-mcp", "mcp-server")],
             sandbox_enabled: Some(false),
             selected_features: BTreeSet::new(),
+            container_engine_mode: None,
         };
-        let descriptors = invocation_descriptor_roster(&input).unwrap();
+        let descriptors = invocation_descriptor_roster(Path::new("/"), &input).unwrap();
         for id in [
             "harness.custom.private",
             "lsp.private-lsp",
@@ -1813,5 +1855,98 @@ mod tests {
             assert_eq!(projection.rows[0].target, descriptor.target);
             assert!(projection.rows[0].remedy.is_some());
         }
+    }
+
+    #[test]
+    fn invocation_roster_contains_selected_engines_before_engine_probe_stage() {
+        let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"sandbox":{"defaultMode":"container_readonly"}}"#,
+        )
+        .unwrap();
+        let previous = super::super::safety_adapters::current_container_engine_mode();
+        super::super::safety_adapters::set_container_engine_mode(
+            super::super::safety_adapters::ContainerEngineMode::Auto,
+        );
+        let mut input = IntegrationHealthComposeInput {
+            sandbox_enabled: Some(true),
+            ..Default::default()
+        };
+        let descriptors = invocation_descriptor_roster(tmp.path(), &input).unwrap();
+        input.container_engine_mode =
+            Some(super::super::safety_adapters::ContainerEngineMode::Auto);
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"sandbox":{"defaultMode":"off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_container_engine_mode(tmp.path(), &input),
+            super::super::safety_adapters::ContainerEngineMode::Auto,
+            "the worker must honor the invocation freeze after config changes"
+        );
+        super::super::safety_adapters::set_container_engine_mode(previous);
+        drop(guard);
+
+        let engines: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| {
+                [
+                    super::super::safety_adapters::ID_DOCKER,
+                    super::super::safety_adapters::ID_PODMAN,
+                ]
+                .contains(&descriptor.id.as_str())
+            })
+            .collect();
+        assert_eq!(engines.len(), 2);
+        // Simulate a deadline before the engine stage has emitted progress:
+        // the invocation roster must still materialize both selected rows.
+        let mut pre_engine = ExternalRuntimeSnapshot::empty(9, HostPlatform::GenericLinux);
+        for descriptor in engines {
+            pre_engine.entries.insert(
+                descriptor.id.as_str().to_owned(),
+                HealthEntry {
+                    id: descriptor.id.clone(),
+                    state: HealthState::Pending,
+                    importance: descriptor.importance,
+                    target: descriptor.target,
+                    remedy: Some(descriptor.remedy.clone()),
+                    platform: HostPlatform::GenericLinux,
+                },
+            );
+        }
+        let frozen = super::super::projection::freeze_pending_as_timed_out(&pre_engine);
+        let projection =
+            super::super::projection::project_dependencies(Some(&frozen), &descriptors);
+        for id in [
+            super::super::safety_adapters::ID_DOCKER,
+            super::super::safety_adapters::ID_PODMAN,
+        ] {
+            let row = projection.rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(
+                row.state,
+                super::super::projection::DependencyViewState::TimedOut
+            );
+        }
+
+        let disabled = invocation_descriptor_roster(
+            tmp.path(),
+            &IntegrationHealthComposeInput {
+                sandbox_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!disabled.iter().any(|descriptor| {
+            [
+                super::super::safety_adapters::ID_DOCKER,
+                super::super::safety_adapters::ID_PODMAN,
+            ]
+            .contains(&descriptor.id.as_str())
+        }));
     }
 }

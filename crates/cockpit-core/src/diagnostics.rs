@@ -1021,6 +1021,7 @@ fn doctor_integration_input(
             })
             .map(|(name, _)| format!("harness.{name}"))
             .collect(),
+        container_engine_mode: None,
     };
     // Builtin + configured LSP recipes (command argv only; install stays feature-local).
     let extended = crate::config::extended::load_for_cwd(cwd);
@@ -1114,8 +1115,12 @@ fn dependency_projection_with_deadline_internal(
     let worker_cancel = cancel.clone();
     let worker_cwd = cwd.clone();
     let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
-    let compose = doctor_integration_input(&worker_cwd, &harnesses, sandbox_enabled);
-    let descriptors = crate::external_runtime::invocation_descriptor_roster(&compose)
+    let mut compose = doctor_integration_input(&worker_cwd, &harnesses, sandbox_enabled);
+    compose.container_engine_mode = Some(crate::external_runtime::resolved_container_engine_mode(
+        &worker_cwd,
+        &compose,
+    ));
+    let descriptors = crate::external_runtime::invocation_descriptor_roster(&cwd, &compose)
         .map_err(anyhow::Error::new)?;
     let generation = if publish_complete {
         crate::external_runtime::global_health_store().begin_refresh()
@@ -1268,7 +1273,10 @@ fn dependency_descriptor_applicable(
             && extended.sandbox.default_mode.enabled()
             && !extended.sandbox.default_mode.is_container())
         || (descriptor.owner.feature == "container-sandbox"
-            && extended.sandbox.default_mode.is_container())
+            // Engine descriptors enter this invocation-private roster only
+            // when the sandbox/container selection was frozen as applicable.
+            // Do not re-read mutable config at the deadline.
+            && sandbox_enabled)
         || (descriptor.owner.feature == "computer-use"
             && crate::config::extended::resolve_computer_use_policy_for_cwd(cwd).is_some_and(
                 |mode| !matches!(mode, crate::config::extended::ComputerUseMode::Disabled),

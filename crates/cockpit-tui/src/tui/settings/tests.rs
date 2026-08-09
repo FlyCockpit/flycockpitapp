@@ -4570,3 +4570,14 @@ fn category_reset_pending_cancelled_by_navigation() {
         other => panic!("expected Category, got {other:?}"),
     }
 }
+
+#[test]
+fn runtime_sandbox_policy_reaches_settings_dependency_context() {
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = Dialog::Settings(fresh_dialog(&tmp));
+    dialog.set_runtime_sandbox_enabled(false);
+    let Dialog::Settings(settings) = dialog else {
+        unreachable!()
+    };
+    assert!(!settings.cx.sandbox_enabled);
+}

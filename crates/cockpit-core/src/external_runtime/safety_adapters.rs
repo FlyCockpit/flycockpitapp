@@ -271,6 +271,20 @@ fn podman_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::Schem
         .build()
 }
 
+/// Exact mode-aware engine roster for one diagnostics invocation. Disabled
+/// contributes no engine rows; explicit modes contribute only their selected
+/// engine; Auto contributes both alternatives.
+pub(crate) fn container_engine_descriptors(
+    mode: ContainerEngineMode,
+) -> Result<Vec<ExternalRuntimeDescriptor>, super::schema::SchemaError> {
+    match mode {
+        ContainerEngineMode::Disabled => Ok(Vec::new()),
+        ContainerEngineMode::Docker => Ok(vec![docker_descriptor()?]),
+        ContainerEngineMode::Podman => Ok(vec![podman_descriptor()?]),
+        ContainerEngineMode::Auto => Ok(vec![docker_descriptor()?, podman_descriptor()?]),
+    }
+}
+
 fn computer_leaf(
     id: &str,
     candidates: &[&str],

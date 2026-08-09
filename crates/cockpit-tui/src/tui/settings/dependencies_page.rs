@@ -17,7 +17,7 @@ use std::{
 type DependencyRefreshResult = Result<cockpit_core::external_runtime::DependencyProjection, String>;
 type PendingDependencyRefresh = Option<(u64, mpsc::Receiver<DependencyRefreshResult>)>;
 
-pub(super) fn page(cwd: PathBuf) -> PageBox {
+pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
     let bundle = cockpit_core::external_runtime::global_health_store().current_bundle();
     let mut state = match bundle {
         Some((snapshot, descriptors)) => {
@@ -34,11 +34,13 @@ pub(super) fn page(cwd: PathBuf) -> PageBox {
     let generation = state.begin_refresh();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish(
-            cwd,
-            std::time::Duration::from_secs(2),
-        )
-        .map_err(|error| error.to_string());
+        let result =
+            cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+                cwd,
+                std::time::Duration::from_secs(2),
+                sandbox_enabled,
+            )
+            .map_err(|error| error.to_string());
         let _ = tx.send(result);
     });
     Box::new(DependenciesPage {

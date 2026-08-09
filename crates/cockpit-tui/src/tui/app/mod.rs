@@ -3779,6 +3779,7 @@ impl App {
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
         let mut changed = false;
+        self.dialog.set_runtime_sandbox_enabled(!self.no_sandbox);
         self.event_loop_monotonic_now = terminal_input.now();
         changed |= self.expire_pending_paste_probes();
         changed |= self.service_delivery_unconfirmed_reconciliation();

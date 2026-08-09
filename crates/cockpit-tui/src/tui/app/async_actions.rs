@@ -1260,17 +1260,8 @@ impl App {
             fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         }
         if was_busy {
-            let terminal_notices = self
-                .history
-                .drain(optimistic_history_start..)
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        HistoryEntry::InferenceError { .. } | HistoryEntry::CommandError { .. }
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.history.extend(terminal_notices);
+            self.history
+                .retain_terminal_notices_since(optimistic_history_start);
             if outcome != DispatchOutcome::Sent {
                 self.queue.retain(|item| item.id != fence_id);
             }

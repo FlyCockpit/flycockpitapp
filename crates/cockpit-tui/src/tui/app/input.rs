@@ -134,6 +134,32 @@ impl App {
             );
             return;
         }
+        if let Some(probe) = self.pending_paste_probes.get(&correlation_id) {
+            let authoritative_shortcut_completion = probe.request.source
+                == crate::tui::structured_paste::PasteSource::NativePaste
+                && probe.original_data.is_empty()
+                && !data.is_empty()
+                && matches!(
+                    source,
+                    crate::tui::structured_paste::PasteSource::BracketedPty
+                        | crate::tui::structured_paste::PasteSource::RapidPty
+                );
+            if !authoritative_shortcut_completion {
+                if probe.request.source == source && probe.original_data == data {
+                    // The input source has already attached its acknowledgement
+                    // waiter to this correlation. Leave the original probe and
+                    // its fixed deadline running; its terminal result releases
+                    // every waiter together.
+                    return;
+                }
+                // Acknowledgements are correlation-wide, so acknowledging this
+                // conflicting delivery as Busy would also incorrectly release
+                // the original probe's waiter. Reject it locally and let the
+                // preserved probe publish the one authoritative result.
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            }
+        }
         if let Some(probe) = self.pending_paste_probes.get(&correlation_id)
             && let Some(fence_id) = probe.owner_fence
         {
@@ -172,6 +198,7 @@ impl App {
                     correlation_id,
                     super::PendingPasteProbe {
                         request: fence_request,
+                        original_data: data.clone(),
                         source_draft_generation,
                         owner_fence: Some(fence_id),
                         original_offset,
@@ -3309,6 +3336,7 @@ impl App {
                 request_id,
                 super::PendingPasteProbe {
                     request,
+                    original_data: data.clone(),
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),
@@ -3368,6 +3396,7 @@ impl App {
                 request_id,
                 super::PendingPasteProbe {
                     request,
+                    original_data: data.clone(),
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),
@@ -5370,6 +5399,7 @@ mod paste_routing_tests {
             stale_native_id,
             crate::tui::app::PendingPasteProbe {
                 request: stale_native,
+                original_data: String::new(),
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,
                 original_offset: 0,
@@ -5407,6 +5437,7 @@ mod paste_routing_tests {
             request_id,
             crate::tui::app::PendingPasteProbe {
                 request,
+                original_data: String::new(),
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,
                 original_offset: 0,
@@ -5422,6 +5453,87 @@ mod paste_routing_tests {
         app.event_loop_monotonic_now = std::time::Duration::from_millis(2_000);
         assert!(app.expire_pending_paste_probes());
         assert!(!app.pending_paste_probes.contains_key(&request_id));
+    }
+
+    #[test]
+    fn identified_paste_duplicate_preserves_owned_and_unowned_probe() {
+        for owner_fence in [None, Some(uuid::Uuid::new_v4())] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = input_ready_app(&tmp);
+            let request = app
+                .allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
+                .expect("fixture claims correlation");
+            let request_id = request.paste_correlation_id;
+            let generation = request.paste_generation;
+            let deadline = std::time::Duration::from_millis(1_234);
+            app.pending_paste_probes.insert(
+                request_id,
+                crate::tui::app::PendingPasteProbe {
+                    request,
+                    original_data: "same payload".to_string(),
+                    source_draft_generation: app.draft_generation,
+                    owner_fence,
+                    original_offset: 7,
+                    deadline,
+                    async_action_id: None,
+                },
+            );
+
+            app.event_loop_monotonic_now = std::time::Duration::from_millis(900);
+            app.handle_identified_paste(
+                "same payload".to_string(),
+                crate::tui::structured_paste::PasteSource::BracketedPty,
+                request_id,
+            );
+
+            let preserved = app
+                .pending_paste_probes
+                .get(&request_id)
+                .expect("duplicate attaches to the original probe");
+            assert_eq!(preserved.request.paste_generation, generation);
+            assert_eq!(preserved.owner_fence, owner_fence);
+            assert_eq!(preserved.deadline, deadline);
+            assert_eq!(preserved.original_data, "same payload");
+        }
+    }
+
+    #[test]
+    fn identified_paste_rejects_payload_replacement_without_resetting_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::RapidPty)
+            .expect("fixture claims correlation");
+        let request_id = request.paste_correlation_id;
+        let generation = request.paste_generation;
+        let deadline = std::time::Duration::from_millis(1_111);
+        app.pending_paste_probes.insert(
+            request_id,
+            crate::tui::app::PendingPasteProbe {
+                request,
+                original_data: "original".to_string(),
+                source_draft_generation: app.draft_generation,
+                owner_fence: None,
+                original_offset: 3,
+                deadline,
+                async_action_id: None,
+            },
+        );
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(1_000);
+        app.handle_identified_paste(
+            "replacement".to_string(),
+            crate::tui::structured_paste::PasteSource::RapidPty,
+            request_id,
+        );
+
+        let preserved = app
+            .pending_paste_probes
+            .get(&request_id)
+            .expect("differing payload cannot replace in-flight work");
+        assert_eq!(preserved.request.paste_generation, generation);
+        assert_eq!(preserved.deadline, deadline);
+        assert_eq!(preserved.original_data, "original");
     }
 
     #[test]

@@ -329,6 +329,11 @@ pub(crate) struct QueuedModelSubmission {
 
 pub(crate) struct PendingPasteProbe {
     pub request: crate::tui::structured_paste::PasteRequest,
+    /// Exact payload which created this probe. Repeated delivery of a
+    /// correlation may wait on the same work, but may never replace its
+    /// payload. The sole exception is an empty native shortcut probe being
+    /// completed by the terminal's authoritative paste event.
+    pub original_data: String,
     pub source_draft_generation: u64,
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,

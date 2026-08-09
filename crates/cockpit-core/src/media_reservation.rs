@@ -1876,8 +1876,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        let after_fault=db.read(|conn|Ok((
-            conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[&completed.reservation_id],|row|row.get::<_,String>(0))?,
+        let completed_id_after_fault = completed.reservation_id.clone();
+        let after_fault=db.read(move |conn|Ok((
+            conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[&completed_id_after_fault],|row|row.get::<_,String>(0))?,
             conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='session' AND dimension='retained_bytes_per_session'",[],|row|row_u64(row,0))?,
         ))).await.unwrap();
         assert_eq!(
@@ -1898,11 +1899,12 @@ mod tests {
                 .unwrap(),
             1
         );
+        let completed_id_after_release = completed.reservation_id.clone();
         let destroyed_state = db
-            .read(|conn| {
+            .read(move |conn| {
                 Ok(conn.query_row(
                     "SELECT state FROM media_reservations WHERE reservation_id=?1",
-                    [&completed.reservation_id],
+                    [&completed_id_after_release],
                     |row| row.get::<_, String>(0),
                 )?)
             })

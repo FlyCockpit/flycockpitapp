@@ -850,6 +850,54 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::CancelPausedWork { session_id } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::CancelPausedWork { session_id };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let changed = crate::db::Db::resolve_paused_session_work_conn(
+                            conn, session_id, crate::db::paused_work::PausedWorkStatus::Cancelled,
+                            chrono::Utc::now().timestamp(),
+                        )?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: (response, changed), safe_response: bytes.clone(),
+                            outbox_kind: "cancel_paused_work".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((response, changed)) => {
+                        if changed {
+                            if let Err(error) = ctx.registry.locks().suspend_session(session_id).await {
+                                tracing::warn!(%error, %session_id, "releasing cancelled paused work locks failed");
+                            }
+                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                                att.handle.broadcast_notice("paused work cancelled; the session is waiting for new input".to_string());
+                            }
+                        }
+                        Ok(response)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let changed = ctx
                 .db
                 .cancel_paused_session_work(session_id)

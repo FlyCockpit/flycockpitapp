@@ -1230,7 +1230,14 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
-    use super::super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
+    use super::super::pointer_actions::{
+        OAuthCopyKind, ProviderId, ProvidersAction, SettingsPointerAction,
+    };
+
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_oauth_effects(false);
 
     fn edit_fixture() -> (tempfile::TempDir, SettingsDialog) {
         let config = oauth_provider_config("grok-oauth", "oauth:test");
@@ -1248,7 +1255,10 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
     fn oauth_fixture(kind: u8) -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) =
             dialog_with_config(oauth_provider_config("grok-oauth", "oauth:test"));
-        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        let mut state = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+            OAuthProvider::Grok,
+            fake_oauth_effects(),
+        );
         match kind {
             0 => {}
             1 => {
@@ -1277,6 +1287,57 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
                 _ => None,
             })
             .collect()
+    }
+
+    fn copy_visible_authorization_url(dialog: &mut SettingsDialog, expected_copies: usize) {
+        let _ = render_provider_rows(dialog, 110, 60);
+        let actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+                            _,
+                            OAuthCopyKind::AuthorizationUrl,
+                        )),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions.len(),
+            1,
+            "each active Grok fixture must own exactly one authorization-copy source"
+        );
+        let action = actions.into_iter().next().unwrap();
+        let flow_id = match action {
+            SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(flow_id, _)) => flow_id,
+            _ => unreachable!(),
+        };
+        click_rendered_provider_action(
+            dialog,
+            &SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
+                flow_id,
+                OAuthCopyKind::AuthorizationUrl,
+            )),
+        );
+        assert_eq!(
+            oauth_effects_log(),
+            vec!["copy:https://example.test/oauth".to_string(); expected_copies]
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+                if state.flow_id == flow_id
+                    && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
+                        "copied OAuth URL (unverified — also reachable via the Open link above)"
+                    ))
+        ));
     }
 
     replay_special_provider_edit_actions("grok-oauth", edit_fixture);
@@ -1321,6 +1382,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         OAuthOption::ManualPaste,
     ));
     let (_tmp, mut fresh) = oauth_fixture(1);
+    copy_visible_authorization_url(&mut fresh, 1);
     click_rendered_provider_action(&mut fresh, &paste);
     assert!(matches!(
         fresh.test_page(),
@@ -1333,6 +1395,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         OAuthOption::Poll,
     ));
     let (_tmp, mut fresh) = oauth_fixture(1);
+    copy_visible_authorization_url(&mut fresh, 2);
     click_rendered_provider_action(&mut fresh, &poll);
     assert!(matches!(
         fresh.test_page(),
@@ -1349,6 +1412,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         OAuthOption::SkipContinue,
     ));
     let (_tmp, mut fresh) = oauth_fixture(1);
+    copy_visible_authorization_url(&mut fresh, 3);
     click_rendered_provider_action(&mut fresh, &skip);
     assert!(matches!(
         fresh.test_page(),

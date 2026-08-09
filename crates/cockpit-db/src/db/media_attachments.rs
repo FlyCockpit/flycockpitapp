@@ -33,6 +33,233 @@ pub enum RequestedLocalPathMediaKind {
     Video,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMediaActorRoleV1 {
+    Owner,
+    Writer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum LocalMediaMutationPayloadV1 {
+    Begin {
+        #[serde(with = "strict_uuid_v7")]
+        session_id: Uuid,
+        canonical_project_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        client_draft_id: Uuid,
+        media_kind: RequestedLocalPathMediaKind,
+        declared_total_bytes: u64,
+        reservation_digest: String,
+    },
+    Append {
+        #[serde(with = "strict_uuid_v7")]
+        session_id: Uuid,
+        canonical_project_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        client_draft_id: Uuid,
+        #[serde(with = "strict_uuid_v7")]
+        upload_id: Uuid,
+        upload_generation: u64,
+        chunk_index: u32,
+        chunk_length: u32,
+        chunk_sha256: String,
+    },
+    Finalize {
+        #[serde(with = "strict_uuid_v7")]
+        session_id: Uuid,
+        canonical_project_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        client_draft_id: Uuid,
+        #[serde(with = "strict_uuid_v7")]
+        upload_id: Uuid,
+        upload_generation: u64,
+        chunk_count: u32,
+        total_bytes: u64,
+        object_sha256: String,
+    },
+    Cancel {
+        #[serde(with = "strict_uuid_v7")]
+        session_id: Uuid,
+        canonical_project_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        client_draft_id: Uuid,
+        #[serde(with = "strict_uuid_v7")]
+        upload_id: Uuid,
+        upload_generation: u64,
+    },
+    Discard {
+        #[serde(with = "strict_uuid_v7")]
+        session_id: Uuid,
+        canonical_project_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_generation: u64,
+        reference_generation: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_upload: Option<MediaOriginUploadV1>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaOriginUploadV1 {
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
+    pub upload_id: Uuid,
+    pub upload_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalMediaMutationV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub actor_principal_digest: String,
+    pub actor_role: LocalMediaActorRoleV1,
+    pub payload: LocalMediaMutationPayloadV1,
+}
+
+pub type BeginMediaUploadV1 = LocalMediaMutationV1;
+pub type AppendMediaUploadChunkV1 = LocalMediaMutationV1;
+pub type FinalizeMediaUploadV1 = LocalMediaMutationV1;
+pub type CancelMediaUploadV1 = LocalMediaMutationV1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteMediaOperationOutcomeV1 {
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaUploadTerminalReasonV1 {
+    ClientCancelled,
+    DraftExpired,
+    ChunkOutOfOrder,
+    ChunkConflict,
+    DeclaredLengthMismatch,
+    DeclaredDigestMismatch,
+    ReservationExhausted,
+    StorageFailure,
+    StorageSecurityViolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "actor",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MediaUploadLastTransitionV1 {
+    Remote {
+        action: MediaUploadActionV1,
+        #[serde(with = "strict_uuid_v7")]
+        operation_id: Uuid,
+        outcome: RemoteMediaOperationOutcomeV1,
+    },
+    Local {
+        action: MediaUploadActionV1,
+        #[serde(with = "strict_uuid_v7")]
+        local_operation_id: Uuid,
+        outcome: RemoteMediaOperationOutcomeV1,
+    },
+    System {
+        action: MediaUploadSystemActionV1,
+        outcome: RemoteMediaOperationOutcomeV1,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaUploadActionV1 {
+    Begin,
+    Append,
+    Finalize,
+    Cancel,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaUploadSystemActionV1 {
+    Expire,
+    StartupReconcile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MediaUploadStateDetailV1 {
+    Open {
+        next_chunk_index: u32,
+    },
+    Finalizing {
+        next_chunk_index: u32,
+    },
+    Materialized {
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        attachment_version: u64,
+    },
+    Cancelled {
+        reason: MediaUploadTerminalReasonV1,
+    },
+    Expired {
+        reason: MediaUploadTerminalReasonV1,
+    },
+    Failed {
+        reason: MediaUploadTerminalReasonV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaUploadStatusV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub upload_id: Uuid,
+    pub upload_generation: u64,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    pub media_kind: RequestedLocalPathMediaKind,
+    pub expires_at_unix_ms: i64,
+    pub acknowledged_chunks: u32,
+    pub acknowledged_bytes: u64,
+    pub last_transition: MediaUploadLastTransitionV1,
+    #[serde(flatten)]
+    pub detail: MediaUploadStateDetailV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetMediaUploadStatusV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
+    pub upload_id: Uuid,
+    pub upload_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegisterLocalPathMediaV1 {
@@ -534,6 +761,138 @@ pub enum SecurityRecoverySnapshotResult {
 }
 
 impl super::Db {
+    pub fn validate_local_media_mutation_v1(request: &LocalMediaMutationV1) -> Result<()> {
+        ensure!(
+            request.schema_version == 1 && request.kind == "localMediaMutation",
+            "invalid local media mutation schema or kind"
+        );
+        ensure!(
+            is_strict_uuid_v7(request.local_operation_id),
+            "local operation id must be UUIDv7"
+        );
+        validate_digest(&request.actor_principal_digest, "actor principal digest")?;
+        let (session, project) = match &request.payload {
+            LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest,
+                client_draft_id,
+                declared_total_bytes,
+                reservation_digest,
+                ..
+            } => {
+                ensure!(
+                    is_strict_uuid_v7(*client_draft_id) && *declared_total_bytes > 0,
+                    "invalid begin bounds"
+                );
+                validate_digest(reservation_digest, "reservation digest")?;
+                (*session_id, canonical_project_digest)
+            }
+            LocalMediaMutationPayloadV1::Append {
+                session_id,
+                canonical_project_digest,
+                client_draft_id,
+                upload_id,
+                upload_generation,
+                chunk_length,
+                chunk_sha256,
+                ..
+            } => {
+                ensure!(
+                    is_strict_uuid_v7(*client_draft_id)
+                        && is_strict_uuid_v7(*upload_id)
+                        && *upload_generation > 0
+                        && *chunk_length > 0
+                        && *chunk_length <= 262_144,
+                    "invalid append bounds"
+                );
+                validate_digest(chunk_sha256, "chunk checksum")?;
+                (*session_id, canonical_project_digest)
+            }
+            LocalMediaMutationPayloadV1::Finalize {
+                session_id,
+                canonical_project_digest,
+                client_draft_id,
+                upload_id,
+                upload_generation,
+                chunk_count,
+                total_bytes,
+                object_sha256,
+            } => {
+                ensure!(
+                    is_strict_uuid_v7(*client_draft_id)
+                        && is_strict_uuid_v7(*upload_id)
+                        && *upload_generation > 0
+                        && *chunk_count > 0
+                        && *chunk_count <= 65_536
+                        && *total_bytes > 0,
+                    "invalid finalize bounds"
+                );
+                validate_digest(object_sha256, "object checksum")?;
+                (*session_id, canonical_project_digest)
+            }
+            LocalMediaMutationPayloadV1::Cancel {
+                session_id,
+                canonical_project_digest,
+                client_draft_id,
+                upload_id,
+                upload_generation,
+            } => {
+                ensure!(
+                    is_strict_uuid_v7(*client_draft_id)
+                        && is_strict_uuid_v7(*upload_id)
+                        && *upload_generation > 0,
+                    "invalid cancel binding"
+                );
+                (*session_id, canonical_project_digest)
+            }
+            LocalMediaMutationPayloadV1::Discard {
+                session_id,
+                canonical_project_digest,
+                attachment_id,
+                attachment_version,
+                availability_generation,
+                reference_generation,
+                origin_upload,
+            } => {
+                ensure!(
+                    is_strict_uuid_v7(*attachment_id)
+                        && *attachment_version > 0
+                        && *availability_generation > 0
+                        && *reference_generation > 0,
+                    "invalid discard binding"
+                );
+                if let Some(origin) = origin_upload {
+                    ensure!(
+                        is_strict_uuid_v7(origin.client_draft_id)
+                            && is_strict_uuid_v7(origin.upload_id)
+                            && origin.upload_generation > 0,
+                        "invalid upload origin"
+                    )
+                };
+                (*session_id, canonical_project_digest)
+            }
+        };
+        ensure!(is_strict_uuid_v7(session), "session id must be UUIDv7");
+        validate_digest(project, "project digest")?;
+        Ok(())
+    }
+
+    pub fn local_media_mutation_digests(
+        request: &LocalMediaMutationV1,
+    ) -> Result<(String, String)> {
+        Self::validate_local_media_mutation_v1(request)?;
+        let request_bytes = serde_json::to_vec(request)?;
+        let mut semantic = serde_json::to_value(request)?;
+        semantic
+            .as_object_mut()
+            .context("local mutation object")?
+            .remove("localOperationId");
+        Ok((
+            hex_lower(&Sha256::digest(request_bytes)),
+            hex_lower(&Sha256::digest(serde_json::to_vec(&semantic)?)),
+        ))
+    }
+
     pub fn media_attachment_status_for_owner_conn(
         conn: &Connection,
         request: &GetMediaAttachmentStatusV1,
@@ -1441,6 +1800,49 @@ mod tests {
         assert!(serde_json::from_value::<MediaAttachmentStatusV1>(unknown).is_err());
         let request = serde_json::json!({"schemaVersion":1,"kind":"getMediaAttachmentStatus","sessionId":Uuid::now_v7().to_string(),"canonicalProjectDigest":"11".repeat(32),"attachmentId":attachment_id.to_string(),"extra":true});
         assert!(serde_json::from_value::<GetMediaAttachmentStatusV1>(request).is_err());
+    }
+
+    #[test]
+    fn local_media_mutation_v1_digests_and_chunk_bounds_are_exact() {
+        let make = |operation_id| LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: operation_id,
+            actor_principal_digest: "11".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Writer,
+            payload: LocalMediaMutationPayloadV1::Append {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+                chunk_index: 0,
+                chunk_length: 262_144,
+                chunk_sha256: "33".repeat(32),
+            },
+        };
+        let first = make(Uuid::now_v7());
+        let mut alias = first.clone();
+        alias.local_operation_id = Uuid::now_v7();
+        let first_digests = super::super::Db::local_media_mutation_digests(&first).unwrap();
+        let alias_digests = super::super::Db::local_media_mutation_digests(&alias).unwrap();
+        assert_ne!(first_digests.0, alias_digests.0);
+        assert_eq!(first_digests.1, alias_digests.1);
+        let encoded = serde_json::to_value(&first).unwrap();
+        assert_eq!(encoded["payload"]["chunkLength"], 262_144);
+        assert!(encoded.get("path").is_none());
+        let mut over = first.clone();
+        let LocalMediaMutationPayloadV1::Append { chunk_length, .. } = &mut over.payload else {
+            unreachable!()
+        };
+        *chunk_length = 262_145;
+        assert!(super::super::Db::validate_local_media_mutation_v1(&over).is_err());
+        let mut zero = first;
+        let LocalMediaMutationPayloadV1::Append { chunk_length, .. } = &mut zero.payload else {
+            unreachable!()
+        };
+        *chunk_length = 0;
+        assert!(super::super::Db::validate_local_media_mutation_v1(&zero).is_err());
     }
 
     #[test]

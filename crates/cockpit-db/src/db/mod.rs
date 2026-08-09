@@ -1328,7 +1328,7 @@ mod tests {
         db.read(foreign_key_check).await.unwrap();
         // Re-opening against the same immutable ledger validates both stored
         // checksums instead of silently accepting a rewritten v1 migration.
-        db.read(|conn| migrate_with(conn, MIGRATIONS))
+        db.write(|conn| migrate_with(conn, MIGRATIONS))
             .await
             .unwrap();
         let ledger_rows: i64 = db

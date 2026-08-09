@@ -637,6 +637,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_read_only_tool_sources_render_disabled();
     pointer_harness_list_actions_dispatch_from_fresh_sources();
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
@@ -653,6 +654,67 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn pointer_read_only_tool_sources_render_disabled() {
+    use pointer_actions::{SettingsPointerAction, ToolsAction};
+
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    enter_tools_from_root(&mut dialog);
+    set_tools_cursor_to_label(&mut dialog, "read");
+    let _ = render_settings_rows(&dialog, 100, 18);
+    assert!(
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                !target.enabled
+                    && matches!(
+                        &target.action,
+                        shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                            ToolsAction::ReadOnlyBuiltin(id)
+                        )) if id.0 == "read"
+                    )
+            })
+    );
+
+    let raw = r#"{"servers":{"docs":{"transport":"streamable","endpoint":"https://example.test/mcp","enabled":true}}}"#;
+    std::fs::write(tmp.path().join("mcp.json"), raw).unwrap();
+    let cfg = cockpit_core::mcp::config::McpConfig::parse(raw).unwrap();
+    let server = cfg.servers.get("docs").unwrap();
+    let cache_dir = tmp.path().join("mcp-cache");
+    cockpit_core::mcp::cache::save_in(
+        &cache_dir,
+        &cockpit_core::mcp::cache::cache_key("docs", server),
+        &[cockpit_core::mcp::protocol::ToolDescriptor {
+            name: "lookup".into(),
+            description: "Find docs".into(),
+            input_schema: serde_json::json!({}),
+        }],
+    )
+    .unwrap();
+    dialog.mcp_cache_dir = Some(cache_dir);
+    set_tools_cursor_to_label(&mut dialog, "docs/lookup");
+    let _ = render_settings_rows(&dialog, 100, 18);
+    assert!(
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .any(|target| {
+                !target.enabled
+                    && matches!(
+                        &target.action,
+                        shell::SettingsPointerAction::Page(SettingsPointerAction::Tools(
+                            ToolsAction::ReadOnlyMcpTool(server, tool)
+                        )) if server.0 == "docs" && tool.0 == "lookup"
+                    )
+            })
+    );
 }
 
 fn redact_patterns_pointer_fixture(tmp: &TempDir) -> SettingsDialog {

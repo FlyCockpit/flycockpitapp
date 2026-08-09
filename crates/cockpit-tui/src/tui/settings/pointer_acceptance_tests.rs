@@ -482,7 +482,8 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
                         true,
                     _ => false,
                 }),
-                "disabled/read-only {expected} source payload was not rendered"
+                "disabled/read-only {expected} source payload was not rendered; disabled actions: {:?}",
+                coverage.2
             );
         }
     });

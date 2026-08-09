@@ -913,13 +913,16 @@ impl App {
         {
             return;
         }
+        if !self.submission_fences.contains_key(&fence_id) {
+            return;
+        }
         let Some(mut deferred) = self.deferred_fence_dispatches.remove(&fence_id) else {
             return;
         };
         let Some(fence) = self.submission_fences.get_mut(&fence_id) else {
             return;
         };
-        let mut insertions = Vec::new();
+        let mut resolved_images = Vec::new();
         for slot in &fence.slots {
             if let crate::tui::structured_paste::PasteSlotState::Ready {
                 original_offset,
@@ -928,20 +931,50 @@ impl App {
             } = slot
             {
                 if let Some(png) = png {
-                    deferred.submission.images.push(png.clone());
-                    insertions.push(*original_offset);
+                    resolved_images.push((*original_offset, png.clone()));
                 }
             }
         }
-        insertions.sort_unstable_by(|left, right| right.cmp(left));
-        for offset in insertions {
-            let display_offset = floor_char_boundary(&deferred.display, offset);
-            deferred.display.insert_str(display_offset, "[image]");
-            let wire_offset = floor_char_boundary(&deferred.submission.text, offset);
-            deferred.submission.text.insert_str(
-                wire_offset,
-                cockpit_core::daemon::proto::IMAGE_PART_SENTINEL,
-            );
+        resolved_images.sort_unstable_by_key(|(offset, _)| *offset);
+        let positional_wire = deferred.submission.text == fence.captured_composer;
+        let positional_display = deferred.display == fence.captured_composer;
+        if positional_wire {
+            let original_wire = deferred.submission.text.clone();
+            for (inserted, (offset, png)) in resolved_images.iter().enumerate() {
+                let offset = floor_char_boundary(&original_wire, *offset);
+                let existing_before = original_wire[..offset]
+                    .matches(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL)
+                    .count();
+                deferred
+                    .submission
+                    .images
+                    .insert(existing_before + inserted, png.clone());
+            }
+            for (offset, _) in resolved_images.iter().rev() {
+                let offset = floor_char_boundary(&deferred.submission.text, *offset);
+                deferred
+                    .submission
+                    .text
+                    .insert_str(offset, cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
+            }
+        } else {
+            for (_, png) in &resolved_images {
+                deferred
+                    .submission
+                    .text
+                    .push_str(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
+                deferred.submission.images.push(png.clone());
+            }
+        }
+        if positional_display {
+            for (offset, _) in resolved_images.iter().rev() {
+                let offset = floor_char_boundary(&deferred.display, *offset);
+                deferred.display.insert_str(offset, "[image]");
+            }
+        } else {
+            for _ in &resolved_images {
+                deferred.display.push_str("[image]");
+            }
         }
         if deferred.submission.text.trim().is_empty() && deferred.submission.images.is_empty() {
             fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::NoPayload;
@@ -964,13 +997,7 @@ impl App {
         let sequence = fence.fence_sequence;
         fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         let was_busy = self.busy;
-        if was_busy {
-            self.queue.push(super::input::optimistic_queue_item_with_id(
-                fence_id,
-                deferred.submission.text.clone(),
-                Some(deferred.display.clone()),
-            ));
-        } else {
+        if !was_busy {
             self.begin_working_span();
             self.prompt_history.push(deferred.display.clone());
             self.prompt_history_cursor = 0;

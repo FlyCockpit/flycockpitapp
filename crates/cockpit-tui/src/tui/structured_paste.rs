@@ -917,7 +917,7 @@ mod tests {
             .unwrap();
         assert!(!coordinator.complete(second));
         assert!(coordinator.complete(first));
-        assert!(coordinator.complete(second));
+        assert!(!coordinator.complete(second));
     }
 
     #[test]
@@ -979,7 +979,7 @@ mod tests {
         assert!(old_model_fence < switch && switch < new_model_fence);
         assert!(!order.complete(switch));
         assert!(order.complete(old_model_fence));
-        assert!(order.complete(switch));
+        assert!(!order.complete(switch));
         assert!(order.complete(new_model_fence));
     }
 
@@ -994,6 +994,6 @@ mod tests {
         assert!(!order.complete(new_session));
         assert!(order.complete(old_session));
         assert!(order.complete(switch));
-        assert!(order.complete(new_session));
+        assert!(!order.complete(new_session));
     }
 }

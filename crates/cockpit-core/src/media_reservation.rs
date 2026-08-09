@@ -378,6 +378,25 @@ impl MediaReservationLedger {
             let next_version = version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
             let next = if current == ReservationState::ReservedQueued {
                 release_queued(conn, &id, &owner, next_version, wall_ms)?;
+                // A typed pre-execution canceller is responsible for dropping
+                // any admission-time buffers before calling. Consequently
+                // before-allocation/while-bytes-exist reservations are known
+                // to have zero surviving material and can be released without
+                // inventing a persistent deletion attestation.
+                for dimension in [
+                    MediaDimension::EncodedBytesPerObject,
+                    MediaDimension::RetainedBytesPerSession,
+                    MediaDimension::DecodedEdgePixels,
+                    MediaDimension::DecodedImagePixels,
+                ] {
+                    release_dimension_balance(
+                        conn,
+                        &id,
+                        next_version,
+                        &dimension_name(dimension),
+                        wall_ms,
+                    )?;
+                }
                 ReservationState::Released
             } else {
                 if let Some(operation_id) = external_operation_id {
@@ -467,7 +486,7 @@ impl MediaReservationLedger {
             )
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
-        let dispatch = journal
+        let mut dispatch = journal
             .begin_dispatch(record.operation_id, projection, journal_wall_ms)
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
@@ -492,7 +511,11 @@ impl MediaReservationLedger {
                 // leave the journal's own admission latch responsible for
                 // blocking subsequent external work.
                 journal
-                    .request_cancellation(record.operation_id, journal_wall_ms)
+                    .record_outcome(
+                        &mut dispatch,
+                        cockpit_db::external_journal::ExternalJournalState::Rejected,
+                        journal_wall_ms,
+                    )
                     .await
                     .map_err(|cancel_error| {
                         LedgerError::Storage(anyhow!(

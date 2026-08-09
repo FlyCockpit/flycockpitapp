@@ -181,7 +181,10 @@ pub(super) fn begin_attachment_upload_with_limits(
             byte_len,
             sha256,
             purpose,
-            bytes: Vec::with_capacity(byte_len),
+            // Capacity allocation is intentionally deferred until the first
+            // chunk. Production has durably admitted the reservation before
+            // that request can arrive.
+            bytes: Vec::new(),
             created_at: Instant::now(),
         },
     );

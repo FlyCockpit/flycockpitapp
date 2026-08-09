@@ -1407,6 +1407,95 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
 }
 
 #[tokio::test]
+async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "queue-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+            device_generation: 7,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-aaaaaaaaaaaa").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let queue_item_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut pending = Box::pin(handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            operation,
+            Request::RemoveQueuedUserMessage { queue_item_id },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    ));
+    tokio::select! {
+        result = &mut pending => panic!("serialized queue request returned before worker receipt: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    let work = work_rx.recv().await.expect("queue work delivered");
+    let SessionWork::RemoveQueuedUserMessage {
+        queue_item_id: delivered,
+        remote_operation: Some(stamp),
+        respond_to,
+    } = work
+    else {
+        panic!("expected stamped remote queue removal")
+    };
+    assert_eq!(delivered, queue_item_id);
+    assert_eq!(
+        stamp.logical_attachment_id,
+        logical_attachment_id.to_string()
+    );
+    assert_eq!(stamp.operation_id, operation_id.to_string());
+    assert_eq!(stamp.authenticated_device_generation, 7);
+    assert_ne!(stamp.request_hash, [0; 32]);
+    respond_to
+        .send(Ok(proto::RemoveQueuedUserMessageResult {
+            applied: true,
+            reason: proto::RemoveQueuedUserMessageReason::Removed,
+            removed_item: None,
+            queue: Vec::new(),
+        }))
+        .unwrap();
+    pending.await.unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "remote queue response").await,
+        Body::Response { id, response }
+            if id == request_id && matches!(*response, Response::RemoveQueuedUserMessageResult { applied: true, .. })
+    ));
+}
+
+#[tokio::test]
 async fn remote_session_note_applies_replays_and_conflicts_before_second_event() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();

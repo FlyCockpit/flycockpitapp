@@ -13,6 +13,11 @@ fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
         removed_count: 1,
     };
     receipt.validate().unwrap();
+    let applied_wire =
+        serde_json::to_vec(&remote_queue_mutation_response(receipt.clone())).unwrap();
+    let replay_wire = serde_json::to_vec(&remote_queue_mutation_response(receipt.clone())).unwrap();
+    assert_eq!(applied_wire, replay_wire);
+    assert!(!String::from_utf8(applied_wire).unwrap().contains("text"));
     let encoded = serde_json::to_vec(&receipt).unwrap();
     assert_eq!(
         serde_json::from_slice::<RemoteQueueMutationReceiptV1>(&encoded).unwrap(),
@@ -524,12 +529,23 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             "the live driver leaves the later submissions in FIFO order"
         );
 
-        async fn remove_exact(handle: &SessionWorkerHandle, id: Uuid) -> proto::ErrorPayload {
+        let operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000031".into(),
+            operation_id: "01890f3e-4c00-7000-8000-000000000094".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000032".into(),
+            authenticated_device_generation: 1,
+            request_hash: [4; 32],
+        };
+        async fn remove_exact(
+            handle: &SessionWorkerHandle,
+            id: Uuid,
+            operation: Option<RemoteQueueOperation>,
+        ) -> Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload> {
             let (respond_to, response) = tokio::sync::oneshot::channel();
             handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id: id,
-                    remote_operation: None,
+                    remote_operation: operation,
                     respond_to,
                 })
                 .await
@@ -538,13 +554,18 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
                 .await
                 .expect("persistent receipt failure returns promptly")
                 .expect("removal response channel remains open")
-                .expect_err("the active trigger rejects the terminal receipt")
         }
 
         for _ in 0..2 {
-            let error = remove_exact(&handle, second_id).await;
+            let error = remove_exact(&handle, second_id, Some(operation.clone()))
+                .await
+                .expect_err("the active trigger rejects the atomic queue commit");
             assert_eq!(error.code, proto::ErrorCode::Internal);
-            assert!(error.message.contains("remains held"), "{}", error.message);
+            assert!(
+                error.message.contains("could not be committed"),
+                "{}",
+                error.message
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let user_messages = db
@@ -563,6 +584,42 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        db.write(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_terminal_receipt_live_worker;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let applied = remove_exact(&handle, second_id, Some(operation.clone()))
+            .await
+            .unwrap();
+        assert!(applied.applied);
+        assert!(applied.queue.is_empty());
+        let (_fourth_id, _) = enqueue(
+            &handle,
+            crate::engine::message::UserSubmission::text("later mutable queue state"),
+        )
+        .await;
+        let replay = remove_exact(&handle, second_id, Some(operation.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&replay).unwrap(),
+            serde_json::to_vec(&applied).unwrap()
+        );
+
+        let mut changed = operation;
+        changed.request_hash = [3; 32];
+        let conflict = remove_exact(&handle, third_id, Some(changed))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, proto::ErrorCode::Conflict);
+        let released = remove_exact(&handle, third_id, None).await.unwrap();
+        assert!(
+            released.applied,
+            "conflict must release the staged queue claim"
         );
 
         handle.send_work(SessionWork::Cancel).await.unwrap();

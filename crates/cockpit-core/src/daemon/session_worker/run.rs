@@ -366,6 +366,19 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
     }
 }
 
+fn remote_queue_mutation_response(
+    receipt: RemoteQueueMutationReceiptV1,
+) -> proto::RemoveQueuedUserMessageResult {
+    proto::RemoveQueuedUserMessageResult {
+        applied: receipt.applied,
+        reason: receipt.reason,
+        removed_item: None,
+        // QueueUpdated owns the mutable full queue view. Keeping it out of
+        // this response makes Applied and Replay byte-identical and secret-free.
+        queue: Vec::new(),
+    }
+}
+
 fn send_terminal_receipts_event(
     event_tx: &EventSender,
     redaction: &SharedRedactionTable,
@@ -1693,7 +1706,7 @@ pub(super) async fn run_worker(
                         let receipt = match outcome {
                             Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt)) => {
                                 if let Some(staged) = staged {
-                                    snapshot = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
+                                    let _ = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
                                     send_terminal_receipts_event(&event_tx, &redaction, session_id, &receipts, disposition);
                                 }
                                 receipt
@@ -1705,7 +1718,7 @@ pub(super) async fn run_worker(
                                         continue;
                                     }
                                     if let Some(staged) = staged {
-                                        snapshot = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
+                                        let _ = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
                                     }
                                     receipt
                                 }
@@ -1720,13 +1733,7 @@ pub(super) async fn run_worker(
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
                             }
                         };
-                        snapshot = driver_input_queue.snapshot().await;
-                        let _ = respond_to.send(Ok(proto::RemoveQueuedUserMessageResult {
-                            applied: receipt.applied,
-                            reason: receipt.reason,
-                            removed_item: None,
-                            queue: snapshot.into_iter().map(queue_item_to_proto).collect(),
-                        }));
+                        let _ = respond_to.send(Ok(remote_queue_mutation_response(receipt)));
                         continue;
                     }
                     if let Some(staged) = staged {

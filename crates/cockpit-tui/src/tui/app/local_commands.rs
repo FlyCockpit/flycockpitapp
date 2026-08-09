@@ -778,9 +778,24 @@ impl App {
                         ),
                     ),
                     cockpit_core::daemon::proto::Response::GoalUpdated { goal } => {
+                        let state = match goal.disposition {
+                            cockpit_core::daemon::proto::GoalDisposition::Running => "active",
+                            cockpit_core::daemon::proto::GoalDisposition::UserPaused => "paused",
+                            cockpit_core::daemon::proto::GoalDisposition::InfraPaused => {
+                                "paused by infrastructure"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::Blocked => "blocked",
+                            cockpit_core::daemon::proto::GoalDisposition::NoProgressPaused => {
+                                "paused for no progress"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::BudgetLimited => {
+                                "budget limited"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::Complete => "complete",
+                            cockpit_core::daemon::proto::GoalDisposition::Cleared => "cleared",
+                        };
                         Ok(AsyncActionPayload::Text(format!(
-                            "/goal: goal is now {}.",
-                            goal.disposition.as_str()
+                            "/goal: goal is now {state}."
                         )))
                     }
                     cockpit_core::daemon::proto::Response::GoalCleared { cleared: true } => Ok(

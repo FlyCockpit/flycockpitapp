@@ -517,6 +517,7 @@ impl MediaReservationLedger {
                 "UPDATE media_reservations SET state=?1,cancellation_requested=1,version=?2 WHERE reservation_id=?3 AND version=?4",
                 params![next.as_str(), sqlite_i64(next_version)?, id, sqlite_i64(expected_version)?],
             )?;
+            conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1", [&id])?;
             Ok(ReservationReceipt { reservation_id: id, state: next, version: next_version, queue_sequence: sequence, deadline_monotonic_ms: deadline })
         }).await.map_err(classify_storage_error)
     }
@@ -692,6 +693,68 @@ impl MediaReservationLedger {
         }).await.map_err(classify_storage_error)
     }
 
+    /// Durably exposes a fully collected local operation to the fair
+    /// scheduler. This does not acquire capacity or change reservation state.
+    pub async fn mark_execution_ready(&self, id: &str, wall_ms: u64) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        self.db.transaction(move |conn| {
+            let state: String = conn.query_row(
+                "SELECT state FROM media_reservations WHERE reservation_id=?1",
+                [&id], |row| row.get(0))?;
+            if ReservationState::parse(&state)? != ReservationState::ReservedQueued {
+                return Err(anyhow!("invalid_transition"));
+            }
+            conn.execute(
+                "INSERT INTO media_execution_ready(reservation_id,ready_wall_ms) VALUES(?1,?2) ON CONFLICT(reservation_id) DO NOTHING",
+                params![id, sqlite_i64(wall_ms)?])?;
+            Ok(())
+        }).await.map_err(classify_storage_error)
+    }
+
+    /// Claims `id` only when it is the session-fair head among operations
+    /// whose input is ready. `None` means another ready session owns the next
+    /// turn; no cursor, counters, or reservation state are changed.
+    pub async fn claim_ready_fair(
+        &self,
+        id: &str,
+        execution_plan: MediaReservationPlan,
+        wall_ms: u64,
+    ) -> Result<Option<ReservationReceipt>, LedgerError> {
+        if execution_plan.scope_policy.charge != MediaCharge::AcquireAtPromotion {
+            return Err(LedgerError::InvalidTransition);
+        }
+        let requested_id = id.to_owned();
+        let now = self.clock.now_ms();
+        self.db.transaction(move |conn| {
+            let (requested_state, requested_deadline): (String, u64) = conn.query_row(
+                "SELECT state,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1",
+                [&requested_id], |row| Ok((row.get(0)?, row_u64(row, 1)?)))?;
+            if ReservationState::parse(&requested_state)? != ReservationState::ReservedQueued {
+                return Err(anyhow!("invalid_transition"));
+            }
+            if now >= requested_deadline { return Err(anyhow!("deadline_expired")); }
+            let last: Option<String> = conn.query_row(
+                "SELECT last_session_id FROM media_scheduler_cursor WHERE singleton=1", [], |row| row.get(0))?;
+            let candidate: Option<(String,String,u64,u64,String)> = conn.query_row(
+                "WITH heads AS (SELECT r.owner_session_key,MIN(r.queue_sequence) sequence FROM media_reservations r JOIN media_execution_ready e ON e.reservation_id=r.reservation_id WHERE r.state='reserved_queued' AND r.deadline_monotonic_ms>?2 GROUP BY r.owner_session_key) SELECT h.owner_session_key,r.reservation_id,r.version,r.deadline_monotonic_ms,r.project_id FROM heads h JOIN media_reservations r ON r.owner_session_key=h.owner_session_key AND r.queue_sequence=h.sequence ORDER BY CASE WHEN h.owner_session_key>?1 THEN 0 ELSE 1 END,h.owner_session_key LIMIT 1",
+                params![last.as_deref().unwrap_or(""), sqlite_i64(now)?],
+                |row| Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?,row_u64(row,3)?,row.get(4)?)),
+            ).optional()?;
+            let Some((session,id,version,deadline,project)) = candidate else { return Ok(None); };
+            if id != requested_id { return Ok(None); }
+            ensure_unblocked(conn, &project, &session)?;
+            validate_mutation_policy(conn, &id, &execution_plan)?;
+            let owner = MediaOwner { project_id: project, session_id: session.clone() };
+            let next_version = version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
+            acquire_plan(conn, &id, &owner, &execution_plan, next_version, wall_ms)?;
+            release_queued(conn, &id, &owner, next_version, wall_ms)?;
+            conn.execute("UPDATE media_reservations SET state='executing_local',version=?1 WHERE reservation_id=?2 AND version=?3 AND state='reserved_queued'", params![sqlite_i64(next_version)?,id,sqlite_i64(version)?])?;
+            conn.execute("DELETE FROM media_execution_ready WHERE reservation_id=?1", [&id])?;
+            conn.execute("UPDATE media_scheduler_cursor SET last_session_id=?1 WHERE singleton=1", [&session])?;
+            Ok(Some(ReservationReceipt { reservation_id:id,state:ReservationState::ExecutingLocal,version:next_version,queue_sequence:conn.query_row("SELECT queue_sequence FROM media_reservations WHERE reservation_id=?1",[&requested_id],|row|row_u64(row,0))?,deadline_monotonic_ms:deadline }))
+        }).await.map_err(classify_storage_error)
+    }
+
     pub async fn expire_before_handoff(
         &self,
         id: &str,
@@ -769,7 +832,7 @@ impl MediaReservationLedger {
         cleanup: &dyn LocalExpiryCleanup,
     ) -> Result<u64, LedgerError> {
         let rows = self.db.read(|conn| {
-            let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE state IN ('reserved_queued','executing_local','settling') OR (state='cancellation_requested' AND external_operation_id IS NULL)")?;
+            let mut stmt=conn.prepare("SELECT reservation_id,version,state FROM media_reservations WHERE external_operation_id IS NULL AND state IN ('reserved_queued','executing_local','settling','cancellation_requested')")?;
             let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,row_u64(r,1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }).await.map_err(LedgerError::Storage)?;
@@ -796,7 +859,8 @@ impl MediaReservationLedger {
                 }
                 release_restart_dimensions(conn,id,version+1,wall_ms)?;
                 let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-                conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2",params![sqlite_i64(next_version)?,id])?;
+                let next=if has_releasable_balance(conn,id)?{ReservationState::Settling}else{ReservationState::Released};
+                conn.execute("UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3",params![next.as_str(),sqlite_i64(next_version)?,id])?;
                 conn.execute("INSERT INTO media_reservation_deltas(reservation_id,reservation_version,dimension,scope_kind,scope_id,estimated,delta,charged_after,fact_kind,created_wall_ms) VALUES(?1,?2,'restart_expiry','operation',?1,0,0,0,'cleanup',?3)",params![id,sqlite_i64(next_version)?,sqlite_i64(wall_ms)?])?;
             }
             Ok(local_count)
@@ -1377,6 +1441,10 @@ fn release_restart_dimensions(
         MediaDimension::QueuedOperationsGlobal,
         MediaDimension::QueuedOperationsPerSession,
         MediaDimension::LocalCpuJobsGlobal,
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
     ] {
         release_dimension_balance(conn, id, version, &dimension_name(dimension), wall_ms)?;
     }
@@ -2099,7 +2167,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(values.contains(&("retained_bytes_per_session".into(), 5)));
+        assert!(values.contains(&("retained_bytes_per_session".into(), 0)));
+        assert!(ledger.recovery_complete().await.unwrap());
         assert!(values.contains(&("queued_operations_global".into(), 0)));
     }
 

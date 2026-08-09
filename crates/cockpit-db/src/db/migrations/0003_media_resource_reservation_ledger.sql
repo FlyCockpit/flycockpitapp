@@ -47,6 +47,13 @@ CREATE TABLE media_queue_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton
 INSERT INTO media_queue_sequence(singleton,next_value) VALUES(1,1);
 CREATE TABLE media_scheduler_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_session_id TEXT);
 INSERT INTO media_scheduler_cursor(singleton,last_session_id) VALUES(1,NULL);
+-- A reservation is schedulable only after its owner has finished collecting
+-- input. Keeping readiness durable lets the atomic fair claimant distinguish
+-- a slow upload from work that is actually waiting for an execution permit.
+CREATE TABLE media_execution_ready (
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    ready_wall_ms INTEGER NOT NULL
+);
 CREATE TABLE media_reservation_deltas (
     delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
     reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),

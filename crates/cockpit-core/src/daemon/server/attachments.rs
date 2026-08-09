@@ -514,23 +514,34 @@ pub(super) async fn finish_attachment_upload_admitted(
             },
         )
         .map_err(|_| bad_request("attachment exceeds media execution policy"))?;
-    let executing = match ctx
+    if let Err(error) = ctx
         .media_ledger
-        .promote(
-            &receipt.reservation_id,
-            receipt.version,
-            execution_plan,
-            wall_ms,
-        )
+        .mark_execution_ready(&receipt.reservation_id, wall_ms)
         .await
     {
-        Ok(value) => value,
-        Err(error) => {
-            ctx.media_ledger
-                .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
-                .await
-                .map_err(internal)?;
-            return Err(internal(error));
+        ctx.media_ledger
+            .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+            .await
+            .map_err(internal)?;
+        return Err(internal(error));
+    }
+    let executing = loop {
+        match ctx
+            .media_ledger
+            .claim_ready_fair(&receipt.reservation_id, execution_plan.clone(), wall_ms)
+            .await
+        {
+            Ok(Some(value)) => break value,
+            Ok(None) | Err(crate::media_reservation::LedgerError::Denied(_)) => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                ctx.media_ledger
+                    .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+                    .await
+                    .map_err(internal)?;
+                return Err(internal(error));
+            }
         }
     };
     let validation = async {

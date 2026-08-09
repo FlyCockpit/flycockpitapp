@@ -1265,6 +1265,8 @@ mod tests {
         assert_eq!(current_schema_version(&conn).unwrap(), 3);
         conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |_| Ok(()))
             .unwrap();
+        conn.query_row("SELECT COUNT(*) FROM media_execution_ready", [], |_| Ok(()))
+            .unwrap();
     }
 
     #[test]

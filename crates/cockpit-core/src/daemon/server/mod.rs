@@ -2260,21 +2260,32 @@ pub(crate) async fn boot_with_db(
     {
         timer.phase("external_journal_skipped");
     }
-    #[cfg(not(test))]
-    if containment_recovered {
-        // Process-containment recovery proves that descendants were reaped;
-        // it does not prove that reservation-owned artifacts were deleted.
-        // Keep durable charges intact until a production media owner supplies
-        // a cleanup implementation with verifiable artifact evidence.
-        tracing::warn!(
-            "media reservation recovery awaits owner-specific cleanup evidence; retained charges remain admission-blocking"
-        );
-        timer.phase("media_reservation_recovery_blocked");
-    }
     let recovery_wall_ms = chrono::Utc::now()
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
+    #[cfg(not(test))]
+    if containment_recovered {
+        // The only production local media owner is currently the attachment
+        // path, whose collected and decoded bytes are process memory. Reaped
+        // daemon containment is therefore positive cleanup evidence for every
+        // local reservation this binary can create. This contract must grow an
+        // owner-specific deleter before any file-backed producer is added.
+        match ctx
+            .media_ledger
+            .recover_after_restart(recovery_wall_ms, &RestartEphemeralMediaCleanup)
+            .await
+        {
+            Ok(recovered) => {
+                tracing::info!(recovered, "media reservation restart recovery finished");
+                timer.phase("media_reservation_recovered");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "media reservation restart recovery failed");
+                timer.phase("media_reservation_recovery_blocked");
+            }
+        }
+    }
     if let Err(error) = ctx
         .media_ledger
         .recover_ephemeral_attachment_uploads(recovery_wall_ms)
@@ -2307,6 +2318,18 @@ pub(crate) async fn boot_with_db(
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
+
+#[cfg(not(test))]
+struct RestartEphemeralMediaCleanup;
+
+#[cfg(not(test))]
+impl crate::media_reservation::LocalExpiryCleanup for RestartEphemeralMediaCleanup {
+    fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
+        Ok(format!(
+            "daemon-restart-ephemeral-media-destroyed:{reservation_id}"
+        ))
+    }
+}
 
 fn spawn_terminal_reaper(
     terminal_host: crate::daemon::terminal::TerminalHostHandle,

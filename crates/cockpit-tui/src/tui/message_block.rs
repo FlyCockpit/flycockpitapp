@@ -355,7 +355,12 @@ mod provenance_tests {
         let emoji_row = block
             .copy_cells
             .iter()
-            .find(|row| row.iter().flatten().count() == 2)
+            .find(|row| {
+                let ids = row.iter().flatten().copied().collect::<Vec<_>>();
+                ids.len() == 2
+                    && ids[0] == ids[1]
+                    && block.copy_fragments[ids[0] as usize].text == "👩\u{200d}💻"
+            })
             .expect("wide emoji occupies a wrapped row");
         let ids = emoji_row.iter().flatten().copied().collect::<Vec<_>>();
         assert_eq!(ids[0], ids[1], "wide grapheme keeps one fragment identity");

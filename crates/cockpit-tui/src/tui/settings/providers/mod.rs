@@ -2818,9 +2818,22 @@ impl SettingsCx {
             Span::raw(if button_selected { "▸ " } else { "  " }),
             Span::styled("[refetch provider models]".to_string(), button_style),
         ]));
-        // Read-only summary of the global on-unlisted-models policy. Cycled
-        // with `m`; it has no own cursor row so the provider list keeps its
-        // simple index map.
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::Add,
+            ),
+        ));
+        lines.push(Line::from("  [+ add provider]"));
+        // Pointer/keyboard control for the global on-unlisted-models policy.
+        // It has no own cursor row, so the provider list keeps its simple
+        // index map.
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::SettingsPointerAction::Providers(
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy,
+            ),
+        ));
         lines.push(Line::from(vec![
             Span::styled("  on unlisted models (m): ".to_string(), muted),
             Span::styled(
@@ -2874,6 +2887,19 @@ impl SettingsCx {
                     Span::raw("  "),
                     Span::styled(model_count, muted),
                 ]));
+            }
+            if !delete_pending
+                && let Some(id) = cursor.checked_sub(1).and_then(|index| ids.get(index))
+            {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::SettingsPointerAction::Providers(
+                        super::pointer_actions::ProvidersAction::BeginDelete(
+                            super::pointer_actions::ProviderId((*id).clone()),
+                        ),
+                    ),
+                ));
+                lines.push(Line::from("  [Delete]"));
             }
         }
         if delete_pending && let Some(id) = cursor.checked_sub(1).and_then(|index| ids.get(index)) {
@@ -4843,6 +4869,40 @@ impl SettingsPage for ProvidersPage {
                     }
                     return Nav::Stay;
                 }
+            }
+        }
+        if matches!(&*self, ProvidersPage::List { .. }) {
+            match &provider_action {
+                super::pointer_actions::ProvidersAction::Add => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::CycleUnlistedPolicy => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::ProvidersAction::BeginDelete(id) => {
+                    let Some(index) = cx
+                        .config
+                        .providers
+                        .keys()
+                        .position(|candidate| candidate == &id.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    if let ProvidersPage::List { cursor, .. } = self {
+                        *cursor = index + 1;
+                    }
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => {}
             }
         }
         let index = match (&*self, &provider_action) {

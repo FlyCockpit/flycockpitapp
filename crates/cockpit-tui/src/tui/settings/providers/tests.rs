@@ -205,10 +205,142 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     standalone_oauth_link_region_survives_scroll_and_clipping();
     copilot_setup_effect_accepts_only_its_live_operation_once();
     oauth_copy_completion_is_flow_scoped_and_exactly_once();
+    pointer_provider_list_action_family_dispatches_from_fresh_sources();
     pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl();
     pointer_headers_surface_dispatches_every_enabled_control();
     pointer_reachable_nested_surfaces_render_and_dispatch();
     pointer_prompt_surfaces_render_and_dispatch();
+}
+
+fn pointer_provider_list_action_family_dispatches_from_fresh_sources() {
+    use super::super::pointer_actions::{
+        ProviderDeleteChoice, ProviderId, ProvidersAction, SettingsPointerAction,
+    };
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
+        dialog.page = super::super::providers_page(ProvidersPage::List {
+            cursor: 1,
+            status: None,
+            delete_pending: false,
+        });
+        (tmp, dialog)
+    }
+
+    fn actions(dialog: &SettingsDialog) -> std::collections::HashSet<SettingsPointerAction> {
+        let _ = render_provider_rows(dialog, 110, 60);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Providers(_),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let (_tmp, source) = fixture();
+    let id = ProviderId("p".into());
+    assert_eq!(
+        actions(&source),
+        [
+            SettingsPointerAction::Providers(ProvidersAction::RefetchAll),
+            SettingsPointerAction::Providers(ProvidersAction::Add),
+            SettingsPointerAction::Providers(ProvidersAction::CycleUnlistedPolicy),
+            SettingsPointerAction::Providers(ProvidersAction::Open(id.clone())),
+            SettingsPointerAction::Providers(ProvidersAction::BeginDelete(id.clone())),
+        ]
+        .into_iter()
+        .collect(),
+        "provider list publishes its complete initial action family"
+    );
+
+    for action in actions(&source) {
+        let (_tmp, mut dialog) = fixture();
+        click_rendered_provider_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Providers(ProvidersAction::Add) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Providers(ProvidersPage::Add(_))
+            )),
+            SettingsPointerAction::Providers(ProvidersAction::Open(_)) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Providers(ProvidersPage::Edit(state)) if state.provider_id == "p"
+            )),
+            SettingsPointerAction::Providers(ProvidersAction::RefetchAll) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Providers(ProvidersPage::FetchAll(_))
+            )),
+            SettingsPointerAction::Providers(ProvidersAction::CycleUnlistedPolicy) => {
+                assert_eq!(
+                    dialog.config.on_unlisted_models_fetch,
+                    Some(OnUnlistedModelsFetch::Keep)
+                );
+                assert_eq!(
+                    ConfigDoc::load(&dialog.config_path)
+                        .unwrap()
+                        .providers()
+                        .on_unlisted_models_fetch,
+                    Some(OnUnlistedModelsFetch::Keep)
+                );
+            }
+            SettingsPointerAction::Providers(ProvidersAction::BeginDelete(ref provider)) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Providers(ProvidersPage::List {
+                        delete_pending: true,
+                        ..
+                    })
+                ));
+                let choices = actions(&dialog);
+                let expected_choices = [
+                    ProviderDeleteChoice::RemoveSecrets,
+                    ProviderDeleteChoice::KeepSecrets,
+                    ProviderDeleteChoice::Cancel,
+                ];
+                for choice in expected_choices {
+                    let delete = SettingsPointerAction::Providers(ProvidersAction::Delete(
+                        provider.clone(),
+                        choice,
+                    ));
+                    assert!(
+                        choices.contains(&delete),
+                        "missing delete choice {choice:?}"
+                    );
+                    let (_nested_tmp, mut nested) = fixture();
+                    click_rendered_provider_action(&mut nested, &action);
+                    click_rendered_provider_action(&mut nested, &delete);
+                    if choice == ProviderDeleteChoice::Cancel {
+                        assert!(nested.config.providers.contains_key("p"));
+                        assert!(matches!(
+                            nested.test_page(),
+                            TestPageRef::Providers(ProvidersPage::List {
+                                delete_pending: false,
+                                ..
+                            })
+                        ));
+                    } else {
+                        assert!(!nested.config.providers.contains_key("p"));
+                        assert!(
+                            !ConfigDoc::load(&nested.config_path)
+                                .unwrap()
+                                .providers()
+                                .providers
+                                .contains_key("p")
+                        );
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

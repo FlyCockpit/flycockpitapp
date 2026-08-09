@@ -325,17 +325,6 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             return Err(error);
         }
     };
-    if remote_operation.is_some() {
-        tracing::debug!(
-            fcor_resource_count = authorized_request.fcor_resources.len(),
-            fcor_resource_bytes = authorized_request
-                .fcor_resources
-                .iter()
-                .map(|resource| resource.value.len())
-                .sum::<usize>(),
-            "consumed post-authorization FCOR resources"
-        );
-    }
     if audit_remote {
         audit_remote_request(
             ctx,
@@ -1030,6 +1019,49 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             expected_version,
         } => {
             let db_key = app_flag_db_key(key);
+            if let Some(operation) = remote_operation {
+                let canonical_params = Request::MarkAppFlagSeen {
+                    key,
+                    expected_version,
+                }
+                .canonical_remote_operation_params_v1()
+                .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(
+                    &Request::MarkAppFlagSeen {
+                        key,
+                        expected_version,
+                    },
+                    &canonical_params,
+                )?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let Some((version, changed)) = crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)? else { anyhow::bail!("app flag version conflict") };
+                        let response = Response::AppFlagSeen { key, version, changed };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "mark_app_flag_seen".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let outcome = ctx
                 .db
                 .write(move |conn| {

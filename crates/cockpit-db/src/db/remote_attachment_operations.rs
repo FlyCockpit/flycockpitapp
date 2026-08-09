@@ -95,7 +95,95 @@ pub enum CommitRemoteOperationOutcome {
     AttachmentOutboxCapacity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionalRemoteOperationOutcome<T> {
+    Applied(T),
+    Replay(Vec<u8>),
+    OperationConflict,
+    OperationActorConflict,
+    AttachmentLedgerCapacity,
+}
+
+pub struct TransactionalRemoteMutation<T> {
+    pub value: T,
+    pub safe_response: Vec<u8>,
+    pub outbox_kind: String,
+    pub outbox_payload: Vec<u8>,
+}
+
 impl Db {
+    /// Reserve, perform one domain mutation, and commit its replay response and
+    /// outbox event in one writer transaction. No reserved intermediate state
+    /// or connection-level ledger primitive escapes this API.
+    pub async fn execute_transactional_remote_operation<T, F>(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+        mutation: F,
+    ) -> Result<TransactionalRemoteOperationOutcome<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<TransactionalRemoteMutation<T>> + Send + 'static,
+    {
+        let owned = OwnedReserveRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            authenticated_device_id: request.authenticated_device_id.to_owned(),
+            authenticated_device_generation: request.authenticated_device_generation,
+            operation_class: request.operation_class,
+            request_hash: request.request_hash,
+            now_ms: request.now_ms,
+        };
+        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+            ReserveRemoteOperationOutcome::Reserved(_) => {
+                let result = mutation(conn)?;
+                let delivery_id = Uuid::now_v7().to_string();
+                let committed = commit_conn(
+                    conn,
+                    &OwnedCommitRemoteOperation {
+                        logical_attachment_id: owned.logical_attachment_id.clone(),
+                        operation_id: owned.operation_id.clone(),
+                        safe_response: result.safe_response,
+                        outbox_delivery_id: delivery_id,
+                        outbox_kind: result.outbox_kind,
+                        outbox_payload: result.outbox_payload,
+                        now_ms: owned.now_ms,
+                    },
+                )?;
+                match committed {
+                    CommitRemoteOperationOutcome::Committed { .. } => {
+                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                    }
+                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                        bail!("transactional remote operation ledger capacity")
+                    }
+                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                        bail!("transactional remote operation outbox capacity")
+                    }
+                }
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                Ok(TransactionalRemoteOperationOutcome::Replay(
+                    replay
+                        .safe_response
+                        .context("committed operation missing safe response")?,
+                ))
+            }
+            ReserveRemoteOperationOutcome::Replay(_) => {
+                bail!("transactional remote operation is indeterminate")
+            }
+            ReserveRemoteOperationOutcome::OperationConflict => {
+                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+            }
+            ReserveRemoteOperationOutcome::OperationActorConflict => {
+                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+            }
+            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+        })
+        .await
+    }
+
     pub async fn reserve_remote_attachment_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
@@ -362,6 +450,95 @@ fn reservation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transactional_executor_replays_conflicts_and_rolls_back_domain_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000099";
+        let request = || ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+            operation_id: operation,
+            authenticated_device_id: "00000000-0000-4000-8000-000000000002",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::TransactionalMutation,
+            request_hash: [9; 32],
+            now_ms: 1,
+        };
+        let applied = db
+            .execute_transactional_remote_operation(request(), |conn| {
+                Db::mark_app_flag_seen_versioned_conn(conn, "daemon-autostart", 0)?;
+                Ok(TransactionalRemoteMutation {
+                    value: 1_u8,
+                    safe_response: b"one".to_vec(),
+                    outbox_kind: "test".into(),
+                    outbox_payload: b"one".to_vec(),
+                })
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied,
+            TransactionalRemoteOperationOutcome::Applied(1)
+        ));
+        let replay = db
+            .execute_transactional_remote_operation(request(), |_| {
+                panic!("replay must not execute domain closure")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            TransactionalRemoteOperationOutcome::Replay(b"one".to_vec())
+        );
+        let mut changed = request();
+        changed.request_hash = [8; 32];
+        assert!(matches!(
+            db.execute_transactional_remote_operation(changed, |_| panic!(
+                "conflict must not execute domain closure"
+            ))
+            .await
+            .unwrap(),
+            TransactionalRemoteOperationOutcome::OperationConflict
+        ));
+
+        let failed_operation = "01890f3e-4c00-7000-8000-000000000098";
+        let mut failed = request();
+        failed.operation_id = failed_operation;
+        failed.request_hash = [7; 32];
+        assert!(
+            db.execute_transactional_remote_operation::<(), _>(failed, |conn| {
+                conn.execute(
+                    "INSERT INTO app_flags(key,seen_at) VALUES ('rollback-test',1)",
+                    [],
+                )?;
+                anyhow::bail!("injected crash")
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.read(|conn| Db::app_flag_version_conn(conn, "rollback-test"))
+                .await
+                .unwrap(),
+            0
+        );
+        let mut retry = request();
+        retry.operation_id = failed_operation;
+        retry.request_hash = [7; 32];
+        let retried = db
+            .execute_transactional_remote_operation(retry, |conn| {
+                Db::mark_app_flag_seen_versioned_conn(conn, "rollback-test", 0)?;
+                Ok(TransactionalRemoteMutation {
+                    value: 2_u8,
+                    safe_response: b"two".to_vec(),
+                    outbox_kind: "test".into(),
+                    outbox_payload: b"two".to_vec(),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retried, TransactionalRemoteOperationOutcome::Applied(2));
+    }
 
     const ATTACHMENT: &str = "00000000-0000-4000-8000-000000000001";
     const DEVICE: &str = "00000000-0000-4000-8000-000000000002";

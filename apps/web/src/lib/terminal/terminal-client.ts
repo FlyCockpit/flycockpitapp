@@ -13,7 +13,7 @@ export type TerminalClientEvents = {
   output: (data: string) => void;
   clipboard: (text: string) => void;
   attachmentProgress: (progress: {
-    uploadId: string;
+    operationId: string;
     receivedBytes: number;
     totalBytes: number;
   }) => void;
@@ -39,6 +39,17 @@ export class TerminalClient {
   private ws: WebSocket | null = null;
   private listeners = new Map<keyof TerminalClientEvents, Set<AnyListener>>();
   private terminalId: string | null = null;
+  private binding: { id: string; epoch: number } | null = null;
+  private ingressWaiters = new Map<
+    string,
+    (state: { state: "prepared" | "committed"; nextOffset: number }) => void
+  >();
+  private pendingIngress: {
+    operationId: string;
+    mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+    size: number;
+    sha256: string;
+  } | null = null;
   private closedByUser = false;
 
   constructor(private readonly options: TerminalClientOptions) {
@@ -97,43 +108,99 @@ export class TerminalClient {
   }
 
   input(data: string) {
-    if (!data) return;
-    this.sendPayload({ type: "terminal.input", v: TERMINAL_PROTOCOL_VERSION, data });
+    if (!data || !this.binding) return;
+    this.sendPayload({
+      type: "terminal.input",
+      v: TERMINAL_PROTOCOL_VERSION,
+      data,
+      bindingId: this.binding.id,
+      bindingEpoch: this.binding.epoch,
+    });
   }
 
   resize(cols: number, rows: number) {
-    this.sendPayload({ type: "terminal.resize", v: TERMINAL_PROTOCOL_VERSION, cols, rows });
+    if (!this.binding) return;
+    this.sendPayload({
+      type: "terminal.resize",
+      v: TERMINAL_PROTOCOL_VERSION,
+      cols,
+      rows,
+      bindingId: this.binding.id,
+      bindingEpoch: this.binding.epoch,
+    });
   }
 
   close() {
     this.closedByUser = true;
-    this.sendPayload({ type: "terminal.close", v: TERMINAL_PROTOCOL_VERSION });
+    if (this.binding)
+      this.sendPayload({
+        type: "terminal.close",
+        v: TERMINAL_PROTOCOL_VERSION,
+        bindingId: this.binding.id,
+        bindingEpoch: this.binding.epoch,
+      });
     this.ws?.close();
     this.ws = null;
     this.emit("status", "closed");
   }
 
   async uploadImage(file: File, onProgress?: (sentBytes: number, totalBytes: number) => void) {
-    const uploadId = crypto.randomUUID();
+    if (!this.binding) throw new Error("terminal binding is unavailable");
+    if (
+      !(
+        file.type === "image/png" ||
+        file.type === "image/jpeg" ||
+        file.type === "image/gif" ||
+        file.type === "image/webp"
+      )
+    ) {
+      throw new Error("unsupported terminal image type");
+    }
+    const operationId = crypto.randomUUID();
     const buffer = new Uint8Array(await file.arrayBuffer());
-    let offset = 0;
+    if (buffer.byteLength < 1 || buffer.byteLength > 10 * 1024 * 1024) {
+      throw new Error("terminal image size is outside the allowed range");
+    }
+    const sha256 = bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)));
+    const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+    this.pendingIngress = { operationId, mediaType, size: buffer.byteLength, sha256 };
+    const identity = () => {
+      if (!this.binding) throw new Error("terminal binding is unavailable");
+      return { operationId, bindingId: this.binding.id, bindingEpoch: this.binding.epoch };
+    };
+    let acknowledgement = this.waitForIngress(operationId);
+    this.sendPayload({
+      type: "terminal.ingress_begin",
+      v: TERMINAL_PROTOCOL_VERSION,
+      ...identity(),
+      mediaType,
+      size: buffer.byteLength,
+      sha256,
+    });
+    let offset = (await acknowledgement).nextOffset;
     while (offset < buffer.byteLength) {
       const end = Math.min(offset + CHUNK_BYTES, buffer.byteLength);
       const chunk = buffer.slice(offset, end);
+      acknowledgement = this.waitForIngress(operationId);
       this.sendPayload({
-        type: "terminal.attachment_chunk",
+        type: "terminal.ingress_chunk",
         v: TERMINAL_PROTOCOL_VERSION,
-        uploadId,
-        name: file.name || "pasted-image.png",
-        mimeType: file.type || "application/octet-stream",
-        size: buffer.byteLength,
+        ...identity(),
         offset,
         dataBase64: uint8ToBase64(chunk),
-        final: end === buffer.byteLength,
       });
-      offset = end;
+      offset = (await acknowledgement).nextOffset;
       onProgress?.(offset, buffer.byteLength);
     }
+    acknowledgement = this.waitForIngress(operationId);
+    this.sendPayload({
+      type: "terminal.ingress_finish",
+      v: TERMINAL_PROTOCOL_VERSION,
+      ...identity(),
+    });
+    const receipt = await acknowledgement;
+    if (receipt.state !== "committed") throw new Error("terminal ingress did not commit");
+    this.pendingIngress = null;
   }
 
   private sendPayload(payload: TerminalClientPayload) {
@@ -163,6 +230,19 @@ export class TerminalClient {
     }
     if (payload.type === "terminal.opened") {
       this.terminalId = payload.terminalId;
+      this.binding = { id: payload.bindingId, epoch: payload.bindingEpoch };
+      if (this.pendingIngress) {
+        this.sendPayload({
+          type: "terminal.ingress_begin",
+          v: TERMINAL_PROTOCOL_VERSION,
+          operationId: this.pendingIngress.operationId,
+          bindingId: this.binding.id,
+          bindingEpoch: this.binding.epoch,
+          mediaType: this.pendingIngress.mediaType,
+          size: this.pendingIngress.size,
+          sha256: this.pendingIngress.sha256,
+        });
+      }
       this.emit("status", "open");
       this.emit("opened", {
         terminalId: payload.terminalId,
@@ -173,7 +253,18 @@ export class TerminalClient {
     }
     if (payload.type === "terminal.output") this.emit("output", payload.data);
     if (payload.type === "terminal.clipboard") this.emit("clipboard", payload.text);
-    if (payload.type === "terminal.attachment_progress") this.emit("attachmentProgress", payload);
+    if (payload.type === "terminal.ingress_state") {
+      this.ingressWaiters.get(payload.operationId)?.(payload);
+      this.ingressWaiters.delete(payload.operationId);
+      this.emit("attachmentProgress", {
+        operationId: payload.operationId,
+        receivedBytes: payload.nextOffset,
+        totalBytes:
+          this.pendingIngress?.operationId === payload.operationId
+            ? this.pendingIngress.size
+            : payload.nextOffset,
+      });
+    }
     if (payload.type === "terminal.error") this.emit("error", payload);
   }
 
@@ -184,6 +275,25 @@ export class TerminalClient {
     const set = this.listeners.get(event);
     for (const listener of set ?? []) listener(...args);
   }
+
+  private waitForIngress(operationId: string) {
+    return new Promise<{ state: "prepared" | "committed"; nextOffset: number }>(
+      (resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          this.ingressWaiters.delete(operationId);
+          reject(new Error("terminal ingress acknowledgement timed out"));
+        }, 30_000);
+        this.ingressWaiters.set(operationId, (state) => {
+          window.clearTimeout(timer);
+          resolve(state);
+        });
+      },
+    );
+  }
+}
+
+function bytesToHex(bytes: Uint8Array) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function clientRelayUrl(relayUrl: string, token: string) {

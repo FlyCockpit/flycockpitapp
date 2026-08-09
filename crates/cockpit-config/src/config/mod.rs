@@ -59,3 +59,27 @@ pub fn hold_config_mutation_lock(
 ) -> anyhow::Result<HeldConfigMutationLock> {
     files::ConfigMutationLock::acquire(target).map(HeldConfigMutationLock)
 }
+
+/// Reuse the audited component-relative/no-follow private-file primitive for
+/// short-lived terminal ingress. Callers must still enforce their own root,
+/// filename, media, and lifecycle policy.
+pub fn write_terminal_ingress_private_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    files::create_private_file_nofollow(path, bytes)
+}
+
+/// Read a terminal-ingress file through the same retained-parent no-follow
+/// implementation used by config journals.
+pub fn read_terminal_ingress_file_nofollow(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    files::read_file_nofollow(path)
+}
+
+/// Remove the exact no-follow terminal-ingress entry through the audited
+/// retained-parent platform primitive.
+pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
+    files::remove_file_nofollow(path)
+}

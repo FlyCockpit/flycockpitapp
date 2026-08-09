@@ -179,6 +179,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             terminal_id: _,
             viewer_count: _,
             recording: _,
+            binding: _,
+            terminal_generation: _,
         }
         | proto::Response::FsWrite { hash: _ }
         | proto::Response::UsageCounts {
@@ -205,10 +207,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             enabled: _,
             default_depth: _,
         } => {}
-        proto::Response::TerminalPasteImage {
-            terminal_id: _,
-            path,
-        } => scrub_string(path, redact),
+        proto::Response::TerminalIngress { receipt: _ } => {}
         proto::Response::RemoveQueuedUserMessageResult {
             applied: _,
             reason: _,
@@ -2473,7 +2472,7 @@ struct MutableClientState {
     ready_attachments: HashMap<Uuid, ReadyAttachment>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     upload_limits: AttachmentUploadLimits,
-    terminal_views: HashSet<Uuid>,
+    terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
 }
 
@@ -2556,7 +2555,7 @@ impl MutableClientState {
             ready_attachments: HashMap::new(),
             upload_accounting,
             upload_limits: AttachmentUploadLimits::default(),
-            terminal_views: HashSet::new(),
+            terminal_views: HashMap::new(),
             terminal_host,
         }
     }
@@ -2601,8 +2600,8 @@ impl Drop for MutableClientState {
             &self.upload_accounting,
             self.pending_uploads.keys().copied(),
         );
-        for terminal_id in self.terminal_views.drain() {
-            self.terminal_host.release_viewer(terminal_id);
+        for (terminal_id, binding) in self.terminal_views.drain() {
+            self.terminal_host.release_viewer(terminal_id, binding);
         }
     }
 }

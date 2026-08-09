@@ -490,6 +490,32 @@ pub enum Request {
         terminal_id: Uuid,
     },
 
+    TerminalIngressBegin {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        metadata: crate::terminal::TerminalIngressMetadata,
+    },
+
+    TerminalIngressChunk {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+        offset: u64,
+        data_base64: String,
+    },
+
+    TerminalIngressFinish {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+    },
+
+    TerminalIngressStatus {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+    },
+
     /// Control a daemon-owned LSP server. The TUI may request these from
     /// `/settings`, but the daemon remains the only process that checks,
     /// installs, uninstalls, restarts, or kills language servers.
@@ -1216,6 +1242,10 @@ macro_rules! request_variants {
             (Request::TerminalInput { .. }, "terminal_input");
             (Request::TerminalResize { .. }, "terminal_resize");
             (Request::CloseTerminal { .. }, "close_terminal");
+            (Request::TerminalIngressBegin { .. }, "terminal_ingress_begin");
+            (Request::TerminalIngressChunk { .. }, "terminal_ingress_chunk");
+            (Request::TerminalIngressFinish { .. }, "terminal_ingress_finish");
+            (Request::TerminalIngressStatus { .. }, "terminal_ingress_status");
             (Request::LspControl { .. }, "lsp_control");
             (Request::ResolveInterrupt { .. }, "resolve_interrupt");
             (Request::ListSessions { .. }, "list_sessions");
@@ -1356,6 +1386,10 @@ macro_rules! command {
             (Request::TerminalInput { .. }, "terminal_input", terminal, none, false, serialized, none);
             (Request::TerminalResize { .. }, "terminal_resize", terminal, none, false, serialized, none);
             (Request::CloseTerminal { .. }, "close_terminal", terminal, none, true, serialized, none);
+            (Request::TerminalIngressBegin { .. }, "terminal_ingress_begin", terminal, none, true, serialized, none);
+            (Request::TerminalIngressChunk { .. }, "terminal_ingress_chunk", terminal, none, true, serialized, none);
+            (Request::TerminalIngressFinish { .. }, "terminal_ingress_finish", terminal, none, true, serialized, none);
+            (Request::TerminalIngressStatus { .. }, "terminal_ingress_status", terminal, none, false, serialized, none);
             (Request::LspControl { .. }, "lsp_control", custom(authorize_lsp_control), attached, true, serialized, none);
             (Request::ResolveInterrupt { .. }, "resolve_interrupt", session_writer, attached, true, serialized, none);
             (Request::ListSessions { .. }, "list_sessions", public_read, none, false, concurrent, none);
@@ -1452,7 +1486,6 @@ pub enum LspControlAction {
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentPurpose {
     UserMessageImage,
-    TerminalPasteImage { terminal_id: Uuid },
 }
 
 #[cfg(test)]

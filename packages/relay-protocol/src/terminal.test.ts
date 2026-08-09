@@ -27,11 +27,43 @@ describe("terminal frame codec", () => {
         terminalId: "pty-1",
         viewerCount: 1,
         recording: false,
+        bindingId: "550e8400-e29b-41d4-a716-446655440000",
+        bindingEpoch: 1,
       }),
     ).toMatchObject({ type: "terminal.opened", terminalId: "pty-1" });
 
     expect(() =>
       terminalClientPayloadSchema.parse({ type: "terminal.resize", v: 1, cols: 1, rows: 24 }),
+    ).toThrow();
+  });
+
+  it("terminal_ingress_no_reusable_authority_or_sensitive_control_plane", () => {
+    const identity = {
+      operationId: "550e8400-e29b-41d4-a716-446655440000",
+      bindingId: "550e8400-e29b-41d4-a716-446655440001",
+      bindingEpoch: 1,
+    };
+    expect(() =>
+      terminalClientPayloadSchema.parse({
+        type: "terminal.ingress_begin",
+        v: 1,
+        ...identity,
+        mediaType: "image/png",
+        size: 8,
+        sha256: "0".repeat(64),
+        name: "browser-name.png",
+      }),
+    ).toThrow();
+    expect(() =>
+      terminalDaemonPayloadSchema.parse({
+        type: "terminal.ingress_state",
+        v: 1,
+        operationId: identity.operationId,
+        state: "committed",
+        nextOffset: 8,
+        inputSequence: 1,
+        path: "/private/secret.png",
+      }),
     ).toThrow();
   });
 });

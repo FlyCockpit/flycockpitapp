@@ -3,6 +3,25 @@ use super::authz::*;
 use super::sessions::*;
 use super::*;
 
+fn invalid_terminal_ingress() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::InvalidIngress,
+        message: "invalid terminal ingress".to_string(),
+    }
+}
+
+fn require_terminal_binding(
+    state: &MutableClientState,
+    terminal_id: Uuid,
+    binding: proto::terminal::TerminalBinding,
+) -> std::result::Result<(), ErrorPayload> {
+    if state.terminal_views.get(&terminal_id) == Some(&binding) {
+        Ok(())
+    } else {
+        Err(invalid_terminal_ingress())
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn handle_request(
     request: Request,
@@ -863,13 +882,14 @@ pub(super) async fn handle_serialized_request(
 
         Request::OpenTerminal { cwd, cols, rows } => {
             let response = state.terminal_host.open(cwd, cols, rows)?;
-            if let Response::TerminalOpened { terminal_id, .. } = response {
-                state.terminal_views.insert(terminal_id);
-                Ok(Response::TerminalOpened {
-                    terminal_id,
-                    viewer_count: 1,
-                    recording: false,
-                })
+            if let Response::TerminalOpened {
+                terminal_id,
+                binding,
+                ..
+            } = &response
+            {
+                state.terminal_views.insert(*terminal_id, *binding);
+                Ok(response)
             } else {
                 Ok(response)
             }
@@ -881,23 +901,87 @@ pub(super) async fn handle_serialized_request(
             rows,
         } => {
             let response = state.terminal_host.attach(terminal_id, cols, rows)?;
-            state.terminal_views.insert(terminal_id);
+            if let Response::TerminalOpened { binding, .. } = &response {
+                state.terminal_views.insert(terminal_id, *binding);
+            }
             Ok(response)
         }
 
         Request::TerminalInput { terminal_id, bytes } => {
-            state.terminal_host.input(terminal_id, bytes)
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            state.terminal_host.input(terminal_id, binding, bytes)
         }
 
         Request::TerminalResize {
             terminal_id,
             cols,
             rows,
-        } => state.terminal_host.resize(terminal_id, cols, rows),
+        } => {
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            state.terminal_host.resize(terminal_id, binding, cols, rows)
+        }
 
         Request::CloseTerminal { terminal_id } => {
-            state.terminal_views.remove(&terminal_id);
-            state.terminal_host.close(terminal_id)
+            let binding = state
+                .terminal_views
+                .remove(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            state.terminal_host.close(terminal_id, binding)
+        }
+
+        Request::TerminalIngressBegin {
+            terminal_id,
+            binding,
+            metadata,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_begin(terminal_id, binding, metadata)
+        }
+        Request::TerminalIngressChunk {
+            terminal_id,
+            binding,
+            operation_id,
+            offset,
+            data_base64,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            if data_base64.len() > 66_000 {
+                return Err(invalid_terminal_ingress());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_base64)
+                .map_err(|_| invalid_terminal_ingress())?;
+            state
+                .terminal_host
+                .ingress_chunk(terminal_id, binding, operation_id, offset, bytes)
+        }
+        Request::TerminalIngressFinish {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_finish(terminal_id, binding, operation_id)
+        }
+        Request::TerminalIngressStatus {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_status(terminal_id, binding, operation_id)
         }
 
         Request::LspControl {

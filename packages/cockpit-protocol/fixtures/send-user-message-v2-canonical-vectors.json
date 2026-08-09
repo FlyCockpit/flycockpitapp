@@ -45,7 +45,22 @@
     { "text": "\ufeff", "has_message_text": true },
     { "text": "\u200b", "has_message_text": true },
     { "text": "é", "has_message_text": true },
-    { "text": "😀", "has_message_text": true }
+    { "text": "😀", "has_message_text": true },
+    { "text": "\u0008", "has_message_text": true },
+    { "text": "\u0009", "has_message_text": false },
+    { "text": "\u000d", "has_message_text": false },
+    { "text": "\u000e", "has_message_text": true },
+    { "text": "\u0084", "has_message_text": true },
+    { "text": "\u0085", "has_message_text": false },
+    { "text": "\u0086", "has_message_text": true },
+    { "text": "\u167f", "has_message_text": true },
+    { "text": "\u1680", "has_message_text": false },
+    { "text": "\u1681", "has_message_text": true },
+    { "text": "\u1fff", "has_message_text": true },
+    { "text": "\u2000", "has_message_text": false },
+    { "text": "\u200a", "has_message_text": false },
+    { "text": "\u200b", "has_message_text": true },
+    { "text": " \u200b\u3000", "has_message_text": true }
   ],
   "malformed_fcm2": [
     {
@@ -80,6 +95,20 @@
     }
   ],
   "mutation_cases": [
+    {
+      "name": "bad_magic",
+      "source": 0,
+      "offset": 0,
+      "bytes_hex": "00",
+      "error": "invalid FCM2 header"
+    },
+    {
+      "name": "bad_schema",
+      "source": 0,
+      "offset": 4,
+      "bytes_hex": "03",
+      "error": "invalid FCM2 header"
+    },
     {
       "name": "invalid_display_presence",
       "source": 0,
@@ -128,6 +157,34 @@
       "offset": 149,
       "bytes_hex": "02",
       "error": "invalid boolean"
+    },
+    {
+      "name": "zero_project_digest",
+      "source": 0,
+      "offset": 37,
+      "bytes_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "error": "zero project digest"
+    },
+    {
+      "name": "zero_model_digest",
+      "source": 0,
+      "offset": 77,
+      "bytes_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "error": "zero model digest"
+    },
+    { "name": "truncated_fixed_checksum", "source": 0, "truncate": 160, "error": "truncated FCM2" },
+    { "name": "truncated_text_length", "source": 0, "truncate": 111, "error": "truncated FCM2" },
+    { "name": "truncated_display", "source": 1, "truncate": 125, "error": "truncated FCM2" },
+    { "name": "truncated_tag", "source": 1, "truncate": 145, "error": "truncated FCM2" },
+    { "name": "truncated_skill", "source": 1, "truncate": 155, "error": "truncated FCM2" },
+    { "name": "truncated_attachment", "source": 0, "truncate": 130, "error": "truncated FCM2" },
+    {
+      "name": "empty_message_without_attachments",
+      "source": 0,
+      "offset": 117,
+      "bytes_hex": "00",
+      "truncate": 118,
+      "error": "message has no content"
     }
   ]
 }

@@ -44,8 +44,9 @@ describe("send_user_message_v2_canonical_vectors", () => {
       ).toThrow(malformed.error);
     for (const malformed of fixture.mutation_cases) {
       const bytes = fromHex(fixture.vectors[malformed.source].fcm2_hex);
-      bytes.set(fromHex(malformed.bytes_hex), malformed.offset);
-      expect(() => decodeCanonicalSendUserMessageV2(bytes), malformed.name).toThrow(
+      if (malformed.offset !== undefined) bytes.set(fromHex(malformed.bytes_hex), malformed.offset);
+      const input = malformed.truncate === undefined ? bytes : bytes.slice(0, malformed.truncate);
+      expect(() => decodeCanonicalSendUserMessageV2(input), malformed.name).toThrow(
         malformed.error,
       );
     }

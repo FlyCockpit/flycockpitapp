@@ -1,7 +1,7 @@
 use cockpit_proto::send_user_message_v2::{
     CanonicalSendUserMessageV2, MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
     MessageAttachmentIdentity, MessageAttachmentKind, MessageTagExpansion, SendUserMessageV2,
-    validate_fcm2_length,
+    has_message_text, validate_fcm2_length,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -15,6 +15,22 @@ fn hex(raw: &str) -> Vec<u8> {
                 .expect("valid hex")
         })
         .collect()
+}
+
+#[test]
+fn send_user_message_v2_shared_scalar_predicate() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    for vector in fixture["predicate_vectors"].as_array().unwrap() {
+        assert_eq!(
+            has_message_text(vector["text"].as_str().unwrap()),
+            vector["has_message_text"].as_bool().unwrap(),
+            "wrong predicate result for {:?}",
+            vector["text"]
+        );
+    }
 }
 
 #[test]
@@ -160,9 +176,14 @@ fn send_user_message_v2_shared_malformed_bytes_reject() {
     for case in fixture["mutation_cases"].as_array().unwrap() {
         let source = case["source"].as_u64().unwrap() as usize;
         let mut bytes = hex(fixture["vectors"][source]["fcm2_hex"].as_str().unwrap());
-        let offset = case["offset"].as_u64().unwrap() as usize;
-        let replacement = hex(case["bytes_hex"].as_str().unwrap());
-        bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        if let Some(offset) = case["offset"].as_u64() {
+            let replacement = hex(case["bytes_hex"].as_str().unwrap());
+            let offset = offset as usize;
+            bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        }
+        if let Some(length) = case["truncate"].as_u64() {
+            bytes.truncate(length as usize);
+        }
         let error = CanonicalSendUserMessageV2::decode(&bytes)
             .unwrap_err()
             .to_string();

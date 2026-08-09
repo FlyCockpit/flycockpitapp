@@ -213,8 +213,8 @@ impl CanonicalSendUserMessageV2 {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         validate_fcm2_length(bytes.len())?;
         let mut r = Reader { bytes, at: 0 };
-        ensure!(r.take(4)? == FCM2_MAGIC, "invalid FCM2 magic");
-        ensure!(r.u8()? == FCM2_SCHEMA_VERSION, "unsupported FCM2 schema");
+        ensure!(r.take(4)? == FCM2_MAGIC, "invalid FCM2 header");
+        ensure!(r.u8()? == FCM2_SCHEMA_VERSION, "invalid FCM2 header");
         let client_submission_id = r.uuid()?;
         let session_id = r.uuid()?;
         let canonical_project_digest = r.array()?;

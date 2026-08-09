@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -49,7 +49,9 @@ use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, 
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
 use super::{Page, SettingsDialog, TestPageMut, TestPageRef};
@@ -762,6 +764,7 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
         push_wrapped_text(
             &mut lines,
             area.width,
@@ -771,7 +774,9 @@ impl SettingsCx {
              custom agent; reset reverts an overridden built-in.",
             muted,
         );
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
         for (i, row) in p.rows.iter().enumerate() {
             let on_cursor = i == p.cursor;
@@ -804,32 +809,46 @@ impl SettingsCx {
                 spans.push(Span::styled(format!("  ⚠ {e}"), red));
             }
             lines.push(Line::from(spans));
+            controls.push(Some((SettingsControlId(i as u64), true, None)));
             if let Ok(desc) = &row.detail {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(desc.clone(), muted),
                 ]));
+                controls.push(Some((SettingsControlId(i as u64), true, None)));
             }
         }
 
         if p.confirm_reset {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(
                 "Reset ALL built-in agents to default? This deletes their \
                  on-disk overrides (custom agents are kept).  y: confirm  n: cancel"
                     .to_string(),
                 red.add_modifier(Modifier::BOLD),
             )));
+            controls.push(None);
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "agents", lines, selected_line);
+        self.scroll_states.render_control_lines(
+            frame,
+            area,
+            "agents",
+            lines,
+            selected_line,
+            controls,
+            &self.pointer_surface,
+            SettingsScrollRegionId("agents:list"),
+        );
     }
 
     fn render_agent_detail(&self, frame: &mut Frame, area: Rect, detail: &AgentDetail) {
@@ -878,6 +897,34 @@ impl SettingsPage for AgentsPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_agents_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        if self.detail.is_some() || self.editing.is_some() || index >= self.rows.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("agents:list")
+            && self.detail.is_none()
+            && self.editing.is_none()
+        {
+            self.disarm_guards();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(self.rows.len().saturating_sub(1));
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

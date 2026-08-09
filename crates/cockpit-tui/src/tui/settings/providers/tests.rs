@@ -2819,6 +2819,9 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
     // production effects (model refetch/OAuth). Keep this synchronous matrix
     // deterministic while still entering the real reducers: spawned work is
     // owned by the caller's runtime and cancelled when the fixture completes.
+    let _guard = OAUTH_EFFECTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = one_provider_config(None);
     let provider_id = "p".to_string();
     let entry = config.providers[&provider_id].clone();
@@ -2940,7 +2943,11 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
     // The Codex device-code state publishes Poll rather than Login. Exercise
     // that independently from the initial OAuth source above.
     let (_tmp, mut poll_source) = dialog_with_config(oauth.clone());
-    let mut poll_state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    reset_oauth_effects(false);
+    let mut poll_state = OAuthFlowState::new_without_acknowledgement_with_effects_for_test(
+        OAuthProvider::Codex,
+        fake_oauth_effects(),
+    );
     poll_state.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
         "CODE-123",
@@ -2966,6 +2973,53 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
                         == super::super::shell::SettingsPointerAction::Page(poll.clone())
             })
     );
+    let copy_actions = poll_source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::CopyOAuth(
+                            _,
+                            super::super::pointer_actions::OAuthCopyKind::DeviceCode,
+                        ),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        copy_actions.len(),
+        1,
+        "the pending Codex source owns one device-code copy identity"
+    );
+    let copy = copy_actions.into_iter().next().unwrap();
+    click_rendered_provider_action(&mut poll_source, &copy);
+    assert_eq!(
+        oauth_effects_log(),
+        vec![
+            "copy:CODE-123".to_string(),
+            "open:https://example.test/device".to_string(),
+        ]
+    );
+    assert!(matches!(
+        poll_source.test_page(),
+        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
+            if matches!(
+                copy,
+                super::super::pointer_actions::SettingsPointerAction::Providers(
+                    super::super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, _)
+                ) if state.flow_id == flow_id
+            )
+                && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
+                    "copied device code (unverified — also reachable via the Open link above)"
+                ))
+    ));
     click_rendered_provider_action(&mut poll_source, &poll);
     assert!(matches!(
         poll_source.test_page(),

@@ -615,7 +615,10 @@ export class RemoteAuthorityRuntime {
     return this.#decision;
   }
   async mint(mintId: string, claims: Uint8Array, compact: (signature: Uint8Array) => string) {
-    if (!this.#decision.mayMint || !this.#signer || !this.#status)
+    const signer = this.#signer,
+      ring = this.#ring,
+      status = this.#status;
+    if (!this.#decision.mayMint || !signer || !ring || !status)
       throw new Error("remote authority not ready");
     let redisNow: string;
     try {
@@ -628,27 +631,27 @@ export class RemoteAuthorityRuntime {
       !this.#lastRedisTime ||
       BigInt(redisNow) < BigInt(this.#lastRedisTime) ||
       BigInt(redisNow) >= BigInt(this.#lastRedisTime) + REMOTE_AUTHORITY.leaseTtl ||
-      BigInt(redisNow) >= BigInt(this.#status.status.validUntil)
+      BigInt(redisNow) >= BigInt(status.status.validUntil)
     )
       throw new Error("remote authority freshness expired");
     const claimsHash = createHash("sha256").update(claims).digest("hex"),
-      generation = this.#ring!.authorityEpoch;
+      generation = ring.authorityEpoch;
     const reserved = await this.options.store.reserveMint({
       deploymentId: this.config.deploymentId,
       mintId,
-      kid: this.#signer.kid,
+      kid: signer.kid,
       signingGeneration: generation,
       claimsHash,
     });
     if (
       reserved.deploymentId !== this.config.deploymentId ||
-      reserved.kid !== this.#signer.kid ||
+      reserved.kid !== signer.kid ||
       reserved.signingGeneration !== generation ||
       reserved.claimsHash !== claimsHash
     )
       throw new Error("mint request conflict");
     if (reserved.state === "finalized" && reserved.compactJws) return reserved.compactJws;
-    const signature = await this.#signer.signP1363(claims, mintId),
+    const signature = await signer.signP1363(claims, mintId),
       jws = compact(signature),
       finalized = await this.options.store.finalizeMint({
         mintId,

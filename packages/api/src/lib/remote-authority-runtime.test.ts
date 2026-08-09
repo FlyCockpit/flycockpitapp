@@ -179,6 +179,7 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     await inFlightTick;
     expect(await draining).toBe(true);
     expect(drainedCalls).toBe(1);
+    expect(runtime.decision).toMatchObject({ ready: false, reason: "replica_draining" });
     expect(await runtime.tick()).toMatchObject({ ready: false, reason: "replica_draining" });
     expect(reservations).toBe(3);
   });

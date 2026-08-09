@@ -759,6 +759,31 @@ mod tests {
         release.wait();
     }
 
+    #[tokio::test]
+    async fn owned_async_action_timeout_is_terminal_and_late_completion_is_rejected() {
+        let mut runner = AsyncActionRunner::default();
+        let (release, barrier) = oneshot::channel::<()>();
+        runner.start(
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Text("late".to_string()))
+            },
+        );
+        runner.set_pending_kind_started_at(
+            &AsyncActionKind::Blocking("doctor.snapshot"),
+            Instant::now() - Duration::from_secs(31),
+        );
+
+        let expired = runner.expire_blocking(Instant::now(), Duration::from_secs(30));
+        assert_eq!(expired.len(), 1);
+        assert!(matches!(&expired[0].payload, Err(error) if error.contains("timed out")));
+        let _ = release.send(());
+        tokio::task::yield_now().await;
+        assert!(runner.drain_completed().is_empty());
+    }
+
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {
         assert!(matches!(
             &result.payload,

@@ -217,7 +217,7 @@ pub(crate) fn fit_whole_exchange_suffix(
         return None;
     }
     let first = ranges[start].start;
-    Some(FittedCompactHistory {
+    let fitted = FittedCompactHistory {
         history: history[first..].to_vec(),
         rung: if first == 0 {
             CompactFitRung::Verbatim
@@ -229,7 +229,9 @@ pub(crate) fn fit_whole_exchange_suffix(
         } else {
             CompactInputCoverage::Partial
         },
-    })
+    };
+    super::rehydrate::validate_pairing(&fitted.history).ok()?;
+    Some(fitted)
 }
 
 /// Strictly reduce a provider-rejected whole-exchange request. This is used
@@ -241,11 +243,13 @@ pub(crate) fn next_smaller_whole_exchange_fit(history: &[Message]) -> Option<Fit
         return None;
     }
     let first = ranges[1].start;
-    Some(FittedCompactHistory {
+    let fitted = FittedCompactHistory {
         history: history[first..].to_vec(),
         rung: CompactFitRung::HistorySelected,
         coverage: CompactInputCoverage::Partial,
-    })
+    };
+    super::rehydrate::validate_pairing(&fitted.history).ok()?;
+    Some(fitted)
 }
 
 fn utf8_prefix(text: &str, byte_cap: usize) -> &str {
@@ -327,10 +331,13 @@ pub(crate) fn truncate_newest_exchange_to_fit(
             high = mid - 1;
         }
     }
-    best.map(|history| FittedCompactHistory {
-        history,
-        rung: CompactFitRung::ToolResultTruncated,
-        coverage: CompactInputCoverage::Partial,
+    best.and_then(|history| {
+        super::rehydrate::validate_pairing(&history).ok()?;
+        Some(FittedCompactHistory {
+            history,
+            rung: CompactFitRung::ToolResultTruncated,
+            coverage: CompactInputCoverage::Partial,
+        })
     })
 }
 

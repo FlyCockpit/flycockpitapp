@@ -537,7 +537,10 @@ impl SettingsCx {
         &self,
         width: u16,
         p: &ToolsPage,
-    ) -> (Vec<Line<'static>>, Vec<(usize, SettingsControlId)>) {
+    ) -> (
+        Vec<Line<'static>>,
+        Vec<(usize, super::pointer_actions::SettingsPointerAction)>,
+    ) {
         let muted = muted_style();
         let mut lines = Vec::new();
         let mut bindings = Vec::new();
@@ -633,7 +636,61 @@ impl SettingsCx {
                     Some(ToolRow::Builtin(_) | ToolRow::McpTool { .. })
                 )
         });
-        (lines, bindings)
+        let semantic = bindings
+            .into_iter()
+            .filter_map(|(line, control)| {
+                self.tools_pointer_action(p, control.0 as usize)
+                    .map(|action| (line, action))
+            })
+            .collect();
+        (lines, semantic)
+    }
+
+    fn tools_pointer_action(
+        &self,
+        p: &ToolsPage,
+        index: usize,
+    ) -> Option<super::pointer_actions::SettingsPointerAction> {
+        use super::pointer_actions::{
+            BuiltinToolId, CredentialKind, McpServerId, McpToolId, SettingsPointerAction,
+            ToolFieldId, ToolsAction, UserToolId,
+        };
+        let selected = self.tools_page_rows().get(p.cursor);
+        let action = match index {
+            10_000 => ToolsAction::DeleteUserTool(UserToolId(p.delete_pending.clone()?)),
+            10_001 => ToolsAction::ToggleUserTool(UserToolId("cancel-delete".into())),
+            10_002 => match selected? {
+                ToolRow::UserTool(name) => ToolsAction::ToggleUserTool(UserToolId(name.clone())),
+                _ => return None,
+            },
+            10_003 => match selected? {
+                ToolRow::UserTool(name) => ToolsAction::DeleteUserTool(UserToolId(name.clone())),
+                _ => return None,
+            },
+            10_004 => ToolsAction::ResetToolField(ToolFieldId(format!("row:{}", p.cursor))),
+            _ => match self.tools_page_rows().get(index)? {
+                ToolRow::WebProvider => ToolsAction::CycleWebProvider,
+                ToolRow::FirecrawlBaseUrl => ToolsAction::EditFirecrawlBaseUrl,
+                ToolRow::FirecrawlKey => ToolsAction::EditCredential(CredentialKind::Firecrawl),
+                ToolRow::TinyFishKey => ToolsAction::EditCredential(CredentialKind::TinyFish),
+                ToolRow::WebFetchCommand => ToolsAction::EditWebFetchCommand,
+                ToolRow::WebSearchCommand => ToolsAction::EditWebSearchCommand,
+                ToolRow::Builtin(name) => {
+                    ToolsAction::ReadOnlyBuiltin(BuiltinToolId((*name).into()))
+                }
+                ToolRow::UserTool(name) => {
+                    ToolsAction::EditUserToolCommand(UserToolId(name.clone()))
+                }
+                ToolRow::AddUserTool => ToolsAction::AddUserTool,
+                ToolRow::McpTool { server, tool } => ToolsAction::ReadOnlyMcpTool(
+                    McpServerId(server.clone()),
+                    McpToolId(tool.clone()),
+                ),
+                ToolRow::McpJump => ToolsAction::McpJump,
+                ToolRow::Reset => ToolsAction::Reset,
+            },
+        };
+        Some(SettingsPointerAction::Tools(action))
     }
 
     fn push_web_tools_lines(
@@ -1021,26 +1078,66 @@ impl SettingsPage for ToolsPage {
         cx.render_tools_page(frame, area, self);
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
-        let index = control.0 as usize;
-        let key = match index {
-            10_000 if self.delete_pending.is_some() => Some(KeyCode::Char('d')),
-            10_001 if self.delete_pending.is_some() => {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Tools(action) = action else {
+            return Nav::Stay;
+        };
+        use super::pointer_actions::ToolsAction;
+        let key = match &action {
+            ToolsAction::DeleteUserTool(_) if self.delete_pending.is_some() => {
+                Some(KeyCode::Char('d'))
+            }
+            ToolsAction::ToggleUserTool(id)
+                if self.delete_pending.is_some() && id.0 == "cancel-delete" =>
+            {
                 self.delete_pending = None;
                 self.status = Some("delete cancelled".into());
                 return Nav::Stay;
             }
-            10_002 if self.delete_pending.is_none() => Some(KeyCode::Char('t')),
-            10_003 if self.delete_pending.is_none() => Some(KeyCode::Char('d')),
-            10_004 => Some(KeyCode::Char('r')),
+            ToolsAction::ToggleUserTool(_) if self.delete_pending.is_none() => {
+                Some(KeyCode::Char('t'))
+            }
+            ToolsAction::DeleteUserTool(_) if self.delete_pending.is_none() => {
+                Some(KeyCode::Char('d'))
+            }
+            ToolsAction::ResetToolField(_) => Some(KeyCode::Char('r')),
             _ => None,
         };
         if let Some(key) = key {
             return cx.handle_tools_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
-        if index >= cx.tool_rows().len() {
+        let rows = cx.tools_page_rows();
+        let index = rows.iter().position(|row| match (&action, row) {
+            (ToolsAction::CycleWebProvider, ToolRow::WebProvider)
+            | (ToolsAction::EditFirecrawlBaseUrl, ToolRow::FirecrawlBaseUrl)
+            | (ToolsAction::EditWebFetchCommand, ToolRow::WebFetchCommand)
+            | (ToolsAction::EditWebSearchCommand, ToolRow::WebSearchCommand)
+            | (ToolsAction::AddUserTool, ToolRow::AddUserTool)
+            | (ToolsAction::McpJump, ToolRow::McpJump)
+            | (ToolsAction::Reset, ToolRow::Reset) => true,
+            (
+                ToolsAction::EditCredential(super::pointer_actions::CredentialKind::Firecrawl),
+                ToolRow::FirecrawlKey,
+            )
+            | (
+                ToolsAction::EditCredential(super::pointer_actions::CredentialKind::TinyFish),
+                ToolRow::TinyFishKey,
+            ) => true,
+            (ToolsAction::EditUserToolCommand(id), ToolRow::UserTool(name)) => id.0 == *name,
+            (ToolsAction::ReadOnlyBuiltin(id), ToolRow::Builtin(name)) => id.0 == *name,
+            (
+                ToolsAction::ReadOnlyMcpTool(server_id, tool_id),
+                ToolRow::McpTool { server, tool },
+            ) => server_id.0 == *server && tool_id.0 == *tool,
+            _ => false,
+        });
+        let Some(index) = index else {
             return Nav::Stay;
-        }
+        };
         self.cursor = index;
         cx.handle_tools_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }

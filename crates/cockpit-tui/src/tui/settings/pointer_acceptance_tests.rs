@@ -1,10 +1,15 @@
 use super::SettingsPointerSurfaceKind;
 use super::pointer_actions::*;
 use super::shell::{
-    PointerOperationGate, PointerOperationId, SettingsControlId, SettingsHeaderAction,
+    PointerOperationGate, PointerOperationId, SettingsHeaderAction,
     SettingsPointerAction as RenderAction, SettingsPointerSurface, SettingsPointerTarget,
 };
+use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
+use tempfile::TempDir;
+
+use super::tests::{fresh_dialog, render_settings_rows, settings_mouse};
+use super::{SettingsPointerOutcome, TestPageRef};
 
 fn fixture_actions() -> Vec<SettingsPointerAction> {
     let row = || StableRowId("fixture".into());
@@ -85,6 +90,10 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
         SettingsPointerAction::Skills(SkillsAction::AddScanDirectory),
         SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(row())),
         SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(row())),
+        SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
+            row(),
+            ConfirmationChoice::Confirm,
+        )),
         SettingsPointerAction::Skills(SkillsAction::Reset),
         SettingsPointerAction::Mcp(McpAction::Open(McpServerId("server".into()))),
         SettingsPointerAction::Mcp(McpAction::Add),
@@ -211,6 +220,8 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
         SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
         SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
         SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
+        SettingsPointerAction::DefaultModel(DefaultModelAction::Choose),
+        SettingsPointerAction::DefaultModel(DefaultModelAction::Clear),
     ]
 }
 
@@ -219,13 +230,17 @@ fn rendered_surface() -> SettingsPointerSurface {
     surface.clear_for(Rect::new(10, 5, 30, 10));
     surface.register(SettingsPointerTarget {
         rect: Rect::new(12, 7, 8, 1),
-        action: RenderAction::Page(SettingsControlId(7)),
+        action: RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
+            "interface".into(),
+        )))),
         enabled: true,
         disabled_reason: None,
     });
     surface.register(SettingsPointerTarget {
         rect: Rect::new(12, 8, 8, 1),
-        action: RenderAction::Page(SettingsControlId(8)),
+        action: RenderAction::Page(SettingsPointerAction::Tools(ToolsAction::ReadOnlyBuiltin(
+            BuiltinToolId("read".into()),
+        ))),
         enabled: false,
         disabled_reason: Some("read only"),
     });
@@ -257,7 +272,9 @@ fn settings_pointer_dispatch_preempts_chat() {
     let surface = rendered_surface();
     assert_eq!(
         surface.hit(13, 7).unwrap().action,
-        RenderAction::Page(SettingsControlId(7))
+        RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
+            "interface".into()
+        ))))
     );
     let area = surface.area.get().unwrap();
     assert!(39 >= area.x && 39 < area.right() && 14 >= area.y && 14 < area.bottom());
@@ -269,19 +286,74 @@ fn settings_pointer_dispatch_preempts_chat() {
 
 #[test]
 fn settings_wheel_moves_focus_and_liststate_without_activation() {
-    let mut cursor = 1usize;
-    cursor = cursor.saturating_add_signed(3).min(4);
-    assert_eq!(cursor, 4);
-    cursor = cursor.saturating_add_signed(-3);
-    assert_eq!(cursor, 1);
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let _ = render_settings_rows(&dialog, 80, 12);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                RenderAction::Page(SettingsPointerAction::Root(_))
+            )
+        })
+        .cloned()
+        .expect("rendered root target");
+    assert_eq!(
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollDown,
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 3 }
+    ));
+    for _ in 0..8 {
+        let _ = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollUp,
+            target.rect.x,
+            target.rect.y,
+        ));
+    }
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 0 }
+    ));
 }
 
 #[test]
 fn settings_pointer_clicks_visible_controls_only() {
-    let surface = rendered_surface();
-    assert!(surface.hit(12, 7).unwrap().enabled);
-    assert!(!surface.hit(12, 8).unwrap().enabled);
-    assert!(surface.hit(12, 9).is_none());
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let _ = render_settings_rows(&dialog, 80, 18);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                RenderAction::Page(SettingsPointerAction::Root(_))
+            )
+        })
+        .cloned()
+        .expect("rendered root target");
+    assert_eq!(
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(!matches!(dialog.test_page(), TestPageRef::Root { .. }));
 }
 
 #[test]
@@ -330,9 +402,11 @@ fn settings_pointer_links_and_capture_transitions_are_safe() {
 #[test]
 fn settings_pointer_hover_and_help_are_truthful() {
     let surface = rendered_surface();
-    surface.hover.set(Some(SettingsControlId(7)));
+    *surface.hover.borrow_mut() = Some(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
+        "interface".into(),
+    ))));
     surface.clear_for_page(Rect::new(10, 5, 30, 10), 2);
-    assert!(surface.hover.get().is_none());
+    assert!(surface.hover.borrow().is_none());
 }
 
 #[test]
@@ -369,28 +443,42 @@ fn settings_pointer_provider_secret_choices_are_functional() {
 
 #[test]
 fn existing_settings_tests_retain_behavioral_assertions() {
-    // These are the production test fixtures whose exact behavior this
-    // pointer layer builds on. Keeping the names here makes accidental
-    // deletion visible in the focused `settings_pointer` suite as well as in
-    // their original modules.
-    let retained = [
-        "category_short_viewport_keeps_bottom_reset_row_visible",
-        "nav_stack_restores_behavior_cursor_and_scroll_from_instructions",
-        "provider deletion keeps explicit secret choices",
-        "OAuth links account for list offset",
-    ];
-    assert_eq!(retained.len(), 4);
-    assert!(retained.iter().all(|name| !name.is_empty()));
+    let settings_tests = include_str!("tests.rs");
+    let provider_tests = include_str!("providers/tests.rs");
+    for retained in [
+        "fn category_short_viewport_keeps_bottom_reset_row_visible",
+        "fn nav_stack_restores_behavior_cursor_and_scroll_from_instructions",
+    ] {
+        assert!(settings_tests.contains(retained), "missing {retained}");
+    }
+    assert!(
+        provider_tests.contains("secret") && provider_tests.contains("delete"),
+        "provider secret-deletion assertions must remain in the production suite"
+    );
+    assert!(
+        provider_tests.contains("oauth") && provider_tests.contains("link"),
+        "OAuth link/scroll assertions must remain in the production suite"
+    );
 }
 
 #[test]
 fn settings_pointer_header_navigation_is_complete() {
-    let header = [
-        SettingsHeaderAction::Close,
-        SettingsHeaderAction::Back,
-        SettingsHeaderAction::BackToConfigPicker,
-    ];
-    assert_eq!(header.len(), 3);
+    let tmp = TempDir::new().unwrap();
+    let dialog = fresh_dialog(&tmp);
+    let rows = render_settings_rows(&dialog, 80, 12);
+    let targets = dialog.pointer_surface.targets.borrow();
+    assert!(
+        targets
+            .iter()
+            .any(|target| { target.action == RenderAction::Header(SettingsHeaderAction::Close) })
+    );
+    assert!(rows.iter().any(|row| row.contains("Close settings")));
+    assert!(
+        !targets
+            .iter()
+            .any(|target| { target.action == RenderAction::Header(SettingsHeaderAction::Back) }),
+        "root without a parent has no Back target"
+    );
 }
 
 #[test]

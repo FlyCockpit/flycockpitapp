@@ -25,10 +25,9 @@ use ratatui::text::{Line, Span};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
+use super::pointer_actions::{ListAction, SettingsPointerAction, StableRowId};
 use super::secret_display;
-use super::shell::{
-    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
-};
+use super::shell::{SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker};
 use super::ui_page::GrabState;
 use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
@@ -469,7 +468,13 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     p.kind.empty_hint(),
                 )));
-                controls.push(Some((SettingsControlId(i as u64), true, None)));
+                controls.push(Some((
+                    SettingsPointerAction::List(ListAction::Edit(string_list_row_id(
+                        p.kind, i, val,
+                    ))),
+                    true,
+                    None,
+                )));
                 continue;
             }
             let marker = if on_cursor {
@@ -486,7 +491,11 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled(string_list_display_value(p.kind, i, val), style),
             ]));
-            controls.push(Some((SettingsControlId(i as u64), true, None)));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Edit(string_list_row_id(p.kind, i, val))),
+                true,
+                None,
+            )));
         }
 
         if p.grabbed.is_none() {
@@ -506,7 +515,11 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled("[+ add]".to_string(), style),
             ]));
-            controls.push(Some((SettingsControlId(add_idx as u64), true, None)));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Add),
+                true,
+                None,
+            )));
         }
 
         if p.grabbed.is_some() {
@@ -516,20 +529,36 @@ impl SettingsCx {
             let can_down = p.cursor + 1 < values.len();
             lines.push(Line::from("[Move up]"));
             controls.push(Some((
-                SettingsControlId(1000),
+                SettingsPointerAction::List(ListAction::MoveUp(string_list_row_id(
+                    p.kind,
+                    p.cursor,
+                    &values[p.cursor],
+                ))),
                 can_up,
                 (!can_up).then_some("already first"),
             )));
             lines.push(Line::from("[Move down]"));
             controls.push(Some((
-                SettingsControlId(1001),
+                SettingsPointerAction::List(ListAction::MoveDown(string_list_row_id(
+                    p.kind,
+                    p.cursor,
+                    &values[p.cursor],
+                ))),
                 can_down,
                 (!can_down).then_some("already last"),
             )));
             lines.push(Line::from("[Save]"));
-            controls.push(Some((SettingsControlId(1002), true, None)));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Save),
+                true,
+                None,
+            )));
             lines.push(Line::from("[Cancel]"));
-            controls.push(Some((SettingsControlId(1003), true, None)));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Cancel),
+                true,
+                None,
+            )));
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
             controls.push(None);
         }
@@ -576,19 +605,38 @@ impl SettingsPage for StringListPage {
         cx.render_string_list_page(frame, area, self);
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
         if self.grabbed.is_some() {
-            let key = match control.0 {
-                1000 => KeyCode::Up,
-                1001 => KeyCode::Down,
-                1002 => KeyCode::Enter,
-                1003 => KeyCode::Esc,
+            let key = match action {
+                ListAction::MoveUp(id) if self.current_row_id(cx).as_ref() == Some(&id) => {
+                    KeyCode::Up
+                }
+                ListAction::MoveDown(id) if self.current_row_id(cx).as_ref() == Some(&id) => {
+                    KeyCode::Down
+                }
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
                 _ => return Nav::Stay,
             };
             return cx.handle_string_list_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
         let values = cx.string_list_values(self.kind);
-        let index = control.0 as usize;
+        let index = match action {
+            ListAction::Add => values.len(),
+            ListAction::Edit(id) => values
+                .iter()
+                .enumerate()
+                .position(|(index, value)| string_list_row_id(self.kind, index, value) == id)
+                .unwrap_or(values.len().saturating_add(1)),
+            _ => return Nav::Stay,
+        };
         if index > values.len() {
             return Nav::Stay;
         }
@@ -635,5 +683,18 @@ impl SettingsPage for StringListPage {
     #[cfg(test)]
     fn test_name(&self) -> &'static str {
         "StringList"
+    }
+}
+
+fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{kind:?}:{index}:{value}"))
+}
+
+impl StringListPage {
+    fn current_row_id(&self, cx: &SettingsCx) -> Option<StableRowId> {
+        let values = cx.string_list_values(self.kind);
+        values
+            .get(self.cursor)
+            .map(|value| string_list_row_id(self.kind, self.cursor, value))
     }
 }

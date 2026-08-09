@@ -296,18 +296,18 @@ pub(super) trait SettingsPage: Any {
     fn handle_pointer_control(
         &mut self,
         _cx: &mut SettingsCx,
-        _control: shell::SettingsControlId,
+        _action: pointer_actions::SettingsPointerAction,
     ) -> Nav {
         Nav::Stay
     }
     fn handle_pointer_control_at(
         &mut self,
         cx: &mut SettingsCx,
-        control: shell::SettingsControlId,
+        action: pointer_actions::SettingsPointerAction,
         _column: u16,
         _row: u16,
     ) -> Nav {
-        self.handle_pointer_control(cx, control)
+        self.handle_pointer_control(cx, action)
     }
     /// Move only the independently scrollable region under the pointer.
     /// `delta` is measured in selectable controls and is already normalized
@@ -400,7 +400,7 @@ fn boxed_page(page: Page) -> PageBox {
 
 #[allow(private_interfaces)]
 #[cfg(test)]
-enum TestPageRef<'a> {
+pub(super) enum TestPageRef<'a> {
     Root { cursor: usize },
     Agents(&'a AgentsPage),
     Tools(&'a ToolsPage),
@@ -605,11 +605,15 @@ impl SettingsPage for DefaultModelPage {
     fn handle_pointer_control(
         &mut self,
         cx: &mut SettingsCx,
-        control: shell::SettingsControlId,
+        action: pointer_actions::SettingsPointerAction,
     ) -> Nav {
-        match control.0 {
-            0 => self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            1 if self.effective_default.is_some() => {
+        match action {
+            pointer_actions::SettingsPointerAction::DefaultModel(
+                pointer_actions::DefaultModelAction::Choose,
+            ) => self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            pointer_actions::SettingsPointerAction::DefaultModel(
+                pointer_actions::DefaultModelAction::Clear,
+            ) if self.effective_default.is_some() => {
                 self.handle_key(cx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
             }
             _ => Nav::Stay,
@@ -652,18 +656,27 @@ impl SettingsPage for DefaultModelPage {
         }
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, area);
-        for (line, id, enabled, reason) in [
-            (choose_line, 0, true, None),
+        for (line, action, enabled, reason) in [
+            (
+                choose_line,
+                pointer_actions::SettingsPointerAction::DefaultModel(
+                    pointer_actions::DefaultModelAction::Choose,
+                ),
+                true,
+                None,
+            ),
             (
                 clear_line,
-                1,
+                pointer_actions::SettingsPointerAction::DefaultModel(
+                    pointer_actions::DefaultModelAction::Clear,
+                ),
                 self.effective_default.is_some(),
                 Some("no effective default is set"),
             ),
         ] {
             cx.pointer_surface.register(shell::SettingsPointerTarget {
                 rect: Rect::new(area.x, area.y.saturating_add(line as u16), area.width, 1),
-                action: shell::SettingsPointerAction::Page(shell::SettingsControlId(id)),
+                action: shell::SettingsPointerAction::Page(action),
                 enabled,
                 disabled_reason: if enabled { None } else { reason },
             });
@@ -815,14 +828,14 @@ impl Dialog {
 
     pub(crate) fn clear_settings_pointer_hover(&self) {
         if let Dialog::Settings(settings) = self {
-            settings.pointer_surface.hover.set(None);
+            *settings.pointer_surface.hover.borrow_mut() = None;
         }
     }
     pub(crate) fn cancel_settings_pointer_transients(&mut self) {
         if let Dialog::Settings(settings) = self {
-            settings.pointer_surface.hover.set(None);
+            *settings.pointer_surface.hover.borrow_mut() = None;
             settings.pointer_surface.header_hover.set(None);
-            settings.pointer_surface.pressed.set(None);
+            *settings.pointer_surface.pressed.borrow_mut() = None;
             settings.page.cancel_pointer_transients();
         }
     }
@@ -2127,7 +2140,7 @@ impl SettingsDialog {
             || mouse.row >= area.bottom()
         {
             if matches!(mouse.kind, MouseEventKind::Moved) {
-                self.pointer_surface.hover.set(None);
+                *self.pointer_surface.hover.borrow_mut() = None;
                 self.pointer_surface.header_hover.set(None);
             }
             return SettingsPointerOutcome::Consumed;
@@ -2139,17 +2152,17 @@ impl SettingsDialog {
                     .hit(mouse.column, mouse.row)
                     .filter(|target| target.enabled)
                     .map(|target| target.action);
-                self.pointer_surface.hover.set(match action {
-                    Some(SettingsPointerAction::Page(id)) => Some(id),
+                *self.pointer_surface.hover.borrow_mut() = match action {
+                    Some(SettingsPointerAction::Page(action)) => Some(action),
                     _ => None,
-                });
+                };
                 self.pointer_surface.header_hover.set(match action {
                     Some(SettingsPointerAction::Header(action)) => Some(action),
                     _ => None,
                 });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                self.pointer_surface.hover.set(None);
+                *self.pointer_surface.hover.borrow_mut() = None;
                 self.pointer_surface.header_hover.set(None);
                 if let Some(region) = self
                     .pointer_surface
@@ -2174,7 +2187,8 @@ impl SettingsDialog {
                 if self
                     .pointer_surface
                     .pressed
-                    .replace(Some(target.action))
+                    .borrow_mut()
+                    .replace(target.action.clone())
                     .is_some()
                 {
                     return SettingsPointerOutcome::Consumed;
@@ -2197,10 +2211,10 @@ impl SettingsDialog {
                         };
                         let _ = self.apply_nav(nav);
                     }
-                    SettingsPointerAction::Page(control) => {
+                    SettingsPointerAction::Page(action) => {
                         let nav = self.page.handle_pointer_control_at(
                             &mut self.cx,
-                            control,
+                            action,
                             mouse.column,
                             mouse.row,
                         );
@@ -2209,7 +2223,7 @@ impl SettingsDialog {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.pointer_surface.pressed.set(None);
+                *self.pointer_surface.pressed.borrow_mut() = None;
             }
             _ => {}
         }
@@ -2259,7 +2273,7 @@ impl SettingsDialog {
             .enabled
             .set(self.extended.tui.mouse_capture);
         if !self.extended.tui.mouse_capture {
-            self.pointer_surface.hover.set(None);
+            *self.pointer_surface.hover.borrow_mut() = None;
         }
         self.pointer_surface.clear_for_page(area, surface_token);
         let title = self.title();
@@ -2462,12 +2476,17 @@ impl SettingsPage for RootPage {
     fn handle_pointer_control(
         &mut self,
         cx: &mut SettingsCx,
-        control: shell::SettingsControlId,
+        action: pointer_actions::SettingsPointerAction,
     ) -> Nav {
-        let index = control.0 as usize;
-        if index >= root_nodes().len() {
+        let pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
+            pointer_actions::RootNodeId(id),
+        )) = action
+        else {
             return Nav::Stay;
-        }
+        };
+        let Some(index) = root_nodes().iter().position(|node| node.title == id) else {
+            return Nav::Stay;
+        };
         self.cursor = index;
         self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     }
@@ -2627,8 +2646,17 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
             ])
         })
         .collect();
-    let controls = (0..children.len())
-        .map(|index| Some((shell::SettingsControlId(index as u64), true, None)))
+    let controls = children
+        .iter()
+        .map(|node| {
+            Some((
+                pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
+                    pointer_actions::RootNodeId(node.title.to_string()),
+                )),
+                true,
+                None,
+            ))
+        })
         .collect();
     cx.scroll_states.render_control_lines(
         frame,

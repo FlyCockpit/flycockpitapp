@@ -191,20 +191,19 @@ impl PointerOperationGate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum SettingsHeaderAction {
     Close,
     Back,
     BackToConfigPicker,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum SettingsPointerAction {
     Header(SettingsHeaderAction),
-    /// A page-declared semantic control. The value is an opaque, stable key
-    /// interpreted only by the page that registered it; it is never derived
-    /// from terminal text or a transient screen coordinate.
-    Page(SettingsControlId),
+    /// A sealed, domain-identified page action. Render-local row keys never
+    /// cross this boundary or enter a behavioral reducer.
+    Page(super::pointer_actions::SettingsPointerAction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,7 +212,7 @@ pub(super) struct SettingsControlId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct SettingsScrollRegionId(pub &'static str);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SettingsPointerTarget {
     pub rect: Rect,
     pub action: SettingsPointerAction,
@@ -227,10 +226,10 @@ pub(super) struct SettingsPointerSurface {
     page_token: std::cell::Cell<Option<u64>>,
     pub targets: RefCell<Vec<SettingsPointerTarget>>,
     pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
-    pub hover: std::cell::Cell<Option<SettingsControlId>>,
+    pub hover: RefCell<Option<super::pointer_actions::SettingsPointerAction>>,
     pub header_hover: std::cell::Cell<Option<SettingsHeaderAction>>,
     pub enabled: std::cell::Cell<bool>,
-    pub pressed: std::cell::Cell<Option<SettingsPointerAction>>,
+    pub pressed: RefCell<Option<SettingsPointerAction>>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -240,10 +239,10 @@ impl Default for SettingsPointerSurface {
             page_token: std::cell::Cell::new(None),
             targets: RefCell::new(Vec::new()),
             scroll_regions: RefCell::new(Vec::new()),
-            hover: std::cell::Cell::new(None),
+            hover: RefCell::new(None),
             header_hover: std::cell::Cell::new(None),
             enabled: std::cell::Cell::new(true),
-            pressed: std::cell::Cell::new(None),
+            pressed: RefCell::new(None),
         }
     }
 }
@@ -251,7 +250,7 @@ impl Default for SettingsPointerSurface {
 impl SettingsPointerSurface {
     pub fn clear_for(&self, area: Rect) {
         if self.area.get() != Some(area) {
-            self.hover.set(None);
+            *self.hover.borrow_mut() = None;
             self.header_hover.set(None);
         }
         self.area.set(Some(area));
@@ -261,9 +260,9 @@ impl SettingsPointerSurface {
 
     pub fn clear_for_page(&self, area: Rect, page_token: u64) {
         if self.page_token.replace(Some(page_token)) != Some(page_token) {
-            self.hover.set(None);
+            *self.hover.borrow_mut() = None;
             self.header_hover.set(None);
-            self.pressed.set(None);
+            *self.pressed.borrow_mut() = None;
         }
         self.clear_for(area);
     }
@@ -276,12 +275,17 @@ impl SettingsPointerSurface {
     }
 
     pub fn hit(&self, column: u16, row: u16) -> Option<SettingsPointerTarget> {
-        self.targets.borrow().iter().rev().copied().find(|target| {
-            column >= target.rect.x
-                && column < target.rect.right()
-                && row >= target.rect.y
-                && row < target.rect.bottom()
-        })
+        self.targets
+            .borrow()
+            .iter()
+            .rev()
+            .find(|target| {
+                column >= target.rect.x
+                    && column < target.rect.right()
+                    && row >= target.rect.y
+                    && row < target.rect.bottom()
+            })
+            .cloned()
     }
 
     pub fn register_scroll_region(&self, rect: Rect, id: SettingsScrollRegionId) {
@@ -335,7 +339,13 @@ impl SettingsScrollStates {
         key: impl Into<String>,
         lines: Vec<Line<'static>>,
         selected_line: Option<usize>,
-        controls: Vec<Option<(SettingsControlId, bool, Option<&'static str>)>>,
+        controls: Vec<
+            Option<(
+                super::pointer_actions::SettingsPointerAction,
+                bool,
+                Option<&'static str>,
+            )>,
+        >,
         surface: &SettingsPointerSurface,
         region: SettingsScrollRegionId,
     ) {
@@ -350,7 +360,7 @@ impl SettingsScrollStates {
             .take(usize::from(area.height))
             .enumerate()
         {
-            let Some((id, enabled, disabled_reason)) = binding else {
+            let Some((action, enabled, disabled_reason)) = binding else {
                 continue;
             };
             surface.register(SettingsPointerTarget {
@@ -360,11 +370,11 @@ impl SettingsScrollStates {
                     area.width,
                     1,
                 ),
-                action: SettingsPointerAction::Page(id),
+                action: SettingsPointerAction::Page(action.clone()),
                 enabled,
                 disabled_reason,
             });
-            if enabled && surface.hover.get() == Some(id) {
+            if enabled && surface.hover.borrow().as_ref() == Some(&action) {
                 let y = area.y.saturating_add(screen_row as u16);
                 for x in area.x..area.right() {
                     if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
@@ -375,21 +385,23 @@ impl SettingsScrollStates {
         }
     }
 
-    pub(super) fn render_bound_lines(
+    pub(super) fn render_bound_lines<A>(
         &self,
         frame: &mut Frame,
         area: Rect,
         key: impl Into<String>,
         lines: Vec<Line<'static>>,
         selected_line: Option<usize>,
-        bindings: impl IntoIterator<Item = (usize, SettingsControlId)>,
+        bindings: impl IntoIterator<Item = (usize, A)>,
         surface: &SettingsPointerSurface,
         region: SettingsScrollRegionId,
-    ) {
+    ) where
+        A: Into<super::pointer_actions::SettingsPointerAction>,
+    {
         let mut controls = vec![None; lines.len()];
         for (line, id) in bindings {
             if let Some(slot) = controls.get_mut(line) {
-                *slot = Some((id, true, None));
+                *slot = Some((id.into(), true, None));
             }
         }
         self.render_control_lines(
@@ -777,7 +789,19 @@ mod tests {
                     (0..8).map(|row| Line::from(format!("row {row}"))).collect(),
                     Some(6),
                     (0..8)
-                        .map(|row| Some((SettingsControlId(row), true, None)))
+                        .map(|row| {
+                            Some((
+                                super::super::pointer_actions::SettingsPointerAction::Root(
+                                    super::super::pointer_actions::RootAction::Open(
+                                        super::super::pointer_actions::RootNodeId(format!(
+                                            "row-{row}"
+                                        )),
+                                    ),
+                                ),
+                                true,
+                                None,
+                            ))
+                        })
                         .collect(),
                     &surface,
                     SettingsScrollRegionId("controls"),
@@ -805,10 +829,15 @@ mod tests {
         let surface = SettingsPointerSurface::default();
         let area = Rect::new(1, 2, 20, 5);
         surface.clear_for_page(area, 10);
-        surface.hover.set(Some(SettingsControlId(4)));
+        let action = super::super::pointer_actions::SettingsPointerAction::Root(
+            super::super::pointer_actions::RootAction::Open(
+                super::super::pointer_actions::RootNodeId("fixture".into()),
+            ),
+        );
+        *surface.hover.borrow_mut() = Some(action.clone());
         surface.clear_for_page(area, 10);
-        assert_eq!(surface.hover.get(), Some(SettingsControlId(4)));
+        assert_eq!(surface.hover.borrow().as_ref(), Some(&action));
         surface.clear_for_page(area, 11);
-        assert_eq!(surface.hover.get(), None);
+        assert!(surface.hover.borrow().is_none());
     }
 }

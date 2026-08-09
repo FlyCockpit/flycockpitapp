@@ -241,7 +241,7 @@ impl EditorEnv {
     }
 }
 
-fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
+pub(super) fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     SettingsDialog::open(path)
@@ -572,7 +572,7 @@ fn line_text(line: &Line<'static>) -> String {
         .collect()
 }
 
-fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<String> {
+pub(super) fn render_settings_rows(d: &SettingsDialog, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     let mut links = crate::tui::links::LinkRegistry::default();
@@ -622,7 +622,7 @@ fn rendered_char(row: &str, x: u16) -> char {
     row.chars().nth(usize::from(x)).unwrap_or(' ')
 }
 
-fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind,
         column,
@@ -645,10 +645,10 @@ fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
         .find(|target| {
             matches!(
                 target.action,
-                shell::SettingsPointerAction::Page(shell::SettingsControlId(0))
+                shell::SettingsPointerAction::Page(pointer_actions::SettingsPointerAction::Root(_))
             )
         })
-        .copied()
+        .cloned()
         .expect("root's first semantic target");
     assert_eq!(
         dialog.handle_pointer(settings_mouse(

@@ -50,8 +50,8 @@ use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    PointerOperationGate, PointerOperationId, SettingsControlId, SettingsScrollRegionId,
-    push_wrapped_text, selected_line_from_marker, selected_style,
+    PointerOperationGate, PointerOperationId, SettingsScrollRegionId, push_wrapped_text,
+    selected_line_from_marker, selected_style,
 };
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
@@ -785,11 +785,25 @@ impl SettingsCx {
         if let Some(editor) = &p.editing {
             editor.render(frame, area);
             let action_y = area.bottom().saturating_sub(1);
-            for (id, x, width) in [(2000, 0, 6), (2001, 8, 8)] {
+            let agent = super::pointer_actions::AgentId(editor.name.clone());
+            for (action, x, width) in [
+                (
+                    super::pointer_actions::AgentsAction::Save(agent.clone()),
+                    0,
+                    6,
+                ),
+                (
+                    super::pointer_actions::AgentsAction::Cancel(agent.clone()),
+                    8,
+                    8,
+                ),
+            ] {
                 self.pointer_surface
                     .register(super::shell::SettingsPointerTarget {
                         rect: Rect::new(area.x + x, action_y, width, 1),
-                        action: super::shell::SettingsPointerAction::Page(SettingsControlId(id)),
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Agents(action),
+                        ),
                         enabled: true,
                         disabled_reason: None,
                     });
@@ -807,7 +821,19 @@ impl SettingsCx {
         if let Some(detail) = &p.detail {
             self.render_agent_detail(frame, area, detail);
             let action_y = area.bottom().saturating_sub(1);
-            for (id, x, width) in [(2100, 0, 15), (2101, 17, 6)] {
+            let agent = super::pointer_actions::AgentId(detail.name.clone());
+            for (action, x, width) in [
+                (
+                    super::pointer_actions::AgentsAction::OpenRawEditor(agent.clone()),
+                    0,
+                    15,
+                ),
+                (
+                    super::pointer_actions::AgentsAction::Save(agent.clone()),
+                    17,
+                    6,
+                ),
+            ] {
                 self.pointer_surface
                     .register(super::shell::SettingsPointerTarget {
                         rect: Rect::new(
@@ -816,7 +842,9 @@ impl SettingsCx {
                             width.min(area.width.saturating_sub(x)),
                             1,
                         ),
-                        action: super::shell::SettingsPointerAction::Page(SettingsControlId(id)),
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Agents(action),
+                        ),
                         enabled: x < area.width,
                         disabled_reason: (x >= area.width).then_some("control is clipped"),
                     });
@@ -885,13 +913,18 @@ impl SettingsCx {
                 spans.push(Span::styled(format!("  ⚠ {e}"), red));
             }
             lines.push(Line::from(spans));
-            controls.push(Some((SettingsControlId(i as u64), true, None)));
+            let open = super::pointer_actions::SettingsPointerAction::Agents(
+                super::pointer_actions::AgentsAction::Open(super::pointer_actions::AgentId(
+                    row.name.clone(),
+                )),
+            );
+            controls.push(Some((open.clone(), true, None)));
             if let Ok(desc) = &row.detail {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(desc.clone(), muted),
                 ]));
-                controls.push(Some((SettingsControlId(i as u64), true, None)));
+                controls.push(Some((open, true, None)));
             }
         }
 
@@ -906,9 +939,23 @@ impl SettingsCx {
             )));
             controls.push(None);
             lines.push(Line::from("[Reset]"));
-            controls.push(Some((SettingsControlId(2300), true, None)));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::ResetAll,
+                ),
+                true,
+                None,
+            )));
             lines.push(Line::from("[Cancel]"));
-            controls.push(Some((SettingsControlId(2301), true, None)));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
+                        "reset-all".into(),
+                    )),
+                ),
+                true,
+                None,
+            )));
         } else if p.delete.is_pending() || p.reset_one.is_pending() {
             let verb = if p.delete.is_pending() {
                 "Delete"
@@ -924,29 +971,81 @@ impl SettingsCx {
             lines.push(Line::from(format!("{verb} {name}?")));
             controls.push(None);
             lines.push(Line::from(format!("[{verb}]")));
-            controls.push(Some((SettingsControlId(2200), true, None)));
+            let id = super::pointer_actions::AgentId(name.to_string());
+            let action = if p.delete.is_pending() {
+                super::pointer_actions::AgentsAction::Delete(id)
+            } else {
+                super::pointer_actions::AgentsAction::Reset(id)
+            };
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(action),
+                true,
+                None,
+            )));
             lines.push(Line::from("[Cancel]"));
-            controls.push(Some((SettingsControlId(2202), true, None)));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
+                        name.to_string(),
+                    )),
+                ),
+                true,
+                None,
+            )));
         } else {
             lines.push(Line::default());
             controls.push(None);
             lines.push(Line::from("[Open]"));
-            controls.push(Some((SettingsControlId(2201), true, None)));
+            let id = super::pointer_actions::AgentId(
+                p.rows
+                    .get(p.cursor)
+                    .map_or("", |r| r.name.as_str())
+                    .to_string(),
+            );
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Open(id.clone()),
+                ),
+                true,
+                None,
+            )));
             lines.push(Line::from("[Edit raw file]"));
-            controls.push(Some((SettingsControlId(2203), true, None)));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::Edit(id.clone()),
+                ),
+                true,
+                None,
+            )));
             if let Some(kind) = p.rows.get(p.cursor).map(|row| &row.kind) {
-                let (label, id) = match kind {
-                    AgentKind::Custom => ("[Delete]", 2204),
-                    AgentKind::Builtin { overridden: true } => ("[Reset]", 2205),
-                    AgentKind::Builtin { overridden: false } => ("", 0),
+                let (label, action) = match kind {
+                    AgentKind::Custom => (
+                        "[Delete]",
+                        Some(super::pointer_actions::AgentsAction::Delete(id.clone())),
+                    ),
+                    AgentKind::Builtin { overridden: true } => (
+                        "[Reset]",
+                        Some(super::pointer_actions::AgentsAction::Reset(id.clone())),
+                    ),
+                    AgentKind::Builtin { overridden: false } => ("", None),
                 };
-                if id != 0 {
+                if let Some(action) = action {
                     lines.push(Line::from(label));
-                    controls.push(Some((SettingsControlId(id), true, None)));
+                    controls.push(Some((
+                        super::pointer_actions::SettingsPointerAction::Agents(action),
+                        true,
+                        None,
+                    )));
                 }
             }
             lines.push(Line::from("[Reset all]"));
-            controls.push(Some((SettingsControlId(2206), true, None)));
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Agents(
+                    super::pointer_actions::AgentsAction::ResetAll,
+                ),
+                true,
+                None,
+            )));
         }
 
         if let Some(status) = &p.status {
@@ -990,7 +1089,17 @@ impl SettingsCx {
             semantic_rows
                 .into_iter()
                 .filter(|(_, _, enabled)| *enabled)
-                .map(|(line, index, _)| (line, SettingsControlId(index as u64))),
+                .map(|(line, index, _)| {
+                    (
+                        line,
+                        super::pointer_actions::SettingsPointerAction::Agents(
+                            super::pointer_actions::AgentsAction::ToggleTool(
+                                super::pointer_actions::AgentId(detail.name.clone()),
+                                super::pointer_actions::StableRowId(index.to_string()),
+                            ),
+                        ),
+                    )
+                }),
             &self.pointer_surface,
             SettingsScrollRegionId("agents:detail"),
         );
@@ -1050,33 +1159,53 @@ impl SettingsPage for AgentsPage {
         cx.render_agents_page(frame, area, self);
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
-        let index = control.0 as usize;
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Agents(action) = action else {
+            return Nav::Stay;
+        };
         if self.editing.is_some() {
-            return match index {
-                2000 => cx.handle_agents_page_key(
+            return match action {
+                super::pointer_actions::AgentsAction::Save(_) => cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
                     self,
                 ),
-                2001 => {
+                super::pointer_actions::AgentsAction::Cancel(_) => {
                     cx.handle_agents_page_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), self)
                 }
                 _ => Nav::Stay,
             };
         }
-        if self.detail.is_some() && index == 2100 {
+        if self.detail.is_some()
+            && matches!(
+                &action,
+                super::pointer_actions::AgentsAction::OpenRawEditor(_)
+            )
+        {
             return cx.handle_agents_page_key(
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 self,
             );
         }
-        if self.detail.is_some() && index == 2101 {
+        if self.detail.is_some() && matches!(&action, super::pointer_actions::AgentsAction::Save(_))
+        {
             return cx.handle_agents_page_key(
                 KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 self,
             );
         }
         if let Some(detail) = self.detail.as_mut() {
+            let (super::pointer_actions::AgentsAction::ToggleTool(_, row)
+            | super::pointer_actions::AgentsAction::CycleTier(_, row)) = action
+            else {
+                return Nav::Stay;
+            };
+            let Ok(index) = row.0.parse::<usize>() else {
+                return Nav::Stay;
+            };
             if index >= cockpit_core::agents::tool_surface_catalog().len() {
                 return Nav::Stay;
             }
@@ -1084,60 +1213,60 @@ impl SettingsPage for AgentsPage {
             return cx
                 .handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self);
         }
-        match index {
-            2300 if self.confirm_reset => {
+        match &action {
+            super::pointer_actions::AgentsAction::ResetAll if self.confirm_reset => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     self,
                 );
             }
-            2301 if self.confirm_reset => {
+            super::pointer_actions::AgentsAction::Cancel(_) if self.confirm_reset => {
                 self.confirm_reset = false;
                 self.status = Some("reset cancelled".into());
                 return Nav::Stay;
             }
-            2200 if self.delete.is_pending() => {
+            super::pointer_actions::AgentsAction::Delete(_) if self.delete.is_pending() => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
                     self,
                 );
             }
-            2200 if self.reset_one.is_pending() => {
+            super::pointer_actions::AgentsAction::Reset(_) if self.reset_one.is_pending() => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
                     self,
                 );
             }
-            2201 => {
+            super::pointer_actions::AgentsAction::Open(_) => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     self,
                 );
             }
-            2202 => {
+            super::pointer_actions::AgentsAction::Cancel(_) => {
                 self.disarm_guards();
                 self.status = Some("action cancelled".into());
                 return Nav::Stay;
             }
-            2203 => {
+            super::pointer_actions::AgentsAction::Edit(_) => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                     self,
                 );
             }
-            2204 => {
+            super::pointer_actions::AgentsAction::Delete(_) => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
                     self,
                 );
             }
-            2205 => {
+            super::pointer_actions::AgentsAction::Reset(_) => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
                     self,
                 );
             }
-            2206 => {
+            super::pointer_actions::AgentsAction::ResetAll => {
                 return cx.handle_agents_page_key(
                     KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
                     self,
@@ -1145,9 +1274,13 @@ impl SettingsPage for AgentsPage {
             }
             _ => {}
         }
-        if index >= self.rows.len() {
+        let agent = match action {
+            super::pointer_actions::AgentsAction::Open(id) => id,
+            _ => return Nav::Stay,
+        };
+        let Some(index) = self.rows.iter().position(|row| row.name == agent.0) else {
             return Nav::Stay;
-        }
+        };
         self.cursor = index;
         cx.handle_agents_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }

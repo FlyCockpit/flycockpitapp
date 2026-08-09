@@ -24,9 +24,12 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
+use super::pointer_actions::{
+    ListAction, SettingsPointerAction, StableRowId, UtilityModelAction, UtilityModelId,
+};
 use super::shell::{
-    SettingsControlId, SettingsPointerSurface, SettingsScrollRegionId, SettingsScrollStates,
-    push_wrapped_text, selected_line_from_marker,
+    SettingsPointerSurface, SettingsScrollRegionId, SettingsScrollStates, push_wrapped_text,
+    selected_line_from_marker,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -571,7 +574,10 @@ impl SettingsCx {
                     muted,
                 )));
                 let (before, after) = buf.split_at_cursor();
-                bindings.push((lines.len(), SettingsControlId(1000)));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
+                ));
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
@@ -587,9 +593,15 @@ impl SettingsCx {
                         muted,
                     )));
                 }
-                bindings.push((lines.len(), SettingsControlId(1001)));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
+                ));
                 lines.push(Line::from(Span::styled("[Save custom]", muted)));
-                bindings.push((lines.len(), SettingsControlId(1002)));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
+                ));
                 lines.push(Line::from(Span::styled("[Cancel]", muted)));
             }
             PickerMode::List { cursor, scroll } => {
@@ -614,7 +626,10 @@ impl SettingsCx {
                 } else {
                     ""
                 };
-                bindings.push((lines.len(), SettingsControlId(PICKER_CLEAR_ROW as u64)));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
+                ));
                 lines.push(Line::from(vec![
                     Span::raw(if clear_active { "▸ " } else { "  " }),
                     Span::styled(
@@ -622,7 +637,10 @@ impl SettingsCx {
                         action_style(clear_active),
                     ),
                 ]));
-                bindings.push((lines.len(), SettingsControlId(PICKER_CUSTOM_ROW as u64)));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
+                ));
                 lines.push(Line::from(vec![
                     Span::raw(if custom_active { "▸ " } else { "  " }),
                     Span::styled(
@@ -668,7 +686,9 @@ impl SettingsCx {
                     }
                     bindings.push((
                         lines.len(),
-                        SettingsControlId((i + PICKER_ACTION_ROWS) as u64),
+                        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(
+                            UtilityModelId(value.clone()),
+                        )),
                     ));
                     lines.push(Line::from(spans));
                 }
@@ -737,7 +757,11 @@ fn render_grab_list(
                 grabbed.buf.cursor(),
                 empty_hint,
             )));
-            controls.push(Some((SettingsControlId(i as u64), true, None)));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Edit(grab_list_row_id(key, i, item))),
+                true,
+                None,
+            )));
             continue;
         }
         let marker = if on_cursor {
@@ -754,7 +778,11 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(item.clone(), style),
         ]));
-        controls.push(Some((SettingsControlId(i as u64), true, None)));
+        controls.push(Some((
+            SettingsPointerAction::List(ListAction::Edit(grab_list_row_id(key, i, item))),
+            true,
+            None,
+        )));
     }
 
     if grabbed.is_none() {
@@ -774,7 +802,11 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(add_label.to_string(), style),
         ]));
-        controls.push(Some((SettingsControlId(add_idx as u64), true, None)));
+        controls.push(Some((
+            SettingsPointerAction::List(ListAction::Add),
+            true,
+            None,
+        )));
     }
 
     if grabbed.is_some() {
@@ -782,15 +814,26 @@ fn render_grab_list(
         controls.push(None);
         let can_up = cursor > 0;
         let can_down = cursor + 1 < items.len();
-        for (id, label, enabled, reason) in [
-            (1000, "[Move up]", can_up, "already first"),
-            (1001, "[Move down]", can_down, "already last"),
-            (1002, "[Save]", true, ""),
-            (1003, "[Cancel]", true, ""),
+        let row_id = grab_list_row_id(key, cursor, &items[cursor]);
+        for (action, label, enabled, reason) in [
+            (
+                ListAction::MoveUp(row_id.clone()),
+                "[Move up]",
+                can_up,
+                "already first",
+            ),
+            (
+                ListAction::MoveDown(row_id),
+                "[Move down]",
+                can_down,
+                "already last",
+            ),
+            (ListAction::Save, "[Save]", true, ""),
+            (ListAction::Cancel, "[Cancel]", true, ""),
         ] {
             lines.push(Line::from(label));
             controls.push(Some((
-                SettingsControlId(id),
+                SettingsPointerAction::List(action),
                 enabled,
                 (!enabled).then_some(reason),
             )));
@@ -819,6 +862,10 @@ fn render_grab_list(
     );
 }
 
+fn grab_list_row_id(key: &str, index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{key}:{index}:{value}"))
+}
+
 impl SettingsPage for InstructionsPage {
     fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
         super::SettingsPointerSurfaceKind::Instructions
@@ -840,18 +887,40 @@ impl SettingsPage for InstructionsPage {
         cx.render_instructions_page(frame, area, self);
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
         if self.grabbed.is_some() {
-            let key = match control.0 {
-                1000 => KeyCode::Up,
-                1001 => KeyCode::Down,
-                1002 => KeyCode::Enter,
-                1003 => KeyCode::Esc,
+            let current = cx
+                .extended
+                .agent_guidance_files
+                .get(self.cursor)
+                .map(|value| grab_list_row_id("instructions", self.cursor, value));
+            let key = match action {
+                ListAction::MoveUp(id) if current.as_ref() == Some(&id) => KeyCode::Up,
+                ListAction::MoveDown(id) if current.as_ref() == Some(&id) => KeyCode::Down,
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
                 _ => return Nav::Stay,
             };
             return cx.handle_instructions_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
-        let index = control.0 as usize;
+        let index = match action {
+            ListAction::Add => cx.extended.agent_guidance_files.len(),
+            ListAction::Edit(id) => cx
+                .extended
+                .agent_guidance_files
+                .iter()
+                .enumerate()
+                .position(|(index, value)| grab_list_row_id("instructions", index, value) == id)
+                .unwrap_or(usize::MAX),
+            _ => return Nav::Stay,
+        };
         if index > cx.extended.agent_guidance_files.len() {
             return Nav::Stay;
         }
@@ -922,19 +991,43 @@ impl SettingsPage for RedactPatternsPage {
         cx.render_redact_patterns_page(frame, area, self);
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
         if self.grabbed.is_some() {
-            let key = match control.0 {
-                1000 => KeyCode::Up,
-                1001 => KeyCode::Down,
-                1002 => KeyCode::Enter,
-                1003 => KeyCode::Esc,
+            let current = cx
+                .extended
+                .redact
+                .dotenv_patterns
+                .get(self.cursor)
+                .map(|value| grab_list_row_id("redact-patterns", self.cursor, value));
+            let key = match action {
+                ListAction::MoveUp(id) if current.as_ref() == Some(&id) => KeyCode::Up,
+                ListAction::MoveDown(id) if current.as_ref() == Some(&id) => KeyCode::Down,
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
                 _ => return Nav::Stay,
             };
             return cx
                 .handle_redact_patterns_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
-        let index = control.0 as usize;
+        let index = match action {
+            ListAction::Add => cx.extended.redact.dotenv_patterns.len(),
+            ListAction::Edit(id) => cx
+                .extended
+                .redact
+                .dotenv_patterns
+                .iter()
+                .enumerate()
+                .position(|(index, value)| grab_list_row_id("redact-patterns", index, value) == id)
+                .unwrap_or(usize::MAX),
+            _ => return Nav::Stay,
+        };
         if index > cx.extended.redact.dotenv_patterns.len() {
             return Nav::Stay;
         }

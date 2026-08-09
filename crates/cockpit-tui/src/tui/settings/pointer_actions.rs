@@ -114,6 +114,17 @@ pub(super) enum SettingsPointerAction {
     Lsp(LspAction),
     List(ListAction),
     UtilityModel(UtilityModelAction),
+    DefaultModel(DefaultModelAction),
+}
+
+impl From<super::shell::SettingsControlId> for SettingsPointerAction {
+    fn from(value: super::shell::SettingsControlId) -> Self {
+        Self::Providers(ProvidersAction::RowEditor(
+            StableRowId("provider-page".to_string()),
+            StableRowId("control".to_string()),
+            StableRowId(value.0.to_string()),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -193,6 +204,7 @@ pub(super) enum SkillsAction {
     AddScanDirectory,
     EditScanDirectory(StableRowId),
     DeleteScanDirectory(StableRowId),
+    ConfirmDeleteScanDirectory(StableRowId, ConfirmationChoice),
     Reset,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -302,4 +314,10 @@ pub(super) enum UtilityModelAction {
     EditCustom,
     CommitCustom,
     CancelCustom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum DefaultModelAction {
+    Choose,
+    Clear,
 }

@@ -4477,8 +4477,20 @@ impl SettingsPage for ProvidersPage {
         cx.render_providers_page(frame, area, self, Some(links));
     }
 
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
-        let index = control.0 as usize;
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Providers(
+            super::pointer_actions::ProvidersAction::RowEditor(_, _, control),
+        ) = action
+        else {
+            return Nav::Stay;
+        };
+        let Ok(index) = control.0.parse::<usize>() else {
+            return Nav::Stay;
+        };
         if matches!(
             self,
             ProvidersPage::List {
@@ -4636,17 +4648,25 @@ impl SettingsPage for ProvidersPage {
     fn handle_pointer_control_at(
         &mut self,
         cx: &mut SettingsCx,
-        control: SettingsControlId,
+        action: super::pointer_actions::SettingsPointerAction,
         column: u16,
         _row: u16,
     ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Providers(
+            super::pointer_actions::ProvidersAction::RowEditor(_, _, control),
+        ) = &action
+        else {
+            return Nav::Stay;
+        };
         if let ProvidersPage::Add(state) = self {
             let (label, field): (&str, &mut TextField) = match state.run.current_step_id() {
                 Some("id") => ("id", &mut state.id_field),
                 Some("url") => ("url", &mut state.url_field),
                 Some("api-key") => ("api key", state.api_key_field.as_mut()),
                 Some("env-var") => ("env var", state.env_var_field.as_mut()),
-                _ => return self.handle_pointer_control(cx, control),
+                _ => {
+                    return self.handle_pointer_control(cx, action);
+                }
             };
             let value_x = cx
                 .pointer_surface
@@ -4658,7 +4678,7 @@ impl SettingsPage for ProvidersPage {
             field.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
             return Nav::Stay;
         }
-        self.handle_pointer_control(cx, control)
+        self.handle_pointer_control(cx, action)
     }
 
     fn handle_pointer_scroll(

@@ -50,10 +50,9 @@ use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingSto
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
-    PointerOperationGate, PointerOperationId, SettingsControlId, SettingsPointerAction,
-    SettingsPointerSurface, SettingsPointerTarget, TextColumnLayout, heading_style, muted_style,
-    push_label_text_field_row, push_label_value_row, push_wrapped_text, selected_style,
-    settings_text_columns, warning_style,
+    PointerOperationGate, PointerOperationId, SettingsPointerAction, SettingsPointerSurface,
+    SettingsPointerTarget, TextColumnLayout, heading_style, muted_style, push_label_text_field_row,
+    push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -1345,7 +1344,13 @@ impl CategoryPathEditor {
                     .saturating_sub(field_x.min(u16::MAX as usize) as u16),
                 1,
             ),
-            action: SettingsPointerAction::Page(SettingsControlId(1100)),
+            action: SettingsPointerAction::Page(
+                super::pointer_actions::SettingsPointerAction::Category(
+                    super::pointer_actions::CategoryAction::PathEditBegin(category_pointer_id(
+                        self.id,
+                    )),
+                ),
+            ),
             enabled: true,
             disabled_reason: None,
         });
@@ -1387,7 +1392,14 @@ impl CategoryPathEditor {
                         area.width,
                         1,
                     ),
-                    action: SettingsPointerAction::Page(SettingsControlId(1200 + i as u64)),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::SuggestionSelect(
+                                category_pointer_id(self.id),
+                                super::pointer_actions::StableRowId(entry.replacement.clone()),
+                            ),
+                        ),
+                    ),
                     enabled: true,
                     disabled_reason: None,
                 });
@@ -1410,7 +1422,22 @@ impl CategoryPathEditor {
             Span::styled("[Cancel]", selected_style()),
             Span::styled("  tab: accept  right: complete", muted_style()),
         ]));
-        for (id, x, width) in [(1300, 0, 6), (1301, 8, 8)] {
+        for (action, x, width) in [
+            (
+                super::pointer_actions::CategoryAction::PathEditCommit(category_pointer_id(
+                    self.id,
+                )),
+                0,
+                6,
+            ),
+            (
+                super::pointer_actions::CategoryAction::PathEditCancel(category_pointer_id(
+                    self.id,
+                )),
+                8,
+                8,
+            ),
+        ] {
             surface.register(SettingsPointerTarget {
                 rect: Rect::new(
                     area.x + x,
@@ -1418,7 +1445,9 @@ impl CategoryPathEditor {
                     width,
                     1,
                 ),
-                action: SettingsPointerAction::Page(SettingsControlId(id)),
+                action: SettingsPointerAction::Page(
+                    super::pointer_actions::SettingsPointerAction::Category(action),
+                ),
                 enabled: true,
                 disabled_reason: None,
             });
@@ -1433,6 +1462,19 @@ fn path_setting_mode(id: SettingId) -> Option<PathSuggestMode> {
         SettingId::SandboxDockerfile => Some(PathSuggestMode::FilesAndDirectories),
         _ => None,
     }
+}
+
+fn category_pointer_id(id: SettingId) -> super::pointer_actions::SettingId {
+    super::pointer_actions::SettingId(
+        ALL_SETTING_IDS
+            .iter()
+            .position(|candidate| *candidate == id)
+            .expect("every category setting is sealed in ALL_SETTING_IDS") as u64,
+    )
+}
+
+fn category_setting_from_pointer(id: super::pointer_actions::SettingId) -> Option<SettingId> {
+    ALL_SETTING_IDS.get(id.0 as usize).copied()
 }
 
 /// Full-area editor for long text and JSON category settings.
@@ -3197,10 +3239,27 @@ impl SettingsCx {
         if let Some(editor) = &p.text_editor {
             editor.render(frame, area);
             let action_y = area.bottom().saturating_sub(1);
-            for (id, x, width) in [(1400, 0, 6), (1401, 8, 8)] {
+            for (action, x, width) in [
+                (
+                    super::pointer_actions::CategoryAction::TextEditorSave(category_pointer_id(
+                        editor.id,
+                    )),
+                    0,
+                    6,
+                ),
+                (
+                    super::pointer_actions::CategoryAction::TextEditorCancel(category_pointer_id(
+                        editor.id,
+                    )),
+                    8,
+                    8,
+                ),
+            ] {
                 self.pointer_surface.register(SettingsPointerTarget {
                     rect: Rect::new(area.x + x, action_y, width, 1),
-                    action: SettingsPointerAction::Page(SettingsControlId(id)),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(action),
+                    ),
                     enabled: true,
                     disabled_reason: None,
                 });
@@ -3292,9 +3351,22 @@ impl SettingsCx {
                             muted_style(),
                         );
                     }
+                    let action = if p.editing == Some(*id) {
+                        super::pointer_actions::CategoryAction::InlineEditBegin(
+                            category_pointer_id(*id),
+                        )
+                    } else {
+                        super::pointer_actions::CategoryAction::DescriptorActivate(
+                            category_pointer_id(*id),
+                        )
+                    };
                     controls.resize(
                         lines.len(),
-                        Some((super::shell::SettingsControlId(sel as u64), true, None)),
+                        Some((
+                            super::pointer_actions::SettingsPointerAction::Category(action),
+                            true,
+                            None,
+                        )),
                     );
                     debug_assert!(lines.len() > before);
                     sel += 1;
@@ -3313,7 +3385,9 @@ impl SettingsCx {
                     .render_line(Some(p.cursor) == p.reset_cursor(), label),
             );
             controls.push(Some((
-                super::shell::SettingsControlId(sel as u64),
+                super::pointer_actions::SettingsPointerAction::Category(
+                    super::pointer_actions::CategoryAction::Reset,
+                ),
                 true,
                 None,
             )));
@@ -3453,112 +3527,215 @@ impl SettingsPage for CategoryPage {
     fn handle_pointer_control(
         &mut self,
         cx: &mut SettingsCx,
-        control: super::shell::SettingsControlId,
+        action: super::pointer_actions::SettingsPointerAction,
     ) -> Nav {
-        let index = control.0 as usize;
-        if self.path_editor.is_some() {
-            match index {
-                1100 => return Nav::Stay,
-                1200..=1299 => {
-                    let suggestion = index - 1200;
-                    if let Some(editor) = self.path_editor.as_mut()
-                        && suggestion < editor.suggest.entries.len()
-                    {
-                        editor.suggest.selected = suggestion;
-                        return cx.handle_category_page_key(
-                            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        use super::pointer_actions::{CategoryAction, SettingsPointerAction, UtilityModelAction};
+        match action {
+            SettingsPointerAction::Category(action) => match action {
+                CategoryAction::PathEditBegin(_) => Nav::Stay,
+                CategoryAction::SuggestionSelect(id, row) => {
+                    let Some(editor) = self.path_editor.as_mut() else {
+                        return Nav::Stay;
+                    };
+                    if category_pointer_id(editor.id) != id {
+                        return Nav::Stay;
+                    }
+                    let Some(index) = editor
+                        .suggest
+                        .entries
+                        .iter()
+                        .position(|entry| entry.replacement == row.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    editor.suggest.selected = index;
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::PathEditCommit(id)
+                    if self
+                        .path_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::PathEditCancel(id)
+                    if self
+                        .path_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::TextEditorSave(id)
+                    if self
+                        .text_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                        self,
+                    )
+                }
+                CategoryAction::TextEditorCancel(id)
+                    if self
+                        .text_editor
+                        .as_ref()
+                        .is_some_and(|editor| category_pointer_id(editor.id) == id) =>
+                {
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::DescriptorActivate(id) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    let Some(index) = self
+                        .setting_ids()
+                        .iter()
+                        .position(|candidate| *candidate == setting)
+                    else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditBegin(id) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    if self.editing != Some(setting) {
+                        return Nav::Stay;
+                    }
+                    self.cursor = self
+                        .setting_ids()
+                        .iter()
+                        .position(|candidate| *candidate == setting)
+                        .unwrap_or(self.cursor);
+                    Nav::Stay
+                }
+                CategoryAction::Reset => {
+                    let Some(index) = self.reset_cursor() else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    )
+                }
+                CategoryAction::InlineEditCommit(_)
+                | CategoryAction::InlineEditCancel(_)
+                | CategoryAction::PickerSelect(_, _)
+                | CategoryAction::Confirm(_, _)
+                | CategoryAction::ExternalEditBegin(_, _)
+                | CategoryAction::ExternalEditResult(_, _)
+                | CategoryAction::PathEditCommit(_)
+                | CategoryAction::PathEditCancel(_)
+                | CategoryAction::TextEditorSave(_)
+                | CategoryAction::TextEditorCancel(_) => Nav::Stay,
+            },
+            SettingsPointerAction::UtilityModel(action) => {
+                let Some(picker) = self.utility_picker.as_mut() else {
+                    return Nav::Stay;
+                };
+                use super::ui_page::{
+                    PICKER_ACTION_ROWS, PICKER_CLEAR_ROW, PICKER_CUSTOM_ROW, PickerMode,
+                };
+                match (&mut picker.mode, action) {
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::Clear) => {
+                        *cursor = PICKER_CLEAR_ROW
+                    }
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::OpenCustom) => {
+                        *cursor = PICKER_CUSTOM_ROW
+                    }
+                    (PickerMode::List { cursor, .. }, UtilityModelAction::Select(id)) => {
+                        let Some(index) = picker
+                            .entries
+                            .iter()
+                            .position(|entry| entry.value() == id.0)
+                        else {
+                            return Nav::Stay;
+                        };
+                        *cursor = PICKER_ACTION_ROWS + index;
+                    }
+                    (PickerMode::Custom { .. }, UtilityModelAction::EditCustom) => {
+                        return Nav::Stay;
+                    }
+                    (PickerMode::Custom { .. }, UtilityModelAction::CommitCustom) => {
+                        return cx.handle_category_utility_picker_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                             self,
                         );
                     }
-                    return Nav::Stay;
-                }
-                1300 => {
-                    return cx.handle_category_page_key(
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        self,
-                    );
-                }
-                1301 => {
-                    return cx.handle_category_page_key(
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        self,
-                    );
-                }
-                _ => return Nav::Stay,
-            }
-        }
-        if self.text_editor.is_some() {
-            return match index {
-                1400 => cx.handle_category_page_key(
-                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-                    self,
-                ),
-                1401 => cx.handle_category_page_key(
-                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                    self,
-                ),
-                _ => Nav::Stay,
-            };
-        }
-        if let Some(picker) = self.utility_picker.as_mut() {
-            use super::ui_page::{PICKER_ACTION_ROWS, PickerMode};
-            match &mut picker.mode {
-                PickerMode::List { cursor, .. } => {
-                    if index >= PICKER_ACTION_ROWS + picker.entries.len() {
-                        return Nav::Stay;
+                    (PickerMode::Custom { .. }, UtilityModelAction::CancelCustom)
+                    | (_, UtilityModelAction::Back) => {
+                        return cx.handle_category_utility_picker_key(
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            self,
+                        );
                     }
-                    *cursor = index;
-                    cx.handle_category_utility_picker_key(
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        self,
-                    );
+                    _ => return Nav::Stay,
                 }
-                PickerMode::Custom { .. } => match index {
-                    1000 => {}
-                    1001 => cx.handle_category_utility_picker_key(
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        self,
-                    ),
-                    1002 => cx.handle_category_utility_picker_key(
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        self,
-                    ),
-                    _ => {}
-                },
+                cx.handle_category_utility_picker_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                );
+                Nav::Stay
             }
-            return Nav::Stay;
+            _ => Nav::Stay,
         }
-        if index >= self.nav_len() {
-            return Nav::Stay;
-        }
-        self.cursor = index;
-        cx.handle_category_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }
 
     fn handle_pointer_control_at(
         &mut self,
         cx: &mut SettingsCx,
-        control: super::shell::SettingsControlId,
+        action: super::pointer_actions::SettingsPointerAction,
         column: u16,
         _row: u16,
     ) -> Nav {
-        if control.0 == 1100
-            && let Some(editor) = self.path_editor.as_mut()
+        if matches!(
+            action,
+            super::pointer_actions::SettingsPointerAction::Category(
+                super::pointer_actions::CategoryAction::PathEditBegin(_)
+            )
+        ) && let Some(editor) = self.path_editor.as_mut()
         {
             let field_x = cx
                 .pointer_surface
                 .targets
                 .borrow()
                 .iter()
-                .find(|target| target.action == super::shell::SettingsPointerAction::Page(control))
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
                 .map_or(column, |target| target.rect.x);
             editor
                 .buf
                 .set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
             return Nav::Stay;
         }
-        if control.0 == 1000
-            && let Some(picker) = self.utility_picker.as_mut()
+        if matches!(
+            action,
+            super::pointer_actions::SettingsPointerAction::UtilityModel(
+                super::pointer_actions::UtilityModelAction::EditCustom
+            )
+        ) && let Some(picker) = self.utility_picker.as_mut()
             && let super::ui_page::PickerMode::Custom { buf } = &mut picker.mode
         {
             let value_x = cx
@@ -3569,7 +3746,7 @@ impl SettingsPage for CategoryPage {
             buf.set_cursor_display_col(usize::from(column.saturating_sub(value_x)));
             return Nav::Stay;
         }
-        self.handle_pointer_control(cx, control)
+        self.handle_pointer_control(cx, action)
     }
 
     fn handle_pointer_scroll(

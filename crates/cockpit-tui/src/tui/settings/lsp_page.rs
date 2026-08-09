@@ -9,6 +9,9 @@ use ratatui::text::{Line, Span};
 use crate::tui::textfield::TextField;
 use cockpit_core::daemon::proto::{LspControlAction, Request};
 
+use super::pointer_actions::{
+    LspAction as PointerLspAction, LspEdit as PointerLspEdit, LspServerId, SettingsPointerAction,
+};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{self, marker, muted_style, selected_or_field};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -57,7 +60,16 @@ pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
 ];
 
 pub(super) const LSP_SERVER_ROW_START: usize = LSP_NAV_ROWS.len();
-const POINTER_SERVER_ACTION_BASE: u64 = 10_000;
+
+fn pointer_edit(edit: LspEdit) -> PointerLspEdit {
+    match edit {
+        LspEdit::OtherFilesLimit => PointerLspEdit::OtherFilesLimit,
+        LspEdit::PerFileLimit => PointerLspEdit::PerFileLimit,
+        LspEdit::DebounceMs => PointerLspEdit::DebounceMs,
+        LspEdit::DocumentTimeoutMs => PointerLspEdit::DocumentTimeoutMs,
+        LspEdit::WorkspaceTimeoutMs => PointerLspEdit::WorkspaceTimeoutMs,
+    }
+}
 
 fn lsp_row_for_cursor(cursor: usize) -> LspRow {
     LSP_NAV_ROWS
@@ -249,21 +261,32 @@ impl SettingsPage for LspPage {
     fn handle_pointer_control(
         &mut self,
         cx: &mut SettingsCx,
-        control: shell::SettingsControlId,
+        action: SettingsPointerAction,
     ) -> Nav {
-        if control.0 >= POINTER_SERVER_ACTION_BASE {
-            let encoded = control.0 - POINTER_SERVER_ACTION_BASE;
-            let server_idx = (encoded / 4) as usize;
-            let action = match encoded % 4 {
-                0 => LspControlAction::Check,
-                1 => LspControlAction::Install,
-                2 => LspControlAction::Uninstall,
-                3 => LspControlAction::Restart,
-                _ => return Nav::Stay,
+        let SettingsPointerAction::Lsp(action) = action else {
+            return Nav::Stay;
+        };
+        let server_action = match &action {
+            PointerLspAction::Check(id) => Some((id, LspControlAction::Check)),
+            PointerLspAction::Install(id) => Some((id, LspControlAction::Install)),
+            PointerLspAction::Uninstall(id) => Some((id, LspControlAction::Uninstall)),
+            PointerLspAction::Restart(id) => Some((id, LspControlAction::Restart)),
+            _ => None,
+        };
+        if let Some((LspServerId(id), control_action)) = server_action {
+            let Some(cwd) = cx.project_context().project_root().cloned() else {
+                return Nav::Stay;
+            };
+            let Some(server_idx) =
+                cockpit_core::daemon::lsp::builtin_server_views(&cwd, &cx.extended)
+                    .iter()
+                    .position(|server| &server.id == id)
+            else {
+                return Nav::Stay;
             };
             self.cursor = LSP_SERVER_ROW_START + server_idx;
             self.reset.disarm();
-            cx.queue_lsp_action(server_idx, action, self);
+            cx.queue_lsp_action(server_idx, control_action, self);
             return Nav::Stay;
         }
         let row_count = LSP_SERVER_ROW_START
@@ -271,10 +294,31 @@ impl SettingsPage for LspPage {
                 .project_root()
                 .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
                 .unwrap_or(1);
-        let index = control.0 as usize;
-        if index >= row_count {
-            return Nav::Stay;
-        }
+        let index = match action {
+            PointerLspAction::ToggleEnabled => row_index(LspRow::Enabled),
+            PointerLspAction::CycleAutoInstall => row_index(LspRow::AutoInstall),
+            PointerLspAction::ToggleDiagnostics => row_index(LspRow::Diagnostics),
+            PointerLspAction::Edit(edit) | PointerLspAction::SaveEdit(edit) => match edit {
+                PointerLspEdit::OtherFilesLimit => row_index(LspRow::OtherFilesLimit),
+                PointerLspEdit::PerFileLimit => row_index(LspRow::PerFileLimit),
+                PointerLspEdit::DebounceMs => row_index(LspRow::DebounceMs),
+                PointerLspEdit::DocumentTimeoutMs => row_index(LspRow::DocumentTimeoutMs),
+                PointerLspEdit::WorkspaceTimeoutMs => row_index(LspRow::WorkspaceTimeoutMs),
+            },
+            PointerLspAction::CancelEdit(edit) => {
+                if self.editing.map(pointer_edit) == Some(edit) {
+                    self.editing = None;
+                    self.buf = TextField::default();
+                }
+                return Nav::Stay;
+            }
+            PointerLspAction::Reset => row_index(LspRow::Reset),
+            PointerLspAction::Check(_)
+            | PointerLspAction::Install(_)
+            | PointerLspAction::Uninstall(_)
+            | PointerLspAction::Restart(_) => return Nav::Stay,
+        };
+        debug_assert!(index < row_count);
         self.cursor = index;
         self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     }
@@ -578,10 +622,34 @@ impl SettingsCx {
                     cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended).len()
                 })
                 .unwrap_or(1);
+        let servers = self
+            .project_context()
+            .project_root()
+            .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended));
         let bindings = (0..row_count).map(|cursor| {
+            let action = match lsp_row_for_cursor(cursor) {
+                LspRow::Enabled => PointerLspAction::ToggleEnabled,
+                LspRow::AutoInstall => PointerLspAction::CycleAutoInstall,
+                LspRow::Diagnostics => PointerLspAction::ToggleDiagnostics,
+                LspRow::OtherFilesLimit => PointerLspAction::Edit(PointerLspEdit::OtherFilesLimit),
+                LspRow::PerFileLimit => PointerLspAction::Edit(PointerLspEdit::PerFileLimit),
+                LspRow::DebounceMs => PointerLspAction::Edit(PointerLspEdit::DebounceMs),
+                LspRow::DocumentTimeoutMs => {
+                    PointerLspAction::Edit(PointerLspEdit::DocumentTimeoutMs)
+                }
+                LspRow::WorkspaceTimeoutMs => {
+                    PointerLspAction::Edit(PointerLspEdit::WorkspaceTimeoutMs)
+                }
+                LspRow::Reset => PointerLspAction::Reset,
+                LspRow::Server(index) => servers
+                    .as_ref()
+                    .and_then(|items| items.get(index))
+                    .map(|server| PointerLspAction::Check(LspServerId(server.id.clone())))
+                    .unwrap_or_else(|| PointerLspAction::Check(LspServerId("unavailable".into()))),
+            };
             (
                 lsp_selected_line_for_cursor(cursor),
-                shell::SettingsControlId(cursor as u64),
+                SettingsPointerAction::Lsp(action),
             )
         });
         self.scroll_states.render_bound_lines(
@@ -597,6 +665,9 @@ impl SettingsCx {
         let offset = self.scroll_states.offset_for("lsp");
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
         for server_idx in 0..server_count {
+            let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
+                continue;
+            };
             let line = lsp_selected_line_for_cursor(LSP_SERVER_ROW_START + server_idx);
             let Some(screen_row) = line.checked_sub(offset) else {
                 continue;
@@ -605,7 +676,24 @@ impl SettingsCx {
                 continue;
             }
             let y = area.y.saturating_add(screen_row as u16);
-            for (action, (x, width)) in [(0, (26, 7)), (1, (34, 9)), (2, (44, 11)), (3, (56, 9))] {
+            for (action, (x, width)) in [
+                (
+                    PointerLspAction::Check(LspServerId(server.id.clone())),
+                    (26, 7),
+                ),
+                (
+                    PointerLspAction::Install(LspServerId(server.id.clone())),
+                    (34, 9),
+                ),
+                (
+                    PointerLspAction::Uninstall(LspServerId(server.id.clone())),
+                    (44, 11),
+                ),
+                (
+                    PointerLspAction::Restart(LspServerId(server.id.clone())),
+                    (56, 9),
+                ),
+            ] {
                 if x >= area.width {
                     continue;
                 }
@@ -616,9 +704,7 @@ impl SettingsCx {
                         width.min(area.width.saturating_sub(x)),
                         1,
                     ),
-                    action: shell::SettingsPointerAction::Page(shell::SettingsControlId(
-                        POINTER_SERVER_ACTION_BASE + (server_idx as u64 * 4) + action,
-                    )),
+                    action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(action)),
                     enabled: true,
                     disabled_reason: None,
                 });

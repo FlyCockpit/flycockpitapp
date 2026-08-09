@@ -137,7 +137,7 @@ async fn at_suggestion_failure_is_terminal() {
         AsyncActionPolicy::AllowConcurrent,
         async { Err("walk failed".to_string()) },
     );
-    tokio::task::yield_now().await;
+    app.async_actions.notifier().notified().await;
     app.drain_async_actions();
 
     assert!(!app.at_suggestions_loading);

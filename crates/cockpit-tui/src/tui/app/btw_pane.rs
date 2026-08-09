@@ -1609,7 +1609,7 @@ mod tests {
                 )
             },
         );
-        tokio::task::yield_now().await;
+        app.async_actions.notifier().notified().await;
         app.drain_async_actions();
 
         assert!(app.btw_pane.is_none());

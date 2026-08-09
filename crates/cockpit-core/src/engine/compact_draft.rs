@@ -4,7 +4,7 @@
 //! can therefore classify and fit a request before inference without risking
 //! a partial compaction commit.
 
-use rig::message::Message;
+use rig::message::{Message, ToolResultContent, UserContent};
 
 use super::driver::wire_token_total;
 
@@ -191,6 +191,7 @@ pub(crate) fn fit_compact_request(
         });
     }
     fit_whole_exchange_suffix(history, budget.history_allowance())
+        .or_else(|| truncate_newest_exchange_to_fit(history, budget.history_allowance()))
         .ok_or_else(|| "newest complete exchange does not fit the compact model".to_string())
 }
 
@@ -248,9 +249,97 @@ pub(crate) fn next_smaller_whole_exchange_fit(history: &[Message]) -> Option<Fit
     })
 }
 
+fn utf8_prefix(text: &str, byte_cap: usize) -> &str {
+    let mut end = byte_cap.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn truncate_tool_payloads(history: &[Message], byte_cap: usize) -> (Vec<Message>, bool) {
+    let mut output = history.to_vec();
+    let mut changed = false;
+    for message in &mut output {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for part in content.iter_mut() {
+            let UserContent::ToolResult(result) = part else {
+                continue;
+            };
+            for payload in result.content.iter_mut() {
+                let ToolResultContent::Text(text) = payload else {
+                    continue;
+                };
+                if text.text.len() <= byte_cap {
+                    continue;
+                }
+                let retained = utf8_prefix(&text.text, byte_cap);
+                let omitted = text.text.len().saturating_sub(retained.len());
+                text.text = format!(
+                    "{retained}\n[compaction omitted {omitted} bytes from this tool result]"
+                );
+                changed = true;
+            }
+        }
+    }
+    (output, changed)
+}
+
+/// Fit only the newest complete exchange by shortening tool-result text.
+/// Tool IDs, calls, arguments, ordering, and non-text content remain intact.
+pub(crate) fn truncate_newest_exchange_to_fit(
+    history: &[Message],
+    allowance: u64,
+) -> Option<FittedCompactHistory> {
+    let range = super::compact::complete_exchange_ranges(history).pop()?;
+    let exchange = &history[range];
+    let max_payload = exchange
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|part| match part {
+            UserContent::ToolResult(result) => Some(&result.content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|payload| match payload {
+            ToolResultContent::Text(text) => Some(text.text.len()),
+            _ => None,
+        })
+        .max()?;
+
+    let mut low = 0_usize;
+    let mut high = max_payload;
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let (candidate, changed) = truncate_tool_payloads(exchange, mid);
+        if changed && wire_token_total(&candidate) <= allowance {
+            best = Some(candidate);
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best.map(|history| FittedCompactHistory {
+        history,
+        rung: CompactFitRung::ToolResultTruncated,
+        coverage: CompactInputCoverage::Partial,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig::OneOrMany;
+    use rig::message::{AssistantContent, ToolCall, ToolFunction, ToolResult};
 
     #[test]
     fn context_overflow_variants_are_narrow_and_case_insensitive() {
@@ -348,5 +437,39 @@ mod tests {
         assert_eq!(fitted.history, history);
         assert_eq!(fitted.rung, CompactFitRung::Verbatim);
         assert_eq!(fitted.coverage, CompactInputCoverage::Full);
+    }
+
+    #[test]
+    fn compact_tool_result_truncation_preserves_pair_metadata() {
+        let call = Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "call-1".into(),
+                call_id: Some("provider-call-1".into()),
+                function: ToolFunction {
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "large.json"}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        };
+        let result = Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "call-1".into(),
+                call_id: Some("provider-call-1".into()),
+                content: OneOrMany::one(ToolResultContent::text("x".repeat(4_000))),
+            })),
+        };
+        let history = vec![Message::user("inspect it"), call.clone(), result];
+        let allowance = wire_token_total(&history).saturating_sub(100);
+        let fitted = truncate_newest_exchange_to_fit(&history, allowance).unwrap();
+        assert_eq!(fitted.rung, CompactFitRung::ToolResultTruncated);
+        assert_eq!(fitted.history[1], call);
+        let serialized = serde_json::to_string(&fitted.history).unwrap();
+        assert!(serialized.contains("compaction omitted"));
+        assert!(serialized.contains("call-1"));
+        assert!(serialized.contains("provider-call-1"));
+        assert!(serialized.contains("large.json"));
     }
 }

@@ -94,4 +94,21 @@ describe("browser terminal paste source contracts", () => {
     expect(nodeConfig).toContain("passWithNoTests: false");
     expect(workflow).toContain("pnpm --filter web exec playwright install --with-deps chromium");
   });
+
+  it("browser_terminal_listener_targets_xterm_textarea_capture_phase", () => {
+    const root = resolve(import.meta.dirname, "../../../..");
+    const hook = readFileSync(resolve(root, "apps/web/src/hooks/use-browser-terminal.ts"), "utf8");
+    const interceptor = readFileSync(
+      resolve(root, "apps/web/src/hooks/browser-terminal-paste.ts"),
+      "utf8",
+    );
+    expect(hook).toContain("const textarea = terminal.textarea");
+    expect(hook.indexOf("terminal.open(element)")).toBeLessThan(
+      hook.indexOf("installTerminalPasteInterceptor"),
+    );
+    expect(hook.indexOf("installTerminalPasteInterceptor")).toBeLessThan(
+      hook.indexOf("client.connect()"),
+    );
+    expect(interceptor).toContain("event.stopImmediatePropagation()");
+  });
 });

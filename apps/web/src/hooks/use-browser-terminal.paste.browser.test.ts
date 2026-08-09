@@ -76,6 +76,24 @@ describe("browser terminal native paste ownership", () => {
     cleanup();
   });
 
+  it("browser_terminal_structural_paste_wins_over_text_caption", () => {
+    const { textarea, cleanup } = openTerminal();
+    const ingress = vi.fn();
+    const remove = installTerminalPasteInterceptor(textarea, ingress);
+    const data = new DataTransfer();
+    const file = new File(["image"], "screen.png", { type: "image/png" });
+    data.items.add(file);
+    data.setData("text/plain", "caption");
+    const getData = vi.spyOn(data, "getData");
+
+    textarea.dispatchEvent(pasteEvent(data));
+
+    expect(getData).not.toHaveBeenCalled();
+    expect(ingress).toHaveBeenCalledWith([file]);
+    remove();
+    cleanup();
+  });
+
   it("browser_terminal_paste_listener_attaches_and_cleans_up_once", () => {
     const { textarea, cleanup } = openTerminal();
     const first = vi.fn();

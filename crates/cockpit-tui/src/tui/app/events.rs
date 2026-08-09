@@ -542,8 +542,7 @@ impl App {
                         if let Some(fence) = self.submission_fences.remove(id) {
                             self.submission_order.cancel(fence.fence_sequence);
                         }
-                        self.pending_paste_probes
-                            .retain(|_, probe| probe.owner_fence != Some(*id));
+                        self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(*id));
                     }
                     if !cancelled.is_empty() {
                         self.show_toast("Paste unavailable", ToastKind::Error);

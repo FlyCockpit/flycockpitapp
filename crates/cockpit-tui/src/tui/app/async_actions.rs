@@ -31,6 +31,23 @@ fn floor_char_boundary(text: &str, requested: usize) -> usize {
 }
 
 impl App {
+    pub(super) fn cancel_paste_probes_matching(
+        &mut self,
+        mut predicate: impl FnMut(&PendingPasteProbe) -> bool,
+    ) {
+        let cancelled = self
+            .pending_paste_probes
+            .iter()
+            .filter_map(|(id, probe)| predicate(probe).then_some((*id, probe.async_action_id)))
+            .collect::<Vec<_>>();
+        for (id, action_id) in cancelled {
+            if let Some(action_id) = action_id {
+                self.async_actions.abort_id(action_id);
+            }
+            self.pending_paste_probes.remove(&id);
+        }
+    }
+
     pub(super) fn expire_pending_paste_probes(&mut self) -> bool {
         let expired = self
             .pending_paste_probes
@@ -40,10 +57,14 @@ impl App {
                     *id,
                     probe.request.paste_generation,
                     probe.source_draft_generation,
+                    probe.async_action_id,
                 ))
             })
             .collect::<Vec<_>>();
-        for (id, generation, draft_generation) in &expired {
+        for (id, generation, draft_generation, action_id) in &expired {
+            if let Some(action_id) = action_id {
+                self.async_actions.abort_id(*action_id);
+            }
             self.settle_paste_probe(*id, *generation, *draft_generation, 0, None, true);
         }
         !expired.is_empty()

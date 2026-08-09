@@ -333,6 +333,7 @@ pub(crate) struct PendingPasteProbe {
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,
     pub deadline: std::time::Duration,
+    pub async_action_id: Option<crate::tui::async_action::AsyncActionId>,
 }
 
 pub(crate) struct DeferredFenceDispatch {
@@ -3621,8 +3622,11 @@ impl App {
     }
 
     pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.event_loop_with_input(terminal, TerminalInput::new())
-            .await
+        let mut input = TerminalInput::new();
+        input.install_native_paste_adapter();
+        let result = self.event_loop_with_input(terminal, input).await;
+        crate::tui::input_source::clear_native_paste_adapter();
+        result
     }
 
     async fn event_loop_with_input(
@@ -3815,6 +3819,8 @@ impl App {
                     event,
                     observed.observed_at,
                     observed.terminal_generation,
+                    observed.paste_source,
+                    observed.paste_correlation_id,
                 )),
                 Err(error) => Err(error.into()),
             },
@@ -3843,6 +3849,8 @@ impl App {
         event: Event,
         observed_at: std::time::Duration,
         terminal_generation: u64,
+        paste_source: Option<crate::tui::structured_paste::PasteSource>,
+        paste_correlation_id: Option<uuid::Uuid>,
     ) -> bool {
         if self.terminal_input_generation != Some(terminal_generation) {
             let replay = self.terminal_paste_classifier.cancel();
@@ -3856,7 +3864,7 @@ impl App {
                 .pending_paste_probes
                 .values()
                 .any(|probe| probe.owner_fence.is_none());
-            self.pending_paste_probes.clear();
+            self.cancel_paste_probes_matching(|_| true);
             for id in cancelled_fences {
                 self.deferred_fence_dispatches.remove(&id);
                 if let Some(fence) = self.submission_fences.remove(&id) {
@@ -3869,20 +3877,30 @@ impl App {
             }
             self.terminal_input_generation = Some(terminal_generation);
             for key in replay {
-                if self.handle_key(key) {
+                if self.handle_frozen_composer_key(key) {
                     return true;
                 }
             }
         }
         if !self.structured_paste_composer_eligible() {
+            self.cancel_paste_probes_matching(|probe| {
+                probe.owner_fence.is_none()
+                    && probe.request.source
+                        == crate::tui::structured_paste::PasteSource::NativePaste
+            });
             for key in self.terminal_paste_classifier.cancel() {
-                if self.handle_key(key) {
+                if self.handle_frozen_composer_key(key) {
                     return true;
                 }
             }
             return self.handle_terminal_event(event);
         }
-        let decision = self.terminal_paste_classifier.observe(event, observed_at);
+        let decision = self.terminal_paste_classifier.observe_with_paste_source(
+            event,
+            observed_at,
+            paste_source.unwrap_or(crate::tui::structured_paste::PasteSource::BracketedPty),
+            paste_correlation_id,
+        );
         self.apply_terminal_paste_decision(decision)
     }
 
@@ -3896,49 +3914,90 @@ impl App {
             ClassifierDecision::Replay {
                 keys,
                 boundary,
+                boundary_paste_source,
+                boundary_correlation_id,
                 shortcut_intent,
                 paste_unavailable,
             } => {
                 let mut exit = false;
                 for key in keys {
-                    exit |= self.handle_key(key);
+                    exit |= self.handle_frozen_composer_key(key);
                 }
                 if shortcut_intent {
                     // The shortcut is an intent, never literal composer text.
-                    self.handle_paste(String::new());
+                    let correlation_id = self
+                        .terminal_paste_classifier
+                        .pending_shortcut_correlation_id()
+                        .unwrap_or_else(uuid::Uuid::new_v4);
+                    self.handle_identified_paste(
+                        String::new(),
+                        crate::tui::structured_paste::PasteSource::NativePaste,
+                        correlation_id,
+                    );
                 }
                 if paste_unavailable {
+                    self.cancel_paste_probes_matching(|probe| {
+                        probe.owner_fence.is_none()
+                            && probe.request.source
+                                == crate::tui::structured_paste::PasteSource::NativePaste
+                    });
                     self.show_toast("Paste unavailable", ToastKind::Error);
                 }
                 if let Some(event) = boundary {
-                    exit |= self.handle_terminal_event(event);
+                    if let Event::Paste(text) = event {
+                        self.handle_identified_paste(
+                            text,
+                            boundary_paste_source
+                                .unwrap_or(crate::tui::structured_paste::PasteSource::BracketedPty),
+                            boundary_correlation_id.unwrap_or_else(uuid::Uuid::new_v4),
+                        );
+                    } else {
+                        exit |= self.handle_terminal_event(event);
+                    }
                 }
                 exit
             }
-            ClassifierDecision::Paste { text, source } => {
+            ClassifierDecision::Paste {
+                text,
+                source,
+                correlation_id,
+            } => {
                 if matches!(
                     source,
                     crate::tui::structured_paste::PasteSource::BracketedPty
                         | crate::tui::structured_paste::PasteSource::RapidPty
                 ) {
-                    self.pending_paste_probes.retain(|_, probe| {
-                        probe.owner_fence.is_some()
-                            || probe.request.source
-                                != crate::tui::structured_paste::PasteSource::NativePaste
+                    self.cancel_paste_probes_matching(|probe| {
+                        probe.owner_fence.is_none()
+                            && probe.request.source
+                                == crate::tui::structured_paste::PasteSource::NativePaste
                     });
                 }
-                self.handle_paste(text);
+                self.handle_identified_paste(text, source, correlation_id);
                 false
             }
             ClassifierDecision::ShortcutIntent => {
                 // A native shortcut may represent image-only clipboard data;
                 // probe it off-loop while the classifier retains the intent
                 // for a possible authoritative text/bracketed event.
-                self.handle_paste(String::new());
+                let correlation_id = self
+                    .terminal_paste_classifier
+                    .pending_shortcut_correlation_id()
+                    .unwrap_or_else(uuid::Uuid::new_v4);
+                self.handle_identified_paste(
+                    String::new(),
+                    crate::tui::structured_paste::PasteSource::NativePaste,
+                    correlation_id,
+                );
                 false
             }
             ClassifierDecision::Pending => false,
             ClassifierDecision::PasteUnavailable => {
+                self.cancel_paste_probes_matching(|probe| {
+                    probe.owner_fence.is_none()
+                        && probe.request.source
+                            == crate::tui::structured_paste::PasteSource::NativePaste
+                });
                 self.show_toast("Paste unavailable", ToastKind::Error);
                 false
             }

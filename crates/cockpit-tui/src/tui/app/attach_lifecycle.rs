@@ -265,8 +265,7 @@ impl App {
         }
         for id in cancelled_fences {
             self.deferred_fence_dispatches.remove(&id);
-            self.pending_paste_probes
-                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(id));
             self.retained_pre_dispatch_submissions
                 .retain(|retained| retained.pending.optimistic_submission_id != id);
         }
@@ -274,8 +273,7 @@ impl App {
         if cancelled_any_fence {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
         }
-        self.pending_paste_probes
-            .retain(|_, probe| probe.owner_fence.is_some());
+        self.cancel_paste_probes_matching(|probe| probe.owner_fence.is_none());
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;

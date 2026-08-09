@@ -548,6 +548,19 @@ impl AsyncActionRunner {
         pending.handle.abort();
         true
     }
+
+    pub fn abort_id(&mut self, id: AsyncActionId) -> bool {
+        let Some(pending) = self.pending.remove(&id) else {
+            return false;
+        };
+        if let Some(key) = pending.key
+            && self.keyed.get(&key) == Some(&id)
+        {
+            self.keyed.remove(&key);
+        }
+        pending.handle.abort();
+        true
+    }
 }
 
 impl Drop for AsyncActionRunner {

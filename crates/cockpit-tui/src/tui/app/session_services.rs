@@ -342,8 +342,7 @@ impl App {
         for (id, sequence) in cancelled {
             self.submission_fences.remove(&id);
             self.deferred_fence_dispatches.remove(&id);
-            self.pending_paste_probes
-                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(id));
             self.retained_pre_dispatch_submissions
                 .retain(|retained| retained.pending.optimistic_submission_id != id);
             self.submission_order.cancel(sequence);

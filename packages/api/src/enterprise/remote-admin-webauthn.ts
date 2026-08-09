@@ -218,6 +218,12 @@ export async function verifyPortableRemoteAdminApproval(input: {
   const { evidence, credential, policy } = input;
   if (evidence.coseAlg !== -7 || credential.coseAlg !== -7 || credential.state !== 1)
     throw new Error("remote_admin_credential_not_active");
+  if (
+    evidence.role !== credential.role ||
+    !equal(evidence.principalId, credential.principalId) ||
+    !equal(evidence.credentialIdHash, credential.credentialIdHash)
+  )
+    throw new Error("remote_admin_approval_credential_mismatch");
   if (evidence.rpId !== policy.rpId || evidence.origin !== policy.origin)
     throw new Error("remote_admin_approval_rp_origin_mismatch");
   if (!equal(evidence.challengeHash, await sha256(input.expectedChallenge)))
@@ -231,6 +237,7 @@ export async function verifyPortableRemoteAdminApproval(input: {
     throw new Error("remote_admin_approval_client_data_mismatch");
   if (
     evidence.authenticatorData.length < 37 ||
+    evidence.authenticatorData.length > 1024 ||
     !equal(evidence.authenticatorData.slice(0, 32), await sha256(text.encode(policy.rpId)))
   )
     throw new Error("remote_admin_approval_authenticator_data_invalid");

@@ -273,6 +273,33 @@ describe("remote_admin_webauthn_registration_assertion", () => {
         },
       }),
     ).resolves.toEqual({ signCount: 0n });
+    await expect(
+      verifyPortableRemoteAdminApproval({
+        credential,
+        policy: { rpId, origin },
+        expectedChallenge: challenge,
+        evidence: {
+          tenantId: tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3)),
+          principalId: tagProtocolIdBytes("account", new Uint8Array(16).fill(4)),
+          role: 1,
+          registryGeneration: 1n,
+          credentialIdHash: credential.credentialIdHash,
+          operation: 5,
+          canonicalRequestDigest: new Uint8Array(32),
+          operationEpoch: 1n,
+          issuedAt: 1n,
+          expiresAt: 2n,
+          challengeId: new Uint8Array(16),
+          challengeHash: new Uint8Array(await crypto.subtle.digest("SHA-256", challenge)),
+          rpId,
+          origin,
+          authenticatorData,
+          clientDataJson,
+          coseAlg: -7,
+          signatureP1363,
+        },
+      }),
+    ).rejects.toThrow("credential_mismatch");
   });
 });
 

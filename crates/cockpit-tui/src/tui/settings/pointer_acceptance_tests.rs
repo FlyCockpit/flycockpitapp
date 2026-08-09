@@ -649,6 +649,19 @@ fn dispatch_enabled_category_descriptor_actions() {
             .cloned()
             .expect("source category descriptor action is rendered");
         click_target(&mut dialog, &target);
+        if matches!(
+            setting,
+            SettingId::Instructions
+                | SettingId::CompactPrompt
+                | SettingId::AgentDirs
+                | SettingId::PackagesDir
+                | SettingId::TimeInjectionInterval
+        ) {
+            assert!(
+                !matches!(dialog.test_page(), TestPageRef::Category(page) if !page.is_editing()),
+                "descriptor activation had no semantic outcome for {setting:?}"
+            );
+        }
         let after = render_settings_rows(&dialog, 100, 50);
         assert_ne!(
             before, after,

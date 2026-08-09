@@ -279,6 +279,44 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
             click_rendered_provider_action(&mut dialog, &action);
         }
     }
+
+    let oauth = oauth_provider_config("codex", "oauth:test");
+    let oauth_entry = oauth.providers["codex"].clone();
+    let (_tmp, mut source) = dialog_with_config(oauth.clone());
+    source.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
+        "codex".into(),
+        oauth_entry.clone(),
+    )));
+    let _ = render_provider_rows(&source, 110, 60);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::OAuthSetup(_, _),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !actions.is_empty(),
+        "OAuth source row must render its setup action"
+    );
+    for action in actions {
+        let (_tmp, mut dialog) = dialog_with_config(oauth.clone());
+        dialog.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
+            "codex".into(),
+            oauth_entry.clone(),
+        )));
+        click_rendered_provider_action(&mut dialog, &action);
+    }
 }
 
 #[test]

@@ -635,6 +635,10 @@ impl SettingsPage for StringListPage {
         super::SettingsPointerSurfaceKind::StringList
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        500 + self.kind as u64 * 2 + u64::from(self.grabbed.is_some())
+    }
+
     fn resolve_header_back(&self) -> super::SettingsLocalBack {
         if self.grabbed.is_some() {
             super::SettingsLocalBack::LocalBack

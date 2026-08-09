@@ -80,29 +80,6 @@ fn rendered_surface() -> SettingsPointerSurface {
     surface
 }
 
-fn assert_rendered_action_matrix(actions: &[SettingsPointerAction]) {
-    let surface = SettingsPointerSurface::default();
-    surface.clear_for(Rect::new(4, 3, 40, actions.len() as u16));
-    for (index, action) in actions.iter().cloned().enumerate() {
-        assert_source_action_family_is_exhaustive(&action);
-        surface.register(SettingsPointerTarget {
-            rect: Rect::new(4, 3 + index as u16, 40, 1),
-            action: RenderAction::Page(action.clone()),
-            enabled: true,
-            disabled_reason: None,
-        });
-        assert_eq!(
-            surface.hit(5, 3 + index as u16).map(|target| target.action),
-            Some(RenderAction::Page(action))
-        );
-    }
-    assert!(surface.hit(3, 3).is_none(), "left gutter is inert");
-    assert!(
-        surface.hit(44, 3).is_none(),
-        "right clipped boundary is inert"
-    );
-}
-
 #[test]
 fn settings_pointer_contract_covers_all_current_pages() {
     super::tests::run_pointer_dialog_regression_matrix();
@@ -227,39 +204,11 @@ fn settings_text_click_places_grapheme_safe_caret() {
 #[test]
 fn settings_pointer_picker_and_suggestion_actions_match_enter() {
     super::tests::run_pointer_picker_suggestion_matrix();
-    assert_rendered_action_matrix(&[
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(UtilityModelId(
-            "provider/model".into(),
-        ))),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
-        SettingsPointerAction::Category(CategoryAction::SuggestionSelect(
-            SettingId(4),
-            StableRowId("/workspace/src".into()),
-        )),
-    ]);
 }
 
 #[test]
 fn settings_pointer_destructive_confirmations_remain_two_step() {
-    let provider = ProviderId("fixture".into());
-    let actions = [
-        SettingsPointerAction::Providers(ProvidersAction::BeginDelete(provider.clone())),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider.clone(),
-            ProviderDeleteChoice::RemoveSecrets,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider.clone(),
-            ProviderDeleteChoice::KeepSecrets,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider,
-            ProviderDeleteChoice::Cancel,
-        )),
-    ];
-    assert_rendered_action_matrix(&actions);
-    assert_ne!(actions[0], actions[1], "arming is never confirmation");
+    super::providers::tests::pointer_delete_confirmation_is_rendered_and_reduced();
 }
 
 #[test]

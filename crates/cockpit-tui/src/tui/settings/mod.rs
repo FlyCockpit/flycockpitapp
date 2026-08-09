@@ -2237,15 +2237,15 @@ impl SettingsDialog {
                         let _ = self.apply_nav(nav);
                     }
                     SettingsPointerAction::Page(action) => {
-                        #[cfg(test)]
-                        pointer_acceptance_tests::record_dispatched_action(&action);
                         let nav = self.page.handle_pointer_control_at(
                             &mut self.cx,
-                            action,
+                            action.clone(),
                             mouse.column,
                             mouse.row,
                         );
                         let _ = self.apply_nav(nav);
+                        #[cfg(test)]
+                        pointer_acceptance_tests::record_dispatched_action(&action);
                     }
                 }
             }

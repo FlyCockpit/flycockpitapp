@@ -3488,6 +3488,23 @@ impl SettingsPage for CategoryPage {
     }
 
     fn pointer_surface_token(&self) -> u64 {
+        let mode = if self.utility_picker.is_some() {
+            5
+        } else if self.pending_external_edit.is_some() {
+            4
+        } else if self.text_editor.is_some() {
+            3
+        } else if self.path_editor.is_some() {
+            2
+        } else if self.editing.is_some() {
+            1
+        } else {
+            0
+        };
+        600 + self.category as u64 * 6 + mode
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
         if self.path_editor.is_some() {
             504
         } else if self.text_editor.is_some() {

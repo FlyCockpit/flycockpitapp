@@ -1,4 +1,5 @@
 use super::oauth_flow::{OAuthBrowserBegin, OAuthOption, oauth_options};
+use super::row_editor::RowListEditor;
 use super::*;
 use crate::tui::settings::pointer_actions::ProviderRowEditorAction;
 use cockpit_config::providers::{AuthKind, ProvidersConfig};

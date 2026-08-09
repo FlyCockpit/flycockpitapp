@@ -133,6 +133,7 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
         SettingsPointerAction::Providers(ProvidersAction::RefetchAll),
         SettingsPointerAction::Providers(ProvidersAction::CycleUnlistedPolicy),
         SettingsPointerAction::Providers(ProvidersAction::DeepFetchConfirm(provider(), row())),
+        SettingsPointerAction::Providers(ProvidersAction::BeginDelete(provider())),
         SettingsPointerAction::Providers(ProvidersAction::Delete(
             provider(),
             ProviderDeleteChoice::RemoveSecrets,
@@ -169,6 +170,18 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
             provider(),
             FetchFallbackChoice::Retry,
         )),
+        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
+            provider(),
+            FetchFallbackChoice::KeepLocal,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
+            provider(),
+            FetchFallbackChoice::UseFallback,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
+            provider(),
+            FetchFallbackChoice::Cancel,
+        )),
         SettingsPointerAction::Providers(ProvidersAction::DeepFetchChoice(
             provider(),
             DeepFetchChoice::Fetch,
@@ -177,7 +190,33 @@ fn fixture_actions() -> Vec<SettingsPointerAction> {
             WizardStepId("step".into()),
             WizardControlId("control".into()),
         )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(row(), row(), row())),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::HeaderOpen(row()),
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::HeaderAdd,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::HeaderContinue,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::HeaderSave,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::ModelOpen(ModelId("model".into())),
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::ModelAdd,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::ModelSave,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingEdit(row()),
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+            ProviderRowEditorAction::SettingSave,
+        )),
         SettingsPointerAction::Providers(ProvidersAction::ModelLifecycle(
             ModelLifecycleAction::Refresh,
         )),
@@ -245,6 +284,28 @@ fn rendered_surface() -> SettingsPointerSurface {
         disabled_reason: Some("read only"),
     });
     surface
+}
+
+fn assert_rendered_action_matrix(actions: &[SettingsPointerAction]) {
+    let surface = SettingsPointerSurface::default();
+    surface.clear_for(Rect::new(4, 3, 40, actions.len() as u16));
+    for (index, action) in actions.iter().cloned().enumerate() {
+        surface.register(SettingsPointerTarget {
+            rect: Rect::new(4, 3 + index as u16, 40, 1),
+            action: RenderAction::Page(action.clone()),
+            enabled: true,
+            disabled_reason: None,
+        });
+        assert_eq!(
+            surface.hit(5, 3 + index as u16).map(|target| target.action),
+            Some(RenderAction::Page(action))
+        );
+    }
+    assert!(surface.hit(3, 3).is_none(), "left gutter is inert");
+    assert!(
+        surface.hit(44, 3).is_none(),
+        "right clipped boundary is inert"
+    );
 }
 
 #[test]
@@ -366,24 +427,39 @@ fn settings_text_click_places_grapheme_safe_caret() {
 
 #[test]
 fn settings_pointer_picker_and_suggestion_actions_match_enter() {
-    assert!(fixture_actions().iter().any(|a| matches!(
-        a,
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(_))
-    )));
-    assert!(fixture_actions().iter().any(|a| matches!(
-        a,
-        SettingsPointerAction::Category(CategoryAction::SuggestionSelect(_, _))
-    )));
+    assert_rendered_action_matrix(&[
+        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(UtilityModelId(
+            "provider/model".into(),
+        ))),
+        SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
+        SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
+        SettingsPointerAction::Category(CategoryAction::SuggestionSelect(
+            SettingId(4),
+            StableRowId("/workspace/src".into()),
+        )),
+    ]);
 }
 
 #[test]
 fn settings_pointer_destructive_confirmations_remain_two_step() {
-    let choices = [
-        ProviderDeleteChoice::RemoveSecrets,
-        ProviderDeleteChoice::KeepSecrets,
-        ProviderDeleteChoice::Cancel,
+    let provider = ProviderId("fixture".into());
+    let actions = [
+        SettingsPointerAction::Providers(ProvidersAction::BeginDelete(provider.clone())),
+        SettingsPointerAction::Providers(ProvidersAction::Delete(
+            provider.clone(),
+            ProviderDeleteChoice::RemoveSecrets,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::Delete(
+            provider.clone(),
+            ProviderDeleteChoice::KeepSecrets,
+        )),
+        SettingsPointerAction::Providers(ProvidersAction::Delete(
+            provider,
+            ProviderDeleteChoice::Cancel,
+        )),
     ];
-    assert_eq!(choices.len(), 3);
+    assert_rendered_action_matrix(&actions);
+    assert_ne!(actions[0], actions[1], "arming is never confirmation");
 }
 
 #[test]
@@ -402,6 +478,11 @@ fn settings_pointer_links_and_capture_transitions_are_safe() {
 #[test]
 fn settings_pointer_hover_and_help_are_truthful() {
     let surface = rendered_surface();
+    let disabled = surface
+        .hit(13, 8)
+        .expect("disabled target remains discoverable");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.disabled_reason, Some("read only"));
     *surface.hover.borrow_mut() = Some(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
         "interface".into(),
     ))));
@@ -412,19 +493,47 @@ fn settings_pointer_hover_and_help_are_truthful() {
 #[test]
 fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     let fixtures = fixture_actions();
-    assert!(fixtures.len() >= 60);
-    assert!(fixtures.iter().any(|a| matches!(
-        a,
-        SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(_, _))
-    )));
+    let surface = SettingsPointerSurface::default();
+    surface.clear_for(Rect::new(0, 0, 80, fixtures.len() as u16));
+    for (row, action) in fixtures.iter().cloned().enumerate() {
+        surface.register(SettingsPointerTarget {
+            rect: Rect::new(0, row as u16, 80, 1),
+            action: RenderAction::Page(action.clone()),
+            enabled: true,
+            disabled_reason: None,
+        });
+        assert_eq!(
+            surface.hit(1, row as u16).map(|target| target.action),
+            Some(RenderAction::Page(action)),
+            "fixture row {row} must round-trip through rendered hit geometry"
+        );
+    }
+    assert!(fixtures.len() >= 100);
+    for expected in [
+        ProviderRowEditorAction::HeaderAdd,
+        ProviderRowEditorAction::HeaderContinue,
+        ProviderRowEditorAction::HeaderSave,
+        ProviderRowEditorAction::ModelAdd,
+        ProviderRowEditorAction::ModelSave,
+        ProviderRowEditorAction::SettingSave,
+    ] {
+        assert!(fixtures.contains(&SettingsPointerAction::Providers(
+            ProvidersAction::RowEditor(expected)
+        )));
+    }
 }
 
 #[test]
 fn settings_pointer_copilot_setup_is_explicit_and_exactly_once() {
     let mut gate = PointerOperationGate::default();
     let id = gate.begin();
+    assert_eq!(gate.pending(), Some(id));
+    assert!(!gate.complete(PointerOperationId(id.0 + 1)));
     assert!(gate.complete(id));
     assert!(!gate.complete(id));
+    let cancelled = gate.begin();
+    gate.cancel();
+    assert!(!gate.complete(cancelled));
 }
 
 #[test]
@@ -439,6 +548,18 @@ fn settings_pointer_provider_secret_choices_are_functional() {
     fn provider_id() -> ProviderId {
         ProviderId("provider".into())
     }
+    let choices = actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                SettingsPointerAction::Providers(ProvidersAction::Delete(_, _))
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(choices.len(), 3);
+    assert_rendered_action_matrix(&choices);
 }
 
 #[test]
@@ -485,7 +606,14 @@ fn settings_pointer_header_navigation_is_complete() {
 fn settings_pointer_oauth_copy_actions_are_effect_safe() {
     let mut gate = PointerOperationGate::default();
     let live = gate.begin();
-    gate.cancel();
-    assert!(!gate.complete(live));
     assert!(!gate.complete(PointerOperationId(live.0 + 1)));
+    assert!(gate.complete(live));
+    assert!(!gate.complete(live), "duplicate completion is inert");
+    let cancelled = gate.begin();
+    gate.cancel();
+    assert!(!gate.complete(cancelled));
+    let replaced = gate.begin();
+    let replacement = gate.begin();
+    assert!(!gate.complete(replaced));
+    assert!(gate.complete(replacement));
 }

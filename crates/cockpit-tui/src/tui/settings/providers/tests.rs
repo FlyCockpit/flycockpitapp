@@ -177,6 +177,109 @@ fn render_provider_links(
     links
 }
 
+#[test]
+fn pointer_render_boundary_publishes_stable_provider_identity() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers
+        .insert("stable-provider".into(), ProviderEntry::default());
+    let (_tmp, mut dialog) = dialog_with_config(cfg);
+    let _ = render_provider_rows(&dialog, 90, 24);
+    let target = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == super::super::shell::SettingsPointerAction::Page(
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::Open(
+                            super::super::pointer_actions::ProviderId("stable-provider".into()),
+                        ),
+                    ),
+                )
+        })
+        .cloned()
+        .expect("provider row publishes its config-map identity");
+    assert_eq!(
+        dialog.handle_pointer(super::super::tests::settings_mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        super::super::SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Edit(state))
+            if state.provider_id == "stable-provider"
+    ));
+}
+
+#[test]
+fn pointer_edit_menu_mapping_is_exhaustive_over_source_actions() {
+    let state = EditState::new("p".into(), ProviderEntry::default());
+    for source in edit_menu_actions(&state.provider_id, &state.entry) {
+        let action = provider_edit_pointer_action(&state, source);
+        assert!(matches!(
+            action,
+            super::super::pointer_actions::SettingsPointerAction::Providers(_)
+        ));
+    }
+    assert_eq!(
+        provider_edit_pointer_action(&state, EditAction::Delete),
+        super::super::pointer_actions::SettingsPointerAction::Providers(
+            super::super::pointer_actions::ProvidersAction::BeginDelete(
+                super::super::pointer_actions::ProviderId("p".into()),
+            ),
+        ),
+        "the ordinary row can only arm deletion"
+    );
+}
+
+#[test]
+fn pointer_row_editor_actions_survive_reordering_by_identity() {
+    let headers = HeaderEditor::new(
+        vec![
+            HeaderSpec {
+                name: "X-First".into(),
+                value: "one".into(),
+            },
+            HeaderSpec {
+                name: "X-Second".into(),
+                value: "two".into(),
+            },
+        ],
+        false,
+    );
+    let action = provider_header_pointer_action(&headers, 1).expect("second header action");
+    assert_eq!(
+        action,
+        super::super::pointer_actions::SettingsPointerAction::Providers(
+            super::super::pointer_actions::ProvidersAction::RowEditor(
+                super::super::pointer_actions::ProviderRowEditorAction::HeaderOpen(
+                    super::super::pointer_actions::StableRowId("X-Second".into()),
+                ),
+            ),
+        )
+    );
+
+    let models = ModelEditor::new(
+        None,
+        vec![model("first", true), model("stable-model", true)],
+    );
+    assert_eq!(
+        provider_model_pointer_action(&models, 1).expect("second model action"),
+        super::super::pointer_actions::SettingsPointerAction::Providers(
+            super::super::pointer_actions::ProvidersAction::RowEditor(
+                super::super::pointer_actions::ProviderRowEditorAction::ModelOpen(
+                    super::super::pointer_actions::ModelId("stable-model".into()),
+                ),
+            ),
+        )
+    );
+}
+
 fn compact_text(s: &str) -> String {
     s.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())

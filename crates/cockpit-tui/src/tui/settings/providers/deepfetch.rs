@@ -374,7 +374,21 @@ impl SettingsCx {
                 lines.push(Line::default());
                 for (index, label) in ["Run deep fetch", "Cancel"].iter().enumerate() {
                     let selected = state.cursor == index;
-                    bindings.push((lines.len(), SettingsControlId(index as u64)));
+                    bindings.push((
+                        lines.len(),
+                        super::super::pointer_actions::SettingsPointerAction::Providers(
+                            super::super::pointer_actions::ProvidersAction::DeepFetchChoice(
+                                super::super::pointer_actions::ProviderId(
+                                    state.provider_id.clone(),
+                                ),
+                                if index == 0 {
+                                    super::super::pointer_actions::DeepFetchChoice::Fetch
+                                } else {
+                                    super::super::pointer_actions::DeepFetchChoice::Cancel
+                                },
+                            ),
+                        ),
+                    ));
                     lines.push(Line::from(Span::styled(
                         format!("{}{}", if selected { "▸ " } else { "  " }, label),
                         if selected {

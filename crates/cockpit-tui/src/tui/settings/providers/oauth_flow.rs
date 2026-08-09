@@ -287,7 +287,7 @@ pub(crate) enum OAuthOption {
 }
 
 impl OAuthOption {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             OAuthOption::Login => "log in",
             OAuthOption::ManualPaste => "manual paste",

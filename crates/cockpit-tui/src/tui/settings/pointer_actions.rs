@@ -83,6 +83,7 @@ pub(super) enum FetchOneChoice {
 pub(super) enum FetchFallbackChoice {
     Retry,
     KeepLocal,
+    UseFallback,
     Cancel,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,16 +116,6 @@ pub(super) enum SettingsPointerAction {
     List(ListAction),
     UtilityModel(UtilityModelAction),
     DefaultModel(DefaultModelAction),
-}
-
-impl From<super::shell::SettingsControlId> for SettingsPointerAction {
-    fn from(value: super::shell::SettingsControlId) -> Self {
-        Self::Providers(ProvidersAction::RowEditor(
-            StableRowId("provider-page".to_string()),
-            StableRowId("control".to_string()),
-            StableRowId(value.0.to_string()),
-        ))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -262,6 +253,7 @@ pub(super) enum ProvidersAction {
     RefetchAll,
     CycleUnlistedPolicy,
     DeepFetchConfirm(ProviderId, StableRowId),
+    BeginDelete(ProviderId),
     Delete(ProviderId, ProviderDeleteChoice),
     SaveProvider(ProviderId),
     LocalBack,
@@ -274,10 +266,26 @@ pub(super) enum ProvidersAction {
     FetchFallbackConfirm(ProviderId, FetchFallbackChoice),
     DeepFetchChoice(ProviderId, DeepFetchChoice),
     WizardControl(WizardStepId, WizardControlId),
-    RowEditor(StableRowId, StableRowId, StableRowId),
+    /// A control published by a provider row editor.  Every identity comes
+    /// from the rendered domain object; cursor ordinals never cross the hit
+    /// map/reducer boundary.
+    RowEditor(ProviderRowEditorAction),
     ModelLifecycle(ModelLifecycleAction),
     CopyOAuth(OAuthFlowId, OAuthCopyKind),
     CopilotConfirm(ProviderId, ConfirmationChoice),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ProviderRowEditorAction {
+    HeaderOpen(StableRowId),
+    HeaderAdd,
+    HeaderContinue,
+    HeaderSave,
+    ModelOpen(ModelId),
+    ModelAdd,
+    ModelSave,
+    SettingEdit(StableRowId),
+    SettingSave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

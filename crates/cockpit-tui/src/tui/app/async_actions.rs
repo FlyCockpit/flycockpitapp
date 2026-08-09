@@ -764,6 +764,8 @@ impl App {
                     result.payload
                     && self.composer.at_query() == Some(query.as_str())
                 {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = Some(query.clone());
                     *self.at_cache.borrow_mut() = Some((query, suggestions));
                 }
             }

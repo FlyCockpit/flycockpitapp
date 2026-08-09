@@ -935,6 +935,11 @@ impl App {
             if rows > 0 {
                 return rows as u16 + 2;
             }
+            if self.at_suggestions_loading
+                || self.at_suggestions_loaded_query.as_deref() == self.composer.at_query()
+            {
+                return 3;
+            }
         }
         if self.slash_query().is_some() {
             let rows = self
@@ -3663,6 +3668,15 @@ impl App {
     ) {
         let suggestions = self.at_suggestions();
         if suggestions.is_empty() {
+            let text = if self.at_suggestions_loading {
+                "loading files…"
+            } else {
+                "no matching files"
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
+                content_area,
+            );
             return;
         }
         let window = content_area.height.min(AUTOCOMPLETE_ROWS) as usize;

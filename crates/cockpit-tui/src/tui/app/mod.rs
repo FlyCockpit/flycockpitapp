@@ -1993,6 +1993,10 @@ pub struct App {
     /// `@`-query string; recomputed when the query changes. `RefCell`
     /// because `at_suggestions` is called from `&self` render paths.
     pub(super) at_cache: std::cell::RefCell<Option<(String, Vec<cockpit_core::tags::Suggestion>)>>,
+    /// Distinguishes an in-flight filesystem query from a completed query
+    /// with zero matches; rendering must never infer loading from emptiness.
+    pub(super) at_suggestions_loading: bool,
+    pub(super) at_suggestions_loaded_query: Option<String>,
     /// Accepted `@`-tag paths that contain a space / shell-special char.
     /// Tracked so the submit-time pass can wrap them in quotes (the
     /// composer shows them unquoted; the wire payload needs the quotes
@@ -3300,6 +3304,8 @@ impl App {
             at_selected: 0,
             at_scroll: 0,
             at_cache: std::cell::RefCell::new(None),
+            at_suggestions_loading: false,
+            at_suggestions_loaded_query: None,
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
             terminal_paste_classifier:

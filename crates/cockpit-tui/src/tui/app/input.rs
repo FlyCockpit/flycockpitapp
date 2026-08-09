@@ -1635,6 +1635,8 @@ impl App {
         self.at_scroll = 0;
         let Some(query) = self.composer.at_query().map(str::to_string) else {
             self.at_cache.borrow_mut().take();
+            self.at_suggestions_loading = false;
+            self.at_suggestions_loaded_query = None;
             self.async_actions
                 .abort_key(&AsyncActionKey::new("autocomplete.files"));
             return;
@@ -1643,6 +1645,8 @@ impl App {
         let usage_tags = self.usage_tags.clone();
         let session_allow = self.gitignore_session_allow.clone();
         let result_query = query.clone();
+        self.at_suggestions_loading = true;
+        self.at_suggestions_loaded_query = None;
         self.start_owned_blocking_action(
             blocking_operations::BlockingOperationKind::FileAutocomplete,
             AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),

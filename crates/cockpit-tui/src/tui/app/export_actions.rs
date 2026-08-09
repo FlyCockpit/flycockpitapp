@@ -122,9 +122,7 @@ async fn export_via_attached_daemon(
     tokio::fs::create_dir_all(&exports_dir)
         .await
         .map_err(|error| format!("{command}: creating export directory failed: {error}"))?;
-    tokio::fs::write(&out_path, bytes)
-        .await
-        .map_err(|error| format!("{command}: writing export failed: {error}"))?;
+    write_export_no_clobber(&out_path, &bytes, command).await?;
     let sessions = data.session_count.unwrap_or(1);
     Ok(match kind {
         ExportSessionKind::TranscriptJson => format!(
@@ -140,6 +138,51 @@ async fn export_via_attached_daemon(
             out_path.display()
         ),
     })
+}
+
+/// Publish through an owned temporary file and a no-replace hard link.  The
+/// target either remains absent or contains the complete verified export;
+/// failures clean up the partial file and never overwrite an earlier export.
+async fn write_export_no_clobber(
+    out_path: &std::path::Path,
+    bytes: &[u8],
+    command: &'static str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let file_name = out_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{command}: invalid export path"))?;
+    let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+            .map_err(|error| format!("{command}: creating export failed: {error}"))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|error| format!("{command}: writing export failed: {error}"))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("{command}: syncing export failed: {error}"))?;
+        drop(file);
+        tokio::fs::hard_link(&temp, out_path)
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("{command}: export already exists: {}", out_path.display())
+                } else {
+                    format!("{command}: publishing export failed: {error}")
+                }
+            })?;
+        Ok(())
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temp).await;
+    result
 }
 
 /// Pull a staged bulk transfer chunk by chunk and verify it end to end.

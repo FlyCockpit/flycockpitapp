@@ -395,14 +395,16 @@ fn verify_private_dacl(path: &Path) -> Result<()> {
         fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     }
 
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const SECURITY_INFORMATION: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut needed = 0_u32;
     // SAFETY: this first call intentionally supplies a null buffer to obtain its size.
     unsafe {
         GetFileSecurityW(
             wide_path.as_ptr(),
-            DACL_SECURITY_INFORMATION,
+            SECURITY_INFORMATION,
             ptr::null_mut(),
             0,
             &mut needed,
@@ -418,7 +420,7 @@ fn verify_private_dacl(path: &Path) -> Result<()> {
     unsafe {
         if GetFileSecurityW(
             wide_path.as_ptr(),
-            DACL_SECURITY_INFORMATION,
+            SECURITY_INFORMATION,
             descriptor.as_mut_ptr().cast(),
             needed,
             &mut needed,
@@ -426,7 +428,7 @@ fn verify_private_dacl(path: &Path) -> Result<()> {
             || ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 descriptor.as_mut_ptr().cast(),
                 1,
-                DACL_SECURITY_INFORMATION,
+                SECURITY_INFORMATION,
                 &mut sddl_ptr,
                 &mut sddl_len,
             ) == 0
@@ -438,12 +440,103 @@ fn verify_private_dacl(path: &Path) -> Result<()> {
             usize::try_from(sddl_len).unwrap_or(0),
         ));
         LocalFree(sddl_ptr.cast());
-        if !sddl.starts_with("D:P") || sddl.matches("(A;").count() != 1 || !sddl.contains(";;FA;;;")
+        let owner = sddl
+            .strip_prefix("O:")
+            .and_then(|value| value.split_once("D:"))
+            .map(|(owner, _)| owner);
+        let ace_sid = sddl
+            .split(";;FA;;;")
+            .nth(1)
+            .and_then(|value| value.split(')').next());
+        let current_user = current_windows_user_sid()?;
+        if !sddl.contains("D:P")
+            || sddl.matches("(A;").count() != 1
+            || owner.is_none()
+            || owner != ace_sid
+            || owner != Some(current_user.as_str())
         {
             bail!("goal scratch DACL is not protected current-owner-only full control");
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String> {
+    use std::ptr;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut core::ffi::c_void,
+        attributes: u32,
+    }
+    #[repr(C)]
+    struct TokenUser {
+        user: SidAndAttributes,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut core::ffi::c_void,
+            desired_access: u32,
+            token_handle: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut core::ffi::c_void,
+            token_information_class: u32,
+            token_information: *mut core::ffi::c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut core::ffi::c_void, string_sid: *mut *mut u16) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: u32 = 1;
+    let mut token = ptr::null_mut();
+    // SAFETY: all handles and output pointers follow the documented Win32 contracts.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error()).context("opening process token");
+        }
+        let mut needed = 0_u32;
+        GetTokenInformation(token, TOKEN_USER_CLASS, ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("reading process SID size");
+        }
+        let mut buffer = vec![0_u8; usize::try_from(needed)?];
+        if GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("reading process SID");
+        }
+        let token_user = &*buffer.as_ptr().cast::<TokenUser>();
+        let mut sid_text = ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.user.sid, &mut sid_text) == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error()).context("formatting process SID");
+        }
+        let mut len = 0_usize;
+        while *sid_text.add(len) != 0 {
+            len += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, len));
+        LocalFree(sid_text.cast());
+        CloseHandle(token);
+        Ok(result)
+    }
 }
 
 #[cfg(not(any(unix, windows)))]

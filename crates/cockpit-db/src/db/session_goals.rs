@@ -152,7 +152,12 @@ pub struct GoalContract {
 
 impl GoalContract {
     pub fn validate(&self) -> Result<()> {
+        const MAX_KIND_CHARS: usize = 128;
+        const MAX_ITEMS_PER_SECTION: usize = 32;
+        const MAX_ITEM_CHARS: usize = 4_096;
+        const MAX_SERIALIZED_BYTES: usize = 65_536;
         if self.kind.trim().is_empty()
+            || self.kind.chars().count() > MAX_KIND_CHARS
             || self.acceptance.is_empty()
             || self.verification_gates.is_empty()
         {
@@ -165,6 +170,23 @@ impl GoalContract {
             .any(|v| v.trim().is_empty())
         {
             anyhow::bail!("goal contract criteria must not be empty");
+        }
+        let sections = [
+            &self.acceptance,
+            &self.verification_gates,
+            &self.evidence_collection,
+            &self.non_goals,
+            &self.assumed_scope,
+            &self.implementation_checklist,
+        ];
+        if sections.iter().any(|section| {
+            section.len() > MAX_ITEMS_PER_SECTION
+                || section
+                    .iter()
+                    .any(|item| item.trim().is_empty() || item.chars().count() > MAX_ITEM_CHARS)
+        }) || serde_json::to_vec(self)?.len() > MAX_SERIALIZED_BYTES
+        {
+            anyhow::bail!("goal contract exceeds bounded result limits");
         }
         Ok(())
     }
@@ -985,7 +1007,7 @@ impl Db {
             }
             goal.transition(GoalLifecycleEvent::RootFailed)?;
             let changed = tx.execute(
-                "UPDATE goal_root_turns SET state = 'failed', audit_excerpt = 'root turn failed before evaluation', updated_at = ?1
+                "UPDATE goal_root_turns SET state = 'cancelled', audit_excerpt = 'root turn failed before evaluation', updated_at = ?1
                  WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'",
                 params![Utc::now().timestamp(), goal_id.to_string(), attempt_generation, turn_id.to_string()],
             )?;
@@ -1828,6 +1850,17 @@ mod tests {
                 .implementation_checklist,
             advice.implementation_checklist
         );
+    }
+
+    #[test]
+    fn goal_contract_rejects_unbounded_planner_output() {
+        let mut oversized = contract();
+        oversized.acceptance = vec!["x".repeat(4_097)];
+        assert!(oversized.validate().is_err());
+
+        let mut too_many = contract();
+        too_many.non_goals = (0..33).map(|index| format!("non-goal {index}")).collect();
+        assert!(too_many.validate().is_err());
     }
 
     #[test]

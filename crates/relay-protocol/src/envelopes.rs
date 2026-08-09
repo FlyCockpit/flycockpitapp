@@ -530,23 +530,27 @@ mod tests {
 
     #[test]
     fn client_actor_binding_codec_is_strict_and_u64_complete() {
-        let valid = serde_json::json!({
-            "schemaVersion": 1,
-            "deviceId": "00000000-0000-4000-8000-000000000001",
-            "deviceGeneration": "18446744073709551615",
-            "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
-        });
-        let binding: ClientActorBindingV1 = serde_json::from_value(valid.clone()).unwrap();
-        assert_eq!(binding.device_generation, u64::MAX);
-        assert_eq!(serde_json::to_value(binding).unwrap(), valid);
-        for invalid in [
-            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":0,"logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
-            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"0","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
-            serde_json::json!({"schemaVersion":2,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"1","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
-            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-0000-0000-000000000000","deviceGeneration":"1","logicalAttachmentId":"00000000-0000-4000-8000-000000000002"}),
-            serde_json::json!({"schemaVersion":1,"deviceId":"00000000-0000-4000-8000-000000000001","deviceGeneration":"9007199254740993","logicalAttachmentId":"00000000-0000-4000-8000-000000000002","unknown":true}),
-        ] {
-            assert!(serde_json::from_value::<ClientActorBindingV1>(invalid).is_err());
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/relay-protocol/fixtures/client-actor-binding-v1.json"
+        )))
+        .unwrap();
+        for vector in vectors["valid"].as_array().unwrap() {
+            let value = vector["value"].clone();
+            let binding: ClientActorBindingV1 = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(binding).unwrap(),
+                value,
+                "{}",
+                vector["name"]
+            );
+        }
+        for vector in vectors["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<ClientActorBindingV1>(vector["value"].clone()).is_err(),
+                "{}",
+                vector["name"]
+            );
         }
     }
     use serde::Serialize;

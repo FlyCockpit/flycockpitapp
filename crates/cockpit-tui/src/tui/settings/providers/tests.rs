@@ -1,5 +1,6 @@
 use super::oauth_flow::{OAuthBrowserBegin, OAuthOption, oauth_options};
 use super::*;
+use crate::tui::settings::pointer_actions::ProviderRowEditorAction;
 use cockpit_config::providers::{AuthKind, ProvidersConfig};
 use cockpit_config::providers::{ConfigDoc, ProviderEntry};
 use cockpit_core::providers::deepfetch::{

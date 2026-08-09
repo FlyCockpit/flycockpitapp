@@ -127,8 +127,27 @@ fn tree_package_key(row: &str) -> String {
     let (name, version) = package
         .rsplit_once(" v")
         .unwrap_or_else(|| panic!("unexpected cargo tree package row: {row}"));
-    let version = version.split_whitespace().next().unwrap();
+    assert!(
+        !name.is_empty(),
+        "malformed cargo tree package row with empty name: {row}"
+    );
+    let version = version
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("malformed cargo tree package row with empty version: {row}"));
     format!("{name}@{version}")
+}
+
+#[test]
+#[should_panic(expected = "cargo tree package row with empty version: image v")]
+fn tree_package_key_rejects_empty_versions_precisely() {
+    tree_package_key("image v");
+}
+
+#[test]
+#[should_panic(expected = "cargo tree package row with empty name:  v1.0.0")]
+fn tree_package_key_rejects_empty_names_precisely() {
+    tree_package_key(" v1.0.0");
 }
 
 fn target_package_features(

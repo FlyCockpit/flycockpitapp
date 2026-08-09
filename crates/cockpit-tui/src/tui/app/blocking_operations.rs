@@ -77,7 +77,7 @@ impl App {
     pub(super) fn take_owned_test_barrier(
         &self,
         operation: BlockingOperationKind,
-    ) -> Option<std::sync::Arc<std::sync::Barrier>> {
+    ) -> Option<std::sync::Arc<OwnedTestGate>> {
         TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().remove(&operation))
     }
 
@@ -96,7 +96,7 @@ impl App {
             .start_blocking(operation.action_kind(), policy, move || {
                 #[cfg(test)]
                 if let Some(barrier) = barrier {
-                    barrier.wait();
+                    barrier.arrive_and_wait();
                     return Ok(AsyncActionPayload::Unit);
                 }
                 work()
@@ -107,14 +107,56 @@ impl App {
 #[cfg(test)]
 thread_local! {
     static TEST_OWNED_BARRIERS: std::cell::RefCell<
-        std::collections::HashMap<BlockingOperationKind, std::sync::Arc<std::sync::Barrier>>
+        std::collections::HashMap<BlockingOperationKind, std::sync::Arc<OwnedTestGate>>
     > = Default::default();
+}
+
+#[cfg(test)]
+pub(super) struct OwnedTestGate {
+    arrived: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl OwnedTestGate {
+    pub(super) fn new() -> (std::sync::Arc<Self>, tokio::sync::oneshot::Receiver<()>) {
+        let (arrived, receiver) = tokio::sync::oneshot::channel();
+        (
+            std::sync::Arc::new(Self {
+                arrived: std::sync::Mutex::new(Some(arrived)),
+                released: std::sync::Mutex::new(false),
+                release: std::sync::Condvar::new(),
+            }),
+            receiver,
+        )
+    }
+
+    pub(super) fn arrive_and_wait(&self) {
+        if let Some(arrived) = self.arrived.lock().unwrap().take() {
+            let _ = arrived.send(());
+        }
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
+    }
+
+    pub(super) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
 }
 
 #[cfg(test)]
 pub(super) fn install_owned_test_barrier(
     operation: BlockingOperationKind,
-    barrier: std::sync::Arc<std::sync::Barrier>,
+    barrier: std::sync::Arc<OwnedTestGate>,
 ) {
     TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().insert(operation, barrier));
+}
+
+#[cfg(test)]
+pub(super) fn unclaimed_owned_test_operations() -> Vec<BlockingOperationKind> {
+    TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow().keys().copied().collect())
 }

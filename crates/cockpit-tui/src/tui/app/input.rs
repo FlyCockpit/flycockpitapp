@@ -3100,7 +3100,7 @@ impl App {
             async move {
                 #[cfg(test)]
                 if let Some(barrier) = barrier {
-                    tokio::task::spawn_blocking(move || barrier.wait())
+                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
                         .await
                         .map_err(|error| error.to_string())?;
                     return Ok(AsyncActionPayload::Unit);

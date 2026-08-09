@@ -1,18 +1,18 @@
 use super::blocking_operations::BlockingOperationKind;
 use super::*;
 
-struct BarrierRelease(Option<std::sync::Arc<std::sync::Barrier>>);
+struct BarrierRelease(Option<std::sync::Arc<blocking_operations::OwnedTestGate>>);
 
 impl BarrierRelease {
     fn release(mut self) {
-        self.0.take().unwrap().wait();
+        self.0.take().unwrap().release();
     }
 }
 
 impl Drop for BarrierRelease {
     fn drop(&mut self) {
         if let Some(barrier) = self.0.take() {
-            std::thread::spawn(move || barrier.wait());
+            barrier.release();
         }
     }
 }
@@ -87,13 +87,13 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.launch.session_id = Some(uuid::Uuid::nil());
     app.launch.session_short_id = Some("test".to_string());
-    let release = std::sync::Arc::new(std::sync::Barrier::new(7));
-    let release_guard = BarrierRelease(Some(std::sync::Arc::clone(&release)));
+    let mut arrivals = Vec::new();
+    let mut release_guards = Vec::new();
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
-        blocking_operations::install_owned_test_barrier(
-            registration.kind,
-            std::sync::Arc::clone(&release),
-        );
+        let (gate, arrived) = blocking_operations::OwnedTestGate::new();
+        blocking_operations::install_owned_test_barrier(registration.kind, gate.clone());
+        arrivals.push((registration.kind, arrived));
+        release_guards.push(BarrierRelease(Some(gate)));
     }
     app.handle_curator_command("status");
     app.handle_doctor_command();
@@ -105,6 +105,19 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
+
+    let unclaimed = blocking_operations::unclaimed_owned_test_operations();
+    assert!(
+        unclaimed.is_empty(),
+        "handlers did not claim registered work gates: {unclaimed:?}"
+    );
+
+    for (kind, arrived) in arrivals {
+        arrived
+            .await
+            .unwrap_or_else(|_| panic!("{kind:?} never reached its registered work seam"));
+        assert_eq!(app.async_actions.pending_kind_count(&kind.action_kind()), 1);
+    }
 
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
@@ -131,23 +144,27 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         Some(HistoryEntry::Plain { line }) if line == "⚠ daemon reduced"
     ));
     assert_eq!(app.async_actions.pending_count(), 6);
-    tokio::task::yield_now().await;
-    release_guard.release();
+    for guard in release_guards {
+        guard.release();
+    }
 }
 
-fn owned_barrier(kind: BlockingOperationKind) -> BarrierRelease {
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    blocking_operations::install_owned_test_barrier(kind, std::sync::Arc::clone(&barrier));
-    BarrierRelease(Some(barrier))
+fn owned_barrier(
+    kind: BlockingOperationKind,
+) -> (BarrierRelease, tokio::sync::oneshot::Receiver<()>) {
+    let (gate, arrived) = blocking_operations::OwnedTestGate::new();
+    blocking_operations::install_owned_test_barrier(kind, gate.clone());
+    (BarrierRelease(Some(gate)), arrived)
 }
 
 #[tokio::test]
 async fn curator_command_is_async_with_pending_line() {
-    let barrier = owned_barrier(BlockingOperationKind::CuratorMaintenance);
+    let (barrier, arrived) = owned_barrier(BlockingOperationKind::CuratorMaintenance);
     let mut app = App::new(None, false);
     app.daemon_prompt = None;
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.handle_curator_command("status");
+    arrived.await.unwrap();
     assert!(
         matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/curator: pending")
     );
@@ -157,9 +174,10 @@ async fn curator_command_is_async_with_pending_line() {
 
 #[tokio::test]
 async fn doctor_command_is_async() {
-    let barrier = owned_barrier(BlockingOperationKind::DoctorSnapshot);
+    let (barrier, arrived) = owned_barrier(BlockingOperationKind::DoctorSnapshot);
     let mut app = App::new(None, false);
     app.handle_doctor_command();
+    arrived.await.unwrap();
     assert!(
         matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/doctor: collecting diagnostics…")
     );
@@ -219,12 +237,13 @@ async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
 
 #[tokio::test]
 async fn queue_edit_does_not_block_key_handler() {
-    let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
+    let (barrier, arrived) = owned_barrier(BlockingOperationKind::QueueMutation);
     let mut app = App::new(None, false);
     activate_composer(&mut app);
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
+    arrived.await.unwrap();
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('x'),
@@ -233,18 +252,17 @@ async fn queue_edit_does_not_block_key_handler() {
     ));
     assert_eq!(app.composer.text(), "x");
     assert_eq!(app.async_actions.pending_count(), 1);
-    tokio::task::yield_now().await;
     barrier.release();
 }
 
 #[tokio::test]
 async fn btw_teardown_does_not_block_during_session() {
-    let barrier = owned_barrier(BlockingOperationKind::BtwTeardown);
+    let (barrier, arrived) = owned_barrier(BlockingOperationKind::BtwTeardown);
     let mut app = App::new(None, false);
     app.handle_btw_command("end");
+    arrived.await.unwrap();
     app.handle_terminal_event(crossterm::event::Event::Resize(91, 37));
     assert_eq!(app.async_actions.pending_count(), 1);
-    tokio::task::yield_now().await;
     barrier.release();
 }
 
@@ -264,10 +282,11 @@ fn btw_teardown_on_exit_path_remains_synchronous() {
 
 #[tokio::test]
 async fn at_suggestions_do_no_blocking_work() {
-    let barrier = owned_barrier(BlockingOperationKind::FileAutocomplete);
+    let (barrier, arrived) = owned_barrier(BlockingOperationKind::FileAutocomplete);
     let mut app = App::new(None, false);
     app.composer.set("@src".to_string());
     app.reset_at_window();
+    arrived.await.unwrap();
     app.handle_terminal_event(crossterm::event::Event::Resize(80, 24));
     assert!(app.at_suggestions_loading);
     assert_eq!(app.async_actions.pending_count(), 1);

@@ -141,6 +141,7 @@ function EnterpriseAdmin() {
       });
       return orpc.enterprise.reconfirmRemoteAdminRecovery.call({
         proposalId: overview.data.recovery.id,
+        canonicalRequestDigest: overview.data.recovery.canonicalRequestDigest,
         stepUp: stepUp.stepUp,
       });
     },

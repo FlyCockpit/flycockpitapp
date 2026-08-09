@@ -683,9 +683,16 @@ export const enterpriseRouter = {
     }),
 
   reconfirmRemoteAdminRecovery: protectedProcedure
-    .input(z.object({ proposalId: z.string().uuid(), stepUp: z.string().length(87) }))
+    .input(
+      z.object({
+        proposalId: z.string().uuid(),
+        canonicalRequestDigest: z.string().max(64),
+        stepUp: z.string().length(87),
+      }),
+    )
     .handler(async ({ input, context }) => {
-      const now = new Date();
+      const now = new Date(),
+        confirmedDigest = base64urlBytes(input.canonicalRequestDigest, 32);
       return prisma.$transaction(
         async (tx) => {
           const proposal = await tx.remoteAdminRecoveryProposal.findUnique({
@@ -698,7 +705,8 @@ export const enterpriseRouter = {
             now > proposal.expiresAt ||
             ![proposal.ownerPrincipalId, proposal.securityPrincipalId].includes(
               context.session.user.id,
-            )
+            ) ||
+            !Buffer.from(proposal.requestDigest).equals(Buffer.from(confirmedDigest))
           )
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Recovery cannot be reconfirmed.",
@@ -1850,6 +1858,7 @@ export const enterpriseRouter = {
           expiresAt: true,
           ownerReconfirmedAt: true,
           securityReconfirmedAt: true,
+          requestDigest: true,
         },
       }),
     ]);
@@ -1861,7 +1870,13 @@ export const enterpriseRouter = {
       exports,
       instances,
       eventCount,
-      recovery,
+      recovery: recovery
+        ? {
+            ...recovery,
+            canonicalRequestDigest: Buffer.from(recovery.requestDigest).toString("base64url"),
+            requestDigest: undefined,
+          }
+        : null,
     };
   }),
 

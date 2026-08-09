@@ -296,6 +296,7 @@ describe("remote_admin_recovery_timeline", () => {
       state: "PENDING" as const,
     };
     expect(() => recoveryReady(proposal, 12, "d")).not.toThrow();
+    expect(() => recoveryReady(proposal, 12, "changed")).toThrow();
     expect(() => recoveryReady(proposal, 21, "d")).toThrow();
     expect(() => recoveryReady({ ...proposal, ownerReconfirmedAt: 9 }, 12, "d")).toThrow();
     expect(() => recoveryReady({ ...proposal, state: "CANCELLED" as const }, 12, "d")).toThrow();

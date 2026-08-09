@@ -375,6 +375,33 @@ mod tests {
                 .unwrap(),
             AcceptMessageResult::Conflict
         );
+        let mut changed_message = original.clone();
+        changed_message.message_request_digest[0] ^= 1;
+        assert_eq!(
+            db.accept_message_with_attachments(changed_message, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
+        let mut changed_submission = original.clone();
+        changed_submission.client_submission_id = [9; 16];
+        assert_eq!(
+            db.accept_message_with_attachments(changed_submission, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
+        let mut changed_actor = original.clone();
+        changed_actor.actor = MessageActor::RemoteDevice {
+            id: [10; 16],
+            generation: 1,
+        };
+        assert_eq!(
+            db.accept_message_with_attachments(changed_actor, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
         assert_eq!(
             db.message_attachment_receipts(session.session_id, original.client_submission_id)
                 .await
@@ -437,6 +464,78 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_attachment_materialization_mismatch_rolls_back_history_and_states() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let input = input(session.session_id);
+        db.accept_message_with_attachments(input.clone(), Arc::new(Allow))
+            .await
+            .unwrap();
+        assert!(
+            db.materialize_message_submissions(
+                session.session_id,
+                vec![input.client_submission_id, [99; 16]],
+                "{\"client_submission_ids\":[]}".into(),
+                20
+            )
+            .await
+            .is_err()
+        );
+        let (events, state): (i64, String) = db.read(move |conn| {
+            let events = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session_id=?1 AND type='user_message'", [session.session_id.to_string()], |row| row.get(0))?;
+            let state = conn.query_row("SELECT state FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2", params![session.session_id.to_string(), input.client_submission_id.as_slice()], |row| row.get(0))?;
+            Ok((events, state))
+        }).await.unwrap();
+        assert_eq!(events, 0);
+        assert_eq!(state, "accepted");
+    }
+
+    #[tokio::test]
+    async fn message_attachment_remote_actor_id_and_generation_rebinding_conflict() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let mut original = input(session.session_id);
+        original.actor = MessageActor::RemoteDevice {
+            id: [11; 16],
+            generation: 2,
+        };
+        assert_eq!(
+            db.accept_message_with_attachments(original.clone(), Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Accepted
+        );
+        let mut changed_id = original.clone();
+        changed_id.actor = MessageActor::RemoteDevice {
+            id: [12; 16],
+            generation: 2,
+        };
+        assert_eq!(
+            db.accept_message_with_attachments(changed_id, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
+        let mut changed_generation = original;
+        changed_generation.actor = MessageActor::RemoteDevice {
+            id: [11; 16],
+            generation: 3,
+        };
+        assert_eq!(
+            db.accept_message_with_attachments(changed_generation, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
         );
     }
 }

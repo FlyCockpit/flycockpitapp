@@ -89,6 +89,11 @@ const PRODUCTION_ROUTING_SOURCES: &[&str] = &[
 ];
 
 fn derive_wrapper_handler(wrapper: &str) -> Result<(&'static str, String), String> {
+    const MAX_SOURCES: usize = 8;
+    const MAX_FUNCTIONS_PER_SOURCE: usize = 2_000;
+    if PRODUCTION_ROUTING_SOURCES.len() > MAX_SOURCES {
+        return Err("production routing source budget exceeded".to_string());
+    }
     let mut found = Vec::new();
     for source in PRODUCTION_ROUTING_SOURCES {
         let mut parser = tree_sitter::Parser::new();
@@ -100,6 +105,9 @@ fn derive_wrapper_handler(wrapper: &str) -> Result<(&'static str, String), Strin
             .ok_or("Rust parser returned no tree")?;
         let mut functions = Vec::new();
         collect_all_functions(tree.root_node(), &mut functions);
+        if functions.len() > MAX_FUNCTIONS_PER_SOURCE {
+            return Err(format!("function budget exceeded: {}", functions.len()));
+        }
         for function in functions {
             let Some(name) = function
                 .child_by_field_name("name")
@@ -107,7 +115,13 @@ fn derive_wrapper_handler(wrapper: &str) -> Result<(&'static str, String), Strin
             else {
                 continue;
             };
-            if analyze_handler_source(source, name, wrapper).is_ok_and(|calls| calls == 1) {
+            let Some(body) = function.child_by_field_name("body") else {
+                continue;
+            };
+            let mut calls = 0;
+            if inspect_handler_calls_bounded(body, source.as_bytes(), wrapper, &mut calls).is_ok()
+                && calls == 1
+            {
                 found.push((*source, name.to_string()));
             }
         }
@@ -141,39 +155,232 @@ fn validate_site_reachability(
     use super::blocking_operations::BlockingOperationSite::*;
     let slash = include_str!("slash.rs");
     let input = include_str!("input.rs");
+    let graph = production_call_graph()?;
     let reachable = match site {
-        SlashCurator => {
-            slash.contains("name: \"curator\"")
-                && slash.contains("run: run_curator")
-                && handler == "handle_curator_command"
-        }
-        SlashDoctor => {
-            slash.contains("name: \"doctor\"")
-                && slash.contains("run: run_doctor")
-                && handler == "handle_doctor_command"
-        }
-        SlashExport => {
-            slash.contains("name: \"export\"")
-                && slash.contains("run: run_export")
-                && handler == "start_export_action"
-        }
-        SlashBtw => {
-            slash.contains("name: \"btw\"")
-                && slash.contains("run: run_btw")
-                && handler == "handle_btw_command"
-        }
+        SlashCurator => slash_route(slash, "curator", &graph, handler)?,
+        SlashDoctor => slash_route(slash, "doctor", &graph, handler)?,
+        SlashExport => slash_route(slash, "export", &graph, handler)?,
+        SlashBtw => slash_route(slash, "btw", &graph, handler)?,
         QueueEditKey => {
-            input.contains("KeyCode::Up")
-                && input.contains("self.history_up()")
-                && handler == "edit_queued_messages"
+            match_arm_calls(input, "KeyCode::Up", "self.history_up")?
+                && graph_reaches(&graph, "history_up", handler)?
         }
         ComposerSuggestions => {
-            input.contains("self.reset_at_window()") && handler == "reset_at_window"
+            match_arm_has_call(input, "self.reset_at_window")?
+                && graph_reaches(&graph, "reset_at_window", handler)?
         }
     };
     reachable.then_some(()).ok_or_else(|| {
         format!("handler `{handler}` is unreachable from its production registration")
     })
+}
+
+fn production_call_graph()
+-> Result<std::collections::HashMap<String, std::collections::HashSet<String>>, String> {
+    let mut graph = std::collections::HashMap::new();
+    for source in PRODUCTION_ROUTING_SOURCES {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .map_err(|e| e.to_string())?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or("Rust parser returned no tree")?;
+        let mut functions = Vec::new();
+        collect_all_functions(tree.root_node(), &mut functions);
+        for function in functions {
+            let Some(name) = function
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            else {
+                continue;
+            };
+            let mut calls = std::collections::HashSet::new();
+            collect_direct_call_names(
+                function.child_by_field_name("body").unwrap_or(function),
+                source.as_bytes(),
+                &mut calls,
+            );
+            graph
+                .entry(name.to_string())
+                .or_insert_with(std::collections::HashSet::new)
+                .extend(calls);
+        }
+    }
+    Ok(graph)
+}
+
+fn collect_direct_call_names(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    calls: &mut std::collections::HashSet<String>,
+) {
+    if matches!(node.kind(), "closure_expression" | "function_item") {
+        return;
+    }
+    if node.kind() == "call_expression"
+        && let Some(function) = node.child_by_field_name("function")
+        && let Ok(text) = function.utf8_text(source)
+    {
+        calls.insert(text.rsplit('.').next().unwrap_or(text).to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_direct_call_names(child, source, calls);
+    }
+}
+
+fn graph_reaches(
+    graph: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    root: &str,
+    target: &str,
+) -> Result<bool, String> {
+    let mut pending = vec![root.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if visited.len() > 512 {
+            return Err("route call-graph budget exceeded".to_string());
+        }
+        if node == target {
+            return Ok(true);
+        }
+        if let Some(next) = graph.get(&node) {
+            pending.extend(next.iter().cloned());
+        }
+    }
+    Ok(false)
+}
+
+fn slash_route(
+    source: &str,
+    command: &str,
+    graph: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    target: &str,
+) -> Result<bool, String> {
+    let run = slash_registry_run(source, command)?;
+    graph_reaches(graph, &run, target)
+}
+
+fn slash_registry_run(source: &str, command: &str) -> Result<String, String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    let mut found = Vec::new();
+    find_registry_entries(tree.root_node(), source.as_bytes(), command, &mut found);
+    if found.len() != 1 {
+        return Err(format!(
+            "slash `{command}` has {} registry entries",
+            found.len()
+        ));
+    }
+    Ok(found.pop().unwrap())
+}
+
+fn find_registry_entries(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    command: &str,
+    found: &mut Vec<String>,
+) {
+    if node.kind() == "struct_expression" {
+        let mut name = None;
+        let mut run = None;
+        let mut cursor = node.walk();
+        for child in node
+            .children(&mut cursor)
+            .filter(|n| n.kind() == "field_initializer")
+        {
+            let mut child_cursor = child.walk();
+            let mut fields = child.named_children(&mut child_cursor);
+            let key = fields.next().and_then(|n| n.utf8_text(source).ok());
+            let value = fields.next().and_then(|n| n.utf8_text(source).ok());
+            match key {
+                Some("name") => name = value,
+                Some("run") => run = value,
+                _ => {}
+            }
+        }
+        let expected = format!("\"{command}\"");
+        if name == Some(expected.as_str())
+            && let Some(run) = run
+        {
+            found.push(run.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_registry_entries(child, source, command, found);
+    }
+}
+
+fn match_arm_calls(source: &str, pattern: &str, call: &str) -> Result<bool, String> {
+    match_arm_query(source, Some(pattern), call)
+}
+fn match_arm_has_call(source: &str, call: &str) -> Result<bool, String> {
+    match_arm_query(source, None, call)
+}
+fn match_arm_query(source: &str, pattern: Option<&str>, call: &str) -> Result<bool, String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    let mut matched = false;
+    find_match_arm(
+        tree.root_node(),
+        source.as_bytes(),
+        pattern,
+        call,
+        &mut matched,
+    );
+    Ok(matched)
+}
+fn find_match_arm(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    pattern: Option<&str>,
+    call: &str,
+    matched: &mut bool,
+) {
+    if node.kind() == "match_arm" {
+        let mut has_pattern = pattern.is_none();
+        let mut has_call = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.utf8_text(source).ok() == pattern {
+                has_pattern = true;
+            }
+            scan_exact_call(child, source, call, &mut has_call);
+        }
+        *matched |= has_pattern && has_call;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_match_arm(child, source, pattern, call, matched);
+    }
+}
+fn scan_exact_call(node: tree_sitter::Node<'_>, source: &[u8], call: &str, found: &mut bool) {
+    if node.kind() == "call_expression"
+        && node
+            .child_by_field_name("function")
+            .and_then(|n| n.utf8_text(source).ok())
+            == Some(call)
+    {
+        *found = true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        scan_exact_call(child, source, call, found);
+    }
 }
 
 fn validate_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<(), String> {
@@ -236,6 +443,29 @@ fn inspect_handler_calls(
     wrapper: &str,
     wrapper_calls: &mut usize,
 ) -> Result<(), String> {
+    let mut remaining = 50_000usize;
+    inspect_handler_calls_inner(node, source, wrapper, wrapper_calls, &mut remaining)
+}
+
+fn inspect_handler_calls_bounded(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper: &str,
+    wrapper_calls: &mut usize,
+) -> Result<(), String> {
+    inspect_handler_calls(node, source, wrapper, wrapper_calls)
+}
+
+fn inspect_handler_calls_inner(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    wrapper: &str,
+    wrapper_calls: &mut usize,
+    remaining: &mut usize,
+) -> Result<(), String> {
+    *remaining = remaining
+        .checked_sub(1)
+        .ok_or_else(|| "handler AST node budget exceeded".to_string())?;
     if matches!(node.kind(), "closure_expression" | "function_item") {
         return Ok(());
     }
@@ -262,7 +492,7 @@ fn inspect_handler_calls(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        inspect_handler_calls(child, source, wrapper, wrapper_calls)?;
+        inspect_handler_calls_inner(child, source, wrapper, wrapper_calls, remaining)?;
     }
     Ok(())
 }
@@ -317,6 +547,25 @@ fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
     use super::blocking_operations::BlockingOperationSite;
     assert!(validate_site_reachability(BlockingOperationSite::SlashCurator, "bypass").is_err());
     assert!(derive_wrapper_handler("unclassified_owned_dispatch").is_err());
+    assert!(
+        slash_registry_run(
+            "const NOTE: &str = \"name: \\\"curator\\\" run: run_curator\";",
+            "curator"
+        )
+        .is_err()
+    );
+    let rerouted =
+        r#"const COMMANDS: &[SlashCommand] = &[SlashCommand { name: "curator", run: run_wrong }];"#;
+    let run = slash_registry_run(rerouted, "curator").unwrap();
+    assert_eq!(run, "run_wrong");
+    assert!(
+        !graph_reaches(
+            &std::collections::HashMap::new(),
+            &run,
+            "handle_curator_command"
+        )
+        .unwrap()
+    );
 }
 
 #[tokio::test]

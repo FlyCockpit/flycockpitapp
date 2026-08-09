@@ -54,7 +54,7 @@ describe("RedisAuthorityObservationStore", () => {
     await expect(store.publishLease(lease("9"))).rejects.toThrow(
       "stale observation lease generation",
     );
-    await store.publishLease(lease("10"));
+    await store.publishLease(lease("10"), 30);
     expect(evalCalls[0]).toEqual([
       "remote-authority:lease:prod_1:3:replica-a:2",
       expect.any(String),

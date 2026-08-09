@@ -174,6 +174,7 @@ mountRemoteAuthorityRoutes(app, {
   snapshot: remoteAuthority.snapshot,
   now: () => Math.floor(Date.now() / 1000).toString(),
 });
+let remoteAuthorityTickTimer: ReturnType<typeof setInterval> | undefined;
 if (remoteAuthority.runtime) {
   let authorityTickInFlight = false;
   const tickRemoteAuthority = async () => {
@@ -186,9 +187,10 @@ if (remoteAuthority.runtime) {
     }
   };
   void tickRemoteAuthority();
-  setInterval(() => {
+  remoteAuthorityTickTimer = setInterval(() => {
     void tickRemoteAuthority();
-  }, 10_000).unref();
+  }, 10_000);
+  remoteAuthorityTickTimer.unref();
 }
 
 // Liveness probe — answers whether this Node process can serve HTTP. Keep this
@@ -564,6 +566,7 @@ async function shutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
+  if (remoteAuthorityTickTimer) clearInterval(remoteAuthorityTickTimer);
   await remoteAuthority.runtime?.drain().catch(() => false);
 
   // 1. Stop accepting new connections and drain in-flight requests.

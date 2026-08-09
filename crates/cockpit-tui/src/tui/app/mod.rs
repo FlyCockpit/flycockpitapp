@@ -318,6 +318,7 @@ pub(crate) struct PendingModelSelection {
 
 pub(crate) struct QueuedModelSubmission {
     pub client_submission_id: uuid::Uuid,
+    pub fence_sequence: u64,
     /// Composer buffer at the instant this submission was held. A matching
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,
@@ -2879,7 +2880,6 @@ struct StartupFirstPaintTiming {
 impl StartupFirstPaintTiming {
     fn new(launch_start: Option<Instant>) -> Self {
         Self {
-            monotonic_origin: Instant::now(),
             launch_start,
             logged: false,
         }
@@ -3119,6 +3119,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
+            monotonic_origin: Instant::now(),
             launch,
             config_snapshot,
             active_model_state_generation: 0,
@@ -3760,7 +3761,14 @@ impl App {
                 self.handle_paste(text);
                 false
             }
-            ClassifierDecision::ShortcutIntent | ClassifierDecision::Pending => false,
+            ClassifierDecision::ShortcutIntent => {
+                // A native shortcut may represent image-only clipboard data;
+                // probe it off-loop while the classifier retains the intent
+                // for a possible authoritative text/bracketed event.
+                self.handle_paste(String::new());
+                false
+            }
+            ClassifierDecision::Pending => false,
             ClassifierDecision::PasteUnavailable => {
                 self.show_toast("Paste unavailable", ToastKind::Error);
                 false

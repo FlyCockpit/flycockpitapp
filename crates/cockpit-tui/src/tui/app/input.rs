@@ -2164,6 +2164,7 @@ impl App {
             self.paste_registry.build_wire(self.composer.text(), vision);
         let paste_wire = paste_wire.trim().to_string();
         if paste_wire.is_empty() && paste_images.is_empty() {
+            let _ = self.submission_order.complete(fence_sequence);
             return false;
         }
         if let Err(message) = validate_pasted_images_for_submit(&paste_images) {
@@ -2186,6 +2187,9 @@ impl App {
                     .as_ref()
                     .map(|value| value.1.clone())
                     .unwrap_or_default(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
             }
         });
         let host = crate::tui::structured_paste::HostIdentity {
@@ -2233,6 +2237,8 @@ impl App {
         // its first message. The old session stays whole in SQLite,
         // recoverable via `cockpit session show/resume`.
         if self.pending_compact.is_some() {
+            self.submission_fences.remove(&client_submission_id);
+            let _ = self.submission_order.complete(fence_sequence);
             return self.commit_compact(submitted);
         }
 
@@ -2308,6 +2314,7 @@ impl App {
             );
             pending.queued_submission = Some(super::QueuedModelSubmission {
                 client_submission_id,
+                fence_sequence,
                 composer_text: self.composer.text().to_string(),
                 display: submitted,
                 submission,

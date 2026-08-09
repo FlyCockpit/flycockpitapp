@@ -569,7 +569,8 @@ impl App {
                         self.at_scroll = 0;
                     }
                     queued.submission.expected_model_state_generation = Some(generation);
-                    queued.submission.expected_model = requested.clone();
+                    queued.submission.expected_model =
+                        applied_state.as_ref().map(|state| state.selection.clone());
                     self.dispatch_optimistic_user_submission_with_id(
                         queued.client_submission_id,
                         queued.display,
@@ -578,6 +579,13 @@ impl App {
                         true,
                         &queued.tag_expansions,
                     );
+                    if let Some(fence) =
+                        self.submission_fences.get_mut(&queued.client_submission_id)
+                    {
+                        fence.lifecycle =
+                            crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+                    }
+                    let _ = self.submission_order.complete(queued.fence_sequence);
                 }
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
@@ -709,6 +717,9 @@ impl App {
                 client_submission_ids,
                 preflight_cleaned,
             } => {
+                for id in &client_submission_ids {
+                    self.submission_fences.remove(id);
+                }
                 self.retained_user_submission_ids
                     .retain(|id| !client_submission_ids.contains(id));
                 self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());

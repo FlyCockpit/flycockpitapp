@@ -659,7 +659,7 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
 
     for title in ["Tools", "Skills", "MCP", "LSP"] {
         let source_tmp = TempDir::new().unwrap();
-        let mut source = fresh_dialog(&source_tmp);
+        let mut source = standalone_pointer_dialog(&source_tmp, title);
         enter_root_node(&mut source, title);
         let _ = render_settings_rows(&source, 100, 80);
         let actions = source
@@ -698,7 +698,7 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
 
         for action in actions {
             let tmp = TempDir::new().unwrap();
-            let mut dialog = fresh_dialog(&tmp);
+            let mut dialog = standalone_pointer_dialog(&tmp, title);
             enter_root_node(&mut dialog, title);
             let before = serde_json::to_value(&dialog.extended).unwrap();
             let token_before = dialog.page.pointer_surface_token();
@@ -749,13 +749,29 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
                 (SettingsPointerAction::Lsp(LspAction::Reset), TestPageRef::Lsp(page)) => {
                     page.reset.is_pending()
                 }
-                (SettingsPointerAction::Lsp(LspAction::Check(_)), TestPageRef::Lsp(page)) => {
-                    dialog.pending_daemon_request.is_some() || page.status.is_some()
-                }
+                (
+                    SettingsPointerAction::Lsp(
+                        LspAction::Check(_)
+                        | LspAction::Install(_)
+                        | LspAction::Uninstall(_)
+                        | LspAction::Restart(_),
+                    ),
+                    _,
+                ) => dialog.pending_daemon_request.is_some(),
                 _ => panic!("unclassified fresh standalone action {action:?}"),
             };
             assert!(semantic_outcome, "{action:?} produced no semantic outcome");
         }
+    }
+}
+
+fn standalone_pointer_dialog(tmp: &TempDir, title: &str) -> SettingsDialog {
+    if title == "LSP" {
+        let active = tmp.path().join("active-project");
+        std::fs::create_dir_all(&active).unwrap();
+        SettingsDialog::open_from_picker(tmp.path().join("config.json"), active)
+    } else {
+        fresh_dialog(tmp)
     }
 }
 
@@ -1073,7 +1089,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         ("LSP", SettingsPointerSurfaceKind::Lsp),
     ] {
         let tmp = TempDir::new().unwrap();
-        let mut d = fresh_dialog(&tmp);
+        let mut d = standalone_pointer_dialog(&tmp, title);
         enter_root_node(&mut d, title);
         let _ = render_settings_rows(&d, 100, 40);
         let actual_surface = d.page.pointer_surface_kind();

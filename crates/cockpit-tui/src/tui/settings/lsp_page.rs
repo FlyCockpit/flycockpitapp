@@ -626,31 +626,35 @@ impl SettingsCx {
             .project_context()
             .project_root()
             .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended));
-        let bindings = (0..row_count).map(|cursor| {
+        let bindings = (0..row_count).filter_map(|cursor| {
             let action = match lsp_row_for_cursor(cursor) {
-                LspRow::Enabled => PointerLspAction::ToggleEnabled,
-                LspRow::AutoInstall => PointerLspAction::CycleAutoInstall,
-                LspRow::Diagnostics => PointerLspAction::ToggleDiagnostics,
-                LspRow::OtherFilesLimit => PointerLspAction::Edit(PointerLspEdit::OtherFilesLimit),
-                LspRow::PerFileLimit => PointerLspAction::Edit(PointerLspEdit::PerFileLimit),
-                LspRow::DebounceMs => PointerLspAction::Edit(PointerLspEdit::DebounceMs),
+                LspRow::Enabled => Some(PointerLspAction::ToggleEnabled),
+                LspRow::AutoInstall => Some(PointerLspAction::CycleAutoInstall),
+                LspRow::Diagnostics => Some(PointerLspAction::ToggleDiagnostics),
+                LspRow::OtherFilesLimit => {
+                    Some(PointerLspAction::Edit(PointerLspEdit::OtherFilesLimit))
+                }
+                LspRow::PerFileLimit => Some(PointerLspAction::Edit(PointerLspEdit::PerFileLimit)),
+                LspRow::DebounceMs => Some(PointerLspAction::Edit(PointerLspEdit::DebounceMs)),
                 LspRow::DocumentTimeoutMs => {
-                    PointerLspAction::Edit(PointerLspEdit::DocumentTimeoutMs)
+                    Some(PointerLspAction::Edit(PointerLspEdit::DocumentTimeoutMs))
                 }
                 LspRow::WorkspaceTimeoutMs => {
-                    PointerLspAction::Edit(PointerLspEdit::WorkspaceTimeoutMs)
+                    Some(PointerLspAction::Edit(PointerLspEdit::WorkspaceTimeoutMs))
                 }
-                LspRow::Reset => PointerLspAction::Reset,
+                LspRow::Reset => Some(PointerLspAction::Reset),
+                // The unavailable sentinel is explanatory text, not an
+                // enabled Check control. A real project source below supplies
+                // stable server identities and actionable controls.
                 LspRow::Server(index) => servers
                     .as_ref()
                     .and_then(|items| items.get(index))
-                    .map(|server| PointerLspAction::Check(LspServerId(server.id.clone())))
-                    .unwrap_or_else(|| PointerLspAction::Check(LspServerId("unavailable".into()))),
-            };
-            (
+                    .map(|server| PointerLspAction::Check(LspServerId(server.id.clone()))),
+            }?;
+            Some((
                 lsp_selected_line_for_cursor(cursor),
                 SettingsPointerAction::Lsp(action),
-            )
+            ))
         });
         self.scroll_states.render_bound_lines(
             frame,

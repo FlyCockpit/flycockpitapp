@@ -163,6 +163,37 @@ pub(crate) struct FittedCompactHistory {
     pub coverage: CompactInputCoverage,
 }
 
+pub(crate) fn fit_compact_request(
+    history: &[Message],
+    system: &str,
+    instruction: &str,
+    context_window: Option<u32>,
+) -> Result<FittedCompactHistory, String> {
+    let Some(window) = context_window else {
+        return Ok(FittedCompactHistory {
+            history: history.to_vec(),
+            rung: CompactFitRung::Verbatim,
+            coverage: CompactInputCoverage::Full,
+        });
+    };
+    if window == 0 {
+        return Err("compact model declares a zero context window".to_string());
+    }
+    let budget = CompactRequestBudget::new(window, system, instruction, history);
+    if budget.fixed_tokens.saturating_add(budget.reserve) >= budget.window {
+        return Err("compact model window cannot fit system and draft instructions".to_string());
+    }
+    if budget.fits() {
+        return Ok(FittedCompactHistory {
+            history: history.to_vec(),
+            rung: CompactFitRung::Verbatim,
+            coverage: CompactInputCoverage::Full,
+        });
+    }
+    fit_whole_exchange_suffix(history, budget.history_allowance())
+        .ok_or_else(|| "newest complete exchange does not fit the compact model".to_string())
+}
+
 /// Select the richest provider-valid whole-exchange suffix that fits.  The
 /// exchange definition is shared with post-compaction tail planning, so a
 /// split can never begin at a tool result or separate a call from its result
@@ -261,5 +292,45 @@ mod tests {
         assert_eq!(budget.reserve, 10);
         assert!(budget.fixed_tokens > 0);
         assert_eq!(budget.history_tokens, wire_token_total(&history));
+    }
+
+    #[test]
+    fn compact_verbatim_request_accounts_for_system_prompt_instruction_and_headroom() {
+        let history = vec![Message::user("h"), Message::assistant("a")];
+        let raw_history = wire_token_total(&history);
+        let fixed = CompactRequestBudget::new(10_000, "system", "instruction", &history);
+        let window = u32::try_from(raw_history + fixed.fixed_tokens + 1).unwrap();
+        let fitted = fit_compact_request(&history, "system", "instruction", Some(window));
+        assert!(
+            fitted.is_err(),
+            "the ten-percent reserve must make the otherwise raw-fitting request fail"
+        );
+        let verbatim = fit_compact_request(&history, "system", "instruction", None).unwrap();
+        assert_eq!(verbatim.history, history);
+        assert_eq!(verbatim.rung, CompactFitRung::Verbatim);
+    }
+
+    #[test]
+    fn compact_history_selected_never_orphans_tool_pairs() {
+        let history = vec![
+            Message::user("old user ".repeat(200)),
+            Message::assistant("old answer ".repeat(200)),
+            Message::user("new user"),
+            Message::assistant("new answer"),
+        ];
+        let newest_tokens = wire_token_total(&history[2..]);
+        let fitted = fit_whole_exchange_suffix(&history, newest_tokens).unwrap();
+        assert_eq!(fitted.history, history[2..]);
+        assert_eq!(fitted.rung, CompactFitRung::HistorySelected);
+        assert_eq!(fitted.coverage, CompactInputCoverage::Partial);
+    }
+
+    #[test]
+    fn compact_unknown_window_attempts_only_verbatim() {
+        let history = vec![Message::user("history")];
+        let fitted = fit_compact_request(&history, "system", "instruction", None).unwrap();
+        assert_eq!(fitted.history, history);
+        assert_eq!(fitted.rung, CompactFitRung::Verbatim);
+        assert_eq!(fitted.coverage, CompactInputCoverage::Full);
     }
 }

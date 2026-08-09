@@ -99,6 +99,7 @@ struct CompactBriefDraft {
     params: crate::engine::model::ModelParams,
     agent_name: String,
     prompt_override: Option<String>,
+    context_window: Option<u32>,
     #[cfg(test)]
     test_calls: Option<Arc<std::sync::Mutex<Vec<TestCompactBriefCall>>>>,
 }
@@ -1316,6 +1317,10 @@ impl Driver {
             params: top.agent.params.clone(),
             agent_name: top.agent.name.clone(),
             prompt_override: extended.compact_prompt,
+            // Model metadata is resolved through the same driver accounting
+            // path used by trigger and post-compact planning. Unknown remains
+            // unknown: the fitter will allow one verbatim attempt only.
+            context_window: self.active_model_context_length(),
             #[cfg(test)]
             test_calls: self.test_compact_brief_calls.clone(),
         }
@@ -1374,22 +1379,44 @@ trait CompactDraftOutcomeExt {
 impl CompactDraftOutcomeExt for crate::engine::compact_draft::CompactDraftOutcome {
     fn into_brief(self) -> Result<String, PrepareCompactionError> {
         match self {
-            Self::Success(success) => Ok(success.brief),
+            Self::Success(success)
+                if success.input_coverage
+                    == crate::engine::compact_draft::CompactInputCoverage::Full =>
+            {
+                Ok(success.brief)
+            }
+            Self::Success(_) => Err(PrepareCompactionError::Draft(
+                crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow {
+                    diagnostic: "full-source synthesis required".to_string(),
+                },
+            )),
             failure => Err(PrepareCompactionError::Draft(failure)),
         }
     }
 }
 
 async fn execute_compact_brief(
-    draft: CompactBriefDraft,
+    mut draft: CompactBriefDraft,
     prompt_text: String,
     purpose: &'static str,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> crate::engine::compact_draft::CompactDraftOutcome {
     use crate::engine::compact_draft::{
-        CompactDraftOutcome as O, CompactDraftSuccess, CompactFitRung, CompactInputCoverage,
-        CompactSampleClass, MAX_WIRE_SAMPLES_PER_NODE,
+        CompactDraftOutcome as O, CompactDraftSuccess, CompactSampleClass,
+        MAX_WIRE_SAMPLES_PER_NODE,
     };
+    let fitted = match crate::engine::compact_draft::fit_compact_request(
+        &draft.history,
+        &draft.system,
+        &prompt_text,
+        draft.context_window,
+    ) {
+        Ok(fitted) => fitted,
+        Err(diagnostic) => return O::ContextOverflow { diagnostic },
+    };
+    draft.history = fitted.history;
+    let fit_rung = fitted.rung;
+    let input_coverage = fitted.coverage;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
         if cancel.is_cancelled() {
@@ -1411,8 +1438,8 @@ async fn execute_compact_brief(
             .await;
         return O::Success(CompactDraftSuccess {
             brief: "test compact brief".to_string(),
-            fit_rung: CompactFitRung::Verbatim,
-            input_coverage: CompactInputCoverage::Full,
+            fit_rung,
+            input_coverage,
             attempts: 1,
         });
     }
@@ -1482,8 +1509,8 @@ async fn execute_compact_brief(
                 }
                 return O::Success(CompactDraftSuccess {
                     brief: text,
-                    fit_rung: CompactFitRung::Verbatim,
-                    input_coverage: CompactInputCoverage::Full,
+                    fit_rung,
+                    input_coverage,
                     attempts: attempt,
                 });
             }

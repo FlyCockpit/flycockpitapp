@@ -232,6 +232,22 @@ pub(crate) fn fit_whole_exchange_suffix(
     })
 }
 
+/// Strictly reduce a provider-rejected whole-exchange request. This is used
+/// only after an actual context-overflow verdict; transient failures stay on
+/// the same input. A single-exchange request has no pair-safe smaller rung.
+pub(crate) fn next_smaller_whole_exchange_fit(history: &[Message]) -> Option<FittedCompactHistory> {
+    let ranges = super::compact::complete_exchange_ranges(history);
+    if ranges.len() <= 1 {
+        return None;
+    }
+    let first = ranges[1].start;
+    Some(FittedCompactHistory {
+        history: history[first..].to_vec(),
+        rung: CompactFitRung::HistorySelected,
+        coverage: CompactInputCoverage::Partial,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

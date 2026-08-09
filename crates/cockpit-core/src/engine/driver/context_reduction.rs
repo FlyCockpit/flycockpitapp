@@ -1415,8 +1415,8 @@ async fn execute_compact_brief(
         Err(diagnostic) => return O::ContextOverflow { diagnostic },
     };
     draft.history = fitted.history;
-    let fit_rung = fitted.rung;
-    let input_coverage = fitted.coverage;
+    let mut fit_rung = fitted.rung;
+    let mut input_coverage = fitted.coverage;
     #[cfg(test)]
     if let Some(calls) = &draft.test_calls {
         if cancel.is_cancelled() {
@@ -1533,6 +1533,21 @@ async fn execute_compact_brief(
                 ) {
                     CompactSampleClass::Cancelled => return O::Cancelled,
                     CompactSampleClass::ContextOverflow => {
+                        // Provider accounting can be stricter than the local
+                        // estimator. Spend the node's one remaining wire
+                        // sample only on a strictly smaller whole-exchange
+                        // suffix; never retry the known-overflowing input.
+                        if attempt < MAX_WIRE_SAMPLES_PER_NODE
+                            && let Some(smaller) =
+                                crate::engine::compact_draft::next_smaller_whole_exchange_fit(
+                                    &draft.history,
+                                )
+                        {
+                            draft.history = smaller.history;
+                            fit_rung = smaller.rung;
+                            input_coverage = smaller.coverage;
+                            continue;
+                        }
                         return O::ContextOverflow { diagnostic };
                     }
                     CompactSampleClass::Deterministic => return O::Deterministic { diagnostic },

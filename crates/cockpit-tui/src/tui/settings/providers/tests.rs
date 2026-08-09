@@ -289,13 +289,12 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
         }
     }
 
-    let oauth = oauth_provider_config("codex", "oauth:test");
-    let oauth_entry = oauth.providers["codex"].clone();
+    let oauth = oauth_provider_config("codex-oauth", "oauth:test");
     let (_tmp, mut source) = dialog_with_config(oauth.clone());
-    source.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
-        "codex".into(),
-        oauth_entry.clone(),
-    )));
+    source.page = super::super::providers_page(standalone_oauth_page(
+        OAuthProvider::Codex,
+        OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex),
+    ));
     let _ = render_provider_rows(&source, 110, 60);
     let actions = source
         .pointer_surface
@@ -320,10 +319,10 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
     );
     for action in actions {
         let (_tmp, mut dialog) = dialog_with_config(oauth.clone());
-        dialog.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
-            "codex".into(),
-            oauth_entry.clone(),
-        )));
+        dialog.page = super::super::providers_page(standalone_oauth_page(
+            OAuthProvider::Codex,
+            OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex),
+        ));
         click_rendered_provider_action(&mut dialog, &action);
     }
 }

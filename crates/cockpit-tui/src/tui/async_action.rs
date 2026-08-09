@@ -289,6 +289,65 @@ pub struct AsyncActionCancellation {
     export_temp: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
+fn export_temp_reaper() -> &'static std::sync::mpsc::Sender<std::path::PathBuf> {
+    static REAPER: std::sync::OnceLock<std::sync::mpsc::Sender<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+        let retry_tx = tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("cockpit-export-temp-reaper".to_string())
+            .spawn(move || {
+                while let Ok(path) = rx.recv() {
+                    let mut attempt = 0u32;
+                    loop {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                            Err(error) => {
+                                attempt = attempt.saturating_add(1);
+                                eprintln!(
+                                    "cockpit: export recovery retry {attempt} could not remove {}: {error}",
+                                    path.display()
+                                );
+                                std::thread::sleep(Duration::from_millis(
+                                    100u64.saturating_mul(u64::from(attempt.min(50))),
+                                ));
+                                if retry_tx.send(path.clone()).is_err() {
+                                    eprintln!(
+                                        "cockpit: export recovery queue closed with {} still owned",
+                                        path.display()
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        tx
+    })
+}
+
+fn enqueue_export_temp_reap(path: std::path::PathBuf) {
+    if let Err(error) = export_temp_reaper().send(path) {
+        eprintln!("cockpit: export temporary-file reaper unavailable: {error}");
+    }
+}
+
+impl Drop for AsyncActionCancellation {
+    fn drop(&mut self) {
+        if let Some(path) = self
+            .export_temp
+            .get_mut()
+            .expect("export temp owner poisoned")
+            .take()
+        {
+            enqueue_export_temp_reap(path);
+        }
+    }
+}
+
 impl AsyncActionCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
@@ -348,18 +407,7 @@ impl AsyncActionCancellation {
             .expect("export temp owner poisoned")
             .take();
         let Some(path) = path else { return false };
-        // `spawn_blocking` work is not cancelled when its JoinHandle is
-        // dropped or aborted. This is the final in-process reaper after the
-        // bounded async shutdown phase, so runtime teardown cannot strand a
-        // partial merely by cancelling the export future.
-        tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
-                "cockpit: export recovery could not remove {}: {error}",
-                path.display()
-            ),
-        });
+        enqueue_export_temp_reap(path);
         true
     }
 }
@@ -775,12 +823,10 @@ impl AsyncActionRunner {
 
     pub fn shutdown(&mut self) {
         for (id, pending) in self.pending.drain() {
-            if !matches!(
-                &pending.kind,
-                AsyncActionKind::Blocking("export.transcript" | "export.debug")
-            ) {
-                pending.handle.abort();
+            if let Some(shutdown) = &pending.shutdown {
+                shutdown.cancel();
             }
+            pending.handle.abort();
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
@@ -1201,6 +1247,53 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("independent export cleanup retry left an orphan");
+    }
+
+    #[tokio::test]
+    async fn dropping_temp_owner_enqueues_cleanup_before_any_await() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".drop.partial");
+        std::fs::write(&partial, b"partial").unwrap();
+        let owner = AsyncActionCancellation::default();
+        owner.own_export_temp(partial.clone());
+        drop(owner);
+
+        for _ in 0..100 {
+            if !partial.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("dropping cleanup ownership stranded a partial");
+    }
+
+    #[tokio::test]
+    async fn dropping_runner_while_export_waits_eventually_reaps_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".runner-drop.partial");
+        let worker_partial = partial.clone();
+        let (owned_tx, owned_rx) = oneshot::channel();
+        let mut runner = AsyncActionRunner::default();
+        runner.start_export(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::AllowConcurrent,
+            move |owner| async move {
+                std::fs::write(&worker_partial, b"partial").unwrap();
+                owner.own_export_temp(worker_partial);
+                owned_tx.send(()).unwrap();
+                std::future::pending::<Result<AsyncActionPayload, String>>().await
+            },
+        );
+        owned_rx.await.unwrap();
+        drop(runner);
+
+        for _ in 0..100 {
+            if !partial.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("runner drop stranded an owned export partial");
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

@@ -3,15 +3,13 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BlockingOperationRegistration {
     pub(super) site: &'static str,
-    pub(super) handler: &'static str,
-    pub(super) dispatch: &'static str,
-    pub(super) binding: &'static str,
+    pub(super) binding: fn(&App) -> BlockingOperationKind,
     pub(super) kind: BlockingOperationKind,
     pub(super) actions: &'static [&'static str],
 }
 
 macro_rules! blocking_operation_manifest {
-    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
+    ($( $kind:ident => $site:literal => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
@@ -22,9 +20,7 @@ macro_rules! blocking_operation_manifest {
         pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
             $(BlockingOperationRegistration {
                 site: $site,
-                handler: $handler,
-                dispatch: $dispatch,
-                binding: stringify!($binding),
+                binding: App::$binding,
                 kind: BlockingOperationKind::$kind,
                 actions: &[$($action),+],
             }),+
@@ -41,12 +37,12 @@ macro_rules! blocking_operation_manifest {
 }
 
 blocking_operation_manifest! {
-    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => curator_blocking_operation => [curator_action_name => "curator.command"],
-    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
-    ExportWrite => "slash:/export" => "start_export_action" => "start_export" => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
-    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => queue_blocking_operation => [queue_action_name => "queue.edit"],
-    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => btw_blocking_operation => [btw_action_name => "btw.teardown"],
-    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
+    CuratorMaintenance => "slash:/curator" => curator_blocking_operation => [curator_action_name => "curator.command"],
+    DoctorSnapshot => "slash:/doctor" => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
+    ExportWrite => "slash:/export" => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
+    QueueMutation => "key:queue-edit" => queue_blocking_operation => [queue_action_name => "queue.edit"],
+    BtwTeardown => "slash:/btw" => btw_blocking_operation => [btw_action_name => "btw.teardown"],
+    FileAutocomplete => "composer:@suggestions" => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
 }
 
 impl BlockingOperationKind {

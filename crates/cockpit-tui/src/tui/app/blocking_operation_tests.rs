@@ -30,44 +30,10 @@ fn blocking_operation_manifest_is_complete() {
             .collect::<Vec<_>>(),
         expected
     );
-    assert_eq!(
-        BLOCKING_OPERATION_MANIFEST
-            .iter()
-            .map(|entry| (entry.handler, entry.dispatch, entry.binding))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "handle_curator_command",
-                "start_owned_blocking_action",
-                "curator_blocking_operation"
-            ),
-            (
-                "handle_doctor_command",
-                "start_owned_blocking_action",
-                "doctor_blocking_operation"
-            ),
-            (
-                "start_export_action",
-                "start_export",
-                "export_blocking_operation"
-            ),
-            (
-                "edit_queued_messages",
-                "start_serialized",
-                "queue_blocking_operation"
-            ),
-            (
-                "handle_btw_command",
-                "async_actions.start",
-                "btw_blocking_operation"
-            ),
-            (
-                "reset_at_window",
-                "start_owned_blocking_action",
-                "autocomplete_blocking_operation"
-            ),
-        ]
-    );
+    let app = App::new(None, false);
+    for registration in BLOCKING_OPERATION_MANIFEST {
+        assert_eq!((registration.binding)(&app), registration.kind);
+    }
 
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();

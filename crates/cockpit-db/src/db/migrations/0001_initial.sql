@@ -224,6 +224,24 @@ CREATE TABLE media_image_component_dimensions (
     height INTEGER NOT NULL CHECK(height > 0 AND height <= 8192)
 );
 
+CREATE TABLE media_attachment_transition_evidence (
+    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    availability_generation TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    committed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(attachment_id, availability_generation)
+);
+
+CREATE TABLE media_storage_publication_intents (
+    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    temporary_storage_id TEXT NOT NULL,
+    quarantine_storage_id TEXT NOT NULL,
+    derivative_storage_ids_json TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TRIGGER media_attachment_component_compatibility_insert
 BEFORE INSERT ON media_attachment_components
 WHEN NOT EXISTS (
@@ -364,6 +382,12 @@ CREATE TABLE media_upload_chunks (
     PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
     CHECK(byte_length>0 AND byte_length<=262144), CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
+CREATE TRIGGER media_upload_publication_intent_complete
+AFTER UPDATE OF state ON media_uploads
+WHEN NEW.state='materialized'
+BEGIN
+    DELETE FROM media_storage_publication_intents WHERE upload_id=NEW.upload_id;
+END;
 CREATE TABLE media_attachment_upload_origins(
     attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation TEXT NOT NULL,
     FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE

@@ -1865,7 +1865,7 @@ fn existing_reference(
 macro_rules! text_enum {
     ($ty:ty, {$($variant:ident => $value:literal),+ $(,)?}) => {
         impl $ty {
-            fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } }
+            pub fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } }
             fn parse(value: &str) -> Result<Self> { match value { $($value => Ok(Self::$variant),)+ _ => bail!("invalid {} `{value}`", stringify!($ty)) } }
         }
     };

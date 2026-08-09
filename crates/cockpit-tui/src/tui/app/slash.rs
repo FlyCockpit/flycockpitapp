@@ -1494,10 +1494,14 @@ impl App {
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             action,
         };
+        let curator_key = AsyncActionKey::new("curator.command");
+        if self.async_actions.has_pending_key(&curator_key) {
+            return;
+        }
         self.push_plain("/curator: pending".to_string());
         self.start_owned_blocking_action(
             blocking_operations::BlockingOperationKind::CuratorMaintenance,
-            AsyncActionPolicy::AllowConcurrent,
+            AsyncActionPolicy::Dedupe(curator_key),
             move || {
                 let response = agent_runner::daemon_request_at_blocking(&socket, request)?;
                 Ok(AsyncActionPayload::Text(format!("/curator: {response:?}")))

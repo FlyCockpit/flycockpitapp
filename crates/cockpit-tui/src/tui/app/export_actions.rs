@@ -11,6 +11,18 @@ const EXPORT_ACTION_KEY: &str = "export";
 const EXPORT_TRANSCRIPT_ACTION: &str = "export.transcript";
 const EXPORT_DEBUG_ACTION: &str = "export.debug";
 
+struct AsyncTempFileCleanup(Option<std::path::PathBuf>);
+
+impl Drop for AsyncTempFileCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(path).await;
+            });
+        }
+    }
+}
+
 impl App {
     /// `/export` (default) — ask the attached daemon for a redacted
     /// transcript and write it asynchronously, overwriting any prior file.
@@ -155,6 +167,7 @@ async fn write_export_no_clobber(
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{command}: invalid export path"))?;
     let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::new_v4()));
+    let mut cleanup = AsyncTempFileCleanup(Some(temp.clone()));
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -182,6 +195,7 @@ async fn write_export_no_clobber(
     }
     .await;
     let _ = tokio::fs::remove_file(&temp).await;
+    cleanup.0 = None;
     result
 }
 

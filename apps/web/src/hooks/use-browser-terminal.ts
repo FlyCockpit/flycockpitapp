@@ -77,7 +77,7 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
       });
       setUploadProgress(null);
     },
-    [options],
+    [options.onError],
   );
 
   useEffect(() => {

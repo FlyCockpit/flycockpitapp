@@ -554,7 +554,11 @@ fn compose_settings_doctor_health_internal(
     publish_global: bool,
     mut observer: impl FnMut(&ExternalRuntimeSnapshot),
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
-    let registry = super::registry::global_registry();
+    let registry = if publish_global {
+        super::registry::global_registry()
+    } else {
+        Arc::new(super::registry::ExternalRuntimeRegistry::new())
+    };
     ensure_integration_adapters_registered(&registry)?;
     let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
     let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
@@ -636,12 +640,11 @@ fn compose_settings_doctor_health_internal(
     // Merge Docker/Podman health from a private mode-aware refresh (never
     // registered into the global catalog).
     {
-        use super::safety_adapters::{
-            ContainerEngineMode, ID_DOCKER, ID_PODMAN, refresh_safety_snapshot,
-        };
+        use super::safety_adapters::{ContainerEngineMode, ID_DOCKER, ID_PODMAN};
         if !matches!(engine_mode, ContainerEngineMode::Disabled) {
             let engine_reg = super::registry::ExternalRuntimeRegistry::new();
-            let engine_snap = refresh_safety_snapshot(
+            let base_snapshot = snapshot.clone();
+            let engine_snap = super::safety_adapters::refresh_safety_snapshot_with_observer(
                 &engine_reg,
                 executor,
                 path_env,
@@ -651,6 +654,11 @@ fn compose_settings_doctor_health_internal(
                 cancel,
                 generation,
                 engine_mode,
+                |engine_progress| {
+                    let mut progress = base_snapshot.clone();
+                    progress.entries.extend(engine_progress.entries.clone());
+                    observer(&progress);
+                },
             );
             for id in [ID_DOCKER, ID_PODMAN] {
                 if let Some(entry) = engine_snap.get(id) {

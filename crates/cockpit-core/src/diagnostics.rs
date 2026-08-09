@@ -1061,9 +1061,16 @@ pub fn dependency_projection_with_deadline_for_run(
     deadline: Duration,
     sandbox_enabled: bool,
 ) -> Result<crate::external_runtime::DependencyProjection> {
+    let expires = std::time::Instant::now() + deadline;
     enum WorkerUpdate {
-        Progress(crate::external_runtime::ExternalRuntimeSnapshot),
-        Complete(Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>>),
+        Progress {
+            completed_at: std::time::Instant,
+            snapshot: crate::external_runtime::ExternalRuntimeSnapshot,
+        },
+        Complete {
+            completed_at: std::time::Instant,
+            result: Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>>,
+        },
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = std::sync::Arc::new(crate::external_runtime::CancelToken::new());
@@ -1088,30 +1095,62 @@ pub fn dependency_projection_with_deadline_for_run(
                 sandbox_enabled,
                 &worker_cancel,
                 move |snapshot| {
-                    let _ = progress_tx.send(WorkerUpdate::Progress(snapshot.clone()));
+                    let _ = progress_tx.send(WorkerUpdate::Progress {
+                        completed_at: std::time::Instant::now(),
+                        snapshot: snapshot.clone(),
+                    });
                 },
             );
-            let _ = tx.send(WorkerUpdate::Complete(result));
+            let _ = tx.send(WorkerUpdate::Complete {
+                completed_at: std::time::Instant::now(),
+                result,
+            });
         })
         .context("starting dependency diagnostics worker")?;
-    let expires = std::time::Instant::now() + deadline;
     let mut latest = None;
     loop {
         let remaining = expires.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(remaining) {
-            Ok(WorkerUpdate::Progress(snapshot)) => {
+            Ok(WorkerUpdate::Progress {
+                completed_at,
+                snapshot,
+            }) if completed_at <= expires => {
                 latest = Some(snapshot);
                 continue;
             }
-            Ok(WorkerUpdate::Complete(result)) => {
+            Ok(WorkerUpdate::Complete {
+                completed_at,
+                result,
+            }) if completed_at <= expires => {
                 let snapshot = result?;
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(snapshot.as_ref()),
                     &crate::external_runtime::global_registry().descriptors(),
                 ));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 cancel.cancel();
+                // Preserve every row that completed on time even if scheduler
+                // latency left its message queued at the deadline.
+                while let Ok(update) = rx.try_recv() {
+                    match update {
+                        WorkerUpdate::Progress {
+                            completed_at,
+                            snapshot,
+                        } if completed_at <= expires => latest = Some(snapshot),
+                        WorkerUpdate::Complete {
+                            completed_at,
+                            result,
+                        } if completed_at <= expires => {
+                            let snapshot = result?;
+                            return Ok(crate::external_runtime::project_dependencies(
+                                Some(snapshot.as_ref()),
+                                &crate::external_runtime::global_registry().descriptors(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
                 let descriptors = crate::external_runtime::global_registry().descriptors();
                 let platform = crate::external_runtime::detect_host_platform();
                 let next_generation = crate::external_runtime::global_health_store()

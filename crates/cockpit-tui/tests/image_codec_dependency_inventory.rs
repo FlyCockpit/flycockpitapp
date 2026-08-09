@@ -346,7 +346,7 @@ fn target_package_features(
         );
         let child_features = &package_features[child_key];
         assert!(
-            child_features.contains(feature) || (feature == "default" && child_features.is_empty()),
+            feature == "default" || child_features.contains(feature),
             "cargo feature activation is absent from child resolved feature set: {package_name} feature \"{feature}\" -> {child_key}"
         );
         resolved_activations
@@ -506,6 +506,23 @@ fn target_package_feature_inventory_accepts_vacuous_default_requests() {
         "image@0.25.10",
     );
     assert!(features["autocfg@1.5.1"].is_empty());
+}
+
+#[test]
+fn target_package_feature_inventory_accepts_default_requests_without_a_default_feature() {
+    let features = target_package_features(
+        concat!(
+            "0image v0.25.10|png\n",
+            "1bytemuck feature \"default\"\n",
+            "2bytemuck v1.25.2|extern_crate_alloc,simd\n",
+        ),
+        &BTreeSet::from(["bytemuck@1.25.2".to_owned(), "image@0.25.10".to_owned()]),
+        "image@0.25.10",
+    );
+    assert_eq!(
+        features["bytemuck@1.25.2"],
+        BTreeSet::from(["extern_crate_alloc".to_owned(), "simd".to_owned()])
+    );
 }
 
 #[test]

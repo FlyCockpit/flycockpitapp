@@ -763,6 +763,11 @@ impl SettingsCx {
                     "↑/↓  enter: select  esc: cancel".to_string(),
                     muted,
                 )));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::Back),
+                ));
+                lines.push(Line::from("[Back]"));
             }
         }
 

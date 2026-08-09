@@ -2490,6 +2490,119 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         );
     }
 
+    let utility_select_actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::Select(_),
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!utility_select_actions.is_empty());
+    for action in utility_select_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = dialog_with_models(&tmp);
+        open_utility_picker(&mut dialog);
+        click_settings_action(&mut dialog, &action);
+        let pointer_actions::SettingsPointerAction::UtilityModel(
+            pointer_actions::UtilityModelAction::Select(id),
+        ) = action
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            dialog.extended.utility_model.as_deref(),
+            Some(id.0.as_str())
+        );
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if page.utility_picker.is_none()
+        ));
+    }
+
+    let back_tmp = TempDir::new().unwrap();
+    let mut back = dialog_with_models(&back_tmp);
+    open_utility_picker(&mut back);
+    let config_before = serde_json::to_value(&back.extended).unwrap();
+    let persisted_before = std::fs::read(back_tmp.path().join("config.json")).unwrap();
+    let _ = render_settings_rows(&back, 90, 24);
+    let back_actions = back
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                shell::SettingsPointerAction::Page(
+                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::Back,
+                    ),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(back_actions.len(), 1, "utility picker owns one Back source");
+    let target = back
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled
+                && target.action == shell::SettingsPointerAction::Page(back_actions[0].clone())
+        })
+        .cloned()
+        .expect("fresh utility picker renders its exact Back target");
+    assert_eq!(
+        back.handle_pointer(settings_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        back.test_page(),
+        TestPageRef::Category(page)
+            if page.category == Category::Behavior
+                && page.utility_picker.is_none()
+                && page.utility_picker_target.is_none()
+                && page.editing.is_none()
+    ));
+    assert_eq!(
+        back.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert_eq!(serde_json::to_value(&back.extended).unwrap(), config_before);
+    assert_eq!(
+        std::fs::read(back_tmp.path().join("config.json")).unwrap(),
+        persisted_before,
+        "Utility Back does not write configuration"
+    );
+    assert!(matches!(
+        back.test_page(),
+        TestPageRef::Category(page)
+            if page.category == Category::Behavior
+                && page.utility_picker.is_none()
+                && page.utility_picker_target.is_none()
+                && page.editing.is_none()
+    ));
+
     let tmp = TempDir::new().unwrap();
     let mut source = dialog_with_models(&tmp);
     open_utility_picker(&mut source);

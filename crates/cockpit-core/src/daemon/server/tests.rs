@@ -10413,6 +10413,56 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::SetWorkspaceTrust {
+                project_root: project_root.clone(),
+                mode: proto::WorkspaceTrustMode::Trust,
+                expected_config_generation: 0,
+            },
+            kind: "set_workspace_trust",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetStartupDisclosures {
+                project_root: project_root.clone(),
+            },
+            kind: "get_startup_disclosures",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::GetAppFlag {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+            },
+            kind: "get_app_flag",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+            kind: "mark_app_flag_seen",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ResolveAssistantSession {
+                assistant_id: "a".into(),
+                project_root: project_root.clone(),
+                mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+            },
+            kind: "resolve_assistant_session",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::UpsertAssistant {
                 name: "a".into(),
                 home_dir: "/tmp".into(),
@@ -10479,6 +10529,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetProjectNoteContent,
         RenameProjectNote,
         DeleteProjectNote,
+        SetWorkspaceTrust,
+        GetStartupDisclosures,
+        GetAppFlag,
+        MarkAppFlagSeen,
+        ResolveAssistantSession,
         ListAssistants,
         UpsertAssistant,
         CreateAssistantSession,

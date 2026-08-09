@@ -77,9 +77,10 @@ impl NativePasteAdapter {
         if sent {
             Some(ack_rx)
         } else {
-            if let Ok(mut acks) = native_paste_acks().lock() {
-                acks.remove(&correlation_id);
-            }
+            acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
             None
         }
     }

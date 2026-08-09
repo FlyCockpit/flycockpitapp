@@ -901,16 +901,17 @@ async fn compact_draft_retries_only_transient_or_degenerate() {
         panic!("scripted retry should recover")
     };
     assert_eq!(success.attempts, 2);
-    let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
-    let scripted = calls
-        .iter()
-        .filter(|call| call.purpose == "compact_script_test")
-        .collect::<Vec<_>>();
-    assert_eq!(scripted.len(), 2);
-    assert_eq!(scripted[0].attempt, 1);
-    assert_eq!(scripted[1].attempt, 2);
-    assert_eq!(scripted[0].fit_rung, scripted[1].fit_rung);
-    drop(calls);
+    {
+        let calls = crate::sync::lock_or_recover(driver.test_compact_brief_calls.as_ref().unwrap());
+        let scripted = calls
+            .iter()
+            .filter(|call| call.purpose == "compact_script_test")
+            .collect::<Vec<_>>();
+        assert_eq!(scripted.len(), 2);
+        assert_eq!(scripted[0].attempt, 1);
+        assert_eq!(scripted[1].attempt, 2);
+        assert_eq!(scripted[0].fit_rung, scripted[1].fit_rung);
+    }
     assert_eq!(
         compact_inference_purposes(&driver)
             .await

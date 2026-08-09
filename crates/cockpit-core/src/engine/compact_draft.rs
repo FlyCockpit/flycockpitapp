@@ -104,9 +104,7 @@ pub(crate) fn classify_sample_error(
     .any(|needle| lower.contains(needle))
     {
         CompactSampleClass::Deterministic
-    } else if typed_timeout || status.is_none() {
-        CompactSampleClass::Transient
-    } else if matches!(status, Some(408 | 429 | 500..=599)) {
+    } else if typed_timeout || status.is_none() || matches!(status, Some(408 | 429 | 500..=599)) {
         CompactSampleClass::Transient
     } else {
         CompactSampleClass::Deterministic

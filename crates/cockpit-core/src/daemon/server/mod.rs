@@ -2271,6 +2271,17 @@ pub(crate) async fn boot_with_db(
         );
         timer.phase("media_reservation_recovery_blocked");
     }
+    let recovery_wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    if let Err(error) = ctx
+        .media_ledger
+        .recover_ephemeral_attachment_uploads(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "ephemeral attachment reservation recovery failed");
+    }
     let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
     ctx.media_admission_open
         .store(recovery_complete, std::sync::atomic::Ordering::Release);

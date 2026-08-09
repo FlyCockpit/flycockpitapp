@@ -44,6 +44,7 @@ pub mod knowledge;
 pub mod locks;
 pub mod mcp;
 pub mod media_reservation;
+mod media_storage;
 pub mod model_system_prompt;
 pub mod packages;
 pub mod path_containment;

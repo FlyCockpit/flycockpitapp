@@ -179,6 +179,15 @@ fn render_provider_links(
 }
 
 pub(crate) fn run_pointer_provider_regression_matrix() {
+    // The aggregate exercises every provider surface, including reducers
+    // that spawn refetch/OAuth work. Keep one reactor alive across the full
+    // construction -> render -> dispatch matrix; narrower fixtures must not
+    // accidentally drop the runtime before later nested traversals run.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("provider pointer matrix runtime");
+    let _runtime_guard = runtime.enter();
     pointer_render_boundary_publishes_stable_provider_identity();
     pointer_delete_confirmation_is_rendered_and_reduced();
     pointer_edit_menu_mapping_is_exhaustive_over_source_actions();
@@ -195,7 +204,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     standalone_oauth_link_region_survives_scroll_and_clipping();
     copilot_setup_effect_accepts_only_its_live_operation_once();
     oauth_copy_completion_is_flow_scoped_and_exactly_once();
-    pointer_enabled_list_and_edit_actions_dispatch_through_dialog();
+    pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl();
     pointer_headers_surface_dispatches_every_enabled_control();
     pointer_reachable_nested_surfaces_render_and_dispatch();
     pointer_prompt_surfaces_render_and_dispatch();
@@ -463,15 +472,19 @@ fn click_rendered_provider_action(
 
 #[test]
 fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
-    // Several visible provider controls intentionally start async-backed
-    // production effects (model refetch/OAuth). Keep this synchronous matrix
-    // deterministic while still entering the real reducers: spawned work is
-    // owned by this runtime and cancelled when the fixture completes.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("provider pointer test runtime");
     let _runtime_guard = runtime.enter();
+    pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl();
+}
+
+fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
+    // Several visible provider controls intentionally start async-backed
+    // production effects (model refetch/OAuth). Keep this synchronous matrix
+    // deterministic while still entering the real reducers: spawned work is
+    // owned by the caller's runtime and cancelled when the fixture completes.
     let config = one_provider_config(None);
     let provider_id = "p".to_string();
     let entry = config.providers[&provider_id].clone();

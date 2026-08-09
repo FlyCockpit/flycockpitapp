@@ -435,7 +435,40 @@ pub struct AccountInfo {
     pub email: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "server URL cannot be empty");
+    let url = url::Url::parse(trimmed)
+        .map_err(|_| anyhow::anyhow!("server URL must be an absolute URL"))?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "server URL must not include credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "server URL must not include a query string or fragment"
+    );
+    anyhow::ensure!(
+        matches!(url.path(), "" | "/"),
+        "server URL must be an origin, not a path"
+    );
+    let loopback = matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    );
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "server URL must use HTTPS except for localhost development"
+    );
+    let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Ok(origin)
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct StoredFlycockpitCredential {
     pub server_url: String,
     pub instance_id: String,
@@ -445,6 +478,66 @@ pub struct StoredFlycockpitCredential {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_choice: Option<RelayChoice>,
+}
+
+impl<'de> Deserialize<'de> for StoredFlycockpitCredential {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            server_url: String,
+            instance_id: String,
+            instance_token: String,
+            account: AccountInfo,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            relay_choice: Option<RelayChoice>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            server_url: wire.server_url,
+            instance_id: wire.instance_id,
+            instance_token: wire.instance_token,
+            account: wire.account,
+            display_name: wire.display_name,
+            relay_choice: wire.relay_choice,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl StoredFlycockpitCredential {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            normalize_server_url(&self.server_url)? == self.server_url,
+            "server URL must be normalized"
+        );
+        anyhow::ensure!(
+            !self.instance_id.is_empty(),
+            "instance id must not be empty"
+        );
+        anyhow::ensure!(
+            !self.instance_token.is_empty(),
+            "instance token must not be empty"
+        );
+        anyhow::ensure!(
+            !self.account.user_id.is_empty(),
+            "account user id must not be empty"
+        );
+        anyhow::ensure!(
+            !self.account.email.is_empty(),
+            "account email must not be empty"
+        );
+        if let Some(relay) = &self.relay_choice {
+            anyhow::ensure!(!relay.relay_id.is_empty(), "relay id must not be empty");
+            anyhow::ensure!(
+                !relay.ws_url.is_empty(),
+                "relay websocket URL must not be empty"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

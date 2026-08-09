@@ -541,19 +541,20 @@ canonical_struct!(
     out,
     [relay_id, region, ws_url, rtt_ms, chosen_at]
 );
-canonical_struct!(
-    crate::StoredFlycockpitCredential,
-    self,
-    out,
-    [
-        server_url,
-        instance_id,
-        instance_token,
-        account,
-        display_name,
-        relay_choice
-    ]
-);
+impl CanonicalFcorValueV1 for crate::StoredFlycockpitCredential {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate()?;
+        let mut nested = CanonicalParamsV1::new();
+        self.server_url.encode_fcor_value_v1(&mut nested)?;
+        self.instance_id.encode_fcor_value_v1(&mut nested)?;
+        self.instance_token.encode_fcor_value_v1(&mut nested)?;
+        self.account.encode_fcor_value_v1(&mut nested)?;
+        self.display_name.encode_fcor_value_v1(&mut nested)?;
+        self.relay_choice.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
 
 impl CanonicalParamsV1 {
     pub fn new() -> Self {

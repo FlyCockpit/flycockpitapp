@@ -3068,6 +3068,8 @@ pub(super) enum QueueEditOutcome {
     TransportError,
 }
 
+const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
+
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
         #[cfg(test)]
@@ -3091,7 +3093,7 @@ impl App {
                 return true;
             }
         }
-        self.push_queue_edit_notice("retrieving queued messages…");
+        self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
         let action_kind = self.queue_blocking_operation().action_kind();
         let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
         self.async_actions.start_serialized(
@@ -3121,7 +3123,11 @@ impl App {
                 self.composer.set(text);
                 self.paste_registry.clear();
                 if partial {
-                    self.push_queue_edit_notice("some queued messages already started");
+                    if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
+                        self.push_queue_edit_notice("some queued messages already started");
+                    }
+                } else if self.has_owned_queue_edit_pending_notice() {
+                    self.toast = None;
                 }
                 true
             }
@@ -3139,6 +3145,14 @@ impl App {
 
     fn push_queue_edit_notice(&mut self, text: &str) {
         self.show_toast(text, super::ToastKind::Info);
+    }
+
+    fn has_owned_queue_edit_pending_notice(&self) -> bool {
+        self.toast.as_ref().is_some_and(|toast| {
+            toast.kind == super::ToastKind::Info
+                && !toast.persistent
+                && toast.text == QUEUE_EDIT_PENDING_NOTICE
+        })
     }
 
     pub(super) fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
@@ -4646,7 +4660,9 @@ mod tag_delete_tests {
 
 #[cfg(test)]
 mod queued_message_edit_tests {
-    use super::{optimistic_queue_item, queue_item_from_proto};
+    use super::{
+        QUEUE_EDIT_PENDING_NOTICE, QueueEditOutcome, optimistic_queue_item, queue_item_from_proto,
+    };
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
     use cockpit_core::daemon::proto::{
@@ -4973,6 +4989,28 @@ mod queued_message_edit_tests {
         assert_eq!(app.prompt_history_cursor, 0);
         assert!(app.queue.is_empty());
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn queue_edit_success_does_not_clear_or_replace_a_newer_toast() {
+        for partial in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new(Some(tmp.path()), false);
+            app.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+            app.show_toast("newer notice", crate::tui::app::ToastKind::Warning);
+
+            app.apply_queue_edit_outcome(QueueEditOutcome::Edited {
+                text: "queued".to_string(),
+                partial,
+            });
+
+            assert!(matches!(
+                &app.toast,
+                Some(toast)
+                    if toast.text == "newer notice"
+                        && toast.kind == crate::tui::app::ToastKind::Warning
+            ));
+        }
     }
 
     #[test]

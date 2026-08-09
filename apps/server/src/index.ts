@@ -11,7 +11,12 @@ import { auth, type Session } from "@flycockpit/auth";
 import { runWithAllowedUserCreation } from "@flycockpit/auth/user-creation-policy";
 import { THEME_INIT_SCRIPT } from "@flycockpit/config/theme-init";
 import prisma from "@flycockpit/db";
-import { ADMIN_EMAILS, env, SIGNUP_ENABLED } from "@flycockpit/env/server";
+import {
+  ADMIN_EMAILS,
+  env,
+  REMOTE_CONNECTION_CAPABILITIES,
+  SIGNUP_ENABLED,
+} from "@flycockpit/env/server";
 import { getRedisConnection } from "@flycockpit/queue";
 import { serve } from "@hono/node-server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
@@ -39,6 +44,7 @@ import {
 import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
 import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
+import { loadRemoteFallbackRouteBindingKeyRuntime } from "./remote-fallback-route-keys.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
@@ -170,6 +176,7 @@ mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
 const redisConnection = getRedisConnection();
 const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
+let remoteFallbackRouteKeysReady = !REMOTE_CONNECTION_CAPABILITIES.websocketData;
 app.use("/api/remote/*", createRateLimiterMiddleware(rpcLimiter));
 mountRemoteAuthorityRoutes(app, {
   snapshot: remoteAuthority.snapshot,
@@ -205,6 +212,7 @@ app.get("/ready", async (c) => {
     postgres: false,
     redis: false,
     remoteAuthority: remoteAuthority.runtime ? remoteAuthority.runtime.decision.ready : true,
+    remoteFallbackRouteKeys: remoteFallbackRouteKeysReady,
   };
   try {
     await withTimeout(prisma.$queryRaw`SELECT 1`, 3000, "postgres readiness check");
@@ -217,6 +225,7 @@ app.get("/ready", async (c) => {
       ? remoteAuthority.runtime.decision.ready
       : true;
     if (!checks.remoteAuthority) return c.json({ ok: false, checks }, 503);
+    if (!checks.remoteFallbackRouteKeys) return c.json({ ok: false, checks }, 503);
 
     return c.json({ ok: true, checks });
   } catch {
@@ -539,6 +548,18 @@ async function waitForDependencies() {
 }
 
 await waitForDependencies();
+
+if (REMOTE_CONNECTION_CAPABILITIES.websocketData) {
+  if (!env.REMOTE_AUTHORITY_DEPLOYMENT_ID)
+    throw new Error("REMOTE_AUTHORITY_DEPLOYMENT_ID is required for WebSocket fallback");
+  await loadRemoteFallbackRouteBindingKeyRuntime({
+    path: env.REMOTE_FALLBACK_ROUTE_BINDING_KEYS_FILE,
+    expectedDigest: env.REMOTE_FALLBACK_ROUTE_BINDING_KEY_DIGEST,
+    deploymentId: env.REMOTE_AUTHORITY_DEPLOYMENT_ID,
+    database: prisma,
+  });
+  remoteFallbackRouteKeysReady = true;
+}
 
 // ---------------------------------------------------------------------------
 // Start listening

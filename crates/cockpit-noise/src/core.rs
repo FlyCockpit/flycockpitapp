@@ -4,7 +4,7 @@ use zeroize::Zeroize;
 
 use crate::frame::{HandshakeFrame, MAX_HANDSHAKE_MESSAGE};
 use crate::prologue::RemoteNoisePrologueV1;
-use crate::record::{MAX_CIPHERTEXT, MAX_PLAINTEXT, RecordKind, RemoteNoiseRecordV1};
+use crate::record::{MAX_CIPHERTEXT, MAX_PAYLOAD, MAX_PLAINTEXT, RecordKind, RemoteNoiseRecordV1};
 use crate::rekey::{DirectionalRekey, RekeyAction, RekeyEvent};
 use crate::{NoiseError, Result};
 
@@ -71,7 +71,8 @@ pub struct NoiseChild {
     send_rekey: DirectionalRekey,
     receive_rekey: DirectionalRekey,
     pending_control_action: Option<RekeyAction>,
-    last_control_ciphertext: Option<(RekeyAction, Vec<u8>)>,
+    last_control_ciphertext: Option<(RekeyAction, Vec<u8>, Vec<u8>)>,
+    fallback_route_generation: Option<u64>,
     closed_due_to_failure: bool,
 }
 
@@ -127,6 +128,7 @@ impl NoiseChild {
             })?,
             pending_control_action: None,
             last_control_ciphertext: None,
+            fallback_route_generation: None,
             closed_due_to_failure: false,
         })
     }
@@ -264,6 +266,9 @@ impl NoiseChild {
         if self.phase != HandshakePhase::Transport {
             return self.invalid_state();
         }
+        if payload.len() > MAX_PAYLOAD {
+            return Err(NoiseError::RecordTooLarge);
+        }
         let actions = match self.send_rekey.reduce(RekeyEvent::LocalRecordRequest {
             kind,
             data_bytes: u64::try_from(payload.len()).map_err(|_| NoiseError::RecordTooLarge)?,
@@ -354,18 +359,30 @@ impl NoiseChild {
     /// Repeating the identical action returns the retained ciphertext without
     /// advancing Snow or the absolute sequence a second time.
     pub fn encrypt_rekey_action(&mut self, action: &RekeyAction) -> Result<Vec<u8>> {
+        self.encrypt_rekey_action_with_prefix(action, &[])
+    }
+
+    /// Encrypts a reducer-emitted control action with an authenticated carrier prefix.
+    /// Fallback uses this for its peer-seen-through watermark; the prefix is part of
+    /// idempotency so a changed watermark can never reuse prior ciphertext.
+    pub fn encrypt_rekey_action_with_prefix(
+        &mut self,
+        action: &RekeyAction,
+        authenticated_prefix: &[u8],
+    ) -> Result<Vec<u8>> {
         if self.phase != HandshakePhase::Transport {
             return self.invalid_state();
         }
-        if let Some((prior, ciphertext)) = &self.last_control_ciphertext
+        if let Some((prior, prefix, ciphertext)) = &self.last_control_ciphertext
             && prior == action
+            && prefix == authenticated_prefix
         {
             return Ok(ciphertext.clone());
         }
         if self.pending_control_action.as_ref() != Some(action) {
             return self.fail(NoiseError::InvalidRekey);
         }
-        let (kind, sequence, payload) = match action {
+        let (kind, sequence, control_payload) = match action {
             RekeyAction::SendPrepare(prepare) => {
                 let sequence = self
                     .send_rekey
@@ -396,6 +413,9 @@ impl NoiseChild {
         if sequence != self.send_sequence {
             return self.fail(NoiseError::SequenceMismatch);
         }
+        let mut payload = Vec::with_capacity(authenticated_prefix.len() + control_payload.len());
+        payload.extend_from_slice(authenticated_prefix);
+        payload.extend_from_slice(&control_payload);
         let plaintext = RemoteNoiseRecordV1 {
             kind,
             sequence,
@@ -417,7 +437,11 @@ impl NoiseChild {
             .send_sequence
             .checked_add(1)
             .ok_or(NoiseError::SequenceExhausted)?;
-        self.last_control_ciphertext = Some((action.clone(), ciphertext.clone()));
+        self.last_control_ciphertext = Some((
+            action.clone(),
+            authenticated_prefix.to_vec(),
+            ciphertext.clone(),
+        ));
         self.pending_control_action = None;
         Ok(ciphertext)
     }
@@ -480,6 +504,7 @@ impl NoiseChild {
         self.receive_sequence = 0;
         self.last_control_ciphertext = None;
         self.pending_control_action = None;
+        self.fallback_route_generation = None;
     }
 
     #[must_use]
@@ -491,6 +516,30 @@ impl NoiseChild {
     #[must_use]
     pub fn endpoint_role(&self) -> EndpointRole {
         self.role
+    }
+
+    #[must_use]
+    pub fn next_send_sequence(&self) -> u64 {
+        self.send_sequence
+    }
+
+    pub fn bind_fallback_route_generation(&mut self, route_generation: u64) -> Result<()> {
+        if self.phase != HandshakePhase::Transport || route_generation == 0 {
+            return self.fail(NoiseError::InvalidFallback);
+        }
+        match self.fallback_route_generation {
+            None => {
+                self.fallback_route_generation = Some(route_generation);
+                Ok(())
+            }
+            Some(prior) if prior == route_generation => Ok(()),
+            Some(_) => self.fail(NoiseError::InvalidFallback),
+        }
+    }
+
+    #[must_use]
+    pub fn fallback_route_generation(&self) -> Option<u64> {
+        self.fallback_route_generation
     }
 
     fn fail<T>(&mut self, error: NoiseError) -> Result<T> {

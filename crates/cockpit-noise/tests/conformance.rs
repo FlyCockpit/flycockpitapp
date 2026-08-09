@@ -263,6 +263,49 @@ fn remote_noise_binding_conformance_uses_the_same_opaque_core() {
     cockpit_noise::noise_close(daemon);
 }
 
+#[test]
+fn remote_fallback_binding_authenticates_outer_sequence_watermark_and_route() {
+    let bytes = prologue().encode();
+    let client = cockpit_noise::noise_create_initiator(bytes.clone(), 11).unwrap();
+    let daemon = cockpit_noise::noise_create_responder(bytes, 11).unwrap();
+    let one = cockpit_noise::noise_write_handshake(client).unwrap();
+    cockpit_noise::noise_read_handshake(daemon, one).unwrap();
+    let two = cockpit_noise::noise_write_handshake(daemon).unwrap();
+    cockpit_noise::noise_read_handshake(client, two).unwrap();
+    let gate: Arc<dyn cockpit_noise::BindingAuthorizationGate> = Arc::new(BindingGate);
+    cockpit_noise::noise_authorize(
+        client,
+        b"client-proof".to_vec(),
+        b"daemon-proof".to_vec(),
+        Arc::clone(&gate),
+    )
+    .unwrap();
+    cockpit_noise::noise_authorize(
+        daemon,
+        b"client-proof".to_vec(),
+        b"daemon-proof".to_vec(),
+        gate,
+    )
+    .unwrap();
+    cockpit_noise::noise_bind_fallback_route(client, 7).unwrap();
+    cockpit_noise::noise_bind_fallback_route(daemon, 7).unwrap();
+    let outer = cockpit_noise::noise_encrypt_fallback_record(
+        client,
+        1,
+        7,
+        0,
+        u64::MAX,
+        b"fragment".to_vec(),
+    )
+    .unwrap();
+    let plaintext = cockpit_noise::noise_decrypt_fallback_record(daemon, outer).unwrap();
+    let record = RemoteNoiseRecordV1::decode_plaintext(&plaintext, 0).unwrap();
+    assert_eq!(&record.payload[..8], &u64::MAX.to_be_bytes());
+    assert_eq!(&record.payload[8..], b"fragment");
+    cockpit_noise::noise_close(client);
+    cockpit_noise::noise_close(daemon);
+}
+
 #[cfg(feature = "test-entropy")]
 #[test]
 fn remote_noise_official_vector_conformance_executes_pinned_case() {

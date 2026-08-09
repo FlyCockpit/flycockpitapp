@@ -52,6 +52,11 @@ export const env = createEnv({
       .optional(),
     REMOTE_AUTHORITY_ISSUER: originUrl("REMOTE_AUTHORITY_ISSUER").optional(),
     REMOTE_GRANT_SIGNING_KEY_DIGESTS: z.string().optional(),
+    REMOTE_FALLBACK_ROUTE_BINDING_KEYS_FILE: z.string().optional(),
+    REMOTE_FALLBACK_ROUTE_BINDING_KEY_DIGEST: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .optional(),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SSO_ENABLED: strictBooleanFlag(),
     SSO_CLIENT_ID: z.string().optional(),

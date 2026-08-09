@@ -14,8 +14,31 @@ namespace cockpit_noise {
   [Throws=NoiseBindingError]
   sequence<u8> noise_encrypt_record(u64 handle, u8 kind, sequence<u8> payload);
   [Throws=NoiseBindingError]
+  sequence<u8> noise_encrypt_fallback_record(u64 handle, u8 kind, u64 route_generation, u8 direction, u64 peer_seen_through, sequence<u8> payload);
+  [Throws=NoiseBindingError]
+  sequence<u8> noise_encrypt_fallback_rekey_action(u64 handle, u8 kind, u64 route_generation, u8 direction, u64 peer_seen_through, sequence<u8> control_payload);
+  [Throws=NoiseBindingError]
+  void noise_bind_fallback_route(u64 handle, u64 route_generation);
+  [Throws=NoiseBindingError]
   sequence<u8> noise_decrypt_record(u64 handle, u64 routing_sequence, sequence<u8> ciphertext);
+  [Throws=NoiseBindingError]
+  sequence<u8> noise_decrypt_fallback_record(u64 handle, sequence<u8> outer_record);
   void noise_close(u64 handle);
+  [Throws=NoiseBindingError]
+  u64 fallback_create(u64 now_millis);
+  [Throws=NoiseBindingError]
+  sequence<u8> fallback_observe(u64 handle, sequence<u8> outer_record);
+  [Throws=NoiseBindingError]
+  sequence<u8> fallback_ack_due(u64 handle, u64 now_millis, boolean immediate, boolean received_ack_only);
+  [Throws=NoiseBindingError]
+  void fallback_cache_outgoing(u64 handle, u64 sequence, sequence<u8> ciphertext, u8 kind);
+  [Throws=NoiseBindingError]
+  void fallback_acknowledge(u64 handle, u64 largest_contiguous);
+  [Throws=NoiseBindingError]
+  sequence<u8> fallback_gap_retransmit(u64 handle, u64 next_missing);
+  [Throws=NoiseBindingError]
+  sequence<u8> fallback_retry_due(u64 handle, u64 elapsed_millis);
+  void fallback_close(u64 handle);
 };
 
 dictionary BindingAuthorizationRequest {

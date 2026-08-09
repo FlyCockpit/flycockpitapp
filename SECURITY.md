@@ -88,6 +88,25 @@ memory-surface risks; their pinned inputs, tools, commands, and reproducibility
 gates are recorded in `crates/cockpit-noise/PROVENANCE.json`. This is a design
 and CI control record, not a claim of formal verification or third-party audit.
 
+## Encrypted WebSocket fallback
+
+The optional `flycockpit.remote-data.v1` gateway is an opaque carrier. The
+TypeScript server validates single-use role tickets, durable certificate
+signatures, committed signaling transitions, route generations, quotas, and
+lease ownership, but never receives Noise keys or plaintext and never parses
+logical lanes. Redis keys contain only bounded authentication digests and
+opaque route coordinates; cross-replica Pub/Sub may contain one ephemeral
+opaque ciphertext record and is not delivery acknowledgement or persistence.
+
+Endpoint delivery, cumulative ACK/retry, duplicate detection, reordering, and
+rekey remain in the shared Rust core. Redis, Pub/Sub, socket writes, and gateway
+command completion cannot open application state or acknowledge endpoint
+delivery. Any Redis/subscription/lease failure closes the affected transport;
+there is no process-local authority or plaintext fallback. Operational logs
+must use reason/size/route-class buckets only and must not include ticket,
+certificate, proof, network, attachment, route, ciphertext, or application
+material.
+
 See `AGENTS.md` § "Safety" for the full list of guardrails a coding agent
 must respect when working in this repo.
 

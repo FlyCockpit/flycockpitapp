@@ -2,21 +2,33 @@
 
 mod bindings;
 mod core;
+mod fallback;
 mod frame;
 mod prologue;
 mod record;
 mod rekey;
 
 pub use bindings::{
-    BindingAuthorizationGate, BindingAuthorizationRequest, NoiseBindingError, noise_authorize,
-    noise_close, noise_create_initiator, noise_create_responder, noise_decrypt_record,
-    noise_encrypt_record, noise_handshake_hash, noise_read_handshake, noise_write_handshake,
+    BindingAuthorizationGate, BindingAuthorizationRequest, NoiseBindingError, fallback_ack_due,
+    fallback_acknowledge, fallback_cache_outgoing, fallback_close, fallback_create,
+    fallback_gap_retransmit, fallback_observe, fallback_retry_due, noise_authorize,
+    noise_bind_fallback_route, noise_close, noise_create_initiator, noise_create_responder,
+    noise_decrypt_fallback_record, noise_decrypt_record, noise_encrypt_fallback_record,
+    noise_encrypt_fallback_rekey_action, noise_encrypt_record, noise_handshake_hash,
+    noise_read_handshake, noise_write_handshake,
 };
 #[cfg(feature = "test-entropy")]
 pub use core::run_nn_test_vector;
 pub use core::{
     AuthorizationCapability, EndpointRole, NoiseChild, TranscriptAuthorizationGate,
     TranscriptAuthorizationRequest, final_proof_binding_bytes, final_proof_binding_digest,
+};
+pub use fallback::{
+    ACK_BATCH, ACK_DEADLINE_MILLIS, ACK_NONE, ACK_WIRE_LEN, CumulativeAckV1,
+    FALLBACK_MAX_CIPHERTEXT, FALLBACK_MAX_MESSAGE, FALLBACK_MIN_CIPHERTEXT,
+    FALLBACK_OUTER_HEADER_LEN, FALLBACK_WINDOW_BYTES, FALLBACK_WINDOW_RECORDS, FallbackDirection,
+    FallbackOuterRecordV1, FallbackReceiveWindow, FallbackSendWindow, RETRY_MILLIS,
+    ReceiveDisposition, validate_authenticated_outer,
 };
 pub use frame::{
     ABSOLUTE_CIPHERTEXT_CAP, HANDSHAKE_HEADER_LEN, HandshakeFrame, MAX_HANDSHAKE_MESSAGE,
@@ -72,4 +84,10 @@ pub enum NoiseError {
     CryptoUnavailable,
     #[error("closed")]
     Closed,
+    #[error("invalid_fallback")]
+    InvalidFallback,
+    #[error("fallback_window_exceeded")]
+    FallbackWindowExceeded,
+    #[error("fallback_retry_exhausted")]
+    FallbackRetryExhausted,
 }

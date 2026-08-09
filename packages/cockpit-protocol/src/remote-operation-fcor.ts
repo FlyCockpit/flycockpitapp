@@ -167,6 +167,34 @@ export class CanonicalParamsV1 {
   }
 }
 
+export function encodeProviderModelResourceV1(provider: string, model: string): Uint8Array {
+  const out = new CanonicalParamsV1();
+  out.pushString(provider);
+  out.pushString(model);
+  return out.finish();
+}
+
+export function validateProviderModelResourceV1(bytes: Uint8Array): void {
+  let offset = 0;
+  for (let field = 0; field < 2; field += 1) {
+    if (offset + 4 > bytes.length) throw new Error("truncated provider_model length");
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
+    const length = view.getUint32(0, false);
+    offset += 4;
+    if (offset + length > bytes.length) throw new Error("truncated provider_model value");
+    let value: string;
+    try {
+      value = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(offset, offset + length));
+    } catch {
+      throw new Error("invalid provider_model UTF-8");
+    }
+    if (value.includes("\0")) throw new Error("provider_model contains NUL");
+    if (value.normalize("NFC") !== value) throw new Error("provider_model is not NFC");
+    offset += length;
+  }
+  if (offset !== bytes.length) throw new Error("trailing provider_model bytes");
+}
+
 function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);

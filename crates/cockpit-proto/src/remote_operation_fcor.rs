@@ -708,9 +708,36 @@ fn validate_stable_resource_shape(kind: u8, value: &[u8]) -> Result<()> {
         11 => ensure!(value.is_empty(), "daemon_global resource must be empty"),
         // Text/path canonicalization is descriptor-specific because paths must
         // first pass through the daemon authorization resolver.
-        2 | 3 | 4 | 8 | 10 => {}
+        10 => validate_provider_model_resource_v1(value)?,
+        2 | 3 | 4 | 8 => {}
         _ => bail!("unknown resource kind"),
     }
+    Ok(())
+}
+
+pub fn encode_provider_model_resource_v1(provider: &str, model: &str) -> Result<Vec<u8>> {
+    let mut out = CanonicalParamsV1::new();
+    out.push_string(provider)?;
+    out.push_string(model)?;
+    Ok(out.into_bytes())
+}
+
+pub fn validate_provider_model_resource_v1(bytes: &[u8]) -> Result<()> {
+    let mut offset = 0usize;
+    for _ in 0..2 {
+        ensure!(offset + 4 <= bytes.len(), "truncated provider_model length");
+        let len = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("provider_model length overflow"))?;
+        ensure!(end <= bytes.len(), "truncated provider_model value");
+        let value = std::str::from_utf8(&bytes[offset..end])?;
+        ensure!(!value.contains('\0'), "provider_model contains NUL");
+        ensure!(value.nfc().eq(value.chars()), "provider_model is not NFC");
+        offset = end;
+    }
+    ensure!(offset == bytes.len(), "trailing provider_model bytes");
     Ok(())
 }
 
@@ -807,6 +834,27 @@ pub fn validate_fcor_v1(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_model_resource_shared_vector_is_exact() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/cockpit-protocol/fixtures/provider-model-resource-v1.json"
+        ))
+        .unwrap();
+        let bytes = encode_provider_model_resource_v1(
+            fixture["provider"].as_str().unwrap(),
+            fixture["model"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hex(&bytes), fixture["canonicalHex"].as_str().unwrap());
+        validate_provider_model_resource_v1(&bytes).unwrap();
+        for malformed in fixture["malformedHex"].as_array().unwrap() {
+            assert!(
+                validate_provider_model_resource_v1(&decode_hex(malformed.as_str().unwrap()))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn named_codec_validation_is_rollback_safe_and_resolve_is_bounded() {

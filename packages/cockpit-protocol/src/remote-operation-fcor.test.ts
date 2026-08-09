@@ -1,16 +1,32 @@
 import { describe, expect, it } from "vitest";
 import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
+import providerModelVector from "../fixtures/provider-model-resource-v1.json" with { type: "json" };
 import {
   CanonicalParamsV1,
   CanonicalParamError,
   checkedFcorV1Size,
   encodeFcorV1,
+  encodeProviderModelResourceV1,
   hashFcorV1,
   validateRegisteredSendUserMessageV2,
   validateFcorV1,
+  validateProviderModelResourceV1,
 } from "./remote-operation-fcor";
 
 describe("FCOR v1", () => {
+  it("matches the shared provider_model resource vector", () => {
+    const bytes = encodeProviderModelResourceV1(
+      providerModelVector.provider,
+      providerModelVector.model,
+    );
+    expect(Buffer.from(bytes).toString("hex")).toBe(providerModelVector.canonicalHex);
+    expect(() => validateProviderModelResourceV1(bytes)).not.toThrow();
+    for (const malformed of providerModelVector.malformedHex) {
+      expect(() =>
+        validateProviderModelResourceV1(Uint8Array.from(Buffer.from(malformed, "hex"))),
+      ).toThrow();
+    }
+  });
   it("matches the shared canonical vector and digest exactly", async () => {
     const bytes = encodeFcorV1(
       vector.requestKind,

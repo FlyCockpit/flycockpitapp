@@ -301,6 +301,7 @@ fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) 
 
 fn descend_provider(
     dialog: &mut SettingsDialog,
+    requested: &'static str,
     matches: impl Fn(&super::super::pointer_actions::ProvidersAction) -> bool,
 ) {
     if let Some(ProvidersPage::Edit(state)) = dialog.page.downcast_mut::<ProvidersPage>()
@@ -320,7 +321,7 @@ fn descend_provider(
     let _ = render_provider_rows(dialog, 110, 60);
     let target = dialog.pointer_surface.targets.borrow().iter().find(|target| {
         matches!(&target.action, super::super::shell::SettingsPointerAction::Page(super::super::pointer_actions::SettingsPointerAction::Providers(action)) if target.enabled && matches(action))
-    }).cloned().expect("nested provider source action");
+    }).cloned().unwrap_or_else(|| panic!("nested provider source action `{requested}` was not rendered"));
     for kind in [
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
@@ -340,21 +341,24 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
     for path in [0, 1, 2, 3] {
         let (_tmp, mut dialog) = edit_fixture(config.clone());
         match path {
-            0 => descend_provider(&mut dialog, |action| {
+            0 => descend_provider(&mut dialog, "EditAction::Models", |action| {
                 matches!(action, ProvidersAction::ManageModels(_))
             }),
-            1 => descend_provider(&mut dialog, |action| {
+            1 => descend_provider(&mut dialog, "EditAction::Settings", |action| {
                 matches!(action, ProvidersAction::ProviderSettings(_))
             }),
             2 => {
-                descend_provider(&mut dialog, |action| {
+                descend_provider(&mut dialog, "EditAction::Models", |action| {
                     matches!(action, ProvidersAction::ManageModels(_))
                 });
-                descend_provider(&mut dialog, |action| {
-                    matches!(action, ProvidersAction::ModelSettings(_, _))
+                descend_provider(&mut dialog, "ModelEditor::ModelOpen", |action| {
+                    matches!(
+                        action,
+                        ProvidersAction::RowEditor(ProviderRowEditorAction::ModelOpen(_))
+                    )
                 });
             }
-            3 => descend_provider(&mut dialog, |action| {
+            3 => descend_provider(&mut dialog, "EditAction::DeepFetch", |action| {
                 matches!(action, ProvidersAction::DeepFetchConfirm(_, _))
             }),
             _ => unreachable!(),

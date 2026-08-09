@@ -292,6 +292,47 @@ pub enum GoalSkepticVerdict {
     Refute { findings: Vec<String> },
 }
 
+const MAX_GOAL_CONTROL_FIELD_CHARS: usize = 4_096;
+const MAX_GOAL_FINDINGS: usize = 32;
+
+impl GoalEvaluatorDecision {
+    fn validate(&self) -> Result<()> {
+        let valid = |value: &str| {
+            let len = value.chars().count();
+            !value.trim().is_empty() && len <= MAX_GOAL_CONTROL_FIELD_CHARS
+        };
+        match self {
+            Self::Continue { next_step } => valid(next_step),
+            Self::CandidateComplete { evidence } => valid(evidence),
+            Self::Blocked {
+                blocker_key,
+                explanation,
+            } => valid(blocker_key) && valid(explanation),
+        }
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("invalid evaluator decision fields"))
+    }
+}
+
+impl GoalSkepticVerdict {
+    fn validate(&self) -> Result<()> {
+        let valid = |value: &str| {
+            let len = value.chars().count();
+            !value.trim().is_empty() && len <= MAX_GOAL_CONTROL_FIELD_CHARS
+        };
+        match self {
+            Self::Approve { evidence } => valid(evidence),
+            Self::Refute { findings } => {
+                !findings.is_empty()
+                    && findings.len() <= MAX_GOAL_FINDINGS
+                    && findings.iter().all(|finding| valid(finding))
+            }
+        }
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("invalid skeptic verdict fields"))
+    }
+}
+
 pub fn sanitize_goal_finding(value: &str) -> String {
     let mut cleaned = value
         .replace("<tool", "&lt;tool")
@@ -300,6 +341,16 @@ pub fn sanitize_goal_finding(value: &str) -> String {
         .replace("<system", "&lt;system");
     cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     cleaned.truncate(floor_char_boundary(&cleaned, 512));
+    cleaned
+}
+
+fn sanitize_goal_evidence(value: &str) -> String {
+    let mut cleaned = value
+        .replace("<tool", "&lt;tool")
+        .replace("</tool", "&lt;/tool")
+        .replace("<assistant", "&lt;assistant")
+        .replace("<system", "&lt;system");
+    cleaned.truncate(floor_char_boundary(&cleaned, 16_384));
     cleaned
 }
 
@@ -847,16 +898,33 @@ impl Db {
         attempt_generation: i64,
         turn_id: Uuid,
     ) -> Result<Option<SessionGoal>> {
+        self.finish_goal_root_turn_with_evidence(
+            goal_id,
+            attempt_generation,
+            turn_id,
+            "host-observed successful root turn",
+        )
+        .await
+    }
+
+    pub async fn finish_goal_root_turn_with_evidence(
+        &self,
+        goal_id: Uuid,
+        attempt_generation: i64,
+        turn_id: Uuid,
+        worker_evidence: &str,
+    ) -> Result<Option<SessionGoal>> {
+        let worker_evidence = sanitize_goal_evidence(worker_evidence);
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let conn = &tx;
             let now = Utc::now().timestamp();
             let changed = conn.execute(
-                "UPDATE goal_root_turns SET state = 'finished', audit_excerpt = 'host-observed successful root turn', updated_at = ?1
-                 WHERE goal_id = ?2 AND attempt_generation = ?3 AND turn_id = ?4 AND state = 'leased'
-                   AND EXISTS (SELECT 1 FROM session_goals WHERE id = ?2 AND disposition = 'running'
-                               AND phase = 'executing' AND attempt_generation = ?3)",
-                params![now, goal_id.to_string(), attempt_generation, turn_id.to_string()],
+                "UPDATE goal_root_turns SET state = 'finished', audit_excerpt = ?1, updated_at = ?2
+                 WHERE goal_id = ?3 AND attempt_generation = ?4 AND turn_id = ?5 AND state = 'leased'
+                   AND EXISTS (SELECT 1 FROM session_goals WHERE id = ?3 AND disposition = 'running'
+                               AND phase = 'executing' AND attempt_generation = ?4)",
+                params![worker_evidence.as_str(), now, goal_id.to_string(), attempt_generation, turn_id.to_string()],
             )?;
             if changed != 1 { return Ok(None); }
             let session_id: String = conn.query_row("SELECT session_id FROM session_goals WHERE id = ?1", params![goal_id.to_string()], |row| row.get(0))?;
@@ -871,7 +939,7 @@ impl Db {
                 "tool_policy": "none",
                 "objective": current.objective,
                 "immutable_contract": current.contract,
-                "root_turn": {"turn_id": turn_id, "result": "successful", "audit": "host-observed successful root turn"},
+                "root_turn": {"turn_id": turn_id, "result": "successful", "evidence": worker_evidence},
                 "unresolved_gaps": current.unresolved_gaps,
                 "instructions": "Return only one JSON object matching one response variant.",
                 "response_schema": [
@@ -1105,7 +1173,7 @@ impl Db {
                     )?;
                 }
                 GoalControlRole::Evaluator => {
-                    let decision = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalEvaluatorDecision>(raw).ok());
+                    let decision = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalEvaluatorDecision>(raw).ok()).filter(|decision| decision.validate().is_ok());
                     let Some(decision) = decision else {
                         goal.transition(GoalLifecycleEvent::EvaluatorFailed)?;
                         finish_control_row(conn, &job, output.as_ref().ok().map(String::as_str), now)?;
@@ -1140,7 +1208,7 @@ impl Db {
                     }
                 }
                 GoalControlRole::Gatekeeper | GoalControlRole::ColdSkeptic => {
-                    let verdict = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalSkepticVerdict>(raw).ok()).unwrap_or_else(|| GoalSkepticVerdict::Refute { findings: vec!["skeptic result unavailable or malformed".into()] });
+                    let verdict = output.as_ref().ok().and_then(|raw| serde_json::from_str::<GoalSkepticVerdict>(raw).ok()).filter(|verdict| verdict.validate().is_ok()).unwrap_or_else(|| GoalSkepticVerdict::Refute { findings: vec!["skeptic result unavailable or malformed".into()] });
                     let normalized = serde_json::to_string(&verdict)?;
                     finish_control_row(conn, &job, Some(&normalized), now)?;
                     apply_verification_if_terminal(conn, &goal, now)?;
@@ -1406,7 +1474,9 @@ fn register_verification_jobs(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(3)
         .clamp(1, 5);
-    let gatekeepers = std::iter::once((GoalControlRole::Gatekeeper, 0_i64));
+    let gatekeepers = (!goal.unresolved_gaps.is_empty())
+        .then_some((GoalControlRole::Gatekeeper, 0_i64))
+        .into_iter();
     for (role, slot) in gatekeepers.chain((0..count).map(|slot| {
         (
             GoalControlRole::ColdSkeptic,
@@ -1463,6 +1533,11 @@ fn apply_verification_if_terminal(
     let mut approvals = 0_usize;
     let mut cold_total = 0_usize;
     let mut findings = Vec::new();
+    let prior_gap_fingerprints: std::collections::HashSet<String> = goal
+        .unresolved_gaps
+        .iter()
+        .map(|finding| goal_gap_fingerprint(finding))
+        .collect();
     for row in rows {
         let (role, raw) = row?;
         let verdict = raw
@@ -1480,7 +1555,17 @@ fn apply_verification_if_terminal(
                 findings: row_findings,
             } => {
                 if role == "gatekeeper" {
-                    gatekeeper_refuted = true;
+                    let replayed: Vec<String> = row_findings
+                        .into_iter()
+                        .map(|finding| sanitize_goal_finding(&finding))
+                        .filter(|finding| {
+                            finding == "skeptic result unavailable or malformed"
+                                || prior_gap_fingerprints.contains(&goal_gap_fingerprint(finding))
+                        })
+                        .collect();
+                    gatekeeper_refuted = !replayed.is_empty();
+                    findings.extend(replayed);
+                    continue;
                 }
                 findings.extend(
                     row_findings
@@ -1742,6 +1827,39 @@ mod tests {
                 .unwrap()
                 .implementation_checklist,
             advice.implementation_checklist
+        );
+    }
+
+    #[test]
+    fn goal_control_results_require_bounded_nonempty_semantics() {
+        assert!(
+            GoalEvaluatorDecision::CandidateComplete {
+                evidence: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GoalEvaluatorDecision::Blocked {
+                blocker_key: "key".into(),
+                explanation: " ".into(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GoalSkepticVerdict::Approve {
+                evidence: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GoalSkepticVerdict::Refute {
+                findings: vec!["x".repeat(MAX_GOAL_CONTROL_FIELD_CHARS + 1)],
+            }
+            .validate()
+            .is_err()
         );
     }
 

@@ -3501,10 +3501,24 @@ impl Driver {
     ) -> Result<()> {
         loop {
             if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
+                let worker_evidence = self
+                    .stack
+                    .first()
+                    .and_then(|frame| {
+                        let start = frame.history.len().saturating_sub(12);
+                        serde_json::to_string(&frame.history[start..]).ok()
+                    })
+                    .unwrap_or_else(|| "successful root turn; transcript unavailable".to_string());
+                let worker_evidence = self.schedule.redaction_table().scrub(&worker_evidence);
                 if let Some(goal) = self
                     .session
                     .db
-                    .finish_goal_root_turn(goal_id, generation, turn_id)
+                    .finish_goal_root_turn_with_evidence(
+                        goal_id,
+                        generation,
+                        turn_id,
+                        &worker_evidence,
+                    )
                     .await?
                 {
                     self.maybe_start_goal_supervision_round(&goal, tx).await?;

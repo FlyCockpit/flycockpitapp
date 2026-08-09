@@ -9,6 +9,10 @@ const ROLES: [&str; 4] = ["planner", "worker", "evaluator", "skeptic"];
 pub struct GoalScratchRoot {
     parent: PathBuf,
     root: PathBuf,
+    #[cfg(unix)]
+    parent_handle: std::fs::File,
+    #[cfg(unix)]
+    root_handle: std::fs::File,
 }
 
 impl GoalScratchRoot {
@@ -25,35 +29,186 @@ impl GoalScratchRoot {
     }
 
     pub fn create_in(parent: &Path, goal_id: Uuid) -> Result<Self> {
-        create_checked_dir(&parent)?;
-        let root = parent.join(goal_id.to_string());
-        create_checked_dir(&root)?;
-        for role in ROLES {
-            create_checked_dir(&root.join(role))?;
+        #[cfg(unix)]
+        return create_in_unix(parent, goal_id);
+        #[cfg(not(unix))]
+        {
+            create_checked_dir(&parent)?;
+            let root = parent.join(goal_id.to_string());
+            create_checked_dir(&root)?;
+            for role in ROLES {
+                create_checked_dir(&root.join(role))?;
+            }
+            Ok(Self {
+                parent: parent.to_path_buf(),
+                root,
+            })
         }
-        Ok(Self {
-            parent: parent.to_path_buf(),
-            root,
-        })
     }
 
     pub fn role(&self, role: &str) -> Result<PathBuf> {
         if !ROLES.contains(&role) {
             bail!("unknown goal scratch role");
         }
+        #[cfg(unix)]
+        openat_private_dir(&self.root_handle, role)?;
         let path = self.root.join(role);
+        #[cfg(not(unix))]
         verify_checked_dir(&path)?;
         Ok(path)
     }
 
     pub fn cleanup(self) -> Result<()> {
-        verify_checked_dir(&self.root)?;
-        verify_checked_dir(&self.parent)?;
-        if self.root.parent() != Some(self.parent.as_path()) {
-            bail!("refusing to remove goal scratch outside the private root");
+        #[cfg(unix)]
+        {
+            for role in ROLES {
+                unlinkat_dir(&self.root_handle, role)?;
+            }
+            let name = self
+                .root
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| anyhow::anyhow!("invalid goal scratch root name"))?;
+            return unlinkat_dir(&self.parent_handle, name)
+                .context("removing terminal goal scratch root");
         }
-        std::fs::remove_dir_all(&self.root).context("removing terminal goal scratch root")
+        #[cfg(not(unix))]
+        {
+            verify_checked_dir(&self.root)?;
+            verify_checked_dir(&self.parent)?;
+            if self.root.parent() != Some(self.parent.as_path()) {
+                bail!("refusing to remove goal scratch outside the private root");
+            }
+            std::fs::remove_dir_all(&self.root).context("removing terminal goal scratch root")
+        }
     }
+}
+
+#[cfg(unix)]
+fn create_in_unix(parent: &Path, goal_id: Uuid) -> Result<GoalScratchRoot> {
+    let parent_handle = ensure_private_dir_tree(parent)?;
+    let root_name = goal_id.to_string();
+    mkdirat_private(&parent_handle, &root_name)?;
+    let root_handle = openat_private_dir(&parent_handle, &root_name)?;
+    for role in ROLES {
+        mkdirat_private(&root_handle, role)?;
+        openat_private_dir(&root_handle, role)?;
+    }
+    Ok(GoalScratchRoot {
+        parent: parent.to_path_buf(),
+        root: parent.join(&root_name),
+        parent_handle,
+        root_handle,
+    })
+}
+
+#[cfg(unix)]
+fn ensure_private_dir_tree(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let start = if path.is_absolute() { "/" } else { "." };
+    let start = std::ffi::CString::new(start)?;
+    // SAFETY: the path is NUL terminated; the returned descriptor is owned.
+    let fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("opening scratch path anchor");
+    }
+    // SAFETY: `fd` was newly returned by open and has unique ownership.
+    let mut current: std::fs::File = unsafe { OwnedFd::from_raw_fd(fd) }.into();
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("goal scratch parent has no parent directory"))?;
+    for component in parent_path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::CurDir
+            ) {
+                continue;
+            }
+            bail!("goal scratch path contains an unsafe component");
+        };
+        let name = std::str::from_utf8(name.as_bytes())
+            .context("goal scratch path component is not UTF-8")?;
+        current = openat_dir_nofollow(&current, name)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid goal scratch parent name"))?;
+    mkdirat_private(&current, name)?;
+    openat_private_dir(&current, name)
+}
+
+#[cfg(unix)]
+fn component_cstring(name: &str) -> Result<std::ffi::CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        bail!("unsafe goal scratch component");
+    }
+    Ok(std::ffi::CString::new(name)?)
+}
+
+#[cfg(unix)]
+fn mkdirat_private(parent: &std::fs::File, name: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = component_cstring(name)?;
+    // SAFETY: parent is a live directory descriptor and name is NUL terminated.
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Ok(());
+    }
+    Err(error).context("creating private goal scratch directory")
+}
+
+#[cfg(unix)]
+fn openat_private_dir(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = openat_dir_nofollow(parent, name)?;
+    let meta = file.metadata()?;
+    if meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o777 != 0o700 {
+        bail!("goal scratch component failed owner/mode checks");
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn openat_dir_nofollow(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let name = component_cstring(name)?;
+    // SAFETY: parent is live and name is NUL terminated. O_NOFOLLOW rejects links.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("opening goal scratch component");
+    }
+    // SAFETY: `fd` is newly owned.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) }.into())
+}
+
+#[cfg(unix)]
+fn unlinkat_dir(parent: &std::fs::File, name: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = component_cstring(name)?;
+    // SAFETY: parent is live and unlinkat operates on the literal child name.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("removing goal scratch directory");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -85,11 +240,25 @@ mod tests {
     fn goal_scratch_root_rejects_windows_reparse_point() {
         let temp = tempfile::tempdir().unwrap();
         let scratch = GoalScratchRoot::create_in(&temp.path().join("goals"), Uuid::nil()).unwrap();
-        assert!(scratch.role("planner").is_ok());
+        let planner = scratch.root.join("planner");
+        std::fs::remove_dir(&planner).unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&planner)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(scratch.role("planner").is_err());
     }
 }
 
+#[cfg(not(unix))]
 fn create_checked_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    verify_no_reparse_components(path.parent().unwrap_or(path))?;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.file_type().is_dir() || meta.file_type().is_symlink() => bail!(
             "goal scratch path is a link or non-directory: {}",
@@ -105,27 +274,10 @@ fn create_checked_dir(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn set_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn verify_checked_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink()
-        || !meta.is_dir()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.permissions().mode() & 0o777 != 0o700
-    {
-        bail!(
-            "goal scratch directory failed owner/link/mode checks: {}",
-            path.display()
-        );
-    }
     Ok(())
 }
 
@@ -186,12 +338,110 @@ fn set_private(path: &Path) -> Result<()> {
 fn verify_checked_dir(path: &Path) -> Result<()> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    verify_no_reparse_components(path)?;
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         bail!(
             "goal scratch directory is a reparse point or non-directory: {}",
             path.display()
         );
+    }
+    verify_private_dacl(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_no_reparse_components(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&current)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!("goal scratch path contains a reparse-point component");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_private_dacl(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetFileSecurityW(
+            file_name: *const u16,
+            requested_information: u32,
+            security_descriptor: *mut core::ffi::c_void,
+            length: u32,
+            length_needed: *mut u32,
+        ) -> i32;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            security_descriptor: *mut core::ffi::c_void,
+            revision: u32,
+            security_information: u32,
+            string_security_descriptor: *mut *mut u16,
+            string_length: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut needed = 0_u32;
+    // SAFETY: this first call intentionally supplies a null buffer to obtain its size.
+    unsafe {
+        GetFileSecurityW(
+            wide_path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error()).context("reading goal scratch DACL size");
+    }
+    let mut descriptor = vec![0_u8; usize::try_from(needed)?];
+    let mut sddl_ptr = ptr::null_mut();
+    let mut sddl_len = 0_u32;
+    // SAFETY: buffers are sized by Windows and all output pointers remain valid.
+    unsafe {
+        if GetFileSecurityW(
+            wide_path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) == 0
+            || ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.as_mut_ptr().cast(),
+                1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut sddl_len,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("reading goal scratch DACL");
+        }
+        let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(
+            sddl_ptr,
+            usize::try_from(sddl_len).unwrap_or(0),
+        ));
+        LocalFree(sddl_ptr.cast());
+        if !sddl.starts_with("D:P") || sddl.matches("(A;").count() != 1 || !sddl.contains(";;FA;;;")
+        {
+            bail!("goal scratch DACL is not protected current-owner-only full control");
+        }
     }
     Ok(())
 }

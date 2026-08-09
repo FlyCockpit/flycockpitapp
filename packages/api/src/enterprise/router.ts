@@ -974,6 +974,7 @@ export const enterpriseRouter = {
       if (typeof payload?.operation !== "number" || typeof payload.operationEpoch !== "string")
         throw new ORPCError("CONFLICT", { message: "Approval scope is invalid." });
       const operation = payload.operation as RemoteAdminOperation;
+      const operationEpoch = BigInt(payload.operationEpoch);
       const credentialIdHash = base64urlBytes(input.credentialIdHash, 32);
       const credential = await prisma.remoteAdminCredential.findUnique({
         where: {
@@ -1050,7 +1051,7 @@ export const enterpriseRouter = {
         credentialIdHash,
         operation,
         canonicalRequestDigest: new Uint8Array(ceremony.requestDigest),
-        operationEpoch: BigInt(payload.operationEpoch),
+        operationEpoch,
         issuedAt,
         expiresAt,
         challengeId: uuidBytes(ceremony.id),
@@ -1085,7 +1086,7 @@ export const enterpriseRouter = {
               registryGeneration: registry.generation,
               operation,
               canonicalRequestDigest: ceremony.requestDigest,
-              operationEpoch: BigInt(payload.operationEpoch),
+              operationEpoch,
               challengeId: ceremony.id,
               evidenceDigest: createHash("sha256").update(evidenceBytes).digest(),
               evidenceBytes: Buffer.from(evidenceBytes),
@@ -1242,7 +1243,7 @@ export const enterpriseRouter = {
         throw new ORPCError("CONFLICT", { message: "Owner bootstrap payload is invalid." });
       const credentialIdHash = base64urlBytes(input.credentialIdHash, 32);
       const spki = base64urlBytes(input.publicKeySpki);
-      let publicJwk: JsonWebKey;
+      let publicJwk: { kty?: string; crv?: string; x?: string; y?: string };
       try {
         const publicKey = await crypto.subtle.importKey(
           "spki",
@@ -1429,7 +1430,7 @@ export const enterpriseRouter = {
         });
       const credentialIdHash = base64urlBytes(input.credentialIdHash, 32);
       const spki = base64urlBytes(input.publicKeySpki);
-      let jwk: JsonWebKey;
+      let jwk: { kty?: string; crv?: string; x?: string; y?: string };
       try {
         const key = await crypto.subtle.importKey(
           "spki",

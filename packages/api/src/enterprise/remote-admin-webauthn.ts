@@ -11,6 +11,11 @@ const text = new TextEncoder();
 const b64url = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64url");
 const equal = (left: Uint8Array, right: Uint8Array) =>
   left.length === right.length && left.every((value, index) => value === right[index]);
+const webCryptoBytes = (value: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const copy = new Uint8Array(value.byteLength);
+  copy.set(value);
+  return copy;
+};
 
 export type WebAuthnPolicy = { rpId: string; origin: string };
 export type AssertionInput = {
@@ -21,7 +26,7 @@ export type AssertionInput = {
 };
 
 async function sha256(value: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", value));
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", webCryptoBytes(value)));
 }
 function concat(...parts: Uint8Array[]) {
   const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
@@ -157,8 +162,8 @@ export async function verifyRemoteAdminAssertion(input: {
     !(await crypto.subtle.verify(
       { name: "ECDSA", hash: "SHA-256" },
       publicKey,
-      signatureP1363,
-      signed,
+      webCryptoBytes(signatureP1363),
+      webCryptoBytes(signed),
     ))
   )
     throw new Error("webauthn_signature_invalid");
@@ -250,8 +255,8 @@ export async function verifyPortableRemoteAdminApproval(input: {
     !(await crypto.subtle.verify(
       { name: "ECDSA", hash: "SHA-256" },
       publicKey,
-      evidence.signatureP1363,
-      signed,
+      webCryptoBytes(evidence.signatureP1363),
+      webCryptoBytes(signed),
     ))
   )
     throw new Error("webauthn_signature_invalid");

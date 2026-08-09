@@ -11,7 +11,7 @@ describe("remote_admin_passkey_web_accessibility", () => {
       rpId: "admin.example.com",
       userId: new Uint8Array(16).fill(2),
     });
-    expect(new Uint8Array(options.challenge)).toHaveLength(32);
+    expect(options.challenge.byteLength).toBe(32);
     expect(options.timeout).toBe(300_000);
     expect(options.authenticatorSelection).toMatchObject({
       residentKey: "preferred",

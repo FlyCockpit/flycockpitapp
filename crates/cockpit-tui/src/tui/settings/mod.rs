@@ -167,7 +167,6 @@ pub struct SettingsDialog {
     /// exact boxed page object, including cursor and scroll state.
     stack: Vec<PageBox>,
     cx: SettingsCx,
-    pointer_surface: SettingsPointerSurface,
 }
 
 fn setup_wizard_dialog(
@@ -254,6 +253,38 @@ pub(super) trait SettingsPage: Any {
     }
     fn title(&self, cx: &SettingsCx) -> String;
     fn help_text(&self, cx: &SettingsCx) -> &'static str;
+    /// Resolve a semantic control registered by this page. Implementations
+    /// must validate the stable identity against current state before
+    /// mutating; stale targets therefore become inert after reloads.
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        _control: shell::SettingsControlId,
+    ) -> Nav {
+        Nav::Stay
+    }
+    /// Move only the independently scrollable region under the pointer.
+    /// `delta` is measured in selectable controls and is already normalized
+    /// to the settings wheel step (three per notch).
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        _region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        let key = if delta < 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..delta.unsigned_abs() {
+            let nav = self.handle_key(cx, KeyEvent::new(key, KeyModifiers::NONE));
+            if !matches!(nav, Nav::Stay) {
+                return nav;
+            }
+        }
+        Nav::Stay
+    }
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     #[cfg(test)]
@@ -399,6 +430,7 @@ pub struct SettingsCx {
     /// lazily when the UI / Tools pages open; saved on each edit there.
     pub(super) extended_path: PathBuf,
     scroll_states: SettingsScrollStates,
+    pointer_surface: SettingsPointerSurface,
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
@@ -1601,11 +1633,11 @@ impl SettingsDialog {
         Self {
             page: root_page(0),
             stack: Vec::new(),
-            pointer_surface: SettingsPointerSurface::default(),
             cx: SettingsCx {
                 config_path,
                 extended_path,
                 scroll_states: SettingsScrollStates::default(),
+                pointer_surface: SettingsPointerSurface::default(),
                 original_config: config.clone(),
                 config,
                 extended,
@@ -1991,19 +2023,17 @@ impl SettingsDialog {
         }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let code = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                    KeyCode::Up
-                } else {
-                    KeyCode::Down
-                };
-                for _ in 0..3 {
-                    let nav = self
-                        .page
-                        .handle_key(&mut self.cx, KeyEvent::new(code, KeyModifiers::NONE));
-                    if !matches!(nav, Nav::Stay) {
-                        let _ = self.apply_nav(nav);
-                        break;
-                    }
+                if let Some(region) = self
+                    .pointer_surface
+                    .scroll_region_at(mouse.column, mouse.row)
+                {
+                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        -3
+                    } else {
+                        3
+                    };
+                    let nav = self.page.handle_pointer_scroll(&mut self.cx, region, delta);
+                    let _ = self.apply_nav(nav);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2031,6 +2061,10 @@ impl SettingsDialog {
                         } else {
                             let _ = self.apply_nav(nav);
                         }
+                    }
+                    SettingsPointerAction::Page(control) => {
+                        let nav = self.page.handle_pointer_control(&mut self.cx, control);
+                        let _ = self.apply_nav(nav);
                     }
                 }
             }
@@ -2087,6 +2121,7 @@ impl SettingsDialog {
             rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
             action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
             enabled: true,
+            disabled_reason: None,
         });
         let root = self.page.as_any().is::<RootPage>();
         if !root || !self.stack.is_empty() {
@@ -2095,6 +2130,7 @@ impl SettingsDialog {
                 rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
                 action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
                 enabled: true,
+                disabled_reason: None,
             });
         } else if self.picker_cwd.is_some() {
             header.push(Span::raw("  [Back to config picker]"));
@@ -2102,6 +2138,7 @@ impl SettingsDialog {
                 rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
                 action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
                 enabled: true,
+                disabled_reason: None,
             });
         }
         frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
@@ -2235,7 +2272,34 @@ impl SettingsPage for RootPage {
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        render_root(frame, area, self.cursor, &cx.scroll_states);
+        render_root(frame, area, self.cursor, cx);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: shell::SettingsControlId,
+    ) -> Nav {
+        let index = control.0 as usize;
+        if index >= root_nodes().len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region != shell::SettingsScrollRegionId("root") {
+            return Nav::Stay;
+        }
+        let last = root_nodes().len().saturating_sub(1);
+        self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -2358,7 +2422,7 @@ pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
     Line::from(Span::styled(label.to_string(), style))
 }
 
-fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &SettingsScrollStates) {
+fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
     let children = root_nodes();
     let cursor = cursor.min(children.len().saturating_sub(1));
     let rows = Layout::vertical([
@@ -2379,7 +2443,19 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, scroll_states: &Set
             ])
         })
         .collect();
-    scroll_states.render_lines(frame, rows[0], "root", list_lines, Some(cursor));
+    let controls = (0..children.len())
+        .map(|index| Some((shell::SettingsControlId(index as u64), true, None)))
+        .collect();
+    cx.scroll_states.render_control_lines(
+        frame,
+        rows[0],
+        "root",
+        list_lines,
+        Some(cursor),
+        controls,
+        &cx.pointer_surface,
+        shell::SettingsScrollRegionId("root"),
+    );
 
     let desc = children[cursor].description;
     frame.render_widget(

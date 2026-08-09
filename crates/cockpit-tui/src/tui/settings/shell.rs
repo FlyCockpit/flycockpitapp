@@ -161,25 +161,40 @@ pub(super) enum SettingsHeaderAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsPointerAction {
     Header(SettingsHeaderAction),
+    /// A page-declared semantic control. The value is an opaque, stable key
+    /// interpreted only by the page that registered it; it is never derived
+    /// from terminal text or a transient screen coordinate.
+    Page(SettingsControlId),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct SettingsControlId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct SettingsScrollRegionId(pub &'static str);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SettingsPointerTarget {
     pub rect: Rect,
     pub action: SettingsPointerAction,
     pub enabled: bool,
+    pub disabled_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct SettingsPointerSurface {
     pub area: std::cell::Cell<Option<Rect>>,
     pub targets: RefCell<Vec<SettingsPointerTarget>>,
+    pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
+    pub hover: std::cell::Cell<Option<SettingsControlId>>,
 }
 
 impl SettingsPointerSurface {
     pub fn clear_for(&self, area: Rect) {
         self.area.set(Some(area));
         self.targets.borrow_mut().clear();
+        self.scroll_regions.borrow_mut().clear();
+        self.hover.set(None);
     }
 
     pub fn register(&self, target: SettingsPointerTarget) {
@@ -193,6 +208,21 @@ impl SettingsPointerSurface {
                 && row >= target.rect.y
                 && row < target.rect.bottom()
         })
+    }
+
+    pub fn register_scroll_region(&self, rect: Rect, id: SettingsScrollRegionId) {
+        self.scroll_regions.borrow_mut().push((rect, id));
+    }
+
+    pub fn scroll_region_at(&self, column: u16, row: u16) -> Option<SettingsScrollRegionId> {
+        self.scroll_regions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(rect, _)| {
+                column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+            })
+            .map(|(_, id)| *id)
     }
 }
 
@@ -214,6 +244,50 @@ impl SettingsScrollStates {
         let state = states.entry(key.into()).or_default();
         state.select(selected);
         frame.render_stateful_widget(List::new(items).scroll_padding(1), area, state);
+    }
+
+    /// Render a list and publish its page-declared semantic controls from the
+    /// same final line layout and `ListState` offset. `controls` is parallel
+    /// to `lines`; continuation, heading, blank, and status lines use `None`.
+    /// This is deliberately source-backed metadata, not terminal-buffer or
+    /// marker-text inference.
+    pub(super) fn render_control_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        key: impl Into<String>,
+        lines: Vec<Line<'static>>,
+        selected_line: Option<usize>,
+        controls: Vec<Option<(SettingsControlId, bool, Option<&'static str>)>>,
+        surface: &SettingsPointerSurface,
+        region: SettingsScrollRegionId,
+    ) {
+        debug_assert_eq!(lines.len(), controls.len());
+        let key = key.into();
+        self.render_lines(frame, area, key.clone(), lines, selected_line);
+        surface.register_scroll_region(area, region);
+        let offset = self.offset_for(&key);
+        for (screen_row, binding) in controls
+            .into_iter()
+            .skip(offset)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let Some((id, enabled, disabled_reason)) = binding else {
+                continue;
+            };
+            surface.register(SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    area.width,
+                    1,
+                ),
+                action: SettingsPointerAction::Page(id),
+                enabled,
+                disabled_reason,
+            });
+        }
     }
 
     pub(super) fn offset_for(&self, key: &str) -> usize {

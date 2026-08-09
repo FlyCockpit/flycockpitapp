@@ -400,7 +400,7 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
     use super::super::pointer_actions::ProvidersAction;
     let config = one_provider_config(None);
     for path in [0, 1, 2, 3] {
-        let (_tmp, mut dialog) = if path == 3 {
+        let (_tmp, dialog) = if path == 3 {
             let (tmp, mut dialog) = edit_fixture(config.clone());
             descend_provider(&mut dialog, "EditAction::DeepFetch", |action| {
                 matches!(action, ProvidersAction::DeepFetchConfirm(_))

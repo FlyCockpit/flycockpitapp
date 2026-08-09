@@ -686,7 +686,7 @@ fn click_settings_action(
     dialog: &mut SettingsDialog,
     action: &pointer_actions::SettingsPointerAction,
 ) {
-    let _ = render_settings_rows(dialog, 100, 40);
+    let _ = render_settings_rows(dialog, 100, 80);
     let target = dialog
         .pointer_surface
         .targets
@@ -911,6 +911,21 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             }
         }
     }
+
+    // `custom` is the trailing BTreeMap row and can be clipped from the
+    // smaller inventory render above. Prove and dispatch its destructive
+    // identity independently from a tall, fresh real source.
+    let custom_delete = SettingsPointerAction::Harnesses(HarnessesAction::Delete(
+        pointer_actions::HarnessId("custom".into()),
+    ));
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = populated_harness_list_pointer_fixture(&tmp);
+    click_settings_action(&mut dialog, &custom_delete);
+    assert!(dialog.extended.harnesses.contains_key("custom"));
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Harnesses(HarnessesPage::List(state)) if state.delete_pending
+    ));
 }
 
 /// Render the concrete nested states whose discriminants form the strict

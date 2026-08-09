@@ -602,11 +602,38 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::AgentDirs),
         (Category::Behavior, SettingId::PackagesDir),
         (Category::Behavior, SettingId::TimeInjectionInterval),
+        (Category::Behavior, SettingId::AutoTitleModel),
+        (Category::Behavior, SettingId::ScheduleAllowUnboundedLoops),
+        (Category::Behavior, SettingId::DelegationMaxParallel),
+        (Category::Behavior, SettingId::DeepthinkEnabled),
+        (Category::Behavior, SettingId::TranslationModel),
+        (Category::Behavior, SettingId::TextEmbeddedRecovery),
+        (Category::Behavior, SettingId::Concurrency),
+        (Category::Behavior, SettingId::LoopGuardThreshold),
+        (Category::Behavior, SettingId::GoalVerificationSkepticCount),
+        (Category::Behavior, SettingId::CheapCodeModel),
+        (Category::Behavior, SettingId::GoalVerificationMaxRounds),
+        (Category::Behavior, SettingId::CompactModel),
+        (Category::Behavior, SettingId::ScheduleMaxConcurrent),
+        (Category::Behavior, SettingId::PredictNextMessageModel),
+        (Category::Behavior, SettingId::SmartCodeModel),
+        (Category::Behavior, SettingId::ReasoningModel),
+        (Category::Behavior, SettingId::GoalVerificationModel),
+        (Category::Behavior, SettingId::DialogLockoutMs),
+        (Category::Behavior, SettingId::AgentChoosesSubagentModel),
+        (Category::Behavior, SettingId::GoalVerificationEnabled),
+        (
+            Category::Behavior,
+            SettingId::HarnessReportSummarizationModel,
+        ),
+        (Category::Behavior, SettingId::SkillInjectionModel),
+        (Category::Behavior, SettingId::MaxPrimaryRounds),
+        (Category::Behavior, SettingId::UtilityModel),
     ] {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
         super::tests::open_category_on(&mut dialog, category, setting);
-        let _ = render_settings_rows(&dialog, 100, 50);
+        let before = render_settings_rows(&dialog, 100, 50);
         let target = dialog
             .pointer_surface
             .targets
@@ -622,9 +649,10 @@ fn dispatch_enabled_category_descriptor_actions() {
             .cloned()
             .expect("source category descriptor action is rendered");
         click_target(&mut dialog, &target);
-        assert!(
-            !matches!(dialog.test_page(), TestPageRef::Category(page) if !page.is_editing()),
-            "descriptor activation had no observable outcome for {setting:?}"
+        let after = render_settings_rows(&dialog, 100, 50);
+        assert_ne!(
+            before, after,
+            "descriptor activation had no rendered outcome for {setting:?}"
         );
     }
 }

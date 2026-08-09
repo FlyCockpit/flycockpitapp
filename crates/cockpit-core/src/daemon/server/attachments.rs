@@ -317,6 +317,7 @@ pub(super) async fn begin_attachment_upload_admitted(
         (MediaDimension::QueuedOperationsPerSession, 1),
         (MediaDimension::EncodedBytesPerObject, byte_len as u64),
         (MediaDimension::RetainedBytesPerSession, byte_len as u64),
+        (MediaDimension::LocalCpuJobsGlobal, 1),
         (
             MediaDimension::OperationDeadlineSeconds,
             policy
@@ -494,6 +495,44 @@ pub(super) async fn finish_attachment_upload_admitted(
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
+    let config_root = state
+        .attached
+        .as_ref()
+        .map(|attached| attached.handle.project_root.as_path())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let (_, extended) = ctx.config_source.load(config_root).map_err(internal)?;
+    let execution_plan = extended
+        .media_resources
+        .evaluate(
+            cockpit_config::config::media_budget::MediaEvaluationRequest {
+                dimension: cockpit_config::config::media_budget::MediaDimension::LocalCpuJobsGlobal,
+                requested: Some(1),
+                current_scope: 0,
+                profile: Some(cockpit_config::config::media_budget::PASTE_IMAGE_PROFILE),
+                adapter_limit: None,
+                request_limit: None,
+            },
+        )
+        .map_err(|_| bad_request("attachment exceeds media execution policy"))?;
+    let executing = match ctx
+        .media_ledger
+        .promote(
+            &receipt.reservation_id,
+            receipt.version,
+            execution_plan,
+            wall_ms,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            ctx.media_ledger
+                .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+                .await
+                .map_err(internal)?;
+            return Err(internal(error));
+        }
+    };
     let validation = async {
         if upload.bytes.len() != upload.byte_len {
             return Err(bad_request(format!(
@@ -511,8 +550,18 @@ pub(super) async fn finish_attachment_upload_admitted(
     let bytes = match validation {
         Ok(bytes) => bytes,
         Err(error) => {
+            let cancelled = ctx
+                .media_ledger
+                .request_cancellation(&executing.reservation_id, executing.version, wall_ms)
+                .await
+                .map_err(internal)?;
             ctx.media_ledger
-                .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+                .destroy_local_artifacts(
+                    &cancelled.reservation_id,
+                    cancelled.version,
+                    &format!("invalid-attachment-destroyed:{upload_id}"),
+                    wall_ms,
+                )
                 .await
                 .map_err(internal)?;
             return Err(error);
@@ -522,7 +571,7 @@ pub(super) async fn finish_attachment_upload_admitted(
     // authoritative before the bytes become visible to another subsystem.
     let completed = ctx
         .media_ledger
-        .complete_local_allocation(&receipt.reservation_id, receipt.version, wall_ms)
+        .complete_local_allocation(&executing.reservation_id, executing.version, wall_ms)
         .await
         .map_err(internal)?;
     match upload.purpose {

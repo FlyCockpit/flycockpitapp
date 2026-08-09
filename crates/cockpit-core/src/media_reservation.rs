@@ -296,7 +296,7 @@ impl MediaReservationLedger {
             for(id,version,state) in rows {
                 if ReservationState::parse(&state)? != ReservationState::Released {
                     let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-                    for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels] {
+                    for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::LocalCpuJobsGlobal] {
                         let name=dimension_name(dimension);
                         conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,format!("downstream-invocation-destroyed:{invocation}:{id}"),sqlite_i64(wall_ms)?])?;
                         release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;
@@ -527,9 +527,11 @@ impl MediaReservationLedger {
                 "SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1", [&id],
                 |row| Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row_u64(row,2)?,row_u64(row,3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?;
             if version != expected_version { return Err(anyhow!("stale_version")); }
-            if ReservationState::parse(&state)? != ReservationState::ReservedQueued { return Err(anyhow!("invalid_transition")); }
+            let current=ReservationState::parse(&state)?;
+            if !matches!(current,ReservationState::ReservedQueued|ReservationState::ExecutingLocal) { return Err(anyhow!("invalid_transition")); }
             let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            release_queued(conn,&id,&MediaOwner{project_id:project,session_id:session},next_version,wall_ms)?;
+            if current==ReservationState::ReservedQueued { release_queued(conn,&id,&MediaOwner{project_id:project,session_id:session},next_version,wall_ms)?; }
+            release_dimension_balance(conn,&id,next_version,&dimension_name(MediaDimension::LocalCpuJobsGlobal),wall_ms)?;
             conn.execute("UPDATE media_reservations SET state='settling',version=?1 WHERE reservation_id=?2 AND version=?3",
                 params![sqlite_i64(next_version)?,id,sqlite_i64(version)?])?;
             Ok(ReservationReceipt{reservation_id:id,state:ReservationState::Settling,version:next_version,queue_sequence:sequence,deadline_monotonic_ms:deadline})
@@ -558,7 +560,7 @@ impl MediaReservationLedger {
             if version!=expected_version{return Err(anyhow!("stale_version"));}
             if !matches!(ReservationState::parse(&state)?,ReservationState::Settling|ReservationState::CancellationRequested|ReservationState::OverageQuarantined){return Err(anyhow!("invalid_transition"));}
             let next_version=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
-            for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels] {
+            for dimension in [MediaDimension::EncodedBytesPerObject,MediaDimension::RetainedBytesPerSession,MediaDimension::DecodedEdgePixels,MediaDimension::DecodedImagePixels,MediaDimension::LocalCpuJobsGlobal] {
                 let name=dimension_name(dimension);
                 conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,checksum,sqlite_i64(wall_ms)?])?;
                 release_dimension_balance(conn,&id,next_version,&name,wall_ms)?;

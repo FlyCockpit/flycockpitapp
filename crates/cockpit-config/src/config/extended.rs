@@ -1582,6 +1582,7 @@ impl Default for ExtendedConfig {
             resource_scheduler: ResourceSchedulerConfig::default(),
             sandbox: SandboxConfig::default(),
             daemon: DaemonConfig::default(),
+            media_resources: crate::config::media_budget::MediaResourcePolicy::default(),
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
             deepthink: DeepthinkConfig::default(),

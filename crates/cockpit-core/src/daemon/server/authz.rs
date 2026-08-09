@@ -12,6 +12,38 @@ pub(super) struct AuthorizedRequestContext {
     pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
 }
 
+impl AuthorizedRequestContext {
+    /// Build the canonical operation bytes from resources resolved at the
+    /// authorization boundary. Callers must supply the request-specific
+    /// canonical parameter encoding; schema text or transport JSON are not
+    /// valid substitutes.
+    pub(super) fn encode_fcor(
+        &self,
+        request: &Request,
+        canonical_params: &[u8],
+    ) -> std::result::Result<Vec<u8>, ErrorPayload> {
+        let resources: Vec<_> = self
+            .fcor_resources
+            .iter()
+            .map(
+                |resource| proto::remote_operation_fcor::RemoteOperationResource {
+                    kind: resource.kind,
+                    value: resource.value.as_slice(),
+                },
+            )
+            .collect();
+        proto::remote_operation_fcor::encode_fcor_v1(
+            request.wire_tag(),
+            &resources,
+            canonical_params,
+        )
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("request cannot be canonically encoded: {error}"),
+        })
+    }
+}
+
 fn canonical_project_root_bytes(
     path: &std::path::Path,
 ) -> std::result::Result<Vec<u8>, ErrorPayload> {
@@ -82,15 +114,12 @@ pub(super) async fn authorize_request_context(
 ) -> std::result::Result<AuthorizedRequestContext, ErrorPayload> {
     authorize_request(request, state, ctx).await?;
     #[cfg(test)]
-    AUTHORIZED_FCOR_RESOLVER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ctx.fcor_resolver_calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(AuthorizedRequestContext {
         fcor_resources: resolve_authorized_fcor_resources(request, &ctx.canonical_cwd)?,
     })
 }
-
-#[cfg(test)]
-static AUTHORIZED_FCOR_RESOLVER_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,

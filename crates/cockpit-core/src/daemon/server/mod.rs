@@ -1718,6 +1718,8 @@ pub struct DaemonContext {
     /// Canonical process cwd captured once at daemon construction. Remote
     /// operation resources never trust a caller-supplied fallback cwd.
     pub canonical_cwd: PathBuf,
+    #[cfg(test)]
+    pub(crate) fcor_resolver_calls: std::sync::atomic::AtomicUsize,
     pub started_at: Instant,
     /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
     /// Holds the OS sleep assertion **in the daemon process** so it
@@ -1872,6 +1874,8 @@ impl DaemonContext {
             registry,
             paths,
             canonical_cwd,
+            #[cfg(test)]
+            fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
             started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,

@@ -996,7 +996,9 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
         vec![Kind::SchedulerId]
     );
 
-    AUTHORIZED_FCOR_RESOLVER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let resolver_calls = ctx
+        .fcor_resolver_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
     let denied = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         remote_principal(),
@@ -1008,9 +1010,71 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
             .is_err()
     );
     assert_eq!(
-        AUTHORIZED_FCOR_RESOLVER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-        0
+        ctx.fcor_resolver_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        resolver_calls
     );
+}
+
+#[tokio::test]
+async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let attach = |project_root: &std::path::Path| Request::Attach {
+        session_id: None,
+        since_seq: None,
+        project_root: Some(project_root.to_string_lossy().into_owned()),
+        initial_model: None,
+        no_sandbox: false,
+        interactive: false,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    };
+    let first_request = attach(first_root.path());
+    let second_request = attach(second_root.path());
+    let first = authorize_request_context(&first_request, &state, &ctx)
+        .await
+        .unwrap()
+        .encode_fcor(&first_request, b"same-canonical-params")
+        .unwrap();
+    let second = authorize_request_context(&second_request, &state, &ctx)
+        .await
+        .unwrap()
+        .encode_fcor(&second_request, b"same-canonical-params")
+        .unwrap();
+    assert_ne!(first, second);
+
+    let operation_id = characterized_operation_id();
+    let side_effects = std::sync::atomic::AtomicUsize::new(0);
+    let first_hash = proto::remote_operation_fcor::hash_fcor_v1(&first).unwrap();
+    let second_hash = proto::remote_operation_fcor::hash_fcor_v1(&second).unwrap();
+    assert!(matches!(
+        characterize_operation_dispatch(
+            &ctx.db,
+            Uuid::new_v4(),
+            operation_id,
+            first_hash,
+            &side_effects,
+        )
+        .await,
+        CharacterizedDispatchOutcome::Applied(_)
+    ));
+    assert_eq!(
+        characterize_operation_dispatch(
+            &ctx.db,
+            Uuid::new_v4(),
+            operation_id,
+            second_hash,
+            &side_effects,
+        )
+        .await,
+        CharacterizedDispatchOutcome::Conflict
+    );
+    assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

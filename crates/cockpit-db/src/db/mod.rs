@@ -58,6 +58,7 @@ pub mod principals;
 pub mod project_notes;
 pub mod prune_ledger;
 pub mod remote_audit_upload;
+pub mod remote_attachment_operations;
 pub mod retention;
 pub mod run_invocations;
 pub mod scheduler;

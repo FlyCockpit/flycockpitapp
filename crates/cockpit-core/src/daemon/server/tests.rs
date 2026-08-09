@@ -3568,75 +3568,79 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
-/// Test-only adapter for the current daemon dispatch seam. Production accepts
-/// an envelope request id and a `Request`, but has no logical-attachment
-/// operation reservation API yet. Consequently every arrival reaches the
-/// side-effect closure, irrespective of any operation identity carried by a
-/// future remote transport.
-///
-/// Keep these characterizations beside the exhaustive dispatch matrix: the
-/// ledger implementation replaces this adapter with its production
-/// reservation seam. Until then, each assertion below must fail because the
-/// current dispatcher cannot linearize by `operation_id`.
-#[derive(Default)]
-struct CurrentDispatchWithoutOperationLedger {
-    side_effects: usize,
+async fn characterize_operation_reservation(
+    db: &crate::db::Db,
+    operation_id: Uuid,
+    request_hash: [u8; 32],
+) -> crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome {
+    use crate::db::remote_attachment_operations::{RemoteOperationClass, ReserveRemoteOperation};
+    let operation_id = operation_id.to_string();
+    db.reserve_remote_attachment_operation(ReserveRemoteOperation {
+        logical_attachment_id: "attachment-characterization",
+        operation_id: &operation_id,
+        authenticated_device_id: "device-characterization",
+        authenticated_device_generation: 1,
+        operation_class: RemoteOperationClass::TransactionalMutation,
+        request_hash,
+        now_ms: 1,
+    })
+    .await
+    .unwrap()
 }
 
-impl CurrentDispatchWithoutOperationLedger {
-    fn submit(
-        &mut self,
-        _request_id: Uuid,
-        _operation_id: Uuid,
-        _canonical_request_bytes: &[u8],
-    ) -> CharacterizedOperationOutcome {
-        self.side_effects += 1;
-        CharacterizedOperationOutcome::Applied(self.side_effects)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharacterizedOperationOutcome {
-    Applied(usize),
-    Conflict,
-}
-
-#[test]
-fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
+#[tokio::test]
+async fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
+    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
+        Replay, Reserved,
+    };
+    let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = Uuid::new_v4();
-    let request_id = Uuid::new_v4();
-    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
-
-    let first = dispatch.submit(request_id, operation_id, b"canonical request");
-    let replay = dispatch.submit(request_id, operation_id, b"canonical request");
-
-    assert_eq!(replay, first, "same operation and bytes must replay");
-    assert_eq!(dispatch.side_effects, 1, "replay must not redispatch");
+    let first = characterize_operation_reservation(&db, operation_id, [1; 32]).await;
+    let replay = characterize_operation_reservation(&db, operation_id, [1; 32]).await;
+    let Reserved(first) = first else {
+        panic!("first submission must reserve")
+    };
+    let Replay(replay) = replay else {
+        panic!("same operation must replay")
+    };
+    assert_eq!(replay.operation_seq, first.operation_seq);
 }
 
-#[test]
-fn remote_operation_same_operation_different_bytes_conflicts() {
+#[tokio::test]
+async fn remote_operation_same_operation_different_bytes_conflicts() {
+    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
+        OperationConflict, Reserved,
+    };
+    let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = Uuid::new_v4();
-    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
-
-    let first = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request A");
-    let conflict = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request B");
-
-    assert_eq!(first, CharacterizedOperationOutcome::Applied(1));
-    assert_eq!(conflict, CharacterizedOperationOutcome::Conflict);
-    assert_eq!(dispatch.side_effects, 1, "conflict must not redispatch");
+    assert!(matches!(
+        characterize_operation_reservation(&db, operation_id, [1; 32]).await,
+        Reserved(_)
+    ));
+    assert_eq!(
+        characterize_operation_reservation(&db, operation_id, [2; 32]).await,
+        OperationConflict
+    );
 }
 
-#[test]
-fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
+#[tokio::test]
+async fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
+    use crate::db::remote_attachment_operations::ReserveRemoteOperationOutcome::{
+        Replay, Reserved,
+    };
+    let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = Uuid::new_v4();
-    let mut dispatch = CurrentDispatchWithoutOperationLedger::default();
-
-    let first = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request");
-    let replay = dispatch.submit(Uuid::new_v4(), operation_id, b"canonical request");
-
-    assert_eq!(replay, first, "request id is transport-local correlation");
-    assert_eq!(dispatch.side_effects, 1, "fresh request id must not redispatch");
+    let _first_request_id = Uuid::new_v4();
+    let first = characterize_operation_reservation(&db, operation_id, [3; 32]).await;
+    let _fresh_request_id = Uuid::new_v4();
+    let replay = characterize_operation_reservation(&db, operation_id, [3; 32]).await;
+    let Reserved(first) = first else {
+        panic!("first submission must reserve")
+    };
+    let Replay(replay) = replay else {
+        panic!("fresh request id must replay")
+    };
+    assert_eq!(replay.operation_seq, first.operation_seq);
 }
 
 fn dispatch_matrix_class_for_command(

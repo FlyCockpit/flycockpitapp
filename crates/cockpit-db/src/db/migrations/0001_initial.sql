@@ -2623,3 +2623,76 @@ WHEN NEW.use_epoch < OLD.use_epoch
 BEGIN
     SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
 END;
+
+-- ---- remote attachment operation ledger ----------------------------------
+-- Canonical request bytes and transport metadata are deliberately absent.
+-- The daemon retains only their SHA-256 digest and a bounded safe response.
+CREATE TABLE remote_attachment_operations (
+    logical_attachment_id          TEXT    NOT NULL,
+    operation_id                   TEXT    NOT NULL,
+    authenticated_device_id        TEXT    NOT NULL,
+    authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation >= 0),
+    operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
+    operation_class                TEXT    NOT NULL CHECK (operation_class IN (
+        'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
+    )),
+    state                          TEXT    NOT NULL CHECK (state IN (
+        'reserved', 'committed', 'rejected', 'outcome_unknown'
+    )),
+    dispatch_generation            INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_generation >= 0),
+    request_hash                   BLOB    NOT NULL CHECK (length(request_hash) = 32),
+    safe_response                  BLOB CHECK (safe_response IS NULL OR length(safe_response) <= 524288),
+    event_high_water_mark          INTEGER CHECK (event_high_water_mark IS NULL OR event_high_water_mark >= 0),
+    created_at_ms                  INTEGER NOT NULL,
+    updated_at_ms                  INTEGER NOT NULL,
+    retire_at_ms                   INTEGER,
+    PRIMARY KEY (logical_attachment_id, operation_id),
+    UNIQUE (logical_attachment_id, operation_seq)
+);
+
+CREATE INDEX idx_remote_attachment_operations_retire
+    ON remote_attachment_operations (retire_at_ms)
+    WHERE retire_at_ms IS NOT NULL;
+
+-- Operation identity, actor binding, request digest, class, and sequence are
+-- immutable after reservation. Reuse with changed bytes or actor generation
+-- is resolved as a typed conflict by the reservation API, never by UPDATE.
+CREATE TRIGGER remote_attachment_operation_binding_immutable
+BEFORE UPDATE ON remote_attachment_operations
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.authenticated_device_id IS NOT OLD.authenticated_device_id
+  OR NEW.authenticated_device_generation IS NOT OLD.authenticated_device_generation
+  OR NEW.operation_seq IS NOT OLD.operation_seq
+  OR NEW.operation_class IS NOT OLD.operation_class
+  OR NEW.request_hash IS NOT OLD.request_hash
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment operation binding is immutable');
+END;
+
+CREATE TABLE remote_attachment_outbox (
+    logical_attachment_id TEXT    NOT NULL,
+    event_seq              INTEGER NOT NULL CHECK (event_seq > 0),
+    delivery_id            TEXT    NOT NULL,
+    operation_seq          INTEGER CHECK (operation_seq IS NULL OR operation_seq > 0),
+    kind                   TEXT    NOT NULL CHECK (length(kind) BETWEEN 1 AND 255),
+    canonical_payload      BLOB    NOT NULL CHECK (length(canonical_payload) <= 524288),
+    created_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (logical_attachment_id, event_seq),
+    UNIQUE (logical_attachment_id, delivery_id),
+    FOREIGN KEY (logical_attachment_id, operation_seq)
+        REFERENCES remote_attachment_operations(logical_attachment_id, operation_seq)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_remote_attachment_outbox_operation
+    ON remote_attachment_outbox (logical_attachment_id, operation_seq)
+    WHERE operation_seq IS NOT NULL;
+
+CREATE TABLE remote_attachment_outbox_snapshots (
+    logical_attachment_id       TEXT PRIMARY KEY,
+    compacted_through_event_seq INTEGER NOT NULL CHECK (compacted_through_event_seq >= 0),
+    snapshot_high_water_mark    INTEGER NOT NULL CHECK (snapshot_high_water_mark >= compacted_through_event_seq),
+    updated_at_ms               INTEGER NOT NULL
+);

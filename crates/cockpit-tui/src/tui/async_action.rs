@@ -644,7 +644,12 @@ impl AsyncActionRunner {
 
     pub fn shutdown(&mut self) {
         for (id, pending) in self.pending.drain() {
-            pending.handle.abort();
+            if !matches!(
+                &pending.kind,
+                AsyncActionKind::Blocking("export.transcript" | "export.debug")
+            ) {
+                pending.handle.abort();
+            }
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,

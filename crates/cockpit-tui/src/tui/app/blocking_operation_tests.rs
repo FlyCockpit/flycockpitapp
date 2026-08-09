@@ -1,6 +1,30 @@
 use super::blocking_operations::BlockingOperationKind;
 use super::*;
 
+struct BarrierRelease(Option<std::sync::Arc<std::sync::Barrier>>);
+
+impl BarrierRelease {
+    fn release(mut self) {
+        self.0.take().unwrap().wait();
+    }
+}
+
+impl Drop for BarrierRelease {
+    fn drop(&mut self) {
+        if let Some(barrier) = self.0.take() {
+            std::thread::spawn(move || barrier.wait());
+        }
+    }
+}
+
+fn activate_composer(app: &mut App) {
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    app.overlay = Overlay::None;
+    app.question_dialog = None;
+    app.composer.set_vim_enabled(false);
+}
+
 #[test]
 fn blocking_operation_manifest_is_complete() {
     use super::blocking_operations::{BLOCKING_OPERATION_MANIFEST, BlockingOperationKind};
@@ -59,11 +83,12 @@ fn blocking_operation_manifest_is_complete() {
 #[tokio::test]
 async fn no_owned_blocking_command_runs_on_event_loop() {
     let mut app = App::new(None, false);
-    app.daemon_prompt = None;
+    activate_composer(&mut app);
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.launch.session_id = Some(uuid::Uuid::nil());
     app.launch.session_short_id = Some("test".to_string());
     let release = std::sync::Arc::new(std::sync::Barrier::new(7));
+    let release_guard = BarrierRelease(Some(std::sync::Arc::clone(&release)));
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
         blocking_operations::install_owned_test_barrier(
             registration.kind,
@@ -107,13 +132,13 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     ));
     assert_eq!(app.async_actions.pending_count(), 6);
     tokio::task::yield_now().await;
-    release.wait();
+    release_guard.release();
 }
 
-fn owned_barrier(kind: BlockingOperationKind) -> std::sync::Arc<std::sync::Barrier> {
+fn owned_barrier(kind: BlockingOperationKind) -> BarrierRelease {
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     blocking_operations::install_owned_test_barrier(kind, std::sync::Arc::clone(&barrier));
-    barrier
+    BarrierRelease(Some(barrier))
 }
 
 #[tokio::test]
@@ -127,7 +152,7 @@ async fn curator_command_is_async_with_pending_line() {
         matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/curator: pending")
     );
     assert_eq!(app.async_actions.pending_count(), 1);
-    barrier.wait();
+    barrier.release();
 }
 
 #[tokio::test]
@@ -139,7 +164,7 @@ async fn doctor_command_is_async() {
         matches!(app.history.last(), Some(HistoryEntry::Plain { line }) if line == "/doctor: collecting diagnostics…")
     );
     assert_eq!(app.async_actions.pending_count(), 1);
-    barrier.wait();
+    barrier.release();
 }
 
 #[test]
@@ -196,7 +221,7 @@ async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
 async fn queue_edit_does_not_block_key_handler() {
     let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
     let mut app = App::new(None, false);
-    app.daemon_prompt = None;
+    activate_composer(&mut app);
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
@@ -209,7 +234,7 @@ async fn queue_edit_does_not_block_key_handler() {
     assert_eq!(app.composer.text(), "x");
     assert_eq!(app.async_actions.pending_count(), 1);
     tokio::task::yield_now().await;
-    barrier.wait();
+    barrier.release();
 }
 
 #[tokio::test]
@@ -220,7 +245,7 @@ async fn btw_teardown_does_not_block_during_session() {
     app.handle_terminal_event(crossterm::event::Event::Resize(91, 37));
     assert_eq!(app.async_actions.pending_count(), 1);
     tokio::task::yield_now().await;
-    barrier.wait();
+    barrier.release();
 }
 
 #[test]
@@ -246,7 +271,7 @@ async fn at_suggestions_do_no_blocking_work() {
     app.handle_terminal_event(crossterm::event::Event::Resize(80, 24));
     assert!(app.at_suggestions_loading);
     assert_eq!(app.async_actions.pending_count(), 1);
-    barrier.wait();
+    barrier.release();
 }
 
 #[tokio::test]

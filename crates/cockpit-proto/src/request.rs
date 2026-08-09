@@ -1659,6 +1659,43 @@ macro_rules! command_typed_fcor_fields {
     }};
 }
 
+macro_rules! encode_fcor_bound_fields {
+    ($out:ident; client_submission_id: Uuid, expected_model_state_generation: Option<u64>, expected_model: Option<cockpit_config::config::providers::ActiveModelRef>, text: String, display_text: Option<String>, tag_expansions: Vec<TagExpansionMeta>, image_refs: Vec<ImageAttachmentRef>, forced_skill: Option<String>, run_invocation_options: Option<RunInvocationOptions>) => {{
+        let _ = (&$out, client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options);
+        anyhow::bail!("legacy_send_user_message_not_remote_operation")
+    }};
+    ($out:ident; session_id: Option<Uuid>, since_seq: Option<i64>, project_root: Option<String>, initial_model: Option<cockpit_config::config::providers::ActiveModelRef>, no_sandbox: bool, interactive: bool, model_override: Option<cockpit_config::config::providers::ActiveModelRef>, client_protocol_version: u32, env_snapshot: Option<EnvSnapshotWire>, env_policy: EnvDriftPolicy) => {{
+        // Attach's effective canonical project root is an authorized resource.
+        let _ = project_root;
+        session_id.encode_fcor_value_v1(&mut $out)?;
+        since_seq.encode_fcor_value_v1(&mut $out)?;
+        initial_model.encode_fcor_value_v1(&mut $out)?;
+        no_sandbox.encode_fcor_value_v1(&mut $out)?;
+        interactive.encode_fcor_value_v1(&mut $out)?;
+        model_override.encode_fcor_value_v1(&mut $out)?;
+        client_protocol_version.encode_fcor_value_v1(&mut $out)?;
+        env_snapshot.encode_fcor_value_v1(&mut $out)?;
+        env_policy.encode_fcor_value_v1(&mut $out)?;
+    }};
+    ($out:ident; $($name:ident: $ty:ty),* $(,)?) => {{
+        $($name.encode_fcor_value_v1(&mut $out)?;)*
+    }};
+}
+
+macro_rules! command_encode_fcor_params {
+    (($request:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty),*]);)+]) => {{
+        use crate::remote_operation_fcor::CanonicalFcorValueV1 as _;
+        match $request {
+            $($pattern => {
+                $(let _: &$fcor_type = $fcor_field;)*
+                let mut out = crate::remote_operation_fcor::CanonicalParamsV1::new();
+                encode_fcor_bound_fields!(out; $($fcor_field: $fcor_type),*);
+                Ok(out.into_bytes())
+            },)+
+        }
+    }};
+}
+
 impl Request {
     pub fn remote_operation_class(
         &self,
@@ -1673,6 +1710,13 @@ impl Request {
         &self,
     ) -> (&'static str, Vec<(&'static str, &'static str)>) {
         crate::command!(command_typed_fcor_fields, self)
+    }
+
+    /// Canonical parameter bytes for legacy daemon requests. The foundation
+    /// v2 message envelope is intentionally a separate protocol and the
+    /// retired legacy message variant has no remote-operation encoding.
+    pub fn canonical_remote_operation_params_v1(&self) -> anyhow::Result<Vec<u8>> {
+        crate::command!(command_encode_fcor_params, self)
     }
 }
 pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass> {

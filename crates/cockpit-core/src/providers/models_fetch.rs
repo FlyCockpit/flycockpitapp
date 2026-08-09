@@ -2132,6 +2132,37 @@ mod tests {
     }
 
     #[test]
+    fn non_openrouter_requests_byte_identical() {
+        let entry = ProviderEntry {
+            url: "https://example.test/v1".into(),
+            headers: vec![
+                HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer unchanged".into(),
+                },
+                HeaderSpec {
+                    name: "X-Title".into(),
+                    value: "Unrelated".into(),
+                },
+            ],
+            ..ProviderEntry::default()
+        };
+        let resolved =
+            resolve_provider_request_with_sources("openrouter", &entry, |_| None, |_| None)
+                .unwrap();
+        assert_eq!(resolved.base_url, entry.url);
+        assert_eq!(
+            header_pairs(&resolved),
+            vec![
+                ("X-Title", "Unrelated"),
+                ("Authorization", "Bearer unchanged"),
+            ]
+        );
+        assert_eq!(resolved_header_value(&resolved, "HTTP-Referer"), None);
+        assert_eq!(resolved_header_value(&resolved, "X-OpenRouter-Title"), None);
+    }
+
+    #[test]
     fn resolved_request_expands_injected_secret_refs() {
         let entry = ProviderEntry {
             url: "https://api.example.test/v1".into(),

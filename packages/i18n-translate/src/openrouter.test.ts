@@ -24,17 +24,20 @@ vi.mock("openai", () => ({
 
 // Mock @flycockpit/env/shared (the worker-safe env the translation providers
 // import) because the provider reads TRANSLATION_MODEL/PROVIDER from it at
-// module load. The OpenRouter HTTP-Referer now comes off process.env directly,
-// not validated env, so BETTER_AUTH_URL is no longer mocked here. Default to a
-// minimal env; tests that need different values use `vi.doMock` after
-// `vi.resetModules()`.
-vi.mock("@flycockpit/env/shared", () => ({
-  env: {
+// module load. Keep PUBLIC_APP_URL mutable so precedence can be exercised
+// without replacing the module under test.
+const { sharedEnv } = vi.hoisted(() => ({
+  sharedEnv: {
     TRANSLATION_PROVIDER: "openrouter",
     OPENROUTER_API_KEY: "test-key",
     ANTHROPIC_API_KEY: undefined,
     TRANSLATION_MODEL: undefined,
+    PUBLIC_APP_URL: undefined as string | undefined,
   },
+}));
+
+vi.mock("@flycockpit/env/shared", () => ({
+  env: sharedEnv,
 }));
 
 // Re-import the mocked module + the SUT.
@@ -49,6 +52,7 @@ describe("OpenRouterProvider", () => {
   it("openrouter_typescript_override_sources", () => {
     const previous = process.env.BETTER_AUTH_URL;
     try {
+      sharedEnv.PUBLIC_APP_URL = undefined;
       delete process.env.BETTER_AUTH_URL;
       new OpenRouterProvider("test-key");
       expect(openAIOptions).toHaveBeenLastCalledWith(
@@ -57,6 +61,35 @@ describe("OpenRouterProvider", () => {
             "HTTP-Referer": "https://flycockpit.dev",
             "X-OpenRouter-Title": "FlyCockpit Translation",
           },
+        }),
+      );
+
+      process.env.BETTER_AUTH_URL = "https://auth.example";
+      new OpenRouterProvider("test-key");
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          defaultHeaders: expect.objectContaining({
+            "HTTP-Referer": "https://auth.example",
+          }),
+        }),
+      );
+
+      process.env.BETTER_AUTH_URL = "";
+      new OpenRouterProvider("test-key");
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          defaultHeaders: { "X-OpenRouter-Title": "FlyCockpit Translation" },
+        }),
+      );
+
+      sharedEnv.PUBLIC_APP_URL = "https://public.example";
+      process.env.BETTER_AUTH_URL = "https://ignored.example";
+      new OpenRouterProvider("test-key");
+      expect(openAIOptions).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          defaultHeaders: expect.objectContaining({
+            "HTTP-Referer": "https://public.example",
+          }),
         }),
       );
 
@@ -78,6 +111,7 @@ describe("OpenRouterProvider", () => {
         }),
       );
     } finally {
+      sharedEnv.PUBLIC_APP_URL = undefined;
       if (previous === undefined) delete process.env.BETTER_AUTH_URL;
       else process.env.BETTER_AUTH_URL = previous;
     }

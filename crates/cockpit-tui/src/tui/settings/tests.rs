@@ -654,6 +654,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
 
 fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     let mut dialog = fresh_dialog(tmp);
+    dialog.extended.tui.mouse_capture = true;
     dialog.command_installed = |_| true;
     enter_harnesses_from_root(&mut dialog);
     dialog
@@ -661,6 +662,7 @@ fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
 
 fn populated_harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {
     let mut dialog = fresh_dialog(tmp);
+    dialog.extended.tui.mouse_capture = true;
     dialog.command_installed = |_| true;
     let mut presets = cockpit_config::extended::builtin_harness_presets().into_iter();
     let (_, alpha) = presets.next().expect("first populated harness fixture");

@@ -93,3 +93,4 @@ cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }

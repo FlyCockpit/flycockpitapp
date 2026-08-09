@@ -15,7 +15,7 @@ const DIAGNOSTIC_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CompactFitRung {
+pub enum CompactFitRung {
     Verbatim,
     HistorySelected,
     ToolResultTruncated,
@@ -25,7 +25,7 @@ pub(crate) enum CompactFitRung {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CompactInputCoverage {
+pub enum CompactInputCoverage {
     Full,
     Partial,
 }

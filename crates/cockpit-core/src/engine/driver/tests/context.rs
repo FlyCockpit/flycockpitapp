@@ -680,6 +680,39 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
 }
 
 #[tokio::test]
+async fn durable_shadow_missing_fit_metadata_is_discarded() {
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let legacy_payload = serde_json::json!({
+        "kind": "ready_brief",
+        "generation": 1,
+        "snapshot_history": [],
+        "snapshot_turns": 0,
+        "snapshot_tail_turns": 0,
+        "brief": "legacy metadata-free brief"
+    });
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(driver.session.id, &legacy_payload.to_string())
+        .await
+        .unwrap();
+
+    driver.load_compaction_shadow_from_store().await;
+
+    assert!(driver.shadow_brief.is_none());
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "metadata-free shadows must be deleted rather than assumed full"
+    );
+}
+
+#[tokio::test]
 async fn stale_loaded_brief_is_discarded() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let payload = DurableCompactionShadow::ReadyBrief(DurableShadowBrief {

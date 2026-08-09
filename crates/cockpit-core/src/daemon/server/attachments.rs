@@ -303,9 +303,15 @@ pub(super) async fn begin_attachment_upload_admitted(
         unreachable!()
     };
     use cockpit_config::config::media_budget::{
-        MediaDimension, MediaEvaluationRequest, MediaResourcePolicy, PASTE_IMAGE_PROFILE,
+        MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
     };
-    let policy = MediaResourcePolicy::default();
+    let config_root = state
+        .attached
+        .as_ref()
+        .map(|attached| attached.handle.project_root.as_path())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let (_, extended) = ctx.config_source.load(config_root).map_err(internal)?;
+    let policy = extended.media_resources;
     let plans = [
         (MediaDimension::QueuedOperationsGlobal, 1),
         (MediaDimension::QueuedOperationsPerSession, 1),
@@ -313,7 +319,9 @@ pub(super) async fn begin_attachment_upload_admitted(
         (MediaDimension::RetainedBytesPerSession, byte_len as u64),
         (
             MediaDimension::OperationDeadlineSeconds,
-            proto::PENDING_ATTACHMENT_TTL_SECS,
+            policy
+                .limits()
+                .get(MediaDimension::OperationDeadlineSeconds),
         ),
     ]
     .into_iter()

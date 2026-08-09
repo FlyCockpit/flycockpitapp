@@ -675,14 +675,28 @@ impl Db {
         payload: &Value,
         status: InferenceRequestStatus,
     ) -> Result<()> {
+        self.insert_inference_request_with_goal_provenance(
+            call_id, session_id, payload, status, None,
+        )
+        .await
+    }
+
+    pub async fn insert_inference_request_with_goal_provenance(
+        &self,
+        call_id: &str,
+        session_id: Uuid,
+        payload: &Value,
+        status: InferenceRequestStatus,
+        goal_provenance: Option<(Uuid, i64)>,
+    ) -> Result<()> {
         let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
         let ts_ms = now_ms();
         let call_id = call_id.to_owned();
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests
-                   (call_id, session_id, ts_ms, payload_json, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                   (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(call_id) DO UPDATE SET
                    payload_json = excluded.payload_json,
                    status       = excluded.status",
@@ -691,7 +705,9 @@ impl Db {
                     session_id.to_string(),
                     ts_ms,
                     payload_json,
-                    status.as_str()
+                    status.as_str(),
+                    goal_provenance.map(|(goal_id, _)| goal_id.to_string()),
+                    goal_provenance.map(|(_, generation)| generation),
                 ],
             )
             .context("inserting inference_request")?;

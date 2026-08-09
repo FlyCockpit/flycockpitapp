@@ -55,12 +55,15 @@ impl Db {
         conn.execute(
             "UPDATE session_goals
                 SET tokens_used = tokens_used + MAX(0, ?1 + ?2)
-              WHERE session_id = ?3
-                AND disposition = 'running'",
+              WHERE id = (SELECT goal_id FROM inference_requests WHERE call_id = ?3)
+                AND attempt_generation = (SELECT goal_attempt_generation FROM inference_requests WHERE call_id = ?3)
+                AND token_budget IS NOT NULL
+                AND ?4 = 0",
             params![
                 row.input_tokens,
                 row.output_tokens,
-                row.session_id.to_string()
+                row.call_id.to_string(),
+                row.is_utility,
             ],
         )
         .context("accounting inference call against open session goal")?;
@@ -239,15 +242,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_accounting_excludes_paused_activity_and_resumes_from_prior_usage() {
+    async fn goal_accounting_requires_matching_dispatch_provenance() {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "a").await.unwrap();
         let goal = db
             .create_session_goal(session.session_id, "p", "ship it", None, Some(1_000))
             .await
             .unwrap();
-        let inference = |input_tokens, output_tokens| InferenceCallRow {
-            call_id: Uuid::new_v4(),
+        let inference = |call_id, input_tokens, output_tokens, is_utility| InferenceCallRow {
+            call_id,
             session_id: session.session_id,
             project_id: "p".into(),
             project_root: "/x".into(),
@@ -259,29 +262,73 @@ mod tests {
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
             cost_usd_micros: None,
-            is_utility: false,
+            is_utility,
         };
 
-        db.insert_inference_call(&inference(20, 10)).await.unwrap();
+        // An ordinary foreground call in the same Running session has no
+        // supervised dispatch provenance and must not consume the goal budget.
+        db.insert_inference_call(&inference(Uuid::new_v4(), 20, 10, false))
+            .await
+            .unwrap();
         let running = db
             .current_session_goal(session.session_id, false)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(running.tokens_used, 30);
+        assert_eq!(running.tokens_used, 0);
+
+        let utility_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &utility_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(utility_call, 40, 30, true))
+            .await
+            .unwrap();
+
+        let matching_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &matching_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(matching_call, 20, 10, false))
+            .await
+            .unwrap();
 
         db.set_session_goal_status(session.session_id, GoalDisposition::UserPaused)
             .await
             .unwrap();
-        db.insert_inference_call(&inference(40, 30)).await.unwrap();
+        let paused_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &paused_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(paused_call, 7, 4, false))
+            .await
+            .unwrap();
         let paused = db
             .current_session_goal(session.session_id, false)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            paused.tokens_used, 30,
-            "paused inference must not be charged"
+            paused.tokens_used, 41,
+            "a matching call dispatched before pause remains append-once usage"
         );
 
         let resumed = db
@@ -289,13 +336,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resumed.id, goal.id);
-        assert_eq!(resumed.tokens_used, 30);
-        db.insert_inference_call(&inference(7, 4)).await.unwrap();
+        assert_eq!(resumed.tokens_used, 41);
+        assert!(resumed.attempt_generation > goal.attempt_generation);
+
+        let stale_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &stale_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(stale_call, 100, 100, false))
+            .await
+            .unwrap();
+
+        let resumed_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &resumed_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((resumed.id, resumed.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(resumed_call, 5, 6, false))
+            .await
+            .unwrap();
         let charged_after_resume = db
             .current_session_goal(session.session_id, false)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(charged_after_resume.tokens_used, 41);
+        assert_eq!(charged_after_resume.tokens_used, 52);
     }
 }

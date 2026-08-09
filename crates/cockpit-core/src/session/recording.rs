@@ -106,6 +106,10 @@ pub struct ModelSwitchAudit<'a> {
 }
 
 impl Session {
+    pub(crate) fn set_goal_inference_provenance(&self, provenance: Option<(Uuid, i64)>) {
+        *self.goal_inference_provenance.lock().unwrap() = provenance;
+    }
+
     fn session_event_provenance_for(
         &self,
         kind: crate::db::session_log::SessionEventKind,
@@ -313,8 +317,15 @@ impl Session {
         payload: &Value,
         status: crate::db::session_log::InferenceRequestStatus,
     ) -> Result<()> {
+        let provenance = *self.goal_inference_provenance.lock().unwrap();
         self.db
-            .insert_inference_request(&call_id.to_string(), self.id, payload, status)
+            .insert_inference_request_with_goal_provenance(
+                &call_id.to_string(),
+                self.id,
+                payload,
+                status,
+                provenance,
+            )
             .await
             .context("inserting inference_request")
     }
@@ -333,16 +344,25 @@ impl Session {
         let ts_ms = crate::db::session_log::now_ms();
         let call_id = call_id.to_string();
         let session_id = self.id.to_string();
+        let provenance = *self.goal_inference_provenance.lock().unwrap();
         self.db
             .write(move |conn| {
                 conn.execute(
                     "INSERT INTO inference_requests
-                       (call_id, session_id, ts_ms, payload_json, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                       (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(call_id) DO UPDATE SET
                        payload_json = excluded.payload_json,
                        status       = excluded.status",
-                    params![call_id, session_id, ts_ms, payload_json, status.as_str()],
+                    params![
+                        call_id,
+                        session_id,
+                        ts_ms,
+                        payload_json,
+                        status.as_str(),
+                        provenance.map(|(goal_id, _)| goal_id.to_string()),
+                        provenance.map(|(_, generation)| generation),
+                    ],
                 )
                 .context("inserting inference_request")?;
                 Ok(())

@@ -156,7 +156,7 @@ async fn goal_prose_without_tools_counts_as_no_progress_subset() {
 #[tokio::test]
 async fn goal_budget_autopause_idle_reason_is_budget_limited() {
     let (mut driver, tmp) = test_driver(1);
-    driver
+    let goal = driver
         .session
         .db
         .create_session_goal(
@@ -168,24 +168,37 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         )
         .await
         .unwrap();
+    let call = crate::db::inference_calls::InferenceCallRow {
+        call_id: uuid::Uuid::new_v4(),
+        session_id: driver.session.id,
+        project_id: driver.session.project_id.clone(),
+        project_root: tmp.path().display().to_string(),
+        model: "test-model".to_string(),
+        provider: "test-provider".to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        input_tokens: 2,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cost_usd_micros: None,
+        is_utility: false,
+    };
     driver
         .session
         .db
-        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
-            call_id: uuid::Uuid::new_v4(),
-            session_id: driver.session.id,
-            project_id: driver.session.project_id.clone(),
-            project_root: tmp.path().display().to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
-            input_tokens: 2,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd_micros: None,
-            is_utility: false,
-        })
+        .insert_inference_request_with_goal_provenance(
+            &call.call_id.to_string(),
+            driver.session.id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .db
+        .insert_inference_call(&call)
         .await
         .unwrap();
     driver
@@ -212,7 +225,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
 #[tokio::test]
 async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
     let (mut driver, tmp) = test_driver(1);
-    driver
+    let goal = driver
         .session
         .db
         .create_session_goal(
@@ -226,24 +239,37 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
         .unwrap();
     driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
     driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
+    let call = crate::db::inference_calls::InferenceCallRow {
+        call_id: uuid::Uuid::new_v4(),
+        session_id: driver.session.id,
+        project_id: driver.session.project_id.clone(),
+        project_root: tmp.path().display().to_string(),
+        model: "test-model".to_string(),
+        provider: "test-provider".to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        input_tokens: 10,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cost_usd_micros: None,
+        is_utility: false,
+    };
     driver
         .session
         .db
-        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
-            call_id: uuid::Uuid::new_v4(),
-            session_id: driver.session.id,
-            project_id: driver.session.project_id.clone(),
-            project_root: tmp.path().display().to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
-            input_tokens: 10,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd_micros: None,
-            is_utility: false,
-        })
+        .insert_inference_request_with_goal_provenance(
+            &call.call_id.to_string(),
+            driver.session.id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .db
+        .insert_inference_call(&call)
         .await
         .unwrap();
     driver

@@ -737,10 +737,16 @@ struct Migration {
 
 /// All schema migrations in version order. Append the exact filename and SQL;
 /// never derive names from the numeric position.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_initial.sql",
-    sql: include_str!("migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_initial.sql",
+        sql: include_str!("migrations/0001_initial.sql"),
+    },
+    Migration {
+        name: "0002_goal_inference_provenance.sql",
+        sql: include_str!("migrations/0002_goal_inference_provenance.sql"),
+    },
+];
 
 /// Latest schema version understood by this build.
 ///

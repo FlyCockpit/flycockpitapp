@@ -3764,6 +3764,8 @@ impl Driver {
             .begin_goal_root_turn(goal.id, goal.attempt_generation)
             .await?;
         self.goal_root_turn = Some((goal.id, goal.attempt_generation, turn_id));
+        self.session
+            .set_goal_inference_provenance(Some((goal.id, goal.attempt_generation)));
         let result = self
             .run_user_input(
                 UserSubmission::text(self.goal_host_directive(goal)),
@@ -3771,6 +3773,7 @@ impl Driver {
                 tx,
             )
             .await;
+        self.session.set_goal_inference_provenance(None);
         if let Err(error) = result {
             self.goal_root_turn = None;
             let _ = self

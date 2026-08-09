@@ -2420,12 +2420,24 @@ mod tests {
         }
     }
 
+    async fn insert_goal_inference(db: &Db, goal: &SessionGoal, tokens: i64) {
+        let row = inference_row(goal, tokens);
+        db.insert_inference_request_with_goal_provenance(
+            &row.call_id.to_string(),
+            goal.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&row).await.unwrap();
+    }
+
     #[tokio::test]
     async fn goal_usage_detects_counter_reset_with_new_tokens_before_next_refresh() {
         let (db, goal, _) = planning_fixture().await;
-        db.insert_inference_call(&inference_row(&goal, 10))
-            .await
-            .unwrap();
+        insert_goal_inference(&db, &goal, 10).await;
         db.refresh_session_goal_usage(goal.session_id)
             .await
             .unwrap();
@@ -2448,9 +2460,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.insert_inference_call(&inference_row(&goal, 4))
-            .await
-            .unwrap();
+        insert_goal_inference(&db, &goal, 4).await;
         // The append itself is the durable accounting boundary; no refresh
         // occurs between the reset and this assertion.
         assert_eq!(

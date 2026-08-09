@@ -1344,8 +1344,8 @@ fn close_generation_locked(
         },
     );
 
-    // Drop held verified handles first so each committed object is scrubbed
-    // and its published name is identity-gated before directory teardown.
+    // Drop held verified handles first so each exact committed object is
+    // scrubbed without a racy pathname unlink before directory teardown.
     state.ingress.clear();
     let _ = std::fs::remove_dir_all(&state.temp_dir);
     outcome

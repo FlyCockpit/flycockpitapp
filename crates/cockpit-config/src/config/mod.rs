@@ -141,3 +141,33 @@ pub fn hold_terminal_ingress_file_verified(
 pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
     files::remove_file_nofollow(path)
 }
+
+#[cfg(all(test, unix))]
+mod terminal_ingress_cleanup_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn held_cleanup_scrubs_exact_inode_without_deleting_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("published.png");
+        let renamed = temp.path().join("renamed.png");
+        std::fs::write(&published, b"verified-image").unwrap();
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let held = hold_terminal_ingress_file_verified(&published)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&published, &renamed).unwrap();
+        std::fs::write(&published, b"replacement-must-survive").unwrap();
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(held);
+
+        assert_eq!(
+            std::fs::read(&published).unwrap(),
+            b"replacement-must-survive"
+        );
+        assert!(std::fs::read(&renamed).unwrap().is_empty());
+    }
+}

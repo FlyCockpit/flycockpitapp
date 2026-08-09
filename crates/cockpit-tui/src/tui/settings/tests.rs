@@ -1104,6 +1104,25 @@ fn render_all_non_provider_pointer_surface_variants() {
         super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
     }
 
+    for (page, expected_surface) in [
+        (
+            instructions_page(InstructionsPage::new()),
+            SettingsPointerSurfaceKind::Instructions,
+        ),
+        (
+            Box::new(RedactPatternsPage::new()) as PageBox,
+            SettingsPointerSurfaceKind::RedactPatterns,
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.page = page;
+        let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(actual_surface, expected_surface);
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
+    }
+
     // Harnesses: list, add-name editor, harness editor, field editor.
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
@@ -1164,6 +1183,9 @@ fn render_all_non_provider_pointer_surface_variants() {
         let _ = render_settings_rows(&d, 100, 40);
         d.handle_key(press(KeyCode::Enter));
         let _ = render_settings_rows(&d, 100, 40);
+        let actual_surface = d.page.pointer_surface_kind();
+        assert_eq!(actual_surface, SettingsPointerSurfaceKind::StringList);
+        super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
     }
 
     // Category base, inline, path, full-text, external, picker-list, and

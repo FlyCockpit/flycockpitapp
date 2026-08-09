@@ -20,18 +20,61 @@ const fromHex = (value: string) =>
   Uint8Array.from(value.match(/../g)!, (pair) => Number.parseInt(pair, 16));
 const toHex = (value: Uint8Array) =>
   Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+function compactBytes(vector: {
+  segments?: { hex: string; repeat: number }[];
+  prefix_hex?: string;
+  generated_attachments?: number;
+}) {
+  const parts: Uint8Array[] = [];
+  if (vector.segments)
+    for (const segment of vector.segments)
+      for (let i = 0; i < segment.repeat; i++) parts.push(fromHex(segment.hex));
+  else {
+    parts.push(fromHex(vector.prefix_hex!));
+    for (let i = 1; i <= vector.generated_attachments!; i++) {
+      parts.push(fromHex(`00000000000040008000${i.toString(16).padStart(12, "0")}`));
+      const version = new Uint8Array(8);
+      new DataView(version.buffer).setBigUint64(0, BigInt(i));
+      parts.push(version, new Uint8Array(32).fill(i), Uint8Array.of(((i - 1) % 3) + 1));
+    }
+  }
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
 
 describe("send_user_message_v2_canonical_vectors", () => {
   it("round trips the shared bytes and digests", async () => {
-    for (const vector of fixture.vectors) {
-      const bytes = fromHex(vector.fcm2_hex);
+    for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
+      const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);
       const decoded = decodeCanonicalSendUserMessageV2(bytes);
-      expect(toHex(encodeCanonicalSendUserMessageV2(decoded)), vector.name).toBe(vector.fcm2_hex);
+      expect(toHex(encodeCanonicalSendUserMessageV2(decoded)), vector.name).toBe(toHex(bytes));
       expect(toHex(await messageRequestDigest(decoded)), vector.name).toBe(
         vector.message_request_digest_hex,
       );
       expect(toHex(await attachmentSetDigest(decoded)), vector.name).toBe(
         vector.attachment_set_digest_hex,
+      );
+    }
+  });
+
+  it("rejects shared semantic mutations with exact errors", () => {
+    const base = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
+    for (const testCase of fixture.semantic_error_cases) {
+      const value = structuredClone(base);
+      if (testCase.mutation === "empty_tool") value.request.tag_expansions[0].tool = "";
+      else if (testCase.mutation === "detail_one_over")
+        value.request.tag_expansions[0].detail = "d".repeat(4097);
+      else if (testCase.mutation === "empty_skill") value.request.forced_skill = "";
+      else if (testCase.mutation === "invalid_skill") value.request.forced_skill = "bad/skill";
+      else if (testCase.mutation === "multibyte_tool")
+        value.request.tag_expansions[0].tool = "é".repeat(65);
+      expect(() => encodeCanonicalSendUserMessageV2(value), testCase.name).toThrow(
+        testCase.ts_error ?? testCase.error,
       );
     }
   });

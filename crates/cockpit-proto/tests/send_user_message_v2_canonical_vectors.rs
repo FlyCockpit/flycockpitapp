@@ -17,6 +17,31 @@ fn hex(raw: &str) -> Vec<u8> {
         .collect()
 }
 
+fn compact_bytes(vector: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(segments) = vector["segments"].as_array() {
+        for segment in segments {
+            let bytes = hex(segment["hex"].as_str().unwrap());
+            for _ in 0..segment["repeat"].as_u64().unwrap() {
+                out.extend_from_slice(&bytes);
+            }
+        }
+    } else {
+        out.extend_from_slice(&hex(vector["prefix_hex"].as_str().unwrap()));
+        for index in 1..=vector["generated_attachments"].as_u64().unwrap() {
+            out.extend_from_slice(
+                Uuid::parse_str(&format!("00000000-0000-4000-8000-{index:012x}"))
+                    .unwrap()
+                    .as_bytes(),
+            );
+            out.extend_from_slice(&index.to_be_bytes());
+            out.extend_from_slice(&[index as u8; 32]);
+            out.push(((index - 1) % 3 + 1) as u8);
+        }
+    }
+    out
+}
+
 #[test]
 fn send_user_message_v2_shared_scalar_predicate() {
     let fixture: Value = serde_json::from_str(include_str!(
@@ -156,6 +181,54 @@ fn send_user_message_v2_shared_bytes_and_digests() {
         assert_eq!(
             decoded.attachment_set_digest().unwrap().as_slice(),
             hex(vector["attachment_set_digest_hex"].as_str().unwrap())
+        );
+    }
+    for vector in fixture["compact_positive_vectors"].as_array().unwrap() {
+        let bytes = compact_bytes(vector);
+        let decoded = CanonicalSendUserMessageV2::decode(&bytes).unwrap();
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(
+            decoded.message_request_digest().unwrap().as_slice(),
+            hex(vector["message_request_digest_hex"].as_str().unwrap())
+        );
+        assert_eq!(
+            decoded.attachment_set_digest().unwrap().as_slice(),
+            hex(vector["attachment_set_digest_hex"].as_str().unwrap())
+        );
+    }
+}
+
+#[test]
+fn send_user_message_v2_shared_semantic_errors() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let base = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][1]["fcm2_hex"]
+        .as_str()
+        .unwrap()))
+    .unwrap();
+    for case in fixture["semantic_error_cases"].as_array().unwrap() {
+        let mut value = base.clone();
+        match case["mutation"].as_str().unwrap() {
+            "empty_tool" => value.request.tag_expansions[0].tool.clear(),
+            "detail_one_over" => value.request.tag_expansions[0].detail = "d".repeat(4097),
+            "empty_skill" => value.request.forced_skill = Some(String::new()),
+            "invalid_skill" => value.request.forced_skill = Some("bad/skill".into()),
+            "multibyte_tool" => value.request.tag_expansions[0].tool = "é".repeat(65),
+            other => panic!("unknown mutation {other}"),
+        }
+        let expected = case
+            .get("rust_error")
+            .or_else(|| case.get("error"))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            value.encode().unwrap_err().to_string(),
+            expected,
+            "{}",
+            case["name"]
         );
     }
 }

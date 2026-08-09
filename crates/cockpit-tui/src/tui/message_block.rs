@@ -22,6 +22,14 @@ pub(crate) struct MessageBlock {
     pub(crate) copy_fragments: Rc<Vec<markdown::CopyFragment>>,
 }
 
+struct WrappedMarkdown {
+    lines: Vec<Line<'static>>,
+    continuations: Vec<bool>,
+    copy_cells: Vec<Vec<Option<u32>>>,
+    copy_newlines_before: Vec<usize>,
+    copy_incomplete: Vec<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MessageBlockRole {
     pub(crate) label: String,
@@ -51,30 +59,29 @@ pub(crate) fn layout_rendered_markdown_message(
     indent: usize,
     body_style: Style,
 ) -> MessageBlock {
-    let (mut lines, continuations, mut copy_cells, copy_newlines_before, copy_incomplete) =
-        wrap_rendered_markdown(
-            rendered.lines,
-            rendered.copy_cells,
-            rendered.copy_newlines_before,
-            rendered.copy_incomplete,
-            max_width,
-            reserve_first,
-        );
-    lines = indent_lines(lines, indent);
+    let mut wrapped = wrap_rendered_markdown(
+        rendered.lines,
+        rendered.copy_cells,
+        rendered.copy_newlines_before,
+        rendered.copy_incomplete,
+        max_width,
+        reserve_first,
+    );
+    wrapped.lines = indent_lines(wrapped.lines, indent);
     if indent > 0 {
-        for cells in &mut copy_cells {
+        for cells in &mut wrapped.copy_cells {
             cells.splice(0..0, std::iter::repeat_n(None, indent));
         }
     }
-    for line in &mut lines {
+    for line in &mut wrapped.lines {
         line.style = body_style;
     }
     MessageBlock {
-        lines,
-        continuations,
-        copy_cells,
-        copy_newlines_before,
-        copy_incomplete,
+        lines: wrapped.lines,
+        continuations: wrapped.continuations,
+        copy_cells: wrapped.copy_cells,
+        copy_newlines_before: wrapped.copy_newlines_before,
+        copy_incomplete: wrapped.copy_incomplete,
         copy_fragments: rendered.copy_fragments,
     }
 }
@@ -111,13 +118,7 @@ fn wrap_rendered_markdown(
     incomplete: Vec<bool>,
     max_width: usize,
     reserve_first: usize,
-) -> (
-    Vec<Line<'static>>,
-    Vec<bool>,
-    Vec<Vec<Option<u32>>>,
-    Vec<usize>,
-    Vec<bool>,
-) {
+) -> WrappedMarkdown {
     let mut out_lines = Vec::new();
     let mut out_continuations = Vec::new();
     let mut out_cells = Vec::new();
@@ -158,13 +159,13 @@ fn wrap_rendered_markdown(
             }
         }
     }
-    (
-        out_lines,
-        out_continuations,
-        out_cells,
-        out_newlines,
-        out_incomplete,
-    )
+    WrappedMarkdown {
+        lines: out_lines,
+        continuations: out_continuations,
+        copy_cells: out_cells,
+        copy_newlines_before: out_newlines,
+        copy_incomplete: out_incomplete,
+    }
 }
 
 impl MessageBlock {

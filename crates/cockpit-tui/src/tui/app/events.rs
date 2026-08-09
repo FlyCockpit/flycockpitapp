@@ -851,6 +851,7 @@ impl App {
                 error,
                 optimistic_submission_id,
             } => {
+                self.submission_fences.remove(&optimistic_submission_id);
                 self.retained_user_submission_ids
                     .remove(&optimistic_submission_id);
                 let mut owns_working_span = false;

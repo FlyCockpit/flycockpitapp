@@ -145,7 +145,7 @@ impl App {
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
-        let Some(path) = self.dialog.take_pending_agent_edit() else {
+        let Some((operation_id, path)) = self.dialog.take_pending_agent_edit() else {
             return Ok(false);
         };
 
@@ -153,7 +153,7 @@ impl App {
             // Env shifted between the page deciding to defer and now; the
             // page only defers when EDITOR was set, so this is defensive.
             self.dialog
-                .finish_agent_edit(Some("$EDITOR is no longer set".to_string()));
+                .finish_agent_edit(operation_id, Some("$EDITOR is no longer set".to_string()));
             return Ok(true);
         };
 
@@ -188,7 +188,7 @@ impl App {
                 editor.to_string_lossy()
             )),
         };
-        self.dialog.finish_agent_edit(editor_error);
+        self.dialog.finish_agent_edit(operation_id, editor_error);
         Ok(redraw)
     }
 
@@ -200,13 +200,15 @@ impl App {
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
-        let Some(path) = self.dialog.take_pending_category_setting_edit() else {
+        let Some((operation_id, path)) = self.dialog.take_pending_category_setting_edit() else {
             return Ok(false);
         };
 
         let Some(editor) = std::env::var_os("EDITOR") else {
-            self.dialog
-                .finish_category_setting_edit(Some("$EDITOR is no longer set".to_string()));
+            self.dialog.finish_category_setting_edit(
+                operation_id,
+                Some("$EDITOR is no longer set".to_string()),
+            );
             return Ok(true);
         };
 
@@ -241,7 +243,8 @@ impl App {
                 editor.to_string_lossy()
             )),
         };
-        self.dialog.finish_category_setting_edit(editor_error);
+        self.dialog
+            .finish_category_setting_edit(operation_id, editor_error);
         Ok(redraw)
     }
 

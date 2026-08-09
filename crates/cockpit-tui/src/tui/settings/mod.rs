@@ -1265,13 +1265,13 @@ impl Dialog {
     /// (the page handler can't), then calls [`Self::finish_agent_edit`] to
     /// re-read + re-parse the file. `None` unless the user just chose to
     /// edit an agent and `$EDITOR` is set.
-    pub fn take_pending_agent_edit(&mut self) -> Option<PathBuf> {
+    pub fn take_pending_agent_edit(&mut self) -> Option<(shell::PointerOperationId, PathBuf)> {
         let Dialog::Settings(s) = self else {
             return None;
         };
         s.page
             .downcast_mut::<AgentsPage>()
-            .and_then(|p| p.pending_external_edit.take())
+            .and_then(AgentsPage::take_external_edit_request)
     }
 
     /// Apply the result of an external-editor session the event loop ran on
@@ -1279,20 +1279,26 @@ impl Dialog {
     /// surface any parse error inline, and refresh the row markers/model.
     /// `editor_error` carries an external-process failure (non-zero exit /
     /// missing binary) so the page reports it and leaves the file as-is.
-    pub fn finish_agent_edit(&mut self, editor_error: Option<String>) {
+    pub fn finish_agent_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        editor_error: Option<String>,
+    ) {
         let Dialog::Settings(s) = self else {
             return;
         };
         let cwd = s.agents_cwd();
         if let Some(p) = s.page.downcast_mut::<AgentsPage>() {
-            p.finish_external_edit(&cwd, editor_error);
+            p.finish_external_edit(&cwd, operation_id, editor_error);
         }
     }
 
     /// Drain a pending category setting `$EDITOR` request. The category page
     /// retains the temp path until [`Self::finish_category_setting_edit`] reads
     /// it back and drops it.
-    pub fn take_pending_category_setting_edit(&mut self) -> Option<PathBuf> {
+    pub fn take_pending_category_setting_edit(
+        &mut self,
+    ) -> Option<(shell::PointerOperationId, PathBuf)> {
         let Dialog::Settings(s) = self else {
             return None;
         };
@@ -1300,11 +1306,15 @@ impl Dialog {
     }
 
     /// Apply the result of a category-setting `$EDITOR` round trip.
-    pub fn finish_category_setting_edit(&mut self, editor_error: Option<String>) {
+    pub fn finish_category_setting_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        editor_error: Option<String>,
+    ) {
         let Dialog::Settings(s) = self else {
             return;
         };
-        s.finish_category_external_edit(editor_error);
+        s.finish_category_external_edit(operation_id, editor_error);
     }
 
     /// Called by the event loop each tick so async fetches can apply
@@ -2215,17 +2225,26 @@ impl SettingsDialog {
         self.page = string_list_page(StringListPage::gitignore_allow());
     }
 
-    fn take_pending_category_external_edit(&mut self) -> Option<PathBuf> {
-        self.page
-            .downcast_mut::<CategoryPage>()
-            .and_then(|p| p.pending_external_edit.as_mut()?.service_path())
+    fn take_pending_category_external_edit(
+        &mut self,
+    ) -> Option<(shell::PointerOperationId, PathBuf)> {
+        self.page.downcast_mut::<CategoryPage>().and_then(|p| {
+            let pending = p.pending_external_edit.as_mut()?;
+            let id = pending.operation_id;
+            pending.service_path().map(|path| (id, path))
+        })
     }
 
-    fn finish_category_external_edit(&mut self, editor_error: Option<String>) {
+    fn finish_category_external_edit(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        editor_error: Option<String>,
+    ) {
         let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
             return;
         };
-        self.cx.finish_category_page_external_edit(p, editor_error);
+        self.cx
+            .finish_category_page_external_edit(p, operation_id, editor_error);
     }
 
     // ── Rendering ────────────────────────────────────────────────────────

@@ -151,6 +151,46 @@ pub(super) struct SettingsScrollStates {
     states: RefCell<BTreeMap<String, ListState>>,
 }
 
+/// Monotonic identity for a pointer-triggered effect.  Results are accepted
+/// only while the matching operation is live; this prevents a completion
+/// from a page that has since been cancelled/replaced from updating its
+/// successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PointerOperationId(pub u64);
+
+#[derive(Debug, Default)]
+pub(super) struct PointerOperationGate {
+    next: u64,
+    pending: Option<PointerOperationId>,
+}
+
+impl PointerOperationGate {
+    pub(super) fn begin(&mut self) -> PointerOperationId {
+        self.next = self.next.saturating_add(1).max(1);
+        let id = PointerOperationId(self.next);
+        self.pending = Some(id);
+        id
+    }
+
+    /// Consume a matching completion exactly once.
+    pub(super) fn complete(&mut self, id: PointerOperationId) -> bool {
+        if self.pending == Some(id) {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn cancel(&mut self) {
+        self.pending = None;
+    }
+
+    pub(super) fn pending(&self) -> Option<PointerOperationId> {
+        self.pending
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsHeaderAction {
     Close,

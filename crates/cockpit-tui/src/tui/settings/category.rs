@@ -50,9 +50,10 @@ use super::descriptor::{FieldKind, SettingDescriptor, SettingHeading, SettingSto
 use super::reset::{ResetButton, ResetOutcome};
 use super::secret_display;
 use super::shell::{
-    SettingsControlId, SettingsPointerAction, SettingsPointerSurface, SettingsPointerTarget,
-    TextColumnLayout, heading_style, muted_style, push_label_text_field_row, push_label_value_row,
-    push_wrapped_text, selected_style, settings_text_columns, warning_style,
+    PointerOperationGate, PointerOperationId, SettingsControlId, SettingsPointerAction,
+    SettingsPointerSurface, SettingsPointerTarget, TextColumnLayout, heading_style, muted_style,
+    push_label_text_field_row, push_label_value_row, push_wrapped_text, selected_style,
+    settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
@@ -1178,6 +1179,7 @@ pub(super) struct CategoryPage {
     pub(super) text_editor: Option<CategoryTextEditor>,
     pub(super) path_editor: Option<CategoryPathEditor>,
     pub(super) pending_external_edit: Option<CategoryExternalEdit>,
+    external_edit_ops: PointerOperationGate,
     pub(super) status: Option<String>,
     pub(super) reset: ResetButton,
     /// Drained by the App on close to reconcile crossterm mouse capture
@@ -1223,6 +1225,7 @@ pub(super) enum CategoryExternalSource {
 }
 
 pub(super) struct CategoryExternalEdit {
+    pub(super) operation_id: PointerOperationId,
     pub(super) id: SettingId,
     pub(super) path: tempfile::TempPath,
     source: CategoryExternalSource,
@@ -1230,7 +1233,12 @@ pub(super) struct CategoryExternalEdit {
 }
 
 impl CategoryExternalEdit {
-    fn new(id: SettingId, text: &str, source: CategoryExternalSource) -> Result<Self, String> {
+    fn new(
+        operation_id: PointerOperationId,
+        id: SettingId,
+        text: &str,
+        source: CategoryExternalSource,
+    ) -> Result<Self, String> {
         if std::env::var_os("EDITOR").is_none() {
             return Err("No $EDITOR environment variable".into());
         }
@@ -1244,6 +1252,7 @@ impl CategoryExternalEdit {
         temp.flush()
             .map_err(|e| format!("editor: failed to flush temp file: {e}"))?;
         Ok(Self {
+            operation_id,
             id,
             path: temp.into_temp_path(),
             source,
@@ -1531,6 +1540,7 @@ impl CategoryPage {
             text_editor: None,
             path_editor: None,
             pending_external_edit: None,
+            external_edit_ops: PointerOperationGate::default(),
             status: None,
             reset: ResetButton::default(),
             pending_mouse_capture: None,
@@ -2097,8 +2107,17 @@ impl SettingsCx {
     pub(super) fn finish_category_page_external_edit(
         &mut self,
         p: &mut CategoryPage,
+        operation_id: PointerOperationId,
         editor_error: Option<String>,
     ) {
+        if !p.external_edit_ops.complete(operation_id)
+            || p.pending_external_edit
+                .as_ref()
+                .map(|pending| pending.operation_id)
+                != Some(operation_id)
+        {
+            return;
+        }
         let Some(pending) = p.pending_external_edit.take() else {
             return;
         };
@@ -2223,6 +2242,7 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Char('g') if is_ctrl_g(key) => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::PathEditor,
@@ -2320,6 +2340,7 @@ impl SettingsCx {
                 }
                 VimEditorOutcome::ExternalEdit => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::TextEditor,
@@ -2348,6 +2369,7 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Char('g') if is_ctrl_g(key) && category_external_editable(id) => {
                     match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
                         id,
                         p.buf.text(),
                         CategoryExternalSource::Inline,
@@ -2390,7 +2412,12 @@ impl SettingsCx {
                     && category_external_editable(id)
                 {
                     let seed = self.category_edit_seed(id);
-                    match CategoryExternalEdit::new(id, &seed, CategoryExternalSource::Cursor) {
+                    match CategoryExternalEdit::new(
+                        p.external_edit_ops.begin(),
+                        id,
+                        &seed,
+                        CategoryExternalSource::Cursor,
+                    ) {
                         Ok(request) => {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());

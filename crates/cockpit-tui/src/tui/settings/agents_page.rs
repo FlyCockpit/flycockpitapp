@@ -50,8 +50,8 @@ use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    SettingsControlId, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
-    selected_style,
+    PointerOperationGate, PointerOperationId, SettingsControlId, SettingsScrollRegionId,
+    push_wrapped_text, selected_line_from_marker, selected_style,
 };
 use super::{Nav, SettingsCx, SettingsPage};
 #[cfg(test)]
@@ -77,7 +77,14 @@ pub(super) struct AgentsPage {
     /// Set when the user chose to edit and `$EDITOR` is available: the
     /// event loop drains this (the page can't suspend the TUI itself),
     /// runs `$EDITOR`, then calls back to re-read + re-parse.
-    pub(super) pending_external_edit: Option<PathBuf>,
+    pub(super) pending_external_edit: Option<AgentExternalEdit>,
+    external_edit_ops: PointerOperationGate,
+}
+
+pub(super) struct AgentExternalEdit {
+    pub(super) id: PointerOperationId,
+    pub(super) path: PathBuf,
+    servicing: bool,
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -131,6 +138,7 @@ impl AgentsPage {
             editing: None,
             detail: None,
             pending_external_edit: None,
+            external_edit_ops: PointerOperationGate::default(),
         }
     }
 
@@ -164,14 +172,34 @@ impl AgentsPage {
         self.reset_one.disarm();
     }
 
+    pub(super) fn take_external_edit_request(&mut self) -> Option<(PointerOperationId, PathBuf)> {
+        let pending = self.pending_external_edit.as_mut()?;
+        if pending.servicing {
+            return None;
+        }
+        pending.servicing = true;
+        Some((pending.id, pending.path.clone()))
+    }
+
     /// Re-read the edited file from disk, re-parse it, and refresh the row.
     /// A parse error is surfaced inline (keeping the user on the page); the
     /// `editor_error` from a failed external process is reported as-is.
     pub(super) fn finish_external_edit(
         &mut self,
         cwd: &std::path::Path,
+        id: PointerOperationId,
         editor_error: Option<String>,
     ) {
+        if !self.external_edit_ops.complete(id)
+            || self
+                .pending_external_edit
+                .as_ref()
+                .map(|request| request.id)
+                != Some(id)
+        {
+            return;
+        }
+        self.pending_external_edit = None;
         if let Some(err) = editor_error {
             self.status = Some(err);
             return;
@@ -357,7 +385,12 @@ impl SettingsCx {
                         match std::fs::write(&path, &text) {
                             Ok(()) => {
                                 p.editing = None;
-                                p.pending_external_edit = Some(path);
+                                let id = p.external_edit_ops.begin();
+                                p.pending_external_edit = Some(AgentExternalEdit {
+                                    id,
+                                    path,
+                                    servicing: false,
+                                });
                                 p.status = Some("opening $EDITOR…".into());
                             }
                             Err(e) => {
@@ -641,7 +674,12 @@ impl SettingsCx {
             // marked overridden under the cursor; the loop will re-read the
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
-            p.pending_external_edit = Some(path);
+            let id = p.external_edit_ops.begin();
+            p.pending_external_edit = Some(AgentExternalEdit {
+                id,
+                path,
+                servicing: false,
+            });
             p.status = Some("opening $EDITOR…".into());
             return;
         }
@@ -1820,8 +1858,13 @@ mod tests {
         );
         // Second drain is empty (taken).
         assert!(outer.take_pending_agent_edit().is_none());
-        // finish_agent_edit re-parses + refreshes without panicking.
-        outer.finish_agent_edit(None);
+        // A matching completion is accepted once; a duplicate is inert.
+        let (operation_id, _) = drained.unwrap();
+        outer.finish_agent_edit(operation_id, None);
+        outer.finish_agent_edit(operation_id, Some("late duplicate".into()));
+        if let super::super::Dialog::Settings(s) = &mut outer {
+            assert_ne!(page(s).status.as_deref(), Some("late duplicate"));
+        }
     }
 
     #[test]

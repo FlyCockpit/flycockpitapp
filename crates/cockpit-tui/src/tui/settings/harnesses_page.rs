@@ -14,7 +14,7 @@
 //!     cycled enums (prompt input mode, argv overflow, JSON-output +
 //!     agent-file toggles).
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -28,8 +28,8 @@ use cockpit_config::extended::{
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    focused_field_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
-    selected_style, warning_style,
+    SettingsControlId, SettingsScrollRegionId, focused_field_style, marker, muted_style,
+    push_text_field_at_cursor, selected_line_from_marker, selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -502,6 +502,7 @@ impl SettingsCx {
         let muted = muted_style();
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         lines.push(Line::from(Span::styled(
             "External harnesses (harness_invoke)".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -536,6 +537,7 @@ impl SettingsCx {
                 hc.prompt_input.as_str(),
                 hc.models.len()
             );
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("{name:<14}"), label_style),
@@ -548,11 +550,14 @@ impl SettingsCx {
         let seed_row = names.len() + 1;
         let reset_row = names.len() + 2;
         lines.push(Line::default());
+        bindings.push((lines.len(), SettingsControlId(add_row as u64)));
         lines.push(synthetic_row("[+ add harness]", s.cursor == add_row));
+        bindings.push((lines.len(), SettingsControlId(seed_row as u64)));
         lines.push(synthetic_row(
             "[seed installed presets]",
             s.cursor == seed_row,
         ));
+        bindings.push((lines.len(), SettingsControlId(reset_row as u64)));
         lines.push(
             s.reset
                 .render_line(s.cursor == reset_row, "reset to verified presets"),
@@ -575,14 +580,23 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "harnesses:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "harnesses:list",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("harnesses:list"),
+        );
     }
 
     fn render_harness_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
         let muted = muted_style();
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         lines.push(Line::from(Span::styled(
             format!("Harness: {}", s.name),
             Style::default()
@@ -610,6 +624,7 @@ impl SettingsCx {
             } else {
                 value
             };
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("{:<18}", field.label()), label_style),
@@ -636,8 +651,16 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "harnesses:edit", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "harnesses:edit",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("harnesses:edit"),
+        );
     }
 }
 
@@ -686,6 +709,53 @@ impl SettingsPage for HarnessesPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_harnesses_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        let valid = match self {
+            HarnessesPage::List(_) => index < cx.harness_names().len() + 3,
+            HarnessesPage::Edit(_) => index < FIELDS.len(),
+        };
+        if !valid {
+            return Nav::Stay;
+        }
+        match self {
+            HarnessesPage::List(state) => state.cursor = index,
+            HarnessesPage::Edit(state) => state.cursor = index,
+        }
+        cx.handle_harnesses_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        match self {
+            HarnessesPage::List(state)
+                if region == SettingsScrollRegionId("harnesses:list") && state.adding.is_none() =>
+            {
+                state.delete_pending = false;
+                state.reset.disarm();
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(cx.harness_names().len() + 2);
+            }
+            HarnessesPage::Edit(state)
+                if region == SettingsScrollRegionId("harnesses:edit")
+                    && state.editing.is_none() =>
+            {
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(FIELDS.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

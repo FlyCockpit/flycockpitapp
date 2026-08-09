@@ -290,6 +290,35 @@ impl SettingsScrollStates {
         }
     }
 
+    pub(super) fn render_bound_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        key: impl Into<String>,
+        lines: Vec<Line<'static>>,
+        selected_line: Option<usize>,
+        bindings: impl IntoIterator<Item = (usize, SettingsControlId)>,
+        surface: &SettingsPointerSurface,
+        region: SettingsScrollRegionId,
+    ) {
+        let mut controls = vec![None; lines.len()];
+        for (line, id) in bindings {
+            if let Some(slot) = controls.get_mut(line) {
+                *slot = Some((id, true, None));
+            }
+        }
+        self.render_control_lines(
+            frame,
+            area,
+            key,
+            lines,
+            selected_line,
+            controls,
+            surface,
+            region,
+        );
+    }
+
     pub(super) fn offset_for(&self, key: &str) -> usize {
         self.states
             .borrow()

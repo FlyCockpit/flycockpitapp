@@ -272,19 +272,18 @@ fn remote_fallback_binding_authenticates_outer_sequence_watermark_and_route() {
     cockpit_noise::noise_read_handshake(daemon, one).unwrap();
     let two = cockpit_noise::noise_write_handshake(daemon).unwrap();
     cockpit_noise::noise_read_handshake(client, two).unwrap();
-    let gate: Arc<dyn cockpit_noise::BindingAuthorizationGate> = Arc::new(BindingGate);
     cockpit_noise::noise_authorize(
         client,
         b"client-proof".to_vec(),
         b"daemon-proof".to_vec(),
-        Arc::clone(&gate),
+        Box::new(BindingGate),
     )
     .unwrap();
     cockpit_noise::noise_authorize(
         daemon,
         b"client-proof".to_vec(),
         b"daemon-proof".to_vec(),
-        gate,
+        Box::new(BindingGate),
     )
     .unwrap();
     cockpit_noise::noise_bind_fallback_route(client, 7).unwrap();

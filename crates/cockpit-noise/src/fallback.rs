@@ -505,7 +505,7 @@ mod tests {
             ReceiveDisposition::Duplicate { .. }
         ));
         assert_eq!(
-            receive.observe(outer(65, 1)),
+            receive.observe(outer(66, 1)),
             Err(NoiseError::FallbackWindowExceeded)
         );
     }

@@ -2022,7 +2022,19 @@ impl SettingsDialog {
             return SettingsPointerOutcome::Consumed;
         }
         match mouse.kind {
+            MouseEventKind::Moved => {
+                self.pointer_surface.hover.set(
+                    self.pointer_surface
+                        .hit(mouse.column, mouse.row)
+                        .filter(|target| target.enabled)
+                        .and_then(|target| match target.action {
+                            SettingsPointerAction::Page(id) => Some(id),
+                            SettingsPointerAction::Header(_) => None,
+                        }),
+                );
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.pointer_surface.hover.set(None);
                 if let Some(region) = self
                     .pointer_surface
                     .scroll_region_at(mouse.column, mouse.row)
@@ -2056,11 +2068,10 @@ impl SettingsDialog {
                             &mut self.cx,
                             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                         );
-                        if matches!(nav, Nav::Stay) && !self.stack.is_empty() {
-                            let _ = self.apply_nav(Nav::Back);
-                        } else {
-                            let _ = self.apply_nav(nav);
-                        }
+                        // `Esc` is the page-local back contract. In an editor
+                        // it may intentionally cancel a draft and stay on the
+                        // page; never reinterpret that as a stack pop.
+                        let _ = self.apply_nav(nav);
                     }
                     SettingsPointerAction::Page(control) => {
                         let nav = self.page.handle_pointer_control(&mut self.cx, control);

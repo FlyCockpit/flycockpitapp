@@ -599,6 +599,24 @@ mod tests {
             "workspace_trust_mode.untrusted",
             crate::WorkspaceTrustMode::Untrusted
         );
+        check!(
+            "app_flag_key.daemon_autostart_notice",
+            crate::AppFlagKey::DaemonAutostartNotice
+        );
+        check!(
+            "assistant_session_resolution_mode.most_recent_or_create",
+            crate::AssistantSessionResolutionMode::MostRecentOrCreate
+        );
+        check!(
+            "export_session_kind.transcript_json",
+            crate::ExportSessionKind::TranscriptJson
+        );
+        check!(
+            "export_session_kind.debug_bundle",
+            crate::ExportSessionKind::DebugBundle
+        );
+        check!("stats_range.last_7_days", crate::StatsRange::Last7Days);
+        check!("stats_range.all_time", crate::StatsRange::AllTime);
         check!("usage_kind.model", crate::UsageKind::Model);
         check!("usage_kind.slash", crate::UsageKind::Slash);
         check!("usage_kind.tag", crate::UsageKind::Tag);
@@ -615,7 +633,46 @@ mod tests {
             "lsp_control_action.restart",
             crate::LspControlAction::Restart
         );
-        assert_eq!(expected.as_object().unwrap().len(), 34);
+        check!(
+            "active_model_switch_trigger.picker",
+            crate::ActiveModelSwitchTrigger::Picker
+        );
+        check!(
+            "active_model_switch_trigger.quick",
+            crate::ActiveModelSwitchTrigger::Quick
+        );
+        check!(
+            "active_model_switch_trigger.cycle",
+            crate::ActiveModelSwitchTrigger::Cycle
+        );
+        check!(
+            "active_model_switch_trigger.daemon",
+            crate::ActiveModelSwitchTrigger::Daemon
+        );
+        check!(
+            "prompt_cache_retention.default",
+            cockpit_config::config::providers::PromptCacheRetention::Default
+        );
+        check!(
+            "prompt_cache_retention.extended",
+            cockpit_config::config::providers::PromptCacheRetention::Extended
+        );
+        check!(
+            "thinking_mode.off",
+            cockpit_config::config::providers::ThinkingMode::Off
+        );
+        check!(
+            "thinking_mode.low",
+            cockpit_config::config::providers::ThinkingMode::Low
+        );
+        check!(
+            "thinking_mode.medium",
+            cockpit_config::config::providers::ThinkingMode::Medium
+        );
+        check!(
+            "thinking_mode.high",
+            cockpit_config::config::providers::ThinkingMode::High
+        );
     }
 
     #[test]

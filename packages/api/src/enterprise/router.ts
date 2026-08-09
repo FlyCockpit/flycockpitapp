@@ -1327,7 +1327,7 @@ export const enterpriseRouter = {
               },
             },
           });
-          if (!counter || counter.state !== "ACTIVE")
+          if (counter?.state !== "ACTIVE")
             throw new ORPCError("UNAUTHORIZED", { message: "Credential counter is unavailable." });
           const observed = BigInt(verified.signCount);
           const accepted =
@@ -1845,9 +1845,7 @@ export const enterpriseRouter = {
             : null;
           if (
             isClosedBootstrap &&
-            (!nominator ||
-              nominator.role !== "OWNER" ||
-              nominator.userId === context.session.user.id)
+            (nominator?.role !== "OWNER" || nominator.userId === context.session.user.id)
           )
             throw new ORPCError("CONFLICT", { message: "Nominating owner is no longer eligible." });
           if (!isClosedBootstrap) {

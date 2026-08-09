@@ -213,6 +213,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_reachable_nested_surfaces_render_and_dispatch();
     pointer_prompt_surfaces_render_and_dispatch();
     pointer_active_model_retention_renders_dispatches_and_persists();
+    pointer_xai_entitlement_renders_dispatches_and_persists();
     pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state();
     pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state();
     pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state();
@@ -238,6 +239,126 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_model_reapply_renders_and_dispatches_from_fresh_state();
     pointer_model_rebind_renders_and_dispatches_from_fresh_state();
     pointer_model_dismiss_renders_and_dispatches_from_fresh_state();
+}
+
+#[test]
+fn pointer_xai_entitlement_renders_dispatches_and_persists() {
+    use super::super::pointer_actions::{
+        ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+    };
+    use cockpit_config::providers::{
+        CapabilitySource, CapabilityStatus, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT,
+    };
+
+    fn fixture(model_scope: bool) -> (tempfile::TempDir, SettingsDialog) {
+        let mut config = one_provider_config(None);
+        let mut entry = config.providers.remove("p").unwrap();
+        entry.url = "https://api.x.ai/v1".into();
+        entry.models[0].id = "grok-build-multi-agent".into();
+        config.providers.insert("grok-oauth".into(), entry.clone());
+        let (tmp, mut dialog) = dialog_with_config(config);
+        let mut editor = if model_scope {
+            SettingsEditor::for_model("grok-oauth", &entry, "grok-build-multi-agent")
+        } else {
+            SettingsEditor::for_provider("grok-oauth", &entry)
+        };
+        editor.cursor = editor
+            .fields()
+            .iter()
+            .position(|field| *field == ProviderSettingId::XaiMultiAgentToolsBeta)
+            .expect("xAI settings expose multi-agent entitlement");
+        let parent = Box::new(EditState::new("grok-oauth".into(), entry.clone()));
+        dialog.page = super::super::providers_page(if model_scope {
+            ProvidersPage::ModelSettings {
+                editor,
+                models: Box::new(ModelEditor::new(None, entry.models.clone())),
+                parent,
+            }
+        } else {
+            ProvidersPage::ProviderSettings { editor, parent }
+        });
+        (tmp, dialog)
+    }
+
+    let action = SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+        ProviderRowEditorAction::SettingEdit(ProviderSettingId::XaiMultiAgentToolsBeta),
+    ));
+    for model_scope in [false, true] {
+        let (_tmp, source) = fixture(model_scope);
+        let _ = render_provider_rows(&source, 110, 20);
+        let targets = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter(|target| {
+                target.enabled
+                    && target.action
+                        == super::super::shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets.len(),
+            1,
+            "each xAI scope owns one exact entitlement source"
+        );
+
+        let (_tmp, mut fresh) = fixture(model_scope);
+        let _ = render_provider_rows(&fresh, 110, 20);
+        let target = fresh
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                target.enabled
+                    && target.action
+                        == super::super::shell::SettingsPointerAction::Page(action.clone())
+            })
+            .cloned()
+            .expect("fresh xAI scope renders exact entitlement identity");
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        ] {
+            assert_eq!(
+                fresh.handle_pointer(super::super::tests::settings_mouse(
+                    kind,
+                    target.rect.x,
+                    target.rect.y,
+                )),
+                super::super::SettingsPointerOutcome::Consumed
+            );
+        }
+        assert!(matches!(
+            fresh.test_page(),
+            TestPageRef::Providers(ProvidersPage::ProviderSettings { editor, .. }
+                | ProvidersPage::ModelSettings { editor, .. })
+                if editor.value_str(ProviderSettingId::XaiMultiAgentToolsBeta) == "on"
+                    && editor.is_overridden(ProviderSettingId::XaiMultiAgentToolsBeta)
+        ));
+
+        fresh.handle_key(press(KeyCode::Char('s')));
+        let saved = load_provider(&fresh.config_path, "grok-oauth");
+        let capability = if model_scope {
+            &saved
+                .models
+                .iter()
+                .find(|model| model.id == "grok-build-multi-agent")
+                .expect("saved exact xAI model identity")
+                .capabilities
+                .client_side_tools
+        } else {
+            &saved.capabilities.client_side_tools
+        };
+        assert_eq!(capability.status, CapabilityStatus::Supported);
+        assert_eq!(capability.source, Some(CapabilitySource::Manual));
+        assert_eq!(
+            capability.entitlement.as_deref(),
+            Some(XAI_MULTI_AGENT_TOOLS_ENTITLEMENT)
+        );
+    }
 }
 
 #[test]

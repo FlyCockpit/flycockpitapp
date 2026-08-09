@@ -2864,7 +2864,8 @@ mod tests {
             jobs.iter()
                 .filter(|job| job.role == GoalControlRole::Gatekeeper)
                 .count(),
-            1
+            0,
+            "an initial candidate has no unresolved gaps for the resumed-gap gatekeeper"
         );
         assert!(
             jobs.iter()

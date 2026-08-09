@@ -57,7 +57,7 @@ struct IngressOperation {
     created_at: Instant,
     committed_at: Option<Instant>,
     path: Option<PathBuf>,
-    file_identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
+    verified_file: Option<cockpit_config::config::VerifiedTerminalIngressFile>,
     binding_dir: PathBuf,
     owner: AuthenticatedTerminalContext,
     session_id: Uuid,
@@ -953,7 +953,7 @@ impl TerminalHost {
                 created_at: Instant::now(),
                 committed_at: None,
                 path: None,
-                file_identity: None,
+                verified_file: None,
                 binding_dir,
                 owner: binding_record.owner,
                 session_id: binding_record.session_id,
@@ -1086,7 +1086,6 @@ impl TerminalHost {
             drop(verified_file);
             return Err(internal(error));
         }
-        let file_identity = Some(verified_file.retain());
         state.input_sequence = state.input_sequence.saturating_add(1);
         let sequence = state.input_sequence;
         let operation = state
@@ -1097,7 +1096,7 @@ impl TerminalHost {
         operation.input_sequence = Some(sequence);
         operation.committed_at = Some(Instant::now());
         operation.path = Some(final_path);
-        operation.file_identity = file_identity;
+        operation.verified_file = Some(verified_file);
         operation.bytes.clear();
         #[cfg(test)]
         self.hit_ingress_barrier(
@@ -1345,6 +1344,9 @@ fn close_generation_locked(
         },
     );
 
+    // Drop held verified handles first so each committed object is scrubbed
+    // and its published name is identity-gated before directory teardown.
+    state.ingress.clear();
     let _ = std::fs::remove_dir_all(&state.temp_dir);
     outcome
 }
@@ -1799,11 +1801,6 @@ fn sweep_ingress_locked(state: &mut TerminalState) {
     state.ingress.retain(|_, operation| {
         let horizon = operation.committed_at.unwrap_or(operation.created_at);
         let expired = now.duration_since(horizon) >= INGRESS_TTL;
-        if expired {
-            if let Some(path) = &operation.path {
-                remove_if_same_identity(path, operation.file_identity);
-            }
-        }
         !expired
     });
 }

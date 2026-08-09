@@ -103,13 +103,6 @@ pub struct VerifiedTerminalIngressFile {
     cleanup_armed: bool,
 }
 
-impl VerifiedTerminalIngressFile {
-    pub fn retain(mut self) -> TerminalIngressFileIdentity {
-        self.cleanup_armed = false;
-        self.identity
-    }
-}
-
 impl Drop for VerifiedTerminalIngressFile {
     fn drop(&mut self) {
         if !self.cleanup_armed {

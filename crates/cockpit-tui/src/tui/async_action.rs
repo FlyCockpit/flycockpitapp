@@ -643,6 +643,40 @@ mod tests {
         assert_eq!(runner.pending_count(), 0);
     }
 
+    #[tokio::test]
+    async fn queue_edits_apply_in_user_order() {
+        let mut runner = AsyncActionRunner::default();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_first, first_barrier) = oneshot::channel::<()>();
+        let first_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::Blocking("queue.edit"),
+            AsyncActionKey::new("queue.edit"),
+            async move {
+                first_barrier.await.unwrap();
+                first_order.lock().unwrap().push(1);
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        let second_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::Blocking("queue.edit"),
+            AsyncActionKey::new("queue.edit"),
+            async move {
+                second_order.lock().unwrap().push(2);
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+
+        tokio::task::yield_now().await;
+        assert!(order.lock().unwrap().is_empty());
+        release_first.send(()).unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {
         assert!(matches!(
             &result.payload,

@@ -110,35 +110,7 @@ pub(super) enum ToolFieldId {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct BuiltinToolId(pub String);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum WizardStepId {
-    Template,
-    ProviderId,
-    Url,
-    AuthMethod,
-    ApiKey,
-    EnvVar,
-    Headers,
-    TestKeyChoice,
-    GrokOAuth,
-    CodexOAuth,
-}
-impl WizardStepId {
-    pub(super) fn source_id(self) -> &'static str {
-        match self {
-            Self::Template => "template",
-            Self::ProviderId => "id",
-            Self::Url => "url",
-            Self::AuthMethod => "auth-method",
-            Self::ApiKey => "api-key",
-            Self::EnvVar => "env-var",
-            Self::Headers => "headers",
-            Self::TestKeyChoice => "test-key-choice",
-            Self::GrokOAuth => "grok-oauth",
-            Self::CodexOAuth => "codex-oauth",
-        }
-    }
-}
+pub(super) type WizardStepId = cockpit_core::wizard::ProviderWizardStep;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum WizardAuthMethod {
     PasteKey,

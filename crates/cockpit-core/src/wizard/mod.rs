@@ -169,6 +169,15 @@ impl WizardRun {
         self.current_step().map(|step| step.id)
     }
 
+    pub fn current_provider_step(&self) -> Option<ProviderWizardStep> {
+        (self.descriptor.id == PROVIDER_WIZARD_ID).then(|| {
+            ProviderWizardStep::from_source_id(
+                self.current_step_id()
+                    .expect("a live provider wizard has a current step"),
+            )
+        })
+    }
+
     pub fn answer(&self, step_id: &str) -> Option<&WizardAnswer> {
         self.answers.get(step_id)
     }
@@ -344,6 +353,71 @@ impl WizardRun {
         self.current = Some(index);
         self.error = None;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderWizardStep {
+    Template,
+    ProviderId,
+    Url,
+    Headers,
+    AuthMethod,
+    ApiKey,
+    EnvVar,
+    CopilotAuth,
+    GrokOAuth,
+    CodexOAuth,
+    Saving,
+    TestKeyChoice,
+    TestKey,
+    TestSkipped,
+    Fetching,
+    Done,
+}
+
+impl ProviderWizardStep {
+    pub const fn source_id(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::ProviderId => "id",
+            Self::Url => "url",
+            Self::Headers => "headers",
+            Self::AuthMethod => "auth-method",
+            Self::ApiKey => "api-key",
+            Self::EnvVar => "env-var",
+            Self::CopilotAuth => "copilot-auth",
+            Self::GrokOAuth => "grok-oauth",
+            Self::CodexOAuth => "codex-oauth",
+            Self::Saving => "saving",
+            Self::TestKeyChoice => "test-key-choice",
+            Self::TestKey => "test-key",
+            Self::TestSkipped => "test-skipped",
+            Self::Fetching => "fetching",
+            Self::Done => "done",
+        }
+    }
+
+    fn from_source_id(id: &str) -> Self {
+        match id {
+            "template" => Self::Template,
+            "id" => Self::ProviderId,
+            "url" => Self::Url,
+            "headers" => Self::Headers,
+            "auth-method" => Self::AuthMethod,
+            "api-key" => Self::ApiKey,
+            "env-var" => Self::EnvVar,
+            "copilot-auth" => Self::CopilotAuth,
+            "grok-oauth" => Self::GrokOAuth,
+            "codex-oauth" => Self::CodexOAuth,
+            "saving" => Self::Saving,
+            "test-key-choice" => Self::TestKeyChoice,
+            "test-key" => Self::TestKey,
+            "test-skipped" => Self::TestSkipped,
+            "fetching" => Self::Fetching,
+            "done" => Self::Done,
+            _ => panic!("provider wizard descriptor used an unsealed step id `{id}`"),
+        }
     }
 }
 
@@ -787,7 +861,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
         model_context: None,
         steps: vec![
             StepDescriptor {
-                id: "template",
+                id: ProviderWizardStep::Template.source_id(),
                 prompt: "Choose a provider template",
                 help: "The template pre-fills the provider id, URL, and authentication shape.",
                 help_hook: None,
@@ -801,7 +875,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: None,
             },
             StepDescriptor {
-                id: "id",
+                id: ProviderWizardStep::ProviderId.source_id(),
                 prompt: "Provider id",
                 help: "Use lowercase letters, digits, `-`, or `_`.",
                 help_hook: None,
@@ -813,7 +887,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: None,
             },
             StepDescriptor {
-                id: "url",
+                id: ProviderWizardStep::Url.source_id(),
                 prompt: "Base URL",
                 help: "The endpoint must start with http:// or https://.",
                 help_hook: None,
@@ -825,12 +899,12 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_auth_branch),
             },
             action_step(
-                "headers",
+                ProviderWizardStep::Headers.source_id(),
                 "Advanced: edit HTTP headers",
                 "Editing provider headers…",
             ),
             StepDescriptor {
-                id: "auth-method",
+                id: ProviderWizardStep::AuthMethod.source_id(),
                 prompt: "How do you want to provide the API key?",
                 help: "Paste stores the key in Cockpit's credential store; env var keeps a $VAR reference; advanced opens raw headers.",
                 help_hook: None,
@@ -861,7 +935,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_auth_method_branch),
             },
             StepDescriptor {
-                id: "api-key",
+                id: ProviderWizardStep::ApiKey.source_id(),
                 prompt: "Paste API key",
                 help: "Input is masked. Surrounding whitespace is trimmed before storage.",
                 help_hook: None,
@@ -873,7 +947,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(action_to_saving),
             },
             StepDescriptor {
-                id: "env-var",
+                id: ProviderWizardStep::EnvVar.source_id(),
                 prompt: "Environment variable name",
                 help: "The provider header will reference this variable with $VAR.",
                 help_hook: None,
@@ -885,22 +959,22 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(action_to_saving),
             },
             action_step(
-                "copilot-auth",
+                ProviderWizardStep::CopilotAuth.source_id(),
                 "Configure GitHub authentication",
                 "Configuring GitHub authentication…",
             ),
             action_step(
-                "grok-oauth",
+                ProviderWizardStep::GrokOAuth.source_id(),
                 "Sign in to Grok",
                 "Waiting for browser authorization…",
             ),
             action_step(
-                "codex-oauth",
+                ProviderWizardStep::CodexOAuth.source_id(),
                 "Sign in to Codex",
                 "Waiting for device authorization…",
             ),
             StepDescriptor {
-                id: "saving",
+                id: ProviderWizardStep::Saving.source_id(),
                 prompt: "Save provider",
                 help: "The provider is written atomically at this step.",
                 help_hook: None,
@@ -914,7 +988,7 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 branch: Some(provider_after_save_branch),
             },
             StepDescriptor {
-                id: "test-key-choice",
+                id: ProviderWizardStep::TestKeyChoice.source_id(),
                 prompt: "Test key now?",
                 help: "Default: test now. Choose skip-test to save without validation.",
                 help_hook: None,
@@ -938,9 +1012,13 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 write: None,
                 branch: Some(provider_test_choice_branch),
             },
-            action_step("test-key", "Test key", "Testing provider credentials…"),
+            action_step(
+                ProviderWizardStep::TestKey.source_id(),
+                "Test key",
+                "Testing provider credentials…",
+            ),
             StepDescriptor {
-                id: "test-skipped",
+                id: ProviderWizardStep::TestSkipped.source_id(),
                 prompt: "key saved but unverified — it will be tested on your first message.",
                 help: "Continue to finish provider setup.",
                 help_hook: None,
@@ -951,9 +1029,13 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
                 write: None,
                 branch: Some(fetching_to_done),
             },
-            action_step("fetching", "Fetch models", "Fetching /models…"),
+            action_step(
+                ProviderWizardStep::Fetching.source_id(),
+                "Fetch models",
+                "Fetching /models…",
+            ),
             StepDescriptor {
-                id: "done",
+                id: ProviderWizardStep::Done.source_id(),
                 prompt: "Provider setup complete",
                 help: "Continue to return to the provider list.",
                 help_hook: None,

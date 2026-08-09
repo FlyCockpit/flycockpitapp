@@ -4682,19 +4682,7 @@ fn provider_add_pointer_action(
         HeaderName, ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
         WizardStepId, WizardTestChoice,
     };
-    let step = match state.run.current_step_id()? {
-        "template" => WizardStepId::Template,
-        "id" => WizardStepId::ProviderId,
-        "url" => WizardStepId::Url,
-        "auth-method" => WizardStepId::AuthMethod,
-        "api-key" => WizardStepId::ApiKey,
-        "env-var" => WizardStepId::EnvVar,
-        "headers" => WizardStepId::Headers,
-        "test-key-choice" => WizardStepId::TestKeyChoice,
-        "grok-oauth" => WizardStepId::GrokOAuth,
-        "codex-oauth" => WizardStepId::CodexOAuth,
-        _ => return None,
-    };
+    let step = state.run.current_provider_step()?;
     let control = match step {
         WizardStepId::Template => {
             WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
@@ -4732,6 +4720,12 @@ fn provider_add_pointer_action(
         | WizardStepId::Url
         | WizardStepId::ApiKey
         | WizardStepId::EnvVar => WizardControlId::EditText,
+        WizardStepId::CopilotAuth
+        | WizardStepId::Saving
+        | WizardStepId::TestKey
+        | WizardStepId::TestSkipped
+        | WizardStepId::Fetching
+        | WizardStepId::Done => return None,
     };
     Some(SettingsPointerAction::Providers(
         ProvidersAction::WizardControl(step, control),

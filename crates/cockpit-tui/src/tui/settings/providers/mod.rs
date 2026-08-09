@@ -3364,6 +3364,7 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
+        let mut bindings = Vec::new();
 
         // Scope-aware field list: provider scope includes provider-only
         // transport security, while model scope omits provider-only rows and
@@ -3412,10 +3413,12 @@ impl SettingsCx {
             if !overridden {
                 spans.push(Span::styled("  (inherited)".to_string(), muted));
             }
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(spans));
         }
 
         // `[save changes]` row, styled like MCP Add's button.
+        bindings.push((lines.len(), SettingsControlId(fields.len() as u64)));
         lines.push(save_button_line("[save changes]", editor.on_save_row()));
 
         // Read-only model metadata, surfaced (not hidden) for completeness:
@@ -3492,8 +3495,16 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "providers:settings", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:settings",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:settings"),
+        );
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -4206,6 +4217,12 @@ impl SettingsPage for ProvidersPage {
             {
                 state.cursor = index;
             }
+            ProvidersPage::ModelSettings { editor, .. }
+            | ProvidersPage::ProviderSettings { editor, .. }
+                if index <= editor.fields().len() =>
+            {
+                editor.cursor = index;
+            }
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4237,6 +4254,19 @@ impl SettingsPage for ProvidersPage {
                 .cursor
                 .saturating_add_signed(delta)
                 .min(edit_menu_actions(&state.provider_id, &state.entry).len() - 1);
+        } else if region == SettingsScrollRegionId("providers:settings") {
+            match self {
+                ProvidersPage::ModelSettings { editor, .. }
+                | ProvidersPage::ProviderSettings { editor, .. }
+                    if editor.editing.is_none() =>
+                {
+                    editor.cursor = editor
+                        .cursor
+                        .saturating_add_signed(delta)
+                        .min(editor.fields().len());
+                }
+                _ => {}
+            }
         }
         Nav::Stay
     }

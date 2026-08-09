@@ -43,8 +43,8 @@ impl App {
             session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
             terminal_generation: self.terminal_input_generation.unwrap_or_default(),
         };
-        let now = self.monotonic_origin.elapsed();
-        if self.paste_correlations.claim(id, host, now)
+        let now = self.event_loop_monotonic_now;
+        if self.paste_correlations.claim(id, generation, host, now)
             != crate::tui::structured_paste::DedupResult::Claimed
         {
             return None;
@@ -3092,6 +3092,7 @@ impl App {
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),
+                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
                 },
             );
             let terminal_generation = self.terminal_input_generation;
@@ -3125,9 +3126,7 @@ impl App {
             return;
         }
 
-        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data)
-            .filter(|path| crate::tui::image_path_probe::is_generation_scoped(path))
-        {
+        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
             let kind =
                 crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
             if self.async_actions.pending_kind_count(&kind) >= 8 {
@@ -3149,6 +3148,7 @@ impl App {
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
                     original_offset: self.composer.cursor(),
+                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
                 },
             );
             let original = data.clone();
@@ -5113,6 +5113,7 @@ mod paste_routing_tests {
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,
                 original_offset: 0,
+                deadline: std::time::Duration::from_secs(2),
             },
         );
         app.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::editing_for_test(
@@ -5131,6 +5132,34 @@ mod paste_routing_tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn paste_probe_deadline_uses_injected_event_loop_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            .expect("fixture claims a native probe");
+        let request_id = request.paste_correlation_id;
+        app.pending_paste_probes.insert(
+            request_id,
+            crate::tui::app::PendingPasteProbe {
+                request,
+                source_draft_generation: app.draft_generation,
+                owner_fence: None,
+                original_offset: 0,
+                deadline: std::time::Duration::from_secs(2),
+            },
+        );
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(1_999);
+        assert!(!app.expire_pending_paste_probes());
+        assert!(app.pending_paste_probes.contains_key(&request_id));
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(2_000);
+        assert!(app.expire_pending_paste_probes());
+        assert!(!app.pending_paste_probes.contains_key(&request_id));
     }
 
     #[test]

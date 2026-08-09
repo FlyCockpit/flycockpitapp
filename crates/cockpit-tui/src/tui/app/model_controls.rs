@@ -965,6 +965,18 @@ impl App {
         }
     }
 
+    pub(super) fn retry_parked_model_selection_after_reconnect(&mut self) {
+        if self.pending_model_selection.is_some() {
+            return;
+        }
+        let Some(retry) = self.current_model_selection_retry() else {
+            return;
+        };
+        let requested = retry.requested.clone();
+        let trigger = retry.trigger;
+        let _ = self.request_model_selection("model reconnect retry", requested, false, trigger);
+    }
+
     fn show_failed_model_selection(
         &mut self,
         pending: super::PendingModelSelection,

@@ -374,6 +374,7 @@ impl App {
             }
             TurnEvent::DaemonLinkReconnected { active_model_state } => {
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
+                self.retry_parked_model_selection_after_reconnect();
                 if self.daemon_link.take().is_some() {
                     self.daemon_draining = false;
                     self.show_toast("daemon reconnected", ToastKind::Success);
@@ -381,6 +382,7 @@ impl App {
             }
             TurnEvent::DaemonLinkResynced { active_model_state } => {
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
+                self.retry_parked_model_selection_after_reconnect();
             }
             TurnEvent::DaemonLinkTerminal { error } => {
                 self.cancel_model_controls_for_terminal_link();

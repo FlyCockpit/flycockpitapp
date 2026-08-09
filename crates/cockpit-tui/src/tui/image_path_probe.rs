@@ -21,9 +21,6 @@ pub enum ImageProbeError {
 /// not change while read, decode only the closed browser format allowlist, and
 /// return a metadata-free RGBA PNG.
 pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> {
-    if !is_generation_scoped(path) {
-        return Err(ImageProbeError::PasteUnavailable);
-    }
     let mut file = open_no_follow(path)?;
     let before = file
         .metadata()
@@ -99,31 +96,6 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
         .write_to(&mut normalized, ImageFormat::Png)
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
     Ok(normalized.into_inner())
-}
-
-pub(crate) fn is_generation_scoped(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    let components = text
-        .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    let Some(file) = components.last() else {
-        return false;
-    };
-    let Some((stem, extension)) = file.rsplit_once('.') else {
-        return false;
-    };
-    let opaque = |component: &str| {
-        component.len() == 26
-            && component
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
-    };
-    components.len() >= 3
-        && opaque(stem)
-        && matches!(extension, "png" | "jpg" | "jpeg" | "gif" | "webp")
-        && opaque(components[components.len() - 2])
-        && opaque(components[components.len() - 3])
 }
 
 fn browser_format(bytes: &[u8]) -> Result<ImageFormat, ImageProbeError> {

@@ -512,6 +512,24 @@ impl SettingsCx {
         if p.grabbed.is_some() {
             lines.push(Line::default());
             controls.push(None);
+            let can_up = p.cursor > 0;
+            let can_down = p.cursor + 1 < values.len();
+            lines.push(Line::from("[Move up]"));
+            controls.push(Some((
+                SettingsControlId(1000),
+                can_up,
+                (!can_up).then_some("already first"),
+            )));
+            lines.push(Line::from("[Move down]"));
+            controls.push(Some((
+                SettingsControlId(1001),
+                can_down,
+                (!can_down).then_some("already last"),
+            )));
+            lines.push(Line::from("[Save]"));
+            controls.push(Some((SettingsControlId(1002), true, None)));
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((SettingsControlId(1003), true, None)));
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
             controls.push(None);
         }
@@ -551,6 +569,16 @@ impl SettingsPage for StringListPage {
     }
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        if self.grabbed.is_some() {
+            let key = match control.0 {
+                1000 => KeyCode::Up,
+                1001 => KeyCode::Down,
+                1002 => KeyCode::Enter,
+                1003 => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx.handle_string_list_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
         let values = cx.string_list_values(self.kind);
         let index = control.0 as usize;
         if index > values.len() {

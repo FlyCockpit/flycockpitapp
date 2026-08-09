@@ -295,6 +295,17 @@ impl MediaStorageRecovery {
         );
         let (canonical_container, canonical_mime) =
             probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
+        let normalized = if canonical_container == "png" {
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            held.by_ref()
+                .take(10 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
+            Some(normalize_png_image(&bytes)?)
+        } else {
+            None
+        };
         let storage_id = Uuid::now_v7();
         let target = storage_id.to_string();
         self.owned_root
@@ -310,6 +321,59 @@ impl MediaStorageRecovery {
             "quarantine rename identity mismatch"
         );
         drop(reopened);
+        let mut derivative_files = Vec::new();
+        let mut derivative_components = Vec::new();
+        if let Some(normalized) = normalized {
+            let publication = (|| -> Result<()> {
+                for (kind, bytes, width, height) in [
+                    (
+                        "image_model",
+                        normalized.model_png,
+                        normalized.width,
+                        normalized.height,
+                    ),
+                    (
+                        "browser_thumbnail",
+                        normalized.thumbnail_png,
+                        normalized.thumbnail_width,
+                        normalized.thumbnail_height,
+                    ),
+                ] {
+                    let derivative_storage = Uuid::now_v7();
+                    let derivative_name = derivative_storage.to_string();
+                    let mut derivative = self
+                        .owned_root
+                        .create_file_exclusive(&derivative_name)
+                        .map_err(anyhow::Error::new)?;
+                    derivative.write_all(&bytes)?;
+                    derivative.sync_all()?;
+                    let identity = stable_identity_digest(&derivative)?;
+                    let checksum = crate::intel::hex_lower(&Sha256::digest(&bytes));
+                    derivative_files.push(derivative_name);
+                    derivative_components.push((
+                        kind.to_string(),
+                        derivative_storage,
+                        identity,
+                        bytes.len() as u64,
+                        checksum,
+                        width,
+                        height,
+                    ));
+                }
+                self.owned_root.sync().map_err(anyhow::Error::new)?;
+                Ok(())
+            })();
+            if let Err(error) = publication {
+                for derivative in derivative_files {
+                    let _ = self.owned_root.remove_file(&derivative);
+                }
+                self.owned_root
+                    .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
+                    .map_err(anyhow::Error::new)?;
+                self.owned_root.sync().map_err(anyhow::Error::new)?;
+                return Err(error);
+            }
+        }
         let attachment = Uuid::now_v7();
         let component = Uuid::now_v7();
         let media_kind = media_kind_from_text(&snapshot.6)?;
@@ -363,12 +427,17 @@ impl MediaStorageRecovery {
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
         };
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:1,reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let ready = !derivative_components.is_empty();
+        let reservation_id = snapshot.5.clone();
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,width,height) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;availability=next_state;available_generation+=1;}ensure!(availability==MediaAvailability::Ready,"image readiness transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if ready{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
                 .map_err(anyhow::Error::new)?;
             self.owned_root.sync().map_err(anyhow::Error::new)?;
+            for derivative in derivative_files {
+                let _ = self.owned_root.remove_file(&derivative);
+            }
         }
         result.map(|(receipt, _)| receipt)
     }
@@ -1803,7 +1872,15 @@ mod tests {
         let recovery =
             MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
         let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
-        let bytes = b"\x89PNG\r\n\x1a\n";
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+        let bytes: &[u8] = Box::leak(encoded.into_inner().into_boxed_slice());
         let byte_length = bytes.len() as u64;
         let plans = local_path_plans(&policy, byte_length).unwrap();
         let reservation_digest = digest_json(b"media-upload-reservation-v1", &plans).unwrap();
@@ -2211,7 +2288,7 @@ mod tests {
                 upload_generation_before: 2,
                 upload_generation_after: 3,
                 attachment_version: 1,
-                availability_generation: 1,
+                availability_generation: 5,
                 reference_generation: 1
             }
         ));
@@ -2256,6 +2333,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(canonical, ("png".into(), "image/png".into()));
+        let ready_status = db
+            .read(move |conn| {
+                let attachment_id: String =
+                    conn.query_row("SELECT attachment_id FROM media_attachments", [], |row| {
+                        row.get(0)
+                    })?;
+                cockpit_db::Db::media_attachment_status_for_owner_conn(
+                    conn,
+                    &cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                        schema_version: 1,
+                        kind: "getMediaAttachmentStatus".into(),
+                        session_id,
+                        canonical_project_digest: "22".repeat(32),
+                        attachment_id: Uuid::parse_str(&attachment_id)?,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready_status.availability_generation, 5);
+        assert!(ready_status.preview_available);
+        assert!(matches!(
+            ready_status.detail,
+            cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Ready {
+                preview: Some(_),
+                ..
+            }
+        ));
         let counts = db
             .read(|conn| {
                 Ok((
@@ -2280,7 +2386,7 @@ mod tests {
             std::fs::read_dir(temp.path().join("media"))
                 .unwrap()
                 .count(),
-            1
+            3
         );
         let state: String = db
             .read(|conn| {

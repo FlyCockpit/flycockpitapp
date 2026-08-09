@@ -1085,13 +1085,14 @@ impl super::Db {
             MediaAvailability::Normalizing => MediaAttachmentStatusDetailV1::Normalizing,
             MediaAvailability::Ready => {
                 let checksum:Option<String>=conn.query_row("SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind IN ('image_model','audio_model','video_model') AND lifecycle_state='ready' ORDER BY component_kind LIMIT 1",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0)).optional()?;
-                ensure!(
-                    record.media_kind != MediaKind::Image,
-                    "ready image status requires preview dimensions"
-                );
+                let preview = if record.media_kind == MediaKind::Image {
+                    conn.query_row("SELECT c.component_generation,c.sha256,d.width,d.height,c.byte_length FROM media_attachment_components c JOIN media_image_component_dimensions d ON d.component_id=c.component_id WHERE c.attachment_id=?1 AND c.attachment_version=?2 AND c.component_kind='browser_thumbnail' AND c.lifecycle_state='ready'",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|Ok(MediaAttachmentPreviewSummaryV1{generation:row.get::<_,String>(0)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?,checksum:row.get(1)?,width:row.get(2)?,height:row.get(3)?,byte_length:row.get::<_,String>(4)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?.map(Some).context("ready image preview missing")?
+                } else {
+                    None
+                };
                 MediaAttachmentStatusDetailV1::Ready {
                     ready_checksum: checksum.context("ready media component missing")?,
-                    preview: None,
+                    preview,
                 }
             }
             MediaAvailability::ModelDerivativeUnavailable => {

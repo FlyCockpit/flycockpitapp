@@ -1533,7 +1533,15 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
             .as_bytes(),
     ));
     let principal = super::run_invocation::principal_digest(&state.principal);
-    let bytes = b"\x89PNG\r\n\x1a\n";
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut encoded, image::ImageFormat::Png)
+    .unwrap();
+    let bytes: &[u8] = Box::leak(encoded.into_inner().into_boxed_slice());
     let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
     let reservation_digest =
         crate::media_storage::media_upload_reservation_digest(&policy, bytes.len() as u64).unwrap();

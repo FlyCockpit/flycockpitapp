@@ -204,7 +204,7 @@ CREATE TABLE media_attachment_components (
     stable_identity_digest TEXT NOT NULL,
     byte_length           TEXT NOT NULL,
     sha256                TEXT NOT NULL,
-    reservation_id        TEXT NOT NULL UNIQUE,
+    reservation_id        TEXT NOT NULL,
     deletion_evidence_digest TEXT,
     created_at_unix_ms    INTEGER NOT NULL,
     updated_at_unix_ms    INTEGER NOT NULL,
@@ -217,6 +217,12 @@ CREATE TABLE media_attachment_components (
 
 CREATE INDEX idx_media_attachment_components_attachment
     ON media_attachment_components(attachment_id, component_id);
+
+CREATE TABLE media_image_component_dimensions (
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    width INTEGER NOT NULL CHECK(width > 0 AND width <= 8192),
+    height INTEGER NOT NULL CHECK(height > 0 AND height <= 8192)
+);
 
 CREATE TRIGGER media_attachment_component_compatibility_insert
 BEFORE INSERT ON media_attachment_components

@@ -35,7 +35,7 @@ describe("RedisAuthorityObservationStore", () => {
       get: async () => stored,
       eval: async (_script: string, _keys: number, ...args: string[]) => {
         evalCalls.push(args);
-        const incoming = args[1]!;
+        const incoming = args[2]!;
         if (stored) {
           const current = (JSON.parse(stored) as ObservationLease).leaseGeneration;
           if (
@@ -44,7 +44,7 @@ describe("RedisAuthorityObservationStore", () => {
           )
             return 0;
         }
-        stored = args[0]!;
+        stored = args[1]!;
         return 1;
       },
     } satisfies RedisClient;

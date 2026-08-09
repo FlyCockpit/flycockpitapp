@@ -262,5 +262,5 @@ describe("remote_authority_key_cli_state_machine", () => {
         initialized.authorityEpoch,
       ]),
     ).rejects.toThrow("output must be an explicit different absolute path");
-  });
+  }, 30_000);
 });

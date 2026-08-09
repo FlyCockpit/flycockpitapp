@@ -50,7 +50,7 @@ async function write(path: string, ring: AuthorityRingFile) {
   const sourcePaths = ["input", "base", "signing-journal-proof"]
     .map((name) => flags.get(name))
     .filter((value): value is string => value !== undefined)
-    .map(resolve);
+    .map((value) => resolve(value));
   if (!isAbsolute(path) || sourcePaths.includes(resolve(path)))
     throw new Error("output must be an explicit different absolute path");
   try {

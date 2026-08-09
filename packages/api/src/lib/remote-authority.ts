@@ -1,4 +1,11 @@
-import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+import {
+  createECDH,
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  sign,
+  verify,
+} from "node:crypto";
 import { canonicalizeRfc8785, parseCanonicalU64DecimalString } from "@flycockpit/cockpit-protocol";
 
 export const REMOTE_AUTHORITY = {
@@ -158,6 +165,15 @@ function validateKey(raw: unknown, index: number): AuthorityPrivateKey {
   }
   const jwk = { kty: "EC", crv: "P-256", x, y, d };
   try {
+    const ecdh = createECDH("prime256v1");
+    ecdh.setPrivateKey(Buffer.from(d, "base64url"));
+    const derived = ecdh.getPublicKey(undefined, "uncompressed"),
+      supplied = Buffer.concat([
+        Buffer.from([4]),
+        Buffer.from(x, "base64url"),
+        Buffer.from(y, "base64url"),
+      ]);
+    if (!derived.equals(supplied)) throw new Error("private/public mismatch");
     const privateKey = createPrivateKey({ key: jwk, format: "jwk" });
     const publicJwk = createPublicKey(privateKey).export({ format: "jwk" });
     if (publicJwk.x !== key.x || publicJwk.y !== key.y) throw new Error("private/public mismatch");

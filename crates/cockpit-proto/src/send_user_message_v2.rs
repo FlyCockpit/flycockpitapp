@@ -112,9 +112,9 @@ impl CanonicalSendUserMessageV2 {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.request.client_submission_id.is_nil(),
-            "nil client submission id"
+            "invalid nonnil UUID"
         );
-        ensure!(!self.session_id.is_nil(), "nil session id");
+        ensure!(!self.session_id.is_nil(), "invalid nonnil UUID");
         ensure!(
             self.canonical_project_digest.iter().any(|&b| b != 0),
             "zero project digest"
@@ -163,8 +163,8 @@ impl CanonicalSendUserMessageV2 {
         );
         let mut ids = HashSet::with_capacity(self.request.attachments.len());
         for item in &self.request.attachments {
-            ensure!(!item.attachment_id.is_nil(), "nil attachment id");
-            ensure!(item.attachment_version > 0, "zero attachment version");
+            ensure!(!item.attachment_id.is_nil(), "invalid nonnil UUID");
+            ensure!(item.attachment_version > 0, "invalid attachment version");
             ensure!(ids.insert(item.attachment_id), "duplicate attachment id");
         }
         Ok(())

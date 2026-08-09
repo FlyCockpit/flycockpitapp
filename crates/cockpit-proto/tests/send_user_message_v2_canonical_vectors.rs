@@ -58,6 +58,68 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         value.encode().unwrap().len(),
         MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES
     );
+    let oversized_wire = vec![0; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1];
+    assert_eq!(
+        CanonicalSendUserMessageV2::decode(&oversized_wire)
+            .unwrap_err()
+            .to_string(),
+        "FCM2 exceeds maximum size"
+    );
+    let mut one_scalar_over = value.clone();
+    one_scalar_over.request.text.push('😀');
+    assert_eq!(
+        one_scalar_over.encode().unwrap_err().to_string(),
+        "text exceeds byte limit"
+    );
+    let mut scalar_over = value.clone();
+    scalar_over.request.text = "a".repeat(262_145);
+    assert_eq!(
+        scalar_over.encode().unwrap_err().to_string(),
+        "text exceeds scalar limit"
+    );
+    let mut display_over = value.clone();
+    display_over
+        .request
+        .display_text
+        .as_mut()
+        .unwrap()
+        .push('😀');
+    assert_eq!(
+        display_over.encode().unwrap_err().to_string(),
+        "display text exceeds byte limit"
+    );
+    let mut tags_over = value.clone();
+    let repeated_tag = tags_over.request.tag_expansions[0].clone();
+    tags_over.request.tag_expansions.push(repeated_tag);
+    assert_eq!(tags_over.encode().unwrap_err().to_string(), "too many tags");
+    let mut attachments_over = value.clone();
+    let repeated_attachment = attachments_over.request.attachments[0].clone();
+    attachments_over
+        .request
+        .attachments
+        .push(repeated_attachment);
+    assert_eq!(
+        attachments_over.encode().unwrap_err().to_string(),
+        "too many attachments"
+    );
+    let mut tool_over = value.clone();
+    tool_over.request.tag_expansions[0].tool.push('t');
+    assert_eq!(
+        tool_over.encode().unwrap_err().to_string(),
+        "invalid tag tool"
+    );
+    let mut path_over = value.clone();
+    path_over.request.tag_expansions[0].path.push('p');
+    assert_eq!(
+        path_over.encode().unwrap_err().to_string(),
+        "tag field exceeds limit"
+    );
+    let mut skill_over = value;
+    skill_over.request.forced_skill.as_mut().unwrap().push('s');
+    assert_eq!(
+        skill_over.encode().unwrap_err().to_string(),
+        "invalid forced skill"
+    );
     assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1).is_err());
 }
 
@@ -90,10 +152,20 @@ fn send_user_message_v2_shared_malformed_bytes_reject() {
     .unwrap();
     for case in fixture["malformed_fcm2"].as_array().unwrap() {
         let bytes = hex(case["fcm2_hex"].as_str().unwrap());
-        assert!(
-            CanonicalSendUserMessageV2::decode(&bytes).is_err(),
-            "accepted {}",
-            case["name"]
-        );
+        let error = CanonicalSendUserMessageV2::decode(&bytes)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, case["error"], "wrong error for {}", case["name"]);
+    }
+    for case in fixture["mutation_cases"].as_array().unwrap() {
+        let source = case["source"].as_u64().unwrap() as usize;
+        let mut bytes = hex(fixture["vectors"][source]["fcm2_hex"].as_str().unwrap());
+        let offset = case["offset"].as_u64().unwrap() as usize;
+        let replacement = hex(case["bytes_hex"].as_str().unwrap());
+        bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        let error = CanonicalSendUserMessageV2::decode(&bytes)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, case["error"], "wrong error for {}", case["name"]);
     }
 }

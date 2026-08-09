@@ -692,7 +692,7 @@ mod tests {
 
         let frame = serde_json::from_str::<ClientRelayFrame>(&raw).unwrap();
 
-        assert_eq!(frame.v, RELAY_ENVELOPE_VERSION);
+        assert_eq!(frame.v, RELAY_MIN_SUPPORTED_ENVELOPE_VERSION);
         assert_eq!(frame.channel_id, "ch-forward");
         assert_eq!(frame.payload, json!({"kind": "req"}));
     }
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(
             frame,
             IncomingRelayFrame::Unknown {
-                v: RELAY_ENVELOPE_VERSION,
+                v: RELAY_MIN_SUPPORTED_ENVELOPE_VERSION,
                 kind: "mystery".to_string()
             }
         );
@@ -856,6 +856,15 @@ mod tests {
     }
 
     fn parses_any_schema(raw: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return false;
+        };
+        if value
+            .as_object()
+            .is_some_and(|object| object.contains_key("from") || object.contains_key("principal"))
+        {
+            return serde_json::from_value::<StampedClientRelayFrame>(value).is_ok();
+        }
         serde_json::from_str::<ClientRelayFrame>(raw).is_ok()
             || serde_json::from_str::<StampedClientRelayFrame>(raw).is_ok()
             || serde_json::from_str::<DaemonRelayFrame>(raw).is_ok()

@@ -324,8 +324,21 @@ pub struct SubmissionFenceV1 {
     pub accepted_tags: Vec<String>,
     pub pending_git_blocks: Vec<String>,
     pub model: CapturedModel,
+    /// SHA-256 of the exact serialized `UserSubmission` retained for retry.
+    /// It is filled once, immediately before the first transport handoff.
+    pub assembled_wire_digest: Option<[u8; 32]>,
     pub slots: Vec<PasteSlotState>,
     pub lifecycle: FenceLifecycle,
+}
+
+pub fn user_submission_wire_digest(
+    submission: &cockpit_core::engine::message::UserSubmission,
+) -> [u8; 32] {
+    use sha2::Digest as _;
+
+    let bytes = serde_json::to_vec(submission)
+        .expect("UserSubmission contains only infallibly serializable wire fields");
+    sha2::Sha256::digest(bytes).into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +352,34 @@ pub enum FenceLifecycle {
     Accepted,
     IdempotentReplay,
     Conflict,
+}
+
+pub const SESSION_SWITCH_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSwitchReconciliationGate {
+    Ready,
+    Waiting,
+    TimedOut,
+    DaemonLinkLost,
+}
+
+pub fn session_switch_reconciliation_gate(
+    has_possibly_sent: bool,
+    daemon_link_alive: bool,
+    elapsed: Duration,
+) -> SessionSwitchReconciliationGate {
+    if !has_possibly_sent {
+        return SessionSwitchReconciliationGate::Ready;
+    }
+    if !daemon_link_alive {
+        return SessionSwitchReconciliationGate::DaemonLinkLost;
+    }
+    if elapsed < SESSION_SWITCH_RECONCILIATION_TIMEOUT {
+        SessionSwitchReconciliationGate::Waiting
+    } else {
+        SessionSwitchReconciliationGate::TimedOut
+    }
 }
 
 impl SubmissionFenceV1 {
@@ -897,6 +938,7 @@ mod tests {
                 image_capability_generation: 4,
                 supports_images: true,
             },
+            assembled_wire_digest: None,
             slots: vec![PasteSlotState::Pending {
                 request,
                 original_offset: 3,
@@ -929,6 +971,17 @@ mod tests {
         ));
         assert_eq!(fence.captured_composer, "before");
         assert_eq!(fence.lifecycle, FenceLifecycle::Ready);
+
+        let submission = cockpit_core::engine::message::UserSubmission {
+            text: "exact wire".into(),
+            images: vec![vec![1, 2, 3]],
+            ..Default::default()
+        };
+        let digest = user_submission_wire_digest(&submission);
+        assert_eq!(digest, user_submission_wire_digest(&submission.clone()));
+        let mut changed = submission;
+        changed.text.push('!');
+        assert_ne!(digest, user_submission_wire_digest(&changed));
     }
 
     #[test]
@@ -1020,5 +1073,33 @@ mod tests {
         assert!(order.complete(old_session));
         assert!(order.complete(switch));
         assert!(!order.complete(new_session));
+
+        for (elapsed, expected) in [
+            (
+                Duration::from_millis(9_999),
+                SessionSwitchReconciliationGate::Waiting,
+            ),
+            (
+                Duration::from_millis(10_000),
+                SessionSwitchReconciliationGate::TimedOut,
+            ),
+            (
+                Duration::from_millis(10_001),
+                SessionSwitchReconciliationGate::TimedOut,
+            ),
+        ] {
+            assert_eq!(
+                session_switch_reconciliation_gate(true, true, elapsed),
+                expected
+            );
+        }
+        assert_eq!(
+            session_switch_reconciliation_gate(true, false, Duration::ZERO),
+            SessionSwitchReconciliationGate::DaemonLinkLost
+        );
+        assert_eq!(
+            session_switch_reconciliation_gate(false, false, Duration::from_secs(30)),
+            SessionSwitchReconciliationGate::Ready
+        );
     }
 }

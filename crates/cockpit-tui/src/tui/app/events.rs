@@ -748,8 +748,18 @@ impl App {
                 client_submission_ids,
                 preflight_cleaned,
             } => {
+                let reconciled_unconfirmed = client_submission_ids
+                    .iter()
+                    .filter_map(|id| self.delivery_unconfirmed_records.remove(id))
+                    .collect::<Vec<_>>();
                 for id in &client_submission_ids {
                     self.submission_fences.remove(id);
+                }
+                for record in reconciled_unconfirmed {
+                    self.push_plain(format!(
+                        "Delivery confirmed for message {} in session {}.",
+                        record.client_submission_id, record.session_id
+                    ));
                 }
                 self.retained_user_submission_ids
                     .retain(|id| !client_submission_ids.contains(id));

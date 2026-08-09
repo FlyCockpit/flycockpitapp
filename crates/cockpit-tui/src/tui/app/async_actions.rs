@@ -276,6 +276,7 @@ impl App {
                 if label == "session.switch"
                     && let Some((sequence, _)) = self.pending_session_switch_order.take()
                 {
+                    self.pending_session_switch_reconcile_started_at = None;
                     let _ = self.submission_order.complete(sequence);
                     self.dispatch_next_ready_paste_fence();
                 }
@@ -1042,6 +1043,9 @@ impl App {
             return;
         }
         let sequence = fence.fence_sequence;
+        fence.assembled_wire_digest = Some(
+            crate::tui::structured_paste::user_submission_wire_digest(&deferred.submission),
+        );
         fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         let was_busy = self.busy;
         if was_busy && self.has_pending_session_switch_action() {

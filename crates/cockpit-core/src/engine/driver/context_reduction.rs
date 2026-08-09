@@ -42,6 +42,8 @@ pub struct DurableShadowBrief {
     pub snapshot_turns: usize,
     pub snapshot_tail_turns: usize,
     pub brief: String,
+    pub fit_rung: crate::engine::compact_draft::CompactFitRung,
+    pub input_coverage: crate::engine::compact_draft::CompactInputCoverage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +133,8 @@ impl From<&ShadowBriefReady> for DurableShadowBrief {
             snapshot_turns: ready.snapshot_turns,
             snapshot_tail_turns: ready.snapshot_tail_turns,
             brief: ready.brief.clone(),
+            fit_rung: ready.fit_rung,
+            input_coverage: ready.input_coverage,
         }
     }
 }
@@ -143,6 +147,8 @@ impl From<DurableShadowBrief> for ShadowBriefReady {
             snapshot_turns: record.snapshot_turns,
             snapshot_tail_turns: record.snapshot_tail_turns,
             brief: record.brief,
+            fit_rung: record.fit_rung,
+            input_coverage: record.input_coverage,
         }
     }
 }
@@ -712,6 +718,8 @@ impl Driver {
                 snapshot_turns: task.snapshot_turns,
                 snapshot_tail_turns: task.snapshot_tail_turns,
                 brief: success.brief,
+                fit_rung: success.fit_rung,
+                input_coverage: success.input_coverage,
             };
             self.persist_ready_shadow_brief(&ready).await;
             self.shadow_brief = Some(ShadowBriefState::Ready(ready));

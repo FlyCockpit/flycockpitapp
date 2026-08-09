@@ -602,6 +602,8 @@ async fn load_without_row_clears_memory_view() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         brief: "memory only".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     }));
 
     driver.load_compaction_shadow_from_store().await;
@@ -621,6 +623,8 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_turns: 1,
         snapshot_tail_turns: 1,
         brief: "stored brief".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     });
     driver
         .session
@@ -650,6 +654,8 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         brief: "older brief".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     });
     restored
         .session
@@ -682,6 +688,8 @@ async fn stale_loaded_brief_is_discarded() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         brief: "too old".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     });
     driver
         .session
@@ -718,6 +726,8 @@ async fn killswitch_writes_no_rows() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         brief: "delete me".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     });
     driver
         .session
@@ -832,7 +842,9 @@ async fn manual_compact_cancels_shadow() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         cancel,
-        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+        handle: tokio::spawn(std::future::pending::<
+            crate::engine::compact_draft::CompactDraftOutcome,
+        >()),
     }));
 
     driver.do_compact(&tx).await;
@@ -850,7 +862,9 @@ async fn manual_compact_cancels_shadow() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         cancel: ending_cancel,
-        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+        handle: tokio::spawn(std::future::pending::<
+            crate::engine::compact_draft::CompactDraftOutcome,
+        >()),
     }));
     drop(ending_driver);
     assert!(
@@ -874,7 +888,9 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         cancel,
-        handle: tokio::spawn(std::future::pending::<Option<String>>()),
+        handle: tokio::spawn(std::future::pending::<
+            crate::engine::compact_draft::CompactDraftOutcome,
+        >()),
     }));
 
     let prepared = tokio::time::timeout(
@@ -896,6 +912,8 @@ async fn shadow_brief_foreground_preparation_preempts_before_preflight() {
         snapshot_turns: 0,
         snapshot_tail_turns: 0,
         brief: "ready".to_string(),
+        fit_rung: crate::engine::compact_draft::CompactFitRung::Verbatim,
+        input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     }));
     let _ = driver
         .prepare_queued_user_submission(UserSubmission::text("hello again"), &queue, &tx)

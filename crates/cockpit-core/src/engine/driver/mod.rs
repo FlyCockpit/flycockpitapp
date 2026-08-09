@@ -947,6 +947,8 @@ struct ShadowBriefReady {
     snapshot_turns: usize,
     snapshot_tail_turns: usize,
     brief: String,
+    fit_rung: crate::engine::compact_draft::CompactFitRung,
+    input_coverage: crate::engine::compact_draft::CompactInputCoverage,
 }
 
 #[cfg(test)]

@@ -230,6 +230,24 @@ impl App {
         new_session_id: Option<uuid::Uuid>,
         state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
     ) {
+        let mut cancelled_sequences = Vec::new();
+        self.submission_fences
+            .retain(|_, fence| match fence.lifecycle {
+                crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
+                | crate::tui::structured_paste::FenceLifecycle::Ready => {
+                    cancelled_sequences.push(fence.fence_sequence);
+                    false
+                }
+                crate::tui::structured_paste::FenceLifecycle::PossiblySent => {
+                    fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::Reconciling;
+                    true
+                }
+                crate::tui::structured_paste::FenceLifecycle::Reconciling => true,
+                _ => false,
+            });
+        for sequence in cancelled_sequences {
+            self.submission_order.cancel(sequence);
+        }
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;

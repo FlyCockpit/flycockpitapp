@@ -422,6 +422,14 @@ impl SubmissionOrderCoordinator {
             false
         }
     }
+
+    /// Remove an intent that was proven not to have crossed its dispatch
+    /// boundary. This cannot reorder the remaining checked sequence domain.
+    pub fn cancel(&mut self, sequence: u64) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|(candidate, _)| *candidate != sequence);
+        self.queue.len() != before
+    }
 }
 
 impl PasteCorrelationCache {

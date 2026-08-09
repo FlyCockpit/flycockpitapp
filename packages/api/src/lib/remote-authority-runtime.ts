@@ -177,6 +177,7 @@ export class RemoteAuthorityRuntime {
   #recoveryMinimumGeneration?: string;
   #leaseGeneration?: string;
   #drained = false;
+  #tickInFlight?: Promise<RolloutDecision>;
   constructor(private readonly options: AuthorityRuntimeOptions) {
     this.config = parseAuthorityConfig({
       issuer: options.issuer,
@@ -189,11 +190,22 @@ export class RemoteAuthorityRuntime {
   }
   async drain() {
     this.#drained = true;
+    await this.#tickInFlight?.catch(() => undefined);
     this.#fail("replica_draining");
     return this.options.store.drainReplica(this.config.deploymentId, this.options.replicaId);
   }
   async tick() {
     if (this.#drained) return this.#fail("replica_draining");
+    if (this.#tickInFlight) return this.#tickInFlight;
+    const operation = this.#runTick();
+    this.#tickInFlight = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.#tickInFlight === operation) this.#tickInFlight = undefined;
+    }
+  }
+  async #runTick() {
     try {
       return await this.#tick();
     } catch {

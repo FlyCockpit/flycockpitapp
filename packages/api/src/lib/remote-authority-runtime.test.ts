@@ -86,6 +86,8 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     await writeFile(keyFile, JSON.stringify(ring), { mode: 0o600 });
     let now = "100";
     let redisDown = false;
+    let redisGate: Promise<void> | undefined;
+    let drainedCalls = 0;
     let lifecycle: AuthorityLifecycleRecord = {
       revision: "1",
       ringDigest: digest,
@@ -106,7 +108,10 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
         members: [{ replicaId: "replica-a", replicaGeneration: "1", state: "required" }],
       }),
       promoteJoiningReplica: async () => false,
-      drainReplica: async () => true,
+      drainReplica: async () => {
+        drainedCalls++;
+        return true;
+      },
       loadPublicRings: async () => new Map([[digest, publicRing]]),
       observePublicRing: async () => undefined,
       loadHighestFinalizedStatus: async () => finalized,
@@ -131,6 +136,7 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     } satisfies AuthorityRuntimeStore;
     const observations = {
       redisTime: async () => {
+        await redisGate;
         if (redisDown) throw new Error("offline");
         return now;
       },
@@ -160,9 +166,21 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
     expect((await runtime.tick()).ready).toBe(true);
     expect(reservations).toBe(2);
     expect(finalized?.status.statusGeneration).toBe("2");
-    expect(await runtime.drain()).toBe(true);
+    let releaseRedis!: () => void;
+    redisGate = new Promise((resolve) => {
+      releaseRedis = resolve;
+    });
+    const inFlightTick = runtime.tick();
+    await Promise.resolve();
+    const draining = runtime.drain();
+    await Promise.resolve();
+    expect(drainedCalls).toBe(0);
+    releaseRedis();
+    await inFlightTick;
+    expect(await draining).toBe(true);
+    expect(drainedCalls).toBe(1);
     expect(await runtime.tick()).toMatchObject({ ready: false, reason: "replica_draining" });
-    expect(reservations).toBe(2);
+    expect(reservations).toBe(3);
   });
 });
 

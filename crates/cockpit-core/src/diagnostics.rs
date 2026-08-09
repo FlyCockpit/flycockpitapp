@@ -1008,11 +1008,16 @@ fn doctor_integration_input(
     harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
     sandbox_enabled: bool,
 ) -> crate::external_runtime::IntegrationHealthComposeInput {
+    // Resolve mutable layered configuration once at this diagnostics boundary;
+    // the worker receives an invocation-owned, frozen view.
+    let extended = crate::config::extended::load_for_cwd(cwd);
     let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
         harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
         lsp_servers: Vec::new(),
         stdio_mcp: Vec::new(),
         sandbox_enabled: Some(sandbox_enabled),
+        sandbox_mode: extended.sandbox.default_mode,
+        computer_use_mode: crate::config::extended::resolve_computer_use_policy_for_cwd(cwd),
         selected_features: harnesses
             .iter()
             .filter(|(name, config)| {
@@ -1024,7 +1029,6 @@ fn doctor_integration_input(
         container_engine_mode: None,
     };
     // Builtin + configured LSP recipes (command argv only; install stays feature-local).
-    let extended = crate::config::extended::load_for_cwd(cwd);
     for view in crate::daemon::lsp::builtin_server_views(cwd, &extended) {
         if !extended.lsp.servers.contains_key(&view.id)
             || matches!(view.status, crate::daemon::lsp::LspServerStatus::Disabled)
@@ -1117,7 +1121,6 @@ fn dependency_projection_with_deadline_internal(
     let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
     let mut compose = doctor_integration_input(&worker_cwd, &harnesses, sandbox_enabled);
     compose.container_engine_mode = Some(crate::external_runtime::resolved_container_engine_mode(
-        &worker_cwd,
         &compose,
     ));
     let descriptors = crate::external_runtime::invocation_descriptor_roster(&cwd, &compose)

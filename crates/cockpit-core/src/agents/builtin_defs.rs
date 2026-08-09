@@ -204,7 +204,6 @@ fn careful_def() -> AgentDef {
             "session_read",
             "session_lineage_search",
             "todo",
-            "goal",
             "webfetch",
             "websearch",
         ],

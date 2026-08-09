@@ -552,7 +552,7 @@ impl SettingsCx {
                 let oauth = self
                     .load_mcp()
                     .servers
-                    .get(name)
+                    .get(*name)
                     .is_some_and(|server| matches!(server.auth, Auth::Oauth(_)));
                 if oauth {
                     bindings.push((

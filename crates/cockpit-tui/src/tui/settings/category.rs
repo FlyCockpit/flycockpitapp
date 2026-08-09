@@ -3549,8 +3549,12 @@ impl SettingsPage for CategoryPage {
                         return Nav::Stay;
                     };
                     editor.suggest.selected = index;
-                    cx.handle_category_page_key(
+                    let _ = cx.handle_category_page_key(
                         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                        self,
+                    );
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                         self,
                     )
                 }
@@ -3678,24 +3682,27 @@ impl SettingsPage for CategoryPage {
                         return Nav::Stay;
                     }
                     (PickerMode::Custom { .. }, UtilityModelAction::CommitCustom) => {
-                        return cx.handle_category_utility_picker_key(
+                        cx.handle_category_utility_picker_key(
                             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                             self,
                         );
+                        return Nav::Stay;
                     }
                     (PickerMode::Custom { .. }, UtilityModelAction::CancelCustom)
                     | (_, UtilityModelAction::Back) => {
-                        return cx.handle_category_utility_picker_key(
+                        cx.handle_category_utility_picker_key(
                             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                             self,
                         );
+                        return Nav::Stay;
                     }
                     _ => return Nav::Stay,
                 }
                 cx.handle_category_utility_picker_key(
                     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     self,
-                )
+                );
+                Nav::Stay
             }
             _ => Nav::Stay,
         }

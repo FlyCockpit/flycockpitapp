@@ -1361,12 +1361,12 @@ fn category_ctrl_g_focused_prose_setting_round_trips_and_commits() {
     let mut d = fresh_dialog(&tmp);
     open_category_on(&mut d, Category::Behavior, SettingId::CompactPrompt);
     d.handle_key(ctrl('g'));
-    let path = d
+    let (operation_id, path) = d
         .take_pending_category_external_edit()
         .expect("category external edit should be pending");
     assert!(d.take_pending_category_external_edit().is_none());
     std::fs::write(&path, "external compact prompt\n").unwrap();
-    d.finish_category_external_edit(None);
+    d.finish_category_external_edit(operation_id, None);
 
     assert_eq!(
         d.extended.compact_prompt.as_deref(),

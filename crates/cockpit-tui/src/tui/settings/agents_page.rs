@@ -2002,7 +2002,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(super) fn run_pointer_external_edit_exactly_once_regression() {
+    pub(crate) fn run_pointer_external_edit_exactly_once_regression() {
         external_editor_request_is_drained_when_editor_set();
     }
 

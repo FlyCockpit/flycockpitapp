@@ -611,7 +611,7 @@ fn settings_pointer_hover_and_help_are_truthful() {
         dialog.pointer_surface.hover.borrow().is_none(),
         "resize clears hover"
     );
-    dialog.pointer_surface.enabled.set(false);
+    dialog.extended.tui.mouse_capture = false;
     let _ = render_settings_rows(&dialog, 72, 16);
     assert!(
         dialog.pointer_surface.targets.borrow().is_empty(),

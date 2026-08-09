@@ -267,6 +267,7 @@ pub(super) struct RootPage {
 /// current page and stack as boxed trait objects, so pushing and popping
 /// preserves the live concrete page state without adding central render,
 /// title, help, or key-dispatch arms.
+#[allow(private_interfaces)]
 pub(super) trait SettingsPage: Any {
     fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind;
     fn pointer_surface_token(&self) -> u64 {
@@ -400,8 +401,9 @@ fn boxed_page(page: Page) -> PageBox {
 
 #[allow(private_interfaces)]
 #[cfg(test)]
-pub(super) enum TestPageRef<'a> {
+pub(crate) enum TestPageRef<'a> {
     Root { cursor: usize },
+    DefaultModel(&'a DefaultModelPage),
     Agents(&'a AgentsPage),
     Tools(&'a ToolsPage),
     Harnesses(&'a HarnessesPage),
@@ -436,6 +438,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Root { cursor } => write!(f, "Root({cursor})"),
+            Self::DefaultModel(_) => f.write_str("DefaultModel"),
             Self::Agents(_) => f.write_str("Agents"),
             Self::Tools(_) => f.write_str("Tools"),
             Self::Harnesses(_) => f.write_str("Harnesses"),
@@ -1282,7 +1285,9 @@ impl Dialog {
     /// (the page handler can't), then calls [`Self::finish_agent_edit`] to
     /// re-read + re-parse the file. `None` unless the user just chose to
     /// edit an agent and `$EDITOR` is set.
-    pub fn take_pending_agent_edit(&mut self) -> Option<(shell::PointerOperationId, PathBuf)> {
+    pub(crate) fn take_pending_agent_edit(
+        &mut self,
+    ) -> Option<(shell::PointerOperationId, PathBuf)> {
         let Dialog::Settings(s) = self else {
             return None;
         };
@@ -1296,7 +1301,7 @@ impl Dialog {
     /// surface any parse error inline, and refresh the row markers/model.
     /// `editor_error` carries an external-process failure (non-zero exit /
     /// missing binary) so the page reports it and leaves the file as-is.
-    pub fn finish_agent_edit(
+    pub(crate) fn finish_agent_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
         editor_error: Option<String>,
@@ -1313,7 +1318,7 @@ impl Dialog {
     /// Drain a pending category setting `$EDITOR` request. The category page
     /// retains the temp path until [`Self::finish_category_setting_edit`] reads
     /// it back and drops it.
-    pub fn take_pending_category_setting_edit(
+    pub(crate) fn take_pending_category_setting_edit(
         &mut self,
     ) -> Option<(shell::PointerOperationId, PathBuf)> {
         let Dialog::Settings(s) = self else {
@@ -1323,7 +1328,7 @@ impl Dialog {
     }
 
     /// Apply the result of a category-setting `$EDITOR` round trip.
-    pub fn finish_category_setting_edit(
+    pub(crate) fn finish_category_setting_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
         editor_error: Option<String>,
@@ -1635,14 +1640,33 @@ impl Dialog {
 
 impl SettingsDialog {
     #[cfg(test)]
+    pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
+        self.cx
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .map(|target| target.rect)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_test_hover_is_none(&self) -> bool {
+        self.cx.pointer_surface.hover.borrow().is_none()
+    }
+
+    #[cfg(test)]
     fn set_test_page(&mut self, page: Page) {
         self.page = boxed_page(page);
     }
 
     #[cfg(test)]
-    fn test_page(&self) -> TestPageRef<'_> {
+    pub(crate) fn test_page(&self) -> TestPageRef<'_> {
         if let Some(p) = self.page.downcast_ref::<RootPage>() {
             return TestPageRef::Root { cursor: p.cursor };
+        }
+        if let Some(p) = self.page.downcast_ref::<DefaultModelPage>() {
+            return TestPageRef::DefaultModel(p);
         }
         if let Some(p) = self.page.downcast_ref::<AgentsPage>() {
             return TestPageRef::Agents(p);
@@ -2152,8 +2176,8 @@ impl SettingsDialog {
                     .hit(mouse.column, mouse.row)
                     .filter(|target| target.enabled)
                     .map(|target| target.action);
-                *self.pointer_surface.hover.borrow_mut() = match action {
-                    Some(SettingsPointerAction::Page(action)) => Some(action),
+                *self.pointer_surface.hover.borrow_mut() = match &action {
+                    Some(SettingsPointerAction::Page(action)) => Some(action.clone()),
                     _ => None,
                 };
                 self.pointer_surface.header_hover.set(match action {
@@ -2267,7 +2291,12 @@ impl SettingsDialog {
 
     // ── Rendering ────────────────────────────────────────────────────────
 
-    fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
+    pub(crate) fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        links: &mut crate::tui::links::LinkRegistry,
+    ) {
         let surface_token = self.page.pointer_surface_token();
         self.pointer_surface
             .enabled

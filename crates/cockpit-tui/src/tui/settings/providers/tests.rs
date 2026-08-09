@@ -177,7 +177,7 @@ fn render_provider_links(
     links
 }
 
-pub(super) fn run_pointer_provider_regression_matrix() {
+pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_render_boundary_publishes_stable_provider_identity();
     pointer_edit_menu_mapping_is_exhaustive_over_source_actions();
     pointer_row_editor_actions_survive_reordering_by_identity();
@@ -201,6 +201,11 @@ fn pointer_render_boundary_publishes_stable_provider_identity() {
     cfg.providers
         .insert("stable-provider".into(), ProviderEntry::default());
     let (_tmp, mut dialog) = dialog_with_config(cfg);
+    dialog.page = super::super::providers_page(ProvidersPage::List {
+        cursor: 1,
+        status: None,
+        delete_pending: false,
+    });
     let _ = render_provider_rows(&dialog, 90, 24);
     let target = dialog
         .pointer_surface
@@ -3274,7 +3279,7 @@ fn committed_entry_records_template_identity() {
 }
 
 #[test]
-pub(super) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
+pub(crate) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
     struct Spy {
         calls: usize,
     }
@@ -3316,7 +3321,7 @@ pub(super) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
 }
 
 #[test]
-pub(super) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
+pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     let (flow_id, operation_id) = state.begin_copy_for_test();
     state.complete_copy(flow_id, operation_id, Ok("copied".into()));

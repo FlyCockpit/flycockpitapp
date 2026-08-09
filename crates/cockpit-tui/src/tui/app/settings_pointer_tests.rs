@@ -34,9 +34,9 @@ fn render_settings(app: &mut App, width: u16, height: u16) {
 pub(crate) fn run_settings_pointer_z_order_matrix() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut app = App::new(Some(tmp.path()), false);
-    app.dialog = Dialog::Settings(crate::tui::settings::SettingsDialog::open(
+    app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
         tmp.path().join("config.json"),
-    ));
+    )));
     app.mouse_capture = true;
     app.chat_area = Some(Rect::new(0, 0, 80, 24));
     app.chat_scroll_offset = 7;
@@ -45,20 +45,13 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
         unreachable!()
     };
     let target = dialog
-        .pointer_surface
-        .targets
-        .borrow()
-        .iter()
-        .max_by_key(|target| target.rect.y)
-        .cloned()
+        .pointer_test_target_rects()
+        .into_iter()
+        .max_by_key(|rect| rect.y)
         .expect("root target");
 
-    app.keys_overlay = Some(KeysOverlay::open(KeyContext::Chat));
-    app.handle_mouse(mouse(
-        MouseEventKind::ScrollDown,
-        target.rect.x,
-        target.rect.y,
-    ));
+    app.keys_overlay = Some(KeysOverlay::open(KeyContext::Composer));
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, target.x, target.y));
     assert!(
         matches!(&app.dialog, Dialog::Settings(dialog) if matches!(dialog.test_page(), TestPageRef::Root { cursor: 0 }))
     );
@@ -66,15 +59,15 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
     app.keys_overlay = None;
 
     app.context_menu = Some(ContextMenu {
-        preferred_origin: (target.rect.x, target.rect.y),
+        preferred_origin: (target.x, target.y),
         clicked_chat_row: 0,
         cursor: 0,
         items: ContextMenu::build_items(false, false),
     });
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Middle),
-        target.rect.x,
-        target.rect.y,
+        target.x,
+        target.y,
     ));
     assert!(app.context_menu.is_none());
     assert!(
@@ -82,11 +75,7 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
     );
 
     render_settings(&mut app, 80, 24);
-    app.handle_mouse(mouse(
-        MouseEventKind::ScrollDown,
-        target.rect.x,
-        target.rect.y,
-    ));
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, target.x, target.y));
     assert!(
         matches!(&app.dialog, Dialog::Settings(dialog) if matches!(dialog.test_page(), TestPageRef::Root { cursor: 3 }))
     );
@@ -103,8 +92,8 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
 
     render_settings(&mut app, 80, 24);
     app.link_registry
-        .register(target.rect, "https://example.test".into(), "fixture".into());
-    app.handle_mouse(mouse(MouseEventKind::Moved, target.rect.x, target.rect.y));
+        .register(target, "https://example.test", "fixture");
+    app.handle_mouse(mouse(MouseEventKind::Moved, target.x, target.y));
     assert!(
         app.link_registry.hovered().is_some(),
         "link wins hover z-order"
@@ -112,7 +101,7 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
     let Dialog::Settings(dialog) = &app.dialog else {
         unreachable!()
     };
-    assert!(dialog.pointer_surface.hover.borrow().is_none());
+    assert!(dialog.pointer_test_hover_is_none());
 }
 
 #[test]

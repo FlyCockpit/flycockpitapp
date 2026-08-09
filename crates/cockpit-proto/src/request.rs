@@ -1496,6 +1496,211 @@ pub enum AttachmentPurpose {
     TerminalPasteImage { terminal_id: Uuid },
 }
 
+/// Cross-transport retry semantics assigned to every known request tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperationClass {
+    ReadOnly,
+    TransactionalMutation,
+    IdempotentAdapterMutation,
+    NonrepeatableMutation,
+}
+
+/// Durable evidence required before an adapter operation can report a
+/// terminal outcome. This is independent of authorization/audit mutability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAdapterRecoveryStrategy {
+    DomainTransaction,
+    DurableDispatchKey,
+    DurableDesiredState,
+    StagedFilesystemCommit,
+}
+
+impl Request {
+    pub fn remote_operation_class(&self) -> Option<RemoteOperationClass> {
+        remote_operation_class_for_tag(self.wire_tag())
+    }
+}
+
+pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass> {
+    use RemoteOperationClass::{
+        IdempotentAdapterMutation, NonrepeatableMutation, ReadOnly, TransactionalMutation,
+    };
+    Some(match tag {
+        "send_user_message"
+        | "remove_queued_user_message"
+        | "remove_newest_queued_user_message"
+        | "remove_editable_queued_user_messages"
+        | "resume_paused_work"
+        | "cancel_paused_work"
+        | "repair_resume"
+        | "set_goal_status"
+        | "clear_goal"
+        | "pin_message"
+        | "unpin_message"
+        | "toggle_pinned_message"
+        | "delete_sealed_value"
+        | "create_project_note"
+        | "set_project_note_content"
+        | "rename_project_note"
+        | "delete_project_note"
+        | "upsert_assistant"
+        | "create_assistant_session"
+        | "import_session_archive"
+        | "archive_session"
+        | "unarchive_session"
+        | "fork_session"
+        | "discard_session"
+        | "btw_create"
+        | "btw_end"
+        | "rename_session"
+        | "share_session"
+        | "record_session_note"
+        | "delete_session"
+        | "create_scheduled_job"
+        | "delete_scheduled_job"
+        | "set_scheduled_job_enabled"
+        | "record_usage"
+        | "cancel_run_invocation"
+        | "create_goal"
+        | "set_workspace_trust"
+        | "mark_app_flag_seen"
+        | "resolve_assistant_session" => TransactionalMutation,
+
+        "attach"
+        | "begin_attachment_upload"
+        | "upload_attachment_chunk"
+        | "finish_attachment_upload"
+        | "cancel_attachment_upload"
+        | "auto_title"
+        | "curator"
+        | "fs_write"
+        | "fs_create_dir"
+        | "fs_rename"
+        | "fs_delete"
+        | "open_terminal"
+        | "close_terminal"
+        | "lsp_control"
+        | "resolve_interrupt"
+        | "promote_resource"
+        | "run_scheduled_job"
+        | "cancel_schedule"
+        | "set_model_favorite"
+        | "set_default_model"
+        | "set_active_model"
+        | "set_agent"
+        | "set_llm_mode"
+        | "set_session_llm_mode"
+        | "set_tool_surface_override"
+        | "set_goal_settings_override"
+        | "set_approval_mode"
+        | "set_delegation_recursion"
+        | "set_sandbox"
+        | "set_sandbox_escalation"
+        | "set_preflight"
+        | "set_longcache"
+        | "set_redaction"
+        | "set_tandem_models"
+        | "set_caffeinate"
+        | "store_flycockpit_credential"
+        | "clear_flycockpit_credential"
+        | "refresh_env"
+        | "refresh_config" => IdempotentAdapterMutation,
+
+        "steer_delegation"
+        | "cancel_turn"
+        | "terminal_input"
+        | "terminal_resize"
+        | "prune"
+        | "compact"
+        | "pin"
+        | "stop_daemon"
+        | "restart_if_idle"
+        | "write_bulk_transfer_chunk" => NonrepeatableMutation,
+
+        "subagent_transcript"
+        | "get_run_invocation_status"
+        | "goal_status"
+        | "count_pinned_messages"
+        | "list_pinned_message_seqs"
+        | "list_pinned_messages_with_text"
+        | "pinned_message_state"
+        | "list_sealed_values"
+        | "list_project_notes"
+        | "get_startup_disclosures"
+        | "get_app_flag"
+        | "list_assistants"
+        | "export_session_data"
+        | "read_bulk_transfer_chunk"
+        | "fs_list"
+        | "fs_stat"
+        | "fs_read"
+        | "git_status"
+        | "git_diff_file"
+        | "attach_terminal"
+        | "list_sessions"
+        | "read_session_messages"
+        | "read_client_submission_receipt"
+        | "read_history_page"
+        | "read_subagent_history_page"
+        | "session_live_status"
+        | "get_inventory_bundle"
+        | "resource_snapshot"
+        | "list_scheduled_jobs"
+        | "daemon_status"
+        | "get_usage_counts"
+        | "stats_rollup"
+        | "guidance_estimate" => ReadOnly,
+        _ => return None,
+    })
+}
+
+pub fn remote_adapter_recovery_strategy_for_tag(
+    tag: &str,
+) -> Option<RemoteAdapterRecoveryStrategy> {
+    use RemoteAdapterRecoveryStrategy::{
+        DomainTransaction, DurableDesiredState, DurableDispatchKey, StagedFilesystemCommit,
+    };
+    match tag {
+        "attach"
+        | "begin_attachment_upload"
+        | "upload_attachment_chunk"
+        | "finish_attachment_upload"
+        | "cancel_attachment_upload" => Some(DomainTransaction),
+        "auto_title" | "curator" | "open_terminal" | "close_terminal" | "lsp_control"
+        | "resolve_interrupt" | "promote_resource" | "run_scheduled_job" | "cancel_schedule" => {
+            Some(DurableDispatchKey)
+        }
+        "set_active_model"
+        | "set_agent"
+        | "set_llm_mode"
+        | "set_session_llm_mode"
+        | "set_tool_surface_override"
+        | "set_goal_settings_override"
+        | "set_approval_mode"
+        | "set_delegation_recursion"
+        | "set_sandbox"
+        | "set_sandbox_escalation"
+        | "set_preflight"
+        | "set_longcache"
+        | "set_redaction"
+        | "set_tandem_models"
+        | "set_caffeinate"
+        | "refresh_env"
+        | "refresh_config" => Some(DurableDesiredState),
+        "fs_write"
+        | "fs_create_dir"
+        | "fs_rename"
+        | "fs_delete"
+        | "set_model_favorite"
+        | "set_default_model"
+        | "store_flycockpit_credential"
+        | "clear_flycockpit_credential" => Some(StagedFilesystemCommit),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1686,6 +1891,60 @@ mod tests {
         (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
             vec![$($tag),+]
         }};
+    }
+
+    macro_rules! remote_operation_rows {
+        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+            vec![$(($tag, $mutating)),+]
+        }};
+    }
+
+    #[test]
+    fn remote_operation_classification_is_exhaustive() {
+        use std::collections::BTreeSet;
+
+        let rows = crate::command!(remote_operation_rows);
+        let unique: BTreeSet<_> = rows.iter().map(|(tag, _)| *tag).collect();
+        assert_eq!(unique.len(), rows.len(), "request tags must be unique");
+        for (tag, audit_mutating) in rows {
+            let class = remote_operation_class_for_tag(tag);
+            if tag == "unknown" {
+                assert_eq!(class, None, "unknown must be rejected before dispatch");
+                continue;
+            }
+            let class = class.unwrap_or_else(|| panic!("{tag} has no remote operation class"));
+            if audit_mutating && tag != "list_project_notes" {
+                assert_ne!(
+                    class,
+                    RemoteOperationClass::ReadOnly,
+                    "audit-mutating request {tag} needs an explicit remote mutation class"
+                );
+            }
+            match class {
+                RemoteOperationClass::IdempotentAdapterMutation => assert!(
+                    remote_adapter_recovery_strategy_for_tag(tag).is_some(),
+                    "adapter mutation {tag} needs a recovery strategy"
+                ),
+                _ => assert_eq!(
+                    remote_adapter_recovery_strategy_for_tag(tag),
+                    None,
+                    "non-adapter {tag} must not acquire an adapter strategy"
+                ),
+            }
+        }
+        assert_eq!(
+            remote_operation_class_for_tag("terminal_input"),
+            Some(RemoteOperationClass::NonrepeatableMutation),
+            "remote consequence is independent of the audit mutating bit"
+        );
+        assert_eq!(
+            remote_operation_class_for_tag("write_bulk_transfer_chunk"),
+            Some(RemoteOperationClass::NonrepeatableMutation)
+        );
+        assert_eq!(
+            remote_adapter_recovery_strategy_for_tag("set_default_model"),
+            Some(RemoteAdapterRecoveryStrategy::StagedFilesystemCommit)
+        );
     }
 
     #[test]

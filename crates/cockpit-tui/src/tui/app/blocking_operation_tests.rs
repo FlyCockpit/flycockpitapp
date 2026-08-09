@@ -59,6 +59,7 @@ fn blocking_operation_manifest_is_complete() {
 #[tokio::test]
 async fn no_owned_blocking_command_runs_on_event_loop() {
     let mut app = App::new(None, false);
+    app.daemon_prompt = None;
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.launch.session_id = Some(uuid::Uuid::nil());
     app.launch.session_short_id = Some("test".to_string());
@@ -80,9 +81,11 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
 
-    app.handle_key_insert(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Char('x'),
-        crossterm::event::KeyModifiers::NONE,
+    app.handle_terminal_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
     ));
     app.handle_terminal_event(crossterm::event::Event::Mouse(
         crossterm::event::MouseEvent {
@@ -100,7 +103,7 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     assert_eq!(app.composer.text(), "x");
     assert!(matches!(
         app.history.last(),
-        Some(HistoryEntry::Plain { line }) if line == "daemon reduced"
+        Some(HistoryEntry::Plain { line }) if line == "⚠ daemon reduced"
     ));
     assert_eq!(app.async_actions.pending_count(), 6);
     tokio::task::yield_now().await;
@@ -117,6 +120,7 @@ fn owned_barrier(kind: BlockingOperationKind) -> std::sync::Arc<std::sync::Barri
 async fn curator_command_is_async_with_pending_line() {
     let barrier = owned_barrier(BlockingOperationKind::CuratorMaintenance);
     let mut app = App::new(None, false);
+    app.daemon_prompt = None;
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
     app.handle_curator_command("status");
     assert!(
@@ -192,12 +196,15 @@ async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
 async fn queue_edit_does_not_block_key_handler() {
     let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
     let mut app = App::new(None, false);
+    app.daemon_prompt = None;
     app.queue
         .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
-    app.handle_key_insert(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Char('x'),
-        crossterm::event::KeyModifiers::NONE,
+    app.handle_terminal_event(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
     ));
     assert_eq!(app.composer.text(), "x");
     assert_eq!(app.async_actions.pending_count(), 1);

@@ -302,6 +302,9 @@ pub(super) enum ActionFixtureKey {
 pub(super) enum ExpectedReducerOutcome {
     Enabled,
     Disabled,
+    /// The same semantic action is enabled only when its live row position
+    /// permits it (for example move-up/move-down at list boundaries).
+    Contextual,
     NoPointerControl,
 }
 
@@ -516,6 +519,9 @@ impl ActionFixtureKey {
                 | ProvidersFixture::WizardFetchingNoControl
                 | ProvidersFixture::WizardDoneNoControl,
             ) => ExpectedReducerOutcome::NoPointerControl,
+            Self::List(ListFixture::MoveUp | ListFixture::MoveDown) => {
+                ExpectedReducerOutcome::Contextual
+            }
             Self::Root(_)
             | Self::Category(_)
             | Self::Agents(_)

@@ -698,15 +698,50 @@ fn pointer_redact_pattern_rows_dispatch_from_fresh_sources() {
                     dialog.test_page(),
                     TestPageRef::RedactPatterns(page) if page.grabbed.is_some()
                 ));
-                click_settings_action(
-                    &mut dialog,
-                    &SettingsPointerAction::List(ListAction::Cancel),
-                );
-                assert!(matches!(
-                    dialog.test_page(),
-                    TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
-                ));
-                assert_eq!(dialog.extended.redact.dotenv_patterns, expected_values);
+                let _ = render_settings_rows(&dialog, 100, 40);
+                let grabbed_actions = dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .filter_map(|target| match (&target.action, target.enabled) {
+                        (
+                            shell::SettingsPointerAction::Page(
+                                action @ SettingsPointerAction::List(
+                                    ListAction::MoveUp(_)
+                                    | ListAction::MoveDown(_)
+                                    | ListAction::Save
+                                    | ListAction::Cancel,
+                                ),
+                            ),
+                            true,
+                        ) => Some(action.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(grabbed_actions.len(), 3);
+                for grabbed_action in grabbed_actions {
+                    let nested_tmp = TempDir::new().unwrap();
+                    let mut nested = redact_patterns_pointer_fixture(&nested_tmp);
+                    click_settings_action(&mut nested, &action);
+                    click_settings_action(&mut nested, &grabbed_action);
+                    match grabbed_action {
+                        SettingsPointerAction::List(
+                            ListAction::MoveUp(_) | ListAction::MoveDown(_),
+                        ) => assert_ne!(
+                            nested.extended.redact.dotenv_patterns, expected_values,
+                            "enabled move changes row order"
+                        ),
+                        SettingsPointerAction::List(ListAction::Save | ListAction::Cancel) => {
+                            assert!(matches!(
+                                nested.test_page(),
+                                TestPageRef::RedactPatterns(page) if page.grabbed.is_none()
+                            ));
+                            assert_eq!(nested.extended.redact.dotenv_patterns, expected_values);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
             }
             SettingsPointerAction::List(ListAction::Delete(_)) => {
                 click_settings_action(&mut dialog, &action);

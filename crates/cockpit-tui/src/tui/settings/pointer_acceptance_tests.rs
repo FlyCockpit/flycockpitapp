@@ -45,11 +45,12 @@ pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
 }
 
 pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bool) {
-    assert_eq!(
-        super::pointer_action_fixtures::key_for(action).expected()
-            == super::pointer_action_fixtures::ExpectedReducerOutcome::Enabled,
-        enabled,
-        "typed source fixture disagrees with rendered reducer outcome"
+    use super::pointer_action_fixtures::ExpectedReducerOutcome;
+    let expected = super::pointer_action_fixtures::key_for(action).expected();
+    assert!(
+        matches!(expected, ExpectedReducerOutcome::Contextual)
+            || (matches!(expected, ExpectedReducerOutcome::Enabled) == enabled),
+        "typed source fixture disagrees with rendered reducer outcome: action={action:?}, expected={expected:?}, enabled={enabled}"
     );
     ACTION_COVERAGE.with(|coverage| {
         let mut coverage = coverage.borrow_mut();
@@ -508,6 +509,20 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
                     assert!(
                         !coverage.2.contains(&key),
                         "disabled source fixture reached reducer: {key:?}"
+                    );
+                }
+                ExpectedReducerOutcome::Contextual => {
+                    assert!(
+                        coverage.0.contains(&key),
+                        "contextual source fixture never rendered enabled: {key:?}"
+                    );
+                    assert!(
+                        coverage.1.contains(&key),
+                        "contextual source fixture never rendered disabled: {key:?}"
+                    );
+                    assert!(
+                        coverage.2.contains(&key),
+                        "enabled contextual source fixture did not reach reducer: {key:?}"
                     );
                 }
                 ExpectedReducerOutcome::NoPointerControl => {

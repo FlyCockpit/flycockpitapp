@@ -5100,7 +5100,7 @@ mod paste_routing_tests {
         let stale_native_id = stale_native.paste_correlation_id;
         app.pending_paste_probes.insert(
             stale_native_id,
-            super::PendingPasteProbe {
+            crate::tui::app::PendingPasteProbe {
                 request: stale_native,
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,

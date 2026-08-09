@@ -340,12 +340,27 @@ pub(super) async fn begin_attachment_upload_admitted(
     use cockpit_config::config::media_budget::{
         MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
     };
-    let config_root = state
-        .attached
-        .as_ref()
-        .map(|attached| attached.handle.project_root.as_path())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let (_, extended) = ctx.config_source.load(config_root).map_err(internal)?;
+    let (_, extended) = if let Some(attached) = state.attached.as_ref() {
+        ctx.config_source
+            .load_effective_for_daemon(&attached.handle.project_root, &attached.handle.trust_policy)
+            .map_err(internal)?
+    } else {
+        // Terminal uploads can exist before session attachment. They have no
+        // workspace trust decision, so resolve only trusted/global layers and
+        // explicitly ignore any project config beneath the daemon cwd.
+        let root = std::env::current_dir().map_err(internal)?;
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::TrustRoot {
+                opened_path: root.clone(),
+                root: root.clone(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            },
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        };
+        ctx.config_source
+            .load_effective_for_daemon(&root, &policy)
+            .map_err(internal)?
+    };
     let policy = extended.media_resources;
     let plans = [
         (MediaDimension::QueuedOperationsGlobal, 1),
@@ -550,25 +565,14 @@ pub(super) async fn finish_attachment_upload_admitted(
         wall_ms,
         decode_worker: None,
     };
-    let config_root = state
-        .attached
-        .as_ref()
-        .map(|attached| attached.handle.project_root.as_path())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let (_, extended) = ctx.config_source.load(config_root).map_err(internal)?;
-    let execution_plan = extended
-        .media_resources
-        .evaluate(
-            cockpit_config::config::media_budget::MediaEvaluationRequest {
-                dimension: cockpit_config::config::media_budget::MediaDimension::LocalCpuJobsGlobal,
-                requested: Some(1),
-                current_scope: 0,
-                profile: Some(cockpit_config::config::media_budget::PASTE_IMAGE_PROFILE),
-                adapter_limit: None,
-                request_limit: None,
-            },
+    let execution_plan = ctx
+        .media_ledger
+        .evaluated_plan(
+            &receipt.reservation_id,
+            cockpit_config::config::media_budget::MediaDimension::LocalCpuJobsGlobal,
         )
-        .map_err(|_| bad_request("attachment exceeds media execution policy"))?;
+        .await
+        .map_err(internal)?;
     if let Err(error) = ctx
         .media_ledger
         .mark_execution_ready(&receipt.reservation_id, wall_ms)
@@ -992,6 +996,30 @@ mod decode_cleanup_tests {
         fn now_ms(&self) -> u64 {
             0
         }
+    }
+
+    #[test]
+    fn attachment_policy_resolution_is_trust_scoped_and_promotion_is_snapshot_bound() {
+        let source = include_str!("attachments.rs");
+        let begin = source
+            .split("pub(super) async fn begin_attachment_upload_admitted")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(super) fn upload_attachment_chunk").next())
+            .expect("attachment admission function");
+        assert!(begin.contains("load_effective_for_daemon"));
+        assert!(begin.contains("handle.trust_policy"));
+        assert!(begin.contains("WorkspaceTrustMode::IgnoreConfig"));
+
+        let finish = source
+            .split("pub(super) async fn finish_attachment_upload_admitted")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("#[cfg(test)]\npub(super) fn consume_image_refs")
+                    .next()
+            })
+            .expect("attachment finish function");
+        assert!(finish.contains("evaluated_plan"));
+        assert!(!finish.contains("config_source"));
     }
 
     #[tokio::test]

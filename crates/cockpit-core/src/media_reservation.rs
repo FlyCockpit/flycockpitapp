@@ -269,6 +269,29 @@ impl MediaReservationLedger {
         self.clock.now_ms()
     }
 
+    /// Return the immutable evaluated plan recorded when this reservation was
+    /// admitted. Execution must use this fact rather than re-reading mutable
+    /// configuration between admission and promotion.
+    pub async fn evaluated_plan(
+        &self,
+        reservation_id: &str,
+        dimension: MediaDimension,
+    ) -> Result<MediaReservationPlan, LedgerError> {
+        let id = reservation_id.to_owned();
+        let dimension = dimension_name(dimension);
+        self.db
+            .read(move |conn| {
+                let json: String = conn.query_row(
+                    "SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",
+                    params![id, dimension],
+                    |row| row.get(0),
+                )?;
+                Ok(serde_json::from_str(&json)?)
+            })
+            .await
+            .map_err(LedgerError::Storage)
+    }
+
     /// Startup admission remains closed while any non-terminal reservation
     /// still requires owner-specific recovery or external reconciliation.
     pub async fn recovery_complete(&self) -> Result<bool, LedgerError> {
@@ -1874,6 +1897,31 @@ mod tests {
         ));
         let charged=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND dimension='queued_operations_global'",[],|r|row_u64(r,0))?)).await.unwrap();
         assert_eq!(charged, 1);
+    }
+
+    #[tokio::test]
+    async fn evaluated_plan_is_the_immutable_admission_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db, Arc::new(Clock(AtomicU64::new(0))));
+        let cpu_plan = plan(MediaDimension::LocalCpuJobsGlobal, 1, Some(1));
+        let receipt = ledger
+            .reserve(request(
+                "durable-plan",
+                vec![
+                    cpu_plan.clone(),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .evaluated_plan(&receipt.reservation_id, MediaDimension::LocalCpuJobsGlobal,)
+                .await
+                .unwrap(),
+            cpu_plan
+        );
     }
 
     #[tokio::test]

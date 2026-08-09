@@ -2049,24 +2049,6 @@ fn load_goal(conn: &rusqlite::Connection, session_id: Uuid, id: Uuid) -> Result<
     .context("loading session goal")
 }
 
-fn load_goal_optional(
-    conn: &rusqlite::Connection,
-    session_id: Uuid,
-    id: Uuid,
-) -> Result<Option<SessionGoal>> {
-    conn.query_row(
-        &format!(
-            "SELECT {GOAL_SELECT}
-         FROM session_goals
-         WHERE session_id = ?1 AND id = ?2"
-        ),
-        params![session_id.to_string(), id.to_string()],
-        decode_goal,
-    )
-    .optional()
-    .context("loading optional session goal")
-}
-
 fn decode_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionGoal> {
     let id: String = row.get(0)?;
     let session_id: String = row.get(1)?;

@@ -140,23 +140,14 @@ fn rendered_surface() -> SettingsPointerSurface {
 #[test]
 fn settings_pointer_contract_covers_all_current_pages() {
     super::tests::run_pointer_dialog_regression_matrix();
-    let surfaces = [
-        SettingsPointerSurfaceKind::Root,
-        SettingsPointerSurfaceKind::DefaultModel,
-        SettingsPointerSurfaceKind::Agents,
-        SettingsPointerSurfaceKind::Tools,
-        SettingsPointerSurfaceKind::Harnesses,
-        SettingsPointerSurfaceKind::Providers,
-        SettingsPointerSurfaceKind::Category,
-        SettingsPointerSurfaceKind::Instructions,
-        SettingsPointerSurfaceKind::RedactPatterns,
-        SettingsPointerSurfaceKind::StringList,
-        SettingsPointerSurfaceKind::Skills,
-        SettingsPointerSurfaceKind::Mcp,
-        SettingsPointerSurfaceKind::Lsp,
-        SettingsPointerSurfaceKind::Dependencies,
-    ];
-    assert_eq!(surfaces.len(), 13);
+    let surfaces = SettingsPointerSurfaceKind::ALL
+        .into_iter()
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        surfaces.len(),
+        SettingsPointerSurfaceKind::ALL.len(),
+        "sealed pointer-surface inventory contains duplicates"
+    );
 }
 
 #[test]
@@ -461,22 +452,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             !coverage.0.is_empty(),
             "real rendered matrix collected no actions"
         );
-        for surface in [
-            SettingsPointerSurfaceKind::Root,
-            SettingsPointerSurfaceKind::DefaultModel,
-            SettingsPointerSurfaceKind::Agents,
-            SettingsPointerSurfaceKind::Tools,
-            SettingsPointerSurfaceKind::Harnesses,
-            SettingsPointerSurfaceKind::Providers,
-            SettingsPointerSurfaceKind::Category,
-            SettingsPointerSurfaceKind::Instructions,
-            SettingsPointerSurfaceKind::RedactPatterns,
-            SettingsPointerSurfaceKind::StringList,
-            SettingsPointerSurfaceKind::Skills,
-            SettingsPointerSurfaceKind::Mcp,
-            SettingsPointerSurfaceKind::Lsp,
-            SettingsPointerSurfaceKind::Dependencies,
-        ] {
+        for surface in SettingsPointerSurfaceKind::ALL {
             assert!(
                 coverage.3.contains(&surface),
                 "source settings surface {surface:?} was not rendered"

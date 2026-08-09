@@ -175,6 +175,25 @@ pub(super) enum SettingsPointerSurfaceKind {
     Dependencies,
 }
 
+impl SettingsPointerSurfaceKind {
+    pub(super) const ALL: [Self; 14] = [
+        Self::Root,
+        Self::DefaultModel,
+        Self::Agents,
+        Self::Tools,
+        Self::Harnesses,
+        Self::Providers,
+        Self::Category,
+        Self::Instructions,
+        Self::RedactPatterns,
+        Self::StringList,
+        Self::Skills,
+        Self::Mcp,
+        Self::Lsp,
+        Self::Dependencies,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsLocalBack {
     NoLocalBack,

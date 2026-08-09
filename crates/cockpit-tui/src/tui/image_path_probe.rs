@@ -70,6 +70,16 @@ pub fn normalize_private_image(path: &Path) -> Result<Vec<u8>, ImageProbeError> 
     let mut decoder = reader
         .into_decoder()
         .map_err(|_| ImageProbeError::PasteUnavailable)?;
+    let (encoded_width, encoded_height) = decoder.dimensions();
+    let encoded_pixels = u64::from(encoded_width)
+        .checked_mul(u64::from(encoded_height))
+        .ok_or(ImageProbeError::PasteUnavailable)?;
+    if encoded_width > MAX_DIMENSION
+        || encoded_height > MAX_DIMENSION
+        || encoded_pixels > MAX_PIXELS
+    {
+        return Err(ImageProbeError::PasteUnavailable);
+    }
     let orientation = decoder
         .orientation()
         .map_err(|_| ImageProbeError::PasteUnavailable)?;

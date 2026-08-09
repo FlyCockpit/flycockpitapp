@@ -949,6 +949,27 @@ impl App {
         resolved_images.sort_by_key(|(offset, _)| *offset);
         let positional_wire = deferred.submission.text == fence.captured_composer;
         let positional_display = deferred.display == fence.captured_composer;
+        if !fence.model.supports_images {
+            for (index, (offset, _)) in resolved_images.iter().enumerate().rev() {
+                let note = format!(
+                    "[Pasted image #{}: not sent — current model has no image support]",
+                    index + 1
+                );
+                if positional_wire {
+                    let offset = floor_char_boundary(&deferred.submission.text, *offset);
+                    deferred.submission.text.insert_str(offset, &note);
+                } else {
+                    deferred.submission.text.push_str(&note);
+                }
+                if positional_display {
+                    let offset = floor_char_boundary(&deferred.display, *offset);
+                    deferred.display.insert_str(offset, "[image]");
+                } else {
+                    deferred.display.push_str("[image]");
+                }
+            }
+            resolved_images.clear();
+        }
         if positional_wire {
             let original_wire = deferred.submission.text.clone();
             for (inserted, (offset, png)) in resolved_images.iter().enumerate() {
@@ -1008,6 +1029,28 @@ impl App {
         let sequence = fence.fence_sequence;
         fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         let was_busy = self.busy;
+        if was_busy && self.has_pending_session_switch_action() {
+            let item = super::input::optimistic_queue_item_with_id(
+                fence_id,
+                deferred.submission.text.clone(),
+                Some(deferred.display),
+            );
+            self.queue.push(item.clone());
+            self.queue_pending_session_switch_submission_with_optimistic_state(
+                deferred.submission,
+                "engine",
+                false,
+                OptimisticSubmissionState {
+                    id: fence_id,
+                    tag_entries: 0,
+                    history: Vec::new(),
+                    queue_item: Some(item),
+                },
+            );
+            let _ = self.submission_order.complete(sequence);
+            self.dispatch_next_ready_paste_fence();
+            return;
+        }
         if was_busy {
             self.queue.push(super::input::optimistic_queue_item_with_id(
                 fence_id,

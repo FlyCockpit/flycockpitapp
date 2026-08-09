@@ -68,12 +68,18 @@ impl App {
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT));
         if self.composer.text() != composer_before && !clears_or_recalls_without_editing {
             self.last_composer_edit_at = Some(Instant::now());
+            let cancelled_path_probe = self.pending_paste_probes.values().any(|probe| {
+                probe.owner_fence.is_none()
+                    && probe.source_draft_generation == self.draft_generation
+                    && probe.request.source
+                        == crate::tui::structured_paste::PasteSource::BracketedPty
+            });
             let before = self.pending_paste_probes.len();
             let draft_generation = self.draft_generation;
             self.pending_paste_probes.retain(|_, probe| {
                 probe.owner_fence.is_some() || probe.source_draft_generation != draft_generation
             });
-            if self.pending_paste_probes.len() != before {
+            if self.pending_paste_probes.len() != before && cancelled_path_probe {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
             }
         }
@@ -2303,6 +2309,7 @@ impl App {
                     model_id: captured_model.model,
                     active_model_state_generation: self.active_model_state_generation,
                     image_capability_generation: self.config_snapshot.generation,
+                    supports_images: vision,
                 },
                 slots,
                 lifecycle: fence_lifecycle,

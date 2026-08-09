@@ -3806,7 +3806,18 @@ impl App {
                 }
                 exit
             }
-            ClassifierDecision::Paste { text, .. } => {
+            ClassifierDecision::Paste { text, source } => {
+                if matches!(
+                    source,
+                    crate::tui::structured_paste::PasteSource::BracketedPty
+                        | crate::tui::structured_paste::PasteSource::RapidPty
+                ) {
+                    self.pending_paste_probes.retain(|_, probe| {
+                        probe.owner_fence.is_some()
+                            || probe.request.source
+                                != crate::tui::structured_paste::PasteSource::NativePaste
+                    });
+                }
                 self.handle_paste(text);
                 false
             }

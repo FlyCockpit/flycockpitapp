@@ -239,6 +239,7 @@ impl App {
                 crate::tui::structured_paste::FenceLifecycle::Reconciling => true,
                 _ => false,
             });
+        let cancelled_any_fence = !cancelled_fences.is_empty();
         for sequence in cancelled_sequences {
             self.submission_order.cancel(sequence);
         }
@@ -246,6 +247,9 @@ impl App {
             self.deferred_fence_dispatches.remove(&id);
             self.pending_paste_probes
                 .retain(|_, probe| probe.owner_fence != Some(id));
+        }
+        if cancelled_any_fence {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
         }
         self.pending_paste_probes
             .retain(|_, probe| probe.owner_fence.is_some());

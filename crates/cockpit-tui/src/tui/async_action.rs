@@ -597,7 +597,7 @@ mod tests {
     async fn paste_probe_off_event_loop() {
         let mut runner = AsyncActionRunner::default();
         let (release_tx, release_rx) = oneshot::channel::<()>();
-        runner.start(
+        let parked = runner.start(
             AsyncActionKind::Internal("paste.test_probe"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
@@ -606,13 +606,45 @@ mod tests {
             },
         );
         assert_eq!(runner.pending_count(), 1);
-        // A parked probe does not own this reducer turn.
-        let mut reducer_progress = 0;
-        reducer_progress += 1;
-        assert_eq!(reducer_progress, 1);
+        runner.start(
+            AsyncActionKind::Internal("paste.reducer_progress"),
+            AsyncActionPolicy::AllowConcurrent,
+            async { Ok(AsyncActionPayload::Bool(true)) },
+        );
+        runner.notifier().notified().await;
+        let progress = runner.drain_completed();
+        assert_eq!(progress.len(), 1);
+        assert_bool_payload(&progress[0], true);
+        assert!(runner.is_pending(parked.id()));
+
         release_tx.send(()).unwrap();
         runner.notifier().notified().await;
         assert_eq!(runner.drain_completed().len(), 1);
+
+        let replace_key = AsyncActionKey::new("paste.deadline");
+        let (stale_tx, stale_rx) = oneshot::channel::<()>();
+        let stale = runner.start(
+            AsyncActionKind::Internal("paste.deadline"),
+            AsyncActionPolicy::Replace(replace_key.clone()),
+            async move {
+                let _ = stale_rx.await;
+                Ok(AsyncActionPayload::Text("late".into()))
+            },
+        );
+        runner.start(
+            AsyncActionKind::Internal("paste.deadline"),
+            AsyncActionPolicy::Replace(replace_key),
+            async { Ok(AsyncActionPayload::Text("replacement".into())) },
+        );
+        assert!(!runner.is_pending(stale.id()));
+        assert!(
+            stale_tx.send(()).is_err(),
+            "cancelled work cannot settle late"
+        );
+        runner.notifier().notified().await;
+        let settled = runner.drain_completed();
+        assert_eq!(settled.len(), 1);
+        assert_text_payload(&settled[0], "replacement");
     }
 
     #[tokio::test]

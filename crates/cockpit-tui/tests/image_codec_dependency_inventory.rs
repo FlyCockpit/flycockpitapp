@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -28,7 +29,19 @@ fn tui_image_codec_dependency_inventory() {
             serde_json::json!(["gif", "jpeg", "png", "webp"])
         );
     }
+    let mut observed_packages = HashSet::new();
     for (triple, expected) in targets {
+        assert_eq!(
+            expected["tuiFeatures"],
+            serde_json::json!(["gif", "jpeg", "png", "webp"])
+        );
+        let arboard = match triple.as_str() {
+            "x86_64-unknown-linux-gnu" => serde_json::json!(["png"]),
+            "aarch64-apple-darwin" => serde_json::json!(["tiff"]),
+            "x86_64-pc-windows-msvc" => serde_json::json!(["bmp", "png"]),
+            _ => unreachable!(),
+        };
+        assert_eq!(expected["arboardFeatures"], arboard);
         let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
             .current_dir(workspace)
             .args([
@@ -57,15 +70,61 @@ fn tui_image_codec_dependency_inventory() {
             .iter()
             .find(|node| node["id"] == image_id)
             .unwrap();
-        let resolved = node["features"].as_array().unwrap();
-        for feature in expected["resolvedFeatures"].as_array().unwrap() {
-            assert!(resolved.contains(feature), "{triple} missing {feature}");
-        }
+        let mut resolved = node["features"].as_array().unwrap().clone();
+        resolved.sort_by_key(|feature| feature.as_str().unwrap().to_string());
+        let mut expected_features = expected["resolvedFeatures"].as_array().unwrap().clone();
+        expected_features.sort_by_key(|feature| feature.as_str().unwrap().to_string());
+        assert_eq!(resolved, expected_features, "{triple} image feature drift");
         for forbidden in ["default", "default-formats", "rayon", "avif", "exr"] {
             assert!(
                 !resolved.iter().any(|feature| feature == forbidden),
                 "{triple} unexpectedly enabled {forbidden}"
             );
+        }
+        let direct_children = node["deps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|dep| dep["pkg"].as_str())
+            .filter_map(|id| {
+                metadata["packages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|package| package["id"] == id)
+            })
+            .map(|package| package["name"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        for required in ["png", "gif", "zune-jpeg", "image-webp"] {
+            assert!(
+                direct_children.contains(required),
+                "{triple} missing image -> {required}"
+            );
+        }
+        for expected_package in fixture["codecPackages"].as_array().unwrap() {
+            let name = expected_package["name"].as_str().unwrap();
+            let version = expected_package["version"].as_str().unwrap();
+            if let Some(actual) = metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|package| package["name"] == name && package["version"] == version)
+            {
+                observed_packages.insert((name.to_string(), version.to_string()));
+                assert_eq!(
+                    actual["license"], expected_package["license"],
+                    "{name} license drift"
+                );
+                assert_eq!(
+                    actual["rust_version"], expected_package["rustVersion"],
+                    "{name} declared MSRV drift"
+                );
+                assert!(
+                    actual["source"]
+                        .as_str()
+                        .is_some_and(|source| source.starts_with("registry+"))
+                );
+            }
         }
     }
     let lock = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
@@ -73,8 +132,14 @@ fn tui_image_codec_dependency_inventory() {
         let name = package["name"].as_str().unwrap();
         let version = package["version"].as_str().unwrap();
         let checksum = package["checksum"].as_str().unwrap();
-        assert!(lock.contains(&format!("name = \"{name}\"")));
-        assert!(lock.contains(&format!("version = \"{version}\"")));
-        assert!(lock.contains(checksum));
+        assert!(observed_packages.contains(&(name.to_string(), version.to_string())));
+        let block = lock
+            .split("[[package]]")
+            .find(|block| {
+                block.contains(&format!("name = \"{name}\""))
+                    && block.contains(&format!("version = \"{version}\""))
+            })
+            .unwrap_or_else(|| panic!("missing exact lock package {name} {version}"));
+        assert!(block.contains(&format!("checksum = \"{checksum}\"")));
     }
 }

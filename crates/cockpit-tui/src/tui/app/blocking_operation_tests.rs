@@ -78,7 +78,7 @@ fn queue_edit_does_not_block_key_handler() {
 #[test]
 fn queue_edits_apply_in_user_order() {
     let source = include_str!("input.rs");
-    assert!(source.contains("AsyncActionPolicy::Dedupe"));
+    assert!(source.contains("start_serialized"));
 }
 
 #[test]

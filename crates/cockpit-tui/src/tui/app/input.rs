@@ -3075,9 +3075,9 @@ impl App {
             }
         };
         self.push_queue_edit_notice("retrieving queued messages…");
-        self.async_actions.start(
+        self.async_actions.start_serialized(
             blocking_operations::BlockingOperationKind::QueueMutation.action_kind(),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("queue.edit")),
+            AsyncActionKey::new("queue.edit"),
             async move {
                 attached_request
                     .request(Request::RemoveEditableQueuedUserMessages { target_id: None })

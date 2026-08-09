@@ -295,6 +295,7 @@ pub struct AsyncActionRunner {
     view_generation: u64,
     pending: HashMap<AsyncActionId, PendingAction>,
     keyed: HashMap<AsyncActionKey, AsyncActionId>,
+    serialized: HashMap<AsyncActionKey, Arc<tokio::sync::Mutex<()>>>,
     tx: mpsc::UnboundedSender<CompletedAction>,
     rx: mpsc::UnboundedReceiver<CompletedAction>,
     notify: Arc<Notify>,
@@ -309,6 +310,7 @@ impl Default for AsyncActionRunner {
             view_generation: 1,
             pending: HashMap::new(),
             keyed: HashMap::new(),
+            serialized: HashMap::new(),
             tx,
             rx,
             notify: Arc::new(Notify::new()),
@@ -455,6 +457,29 @@ impl AsyncActionRunner {
         })
     }
 
+    /// Start a distinct action in the key's FIFO ordering domain. Unlike
+    /// dedupe/replace, every invocation reaches one terminal result, but its
+    /// side effect cannot overtake an earlier invocation with the same key.
+    pub fn start_serialized<F>(
+        &mut self,
+        kind: AsyncActionKind,
+        key: AsyncActionKey,
+        future: F,
+    ) -> AsyncActionStart
+    where
+        F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
+    {
+        let lock = Arc::clone(
+            self.serialized
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        );
+        self.start(kind, AsyncActionPolicy::AllowConcurrent, async move {
+            let _order = lock.lock().await;
+            future.await
+        })
+    }
+
     pub fn start_blocking<F>(
         &mut self,
         kind: AsyncActionKind,
@@ -570,6 +595,7 @@ impl AsyncActionRunner {
             pending.handle.abort();
         }
         self.keyed.clear();
+        self.serialized.clear();
         while self.rx.try_recv().is_ok() {}
     }
 

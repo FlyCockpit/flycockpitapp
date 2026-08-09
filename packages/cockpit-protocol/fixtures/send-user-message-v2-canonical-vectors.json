@@ -60,7 +60,26 @@
     { "text": "\u2000", "has_message_text": false },
     { "text": "\u200a", "has_message_text": false },
     { "text": "\u200b", "has_message_text": true },
-    { "text": " \u200b\u3000", "has_message_text": true }
+    { "text": " \u200b\u3000", "has_message_text": true },
+    { "text": "\u001f", "has_message_text": true },
+    { "text": "\u0020", "has_message_text": false },
+    { "text": "\u0021", "has_message_text": true },
+    { "text": "\u009f", "has_message_text": true },
+    { "text": "\u00a0", "has_message_text": false },
+    { "text": "\u00a1", "has_message_text": true },
+    { "text": "\u2027", "has_message_text": true },
+    { "text": "\u2028", "has_message_text": false },
+    { "text": "\u2029", "has_message_text": false },
+    { "text": "\u202a", "has_message_text": true },
+    { "text": "\u202e", "has_message_text": true },
+    { "text": "\u202f", "has_message_text": false },
+    { "text": "\u2030", "has_message_text": true },
+    { "text": "\u205e", "has_message_text": true },
+    { "text": "\u205f", "has_message_text": false },
+    { "text": "\u2060", "has_message_text": true },
+    { "text": "\u2fff", "has_message_text": true },
+    { "text": "\u3000", "has_message_text": false },
+    { "text": "\u3001", "has_message_text": true }
   ],
   "malformed_fcm2": [
     {

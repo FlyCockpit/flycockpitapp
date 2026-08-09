@@ -228,6 +228,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_codex_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
+    pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state();
 }
 
 fn pointer_provider_list_action_family_dispatches_from_fresh_sources() {
@@ -1754,7 +1755,7 @@ fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
             (
                 super::super::shell::SettingsPointerAction::Page(
                     action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        _,
+                        ProviderWizardStep::GrokOAuth,
                         WizardControlId::OAuth(OAuthOption::Acknowledge),
                     )),
                 ),
@@ -1769,6 +1770,68 @@ fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
         fresh.test_page(),
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.is_step("grok-oauth")
+                && state.oauth_auth.as_deref().is_some_and(|oauth| {
+                    oauth.status.as_ref().is_some_and(|status| {
+                        status.as_ref().is_ok_and(|message| message.contains("acknowledged"))
+                    })
+                })
+    ));
+    let _ = render_provider_rows(&fresh, 110, 60);
+    assert!(
+        !fresh.pointer_surface.targets.borrow().iter().any(|target| {
+            target.enabled
+                && target.action == super::super::shell::SettingsPointerAction::Page(action.clone())
+        })
+    );
+}
+
+#[test]
+fn pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let oauth = OAuthFlowState::new_with_acknowledgement_for_test(OAuthProvider::Codex);
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "codex-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let action = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        ProviderWizardStep::CodexOAuth,
+                        WizardControlId::OAuth(OAuthOption::Acknowledge),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("Codex wizard renders acknowledgement gate");
+    assert_eq!(
+        super::super::pointer_action_fixtures::key_for(&action),
+        super::super::pointer_action_fixtures::ActionFixtureKey::Providers(
+            super::super::pointer_action_fixtures::ProvidersFixture::WizardCodexAcknowledge,
+        )
+    );
+
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &action);
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.is_step("codex-oauth")
                 && state.oauth_auth.as_deref().is_some_and(|oauth| {
                     oauth.status.as_ref().is_some_and(|status| {
                         status.as_ref().is_ok_and(|message| message.contains("acknowledged"))

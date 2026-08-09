@@ -10,11 +10,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_db::media_attachments::{
-    LocalMediaOwnerReceiptV1, MediaAvailability, MediaSecurityRecoveryComponentTransitionV1,
-    MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
-    RecoverSecurityBlockedMediaV1, SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
+    LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1, LocalPathRegistrationResultV1,
+    MediaAttachmentRecord, MediaAvailability, MediaKind,
+    MediaSecurityRecoveryComponentTransitionV1, MediaSecurityRecoveryDisposition,
+    MediaSecurityRecoveryOutcome, MediaSourceKind, RecoverSecurityBlockedMediaV1,
+    RegisterLocalPathMediaV1, RequestedLocalPathMediaKind, SecurityRecoverySnapshot,
+    SecurityRecoverySnapshotResult,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -40,6 +44,114 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn register_local_path(
+        &self,
+        request: RegisterLocalPathMediaV1,
+        project_root: &Path,
+        now_unix_ms: i64,
+    ) -> Result<LocalPathRegistrationReceiptV1> {
+        validate_registration(&request)?;
+        let binding_digest = digest_json(b"local-path-binding-v1", &request)?;
+        if let Some(receipt) = self.registration_replay(&request, &binding_digest).await? {
+            return Ok(receipt);
+        }
+        let mut source = open_project_source(project_root, &request.path)?;
+        let before = source.metadata()?;
+        ensure!(
+            before.is_file() && before.len() > 0,
+            "media_attachment_unavailable"
+        );
+        let identity = stable_identity_digest(&source)?;
+        let mtime_ns = modified_ns(&before)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut source, &mut hasher)?;
+        source.seek(SeekFrom::Start(0))?;
+        let sha256 = crate::intel::hex_lower(&hasher.finalize());
+        let after = source.metadata()?;
+        ensure!(
+            before.len() == after.len()
+                && identity == stable_identity_digest(&source)?
+                && mtime_ns == modified_ns(&after)?,
+            "source_changed_during_registration"
+        );
+        let canonical_path_digest =
+            crate::intel::hex_lower(&Sha256::digest(request.path.as_bytes()));
+        let authority_digest = crate::intel::hex_lower(&Sha256::digest(
+            [
+                request.canonical_project_digest.as_bytes(),
+                canonical_path_digest.as_bytes(),
+            ]
+            .concat(),
+        ));
+        let evidence_digest = crate::intel::hex_lower(&Sha256::digest(format!("local-path-source-evidence-v1\0{canonical_path_digest}\0{identity}\0{}\0{mtime_ns}\0{sha256}", before.len()).as_bytes()));
+        let request_digest = crate::intel::hex_lower(&Sha256::digest(
+            [
+                binding_digest.as_bytes(),
+                authority_digest.as_bytes(),
+                evidence_digest.as_bytes(),
+            ]
+            .concat(),
+        ));
+        let semantic_digest = crate::intel::hex_lower(&Sha256::digest(
+            format!(
+                "local-path-semantic-v1\0{}\0{}\0{}\0{}",
+                request.session_id,
+                request.canonical_project_digest,
+                request.client_draft_id,
+                evidence_digest
+            )
+            .as_bytes(),
+        ));
+        let attachment_id = Uuid::now_v7();
+        let receipt_id = Uuid::now_v7();
+        let reservation_id = Uuid::now_v7().to_string();
+        let reservation_digest = crate::intel::hex_lower(&Sha256::digest(
+            format!(
+                "local-path-reservation-v1\0{reservation_id}\0{}",
+                before.len()
+            )
+            .as_bytes(),
+        ));
+        let held = BorrowedSourceHandle {
+            file: source,
+            evidence_digest: evidence_digest.clone(),
+        };
+        let request_for_tx = request.clone();
+        let result = self.db.transaction(move |conn| {
+            if let Some((stored_binding, receipt_json)) = conn.query_row("SELECT request_binding_digest,receipt_json FROM media_local_path_registration_operations WHERE local_operation_id=?1", [request_for_tx.local_operation_id.to_string()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
+                ensure!(stored_binding == binding_digest, "idempotency_conflict");
+                return Ok((serde_json::from_str(&receipt_json)?, None));
+            }
+            if let Some((authoritative, stored_semantic, receipt_json)) = conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_local_path_registration_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0", params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
+                ensure!(stored_semantic == semantic_digest, "idempotency_conflict");
+                conn.execute("INSERT INTO media_local_path_registration_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)", params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding_digest,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
+                return Ok((serde_json::from_str(&receipt_json)?, None));
+            }
+            let media_kind = match request_for_tx.requested_media_kind { RequestedLocalPathMediaKind::Image=>MediaKind::Image, RequestedLocalPathMediaKind::Audio=>MediaKind::Audio, RequestedLocalPathMediaKind::Video=>MediaKind::Video };
+            let record=MediaAttachmentRecord{attachment_id,session_id:request_for_tx.session_id,canonical_project_digest:request_for_tx.canonical_project_digest.clone(),media_kind,source_kind:MediaSourceKind::LocalPath,canonical_container:"application/octet-stream".into(),canonical_mime:"application/octet-stream".into(),availability:MediaAvailability::Registered,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:1,source_identity_digest:identity.clone(),source_byte_length:before.len(),source_sha256:sha256.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None};
+            cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;
+            let receipt=LocalPathRegistrationReceiptV1{schema_version:1,kind:"localPathMediaRegistrationReceipt".into(),receipt_id,local_operation_id:request_for_tx.local_operation_id,owner_principal_digest:request_for_tx.owner_principal_digest.clone(),session_id:request_for_tx.session_id,canonical_project_digest:request_for_tx.canonical_project_digest.clone(),client_draft_id:request_for_tx.client_draft_id,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),result:LocalPathRegistrationResultV1::Registered{attachment_id,attachment_version:1,availability_state:"registered".into(),availability_generation:1,reference_generation:1,reservation_id:reservation_id.clone(),reservation_digest:reservation_digest.clone(),source_evidence_digest:evidence_digest.clone()},committed_at_unix_ms:now_unix_ms};
+            let receipt_json=serde_json::to_string(&receipt)?;
+            conn.execute("INSERT INTO media_local_path_registration_evidence(attachment_id,canonical_path_digest,path_authority_digest,source_evidence_digest,source_mtime_unix_ns,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![attachment_id.to_string(),canonical_path_digest,authority_digest,evidence_digest,mtime_ns.to_string(),reservation_id,reservation_digest])?;
+            conn.execute("INSERT INTO media_local_path_registration_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding_digest,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
+            conn.execute("INSERT INTO media_local_path_registration_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'registered',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?;
+            Ok((receipt,Some(attachment_id)))
+        }).await?;
+        if let Some(id) = result.1 {
+            self.register_local_path_source(id, held)?;
+        }
+        Ok(result.0)
+    }
+
+    async fn registration_replay(
+        &self,
+        request: &RegisterLocalPathMediaV1,
+        binding: &str,
+    ) -> Result<Option<LocalPathRegistrationReceiptV1>> {
+        let id = request.local_operation_id.to_string();
+        let binding = binding.to_owned();
+        self.db.read(move|conn| { let row:Option<(String,String)>=conn.query_row("SELECT request_binding_digest,receipt_json FROM media_local_path_registration_operations WHERE local_operation_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?; match row { Some((stored,json))=>{ensure!(stored==binding,"idempotency_conflict");Ok(Some(serde_json::from_str(&json)?))},None=>Ok(None)}}).await
+    }
     pub(crate) fn open_or_create(db: cockpit_db::Db, owned_root: &Path) -> Result<Self> {
         let root = DirGuard::open_root(owned_root, true)
             .map_err(anyhow::Error::new)
@@ -158,6 +270,105 @@ impl MediaStorageRecovery {
 
 fn is_uuid_v7(value: Uuid) -> bool {
     !value.is_nil() && value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
+}
+
+fn validate_registration(request: &RegisterLocalPathMediaV1) -> Result<()> {
+    ensure!(
+        request.schema_version == 1 && request.kind == "registerLocalPathMedia",
+        "invalid local path registration schema or kind"
+    );
+    ensure!(
+        is_uuid_v7(request.local_operation_id)
+            && is_uuid_v7(request.session_id)
+            && is_uuid_v7(request.client_draft_id),
+        "local path registration ids must be UUIDv7"
+    );
+    ensure!(
+        request.owner_principal_digest.len() == 64
+            && request
+                .owner_principal_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "invalid owner digest"
+    );
+    ensure!(
+        request.canonical_project_digest.len() == 64
+            && request
+                .canonical_project_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "invalid project digest"
+    );
+    ensure!(!request.path.is_empty(), "media_attachment_unavailable");
+    Ok(())
+}
+
+fn digest_json<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(serde_json::to_vec(value)?);
+    Ok(crate::intel::hex_lower(&digest.finalize()))
+}
+
+fn modified_ns(metadata: &std::fs::Metadata) -> Result<u128> {
+    Ok(metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("source mtime predates epoch")?
+        .as_nanos())
+}
+
+#[cfg(unix)]
+fn open_project_source(root: &Path, relative: &str) -> Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::path::Component;
+    let parts = Path::new(relative)
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => {
+                CString::new(name.as_encoded_bytes()).map_err(anyhow::Error::new)
+            }
+            _ => Err(anyhow::anyhow!("media_attachment_unavailable")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!parts.is_empty(), "media_attachment_unavailable");
+    let mut current = std::fs::OpenOptions::new().read(true).open(root)?;
+    for (index, name) in parts.iter().enumerate() {
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if index + 1 == parts.len() {
+                0
+            } else {
+                libc::O_DIRECTORY
+            };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!("media_attachment_unavailable"));
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+#[cfg(windows)]
+fn open_project_source(root: &Path, relative: &str) -> Result<File> {
+    use std::path::Component;
+    ensure!(
+        Path::new(relative)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_))),
+        "media_attachment_unavailable"
+    );
+    let path = root.join(relative);
+    let canonical = path.canonicalize()?;
+    ensure!(
+        canonical.starts_with(root.canonicalize()?),
+        "media_attachment_unavailable"
+    );
+    Ok(std::fs::OpenOptions::new().read(true).open(canonical)?)
 }
 
 fn commit_security_recovery(

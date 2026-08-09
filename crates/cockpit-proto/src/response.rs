@@ -15,6 +15,8 @@ pub enum Response {
 
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
+    LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,

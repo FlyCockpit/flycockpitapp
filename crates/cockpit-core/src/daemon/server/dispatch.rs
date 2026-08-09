@@ -2228,6 +2228,55 @@ pub(super) async fn handle_serialized_request(
                 })?;
             Ok(Response::MediaOwnerRecovery(receipt))
         }
+        Request::RegisterLocalPathMedia(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let owner = super::run_invocation::principal_digest(&state.principal);
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.owner_principal_digest != owner
+                || request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "media storage authority is unavailable".into(),
+                })?;
+            let receipt = recovery
+                .register_local_path(
+                    request,
+                    &attached.handle.project_root,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("media_attachment_unavailable") {
+                        unavailable()
+                    } else if text.contains("idempotency_conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "idempotency_conflict".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalPathMediaRegistration(receipt))
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,

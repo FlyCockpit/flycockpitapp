@@ -311,6 +311,7 @@ CREATE TABLE media_local_path_registration_operations (
     session_id               TEXT NOT NULL,
     canonical_project_digest TEXT NOT NULL,
     client_draft_id          TEXT NOT NULL,
+    request_binding_digest   TEXT NOT NULL,
     operation_request_digest TEXT NOT NULL,
     semantic_command_digest  TEXT NOT NULL,
     receipt_json             TEXT NOT NULL,

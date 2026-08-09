@@ -598,18 +598,26 @@ impl App {
                 cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
             }
         };
-        let request = cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
-            project_root: root.root.to_string_lossy().into_owned(),
-            mode: rpc_mode,
-            expected_config_generation: self.config_snapshot.generation,
+        let project_root = root.root.to_string_lossy().into_owned();
+        let config_generation = match set_workspace_trust_with_retry(
+            &project_root,
+            rpc_mode,
+            self.config_snapshot.generation,
+            crate::tui::agent_runner::daemon_request_blocking_classified,
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.show_toast(
+                    format!("workspace trust could not be saved: {error}"),
+                    ToastKind::Error,
+                );
+                return false;
+            }
         };
-        if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
-            self.show_toast(
-                format!("workspace trust could not be saved: {error}"),
-                ToastKind::Error,
-            );
-            return false;
-        }
+        self.config_snapshot.generation = config_generation;
+        self.config_snapshot
+            .providers
+            .set_resolution_generation(config_generation);
         if mode == cockpit_config::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
@@ -629,6 +637,63 @@ impl App {
             self.maybe_open_add_provider_wizard();
         }
         false
+    }
+}
+
+fn set_workspace_trust_with_retry(
+    project_root: &str,
+    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mut expected_generation: u64,
+    mut request: impl FnMut(
+        cockpit_core::daemon::proto::Request,
+    ) -> Result<
+        cockpit_core::daemon::proto::Response,
+        crate::tui::agent_runner::BlockingDaemonRequestError,
+    >,
+) -> Result<u64, String> {
+    for attempt in 0..=1 {
+        let response = request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+            project_root: project_root.to_string(),
+            mode,
+            expected_config_generation: expected_generation,
+        });
+        match response {
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation }) => {
+                return Ok(config_generation);
+            }
+            Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
+            Err(crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(_))
+                if attempt == 0 =>
+            {
+                expected_generation = match request(
+                    cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                        project_root: project_root.to_string(),
+                    },
+                ) {
+                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        config_generation,
+                        ..
+                    }) => config_generation,
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected config generation refresh response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(blocking_request_error(error)),
+                };
+            }
+            Err(error) => return Err(blocking_request_error(error)),
+        }
+    }
+    unreachable!("the retry loop returns after its second attempt")
+}
+
+fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
+    match error {
+        crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
+            format!("config conflict after refresh: {message}")
+        }
+        crate::tui::agent_runner::BlockingDaemonRequestError::Other(message) => message,
     }
 }
 
@@ -1578,6 +1643,7 @@ pub struct App {
     /// attachment can be created. Failures leave this false and user actions
     /// retry the RPC rather than silently entering the session.
     pub(super) startup_disclosures_ready: bool,
+    pub(super) startup_disclosures_generation: u64,
     /// Complete daemon-confirmed session selection. Quick edits modify this
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
@@ -3065,6 +3131,7 @@ impl App {
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
             startup_disclosures_ready: cfg!(test),
+            startup_disclosures_generation: 0,
             active_model_selection,
             composer,
             vim_setting,
@@ -3761,6 +3828,8 @@ mod startup_first_paint_tests;
 mod startup_timing_tests;
 #[cfg(test)]
 mod subagent_settle_tests;
+#[cfg(test)]
+mod trust_rpc_regression_tests;
 #[cfg(test)]
 mod vim_mouse_pending_state_tests;
 #[cfg(test)]

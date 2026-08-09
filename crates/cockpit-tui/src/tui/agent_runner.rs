@@ -548,6 +548,10 @@ impl AgentRunner {
             && self.last_applied_seq.is_some()
     }
 
+    pub(crate) fn has_attached_client(&self) -> bool {
+        self.current_client.is_some()
+    }
+
     pub fn switch_session_task(
         &self,
         target: SessionTarget,
@@ -2611,6 +2615,47 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
                 .request_ok(req)
                 .await
                 .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+#[derive(Debug)]
+pub(crate) enum BlockingDaemonRequestError {
+    Conflict(String),
+    Other(String),
+}
+
+/// Blocking request variant that preserves optimistic-concurrency conflicts.
+pub(crate) fn daemon_request_blocking_classified(
+    req: Request,
+) -> Result<Response, BlockingDaemonRequestError> {
+    use cockpit_core::daemon::{DaemonStatus, discover};
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| BlockingDaemonRequestError::Other("no tokio runtime".to_string()))?;
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let probe = discover().await;
+            if !matches!(probe.status, DaemonStatus::Running) {
+                return Err(BlockingDaemonRequestError::Other(
+                    "daemon not running".to_string(),
+                ));
+            }
+            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
+                .await
+                .map_err(|error| {
+                    BlockingDaemonRequestError::Other(format!("daemon connect: {error}"))
+                })?;
+            match client.request(req).await.map_err(|error| {
+                BlockingDaemonRequestError::Other(format!("daemon request: {error}"))
+            })? {
+                Ok(response) => Ok(response),
+                Err(error) if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict => {
+                    Err(BlockingDaemonRequestError::Conflict(error.message))
+                }
+                Err(error) => Err(BlockingDaemonRequestError::Other(format!(
+                    "daemon request: {error}"
+                ))),
+            }
         })
     })
 }

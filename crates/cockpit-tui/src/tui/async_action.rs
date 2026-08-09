@@ -75,6 +75,11 @@ pub enum AsyncActionPayload {
     ContainerAvailability(cockpit_core::container::ContainerAvailability),
     RemoteDisclosures {
         project_root: String,
+        request_generation: u64,
+        socket: Option<std::path::PathBuf>,
+        launch_session_id: Option<uuid::Uuid>,
+        session_id: Option<uuid::Uuid>,
+        attachment_epoch: Option<u64>,
         org: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
         connector: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
     },

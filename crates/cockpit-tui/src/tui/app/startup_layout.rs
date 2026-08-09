@@ -156,11 +156,22 @@ impl App {
     }
 
     pub(super) fn start_startup_disclosures_fetch(&mut self) {
+        self.startup_disclosures_generation = self.startup_disclosures_generation.wrapping_add(1);
+        let request_generation = self.startup_disclosures_generation;
         let disclosure_root = self.launch.cwd.to_string_lossy().into_owned();
         let disclosure_socket = self.startup_background.daemon_socket.clone();
+        let launch_session_id = self.launch.session_id;
+        let (session_id, attachment_epoch) = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .filter(|runner| runner.has_attached_client())
+            .map(|runner| (Some(runner.session_id()), Some(runner.attachment_epoch())))
+            .unwrap_or((None, None));
+        let request_socket = disclosure_socket.clone();
         self.async_actions.start_blocking(
             AsyncActionKind::Internal("startup.remote_disclosures"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
+            AsyncActionPolicy::Replace(AsyncActionKey::new("startup.remote_disclosures")),
             move || {
                 let request = cockpit_core::daemon::proto::Request::GetStartupDisclosures {
                     project_root: disclosure_root.clone(),
@@ -176,6 +187,11 @@ impl App {
                         ..
                     } => Ok(AsyncActionPayload::RemoteDisclosures {
                         project_root: disclosure_root,
+                        request_generation,
+                        socket: request_socket,
+                        launch_session_id,
+                        session_id,
+                        attachment_epoch,
                         org: org_sync,
                         connector,
                     }),

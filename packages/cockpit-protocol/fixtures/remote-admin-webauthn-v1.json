@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "rpId": "admin.example.com",
+  "origin": "https://admin.example.com",
+  "challengeBase64Url": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+  "fixtures": [
+    {
+      "name": "browser-synced-passkey",
+      "declaredCustody": 1,
+      "authenticatorFlags": 29,
+      "userPresent": true,
+      "userVerified": true,
+      "backupEligible": true,
+      "backupState": true
+    },
+    {
+      "name": "external-security-key",
+      "declaredCustody": 2,
+      "authenticatorFlags": 5,
+      "userPresent": true,
+      "userVerified": true,
+      "backupEligible": false,
+      "backupState": false
+    },
+    {
+      "name": "uv-missing-rejected",
+      "declaredCustody": 3,
+      "authenticatorFlags": 1,
+      "userPresent": true,
+      "userVerified": false,
+      "backupEligible": false,
+      "backupState": false
+    }
+  ]
+}

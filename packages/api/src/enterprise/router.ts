@@ -56,6 +56,240 @@ const base64urlBytes = (value: string, expectedLength?: number) => {
 };
 
 export const enterpriseRouter = {
+  pendingRemoteAdminRegistration: protectedProcedure.handler(async ({ context }) => {
+    const now = new Date();
+    const ceremony = await prisma.remoteAdminCeremony.findFirst({
+      where: {
+        principalId: context.session.user.id,
+        kind: { in: ["SECURITY_ADMIN_BOOTSTRAP", "REGISTRATION"] },
+        consumedAt: null,
+        expiresAt: { gte: now },
+        challengeBytes: { not: null },
+      },
+      orderBy: { createdAt: "desc" },
+      include: {
+        EnterpriseOrg: {
+          include: { RemoteAdminRegistry: true },
+        },
+      },
+    });
+    const registry = ceremony?.EnterpriseOrg?.RemoteAdminRegistry;
+    if (!ceremony?.challengeBytes || !registry) return null;
+    return {
+      challengeId: ceremony.id,
+      challenge: Buffer.from(ceremony.challengeBytes).toString("base64url"),
+      orgId: ceremony.orgId!,
+      orgName: ceremony.EnterpriseOrg!.name,
+      role: "SECURITY_ADMIN" as const,
+      registryGeneration: String(registry.generation + 1n),
+      reviewDigest: Buffer.from(ceremony.requestDigest).toString("base64url"),
+      expiresAt: String(ceremony.expiresAt.getTime()),
+      rpId: registry.rpId,
+      origin: registry.origin,
+      userVerification: "required" as const,
+      residentKey: "preferred" as const,
+      algorithm: -7 as const,
+    };
+  }),
+
+  beginGovernedSecurityAdminRegistration: protectedProcedure
+    .input(
+      z.object({
+        orgId: z.string().min(1),
+        nomineeId: z.string().min(1),
+        canonicalRequestDigest: z.string().max(64),
+        operationEpoch: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
+        ownerApprovalId: z.string().uuid(),
+        securityApprovalId: z.string().uuid(),
+      }),
+    )
+    .handler(async ({ input }) => {
+      const now = new Date(),
+        digest = base64urlBytes(input.canonicalRequestDigest, 32);
+      const epoch = BigInt(input.operationEpoch),
+        challenge = randomBytes(32),
+        challengeId = randomUUID();
+      return prisma.$transaction(
+        async (tx) => {
+          const registry = await tx.remoteAdminRegistry.findUnique({
+            where: { orgId: input.orgId },
+          });
+          const nominee = await tx.enterpriseOrgMember.findUnique({
+            where: {
+              orgId_userId: { orgId: input.orgId, userId: input.nomineeId },
+            },
+          });
+          if (!registry?.securityAdminBootstrapSealed || nominee?.role !== "MEMBER")
+            throw new ORPCError("PRECONDITION_FAILED", { message: "Nominee is not eligible." });
+          const approvals = await tx.remoteAdminApproval.findMany({
+            where: {
+              id: { in: [input.ownerApprovalId, input.securityApprovalId] },
+              orgId: input.orgId,
+              operation: 8,
+              operationEpoch: epoch,
+              canonicalRequestDigest: Buffer.from(digest),
+              consumedAt: null,
+              expiresAt: { gte: now },
+              registryGeneration: registry.generation,
+            },
+          });
+          if (
+            approvals.length !== 2 ||
+            approvals[0]!.principalId === approvals[1]!.principalId ||
+            !approvals.some((approval) => approval.role === "OWNER") ||
+            !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
+          )
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Dual role approvals are required.",
+            });
+          if (
+            (
+              await tx.remoteAdminApproval.updateMany({
+                where: { id: { in: approvals.map((a) => a.id) }, consumedAt: null },
+                data: { consumedAt: now },
+              })
+            ).count !== 2
+          )
+            throw new ORPCError("CONFLICT", { message: "Role approvals were consumed." });
+          await tx.remoteAdminCeremony.create({
+            data: {
+              id: challengeId,
+              orgId: input.orgId,
+              principalId: input.nomineeId,
+              nomineeId: input.nomineeId,
+              kind: "REGISTRATION",
+              action: "security_role_change",
+              requestDigest: Buffer.from(digest),
+              requestPayload: {
+                nomineeId: input.nomineeId,
+                governed: true,
+                operationEpoch: input.operationEpoch,
+              },
+              challengeHash: createHash("sha256").update(challenge).digest(),
+              challengeBytes: challenge,
+              issuedAt: now,
+              expiresAt: new Date(now.getTime() + SECURITY_ADMIN_BOOTSTRAP_TTL_MS),
+            },
+          });
+          return {
+            challengeId,
+            challenge: challenge.toString("base64url"),
+            expiresAt: String(now.getTime() + SECURITY_ADMIN_BOOTSTRAP_TTL_MS),
+            rpId: registry.rpId,
+            origin: registry.origin,
+            userVerification: "required" as const,
+            residentKey: "preferred" as const,
+            algorithm: -7 as const,
+          };
+        },
+        { isolationLevel: "Serializable" },
+      );
+    }),
+
+  revokeSecurityAdminRole: protectedProcedure
+    .input(
+      z.object({
+        orgId: z.string().min(1),
+        principalId: z.string().min(1),
+        canonicalRequestDigest: z.string().max(64),
+        operationEpoch: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
+        ownerApprovalId: z.string().uuid(),
+        securityApprovalId: z.string().uuid(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const now = new Date(),
+        digest = base64urlBytes(input.canonicalRequestDigest, 32);
+      return prisma.$transaction(
+        async (tx) => {
+          const registry = await tx.remoteAdminRegistry.findUnique({
+            where: { orgId: input.orgId },
+          });
+          const member = await tx.enterpriseOrgMember.findUnique({
+            where: {
+              orgId_userId: { orgId: input.orgId, userId: input.principalId },
+            },
+          });
+          if (!registry || member?.role !== "SECURITY_ADMIN")
+            throw new ORPCError("NOT_FOUND", { message: "Security administrator not found." });
+          if (
+            (await tx.enterpriseOrgMember.count({
+              where: {
+                orgId: input.orgId,
+                role: "SECURITY_ADMIN",
+                userId: { not: input.principalId },
+              },
+            })) < 1
+          )
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Last security administrator is protected.",
+            });
+          const approvals = await tx.remoteAdminApproval.findMany({
+            where: {
+              id: { in: [input.ownerApprovalId, input.securityApprovalId] },
+              orgId: input.orgId,
+              operation: 8,
+              operationEpoch: BigInt(input.operationEpoch),
+              canonicalRequestDigest: Buffer.from(digest),
+              consumedAt: null,
+              expiresAt: { gte: now },
+              registryGeneration: registry.generation,
+            },
+          });
+          if (
+            approvals.length !== 2 ||
+            approvals[0]!.principalId === approvals[1]!.principalId ||
+            !approvals.some((approval) => approval.role === "OWNER") ||
+            !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
+          )
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Dual role approvals are required.",
+            });
+          if (
+            (
+              await tx.remoteAdminApproval.updateMany({
+                where: { id: { in: approvals.map((a) => a.id) }, consumedAt: null },
+                data: { consumedAt: now },
+              })
+            ).count !== 2
+          )
+            throw new ORPCError("CONFLICT", { message: "Role approvals were consumed." });
+          await tx.enterpriseOrgMember.update({
+            where: { id: member.id },
+            data: { role: "MEMBER" },
+          });
+          await tx.remoteAdminCredential.updateMany({
+            where: { orgId: input.orgId, principalId: input.principalId, state: "ACTIVE" },
+            data: { state: "REVOKED", revokedAt: now },
+          });
+          const nextGeneration = registry.generation + 1n;
+          await tx.remoteAdminRegistry.update({
+            where: { id: registry.id },
+            data: { generation: nextGeneration },
+          });
+          await tx.remoteAdminApproval.updateMany({
+            where: { orgId: input.orgId, consumedAt: null },
+            data: { consumedAt: now },
+          });
+          await tx.enterpriseAuditLog.create({
+            data: {
+              orgId: input.orgId,
+              userId: context.session.user.id,
+              action: "enterprise.remote_admin.security_role.revoke",
+              entity: "EnterpriseOrgMember",
+              entityId: member.id,
+              metadata: {
+                principalId: input.principalId,
+                registryGeneration: String(nextGeneration),
+              },
+            },
+          });
+          return { role: "MEMBER" as const, registryGeneration: String(nextGeneration) };
+        },
+        { isolationLevel: "Serializable" },
+      );
+    }),
+
   exportRemoteCredentialRegistry: protectedProcedure
     .input(z.object({ orgId: z.string().min(1), stepUp: z.string().length(43) }))
     .handler(async ({ input, context }) => {
@@ -335,6 +569,7 @@ export const enterpriseRouter = {
               orgId: input.orgId,
               event: "remote_admin.recovery.proposed",
               recipients,
+              RecipientRows: { create: recipients.map((userId) => ({ userId })) },
               payload: {
                 proposalId: proposal.id,
                 coolingEndsAt: String(proposal.coolingEndsAt.getTime()),
@@ -468,6 +703,7 @@ export const enterpriseRouter = {
               orgId: proposal.orgId,
               event: "remote_admin.recovery.cancelled",
               recipients,
+              RecipientRows: { create: recipients.map((userId) => ({ userId })) },
               payload: { proposalId: proposal.id },
             },
           });
@@ -587,6 +823,7 @@ export const enterpriseRouter = {
             policyWeakening: input.policyWeakening,
           },
           challengeHash: createHash("sha256").update(challenge).digest(),
+          challengeBytes: Buffer.from(challenge),
           issuedAt,
           expiresAt: new Date(issuedAt.getTime() + APPROVAL_TTL_MS),
         },
@@ -842,6 +1079,7 @@ export const enterpriseRouter = {
               requestDigest: digest,
               requestPayload: { nomineeId: input.nomineeId },
               challengeHash: createHash("sha256").update(challenge).digest(),
+              challengeBytes: challenge,
               issuedAt: now,
               expiresAt: new Date(now.getTime() + SECURITY_ADMIN_BOOTSTRAP_TTL_MS),
             },
@@ -1066,10 +1304,11 @@ export const enterpriseRouter = {
         return ceremony.committedResult;
       }
       const registry = ceremony?.EnterpriseOrg?.RemoteAdminRegistry;
+      const isClosedBootstrap = ceremony?.kind === "SECURITY_ADMIN_BOOTSTRAP";
       if (
         !ceremony ||
         !registry ||
-        ceremony.kind !== "SECURITY_ADMIN_BOOTSTRAP" ||
+        (!isClosedBootstrap && ceremony.kind !== "REGISTRATION") ||
         ceremony.principalId !== context.session.user.id ||
         ceremony.nomineeId !== context.session.user.id ||
         ceremony.consumedAt ||
@@ -1164,7 +1403,7 @@ export const enterpriseRouter = {
                 where: {
                   id: registry.id,
                   generation: registry.generation,
-                  securityAdminBootstrapSealed: false,
+                  securityAdminBootstrapSealed: !isClosedBootstrap,
                 },
                 data: { generation: nextGeneration, securityAdminBootstrapSealed: true },
               })
@@ -1205,7 +1444,9 @@ export const enterpriseRouter = {
             data: {
               orgId: ceremony.orgId!,
               userId: context.session.user.id,
-              action: "enterprise.remote_admin.security_bootstrap",
+              action: isClosedBootstrap
+                ? "enterprise.remote_admin.security_bootstrap"
+                : "enterprise.remote_admin.security_role.grant",
               entity: "RemoteAdminRegistry",
               entityId: registry.id,
               metadata: { registryGeneration: String(nextGeneration) },
@@ -1262,6 +1503,7 @@ export const enterpriseRouter = {
           action: input.action,
           requestDigest: createHash("sha256").update(input.action).digest(),
           challengeHash: createHash("sha256").update(challenge).digest(),
+          challengeBytes: challenge,
           issuedAt: new Date(expiresAt.getTime() - REMOTE_ADMIN_CEREMONY_TTL_MS),
           expiresAt,
         },
@@ -1431,6 +1673,7 @@ export const enterpriseRouter = {
           requestPayload: { name, slug },
           requestDigest: createHash("sha256").update(canonical).digest(),
           challengeHash: createHash("sha256").update(challenge).digest(),
+          challengeBytes: challenge,
           issuedAt: new Date(expiresAt.getTime() - REMOTE_ADMIN_CEREMONY_TTL_MS),
           expiresAt,
         },
@@ -1455,7 +1698,7 @@ export const enterpriseRouter = {
     await requireEnterpriseLogExport(context.session.user.id);
     const membership = await getPrimaryOrgForUser(context.session.user.id);
     if (!membership) return { org: null, membership: null, policy: null };
-    const [members, exports, instances, eventCount] = await Promise.all([
+    const [members, exports, instances, eventCount, recovery] = await Promise.all([
       prisma.enterpriseOrgMember.findMany({
         where: { orgId: membership.orgId },
         orderBy: [{ role: "asc" }, { createdAt: "asc" }],
@@ -1468,6 +1711,18 @@ export const enterpriseRouter = {
       }),
       listOrgInstances(membership.orgId),
       prisma.enterpriseLogEvent.count({ where: { orgId: membership.orgId } }),
+      prisma.remoteAdminRecoveryProposal.findFirst({
+        where: { orgId: membership.orgId, state: { in: ["PENDING", "COOLING", "READY"] } },
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          state: true,
+          coolingEndsAt: true,
+          expiresAt: true,
+          ownerReconfirmedAt: true,
+          securityReconfirmedAt: true,
+        },
+      }),
     ]);
     return {
       org: membership.EnterpriseOrg,
@@ -1477,6 +1732,7 @@ export const enterpriseRouter = {
       exports,
       instances,
       eventCount,
+      recovery,
     };
   }),
 

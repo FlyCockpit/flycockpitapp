@@ -38,6 +38,13 @@ enum RemoteAdminRecoveryState {
   EXPIRED
 }
 
+enum RemoteAdminNotificationState {
+  PENDING
+  PROCESSING
+  DELIVERED
+  FAILED
+}
+
 enum EnterpriseLogEventKind {
   SESSION
   MESSAGE
@@ -162,6 +169,7 @@ model RemoteAdminCeremony {
   requestDigest   Bytes
   requestPayload  Json?
   challengeHash   Bytes
+  challengeBytes  Bytes?
   issuedAt        DateTime                @default(now())
   expiresAt       DateTime
   consumedAt      DateTime?
@@ -237,17 +245,36 @@ model RemoteAdminRecoveryProposal {
 }
 
 model RemoteAdminNotificationOutbox {
-  id            String        @id @default(cuid(2))
+  id            String                             @id @default(cuid(2))
   orgId         String
   event         String
   recipients    Json
   payload       Json
-  createdAt     DateTime      @default(now())
+  createdAt     DateTime                           @default(now())
   deliveredAt   DateTime?
-  EnterpriseOrg EnterpriseOrg @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  RecipientRows RemoteAdminNotificationRecipient[]
+  EnterpriseOrg EnterpriseOrg                      @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId, createdAt])
   @@map("remote_admin_notification_outbox")
+}
+
+model RemoteAdminNotificationRecipient {
+  id            String                        @id @default(cuid(2))
+  outboxId      String
+  userId        String
+  state         RemoteAdminNotificationState  @default(PENDING)
+  attempts      Int                           @default(0)
+  nextAttemptAt DateTime                      @default(now())
+  deliveredAt   DateTime?
+  lastErrorCode String?
+  leaseToken    String?
+  leaseUntil    DateTime?
+  Outbox        RemoteAdminNotificationOutbox @relation(fields: [outboxId], references: [id], onDelete: Cascade)
+
+  @@unique([outboxId, userId])
+  @@index([state, nextAttemptAt])
+  @@map("remote_admin_notification_recipient")
 }
 
 model EnterpriseOrgMember {

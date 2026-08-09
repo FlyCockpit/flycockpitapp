@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import webauthnFixtures from "../fixtures/remote-admin-webauthn-v1.json";
 import {
   decodeRemoteAdminApprovalEvidenceV1,
   decodeRemoteCredentialRegistryV1,
@@ -9,6 +10,20 @@ import { tagProtocolIdBytes } from "./remote-protocol-id";
 
 const bytes = (length: number, value: number) => new Uint8Array(length).fill(value);
 describe("remote_admin_webauthn_registration_assertion", () => {
+  it("commits browser, hardware-key, and UV-rejection interoperability fixtures", () => {
+    expect(webauthnFixtures.version).toBe(1);
+    expect(webauthnFixtures.fixtures.map((fixture) => fixture.name)).toEqual([
+      "browser-synced-passkey",
+      "external-security-key",
+      "uv-missing-rejected",
+    ]);
+    for (const fixture of webauthnFixtures.fixtures) {
+      expect(Boolean(fixture.authenticatorFlags & 0x01)).toBe(fixture.userPresent);
+      expect(Boolean(fixture.authenticatorFlags & 0x04)).toBe(fixture.userVerified);
+      expect(Boolean(fixture.authenticatorFlags & 0x08)).toBe(fixture.backupEligible);
+      expect(Boolean(fixture.authenticatorFlags & 0x10)).toBe(fixture.backupState);
+    }
+  });
   it("round trips the exact FCWR format and rejects trailing bytes", () => {
     const encoded = encodeRemoteCredentialRegistryV1({
       tenantId: tagProtocolIdBytes("tenant", bytes(16, 1)),

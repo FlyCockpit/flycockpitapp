@@ -109,6 +109,8 @@ export async function verifyRemoteAdminAssertion(input: {
   const flags = assertion.authenticatorData[32]!;
   if ((flags & 0x01) === 0 || (flags & 0x04) === 0)
     throw new Error("webauthn_user_verification_required");
+  if (credential.declaredCustody === 2 && (flags & 0x08) !== 0)
+    throw new Error("webauthn_external_key_custody_conflict");
   const client = strictClientData(assertion.clientDataJson);
   if (
     client.type !== "webauthn.get" ||

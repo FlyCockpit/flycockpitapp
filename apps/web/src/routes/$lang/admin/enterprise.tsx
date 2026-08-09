@@ -35,58 +35,85 @@ const toBase64Url = (value: ArrayBuffer) => {
   for (const byte of new Uint8Array(value)) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
+async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId: string }) {
+  if (!window.PublicKeyCredential) throw new Error("WebAuthn is required.");
+  const created = (await navigator.credentials.create({
+    publicKey: {
+      challenge: fromBase64Url(ceremony.challenge),
+      rp: { id: ceremony.rpId, name: "FlyCockpit" },
+      user: {
+        id: new TextEncoder().encode(crypto.randomUUID()),
+        name: "remote-security-admin",
+        displayName: "Remote security administrator",
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      timeout: 300_000,
+      authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
+      attestation: "none",
+    },
+  })) as PublicKeyCredential | null;
+  if (!created || !(created.response instanceof AuthenticatorAttestationResponse))
+    throw new Error("Passkey registration was cancelled.");
+  const publicKey = created.response.getPublicKey();
+  if (!publicKey || created.response.getPublicKeyAlgorithm() !== -7)
+    throw new Error("An ES256 passkey is required.");
+  const credentialIdHash = await crypto.subtle.digest("SHA-256", created.rawId);
+  const asserted = (await navigator.credentials.get({
+    publicKey: {
+      challenge: fromBase64Url(ceremony.challenge),
+      rpId: ceremony.rpId,
+      allowCredentials: [{ type: "public-key", id: created.rawId }],
+      timeout: 300_000,
+      userVerification: "required",
+    },
+  })) as PublicKeyCredential | null;
+  if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
+    throw new Error("Passkey verification was cancelled.");
+  return {
+    credentialIdHash: toBase64Url(credentialIdHash),
+    publicKeySpki: toBase64Url(publicKey),
+    declaredCustody: "UNKNOWN" as const,
+    authenticatorData: toBase64Url(asserted.response.authenticatorData),
+    clientDataJson: toBase64Url(asserted.response.clientDataJSON),
+    signatureDer: toBase64Url(asserted.response.signature),
+  };
+}
+async function assertRemoteAdminCredential(ceremony: { challenge: string; rpId: string }) {
+  const asserted = (await navigator.credentials.get({
+    publicKey: {
+      challenge: fromBase64Url(ceremony.challenge),
+      rpId: ceremony.rpId,
+      timeout: 300_000,
+      userVerification: "required",
+    },
+  })) as PublicKeyCredential | null;
+  if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
+    throw new Error("Passkey verification was cancelled.");
+  return {
+    credentialIdHash: toBase64Url(await crypto.subtle.digest("SHA-256", asserted.rawId)),
+    authenticatorData: toBase64Url(asserted.response.authenticatorData),
+    clientDataJson: toBase64Url(asserted.response.clientDataJSON),
+    signatureDer: toBase64Url(asserted.response.signature),
+  };
+}
 
 function EnterpriseAdmin() {
   const queryClient = useQueryClient();
   const { trigger } = useHaptics();
   const { t } = useTranslation(["admin", "common"]);
   const overview = useQuery(orpc.enterprise.overview.queryOptions());
+  const pendingRegistration = useQuery(
+    orpc.enterprise.pendingRemoteAdminRegistration.queryOptions(),
+  );
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: orpc.enterprise.key() });
   const bootstrap = useMutation({
     mutationFn: async ({ name }: { name: string }) => {
       const ceremony = await orpc.enterprise.bootstrap.call({ name });
-      if (!window.PublicKeyCredential) throw new Error("WebAuthn is required.");
-      const created = (await navigator.credentials.create({
-        publicKey: {
-          challenge: fromBase64Url(ceremony.challenge),
-          rp: { id: ceremony.rpId, name: "FlyCockpit" },
-          user: {
-            id: new TextEncoder().encode(crypto.randomUUID()),
-            name: "enterprise-owner",
-            displayName: "Enterprise owner",
-          },
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-          timeout: 300_000,
-          authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
-          attestation: "none",
-        },
-      })) as PublicKeyCredential | null;
-      if (!created || !(created.response instanceof AuthenticatorAttestationResponse))
-        throw new Error("Passkey registration was cancelled.");
-      const publicKey = created.response.getPublicKey();
-      if (!publicKey || created.response.getPublicKeyAlgorithm() !== -7)
-        throw new Error("An ES256 passkey is required.");
-      const credentialIdHash = await crypto.subtle.digest("SHA-256", created.rawId);
-      const asserted = (await navigator.credentials.get({
-        publicKey: {
-          challenge: fromBase64Url(ceremony.challenge),
-          rpId: ceremony.rpId,
-          allowCredentials: [{ type: "public-key", id: created.rawId }],
-          timeout: 300_000,
-          userVerification: "required",
-        },
-      })) as PublicKeyCredential | null;
-      if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
-        throw new Error("Passkey verification was cancelled.");
+      const credential = await registerRemoteAdminCredential(ceremony);
       return orpc.enterprise.completeOwnerBootstrap.call({
         challengeId: ceremony.challengeId,
-        credentialIdHash: toBase64Url(credentialIdHash),
-        publicKeySpki: toBase64Url(publicKey),
-        declaredCustody: "UNKNOWN",
-        authenticatorData: toBase64Url(asserted.response.authenticatorData),
-        clientDataJson: toBase64Url(asserted.response.clientDataJSON),
-        signatureDer: toBase64Url(asserted.response.signature),
+        ...credential,
       });
     },
     ...{
@@ -97,6 +124,49 @@ function EnterpriseAdmin() {
       },
       onError: () => trigger("error"),
     },
+    meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
+  });
+  const acceptSecurityRole = useMutation({
+    mutationFn: async () => {
+      if (!pendingRegistration.data) throw new Error("Registration ceremony is unavailable.");
+      const credential = await registerRemoteAdminCredential(pendingRegistration.data);
+      return orpc.enterprise.completeSecurityAdminBootstrap.call({
+        challengeId: pendingRegistration.data.challengeId,
+        accept: true,
+        ...credential,
+      });
+    },
+    onSuccess: () => {
+      invalidate();
+      void pendingRegistration.refetch();
+      trigger("success");
+    },
+    onError: () => trigger("error"),
+    meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
+  });
+  const reconfirmRecovery = useMutation({
+    mutationFn: async () => {
+      if (!overview.data?.org || !overview.data.recovery)
+        throw new Error("Recovery proposal is unavailable.");
+      const ceremony = await orpc.enterprise.beginRemoteAdminStepUp.call({
+        orgId: overview.data.org.id,
+        action: "recovery",
+      });
+      const assertion = await assertRemoteAdminCredential(ceremony);
+      const stepUp = await orpc.enterprise.completeRemoteAdminStepUp.call({
+        challengeId: ceremony.challengeId,
+        ...assertion,
+      });
+      return orpc.enterprise.reconfirmRemoteAdminRecovery.call({
+        proposalId: overview.data.recovery.id,
+        stepUp: stepUp.stepUp,
+      });
+    },
+    onSuccess: () => {
+      invalidate();
+      trigger("success");
+    },
+    onError: () => trigger("error"),
     meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
   });
   const updatePolicy = useMutation({
@@ -152,6 +222,31 @@ function EnterpriseAdmin() {
         <p className="mt-2 text-sm text-muted-foreground">{t("admin:enterprise.description")}</p>
       </div>
 
+      {pendingRegistration.data ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("admin:enterprise.securityRegistrationTitle")}</CardTitle>
+            <CardDescription>
+              {t("admin:enterprise.securityRegistrationDescription")}
+              <span className="mt-2 block font-mono text-xs break-all">
+                {pendingRegistration.data.orgName} · {pendingRegistration.data.role} ·{" "}
+                {pendingRegistration.data.reviewDigest}
+              </span>
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button
+              className="min-h-[44px]"
+              disabled={acceptSecurityRole.isPending}
+              onClick={() => acceptSecurityRole.mutate()}
+            >
+              <ShieldCheck className="size-4" />
+              {t("admin:enterprise.securityRegistrationAction")}
+            </Button>
+          </CardContent>
+        </Card>
+      ) : null}
+
       {!data.org || !data.policy ? (
         <Card>
           <CardHeader>
@@ -171,6 +266,30 @@ function EnterpriseAdmin() {
         </Card>
       ) : (
         <>
+          {data.recovery ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("admin:enterprise.recoveryTitle")}</CardTitle>
+                <CardDescription>
+                  {t("admin:enterprise.recoveryDescription")}
+                  <span className="mt-2 block font-mono text-xs">
+                    {data.recovery.state} · {data.recovery.coolingEndsAt.toLocaleString()} ·{" "}
+                    {data.recovery.expiresAt.toLocaleString()}
+                  </span>
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button
+                  className="min-h-[44px]"
+                  disabled={reconfirmRecovery.isPending}
+                  onClick={() => reconfirmRecovery.mutate()}
+                >
+                  <ShieldCheck className="size-4" />
+                  {t("admin:enterprise.recoveryReconfirm")}
+                </Button>
+              </CardContent>
+            </Card>
+          ) : null}
           <div className="grid gap-4 md:grid-cols-3">
             <MetricCard label={t("admin:enterprise.members")} value={String(data.members.length)} />
             <MetricCard

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { type BootstrapChallenge, commitRemoteAdminBootstrap } from "./remote-admin-bootstrap";
+import { classifyRemotePolicyRevision } from "./remote-admin-policy";
 import {
   actionRequiresDualControl,
   assertQuorumAfterChange,
@@ -135,6 +136,29 @@ describe("remote_admin_dual_control_distinctness", () => {
         { ...owner, principalId: "owner-2", credentialIdHash: "owner-key-2" },
       ]),
     ).toThrow("role_pair_invalid");
+  });
+});
+
+describe("remote_admin_policy_weakening", () => {
+  const current = {
+    minimumProtocolVersion: 2,
+    minimumKeyBits: 256,
+    sessionTtlSeconds: 300,
+    attemptGrantTtlSeconds: 60,
+    requireDeviceTrust: true,
+    requireDaemonTrust: true,
+  };
+  it("computes weakening across every security dimension", () => {
+    expect(classifyRemotePolicyRevision(current, current)).toBe("equal_or_stronger");
+    expect(classifyRemotePolicyRevision(current, { ...current, minimumProtocolVersion: 1 })).toBe(
+      "weakening",
+    );
+    expect(classifyRemotePolicyRevision(current, { ...current, sessionTtlSeconds: 301 })).toBe(
+      "weakening",
+    );
+    expect(classifyRemotePolicyRevision(current, { ...current, requireDeviceTrust: false })).toBe(
+      "weakening",
+    );
   });
 });
 

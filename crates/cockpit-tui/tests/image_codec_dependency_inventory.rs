@@ -131,7 +131,7 @@ fn tree_package_key(row: &str) -> String {
     format!("{name}@{version}")
 }
 
-fn normal_tree_graph(
+fn dependency_tree_graph(
     tree: &str,
     target: TargetTriple,
     provenance: Provenance,
@@ -430,9 +430,13 @@ fn tui_image_codec_dependency_inventory() {
         // This target-resolved graph is observed without consulting the fixture.
         // Consequently a newly activated direct image dependency cannot be hidden
         // by a fixture-derived allowlist.
-        let normal_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal", "{p}");
+        // AC17 inventories the complete graph rooted at image, including build
+        // dependencies.  In particular, num-traits selects autocfg through a
+        // build edge; a normal-only view silently drops both that edge and its
+        // package even though Cargo resolves and executes it for this graph.
+        let dependency_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal,build", "{p}");
         let (graph_packages, graph_edges) =
-            normal_tree_graph(&normal_tree, target, Provenance::ImageDescendant);
+            dependency_tree_graph(&dependency_tree, target, Provenance::ImageDescendant);
         let expected_packages = expected.packages.iter().cloned().collect::<BTreeSet<_>>();
         let expected_edges = expected.edges.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(graph_packages, expected_packages, "{triple} package drift");
@@ -570,7 +574,7 @@ fn tui_image_codec_dependency_inventory() {
         }
 
         let tui_tree = cargo_tree(workspace, triple, "cockpit-tui", "normal", "{p}");
-        let (_, tui_edges) = normal_tree_graph(&tui_tree, target, Provenance::TuiNormal);
+        let (_, tui_edges) = dependency_tree_graph(&tui_tree, target, Provenance::TuiNormal);
         let observed_provenance = image_requester_subgraph(&tui_edges);
         let expected_provenance = expected
             .provenance_edges

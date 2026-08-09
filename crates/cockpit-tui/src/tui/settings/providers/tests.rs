@@ -460,8 +460,8 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
                         ProvidersAction::RowEditor(ProviderRowEditorAction::SettingSave),
                     ) => assert!(matches!(
                         fresh.test_page(),
-                        TestPageRef::Providers(ProvidersPage::Edit(_))
-                            | TestPageRef::Providers(ProvidersPage::Models { .. })
+                        TestPageRef::Providers(ProvidersPage::ProviderSettings { .. })
+                            | TestPageRef::Providers(ProvidersPage::ModelSettings { .. })
                     )),
                     super::super::pointer_actions::SettingsPointerAction::Providers(
                         ProvidersAction::RowEditor(ProviderRowEditorAction::SettingEdit(_)),

@@ -21,6 +21,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
@@ -502,7 +503,7 @@ impl SettingsCx {
                 controls.push(None);
                 confirmation_lines.push((
                     lines.len() - 1,
-                    12 + display.chars().count(),
+                    12 + display.as_str().width(),
                     string_list_row_id(p.kind, i, val),
                 ));
             } else {

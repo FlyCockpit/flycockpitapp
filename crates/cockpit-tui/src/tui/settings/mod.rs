@@ -2237,6 +2237,8 @@ impl SettingsDialog {
                         let _ = self.apply_nav(nav);
                     }
                     SettingsPointerAction::Page(action) => {
+                        #[cfg(test)]
+                        pointer_acceptance_tests::record_dispatched_action(&action);
                         let nav = self.page.handle_pointer_control_at(
                             &mut self.cx,
                             action,
@@ -2363,6 +2365,18 @@ impl SettingsDialog {
         frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
             .render_with_links(&self.cx, frame, layout[1], links);
+        #[cfg(test)]
+        for target in self
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter(|target| target.enabled)
+        {
+            if let SettingsPointerAction::Page(action) = &target.action {
+                pointer_acceptance_tests::record_rendered_action(action);
+            }
+        }
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }

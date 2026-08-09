@@ -17,6 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -815,7 +816,7 @@ fn render_grab_list(
         }));
         if pending {
             controls.push(None);
-            confirmation_lines.push((lines.len() - 1, 12 + item.chars().count(), id));
+            confirmation_lines.push((lines.len() - 1, 12 + item.as_str().width(), id));
         } else {
             controls.push(Some((
                 SettingsPointerAction::List(ListAction::Delete(id)),

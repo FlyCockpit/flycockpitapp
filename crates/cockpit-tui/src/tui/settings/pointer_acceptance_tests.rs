@@ -10,6 +10,44 @@ use tempfile::TempDir;
 
 use super::tests::{fresh_dialog, render_settings_rows, settings_mouse};
 use super::{SettingsPointerOutcome, TestPageRef};
+use std::cell::RefCell;
+use std::collections::HashSet;
+
+thread_local! {
+    static ACTION_COVERAGE: RefCell<(HashSet<String>, HashSet<String>)> = RefCell::default();
+}
+
+fn action_variant_key(action: &SettingsPointerAction) -> String {
+    let debug = format!("{action:?}");
+    let mut depth = 0;
+    for (index, ch) in debug.char_indices() {
+        match ch {
+            '(' => {
+                depth += 1;
+                if depth == 2 {
+                    return debug[..index].to_string();
+                }
+            }
+            ')' if depth == 1 => return debug[..=index].to_string(),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    debug
+}
+
+pub(super) fn record_rendered_action(action: &SettingsPointerAction) {
+    assert_source_action_family_is_exhaustive(action);
+    ACTION_COVERAGE.with(|coverage| {
+        coverage.borrow_mut().0.insert(action_variant_key(action));
+    });
+}
+
+pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
+    ACTION_COVERAGE.with(|coverage| {
+        coverage.borrow_mut().1.insert(action_variant_key(action));
+    });
+}
 
 fn click_target(dialog: &mut super::SettingsDialog, target: &SettingsPointerTarget) {
     for kind in [
@@ -378,21 +416,26 @@ fn settings_pointer_hover_and_help_are_truthful() {
 
 #[test]
 fn settings_pointer_action_registry_is_exhaustive_and_operable() {
+    ACTION_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
     super::tests::run_pointer_dialog_regression_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
-    let tmp = TempDir::new().unwrap();
-    let dialog = fresh_dialog(&tmp);
-    let _ = render_settings_rows(&dialog, 90, 30);
-    for target in dialog.pointer_surface.targets.borrow().iter() {
-        if let RenderAction::Page(action) = &target.action {
-            assert_source_action_family_is_exhaustive(action);
-        }
-    }
-    // Coverage comes from each page's rendered source state and real reducer
-    // matrix above. Synthetic action registries can report success for
-    // actions no production page ever publishes, so they are intentionally
-    // not part of acceptance.
+    ACTION_COVERAGE.with(|coverage| {
+        let coverage = coverage.borrow();
+        let missing = coverage
+            .0
+            .difference(&coverage.1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "enabled rendered actions without reducer dispatch: {missing:?}"
+        );
+        assert!(
+            !coverage.0.is_empty(),
+            "real rendered matrix collected no actions"
+        );
+    });
 }
 
 /// No wildcard: adding a list action forces the rendered reducer fixtures to
@@ -584,7 +627,7 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fresh_dialog(&tmp);
         match kind {
-            StringListKind::AgentDirs => dialog.extended.agent_dirs.push("one".into()),
+            StringListKind::AgentDirs => dialog.extended.agent_dirs.push("界🙂".into()),
             StringListKind::ExtraDotenvPaths => {
                 dialog.extended.redact.extra_dotenv_paths.push("one".into())
             }
@@ -625,6 +668,8 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
             "replacement #1"
         } else if kind == StringListKind::RedactAllowlist {
             "ONE"
+        } else if kind == StringListKind::AgentDirs {
+            "界🙂"
         } else {
             "one"
         };

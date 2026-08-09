@@ -1021,15 +1021,122 @@ pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
 
 #[test]
 fn pointer_render_boundary_publishes_stable_provider_identity() {
-    let mut cfg = ProvidersConfig::default();
-    cfg.providers
-        .insert("stable-provider".into(), ProviderEntry::default());
-    let (_tmp, mut dialog) = dialog_with_config(cfg);
-    dialog.page = super::super::providers_page(ProvidersPage::List {
-        cursor: 1,
-        status: None,
-        delete_pending: false,
-    });
+    use super::super::pointer_actions::{
+        ProviderDeleteChoice, ProviderId, ProvidersAction, SettingsPointerAction,
+    };
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("stable-provider".into(), ProviderEntry::default());
+        let (tmp, mut dialog) = dialog_with_config(cfg);
+        dialog.page = super::super::providers_page(ProvidersPage::List {
+            cursor: 1,
+            status: None,
+            delete_pending: false,
+        });
+        (tmp, dialog)
+    }
+
+    fn identity_actions(dialog: &SettingsDialog) -> Vec<SettingsPointerAction> {
+        let _ = render_provider_rows(dialog, 90, 24);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    super::super::shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Providers(
+                            ProvidersAction::Open(_)
+                            | ProvidersAction::BeginDelete(_)
+                            | ProvidersAction::Delete(_, _),
+                        ),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let (_tmp, source) = fixture();
+    let id = ProviderId("stable-provider".into());
+    let initial = identity_actions(&source);
+    assert_eq!(
+        initial
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
+        [
+            SettingsPointerAction::Providers(ProvidersAction::Open(id.clone())),
+            SettingsPointerAction::Providers(ProvidersAction::BeginDelete(id.clone())),
+        ]
+        .into_iter()
+        .collect(),
+        "stable provider row publishes every identity-bearing list action"
+    );
+
+    for action in initial {
+        let (_fresh_tmp, mut dialog) = fixture();
+        click_rendered_provider_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Providers(ProvidersAction::Open(_)) => assert!(matches!(
+                dialog.test_page(),
+                TestPageRef::Providers(ProvidersPage::Edit(state))
+                    if state.provider_id == "stable-provider"
+            )),
+            action @ SettingsPointerAction::Providers(ProvidersAction::BeginDelete(_)) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Providers(ProvidersPage::List {
+                        delete_pending: true,
+                        ..
+                    })
+                ));
+                let nested = identity_actions(&dialog);
+                for choice in [
+                    ProviderDeleteChoice::RemoveSecrets,
+                    ProviderDeleteChoice::KeepSecrets,
+                    ProviderDeleteChoice::Cancel,
+                ] {
+                    let delete = SettingsPointerAction::Providers(ProvidersAction::Delete(
+                        id.clone(),
+                        choice,
+                    ));
+                    assert!(nested.contains(&delete));
+                    let (_choice_tmp, mut choice_dialog) = fixture();
+                    click_rendered_provider_action(&mut choice_dialog, &action);
+                    click_rendered_provider_action(&mut choice_dialog, &delete);
+                    assert_eq!(
+                        choice_dialog
+                            .config
+                            .providers
+                            .contains_key("stable-provider"),
+                        choice == ProviderDeleteChoice::Cancel
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn pointer_render_boundary_click_is_consumed() {
+    let (_tmp, mut dialog) = {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("stable-provider".into(), ProviderEntry::default());
+        let (tmp, mut dialog) = dialog_with_config(cfg);
+        dialog.page = super::super::providers_page(ProvidersPage::List {
+            cursor: 1,
+            status: None,
+            delete_pending: false,
+        });
+        (tmp, dialog)
+    };
     let _ = render_provider_rows(&dialog, 90, 24);
     let target = dialog
         .pointer_surface

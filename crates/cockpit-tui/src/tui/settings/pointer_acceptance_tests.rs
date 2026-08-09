@@ -425,6 +425,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     WIZARD_SOURCE_COVERAGE.with(|coverage| coverage.borrow_mut().clear());
     super::tests::run_pointer_dialog_regression_matrix();
     super::tests::run_pointer_picker_suggestion_matrix();
+    super::tests::run_pointer_category_confirmation_and_effect_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
     dispatch_enabled_category_descriptor_actions();

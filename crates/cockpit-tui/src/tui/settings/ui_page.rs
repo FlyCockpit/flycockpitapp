@@ -25,7 +25,7 @@ use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
 use super::pointer_actions::{
-    ListAction, ListKind, ListRowId, SettingsPointerAction, UtilityModelAction, UtilityModelId,
+    ListAction, ListKind, ListRowId, SettingsPointerAction, UtilityModelAction,
 };
 use super::shell::{
     SettingsPointerSurface, SettingsPointerTarget, SettingsScrollRegionId, SettingsScrollStates,
@@ -577,6 +577,7 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         picker: &UtilityModelPicker,
+        target: super::category::SettingId,
     ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
@@ -733,10 +734,28 @@ impl SettingsCx {
                     bindings.push((
                         lines.len(),
                         SettingsPointerAction::UtilityModel(UtilityModelAction::Select(
-                            UtilityModelId(value.clone()),
+                            super::pointer_actions::UtilityModelId(value.clone()),
                         )),
                     ));
                     lines.push(Line::from(spans));
+                }
+
+                if let Some(entry) = cursor
+                    .checked_sub(PICKER_ACTION_ROWS)
+                    .and_then(|index| picker.entries.get(index))
+                    .or_else(|| picker.entries.first())
+                {
+                    lines.push(Line::default());
+                    bindings.push((
+                        lines.len(),
+                        SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::PickerSelect(
+                                target,
+                                super::pointer_actions::PickerOptionId(entry.value()),
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Select highlighted model]"));
                 }
 
                 lines.push(Line::default());

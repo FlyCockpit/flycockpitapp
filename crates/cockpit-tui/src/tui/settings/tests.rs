@@ -1455,25 +1455,27 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         open_utility_picker(&mut d);
         let _ = render_settings_rows(&d, 90, 24);
         let wanted = if expected == "" {
-            pointer_actions::UtilityModelAction::Clear
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::Clear,
+            )
         } else if expected.starts_with("custom-") {
-            pointer_actions::UtilityModelAction::OpenCustom
+            pointer_actions::SettingsPointerAction::UtilityModel(
+                pointer_actions::UtilityModelAction::OpenCustom,
+            )
         } else {
-            pointer_actions::UtilityModelAction::Select(pointer_actions::UtilityModelId(
-                expected.into(),
-            ))
+            pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::PickerSelect(
+                    SettingId::UtilityModel,
+                    pointer_actions::PickerOptionId(expected.into()),
+                ),
+            )
         };
         let target = d
             .pointer_surface
             .targets
             .borrow()
             .iter()
-            .find(|target| {
-                target.action
-                    == shell::SettingsPointerAction::Page(
-                        pointer_actions::SettingsPointerAction::UtilityModel(wanted.clone()),
-                    )
-            })
+            .find(|target| target.action == shell::SettingsPointerAction::Page(wanted.clone()))
             .cloned()
             .expect("rendered picker target");
         d.handle_pointer(settings_mouse(
@@ -1524,8 +1526,8 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         .filter_map(|target| match (&target.action, target.enabled) {
             (
                 shell::SettingsPointerAction::Page(
-                    action @ pointer_actions::SettingsPointerAction::UtilityModel(
-                        pointer_actions::UtilityModelAction::Select(_),
+                    action @ pointer_actions::SettingsPointerAction::Category(
+                        pointer_actions::CategoryAction::PickerSelect(_, _),
                     ),
                 ),
                 true,
@@ -1539,8 +1541,8 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
         let mut dialog = dialog_with_models(&tmp);
         open_utility_picker(&mut dialog);
         click_settings_action(&mut dialog, &action);
-        let pointer_actions::SettingsPointerAction::UtilityModel(
-            pointer_actions::UtilityModelAction::Select(id),
+        let pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::PickerSelect(_, id),
         ) = action
         else {
             unreachable!();
@@ -2664,6 +2666,77 @@ fn global_name_edit_prompts_to_remove_shadowing_project_value() {
     assert_eq!(global_cfg.name.as_deref(), Some("Ada"));
     assert!(project_raw.get("name").is_none());
     assert_eq!(project_raw["tui"]["show_cwd"], false);
+}
+
+pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
+    use cockpit_config::extended::ExtendedConfigDoc;
+    for (choice, removes) in [
+        (pointer_actions::ConfirmationChoice::Confirm, true),
+        (pointer_actions::ConfirmationChoice::Cancel, false),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("home/.config/cockpit/config.json");
+        let project = tmp.path().join("repo");
+        let project_config = project.join(".cockpit/config.json");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::write(&global, r#"{"name":"Global"}"#).unwrap();
+        std::fs::write(&project_config, r#"{"name":"Project"}"#).unwrap();
+        let mut dialog = SettingsDialog::open_from_picker(global, project);
+        open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+        dialog.handle_key(press(KeyCode::Enter));
+        type_chars(&mut dialog, " pointer");
+        dialog.handle_key(press(KeyCode::Enter));
+        let _ = render_settings_rows(&dialog, 80, 20);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::Confirm(SettingId::Name, choice),
+            ),
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&project_config).unwrap()).unwrap();
+        assert_eq!(raw.get("name").is_none(), removes);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page) if page.shadowed_global.is_none()
+        ));
+        let _ = ExtendedConfigDoc::load(&dialog.config_path).unwrap();
+    }
+
+    let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+    guard.set_var("EDITOR", "true");
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+    dialog.handle_key(press(KeyCode::Enter));
+    let action = pointer_actions::SettingsPointerAction::Category(
+        pointer_actions::CategoryAction::ExternalEditBegin(
+            SettingId::Name,
+            pointer_actions::CategoryExternalSource::Inline,
+        ),
+    );
+    let _ = render_settings_rows(&dialog, 80, 20);
+    click_settings_action(&mut dialog, &action);
+    let (operation, _) = dialog
+        .take_pending_category_external_edit()
+        .expect("category effect drains once");
+    assert!(dialog.take_pending_category_external_edit().is_none());
+    dialog.finish_category_external_edit(PointerOperationId(operation.0 + 1), None);
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page) if page.pending_external_edit.is_some()
+    ));
+    dialog.finish_category_external_edit(operation, None);
+    let status = match dialog.test_page() {
+        TestPageRef::Category(page) => page.status.clone(),
+        _ => unreachable!(),
+    };
+    dialog.finish_category_external_edit(operation, Some("duplicate".into()));
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Category(page) if page.status == status
+    ));
 }
 
 fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {

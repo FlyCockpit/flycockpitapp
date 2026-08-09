@@ -1420,6 +1420,8 @@ impl CategoryPathEditor {
             Span::styled("[Save]", selected_style()),
             Span::raw("  "),
             Span::styled("[Cancel]", selected_style()),
+            Span::raw("  "),
+            Span::styled("[Open in $EDITOR]", selected_style()),
             Span::styled("  tab: accept  right: complete", muted_style()),
         ]));
         for (action, x, width) in [
@@ -1436,6 +1438,14 @@ impl CategoryPathEditor {
                 )),
                 8,
                 8,
+            ),
+            (
+                super::pointer_actions::CategoryAction::ExternalEditBegin(
+                    category_pointer_id(self.id),
+                    super::pointer_actions::CategoryExternalSource::PathEditor,
+                ),
+                18,
+                17,
             ),
         ] {
             surface.register(SettingsPointerTarget {
@@ -2237,11 +2247,11 @@ impl SettingsCx {
         operation_id: PointerOperationId,
         editor_error: Option<String>,
     ) {
-        if !p.external_edit_ops.complete(operation_id)
-            || p.pending_external_edit
-                .as_ref()
-                .map(|pending| pending.operation_id)
-                != Some(operation_id)
+        if p.pending_external_edit
+            .as_ref()
+            .map(|pending| pending.operation_id)
+            != Some(operation_id)
+            || !p.external_edit_ops.complete(operation_id)
         {
             return;
         }
@@ -2378,7 +2388,10 @@ impl SettingsCx {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                     p.path_editor = Some(editor);
                 }
@@ -2477,7 +2490,10 @@ impl SettingsCx {
                             p.status = Some("opening $EDITOR...".into());
                             editor.error = None;
                         }
-                        Err(reason) => editor.error = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            editor.error = Some(reason);
+                        }
                     }
                     p.text_editor = Some(editor);
                 }
@@ -2505,7 +2521,10 @@ impl SettingsCx {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                 }
                 KeyCode::Enter => {
@@ -2549,7 +2568,10 @@ impl SettingsCx {
                             p.pending_external_edit = Some(request);
                             p.status = Some("opening $EDITOR...".into());
                         }
-                        Err(reason) => p.status = Some(reason),
+                        Err(reason) => {
+                            p.external_edit_ops.cancel();
+                            p.status = Some(reason);
+                        }
                     }
                 }
             }
@@ -3316,6 +3338,52 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 
 impl SettingsCx {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
+        if let Some(prompt) = &p.shadowed_global {
+            let label = prompt.setting.descriptor().label;
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!(
+                        "Saved globally, but the project overrides {label}."
+                    )),
+                    Line::default(),
+                    Line::from("Remove that project override?"),
+                    Line::default(),
+                    Line::from("[Remove override]  [Keep override]"),
+                ]),
+                area,
+            );
+            for (choice, x, width) in [
+                (super::pointer_actions::ConfirmationChoice::Confirm, 0, 17),
+                (super::pointer_actions::ConfirmationChoice::Cancel, 19, 15),
+            ] {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(area.x + x, area.y.saturating_add(4), width, 1),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::Confirm(
+                                category_pointer_id(prompt.setting),
+                                choice,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+            return;
+        }
+
+        if let Some(pending) = &p.pending_external_edit {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Opening {} in $EDITOR…",
+                    pending.id.descriptor().label
+                )),
+                area,
+            );
+            return;
+        }
+
         if let Some(editor) = &p.path_editor {
             editor.render(frame, area, &self.pointer_surface);
             return;
@@ -3339,6 +3407,14 @@ impl SettingsCx {
                     8,
                     8,
                 ),
+                (
+                    super::pointer_actions::CategoryAction::ExternalEditBegin(
+                        category_pointer_id(editor.id),
+                        super::pointer_actions::CategoryExternalSource::TextEditor,
+                    ),
+                    18,
+                    17,
+                ),
             ] {
                 self.pointer_surface.register(SettingsPointerTarget {
                     rect: Rect::new(area.x + x, action_y, width, 1),
@@ -3354,6 +3430,8 @@ impl SettingsCx {
                     Span::styled("[Save]", selected_style()),
                     Span::raw("  "),
                     Span::styled("[Cancel]", selected_style()),
+                    Span::raw("  "),
+                    Span::styled("[Open in $EDITOR]", selected_style()),
                 ]),
                 Rect::new(area.x, action_y, area.width, 1),
             );
@@ -3361,7 +3439,12 @@ impl SettingsCx {
         }
 
         if let Some(picker) = &p.utility_picker {
-            self.render_utility_picker(frame, area, picker);
+            self.render_utility_picker(
+                frame,
+                area,
+                picker,
+                p.utility_picker_target.unwrap_or(SettingId::UtilityModel),
+            );
             return;
         }
 
@@ -3467,10 +3550,28 @@ impl SettingsCx {
                 Span::styled("[Save]", selected_style()),
                 Span::raw("  "),
                 Span::styled("[Cancel]", selected_style()),
+                Span::raw("  "),
+                Span::styled("[Open in $EDITOR]", selected_style()),
             ]));
             controls.push(None);
             (line, id)
         });
+
+        let cursor_external_action = if p.editing.is_none() {
+            ids.get(p.cursor)
+                .copied()
+                .filter(|id| category_external_editable(*id))
+                .map(|id| {
+                    lines.push(Line::default());
+                    controls.push(None);
+                    let line = lines.len();
+                    lines.push(Line::from("[Open selected in $EDITOR]"));
+                    controls.push(None);
+                    (line, id)
+                })
+        } else {
+            None
+        };
 
         if let Some(label) = p.category.reset_label() {
             lines.push(Line::default());
@@ -3530,6 +3631,14 @@ impl SettingsCx {
                         8,
                         8,
                     ),
+                    (
+                        super::pointer_actions::CategoryAction::ExternalEditBegin(
+                            category_pointer_id(id),
+                            super::pointer_actions::CategoryExternalSource::Inline,
+                        ),
+                        18,
+                        17,
+                    ),
                 ] {
                     self.pointer_surface.register(SettingsPointerTarget {
                         rect: Rect::new(
@@ -3545,6 +3654,33 @@ impl SettingsCx {
                         disabled_reason: None,
                     });
                 }
+            }
+        }
+        if let Some((line, id)) = cursor_external_action {
+            let offset = self
+                .scroll_states
+                .offset_for(&format!("category:{:?}", p.category));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(settings_area.height)
+            {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        settings_area.x,
+                        settings_area.y.saturating_add(screen_row as u16),
+                        26.min(settings_area.width),
+                        1,
+                    ),
+                    action: SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::ExternalEditBegin(
+                                category_pointer_id(id),
+                                super::pointer_actions::CategoryExternalSource::Cursor,
+                            ),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
             }
         }
 
@@ -3744,6 +3880,81 @@ impl SettingsPage for CategoryPage {
                         self,
                     )
                 }
+                CategoryAction::PickerSelect(id, option) => {
+                    let Some(target) = self.utility_picker_target else {
+                        return Nav::Stay;
+                    };
+                    if category_pointer_id(target) != id {
+                        return Nav::Stay;
+                    }
+                    let Some(picker) = self.utility_picker.as_mut() else {
+                        return Nav::Stay;
+                    };
+                    let super::ui_page::PickerMode::List { cursor, .. } = &mut picker.mode else {
+                        return Nav::Stay;
+                    };
+                    let Some(index) = picker
+                        .entries
+                        .iter()
+                        .position(|entry| entry.value() == option.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    *cursor = super::ui_page::PICKER_ACTION_ROWS + index;
+                    cx.handle_category_utility_picker_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                    Nav::Stay
+                }
+                CategoryAction::Confirm(id, choice) => {
+                    if self
+                        .shadowed_global
+                        .as_ref()
+                        .map_or(true, |prompt| category_pointer_id(prompt.setting) != id)
+                    {
+                        return Nav::Stay;
+                    }
+                    let code = match choice {
+                        super::pointer_actions::ConfirmationChoice::Confirm => KeyCode::Enter,
+                        super::pointer_actions::ConfirmationChoice::Cancel => KeyCode::Esc,
+                    };
+                    cx.handle_category_page_key(KeyEvent::new(code, KeyModifiers::NONE), self)
+                }
+                CategoryAction::ExternalEditBegin(id, source) => {
+                    let Some(setting) = category_setting_from_pointer(id) else {
+                        return Nav::Stay;
+                    };
+                    let source_matches = match source {
+                        super::pointer_actions::CategoryExternalSource::Cursor => {
+                            self.editing.is_none()
+                                && self.path_editor.is_none()
+                                && self.text_editor.is_none()
+                                && self
+                                    .setting_ids()
+                                    .get(self.cursor)
+                                    .is_some_and(|candidate| *candidate == setting)
+                        }
+                        super::pointer_actions::CategoryExternalSource::Inline => {
+                            self.editing == Some(setting)
+                        }
+                        super::pointer_actions::CategoryExternalSource::PathEditor => self
+                            .path_editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.id == setting),
+                        super::pointer_actions::CategoryExternalSource::TextEditor => self
+                            .text_editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.id == setting),
+                    };
+                    if !source_matches || self.pending_external_edit.is_some() {
+                        return Nav::Stay;
+                    }
+                    cx.handle_category_page_key(
+                        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                        self,
+                    )
+                }
                 CategoryAction::DescriptorActivate(id) => {
                     let Some(setting) = category_setting_from_pointer(id) else {
                         return Nav::Stay;
@@ -3807,9 +4018,6 @@ impl SettingsPage for CategoryPage {
                 }
                 CategoryAction::InlineEditCommit(_)
                 | CategoryAction::InlineEditCancel(_)
-                | CategoryAction::PickerSelect(_, _)
-                | CategoryAction::Confirm(_, _)
-                | CategoryAction::ExternalEditBegin(_, _)
                 | CategoryAction::ExternalEditResult(_, _)
                 | CategoryAction::PathEditCommit(_)
                 | CategoryAction::PathEditCancel(_)
@@ -3923,6 +4131,10 @@ impl SettingsPage for CategoryPage {
         region: super::shell::SettingsScrollRegionId,
         delta: isize,
     ) -> Nav {
+        if self.shadowed_global.take().is_some() {
+            self.status = Some("saved; project override kept".into());
+            return Nav::Stay;
+        }
         if region == super::shell::SettingsScrollRegionId("category:utility-picker") {
             if let Some(picker) = self.utility_picker.as_mut()
                 && let super::ui_page::PickerMode::List { cursor, scroll } = &mut picker.mode
@@ -3947,6 +4159,7 @@ impl SettingsPage for CategoryPage {
 
     fn cancel_pointer_transients(&mut self) {
         self.reset.disarm();
+        self.shadowed_global = None;
         self.external_edit_ops.cancel();
         self.pending_external_edit = None;
     }

@@ -284,15 +284,18 @@ impl MediaReservationLedger {
             let aggregate = dimension_name(MediaDimension::AggregateDecodedPixelsPerRequest);
             let mut total = 0u64;
             let mut limit = None;
+            let mut aggregate_claim_owner = None;
             for id in &reservation_ids {
-                let plan_json:String=conn.query_row("SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",params![id,aggregate],|row|row.get(0))?;
-                let plan:MediaReservationPlan=serde_json::from_str(&plan_json)?;
-                limit=Some(limit.map_or(plan.effective_limit,|value:u64|value.min(plan.effective_limit)));
-                let pixels:i64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension='decoded_image_pixels'",[id],|row|row.get(0))?;
-                total=total.checked_add(u64::try_from(pixels.max(0))?).ok_or_else(||anyhow!("accounting_overflow"))?;
+                let plan_json:Option<String>=conn.query_row("SELECT plan_json FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension=?2",params![id,aggregate],|row|row.get(0)).optional()?;
+                if let Some(plan_json) = plan_json {
+                    let plan:MediaReservationPlan=serde_json::from_str(&plan_json)?;
+                    limit=Some(limit.map_or(plan.effective_limit,|value:u64|value.min(plan.effective_limit)));
+                    aggregate_claim_owner.get_or_insert_with(||id.clone());
+                    let pixels:i64=conn.query_row("SELECT COALESCE(SUM(delta),0) FROM media_reservation_deltas WHERE reservation_id=?1 AND dimension='decoded_image_pixels'",[id],|row|row.get(0))?;
+                    total=total.checked_add(u64::try_from(pixels.max(0))?).ok_or_else(||anyhow!("accounting_overflow"))?;
+                }
             }
-            let effective=limit.unwrap_or(0);
-            if total>effective { return Err(anyhow!("media_denied:aggregate_decoded_pixels_per_request:{total}:{effective}:0:request:policy")); }
+            if let Some(effective)=limit && total>effective { return Err(anyhow!("media_denied:aggregate_decoded_pixels_per_request:{total}:{effective}:0:request:policy")); }
             let mut already_bound = 0usize;
             for id in &reservation_ids {
                 if let Some(existing)=conn.query_row("SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",[id],|row|row.get::<_,String>(0)).optional()? {
@@ -302,7 +305,7 @@ impl MediaReservationLedger {
             }
             if already_bound == reservation_ids.len() { return Ok(()); }
             if already_bound != 0 { return Err(anyhow!("partial_downstream_ownership")); }
-            for (index,id) in reservation_ids.iter().enumerate() {
+            for id in &reservation_ids {
                 let(state,published,version):(String,bool,u64)=conn.query_row("SELECT state,published,version FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?)))?;
                 if ReservationState::parse(&state)?!=ReservationState::Settling||!published{return Err(anyhow!("downstream_ownership_requires_published_settling"));}
                 let next=version.checked_add(1).ok_or_else(||anyhow!("accounting_overflow"))?;
@@ -312,7 +315,7 @@ impl MediaReservationLedger {
                     mutate_counter(conn,&kind,&scope,&aggregate,-delta)?;
                     record_delta(conn,id,next,&aggregate,&kind,&scope,u64::try_from(delta.max(0))?,-delta,"release",wall_ms)?;
                 }
-                let target=if index==0{total}else{0};
+                let target=if aggregate_claim_owner.as_ref()==Some(id){total}else{0};
                 if target>0 { mutate_counter(conn,"request",&invocation_id,&aggregate,i64::try_from(target)?)?; record_delta(conn,id,next,&aggregate,"request",&invocation_id,target,i64::try_from(target)?,"durable_invocation",wall_ms)?; }
                 conn.execute("INSERT INTO media_downstream_ownership(reservation_id,invocation_id,bound_wall_ms) VALUES(?1,?2,?3) ON CONFLICT(reservation_id) DO NOTHING",params![id,invocation_id,sqlite_i64(wall_ms)?])?;
                 conn.execute("UPDATE media_reservations SET version=?1 WHERE reservation_id=?2",params![sqlite_i64(next)?,id])?;
@@ -1864,8 +1867,15 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            ledger.transition(&receipt.reservation_id, receipt.version, ReservationState::CancellationRequested, 2).await,
-            Err(LedgerError::Storage(error)) if error.to_string().contains("side_effect_transition_requires_typed_operation")
+            ledger
+                .transition(
+                    &receipt.reservation_id,
+                    receipt.version,
+                    ReservationState::CancellationRequested,
+                    2
+                )
+                .await,
+            Err(LedgerError::InvalidTransition)
         ));
         let cancelled = ledger
             .request_cancellation(&receipt.reservation_id, receipt.version, 2)
@@ -2688,14 +2698,16 @@ mod tests {
         }
         let mut claimed = Vec::new();
         for _ in 0..4 {
-            claimed.push(
-                ledger
-                    .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .reservation_id,
-            );
+            let receipt = ledger
+                .claim_next_fair(MediaDimension::LocalCpuJobsGlobal, 2)
+                .await
+                .unwrap()
+                .unwrap();
+            claimed.push(receipt.reservation_id.clone());
+            ledger
+                .complete_local_allocation(&receipt.reservation_id, receipt.version, 2)
+                .await
+                .unwrap();
         }
         assert_eq!(claimed, ["a1", "b1", "a2", "b2"]);
         assert!(

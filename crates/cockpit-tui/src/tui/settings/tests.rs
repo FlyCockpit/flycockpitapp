@@ -1329,9 +1329,9 @@ fn pointer_instruction_list_actions_dispatch_from_fresh_sources() {
                     TestPageRef::Instructions(page) if page.grabbed.is_some()
                 ))
             }
-            SettingsPointerAction::List(ListAction::Delete(_)) => assert!(matches!(
+            SettingsPointerAction::List(ListAction::Delete(row)) => assert!(matches!(
                 dialog.test_page(),
-                TestPageRef::Instructions(page) if page.delete.is_pending()
+                TestPageRef::Instructions(page) if page.delete.is_pending_for(row.index)
             )),
             _ => unreachable!(),
         }

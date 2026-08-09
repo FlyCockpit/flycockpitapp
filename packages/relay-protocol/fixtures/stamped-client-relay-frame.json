@@ -2,6 +2,15 @@
   "channelId": "ch-stamped",
   "from": "client",
   "payload": { "op": "attach" },
-  "principal": { "grants": [{ "projectRoot": null, "scope": "terminal" }], "userId": "user-1" },
-  "v": 1
+  "principal": {
+    "actorBinding": {
+      "deviceGeneration": "1",
+      "deviceId": "00000000-0000-4000-8000-000000000001",
+      "logicalAttachmentId": "00000000-0000-4000-8000-000000000002",
+      "schemaVersion": 1
+    },
+    "grants": [{ "projectRoot": null, "scope": "terminal" }],
+    "userId": "user-1"
+  },
+  "v": 2
 }

@@ -57,6 +57,7 @@ pub(super) const LSP_NAV_ROWS: [LspRow; 9] = [
 ];
 
 pub(super) const LSP_SERVER_ROW_START: usize = LSP_NAV_ROWS.len();
+const POINTER_SERVER_ACTION_BASE: u64 = 10_000;
 
 fn lsp_row_for_cursor(cursor: usize) -> LspRow {
     LSP_NAV_ROWS
@@ -242,6 +243,21 @@ impl SettingsPage for LspPage {
         cx: &mut SettingsCx,
         control: shell::SettingsControlId,
     ) -> Nav {
+        if control.0 >= POINTER_SERVER_ACTION_BASE {
+            let encoded = control.0 - POINTER_SERVER_ACTION_BASE;
+            let server_idx = (encoded / 4) as usize;
+            let action = match encoded % 4 {
+                0 => LspControlAction::Check,
+                1 => LspControlAction::Install,
+                2 => LspControlAction::Uninstall,
+                3 => LspControlAction::Restart,
+                _ => return Nav::Stay,
+            };
+            self.cursor = LSP_SERVER_ROW_START + server_idx;
+            self.reset.disarm();
+            cx.queue_lsp_action(server_idx, action, self);
+            return Nav::Stay;
+        }
         let row_count = LSP_SERVER_ROW_START
             + cx.project_context()
                 .project_root()
@@ -401,7 +417,7 @@ pub(super) fn lsp_rows(dialog: &SettingsCx, p: &LspPage) -> (Vec<Line<'static>>,
                 p.cursor,
                 &server.id,
                 format!(
-                    "{status}; enter=check i=install u=uninstall R=restart; cockpit-installed: {}; cmd: {command}; install: {install}; uninstall: {uninstall}; {}",
+                    "[Check] [Install] [Uninstall] [Restart]  {status}; cockpit-installed: {}; cmd: {command}; install: {install}; uninstall: {uninstall}; {}",
                     on_off(server.cockpit_installed),
                     server.manual_guidance
                 ),
@@ -570,6 +586,36 @@ impl SettingsCx {
             &self.pointer_surface,
             shell::SettingsScrollRegionId("lsp"),
         );
+        let offset = self.scroll_states.offset_for("lsp");
+        let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
+        for server_idx in 0..server_count {
+            let line = lsp_selected_line_for_cursor(LSP_SERVER_ROW_START + server_idx);
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if screen_row >= usize::from(area.height) {
+                continue;
+            }
+            let y = area.y.saturating_add(screen_row as u16);
+            for (action, (x, width)) in [(0, (26, 7)), (1, (34, 9)), (2, (44, 11)), (3, (56, 9))] {
+                if x >= area.width {
+                    continue;
+                }
+                self.pointer_surface.register(shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(x),
+                        y,
+                        width.min(area.width.saturating_sub(x)),
+                        1,
+                    ),
+                    action: shell::SettingsPointerAction::Page(shell::SettingsControlId(
+                        POINTER_SERVER_ACTION_BASE + (server_idx as u64 * 4) + action,
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
     }
 }
 

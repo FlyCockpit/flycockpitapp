@@ -128,6 +128,10 @@ impl App {
                 result == crate::tui::structured_paste::DedupResult::Committed
             })
         {
+            crate::tui::input_source::acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Committed,
+            );
             return;
         }
         if let Some(probe) = self.pending_paste_probes.get(&correlation_id)
@@ -208,12 +212,13 @@ impl App {
                 }
                 return;
             }
-            let _ = self.paste_correlations.commit(
+            let commit = self.paste_correlations.commit(
                 correlation_id,
                 request_generation,
                 host,
                 self.event_loop_monotonic_now,
             );
+            crate::tui::input_source::acknowledge_native_paste(correlation_id, commit);
             if let Some(fence) = self.submission_fences.get_mut(&fence_id) {
                 if let Some(crate::tui::structured_paste::PasteSlotState::Pending {
                     request,
@@ -246,11 +251,21 @@ impl App {
         let Some(mut request) =
             existing.or_else(|| self.allocate_paste_request_with_id(source, correlation_id))
         else {
+            crate::tui::input_source::acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
             self.show_toast("Paste unavailable", super::ToastKind::Error);
             return;
         };
         request.source = source;
         self.handle_paste_inner(data, Some(request));
+        if !self.pending_paste_probes.contains_key(&correlation_id) {
+            crate::tui::input_source::acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Committed,
+            );
+        }
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {

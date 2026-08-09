@@ -1032,12 +1032,13 @@ impl App {
         {
             return;
         }
-        let _ = self.paste_correlations.commit(
+        let commit = self.paste_correlations.commit(
             request_id,
             request_generation,
             probe.request.host,
             self.event_loop_monotonic_now,
         );
+        crate::tui::input_source::acknowledge_native_paste(request_id, commit);
         let Some(fence_id) = probe.owner_fence else {
             if source_draft_generation != self.draft_generation {
                 return;

@@ -35,6 +35,8 @@ struct HeldHandleRecoveryProof {
 pub(crate) struct MediaStorageRecovery {
     db: cockpit_db::Db,
     owned_root: std::sync::Arc<DirGuard>,
+    borrowed_sources:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, BorrowedSourceHandle>>>,
 }
 
 impl MediaStorageRecovery {
@@ -46,6 +48,7 @@ impl MediaStorageRecovery {
         Ok(Self {
             db,
             owned_root: std::sync::Arc::new(root),
+            borrowed_sources: Default::default(),
         })
     }
 
@@ -59,7 +62,27 @@ impl MediaStorageRecovery {
         Ok(Self {
             db,
             owned_root: std::sync::Arc::new(root),
+            borrowed_sources: Default::default(),
         })
+    }
+
+    /// Transfer the already-open no-delete local-path handle from registration
+    /// into daemon ownership. Recovery consumes it only after its attachment
+    /// identity has been selected under the same Owner scope.
+    pub(crate) fn register_local_path_source(
+        &self,
+        attachment_id: Uuid,
+        source: BorrowedSourceHandle,
+    ) -> Result<()> {
+        ensure!(
+            is_uuid_v7(attachment_id),
+            "borrowed attachment id must be UUIDv7"
+        );
+        self.borrowed_sources
+            .lock()
+            .map_err(|_| anyhow::anyhow!("borrowed source registry poisoned"))?
+            .insert(attachment_id, source);
+        Ok(())
     }
 
     pub(crate) async fn recover(
@@ -71,6 +94,19 @@ impl MediaStorageRecovery {
         now_unix_ms: i64,
     ) -> Result<LocalMediaOwnerReceiptV1> {
         let root = self.owned_root.clone();
+        let borrowed_source =
+            if request.disposition == MediaSecurityRecoveryDisposition::ResumeVerifiedCleanup {
+                match borrowed_source {
+                    Some(source) => Some(source),
+                    None => self
+                        .borrowed_sources
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("borrowed source registry poisoned"))?
+                        .remove(&request.attachment_id),
+                }
+            } else {
+                borrowed_source
+            };
         self.db
             .transaction(move |conn| {
                 let snapshot = match cockpit_db::Db::security_recovery_snapshot_conn(
@@ -118,6 +154,10 @@ impl MediaStorageRecovery {
             })
             .await
     }
+}
+
+fn is_uuid_v7(value: Uuid) -> bool {
+    !value.is_nil() && value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
 }
 
 fn commit_security_recovery(

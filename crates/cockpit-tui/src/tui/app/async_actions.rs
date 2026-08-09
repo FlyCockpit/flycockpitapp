@@ -1015,21 +1015,36 @@ impl App {
         let positional_wire = deferred.submission.text == fence.captured_composer;
         let positional_display = deferred.display == fence.captured_composer;
         if !fence.model.supports_images {
-            for (index, (offset, _)) in resolved_images.iter().enumerate().rev() {
-                let note = format!(
-                    "[Pasted image #{}: not sent — current model has no image support]",
-                    index + 1
-                );
-                if positional_wire {
+            let first_note_number = deferred.submission.text.matches("[Pasted image #").count()
+                + deferred.submission.images.len()
+                + 1;
+            let notes = resolved_images
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    format!(
+                        "[Pasted image #{}: not sent — current model has no image support]",
+                        first_note_number + index
+                    )
+                })
+                .collect::<Vec<_>>();
+            if positional_wire {
+                for ((offset, _), note) in resolved_images.iter().zip(&notes).rev() {
                     let offset = floor_char_boundary(&deferred.submission.text, *offset);
-                    deferred.submission.text.insert_str(offset, &note);
-                } else {
-                    deferred.submission.text.push_str(&note);
+                    deferred.submission.text.insert_str(offset, note);
                 }
-                if positional_display {
+            } else {
+                for note in &notes {
+                    deferred.submission.text.push_str(note);
+                }
+            }
+            if positional_display {
+                for (offset, _) in resolved_images.iter().rev() {
                     let offset = floor_char_boundary(&deferred.display, *offset);
                     deferred.display.insert_str(offset, "[image]");
-                } else {
+                }
+            } else {
+                for _ in &resolved_images {
                     deferred.display.push_str("[image]");
                 }
             }

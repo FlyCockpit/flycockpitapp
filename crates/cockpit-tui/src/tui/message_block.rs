@@ -258,17 +258,18 @@ pub(crate) fn slice_spans_at_width(
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    let styles = spans
+    let scalars = spans
         .iter()
-        .flat_map(|span| std::iter::repeat_n(span.style, span.content.chars().count()))
+        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
         .collect::<Vec<_>>();
-    let mut style_offset = 0usize;
+    let mut scalar_offset = 0usize;
     let flat = markdown::semantic_graphemes(&text)
         .into_iter()
         .map(|grapheme| {
-            let style = styles.get(style_offset).copied().unwrap_or_default();
-            style_offset += grapheme.chars().count();
-            (grapheme, style)
+            let end = scalar_offset + grapheme.chars().count();
+            let styled_scalars = scalars.get(scalar_offset..end).unwrap_or_default().to_vec();
+            scalar_offset = end;
+            (grapheme, styled_scalars)
         })
         .collect::<Vec<_>>();
     let mut used = 0usize;
@@ -296,19 +297,21 @@ pub(crate) fn slice_spans_at_width(
     (head, tail)
 }
 
-fn group_into_spans(graphemes: &[(String, Style)]) -> Vec<Span<'static>> {
+fn group_into_spans(graphemes: &[(String, Vec<(char, Style)>)]) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut current_style = None;
     let mut current_text = String::new();
-    for (grapheme, style) in graphemes {
-        match current_style {
-            Some(current) if current == *style => current_text.push_str(grapheme),
-            _ => {
-                if let Some(current) = current_style.take() {
-                    out.push(Span::styled(std::mem::take(&mut current_text), current));
+    for (_, styled_scalars) in graphemes {
+        for &(ch, style) in styled_scalars {
+            match current_style {
+                Some(current) if current == style => current_text.push(ch),
+                _ => {
+                    if let Some(current) = current_style.take() {
+                        out.push(Span::styled(std::mem::take(&mut current_text), current));
+                    }
+                    current_style = Some(style);
+                    current_text.push(ch);
                 }
-                current_style = Some(*style);
-                current_text.push_str(grapheme);
             }
         }
     }
@@ -323,6 +326,7 @@ fn group_into_spans(graphemes: &[(String, Style)]) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod provenance_tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn markdown_provenance_wraps_and_indents_with_the_rendered_cells() {
@@ -367,5 +371,34 @@ mod provenance_tests {
             .1;
         assert_eq!(copied, "ab👩\u{200d}💻e\u{301}z");
         assert!(block.copy_newlines_before.iter().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn grapheme_wrap_preserves_styles_inside_atomic_cluster() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let spans = vec![
+            Span::raw("ab"),
+            Span::styled("e", red),
+            Span::styled("\u{301}", blue),
+            Span::styled("👩\u{200d}", red),
+            Span::styled("💻", blue),
+        ];
+        let (head, tail) = slice_spans_at_width(spans, 2);
+        assert_eq!(
+            head.iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "ab"
+        );
+        let tail = tail.expect("clusters continue after the first row");
+        assert_eq!(tail[0].content.as_ref(), "e");
+        assert_eq!(tail[0].style, red);
+        assert_eq!(tail[1].content.as_ref(), "\u{301}");
+        assert_eq!(tail[1].style, blue);
+        assert_eq!(tail[2].content.as_ref(), "👩\u{200d}");
+        assert_eq!(tail[2].style, red);
+        assert_eq!(tail[3].content.as_ref(), "💻");
+        assert_eq!(tail[3].style, blue);
     }
 }

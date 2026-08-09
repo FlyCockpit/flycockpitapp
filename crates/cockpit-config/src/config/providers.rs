@@ -342,12 +342,8 @@ impl ActiveModelRef {
         if self.model.is_empty() {
             return Err("active model model must not be empty");
         }
-        if self
-            .reasoning_effort
-            .as_ref()
-            .is_some_and(|effort| effort.value.is_empty())
-        {
-            return Err("active model reasoning effort must not be empty");
+        if let Some(effort) = &self.reasoning_effort {
+            effort.validate()?;
         }
         Ok(())
     }
@@ -410,10 +406,31 @@ impl ModelAvailability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActiveReasoningEffort {
-    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub value: String,
+}
+
+impl ActiveReasoningEffort {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.value.is_empty() {
+            return Err("active reasoning effort must not be empty");
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveReasoningEffort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            value: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self { value: wire.value };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

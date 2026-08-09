@@ -333,12 +333,15 @@ macro_rules! canonical_struct {
 canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
 canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
 canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
-canonical_struct!(
-    cockpit_config::config::providers::ActiveReasoningEffort,
-    self,
-    out,
-    [value]
-);
+impl CanonicalFcorValueV1 for cockpit_config::config::providers::ActiveReasoningEffort {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        let mut nested = CanonicalParamsV1::new();
+        self.value.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
 impl CanonicalFcorValueV1 for crate::RunInvocationOptions {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         ensure!(self.max_turns != Some(0), "run_options_zero_max_turns");
@@ -692,6 +695,56 @@ mod tests {
             "resolve_response_depth_exceeded"
         );
         assert_eq!(out.into_bytes(), vec![7]);
+
+        let mut depth_32 = cockpit_db::wire::ResolveResponse::Cancel;
+        for _ in 0..31 {
+            depth_32 = cockpit_db::wire::ResolveResponse::Batch {
+                responses: vec![depth_32],
+            };
+        }
+        assert!(
+            depth_32
+                .encode_fcor_value_v1(&mut CanonicalParamsV1::new())
+                .is_ok()
+        );
+
+        let nodes_4096 = cockpit_db::wire::ResolveResponse::Batch {
+            responses: std::iter::repeat_n(cockpit_db::wire::ResolveResponse::Cancel, 4095)
+                .collect(),
+        };
+        assert!(
+            nodes_4096
+                .encode_fcor_value_v1(&mut CanonicalParamsV1::new())
+                .is_ok()
+        );
+        let nodes_4097 = cockpit_db::wire::ResolveResponse::Batch {
+            responses: std::iter::repeat_n(cockpit_db::wire::ResolveResponse::Cancel, 4096)
+                .collect(),
+        };
+        let mut out = CanonicalParamsV1::new();
+        out.push_u8(6);
+        assert_eq!(
+            nodes_4097
+                .encode_fcor_value_v1(&mut out)
+                .unwrap_err()
+                .to_string(),
+            "resolve_response_nodes_exceeded"
+        );
+        assert_eq!(out.into_bytes(), vec![6]);
+
+        let invalid_effort = cockpit_config::config::providers::ActiveReasoningEffort {
+            value: String::new(),
+        };
+        let mut out = CanonicalParamsV1::new();
+        out.push_u8(5);
+        assert_eq!(
+            invalid_effort
+                .encode_fcor_value_v1(&mut out)
+                .unwrap_err()
+                .to_string(),
+            "active reasoning effort must not be empty"
+        );
+        assert_eq!(out.into_bytes(), vec![5]);
     }
 
     #[test]

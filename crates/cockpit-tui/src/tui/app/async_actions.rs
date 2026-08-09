@@ -264,19 +264,16 @@ impl App {
                                 } => (disposition, wire_fingerprint),
                                 cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
                             };
-                            if wire_fingerprint.is_empty() {
-                                if let Some(record) = self
-                                    .delivery_unconfirmed_records
-                                    .get_mut(&client_submission_id)
-                                {
-                                    record.probe_in_flight = false;
-                                    record.probe_exhausted = true;
-                                }
-                            } else if let Some(record) = self
+                            if let Some(record) = self
                                 .delivery_unconfirmed_records
                                 .remove(&client_submission_id)
                             {
                                 self.submission_fences.remove(&client_submission_id);
+                                let wire_fingerprint = if wire_fingerprint.is_empty() {
+                                    "unavailable"
+                                } else {
+                                    &wire_fingerprint
+                                };
                                 self.push_plain(format!(
                                     "Delivery {outcome} for message {} in session {} (daemon wire {}).",
                                     record.client_submission_id,

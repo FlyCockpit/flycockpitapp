@@ -212,6 +212,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_headers_surface_dispatches_every_enabled_control();
     pointer_reachable_nested_surfaces_render_and_dispatch();
     pointer_prompt_surfaces_render_and_dispatch();
+    pointer_active_model_retention_renders_dispatches_and_persists();
     pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state();
     pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state();
     pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state();
@@ -237,6 +238,167 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_model_reapply_renders_and_dispatches_from_fresh_state();
     pointer_model_rebind_renders_and_dispatches_from_fresh_state();
     pointer_model_dismiss_renders_and_dispatches_from_fresh_state();
+}
+
+#[test]
+fn pointer_active_model_retention_renders_dispatches_and_persists() {
+    use super::super::pointer_actions::{
+        ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
+    };
+    use cockpit_config::providers::{ActiveModelRef, PromptCacheRetention};
+    use cockpit_core::daemon::proto::Request;
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let mut config = one_provider_config(None);
+        config.active_model = Some(ActiveModelRef {
+            provider: "p".into(),
+            model: "stale".into(),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: Some(PromptCacheRetention::Default),
+        });
+        let (tmp, mut dialog) = dialog_with_config(config.clone());
+        dialog.page = super::super::providers_page(active_model_settings_page(&config));
+        let Some(ProvidersPage::ModelSettings { editor, .. }) =
+            dialog.page.downcast_mut::<ProvidersPage>()
+        else {
+            panic!("active model fixture must open model settings")
+        };
+        editor.cursor = editor
+            .fields()
+            .iter()
+            .position(|field| *field == ProviderSettingId::PromptCacheRetention)
+            .expect("active model exposes prompt-cache retention");
+        (tmp, dialog)
+    }
+
+    let mut inventory = std::collections::HashSet::new();
+    let entry = one_provider_config(None).providers["p"].clone();
+    inventory.extend(
+        SettingsEditor::for_provider("p", &entry)
+            .fields()
+            .iter()
+            .copied(),
+    );
+    inventory.extend(
+        SettingsEditor::for_model("p", &entry, "stale")
+            .with_active_prompt_cache_retention(
+                PromptCacheRetention::Default,
+                cockpit_config::providers::CapabilityStatus::Supported,
+            )
+            .fields()
+            .iter()
+            .copied(),
+    );
+    let mut grok = entry.clone();
+    grok.url = "https://api.x.ai/v1".into();
+    inventory.extend(
+        SettingsEditor::for_provider("grok", &grok)
+            .fields()
+            .iter()
+            .copied(),
+    );
+    assert_eq!(
+        inventory,
+        super::super::settings_editor::ALL_PROVIDER_SETTING_IDS
+            .iter()
+            .copied()
+            .collect(),
+        "scope- and capability-specific sources cover the sealed setting inventory"
+    );
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 20);
+    let actions = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::SettingEdit(
+                            ProviderSettingId::PromptCacheRetention,
+                        ),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 1, "active model owns one retention source");
+
+    let (_tmp, mut fresh) = fixture();
+    let _ = render_provider_rows(&fresh, 110, 20);
+    let target = fresh
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.enabled
+                && target.action
+                    == super::super::shell::SettingsPointerAction::Page(actions[0].clone())
+        })
+        .cloned()
+        .expect("fresh active model renders exact retention identity");
+    for kind in [
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        assert_eq!(
+            fresh.handle_pointer(super::super::tests::settings_mouse(
+                kind,
+                target.rect.x,
+                target.rect.y,
+            )),
+            super::super::SettingsPointerOutcome::Consumed
+        );
+    }
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::ModelSettings { editor, .. })
+            if editor.active_prompt_cache_retention() == Some(PromptCacheRetention::Extended)
+                && editor.value_str(ProviderSettingId::PromptCacheRetention).starts_with("extended")
+    ));
+
+    fresh.handle_key(press(KeyCode::Char('s')));
+    assert_eq!(
+        fresh
+            .config
+            .active_model
+            .as_ref()
+            .and_then(|active| active.prompt_cache_retention),
+        Some(PromptCacheRetention::Extended)
+    );
+    let staged = fresh.pending_default_model_update_id;
+    assert!(matches!(
+        fresh.pending_daemon_request.as_ref(),
+        Some(Request::SetDefaultModel {
+            default_update_id,
+            provider: Some(provider),
+            model: Some(model),
+            prompt_cache_retention: Some(retention),
+            clear: false,
+            ..
+        }) if Some(*default_update_id) == staged
+            && provider == "p"
+            && model == "stale"
+            && retention == "extended"
+    ));
+    let reloaded = cockpit_config::providers::ConfigDoc::load(&fresh.config_path)
+        .unwrap()
+        .providers();
+    assert_eq!(
+        reloaded
+            .active_model
+            .as_ref()
+            .and_then(|active| active.prompt_cache_retention),
+        Some(PromptCacheRetention::Default),
+        "default persistence remains daemon-owned until verified completion"
+    );
 }
 
 #[test]

@@ -540,6 +540,7 @@ impl SettingsCx {
     ) -> (
         Vec<Line<'static>>,
         Vec<(usize, super::pointer_actions::SettingsPointerAction)>,
+        Vec<(usize, super::pointer_actions::SettingsPointerAction)>,
     ) {
         let muted = muted_style();
         let mut lines = Vec::new();
@@ -629,6 +630,20 @@ impl SettingsCx {
         )));
 
         let rows = self.tools_page_rows();
+        let read_only = bindings
+            .iter()
+            .filter_map(|(line, id)| {
+                matches!(
+                    rows.get(id.0 as usize),
+                    Some(ToolRow::Builtin(_) | ToolRow::McpTool { .. })
+                )
+                .then(|| {
+                    self.tools_pointer_action(p, id.0 as usize)
+                        .map(|action| (*line, action))
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
         bindings.retain(|(_, id)| {
             id.0 >= 10_000
                 || !matches!(
@@ -643,7 +658,7 @@ impl SettingsCx {
                     .map(|action| (line, action))
             })
             .collect();
-        (lines, semantic)
+        (lines, semantic, read_only)
     }
 
     fn tools_pointer_action(
@@ -976,7 +991,7 @@ impl SettingsCx {
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
-        let (lines, bindings) = self.build_tools_page_lines_with_bindings(area.width, p);
+        let (lines, bindings, read_only) = self.build_tools_page_lines_with_bindings(area.width, p);
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
             frame,
@@ -988,6 +1003,26 @@ impl SettingsCx {
             &self.pointer_surface,
             SettingsScrollRegionId("tools"),
         );
+        let offset = self.scroll_states.offset_for("tools");
+        for (line, action) in read_only {
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if screen_row >= usize::from(area.height) {
+                continue;
+            }
+            self.pointer_surface.register(shell::SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    area.width,
+                    1,
+                ),
+                action: shell::SettingsPointerAction::Page(action),
+                enabled: false,
+                disabled_reason: Some("read-only inventory row"),
+            });
+        }
     }
 }
 

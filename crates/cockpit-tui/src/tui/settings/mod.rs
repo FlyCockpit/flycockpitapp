@@ -7,7 +7,7 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 13 nodes; see `root_nodes()`):
+//! The Settings page tree (root has 14 nodes; see `root_nodes()`):
 //!
 //! ```text
 //! Root
@@ -16,6 +16,7 @@
 //!  │    ├── List ──── Add Provider wizard ─── (template -> URL -> Auth -> save)
 //!  │    │           └── Edit Provider page
 //!  │    └── FetchAll dialog (triggered by /fetch-models)
+//!  ├── Dependencies (read-only health)
 //!  ├── Agents
 //!  ├── Interface          ┐
 //!  ├── Behavior           │ category pages
@@ -36,6 +37,7 @@ mod agent_editor;
 mod agents_page;
 mod auth;
 mod category;
+mod dependencies_page;
 mod descriptor;
 mod grab;
 mod harnesses_page;
@@ -1733,6 +1735,12 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
+        if let Some(page) = self
+            .page
+            .downcast_mut::<dependencies_page::DependenciesPage>()
+        {
+            page.tick();
+        }
         let pending = self
             .page
             .downcast_mut::<ProvidersPage>()
@@ -2022,6 +2030,7 @@ impl SettingsPage for RootPage {
                         status: None,
                         delete_pending: false,
                     })),
+                    "Dependencies" => Some(dependencies_page::page(cx.agents_cwd())),
                     "Agents" => Some(agents_page(AgentsPage::new(&cx.agents_cwd()))),
                     "Interface" => {
                         cx.reload_extended();
@@ -2140,7 +2149,7 @@ const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// `Default model for new sessions` leads, then the locked scheme in order;
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
-fn root_nodes() -> [NavNode; 13] {
+fn root_nodes() -> [NavNode; 14] {
     [
         NavNode {
             title: DEFAULT_MODEL_TITLE,
@@ -2149,6 +2158,10 @@ fn root_nodes() -> [NavNode; 13] {
         NavNode {
             title: PROVIDERS_TITLE,
             description: "Provider setup and request controls: endpoints, headers, model lists, default model, context/cache, fallback, wire API, and per-provider/per-model inline-<think> extraction overrides.",
+        },
+        NavNode {
+            title: "Dependencies",
+            description: "Read-only dependency health grouped by safety, selected features, optional integrations, and accelerators.",
         },
         NavNode {
             title: "Agents",

@@ -7,7 +7,7 @@ fn reports_unopenable_database() {
 
     let output = home
         .cockpit()
-        .args(["doctor", "--offline"])
+        .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();
     let text = output_text(&output);
@@ -22,7 +22,7 @@ fn reports_amended_migration() {
     let home = IsolatedHome::new();
     let first = home
         .cockpit()
-        .args(["doctor", "--offline"])
+        .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();
     assert_eq!(first.status.code(), Some(1), "{}", output_text(&first));
@@ -37,7 +37,7 @@ fn reports_amended_migration() {
 
     let output = home
         .cockpit()
-        .args(["doctor", "--offline"])
+        .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();
     let text = output_text(&output);
@@ -51,18 +51,19 @@ fn reports_amended_migration() {
 #[test]
 fn reports_daemon_status_without_starting_it() {
     let home = IsolatedHome::new();
+    home.write_local_provider_config("http://127.0.0.1:9/v1");
     assert!(!home.socket_path().exists());
     assert!(!home.pid_file().exists());
 
     let output = home
         .cockpit()
-        .args(["doctor", "--offline"])
+        .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();
     let text = output_text(&output);
-    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("daemon:"), "{text}");
-    assert!(text.contains("doctor did not start it"), "{text}");
+    assert!(text.contains("status: informational"), "{text}");
     assert!(
         !home.socket_path().exists(),
         "doctor must not start a daemon"
@@ -115,7 +116,7 @@ async fn exit_codes() {
     let daemon = SpawnedDaemon::start_with_home(clean_home).await;
     let clean = daemon
         .command()
-        .args(["doctor", "--offline"])
+        .args(["--no-sandbox", "doctor", "--offline"])
         .output()
         .unwrap();
     assert_eq!(clean.status.code(), Some(0), "{}", output_text(&clean));

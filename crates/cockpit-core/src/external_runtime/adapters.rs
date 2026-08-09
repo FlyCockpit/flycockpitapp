@@ -491,6 +491,10 @@ pub struct IntegrationHealthComposeInput {
     pub harnesses: Vec<ConfiguredCommandInput>,
     pub lsp_servers: Vec<ConfiguredCommandInput>,
     pub stdio_mcp: Vec<ConfiguredCommandInput>,
+    /// Per-invocation CLI override; `None` uses layered configuration.
+    pub sandbox_enabled: Option<bool>,
+    /// Catalog-owned features selected by resolved configuration.
+    pub selected_features: BTreeSet<String>,
 }
 
 /// Compose catalog + configured integrations into the process-global health
@@ -538,17 +542,35 @@ pub fn compose_settings_doctor_health_with_executor(
 
     let descriptors = registry.descriptors();
     let mut features = BTreeSet::new();
-    for desc in &descriptors {
-        features.insert(desc.owner.feature.clone());
+    // Registration is inventory, not selection. Only configured entries in
+    // this composition make their owning feature applicable.
+    for id in &keep {
+        if let Some(desc) = descriptors.iter().find(|desc| desc.id.as_str() == id) {
+            features.insert(desc.owner.feature.clone());
+        }
+    }
+    features.extend(input.selected_features.iter().cloned());
+    let extended = crate::config::extended::load_for_cwd(cwd);
+    if input.sandbox_enabled.unwrap_or(true)
+        && extended.sandbox.default_mode.enabled()
+        && !extended.sandbox.default_mode.is_container()
+    {
+        features.insert("shell-sandbox".to_string());
+    }
+    if crate::config::extended::resolve_computer_use_policy_for_cwd(cwd)
+        .is_some_and(|mode| !matches!(mode, crate::config::extended::ComputerUseMode::Disabled))
+    {
+        features.insert("computer-use".to_string());
     }
     let platform = super::platform::detect_host_platform();
-    // Container engines: only mark the feature selected and probe when mode is
-    // not Disabled (Settings may call set_container_engine_mode).
-    let engine_mode = super::safety_adapters::current_container_engine_mode();
-    if !matches!(
-        engine_mode,
+    // Container engine probes are applicable only when layered configuration
+    // selects a container sandbox; the runtime mode then narrows the engine.
+    let engine_mode = if extended.sandbox.default_mode.is_container() {
+        super::safety_adapters::current_container_engine_mode()
+    } else {
         super::safety_adapters::ContainerEngineMode::Disabled
-    ) {
+    };
+    if extended.sandbox.default_mode.is_container() {
         features.insert("container-sandbox".to_string());
     }
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
@@ -564,6 +586,13 @@ pub fn compose_settings_doctor_health_with_executor(
         &ctx,
         super::probe::ProbeDeadlines::default(),
         &cancel,
+    );
+    snapshot.groups.insert(
+        "computer-use".to_owned(),
+        super::health::evaluate_requirement_group(
+            &super::safety_adapters::computer_use_requirement_group(),
+            &snapshot,
+        ),
     );
     // Merge Docker/Podman health from a private mode-aware refresh (never
     // registered into the global catalog).
@@ -1446,6 +1475,8 @@ mod tests {
             harnesses: vec![harness],
             lsp_servers: vec![lsp],
             stdio_mcp: vec![mcp],
+            sandbox_enabled: None,
+            selected_features: BTreeSet::new(),
         };
         // Isolate global store between tests that share the process registry.
         global_health_store().clear();

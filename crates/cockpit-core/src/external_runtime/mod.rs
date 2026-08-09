@@ -11,6 +11,7 @@ mod adapters;
 mod health;
 mod platform;
 mod probe;
+mod projection;
 mod registry;
 mod safety_adapters;
 mod sanitize;
@@ -48,6 +49,12 @@ pub use platform::{
 pub use probe::{
     CancelToken, EvaluationContext, ProbeCommandResult, ProbeDeadlines, ProbeExecutor,
     RecordingProbeExecutor, RunRecord, SystemProbeExecutor, evaluate_descriptor, refresh_snapshot,
+};
+pub use projection::{
+    DEPENDENCY_HEADLESS_SCHEMA_VERSION, DependenciesPageState, DependencyProjection,
+    DependencyProjectionRow, DependencyStartupPolicy, DependencyViewState,
+    current_startup_dependency_policy, freeze_pending_as_timed_out, project_dependencies,
+    startup_dependency_policy,
 };
 pub use safety_adapters::{
     ContainerEngineMode, ContainerEngineSelection, ContainerRuntime as SafetyContainerRuntime,

@@ -307,6 +307,11 @@ pub fn print_header(info: &LaunchInfo) {
     for line in header_lines(info) {
         println!("{line}");
     }
+    if let Some(policy) = crate::external_runtime::current_startup_dependency_policy()
+        && let Some(summary) = policy.summary
+    {
+        println!("dependency warning: {summary}");
+    }
 }
 
 fn resolve_launch_dir(project: Option<&Path>) -> PathBuf {

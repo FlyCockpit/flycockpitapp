@@ -438,6 +438,10 @@ pub struct DoctorArgs {
     /// Skip provider network checks. Static config, credential, git, and container checks still run.
     #[arg(long)]
     pub offline: bool,
+
+    /// Emit the versioned, secret-safe dependency snapshot as JSON.
+    #[arg(long)]
+    pub dependencies_json: bool,
 }
 
 #[derive(Debug, clap::Args)]

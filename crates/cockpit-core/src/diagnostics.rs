@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::StreamExt as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub struct DiagnosticsSnapshot {
     pub default_model_journals: Vec<String>,
     /// Exact external side-effect journal record/byte/age counts.
     pub external_journal: Vec<String>,
+    pub dependencies: crate::external_runtime::DependencyProjection,
     pub has_failures: bool,
 }
 
@@ -61,6 +62,7 @@ pub async fn cli_snapshot(
     }
 
     let launch = crate::welcome::load_bundle_bootstrap(path, false);
+    let dependency_cwd = launch.launch.cwd.clone();
     let extended = launch.extended;
     let mut snapshot = build_snapshot(DiagnosticsInput {
         cwd: launch.launch.cwd,
@@ -74,6 +76,16 @@ pub async fn cli_snapshot(
         pending_model_selection: None,
         sandbox_enabled: Some(!no_sandbox),
     })?;
+    snapshot.dependencies = tokio::task::spawn_blocking(move || {
+        dependency_projection_with_deadline_for_run(
+            dependency_cwd,
+            Duration::from_secs(2),
+            !no_sandbox,
+        )
+    })
+    .await
+    .context("dependency diagnostics worker join")??;
+    snapshot.has_failures |= snapshot.dependencies.has_required_failures();
     let providers = crate::config::providers::ConfigDoc::load_effective(Path::new(&snapshot.cwd));
     let (network, network_failed) = provider_network_lines(&providers, offline).await;
     snapshot.network = network;
@@ -81,14 +93,23 @@ pub async fn cli_snapshot(
     let (database, database_failed) = database_lines(&extended).await;
     snapshot.database = database;
     snapshot.has_failures |= database_failed;
-    let (daemon, daemon_failed) = daemon_lines().await;
+    let (mut daemon, _) = daemon_lines().await;
+    daemon.insert(
+        0,
+        "diagnostic authority: in-process; daemon is not required".to_string(),
+    );
     snapshot.daemon = daemon;
-    snapshot.has_failures |= daemon_failed;
     Ok(snapshot)
 }
 
 pub fn tui_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
-    build_snapshot(input)
+    let cwd = input.cwd.clone();
+    let sandbox_enabled = input.sandbox_enabled.unwrap_or(true);
+    let mut snapshot = build_snapshot(input)?;
+    snapshot.dependencies =
+        dependency_projection_with_deadline_for_run(cwd, Duration::from_secs(2), sandbox_enabled)?;
+    snapshot.has_failures |= snapshot.dependencies.has_required_failures();
+    Ok(snapshot)
 }
 
 pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
@@ -130,6 +151,11 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
         );
     }
     push_section(&mut out, "external journal", &snapshot.external_journal);
+    push_section(
+        &mut out,
+        "dependencies",
+        &snapshot.dependencies.render_lines(),
+    );
     out
 }
 
@@ -150,9 +176,12 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
     let (external_journal, external_journal_failed) = external_journal_lines();
 
-    // Settings/doctor composition: register catalog + configured harness/LSP/MCP
-    // into shared external-runtime health (resolution-only for configured cmds).
-    compose_doctor_integration_health(&input.cwd, &harnesses);
+    let dependency_snapshot = crate::external_runtime::global_health_store().current();
+    let dependency_descriptors = crate::external_runtime::global_registry().descriptors();
+    let dependencies = crate::external_runtime::project_dependencies(
+        dependency_snapshot.as_deref(),
+        &dependency_descriptors,
+    );
 
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
@@ -212,6 +241,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
         ),
         default_model_journals: default_model_journal_lines(&input.cwd),
         external_journal,
+        dependencies,
         has_failures: provider_failures || external_journal_failed,
     })
 }
@@ -485,7 +515,7 @@ async fn daemon_lines() -> (Vec<String>, bool) {
         }
         crate::daemon::DaemonStatus::IncompatibleProtocol => (
             vec![
-                "status: FAILED (daemon protocol is incompatible; run `cockpit daemon restart`)"
+                "status: informational (daemon protocol is incompatible; doctor remains in-process; run `cockpit daemon restart`)"
                     .to_string(),
                 format!("socket: {socket}"),
             ],
@@ -493,7 +523,7 @@ async fn daemon_lines() -> (Vec<String>, bool) {
         ),
         crate::daemon::DaemonStatus::NotRunning => (
             vec![
-                "status: FAILED (canonical daemon is not running; doctor did not start it)"
+                "status: informational (canonical daemon is not running; doctor did not start it or require it)"
                     .to_string(),
                 format!("socket: {socket}"),
                 format!("pid file: {pid_file}"),
@@ -502,7 +532,7 @@ async fn daemon_lines() -> (Vec<String>, bool) {
         ),
         status => (
             vec![
-                format!("status: FAILED ({})", daemon_status_label(status)),
+                format!("status: informational ({})", daemon_status_label(status)),
                 format!("socket: {socket}"),
                 format!("pid file: {pid_file}"),
             ],
@@ -960,15 +990,30 @@ fn one_line(value: &str) -> String {
 fn compose_doctor_integration_health(
     cwd: &Path,
     harnesses: &std::collections::HashMap<String, crate::config::extended::HarnessConfig>,
-) {
+    sandbox_enabled: bool,
+) -> Result<std::sync::Arc<crate::external_runtime::ExternalRuntimeSnapshot>> {
     let mut compose = crate::external_runtime::IntegrationHealthComposeInput {
         harnesses: crate::external_runtime::harness_compose_inputs(harnesses),
         lsp_servers: Vec::new(),
         stdio_mcp: Vec::new(),
+        sandbox_enabled: Some(sandbox_enabled),
+        selected_features: harnesses
+            .iter()
+            .filter(|(name, config)| {
+                crate::external_runtime::known_harness_preset_names().contains(&name.as_str())
+                    && config.command.as_str() == name.as_str()
+            })
+            .map(|(name, _)| format!("harness.{name}"))
+            .collect(),
     };
     // Builtin + configured LSP recipes (command argv only; install stays feature-local).
     let extended = crate::config::extended::load_for_cwd(cwd);
     for view in crate::daemon::lsp::builtin_server_views(cwd, &extended) {
+        if !extended.lsp.servers.contains_key(&view.id)
+            || matches!(view.status, crate::daemon::lsp::LspServerStatus::Disabled)
+        {
+            continue;
+        }
         if let Some(input) = crate::external_runtime::lsp_command_input(&view.id, &view.command) {
             compose.lsp_servers.push(input);
         }
@@ -993,7 +1038,127 @@ fn compose_doctor_integration_health(
                 &server.args,
             ));
     }
-    let _ = crate::external_runtime::compose_settings_doctor_health(cwd, &compose);
+    crate::external_runtime::compose_settings_doctor_health(cwd, &compose)
+        .map_err(anyhow::Error::new)
+}
+
+/// Bounded, daemon-independent dependency snapshot used by CLI doctor and the
+/// TUI background refresh. The returned value is frozen; late worker results
+/// are dropped and cannot mutate the caller's printed/rendered projection.
+pub fn dependency_projection_with_deadline(
+    cwd: PathBuf,
+    deadline: Duration,
+) -> Result<crate::external_runtime::DependencyProjection> {
+    dependency_projection_with_deadline_for_run(cwd, deadline, true)
+}
+
+pub fn dependency_projection_with_deadline_for_run(
+    cwd: PathBuf,
+    deadline: Duration,
+    sandbox_enabled: bool,
+) -> Result<crate::external_runtime::DependencyProjection> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker_cwd = cwd.clone();
+    let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
+    let selected_harnesses: std::collections::BTreeSet<String> = harnesses
+        .iter()
+        .filter(|(name, config)| {
+            crate::external_runtime::known_harness_preset_names().contains(&name.as_str())
+                && config.command.as_str() == name.as_str()
+        })
+        .map(|(name, _)| format!("harness.{name}"))
+        .collect();
+    std::thread::Builder::new()
+        .name("dependency-doctor".into())
+        .spawn(move || {
+            let result =
+                compose_doctor_integration_health(&worker_cwd, &harnesses, sandbox_enabled).map(
+                    |snapshot| {
+                        crate::external_runtime::project_dependencies(
+                            Some(snapshot.as_ref()),
+                            &crate::external_runtime::global_registry().descriptors(),
+                        )
+                    },
+                );
+            let _ = tx.send(result);
+        })
+        .context("starting dependency diagnostics worker")?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let descriptors = crate::external_runtime::global_registry().descriptors();
+            let platform = crate::external_runtime::detect_host_platform();
+            let next_generation = crate::external_runtime::global_health_store()
+                .current()
+                .map_or(1, |value| value.generation.saturating_add(1));
+            let mut snapshot =
+                crate::external_runtime::ExternalRuntimeSnapshot::empty(next_generation, platform);
+            for descriptor in &descriptors {
+                snapshot
+                    .entries
+                    .entry(descriptor.id.as_str().to_owned())
+                    .or_insert_with(|| crate::external_runtime::HealthEntry {
+                        id: descriptor.id.clone(),
+                        state: if dependency_descriptor_applicable(
+                            descriptor,
+                            &cwd,
+                            platform,
+                            sandbox_enabled,
+                            &selected_harnesses,
+                        ) {
+                            crate::external_runtime::HealthState::Pending
+                        } else {
+                            crate::external_runtime::HealthState::NotApplicable
+                        },
+                        importance: descriptor.importance,
+                        target: descriptor.target,
+                        remedy: Some(descriptor.remedy.clone()),
+                        platform,
+                    });
+            }
+            let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
+            Ok(crate::external_runtime::project_dependencies(
+                Some(&snapshot),
+                &descriptors,
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("dependency diagnostics worker disconnected")
+        }
+    }
+}
+
+fn dependency_descriptor_applicable(
+    descriptor: &crate::external_runtime::ExternalRuntimeDescriptor,
+    cwd: &Path,
+    platform: crate::external_runtime::HostPlatform,
+    sandbox_enabled: bool,
+    selected_features: &std::collections::BTreeSet<String>,
+) -> bool {
+    use crate::external_runtime::{Applicability, ProbePolicy};
+    let extended = crate::config::extended::load_for_cwd(cwd);
+    let selected = matches!(
+        descriptor.probe_policy,
+        ProbePolicy::ConfiguredCommand { .. }
+    ) || selected_features.contains(&descriptor.owner.feature)
+        || (descriptor.owner.feature == "shell-sandbox"
+            && sandbox_enabled
+            && extended.sandbox.default_mode.enabled()
+            && !extended.sandbox.default_mode.is_container())
+        || (descriptor.owner.feature == "container-sandbox"
+            && extended.sandbox.default_mode.is_container())
+        || (descriptor.owner.feature == "computer-use"
+            && crate::config::extended::resolve_computer_use_policy_for_cwd(cwd).is_some_and(
+                |mode| !matches!(mode, crate::config::extended::ComputerUseMode::Disabled),
+            ));
+    match &descriptor.applicability {
+        Applicability::Always => true,
+        Applicability::WhenFeatureSelected => selected,
+        Applicability::Platforms(platforms) => platforms.contains(&platform),
+        Applicability::WhenFeatureSelectedOnPlatforms { platforms } => {
+            selected && (platforms.is_empty() || platforms.contains(&platform))
+        }
+    }
 }
 
 fn git_lines(cwd: &Path) -> Vec<String> {
@@ -1214,14 +1379,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_and_tui_paths_share_snapshot_builder() {
+    fn tui_doctor_refreshes_dependency_projection() {
         let tmp = tempfile::tempdir().unwrap();
         let input = base_input(tmp.path());
 
         let tui = trusted_tui_snapshot(input.clone());
-        let direct = trusted_snapshot(input);
-
-        assert_eq!(tui, direct);
+        assert_eq!(
+            tui.dependencies.schema_version,
+            crate::external_runtime::DEPENDENCY_HEADLESS_SCHEMA_VERSION
+        );
+        assert!(!tui.dependencies.rows.is_empty());
         assert!(render(&tui).contains("Cockpit diagnostics"));
     }
 

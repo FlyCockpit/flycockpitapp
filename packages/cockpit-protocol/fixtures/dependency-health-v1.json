@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "generation": 7,
+  "platform": "generic_linux",
+  "rows": [
+    {
+      "id": "git",
+      "state": "available",
+      "importance": "optional_integration",
+      "target": "host",
+      "discovered_version": "2.45.0",
+      "reason": "available"
+    }
+  ]
+}

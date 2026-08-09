@@ -16,6 +16,113 @@ fn ctx(platform: HostPlatform) -> EvaluationContext {
     EvaluationContext::new(platform)
 }
 
+#[test]
+fn dependency_headless_schema_and_shared_reason_are_stable() {
+    let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
+        .owner("test", "selected")
+        .probe_policy(ProbePolicy::configured_command("test-runtime", None))
+        .importance(DependencyImportance::RequiredWhenFeatureSelected)
+        .remedy(RemedyKind::config_guidance(
+            "configure an absolute executable path",
+        ))
+        .build()
+        .unwrap();
+    let unknown = project_dependencies(None, std::slice::from_ref(&descriptor));
+    assert_eq!(unknown.schema_version, DEPENDENCY_HEADLESS_SCHEMA_VERSION);
+    assert_eq!(unknown.rows[0].state, DependencyViewState::Unknown);
+    let json = serde_json::to_string(&unknown).unwrap();
+    assert!(!json.contains("PATH="));
+    assert!(!json.contains("environment"));
+    assert_eq!(
+        unknown.render_lines()[0],
+        format!("runtime.test: {}", unknown.rows[0].reason)
+    );
+}
+
+#[test]
+fn dependency_headless_fixture_matches_rust_schema() {
+    let fixture: DependencyProjection = serde_json::from_str(include_str!(
+        "../../../../packages/cockpit-protocol/fixtures/dependency-health-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.schema_version, DEPENDENCY_HEADLESS_SCHEMA_VERSION);
+    assert_eq!(fixture.rows[0].id, "git");
+    assert_eq!(fixture.rows[0].state, DependencyViewState::Available);
+}
+
+#[test]
+fn dependency_settings_first_paint_and_refresh_generation() {
+    let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
+        .owner("test", "optional")
+        .probe_policy(ProbePolicy::configured_command("runtime", None))
+        .build()
+        .unwrap();
+    let mut page = DependenciesPageState::first_paint(None, std::slice::from_ref(&descriptor));
+    assert_eq!(page.displayed.rows[0].state, DependencyViewState::Unknown);
+    let older = page.begin_refresh();
+    let newer = page.begin_refresh();
+    let mut completed = ExternalRuntimeSnapshot::empty(newer, HostPlatform::GenericLinux);
+    completed.entries.insert(
+        "runtime.test".into(),
+        HealthEntry {
+            id: "runtime.test".into(),
+            state: HealthState::Available {
+                resolved_path: None,
+                version_evidence: Some("1.2.3".into()),
+            },
+            importance: DependencyImportance::OptionalIntegration,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    let projected = project_dependencies(Some(&completed), std::slice::from_ref(&descriptor));
+    assert!(!page.apply_success(older, projected.clone()));
+    assert!(page.apply_success(newer, projected));
+    let generation = page.begin_refresh();
+    assert!(page.apply_failure(generation, "probe construction failed"));
+    assert_eq!(page.displayed.rows[0].state, DependencyViewState::Available);
+    page.close();
+    assert!(!page.apply_success(generation, page.displayed.clone()));
+}
+
+#[test]
+fn dependency_deadline_and_startup_policy_are_deterministic() {
+    let mut snapshot = ExternalRuntimeSnapshot::empty(1, HostPlatform::GenericLinux);
+    snapshot.entries.insert(
+        "required.pending".into(),
+        HealthEntry {
+            id: "required.pending".into(),
+            state: HealthState::Pending,
+            importance: DependencyImportance::RequiredForDefaultSafety,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    snapshot.entries.insert(
+        "optional.missing".into(),
+        HealthEntry {
+            id: "optional.missing".into(),
+            state: HealthState::Missing,
+            importance: DependencyImportance::OptionalAccelerator,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    let frozen = freeze_pending_as_timed_out(&snapshot);
+    let projection = project_dependencies(Some(&frozen), &[]);
+    assert_eq!(projection.rows[0].state, DependencyViewState::TimedOut);
+    assert_eq!(projection.rows[1].state, DependencyViewState::Missing);
+    let policy = startup_dependency_policy(&projection);
+    assert!(!policy.allowed);
+    assert_eq!(
+        policy.summary.as_deref(),
+        Some("required dependencies unavailable: required.pending: timed out")
+    );
+}
+
 fn ctx_features(platform: HostPlatform, features: &[&str]) -> EvaluationContext {
     EvaluationContext::new(platform).with_features(features.iter().copied())
 }

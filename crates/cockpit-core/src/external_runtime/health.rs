@@ -53,6 +53,8 @@ impl HealthState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum HealthCause {
+    /// No probe has completed for this in-memory view yet.
+    NeverProbed,
     SpawnFailed {
         failure: SpawnFailureKind,
     },

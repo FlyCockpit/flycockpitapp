@@ -204,13 +204,15 @@ fn bubblewrap_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::S
     ExternalRuntimeDescriptor::builder(ID_BUBBLEWRAP)
         .owner("cockpit-core", "shell-sandbox")
         .candidates(["bwrap"])
-        .applicability(Applicability::Platforms(vec![
-            HostPlatform::DebianUbuntu,
-            HostPlatform::FedoraRhel,
-            HostPlatform::Arch,
-            HostPlatform::GenericLinux,
-            HostPlatform::OtherUnix,
-        ]))
+        .applicability(Applicability::WhenFeatureSelectedOnPlatforms {
+            platforms: vec![
+                HostPlatform::DebianUbuntu,
+                HostPlatform::FedoraRhel,
+                HostPlatform::Arch,
+                HostPlatform::GenericLinux,
+                HostPlatform::OtherUnix,
+            ],
+        })
         .importance(DependencyImportance::RequiredWhenFeatureSelected)
         .target(ExecutionTarget::Host)
         .probe_policy(version_first_line())

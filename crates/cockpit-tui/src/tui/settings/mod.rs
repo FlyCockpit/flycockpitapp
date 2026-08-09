@@ -2096,6 +2096,14 @@ impl SettingsDialog {
                 if !target.enabled {
                     return SettingsPointerOutcome::Consumed;
                 }
+                if self
+                    .pointer_surface
+                    .pressed
+                    .replace(Some(target.action))
+                    .is_some()
+                {
+                    return SettingsPointerOutcome::Consumed;
+                }
                 match target.action {
                     SettingsPointerAction::Header(SettingsHeaderAction::Close) => {
                         return SettingsPointerOutcome::Close;
@@ -2124,6 +2132,9 @@ impl SettingsDialog {
                         let _ = self.apply_nav(nav);
                     }
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.pointer_surface.pressed.set(None);
             }
             _ => {}
         }

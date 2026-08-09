@@ -189,6 +189,7 @@ pub(super) struct SettingsPointerSurface {
     pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
     pub hover: std::cell::Cell<Option<SettingsControlId>>,
     pub enabled: std::cell::Cell<bool>,
+    pub pressed: std::cell::Cell<Option<SettingsPointerAction>>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -200,6 +201,7 @@ impl Default for SettingsPointerSurface {
             scroll_regions: RefCell::new(Vec::new()),
             hover: std::cell::Cell::new(None),
             enabled: std::cell::Cell::new(true),
+            pressed: std::cell::Cell::new(None),
         }
     }
 }
@@ -217,6 +219,7 @@ impl SettingsPointerSurface {
     pub fn clear_for_page(&self, area: Rect, page_token: u64) {
         if self.page_token.replace(Some(page_token)) != Some(page_token) {
             self.hover.set(None);
+            self.pressed.set(None);
         }
         self.clear_for(area);
     }

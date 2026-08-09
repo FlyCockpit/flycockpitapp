@@ -239,10 +239,10 @@ fn bubblewrap_notice_is_conditional_read_only_and_infallible() {
             fs::write(&bwrap, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        Command::new("sh")
+        Command::new("/bin/sh")
             .arg(&notice)
             .env_clear()
-            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .env("PATH", &tools)
             .env("COCKPIT_INSTALLER_TEST_UNAME", uname)
             .env("COCKPIT_INSTALLER_TEST_OS_RELEASE", &os_release)
             .output()

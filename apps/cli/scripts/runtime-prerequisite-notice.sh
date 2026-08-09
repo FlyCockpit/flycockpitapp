@@ -12,7 +12,17 @@ family=unknown
 os_release=${COCKPIT_INSTALLER_TEST_OS_RELEASE:-/etc/os-release}
 if [ -r "$os_release" ]; then
     # Values are data only; do not source the host-controlled file.
-    os_like=$(sed -n 's/^ID_LIKE="\{0,1\}\([^"]*\).*/\1/p; s/^ID="\{0,1\}\([^"]*\).*/\1/p' "$os_release" 2>/dev/null | tr '\n' ' ')
+    os_like=
+    while IFS= read -r line; do
+        case "$line" in
+            ID=*|ID_LIKE=*)
+                value=${line#*=}
+                value=${value#\"}
+                value=${value%\"}
+                os_like="$os_like $value"
+                ;;
+        esac
+    done < "$os_release"
     case " $os_like " in
         *" debian "*|*" ubuntu "*) family=debian ;;
         *" fedora "*|*" rhel "*|*" centos "*) family=fedora ;;

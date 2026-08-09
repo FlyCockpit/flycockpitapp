@@ -179,6 +179,18 @@ pub struct MediaExternalHandoff {
     pub dispatch: crate::external_journal::DispatchTicket,
 }
 
+/// Typed inputs for atomically preparing journal evidence and handing a media
+/// reservation to an external provider.
+pub struct MediaExternalHandoffRequest<'a> {
+    pub reservation_id: &'a str,
+    pub expected_version: u64,
+    pub owner_session_id: &'a crate::external_journal::projection::SafeToken,
+    pub idempotency_key: &'a crate::external_journal::projection::SafeToken,
+    pub projection: &'a crate::external_journal::projection::SanitizedProjection,
+    pub handoff_plans: Vec<MediaReservationPlan>,
+    pub wall_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MediaDenial {
     pub code: &'static str,
@@ -685,35 +697,29 @@ impl MediaReservationLedger {
     pub async fn prepare_external_handoff(
         &self,
         journal: &crate::external_journal::ExternalJournal,
-        id: &str,
-        expected_version: u64,
-        owner_session_id: &crate::external_journal::projection::SafeToken,
-        idempotency_key: &crate::external_journal::projection::SafeToken,
-        projection: &crate::external_journal::projection::SanitizedProjection,
-        handoff_plans: Vec<MediaReservationPlan>,
-        wall_ms: u64,
+        request: MediaExternalHandoffRequest<'_>,
     ) -> Result<MediaExternalHandoff, LedgerError> {
-        let journal_wall_ms = i64::try_from(wall_ms).map_err(|_| LedgerError::Overflow)?;
+        let journal_wall_ms = i64::try_from(request.wall_ms).map_err(|_| LedgerError::Overflow)?;
         let record = journal
             .prepare(
-                owner_session_id,
-                idempotency_key,
-                projection,
+                request.owner_session_id,
+                request.idempotency_key,
+                request.projection,
                 journal_wall_ms,
             )
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
         let mut dispatch = journal
-            .begin_dispatch(record.operation_id, projection, journal_wall_ms)
+            .begin_dispatch(record.operation_id, request.projection, journal_wall_ms)
             .await
             .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
         match self
             .handoff_external(
-                id,
-                expected_version,
+                request.reservation_id,
+                request.expected_version,
                 &record.operation_id.to_string(),
-                handoff_plans,
-                wall_ms,
+                request.handoff_plans,
+                request.wall_ms,
             )
             .await
         {
@@ -2857,19 +2863,23 @@ mod tests {
             sidecar_kind: SafeToken::parse("media-test").unwrap(),
             request_digest: Digest::of(b"request"),
         });
+        let owner_session_id = SafeToken::parse("session-handoff").unwrap();
+        let idempotency_key = SafeToken::parse("media-handoff-key").unwrap();
         let handoff = ledger
             .prepare_external_handoff(
                 &journal,
-                &receipt.reservation_id,
-                receipt.version,
-                &SafeToken::parse("session-handoff").unwrap(),
-                &SafeToken::parse("media-handoff-key").unwrap(),
-                &projection,
-                vec![
-                    plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
-                    plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
-                ],
-                2,
+                MediaExternalHandoffRequest {
+                    reservation_id: &receipt.reservation_id,
+                    expected_version: receipt.version,
+                    owner_session_id: &owner_session_id,
+                    idempotency_key: &idempotency_key,
+                    projection: &projection,
+                    handoff_plans: vec![
+                        plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
+                        plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
+                    ],
+                    wall_ms: 2,
+                },
             )
             .await
             .unwrap();

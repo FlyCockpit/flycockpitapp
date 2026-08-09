@@ -2679,7 +2679,7 @@ impl MutableClientState {
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting,
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashSet::new(),
             terminal_host,
         }

@@ -2812,7 +2812,7 @@ fn remote_state_with_grants(
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     }
@@ -2840,7 +2840,7 @@ fn owner_state() -> MutableClientState {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     }
@@ -3448,7 +3448,7 @@ async fn attached_state_with_worker_receiver(
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashSet::new(),
             terminal_host: test_terminal_host(),
         },
@@ -11540,7 +11540,7 @@ fn png_validation_reports_decoded_dimensions_for_ledger_reconciliation() {
 
 #[tokio::test]
 async fn attachment_upload_default_limits_match_config_defaults() {
-    let limits = AttachmentUploadLimits::default();
+    let limits = AttachmentUploadLimits;
     let cfg_limits: AttachmentUploadLimits = ExtendedConfig::default().daemon.uploads.into();
     assert_eq!(cfg_limits, limits);
 }
@@ -14495,7 +14495,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     };
@@ -14549,7 +14549,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashSet::new(),
         terminal_host: test_terminal_host(),
     };

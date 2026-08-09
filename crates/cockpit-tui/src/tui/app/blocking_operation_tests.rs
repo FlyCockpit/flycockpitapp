@@ -198,10 +198,3 @@ fn export_is_atomic_and_does_not_clobber() {
     assert!(source.contains("hard_link(&temp, out_path)"));
     assert!(source.contains("remove_file(&temp)"));
 }
-
-#[test]
-fn owned_async_actions_reject_late_and_double_completion() {
-    let source = include_str!("../async_action.rs");
-    assert!(source.contains("pending.generation != completed.generation"));
-    assert!(source.contains("let Some(pending) = self.pending.remove(&completed.id)"));
-}

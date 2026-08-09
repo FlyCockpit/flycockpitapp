@@ -613,7 +613,7 @@ impl AsyncActionRunner {
     pub fn drain_completed(&mut self) -> Vec<AsyncActionResult> {
         let mut results = Vec::new();
         while let Ok(completed) = self.rx.try_recv() {
-            let Some(pending) = self.pending.remove(&completed.id) else {
+            let Some(pending) = self.pending.get(&completed.id) else {
                 continue;
             };
             if pending.generation != completed.generation
@@ -622,6 +622,10 @@ impl AsyncActionRunner {
             {
                 continue;
             }
+            let pending = self
+                .pending
+                .remove(&completed.id)
+                .expect("validated pending action remains registered");
             if let Some(key) = pending.key
                 && self.keyed.get(&key) == Some(&completed.id)
             {
@@ -843,6 +847,37 @@ mod tests {
         assert_eq!(cancelled.len(), 1);
         assert!(matches!(&cancelled[0].payload, Err(error) if error.contains("cancelled")));
         assert!(runner.drain_cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_async_actions_reject_late_and_double_completion() {
+        let mut runner = AsyncActionRunner::default();
+        let (release, barrier) = oneshot::channel::<()>();
+        let action = runner.start(
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Text("current".to_string()))
+            },
+        );
+        runner.inject_completed_for_test(
+            action.id(),
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            Ok(AsyncActionPayload::Text("stale".to_string())),
+        );
+        assert!(runner.drain_completed().is_empty());
+        assert!(runner.is_pending(action.id()));
+
+        release.send(()).unwrap();
+        runner.notifier().notified().await;
+        assert_eq!(runner.drain_completed().len(), 1);
+        runner.inject_completed_for_test(
+            action.id(),
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            Ok(AsyncActionPayload::Text("duplicate".to_string())),
+        );
+        assert!(runner.drain_completed().is_empty());
     }
 
     #[tokio::test]

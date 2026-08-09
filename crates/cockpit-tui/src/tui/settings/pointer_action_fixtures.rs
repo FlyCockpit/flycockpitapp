@@ -1021,7 +1021,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Rebind(_, _)) => {
             ProvidersFixture::ModelRebind
         }
-        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Dismiss) => {
+        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Dismiss(_, _)) => {
             ProvidersFixture::ModelDismiss
         }
         ProvidersAction::CopyOAuth(_, OAuthCopyKind::AuthorizationUrl) => {

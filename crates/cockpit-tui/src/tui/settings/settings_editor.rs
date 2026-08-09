@@ -1948,6 +1948,10 @@ impl SettingsEditor {
             self.status = Some("media capability draft rebound".into());
             return true;
         }
+        if action == "Dismiss" {
+            self.status = Some("media capability refresh failure dismissed".into());
+            return true;
+        }
         if let Some(line) = self
             .multimodal
             .as_ref()

@@ -237,7 +237,7 @@ pub(super) enum ModelLifecycleAction {
     Reload(ProviderId, ModelId),
     Reapply(ProviderId, ModelId),
     Rebind(ProviderId, ModelId),
-    Dismiss,
+    Dismiss(ProviderId, ModelId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

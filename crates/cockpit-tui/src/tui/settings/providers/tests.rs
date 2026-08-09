@@ -223,6 +223,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_add_env_var_field_renders_and_dispatches_from_fresh_state();
     pointer_add_test_key_choices_render_and_dispatch_from_fresh_state();
     pointer_add_grok_login_renders_and_dispatches_from_fresh_state();
+    pointer_add_codex_login_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_continue_renders_and_dispatches_from_fresh_state();
     pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state();
 }
@@ -1537,7 +1538,7 @@ fn pointer_add_grok_login_renders_and_dispatches_from_fresh_state() {
             (
                 super::super::shell::SettingsPointerAction::Page(
                     action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-                        _,
+                        ProviderWizardStep::GrokOAuth,
                         WizardControlId::OAuth(OAuthOption::Login),
                     )),
                 ),
@@ -1556,6 +1557,68 @@ fn pointer_add_grok_login_renders_and_dispatches_from_fresh_state() {
                     && !oauth.paste_focused
                     && oauth.status.as_ref().is_some_and(|status| {
                         status.as_ref().is_ok_and(|message| message.contains("Preparing"))
+                    })
+            })
+    ));
+}
+
+#[test]
+fn pointer_add_codex_login_renders_and_dispatches_from_fresh_state() {
+    use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
+
+    fn fixture() -> (tempfile::TempDir, SettingsDialog) {
+        let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+        // This source represents the Login row regardless of credentials on
+        // the machine running the exhaustive pointer matrix.
+        oauth.logged_in = false;
+        dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
+            "codex-oauth",
+            oauth,
+        )));
+        (tmp, dialog)
+    }
+
+    let (_tmp, source) = fixture();
+    let _ = render_provider_rows(&source, 110, 60);
+    let login = source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ SettingsPointerAction::Providers(ProvidersAction::WizardControl(
+                        ProviderWizardStep::CodexOAuth,
+                        WizardControlId::OAuth(OAuthOption::Login),
+                    )),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .expect("logged-out Codex wizard renders Login");
+
+    let (_tmp, mut fresh) = fixture();
+    click_rendered_provider_action(&mut fresh, &login);
+    assert!(matches!(
+        fresh.take_oauth_action(),
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Codex,
+            op: OAuthFlowOp::Begin,
+        })
+    ));
+    assert!(matches!(
+        fresh.test_page(),
+        TestPageRef::Providers(ProvidersPage::Add(state))
+            if state.oauth_auth.as_deref().is_some_and(|oauth| {
+                oauth.polling
+                    && oauth.device_login().is_none()
+                    && oauth.status.as_ref().is_some_and(|status| {
+                        status.as_ref().is_ok_and(|message| {
+                            message == "Requesting Codex device code..."
+                        })
                     })
             })
     ));

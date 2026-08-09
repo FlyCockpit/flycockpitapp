@@ -622,6 +622,69 @@ fn rendered_char(row: &str, x: u16) -> char {
     row.chars().nth(usize::from(x)).unwrap_or(' ')
 }
 
+fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    let _ = render_settings_rows(&dialog, 80, 12);
+
+    let first = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.action,
+                shell::SettingsPointerAction::Page(shell::SettingsControlId(0))
+            )
+        })
+        .copied()
+        .expect("root's first semantic target");
+    assert_eq!(
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollDown,
+            first.rect.x,
+            first.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 3 }
+    ));
+    for _ in 0..10 {
+        let _ = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::ScrollUp,
+            first.rect.x,
+            first.rect.y,
+        ));
+    }
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Root { cursor: 0 }
+    ));
+
+    let _ = dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        first.rect.x,
+        first.rect.y,
+    ));
+    assert_eq!(
+        dialog.page.pointer_surface_kind(),
+        SettingsPointerSurfaceKind::DefaultModel
+    );
+}
+
 #[derive(Default)]
 struct ProbePage {
     handled: bool,

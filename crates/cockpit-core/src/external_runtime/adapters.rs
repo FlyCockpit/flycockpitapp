@@ -1861,20 +1861,16 @@ mod tests {
     fn invocation_roster_contains_selected_engines_before_engine_probe_stage() {
         let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".cockpit");
-        std::fs::create_dir_all(&config_dir).unwrap();
+        // An explicit config under `.cockpit/` is intentionally trust-gated.
+        // This unit test is about diagnostics mode freezing, not workspace
+        // trust, so use the production-supported non-project override path.
+        let config_path = tmp.path().join("runtime-config.json");
         std::fs::write(
-            config_dir.join("config.json"),
+            &config_path,
             r#"{"sandbox":{"defaultMode":"container_readonly"}}"#,
         )
         .unwrap();
-        // The primary test process may already carry a COCKPIT_CONFIG
-        // override. Point the layered loader at this fixture explicitly so
-        // the test exercises container selection rather than ambient config.
-        guard.set_var(
-            crate::config::dirs::COCKPIT_CONFIG_ENV,
-            config_dir.join("config.json"),
-        );
+        guard.set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, &config_path);
         let previous = super::super::safety_adapters::current_container_engine_mode();
         super::super::safety_adapters::set_container_engine_mode(
             super::super::safety_adapters::ContainerEngineMode::Auto,
@@ -1886,11 +1882,7 @@ mod tests {
         let descriptors = invocation_descriptor_roster(tmp.path(), &input).unwrap();
         input.container_engine_mode =
             Some(super::super::safety_adapters::ContainerEngineMode::Auto);
-        std::fs::write(
-            config_dir.join("config.json"),
-            r#"{"sandbox":{"defaultMode":"off"}}"#,
-        )
-        .unwrap();
+        std::fs::write(&config_path, r#"{"sandbox":{"defaultMode":"off"}}"#).unwrap();
         assert_eq!(
             resolved_container_engine_mode(tmp.path(), &input),
             super::super::safety_adapters::ContainerEngineMode::Auto,

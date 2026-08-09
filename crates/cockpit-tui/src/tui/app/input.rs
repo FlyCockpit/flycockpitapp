@@ -2311,6 +2311,7 @@ impl App {
                     image_capability_generation: self.config_snapshot.generation,
                     supports_images: vision,
                 },
+                assembled_wire_digest: None,
                 slots,
                 lifecycle: fence_lifecycle,
             },
@@ -2394,6 +2395,11 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
+        if let Some(fence) = self.submission_fences.get_mut(&client_submission_id) {
+            fence.assembled_wire_digest = Some(
+                crate::tui::structured_paste::user_submission_wire_digest(&submission),
+            );
+        }
         let order_front = self.submission_order.front();
         let stages_behind_session_switch = self.has_pending_session_switch_action()
             && matches!(

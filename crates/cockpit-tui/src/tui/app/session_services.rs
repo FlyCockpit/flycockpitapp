@@ -93,6 +93,7 @@ impl App {
                 self.submission_order.cancel(sequence);
                 self.dispatch_next_ready_paste_fence();
             }
+            self.pending_session_switch_reconcile_started_at = None;
             self.pending_new_session = false;
             self.report_session_switch_busy("/new");
             return Ok(true);
@@ -142,6 +143,92 @@ impl App {
         ) {
             return Ok(changed);
         }
+
+        let possibly_sent = self
+            .submission_fences
+            .iter()
+            .filter_map(|(id, fence)| {
+                (fence.fence_sequence < switch_sequence
+                    && matches!(
+                        fence.lifecycle,
+                        crate::tui::structured_paste::FenceLifecycle::PossiblySent
+                            | crate::tui::structured_paste::FenceLifecycle::Reconciling
+                    ))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        if !possibly_sent.is_empty() {
+            let daemon_link_alive = self.agent_runner.as_ref().is_some_and(|runner| {
+                runner
+                    .as_ref()
+                    .is_ok_and(|runner| runner.can_switch_session())
+            });
+            let now = self.monotonic_origin.elapsed();
+            let started = *self
+                .pending_session_switch_reconcile_started_at
+                .get_or_insert(now);
+            match crate::tui::structured_paste::session_switch_reconciliation_gate(
+                true,
+                daemon_link_alive,
+                now.saturating_sub(started),
+            ) {
+                crate::tui::structured_paste::SessionSwitchReconciliationGate::DaemonLinkLost => {
+                    self.pending_new_session = false;
+                    self.pending_session_switch_order = None;
+                    self.pending_session_switch_reconcile_started_at = None;
+                    self.submission_order.cancel(switch_sequence);
+                    self.history.push(HistoryEntry::CommandError {
+                        line: concat!(
+                            "/new: daemon connection lost while reconciling an earlier ",
+                            "submission; old session preserved"
+                        )
+                        .to_string(),
+                    });
+                    self.dispatch_next_ready_paste_fence();
+                    return Ok(true);
+                }
+                crate::tui::structured_paste::SessionSwitchReconciliationGate::Waiting => {
+                    return Ok(changed);
+                }
+                crate::tui::structured_paste::SessionSwitchReconciliationGate::TimedOut => {}
+                crate::tui::structured_paste::SessionSwitchReconciliationGate::Ready => {
+                    unreachable!("possibly-sent fences were supplied to the reconciliation gate")
+                }
+            }
+            let records = possibly_sent
+                .iter()
+                .map(|id| {
+                    let fence = self.submission_fences.get(id)?;
+                    Some(super::DeliveryUnconfirmedRecord {
+                        client_submission_id: *id,
+                        session_id: fence.host.session_id,
+                        text: fence.captured_composer.clone(),
+                        wire_digest: fence.assembled_wire_digest?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(records) = records else {
+                self.pending_new_session = false;
+                self.pending_session_switch_order = None;
+                self.pending_session_switch_reconcile_started_at = None;
+                self.submission_order.cancel(switch_sequence);
+                self.history.push(HistoryEntry::CommandError {
+                    line: "/new: an earlier submission lacks a reconciliation digest; old session preserved"
+                        .to_string(),
+                });
+                self.dispatch_next_ready_paste_fence();
+                return Ok(true);
+            };
+            for (id, record) in possibly_sent.into_iter().zip(records) {
+                if let Some(fence) = self.submission_fences.get_mut(&id) {
+                    fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::Reconciling;
+                    self.delivery_unconfirmed_records
+                        .entry(id)
+                        .or_insert(record);
+                }
+            }
+        }
+        self.pending_session_switch_reconcile_started_at = None;
         self.pending_new_session = false;
 
         let switch_task = match self.agent_runner.as_ref() {
@@ -227,6 +314,19 @@ impl App {
         self.estimate_at_last_usage = 0;
         self.current_session_persisted = false;
         self.new_session_terminal_clear_pending = true;
+        for record in self.delivery_unconfirmed_records.values() {
+            let wire_digest = record
+                .wire_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            self.history.push(HistoryEntry::CommandError {
+                line: format!(
+                    "Delivery unconfirmed for message {} in session {} (wire {}): {}",
+                    record.client_submission_id, record.session_id, wire_digest, record.text
+                ),
+            });
+        }
     }
 
     fn commit_new_session_without_swappable_runner(&mut self) {

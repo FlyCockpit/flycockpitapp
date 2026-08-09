@@ -342,6 +342,14 @@ pub(crate) struct DeferredFenceDispatch {
     pub parked_fence_sequence: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeliveryUnconfirmedRecord {
+    pub client_submission_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub text: String,
+    pub wire_digest: [u8; 32],
+}
+
 pub(crate) struct ModelSelectionRetry {
     /// Durable session attachment that owns this retry. Retry payloads are
     /// never transferable between conversations, even while another session
@@ -2005,6 +2013,9 @@ pub struct App {
     pub(super) next_paste_generation: u64,
     pub(super) paste_correlations: crate::tui::structured_paste::PasteCorrelationCache,
     pub(super) pending_session_switch_order: Option<(u64, uuid::Uuid)>,
+    pub(super) pending_session_switch_reconcile_started_at: Option<std::time::Duration>,
+    pub(super) delivery_unconfirmed_records:
+        std::collections::HashMap<uuid::Uuid, DeliveryUnconfirmedRecord>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
     /// `Some(false)` after `i` (inner), in operator-pending / visual
     /// contexts; the next char picks the object (`w`, `"`, `(`, …). `None`
@@ -3286,6 +3297,8 @@ impl App {
             next_paste_generation: 0,
             paste_correlations: Default::default(),
             pending_session_switch_order: None,
+            pending_session_switch_reconcile_started_at: None,
+            delivery_unconfirmed_records: Default::default(),
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,

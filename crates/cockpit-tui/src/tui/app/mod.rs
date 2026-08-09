@@ -4103,6 +4103,8 @@ fn spawn_git_refresh(
 #[cfg(test)]
 mod async_action_app_tests;
 #[cfg(test)]
+mod blocking_operation_tests;
+#[cfg(test)]
 mod attention_interrupt_surface_tests;
 #[cfg(test)]
 mod caffeinate_toast_tests;

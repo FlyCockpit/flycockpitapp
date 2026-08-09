@@ -1,0 +1,102 @@
+use super::*;
+
+#[test]
+fn blocking_operation_manifest_is_complete() {
+    use super::blocking_operations::{BLOCKING_OPERATION_MANIFEST, BlockingOperationKind};
+
+    assert_eq!(BLOCKING_OPERATION_MANIFEST.len(), 6);
+    let expected = [
+        ("slash:/curator", BlockingOperationKind::CuratorMaintenance),
+        ("slash:/doctor", BlockingOperationKind::DoctorSnapshot),
+        ("slash:/export", BlockingOperationKind::ExportWrite),
+        ("key:queue-edit", BlockingOperationKind::QueueMutation),
+        ("composer:/btw-end", BlockingOperationKind::BtwTeardown),
+        ("composer:@suggestions", BlockingOperationKind::FileAutocomplete),
+    ];
+    assert_eq!(BLOCKING_OPERATION_MANIFEST, expected);
+
+    let mut sites = std::collections::HashSet::new();
+    let mut kinds = std::collections::HashSet::new();
+    for (site, kind) in BLOCKING_OPERATION_MANIFEST {
+        assert!(sites.insert(*site), "duplicate blocking-operation site: {site}");
+        assert!(kinds.insert(*kind), "duplicate blocking-operation kind: {kind:?}");
+    }
+}
+
+#[test]
+fn no_owned_blocking_command_runs_on_event_loop() {
+    let source = include_str!("slash.rs");
+    assert!(source.contains("start_owned_blocking_action"));
+    assert!(!source.contains("cockpit_core::diagnostics::tui_snapshot(input)"));
+
+    let input = include_str!("input.rs");
+    assert!(!input.contains("attached_request_tx_blocking(\n                attached_request"));
+
+    let render = include_str!("render.rs");
+    assert!(!render.contains("cockpit_core::tags::suggestions(&self.launch.cwd"));
+}
+
+#[test]
+fn curator_command_is_async_with_pending_line() {
+    let source = include_str!("slash.rs");
+    assert!(source.contains("/curator: pending"));
+}
+
+#[test]
+fn doctor_command_is_async() {
+    let source = include_str!("slash.rs");
+    assert!(source.contains("/doctor: collecting diagnostics…"));
+}
+
+#[test]
+fn doctor_snapshot_is_point_in_time() {
+    assert!(include_str!("slash.rs").contains("DoctorSnapshotInput"));
+}
+
+#[test]
+fn export_writes_off_the_loop_thread() {
+    let source = include_str!("export_actions.rs");
+    assert!(source.contains("self.async_actions.start("));
+    assert!(source.contains("tokio::fs::write"));
+}
+
+#[test]
+fn queue_edit_does_not_block_key_handler() {
+    let source = include_str!("input.rs");
+    assert!(source.contains("queue.edit"));
+}
+
+#[test]
+fn queue_edits_apply_in_user_order() {
+    let source = include_str!("input.rs");
+    assert!(source.contains("AsyncActionPolicy::Dedupe"));
+}
+
+#[test]
+fn btw_teardown_does_not_block_during_session() {
+    let source = include_str!("btw_pane.rs");
+    assert!(source.contains("BtwRpcPlan::End"));
+}
+
+#[test]
+fn btw_teardown_on_exit_path_remains_synchronous() {
+    assert!(include_str!("mod.rs").contains("Request::EndBtwFork"));
+}
+
+#[test]
+fn at_suggestions_do_no_blocking_work() {
+    let source = include_str!("render.rs");
+    assert!(!source.contains("cockpit_core::tags::suggestions(&self.launch.cwd"));
+}
+
+#[test]
+fn stale_at_suggestion_result_is_discarded() {
+    assert!(include_str!("async_actions.rs").contains("autocomplete.files"));
+}
+
+#[test]
+fn owned_async_actions_reject_late_and_double_completion() {
+    let source = include_str!("../async_action.rs");
+    assert!(source.contains("pending.generation != completed.generation"));
+    assert!(source.contains("let Some(pending) = self.pending.remove(&completed.id)"));
+}

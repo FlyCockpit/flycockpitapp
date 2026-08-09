@@ -39,6 +39,17 @@ pub struct RelayPrincipal {
     #[serde(deserialize_with = "non_empty_string")]
     pub user_id: String,
     pub grants: Vec<RelayGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_binding: Option<ClientActorBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientActorBindingV1 {
+    pub schema_version: u8,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub logical_attachment_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

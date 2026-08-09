@@ -18,10 +18,21 @@ export const relayGrantSchema = z
   .strict();
 export type RelayGrant = z.infer<typeof relayGrantSchema>;
 
+export const clientActorBindingSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    deviceId: z.uuid(),
+    deviceGeneration: z.number().int().positive(),
+    logicalAttachmentId: z.uuid(),
+  })
+  .strict();
+export type ClientActorBinding = z.infer<typeof clientActorBindingSchema>;
+
 export const relayPrincipalSchema = z
   .object({
     userId: z.string().min(1),
     grants: z.array(relayGrantSchema),
+    actorBinding: clientActorBindingSchema.optional(),
   })
   .strict();
 export type RelayPrincipal = z.infer<typeof relayPrincipalSchema>;

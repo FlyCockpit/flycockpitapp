@@ -9,7 +9,12 @@ import {
   SignJWT,
 } from "jose";
 import { z } from "zod";
-import { type RelayGrant, relayGrantSchema } from "./envelopes";
+import {
+  type ClientActorBinding,
+  clientActorBindingSchema,
+  type RelayGrant,
+  relayGrantSchema,
+} from "./envelopes";
 
 export const RELAY_TOKEN_TTL_SECONDS = 5 * 60;
 export const RELAY_TOKEN_ALG = "ES256" as const;
@@ -27,6 +32,7 @@ const basePayloadSchema = z
     instanceId: z.string().min(1).optional(),
     userId: z.string().min(1),
     grants: z.array(relayGrantSchema).default([]),
+    actorBinding: clientActorBindingSchema.optional(),
     iat: z.number().int().nonnegative(),
     exp: z.number().int().positive(),
     jti: z.string().min(1),
@@ -51,6 +57,13 @@ export const relayTokenPayloadSchema = basePayloadSchema.superRefine((payload, c
       message: "connector relay tokens cannot carry client grants",
     });
   }
+  if (payload.tokenType !== "client" && payload.actorBinding) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["actorBinding"],
+      message: "only client relay tokens may carry an actor binding",
+    });
+  }
   if (payload.tokenType === "user" && payload.instanceId) {
     ctx.addIssue({
       code: "custom",
@@ -61,12 +74,10 @@ export const relayTokenPayloadSchema = basePayloadSchema.superRefine((payload, c
 });
 export type RelayTokenPayload = z.infer<typeof relayTokenPayloadSchema>;
 
-export type RelayTokenInput = {
-  tokenType: RelayTokenType;
-  instanceId?: string;
-  userId: string;
-  grants?: RelayGrant[];
-};
+type CommonRelayTokenInput = { instanceId?: string; userId: string; grants?: RelayGrant[] };
+export type RelayTokenInput =
+  | (CommonRelayTokenInput & { tokenType: "client"; actorBinding?: ClientActorBinding })
+  | (CommonRelayTokenInput & { tokenType: "connector" | "user"; actorBinding?: never });
 
 export type RelayKeySet = {
   kid: string;
@@ -133,6 +144,7 @@ export async function signRelayToken(
     instanceId: input.instanceId,
     userId: input.userId,
     grants: input.grants ?? [],
+    actorBinding: input.actorBinding,
   } satisfies Partial<RelayTokenPayload>;
   const jti = randomUUID();
   const token = await new SignJWT(claims)

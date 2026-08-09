@@ -15,6 +15,7 @@ pub enum ClientPrincipal {
 pub struct RemotePrincipal {
     pub user_id: String,
     pub grants: Vec<PrincipalGrant>,
+    pub actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,7 @@ impl ClientPrincipal {
     pub fn from_relay(principal: RelayPrincipal) -> Self {
         Self::Remote(RemotePrincipal {
             user_id: principal.user_id,
+            actor_binding: principal.actor_binding,
             grants: principal
                 .grants
                 .into_iter()
@@ -253,6 +255,7 @@ mod tests {
                 scope,
                 project_root,
             }],
+            actor_binding: None,
         })
     }
 

@@ -21,7 +21,7 @@
 //! type, and link count on every reopen.
 //!
 //! Windows applies and verifies the repository's audited protected
-//! current-owner-only DACL on every guarded directory and file. It also uses
+//! current-user-and-SYSTEM-only DACL on every guarded directory and file. It also uses
 //! relative opens beneath the resolved root,
 //! rejection of any entry carrying `FILE_ATTRIBUTE_REPARSE_POINT`, a
 //! regular-file check, and a hard-link (`number_of_links`) check. What it does
@@ -59,7 +59,7 @@ pub struct SpoolPermissionPolicy {
     pub unix_file_mode: u32,
     /// Whether Unix modes are enforced on this build.
     pub unix_mode_enforced: bool,
-    /// Whether an explicit protected current-owner-only DACL is written and
+    /// Whether an explicit protected current-user-and-SYSTEM-only DACL is written and
     /// verified on Windows.
     pub windows_dacl_enforced: bool,
     /// Whether reparse points are rejected for every spool entry.
@@ -874,16 +874,27 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn windows_private_dacl_contract_has_apply_and_deny_verification_seams() {
-        let source = include_str!("fsguard.rs");
-        assert!(source.contains("crate::goal_scratch::set_private(&resolved)"));
-        assert!(source.contains("crate::goal_scratch::set_private(&path)"));
-        assert!(source.contains("crate::goal_scratch::verify_private_dacl(&self.path)"));
-        assert!(source.contains("crate::goal_scratch::verify_private_dacl(&path)"));
-        let verifier = include_str!("../goal_scratch.rs");
-        assert!(verifier.contains("DACL is not protected current-owner-only full control"));
-        assert!(verifier.contains("sddl.matches(\"(A;\").count() != 1"));
+    fn windows_private_dacl_reopen_rejects_broad_directory_and_file_acl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root_path = tmp.path().join("dacl-root");
+        let root = DirGuard::open_root(&root_path, true).unwrap();
+        let file = root.create_file_exclusive("component.v1").unwrap();
+        drop(file);
+        root.verify_private().unwrap();
+        root.open_file_verified("component.v1").unwrap();
+
+        crate::goal_scratch::apply_test_windows_dacl(&root_path, "D:P(A;;FA;;;WD)").unwrap();
+        assert!(root.verify_private().is_err());
+        crate::goal_scratch::set_private(&root_path).unwrap();
+
+        let file_path = root_path.join("component.v1");
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;BU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
+        crate::goal_scratch::set_private(&file_path).unwrap();
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;AU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
     }
 
     /// A symlinked ancestor must not break the spool: macOS resolves `/var` to

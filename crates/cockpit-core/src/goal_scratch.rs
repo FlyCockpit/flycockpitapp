@@ -238,6 +238,17 @@ fn set_private(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn set_private(path: &Path) -> Result<()> {
+    apply_windows_dacl(path, "D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        verify_checked_dir(path)
+    } else {
+        verify_private_dacl(path)
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_dacl(path: &Path, descriptor_text: &str) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
@@ -260,9 +271,7 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
         fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     }
 
-    // Protected DACL with one full-control ACE for the object's owner. `OW`
-    // resolves to the current user for directories Cockpit just created.
-    let sddl: Vec<u16> = std::ffi::OsStr::new("D:P(A;;FA;;;OW)")
+    let sddl: Vec<u16> = std::ffi::OsStr::new(descriptor_text)
         .encode_wide()
         .chain(Some(0))
         .collect();
@@ -286,12 +295,12 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
             return Err(std::io::Error::last_os_error()).context("applying private goal DACL");
         }
     }
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        verify_checked_dir(path)
-    } else {
-        verify_private_dacl(path)
-    }
+    Ok(())
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn apply_test_windows_dacl(path: &Path, descriptor: &str) -> Result<()> {
+    apply_windows_dacl(path, descriptor)
 }
 
 #[cfg(windows)]
@@ -404,18 +413,22 @@ pub(crate) fn verify_private_dacl(path: &Path) -> Result<()> {
             .strip_prefix("O:")
             .and_then(|value| value.split_once("D:"))
             .map(|(owner, _)| owner);
-        let ace_sid = sddl
+        let ace_sids = sddl
             .split(";;FA;;;")
-            .nth(1)
-            .and_then(|value| value.split(')').next());
+            .skip(1)
+            .filter_map(|value| value.split(')').next())
+            .collect::<Vec<_>>();
         let current_user = current_windows_user_sid()?;
         if !sddl.contains("D:P")
-            || sddl.matches("(A;").count() != 1
+            || sddl.matches("(A;").count() != 2
             || owner.is_none()
-            || owner != ace_sid
             || owner != Some(current_user.as_str())
+            || !ace_sids.contains(&current_user.as_str())
+            || !ace_sids
+                .iter()
+                .any(|sid| *sid == "SY" || *sid == "S-1-5-18")
         {
-            bail!("goal scratch DACL is not protected current-owner-only full control");
+            bail!("private DACL is not protected current-user-and-SYSTEM-only full control");
         }
     }
     Ok(())

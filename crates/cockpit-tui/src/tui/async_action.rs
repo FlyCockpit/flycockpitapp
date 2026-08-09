@@ -316,7 +316,7 @@ fn export_temp_reaper() -> &'static ExportReaper {
                         }
                     }
                     if let Some((path, attempts)) = pending.pop_front() {
-                        match std::fs::remove_file(&path) {
+                        match secure_unlink_owned_temp(&path) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => {
@@ -413,14 +413,71 @@ fn enqueue_export_temp_reap_with(
 }
 
 fn synchronous_export_cleanup_fallback(path: &std::path::Path) {
-    if let Err(error) = std::fs::remove_file(path)
+    if let Err(error) = secure_unlink_owned_temp(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
+        let record = persist_export_recovery_record(path);
         eprintln!(
-            "cockpit: synchronous export cleanup failed for {}: {error}",
-            path.display()
+            "cockpit: CleanupDeferred fallback for {}: {error}; record={:?}",
+            path.display(),
+            record
         );
     }
+}
+
+#[cfg(unix)]
+fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing parent"))?;
+    let name = CString::new(
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("missing name"))?
+            .as_bytes(),
+    )?;
+    let parent_name = CString::new(parent_path.as_os_str().as_bytes())?;
+    let parent_fd = unsafe {
+        libc::open(
+            parent_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if parent_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let parent = unsafe { std::fs::File::from_raw_fd(parent_fd) };
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "export temp ownership check failed",
+        ));
+    }
+    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    parent.sync_all()
+}
+
+#[cfg(not(unix))]
+fn secure_unlink_owned_temp(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 pub(crate) fn drain_export_temp_reaper() {

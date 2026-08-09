@@ -847,12 +847,18 @@ impl App {
             async move {
                 let mut created = None;
                 let mut ended = false;
+                let mut error = None;
                 for request in requests {
-                    match attached_request.request(request).await? {
-                        Response::Ack => ended = true,
-                        Response::BtwFork { info, .. } => created = Some(info),
-                        other => {
-                            return Err(format!("/btw: unexpected daemon response: {other:?}"));
+                    match attached_request.request(request).await {
+                        Ok(Response::Ack) => ended = true,
+                        Ok(Response::BtwFork { info, .. }) => created = Some(info),
+                        Ok(other) => {
+                            error = Some(format!("unexpected daemon response: {other:?}"));
+                            break;
+                        }
+                        Err(rpc_error) => {
+                            error = Some(rpc_error);
+                            break;
                         }
                     }
                 }
@@ -861,6 +867,7 @@ impl App {
                         created,
                         ended,
                         question,
+                        error,
                     },
                 )
             },

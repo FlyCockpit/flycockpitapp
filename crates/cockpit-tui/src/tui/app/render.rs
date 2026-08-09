@@ -3670,6 +3670,8 @@ impl App {
         if suggestions.is_empty() {
             let text = if self.at_suggestions_loading {
                 "loading files…"
+            } else if self.at_suggestions_error.is_some() {
+                "file suggestions unavailable"
             } else {
                 "no matching files"
             };

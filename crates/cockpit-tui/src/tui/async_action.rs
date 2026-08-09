@@ -224,6 +224,7 @@ pub enum AsyncActionPayload {
         created: Option<cockpit_core::daemon::proto::BtwForkInfo>,
         ended: bool,
         question: Option<String>,
+        error: Option<String>,
     },
 }
 
@@ -295,7 +296,7 @@ pub struct AsyncActionRunner {
     view_generation: u64,
     pending: HashMap<AsyncActionId, PendingAction>,
     keyed: HashMap<AsyncActionKey, AsyncActionId>,
-    serialized: HashMap<AsyncActionKey, Arc<tokio::sync::Mutex<()>>>,
+    serialized: HashMap<AsyncActionKey, tokio::sync::oneshot::Receiver<()>>,
     tx: mpsc::UnboundedSender<CompletedAction>,
     rx: mpsc::UnboundedReceiver<CompletedAction>,
     notify: Arc<Notify>,
@@ -332,12 +333,41 @@ impl AsyncActionRunner {
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                matches!(pending.kind, AsyncActionKind::Blocking(_)).then_some(*id)
+                matches!(pending.kind, AsyncActionKind::Blocking(_))
+                    .then_some(*id)
+                    .filter(|_| {
+                        !matches!(
+                            pending.kind,
+                            AsyncActionKind::Blocking("export.transcript" | "export.debug")
+                        )
+                    })
             })
             .collect::<Vec<_>>();
         for id in stale {
             self.abort_id(id);
         }
+    }
+
+    pub fn expire_blocking(&mut self, now: Instant, timeout: Duration) -> Vec<AsyncActionResult> {
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                (matches!(pending.kind, AsyncActionKind::Blocking(_))
+                    && now.saturating_duration_since(pending.started_at) >= timeout)
+                    .then_some((*id, pending.kind.clone()))
+            })
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|(id, kind)| {
+                self.abort_id(id).then_some(AsyncActionResult {
+                    id,
+                    kind,
+                    payload: Err("operation timed out".to_string()),
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -469,17 +499,19 @@ impl AsyncActionRunner {
     where
         F: Future<Output = Result<AsyncActionPayload, String>> + Send + 'static,
     {
-        let lock = Arc::clone(
-            self.serialized
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        );
+        // Assign the predecessor synchronously, before either task is
+        // spawned/polled. This is enqueue order, not scheduler/mutex order.
+        let predecessor = self.serialized.remove(&key);
+        let (release_next, tail) = tokio::sync::oneshot::channel();
+        self.serialized.insert(key, tail);
         self.start_with(
             kind,
             AsyncActionPolicy::AllowConcurrent,
             move |tx, notify, id, generation, kind| {
                 tokio::spawn(async move {
-                    let _order = lock.lock().await;
+                    if let Some(predecessor) = predecessor {
+                        let _ = predecessor.await;
+                    }
                     let payload = future.await;
                     let _ = tx.send(CompletedAction {
                         id,
@@ -488,6 +520,7 @@ impl AsyncActionRunner {
                         payload,
                     });
                     notify.notify_one();
+                    let _ = release_next.send(());
                 })
             },
         )

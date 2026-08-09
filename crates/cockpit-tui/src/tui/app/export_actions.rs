@@ -11,18 +11,6 @@ const EXPORT_ACTION_KEY: &str = "export";
 const EXPORT_TRANSCRIPT_ACTION: &str = "export.transcript";
 const EXPORT_DEBUG_ACTION: &str = "export.debug";
 
-struct AsyncTempFileCleanup(Option<std::path::PathBuf>);
-
-impl Drop for AsyncTempFileCleanup {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(path).await;
-            });
-        }
-    }
-}
-
 impl App {
     /// `/export` (default) — ask the attached daemon for a redacted
     /// transcript and write it asynchronously, overwriting any prior file.
@@ -80,6 +68,10 @@ impl App {
             return;
         };
 
+        let export_key = AsyncActionKey::new(EXPORT_ACTION_KEY);
+        if self.async_actions.has_pending_key(&export_key) {
+            return;
+        }
         self.push_plain(match kind {
             ExportSessionKind::TranscriptJson => "/export: writing transcript…".to_string(),
             ExportSessionKind::DebugBundle => "/export debug: writing bundle…".to_string(),
@@ -88,7 +80,7 @@ impl App {
         let exports_dir = exports_dir.to_path_buf();
         self.async_actions.start(
             AsyncActionKind::Blocking(action),
-            AsyncActionPolicy::Replace(AsyncActionKey::new(EXPORT_ACTION_KEY)),
+            AsyncActionPolicy::Dedupe(export_key),
             async move {
                 export_via_attached_daemon(
                     attached_request,
@@ -167,7 +159,6 @@ async fn write_export_no_clobber(
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{command}: invalid export path"))?;
     let temp = out_path.with_file_name(format!(".{file_name}.{}.partial", uuid::Uuid::new_v4()));
-    let mut cleanup = AsyncTempFileCleanup(Some(temp.clone()));
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -194,9 +185,16 @@ async fn write_export_no_clobber(
         Ok(())
     }
     .await;
-    let _ = tokio::fs::remove_file(&temp).await;
-    cleanup.0 = None;
-    result
+    let cleanup = tokio::fs::remove_file(&temp).await;
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; cleaning partial export failed: {cleanup_error}"
+        )),
+        (Ok(()), Err(cleanup_error)) => Err(format!(
+            "{command}: export published, but cleaning temporary file failed: {cleanup_error}"
+        )),
+    }
 }
 
 /// Pull a staged bulk transfer chunk by chunk and verify it end to end.
@@ -512,6 +510,26 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(!tmp.path().join("exports/x.json").exists());
+    }
+
+    #[tokio::test]
+    async fn export_publish_is_no_clobber_and_cleans_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing.json");
+        tokio::fs::write(&target, b"original").await.unwrap();
+
+        let error = write_export_no_clobber(&target, b"replacement", "/export")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"original");
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[tokio::test]

@@ -106,6 +106,24 @@ fn stale_at_suggestion_result_is_discarded() {
     assert!(include_str!("async_actions.rs").contains("autocomplete.files"));
 }
 
+#[tokio::test]
+async fn at_suggestion_failure_is_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.composer.set("@missing".to_string());
+    app.at_suggestions_loading = true;
+    app.async_actions.start(
+        AsyncActionKind::Blocking("autocomplete.files"),
+        AsyncActionPolicy::AllowConcurrent,
+        async { Err("walk failed".to_string()) },
+    );
+    tokio::task::yield_now().await;
+    app.drain_async_actions();
+
+    assert!(!app.at_suggestions_loading);
+    assert_eq!(app.at_suggestions_error.as_deref(), Some("walk failed"));
+}
+
 #[test]
 fn at_suggestions_distinguish_loading_from_empty() {
     let source = include_str!("render.rs");

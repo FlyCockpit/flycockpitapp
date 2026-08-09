@@ -75,7 +75,11 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
-        let results = self.async_actions.drain_completed();
+        let mut results = self.async_actions.expire_blocking(
+            self.event_loop_monotonic_now,
+            std::time::Duration::from_secs(30),
+        );
+        results.extend(self.async_actions.drain_completed());
         let changed = !results.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
@@ -759,16 +763,22 @@ impl App {
                 Ok(_) => self.push_plain("/doctor: unexpected async response".to_string()),
                 Err(error) => self.push_plain(error),
             },
-            AsyncActionKind::Blocking("autocomplete.files") => {
-                if let Ok(AsyncActionPayload::FileSuggestions { query, suggestions }) =
-                    result.payload
-                    && self.composer.at_query() == Some(query.as_str())
+            AsyncActionKind::Blocking("autocomplete.files") => match result.payload {
+                Ok(AsyncActionPayload::FileSuggestions { query, suggestions })
+                    if self.composer.at_query() == Some(query.as_str()) =>
                 {
                     self.at_suggestions_loading = false;
                     self.at_suggestions_loaded_query = Some(query.clone());
+                    self.at_suggestions_error = None;
                     *self.at_cache.borrow_mut() = Some((query, suggestions));
                 }
-            }
+                Err(error) => {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = self.composer.at_query().map(str::to_string);
+                    self.at_suggestions_error = Some(error);
+                }
+                _ => {}
+            },
             AsyncActionKind::Blocking("queue.edit") => {
                 let outcome = match result.payload {
                     Ok(AsyncActionPayload::DaemonResponse(response)) => {
@@ -783,6 +793,7 @@ impl App {
                     created,
                     ended,
                     question,
+                    error,
                 }) => {
                     if ended {
                         self.close_btw_pane();
@@ -790,7 +801,9 @@ impl App {
                     if let Some(info) = created {
                         self.open_btw_pane_from_info(info, true);
                     }
-                    if let Some(pane) = self.btw_pane.as_mut() {
+                    if let Some(error) = error {
+                        self.push_plain(format!("/btw: {error}"));
+                    } else if let Some(pane) = self.btw_pane.as_mut() {
                         pane.focused = true;
                         if let Some(question) = question
                             && let Err(error) = pane.send_text(question)

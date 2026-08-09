@@ -1997,6 +1997,7 @@ pub struct App {
     /// with zero matches; rendering must never infer loading from emptiness.
     pub(super) at_suggestions_loading: bool,
     pub(super) at_suggestions_loaded_query: Option<String>,
+    pub(super) at_suggestions_error: Option<String>,
     /// Accepted `@`-tag paths that contain a space / shell-special char.
     /// Tracked so the submit-time pass can wrap them in quotes (the
     /// composer shows them unquoted; the wire payload needs the quotes
@@ -3306,6 +3307,7 @@ impl App {
             at_cache: std::cell::RefCell::new(None),
             at_suggestions_loading: false,
             at_suggestions_loaded_query: None,
+            at_suggestions_error: None,
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
             terminal_paste_classifier:

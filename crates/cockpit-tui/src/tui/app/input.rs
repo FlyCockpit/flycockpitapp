@@ -1637,6 +1637,7 @@ impl App {
             self.at_cache.borrow_mut().take();
             self.at_suggestions_loading = false;
             self.at_suggestions_loaded_query = None;
+            self.at_suggestions_error = None;
             self.async_actions
                 .abort_key(&AsyncActionKey::new("autocomplete.files"));
             return;
@@ -1647,6 +1648,7 @@ impl App {
         let result_query = query.clone();
         self.at_suggestions_loading = true;
         self.at_suggestions_loaded_query = None;
+        self.at_suggestions_error = None;
         self.start_owned_blocking_action(
             blocking_operations::BlockingOperationKind::FileAutocomplete,
             AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),

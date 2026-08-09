@@ -1084,7 +1084,17 @@ impl App {
             &deferred.tag_expansions,
         );
         if was_busy {
-            self.history.truncate(optimistic_history_start);
+            let terminal_notices = self
+                .history
+                .drain(optimistic_history_start..)
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        HistoryEntry::InferenceError { .. } | HistoryEntry::CommandError { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.history.extend(terminal_notices);
             if outcome != DispatchOutcome::Sent {
                 self.queue.retain(|item| item.id != fence_id);
             }

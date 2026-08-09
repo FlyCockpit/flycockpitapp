@@ -14,6 +14,9 @@ use std::{
     sync::{Mutex, mpsc},
 };
 
+type DependencyRefreshResult = Result<cockpit_core::external_runtime::DependencyProjection, String>;
+type PendingDependencyRefresh = Option<(u64, mpsc::Receiver<DependencyRefreshResult>)>;
+
 pub(super) fn page(cwd: PathBuf) -> PageBox {
     let mut state = cockpit_core::external_runtime::DependenciesPageState::first_paint(
         cockpit_core::external_runtime::global_health_store()
@@ -40,12 +43,7 @@ pub(super) fn page(cwd: PathBuf) -> PageBox {
 
 pub(super) struct DependenciesPage {
     state: Mutex<cockpit_core::external_runtime::DependenciesPageState>,
-    refresh: Mutex<
-        Option<(
-            u64,
-            mpsc::Receiver<Result<cockpit_core::external_runtime::DependencyProjection, String>>,
-        )>,
-    >,
+    refresh: Mutex<PendingDependencyRefresh>,
     scroll: u16,
 }
 

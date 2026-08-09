@@ -68,17 +68,23 @@ impl Db {
     /// Unpin the message at `(session_id, seq)`. Returns `true` when a pin
     /// was removed, `false` when there was none. The unpin path for both
     /// `d` (delete) and checking a checklist item in `/pins`.
+    pub fn unpin_message_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        seq: i64,
+    ) -> Result<bool> {
+        let n = conn
+            .execute(
+                "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.to_string(), seq],
+            )
+            .context("deleting pin")?;
+        Ok(n == 1)
+    }
+
     pub async fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.write(move |conn| {
-            let n = conn
-                .execute(
-                    "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
-                    params![session_id.to_string(), seq],
-                )
-                .context("deleting pin")?;
-            Ok(n == 1)
-        })
-        .await
+        self.write(move |conn| Self::unpin_message_conn(conn, session_id, seq))
+            .await
     }
 
     /// Whether the message at `(session_id, seq)` is currently pinned.

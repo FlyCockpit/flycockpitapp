@@ -511,6 +511,26 @@ enum ProvidersPointerSurface {
     OAuthSetup,
 }
 
+impl ProvidersPointerSurface {
+    /// Exhaustive token inventory used by the concrete-render acceptance
+    /// gate. Adding a nested provider page requires adding it here as well.
+    const ALL: [Self; 13] = [
+        Self::List,
+        Self::Add,
+        Self::Edit,
+        Self::Headers,
+        Self::Models,
+        Self::ModelSettings,
+        Self::ProviderSettings,
+        Self::FetchAll,
+        Self::FetchOnePrompt,
+        Self::FetchFallbackPrompt,
+        Self::DeepFetch,
+        Self::CopilotSetup,
+        Self::OAuthSetup,
+    ];
+}
+
 impl ProvidersPage {
     /// Sealed compile-time inventory for provider pointer fixtures. There is
     /// intentionally no wildcard: a new provider state cannot compile until
@@ -4726,7 +4746,9 @@ impl SettingsPage for ProvidersPage {
     }
 
     fn pointer_surface_token(&self) -> u64 {
-        100 + ProvidersPage::pointer_surface_kind(self) as u64
+        let surface = ProvidersPage::pointer_surface_kind(self);
+        debug_assert!(ProvidersPointerSurface::ALL.contains(&surface));
+        100 + surface as u64
     }
 
     fn resolve_header_back(&self) -> super::SettingsLocalBack {

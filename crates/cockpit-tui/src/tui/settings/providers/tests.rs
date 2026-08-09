@@ -289,6 +289,34 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
         }
     }
 
+    let (_tmp, mut add_source) = dialog_with_config(config.clone());
+    add_source.page = super::super::providers_page(ProvidersPage::Add(AddState::new()));
+    let _ = render_provider_rows(&add_source, 110, 60);
+    let add_actions = add_source
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter_map(|target| match (&target.action, target.enabled) {
+            (
+                super::super::shell::SettingsPointerAction::Page(
+                    action @ super::super::pointer_actions::SettingsPointerAction::Providers(_),
+                ),
+                true,
+            ) => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !add_actions.is_empty(),
+        "Add wizard must render enabled controls"
+    );
+    for action in add_actions {
+        let (_tmp, mut dialog) = dialog_with_config(config.clone());
+        dialog.page = super::super::providers_page(ProvidersPage::Add(AddState::new()));
+        click_rendered_provider_action(&mut dialog, &action);
+    }
+
     let oauth = oauth_provider_config("codex-oauth", "oauth:test");
     let (_tmp, mut source) = dialog_with_config(oauth.clone());
     source.page = super::super::providers_page(standalone_oauth_page(

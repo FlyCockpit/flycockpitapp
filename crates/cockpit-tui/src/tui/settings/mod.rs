@@ -2303,6 +2303,19 @@ impl SettingsDialog {
             .finish_category_page_external_edit(p, operation_id, editor_error);
     }
 
+    #[cfg(test)]
+    fn finish_category_external_edit_outcome_for_test(
+        &mut self,
+        operation_id: shell::PointerOperationId,
+        outcome: pointer_actions::ExternalEditOutcome,
+    ) {
+        let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
+            return;
+        };
+        self.cx
+            .finish_category_external_edit_outcome_for_test(p, operation_id, outcome);
+    }
+
     // ── Rendering ────────────────────────────────────────────────────────
 
     pub(crate) fn render(

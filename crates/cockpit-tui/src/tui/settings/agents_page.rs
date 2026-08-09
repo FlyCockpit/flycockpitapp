@@ -94,6 +94,9 @@ pub(super) struct AgentExternalEdit {
     /// Buffer write owned by the injected host effect. Keyboard list edits
     /// pass `None` because their on-disk file is already the source.
     pub(super) text_before_launch: Option<String>,
+    /// Raw draft retained until the effect reaches a terminal outcome. A
+    /// failed/cancelled operation restores this exact editor for retry.
+    draft: Option<AgentEditor>,
     servicing: bool,
 }
 
@@ -215,10 +218,42 @@ impl AgentsPage {
         id: PointerOperationId,
         editor_error: Option<String>,
     ) {
-        let Some(pending_agent) = self
+        let outcome = if editor_error.is_some() {
+            super::pointer_actions::ExternalEditOutcome::Failed
+        } else {
+            super::pointer_actions::ExternalEditOutcome::Saved
+        };
+        let Some(agent) = self
             .pending_external_edit
             .as_ref()
-            .filter(|request| request.id == id)
+            .filter(|pending| pending.id == id)
+            .map(|pending| pending.agent.clone())
+        else {
+            return;
+        };
+        self.reduce_external_edit_result(
+            cwd,
+            id,
+            super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome),
+            editor_error,
+        );
+    }
+
+    fn reduce_external_edit_result(
+        &mut self,
+        cwd: &std::path::Path,
+        id: PointerOperationId,
+        action: super::pointer_actions::AgentsAction,
+        detail: Option<String>,
+    ) {
+        let super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome) = action
+        else {
+            return;
+        };
+        let Some(agent) = self
+            .pending_external_edit
+            .as_ref()
+            .filter(|request| request.id == id && request.agent == agent)
             .map(|request| request.agent.clone())
         else {
             return;
@@ -226,12 +261,53 @@ impl AgentsPage {
         if !self.external_edit_ops.complete(id) {
             return;
         }
-        self.pending_external_edit = None;
-        if let Some(err) = editor_error {
-            self.status = Some(err);
-            return;
+        let typed_action = super::pointer_actions::SettingsPointerAction::Agents(
+            super::pointer_actions::AgentsAction::ExternalEditResult(agent.clone(), outcome),
+        );
+        #[cfg(test)]
+        {
+            super::pointer_acceptance_tests::record_rendered_action(&typed_action, true);
+            super::pointer_acceptance_tests::record_dispatched_action(&typed_action);
         }
-        self.refresh_after_edit(cwd, Some(&pending_agent.0));
+        let Some(mut pending) = self.pending_external_edit.take() else {
+            return;
+        };
+        match outcome {
+            super::pointer_actions::ExternalEditOutcome::Saved => {
+                self.refresh_after_edit(cwd, Some(&agent.0));
+            }
+            super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                self.editing = pending.draft.take();
+                self.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
+            }
+            super::pointer_actions::ExternalEditOutcome::Failed => {
+                self.editing = pending.draft.take();
+                self.status = Some(detail.unwrap_or_else(|| "external edit failed".into()));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn finish_external_edit_outcome_for_test(
+        &mut self,
+        cwd: &std::path::Path,
+        id: PointerOperationId,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+    ) {
+        let Some(agent) = self
+            .pending_external_edit
+            .as_ref()
+            .filter(|pending| pending.id == id)
+            .map(|pending| pending.agent.clone())
+        else {
+            return;
+        };
+        self.reduce_external_edit_result(
+            cwd,
+            id,
+            super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome),
+            None,
+        );
     }
 }
 
@@ -508,13 +584,14 @@ impl SettingsCx {
         }
         let path = editor.path.clone();
         let text = format!("{}\n", editor.text().trim_end_matches('\n'));
-        p.editing = None;
+        let draft = p.editing.take();
         let id = p.external_edit_ops.begin();
         p.pending_external_edit = Some(AgentExternalEdit {
             id,
             agent: expected,
             path,
             text_before_launch: Some(text),
+            draft,
             servicing: false,
         });
         p.status = Some("opening $EDITOR…".into());
@@ -726,6 +803,7 @@ impl SettingsCx {
                 agent: super::pointer_actions::AgentId(name.clone()),
                 path,
                 text_before_launch: None,
+                draft: None,
                 servicing: false,
             });
             p.status = Some("opening $EDITOR…".into());
@@ -2352,6 +2430,19 @@ pub(super) mod tests {
         );
         assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
         let cwd = dialog.cx.agents_cwd();
+        page_mut(&mut dialog).reduce_external_edit_result(
+            &cwd,
+            operation,
+            super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                super::super::pointer_actions::AgentId("replacement-agent".into()),
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+            ),
+            None,
+        );
+        assert!(
+            page(&dialog).pending_external_edit.is_some(),
+            "stale stable identity is inert"
+        );
         page_mut(&mut dialog).finish_external_edit(&cwd, PointerOperationId(operation.0 + 1), None);
         assert!(
             page(&dialog).pending_external_edit.is_some(),
@@ -2370,6 +2461,43 @@ pub(super) mod tests {
             status,
             "duplicate completion is inert"
         );
+
+        for outcome in [
+            super::super::pointer_actions::ExternalEditOutcome::Cancelled,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+        ] {
+            let mut retry = agents_dialog(&tmp);
+            focus(&mut retry, "pointer-agent");
+            retry.handle_key(press(KeyCode::Enter));
+            retry.handle_key(press(KeyCode::Char('e')));
+            page_mut(&mut retry)
+                .editing
+                .as_mut()
+                .unwrap()
+                .paste("RETAINED");
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            retry
+                .page
+                .handle_pointer_control(&mut retry.cx, action.clone());
+            retry.page.handle_pointer_control(&mut retry.cx, action);
+            let operation = page_mut(&mut retry)
+                .take_external_edit_request()
+                .expect("terminal outcome effect")
+                .operation_id;
+            let cwd = retry.cx.agents_cwd();
+            page_mut(&mut retry).finish_external_edit_outcome_for_test(&cwd, operation, outcome);
+            assert!(page(&retry).pending_external_edit.is_none());
+            assert!(
+                page(&retry)
+                    .editing
+                    .as_ref()
+                    .is_some_and(|editor| editor.text().contains("RETAINED")),
+                "{outcome:?} restores the exact retryable draft"
+            );
+            assert!(page(&retry).external_edit_ops.pending().is_none());
+        }
     }
 
     #[test]

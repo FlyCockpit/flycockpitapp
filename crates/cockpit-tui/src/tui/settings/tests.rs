@@ -2737,6 +2737,39 @@ pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
         dialog.test_page(),
         TestPageRef::Category(page) if page.status == status
     ));
+
+    for outcome in [
+        pointer_actions::ExternalEditOutcome::Cancelled,
+        pointer_actions::ExternalEditOutcome::Failed,
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        open_category_on(&mut dialog, Category::Profile, SettingId::Name);
+        dialog.handle_key(press(KeyCode::Enter));
+        type_chars(&mut dialog, " retained-draft");
+        let _ = render_settings_rows(&dialog, 80, 20);
+        click_settings_action(
+            &mut dialog,
+            &pointer_actions::SettingsPointerAction::Category(
+                pointer_actions::CategoryAction::ExternalEditBegin(
+                    SettingId::Name,
+                    pointer_actions::CategoryExternalSource::Inline,
+                ),
+            ),
+        );
+        let operation = dialog
+            .take_pending_category_external_edit()
+            .expect("category outcome effect")
+            .0;
+        dialog.finish_category_external_edit_outcome_for_test(operation, outcome);
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Category(page)
+                if page.pending_external_edit.is_none()
+                    && page.editing == Some(SettingId::Name)
+                    && page.buf.text().contains("retained-draft")
+        ));
+    }
 }
 
 fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {

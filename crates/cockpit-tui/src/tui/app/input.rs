@@ -16,6 +16,7 @@ use super::{
     TranscriptFind,
 };
 use crate::tui::agent_runner;
+use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};

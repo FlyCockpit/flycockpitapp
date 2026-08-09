@@ -2031,6 +2031,7 @@ pub struct App {
     /// Latest injected TerminalInput clock sample used by App-owned deadline
     /// reducers. Tests advance this without sleeping.
     pub(super) event_loop_monotonic_now: std::time::Duration,
+    pub(super) async_action_clock_origin: std::time::Instant,
     pub(super) delivery_unconfirmed_records:
         std::collections::HashMap<uuid::Uuid, DeliveryUnconfirmedRecord>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
@@ -3326,6 +3327,7 @@ impl App {
             pending_session_switch_order: None,
             pending_session_switch_reconcile_started_at: None,
             event_loop_monotonic_now: std::time::Duration::ZERO,
+            async_action_clock_origin: std::time::Instant::now(),
             delivery_unconfirmed_records: Default::default(),
             pending_text_object: None,
             at_dismissed: false,

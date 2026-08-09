@@ -79,7 +79,7 @@ impl App {
         // it is intentionally acknowledged without applying UI mutations.
         let _cancelled = self.async_actions.drain_cancelled();
         let mut results = self.async_actions.expire_blocking(
-            self.event_loop_monotonic_now,
+            self.async_action_clock_origin + self.event_loop_monotonic_now,
             std::time::Duration::from_secs(30),
         );
         results.extend(self.async_actions.drain_completed());

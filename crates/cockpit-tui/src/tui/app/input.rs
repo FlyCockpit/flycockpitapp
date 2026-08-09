@@ -49,7 +49,6 @@ impl App {
         {
             return None;
         }
-        let _ = self.paste_correlations.commit(id, host, now);
         Some(crate::tui::structured_paste::PasteRequest {
             paste_generation: generation,
             paste_correlation_id: id,
@@ -2387,10 +2386,17 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
-        let waits_for_earlier_intent = !matches!(
-            self.submission_order.front(),
-            Some((sequence, _)) if sequence == fence_sequence
-        );
+        let order_front = self.submission_order.front();
+        let stages_behind_session_switch = self.has_pending_session_switch_action()
+            && matches!(
+                order_front,
+                Some((
+                    _,
+                    crate::tui::structured_paste::OrderedIntent::SessionSwitch(_)
+                ))
+            );
+        let waits_for_earlier_intent = !stages_behind_session_switch
+            && !matches!(order_front, Some((sequence, _)) if sequence == fence_sequence);
         if !pending_probe_ids.is_empty() || waits_for_earlier_intent {
             self.deferred_fence_dispatches.insert(
                 client_submission_id,
@@ -3095,6 +3101,12 @@ impl App {
         if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data)
             .filter(|path| crate::tui::image_path_probe::is_generation_scoped(path))
         {
+            let kind =
+                crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+            if self.async_actions.pending_kind_count(&kind) >= 8 {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            }
             let Some(request) = self
                 .allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
             else {
@@ -3112,13 +3124,6 @@ impl App {
                     original_offset: self.composer.cursor(),
                 },
             );
-            let kind =
-                crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
-            if self.async_actions.pending_kind_count(&kind) >= 8 {
-                self.pending_paste_probes.remove(&request_id);
-                self.show_toast("Paste unavailable", super::ToastKind::Error);
-                return;
-            }
             let original = data.clone();
             let terminal_generation = self.terminal_input_generation;
             let source_draft_generation = self.draft_generation;

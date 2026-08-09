@@ -782,13 +782,6 @@ fn optimistic_queue_item(id: Uuid, text: String) -> QueuedUserMessage {
 
 impl App {
     pub(super) fn handle_btw_command(&mut self, args: &str) {
-        #[cfg(test)]
-        if self.dispatch_owned_test_barrier(
-            super::blocking_operations::BlockingOperationKind::BtwTeardown,
-        ) {
-            self.push_plain("/btw: pending".to_string());
-            return;
-        }
         if self.side_conversation.is_some() {
             self.history.push(HistoryEntry::CommandError {
                 line: "/btw: end /side first".to_string(),
@@ -810,25 +803,31 @@ impl App {
         }
 
         let existing_mode = self.btw_pane.as_ref().map(BtwPane::mode);
-        let parent_session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.session_id(),
-            _ => {
-                self.ensure_agent_runner();
-                match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => runner.session_id(),
-                    _ => {
-                        self.history.push(HistoryEntry::CommandError {
-                            line: "/btw: no daemon connection".to_string(),
-                        });
-                        return;
-                    }
-                }
-            }
-        };
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => unreachable!("runner checked above"),
-        };
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(self.btw_blocking_operation());
+        #[cfg(not(test))]
+        let barrier: Option<std::sync::Arc<std::sync::Barrier>> = None;
+        let mut runner = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok());
+        if runner.is_none() && barrier.is_none() {
+            self.ensure_agent_runner();
+            runner = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok());
+        }
+        if runner.is_none() && barrier.is_none() {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/btw: no daemon connection".to_string(),
+            });
+            return;
+        }
+        let parent_session_id = runner
+            .map(|runner| runner.session_id())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let attached_request = runner.map(|runner| runner.attached_request_binding());
 
         let requests = plan_btw_rpcs(&command, existing_mode)
             .into_iter()
@@ -846,12 +845,20 @@ impl App {
             BtwCommand::End | BtwCommand::NotYetAvailable(_) => None,
         };
         self.push_plain("/btw: pending".to_string());
+        let action_kind = self.btw_blocking_operation().action_kind();
         self.async_actions.start(
-            super::blocking_operations::BlockingOperationKind::BtwTeardown.action_kind(),
+            action_kind,
             crate::tui::async_action::AsyncActionPolicy::Replace(
                 crate::tui::async_action::AsyncActionKey::new("btw.transition"),
             ),
             async move {
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
+                let attached_request = attached_request.expect("BTW dispatch checked runner");
                 let mut created = None;
                 let mut ended = false;
                 let mut error = None;

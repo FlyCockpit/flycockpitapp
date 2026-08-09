@@ -1499,8 +1499,9 @@ impl App {
             return;
         }
         self.push_plain("/curator: pending".to_string());
+        let operation = self.curator_blocking_operation();
         self.start_owned_blocking_action(
-            blocking_operations::BlockingOperationKind::CuratorMaintenance,
+            operation,
             AsyncActionPolicy::Dedupe(curator_key),
             move || {
                 let response = agent_runner::daemon_request_at_blocking(&socket, request)?;
@@ -1948,8 +1949,9 @@ impl App {
         let input = self.doctor_snapshot_input();
         let clipboard_recovery = self.clipboard_recovery;
         self.push_plain("/doctor: collecting diagnostics…".to_string());
+        let operation = self.doctor_blocking_operation();
         self.start_owned_blocking_action(
-            blocking_operations::BlockingOperationKind::DoctorSnapshot,
+            operation,
             AsyncActionPolicy::Replace(AsyncActionKey::new("doctor.snapshot")),
             move || {
                 let snapshot = cockpit_core::diagnostics::tui_snapshot(input)
@@ -2301,12 +2303,6 @@ impl App {
     /// the full CLI bundle `.zip`. Both overwrite their own prior file
     /// and surface success/failure as a chat line, never a panic.
     pub(super) fn handle_export_command(&mut self, arg: &str) {
-        #[cfg(test)]
-        if self.dispatch_owned_test_barrier(blocking_operations::BlockingOperationKind::ExportWrite)
-        {
-            self.push_plain("/export: writing transcript…".to_string());
-            return;
-        }
         // Authoritative current session: the live runner if attached,
         // else the last-attached ids tracked on launch info.
         let (session_id, short_id) = match self.agent_runner.as_ref() {

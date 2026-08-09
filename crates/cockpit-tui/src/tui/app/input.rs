@@ -1649,8 +1649,9 @@ impl App {
         self.at_suggestions_loading = true;
         self.at_suggestions_loaded_query = None;
         self.at_suggestions_error = None;
+        let operation = self.autocomplete_blocking_operation();
         self.start_owned_blocking_action(
-            blocking_operations::BlockingOperationKind::FileAutocomplete,
+            operation,
             AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),
             move || {
                 let mut allow = cockpit_config::extended::resolve_gitignore_allow(&cwd);
@@ -3070,8 +3071,7 @@ pub(super) enum QueueEditOutcome {
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
         #[cfg(test)]
-        let barrier =
-            self.take_owned_test_barrier(blocking_operations::BlockingOperationKind::QueueMutation);
+        let barrier = self.take_owned_test_barrier(self.queue_blocking_operation());
         let attached_request = self
             .agent_runner
             .as_ref()
@@ -3092,8 +3092,9 @@ impl App {
             }
         }
         self.push_queue_edit_notice("retrieving queued messages…");
+        let action_kind = self.queue_blocking_operation().action_kind();
         self.async_actions.start_serialized(
-            blocking_operations::BlockingOperationKind::QueueMutation.action_kind(),
+            action_kind,
             AsyncActionKey::new("queue.edit"),
             async move {
                 #[cfg(test)]

@@ -60,6 +60,25 @@ fn blocking_operation_manifest_is_complete() {
 
 #[test]
 fn classified_handlers_dispatch_before_any_owned_blocking_call() {
+    fn exact_function_body<'a>(source: &'a str, handler: &str) -> &'a str {
+        let signature = format!("fn {handler}");
+        let tail = source.split_once(&signature).unwrap().1;
+        let open = tail.find('{').unwrap();
+        let mut depth = 0usize;
+        for (offset, byte) in tail.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &tail[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated handler {handler}")
+    }
     let forbidden = [
         "std::fs::",
         "std::process::",
@@ -70,15 +89,20 @@ fn classified_handlers_dispatch_before_any_owned_blocking_call() {
     ];
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
         let source = match registration.site {
-            "slash:/curator" | "slash:/doctor" | "slash:/export" => include_str!("slash.rs"),
+            "slash:/curator" | "slash:/doctor" => include_str!("slash.rs"),
+            "slash:/export" => include_str!("export_actions.rs"),
             "key:queue-edit" | "composer:@suggestions" => include_str!("input.rs"),
             "slash:/btw" => include_str!("btw_pane.rs"),
             unknown => panic!("manifest registered unknown handler site {unknown}"),
         };
         let handler = registration.handler;
         let dispatch = registration.dispatch;
-        let signature = format!("fn {handler}");
-        let body = source.split_once(&signature).unwrap().1;
+        let body = exact_function_body(source, handler);
+        assert!(
+            body.contains(registration.binding),
+            "{handler} does not invoke typed manifest binding {}",
+            registration.binding
+        );
         let before_dispatch = body.split_once(dispatch).unwrap().0;
         for blocking_call in forbidden {
             assert!(
@@ -93,6 +117,8 @@ fn classified_handlers_dispatch_before_any_owned_blocking_call() {
 async fn no_owned_blocking_command_runs_on_event_loop() {
     let mut app = App::new(None, false);
     app.startup_background.daemon_socket = Some(std::path::PathBuf::from("/nonexistent-test.sock"));
+    app.launch.session_id = Some(uuid::Uuid::nil());
+    app.launch.session_short_id = Some("test".to_string());
     let release = std::sync::Arc::new(std::sync::Barrier::new(7));
     for registration in blocking_operations::BLOCKING_OPERATION_MANIFEST {
         blocking_operations::install_owned_test_barrier(

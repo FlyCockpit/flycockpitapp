@@ -58,17 +58,23 @@ impl App {
         exports_dir: &Path,
         kind: ExportSessionKind,
     ) {
-        let Some(attached_request) = self
+        let operation = self.export_blocking_operation();
+        debug_assert!(operation.registration().actions.contains(&action));
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
+        #[cfg(not(test))]
+        let barrier: Option<std::sync::Arc<std::sync::Barrier>> = None;
+        let attached_request = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
-            .map(|runner| runner.attached_request_binding())
-        else {
+            .map(|runner| runner.attached_request_binding());
+        if attached_request.is_none() && barrier.is_none() {
             self.push_plain(format!(
                 "{command}: an attached daemon is required for export"
             ));
             return;
-        };
+        }
 
         let export_key = AsyncActionKey::new(EXPORT_ACTION_KEY);
         if self.async_actions.has_pending_key(&export_key) {
@@ -84,8 +90,14 @@ impl App {
             AsyncActionKind::Blocking(action),
             AsyncActionPolicy::Dedupe(export_key),
             move |shutdown| async move {
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
                 export_via_attached_daemon(
-                    attached_request,
+                    attached_request.expect("export dispatch checked attached request"),
                     session_id,
                     kind,
                     file_stem,

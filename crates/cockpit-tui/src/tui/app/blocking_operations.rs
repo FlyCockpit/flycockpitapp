@@ -5,12 +5,13 @@ pub(super) struct BlockingOperationRegistration {
     pub(super) site: &'static str,
     pub(super) handler: &'static str,
     pub(super) dispatch: &'static str,
+    pub(super) binding: &'static str,
     pub(super) kind: BlockingOperationKind,
     pub(super) actions: &'static [&'static str],
 }
 
 macro_rules! blocking_operation_manifest {
-    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => [$($action:literal),+ $(,)?] ),+ $(,)?) => {
+    ($( $kind:ident => $site:literal => $handler:literal => $dispatch:literal => $binding:ident => [$($action:literal),+ $(,)?] ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
@@ -23,24 +24,31 @@ macro_rules! blocking_operation_manifest {
                 site: $site,
                 handler: $handler,
                 dispatch: $dispatch,
+                binding: stringify!($binding),
                 kind: BlockingOperationKind::$kind,
                 actions: &[$($action),+],
             }),+
         ];
+
+        impl App {
+            $(pub(super) const fn $binding(&self) -> BlockingOperationKind {
+                BlockingOperationKind::$kind
+            })+
+        }
     };
 }
 
 blocking_operation_manifest! {
-    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => ["curator.command"],
-    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => ["doctor.snapshot"],
-    ExportWrite => "slash:/export" => "handle_export_command" => "export_transcript_json" => ["export.transcript", "export.debug"],
-    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => ["queue.edit"],
-    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => ["btw.teardown"],
-    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => ["autocomplete.files"],
+    CuratorMaintenance => "slash:/curator" => "handle_curator_command" => "start_owned_blocking_action" => curator_blocking_operation => ["curator.command"],
+    DoctorSnapshot => "slash:/doctor" => "handle_doctor_command" => "start_owned_blocking_action" => doctor_blocking_operation => ["doctor.snapshot"],
+    ExportWrite => "slash:/export" => "start_export_action" => "start_export" => export_blocking_operation => ["export.transcript", "export.debug"],
+    QueueMutation => "key:queue-edit" => "edit_queued_messages" => "start_serialized" => queue_blocking_operation => ["queue.edit"],
+    BtwTeardown => "slash:/btw" => "handle_btw_command" => "async_actions.start" => btw_blocking_operation => ["btw.teardown"],
+    FileAutocomplete => "composer:@suggestions" => "reset_at_window" => "start_owned_blocking_action" => autocomplete_blocking_operation => ["autocomplete.files"],
 }
 
 impl BlockingOperationKind {
-    const fn registration(self) -> BlockingOperationRegistration {
+    pub(super) const fn registration(self) -> BlockingOperationRegistration {
         let mut index = 0;
         while index < BLOCKING_OPERATION_MANIFEST.len() {
             let registration = BLOCKING_OPERATION_MANIFEST[index];
@@ -66,22 +74,6 @@ impl BlockingOperationKind {
 }
 
 impl App {
-    #[cfg(test)]
-    pub(super) fn dispatch_owned_test_barrier(&mut self, operation: BlockingOperationKind) -> bool {
-        let Some(barrier) = self.take_owned_test_barrier(operation) else {
-            return false;
-        };
-        self.async_actions.start_blocking(
-            operation.action_kind(),
-            AsyncActionPolicy::AllowConcurrent,
-            move || {
-                barrier.wait();
-                Ok(AsyncActionPayload::Unit)
-            },
-        );
-        true
-    }
-
     #[cfg(test)]
     pub(super) fn take_owned_test_barrier(
         &self,

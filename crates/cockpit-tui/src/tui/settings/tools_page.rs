@@ -1,7 +1,7 @@
 //! `/settings -> Tools` page: effective web tools, builtin inventory,
 //! user-defined command tools, and MCP catalog visibility.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -18,8 +18,9 @@ use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    WrappedValueLayout, focused_field_style, muted_style, push_text_field_at_cursor,
-    push_wrapped_prefixed_value, selected_line_from_marker, selected_style, warning_style,
+    SettingsControlId, SettingsScrollRegionId, WrappedValueLayout, focused_field_style,
+    muted_style, push_text_field_at_cursor, push_wrapped_prefixed_value, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -529,24 +530,34 @@ impl SettingsCx {
     }
 
     pub(super) fn build_tools_page_lines(&self, width: u16, p: &ToolsPage) -> Vec<Line<'static>> {
+        self.build_tools_page_lines_with_bindings(width, p).0
+    }
+
+    fn build_tools_page_lines_with_bindings(
+        &self,
+        width: u16,
+        p: &ToolsPage,
+    ) -> (Vec<Line<'static>>, Vec<(usize, SettingsControlId)>) {
         let muted = muted_style();
         let mut lines = Vec::new();
+        let mut bindings = Vec::new();
         let mut row_idx = 0usize;
 
         push_section(&mut lines, "Web tools");
-        self.push_web_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_web_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "Built-in tools");
-        self.push_builtin_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_builtin_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "User-defined tools");
-        self.push_user_defined_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_user_defined_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "MCP tools");
-        self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         lines.push(Line::default());
         let reset_row = row_idx;
+        bindings.push((lines.len(), SettingsControlId(reset_row as u64)));
         lines.push(
             p.reset
                 .render_line(p.cursor == reset_row, "reset to defaults"),
@@ -585,7 +596,7 @@ impl SettingsCx {
             muted,
         )));
 
-        lines
+        (lines, bindings)
     }
 
     fn push_web_tools_lines(
@@ -594,12 +605,14 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         push_selectable_row(
             lines,
             width,
             p,
             row_idx,
+            bindings,
             "provider",
             &format!(
                 "{} (enter cycles Firecrawl, TinyFish, Custom)",
@@ -614,6 +627,7 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
+                    bindings,
                     "api key",
                     &format!(
                         "{}; env wins over stored credentials",
@@ -630,6 +644,7 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
+                    bindings,
                     "base url",
                     &format!(
                         "{} ({env_override})",
@@ -648,6 +663,7 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
+                    bindings,
                     "api key",
                     &format!(
                         "{}; env wins over stored credentials",
@@ -667,6 +683,7 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
+                    bindings,
                     "webfetch",
                     &web_command_status(fetch_command, "{url}"),
                     if fetch_command.is_some_and(|command| !command.trim().is_empty()) {
@@ -681,6 +698,7 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
+                    bindings,
                     "websearch",
                     &web_command_status(search_command, "{query}"),
                     if search_command.is_some_and(|command| !command.trim().is_empty()) {
@@ -699,6 +717,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let mut last_family = "";
         for tool in builtin_tool_inventory() {
@@ -713,7 +732,16 @@ impl SettingsCx {
                 Some(condition) => format!("{} ({condition})", tool.summary),
                 None => tool.summary.to_string(),
             };
-            push_selectable_row(lines, width, p, row_idx, tool.name, &value, muted_style());
+            push_selectable_row(
+                lines,
+                width,
+                p,
+                row_idx,
+                bindings,
+                tool.name,
+                &value,
+                muted_style(),
+            );
         }
     }
 
@@ -723,6 +751,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let mut names = self.extended.tools.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -759,6 +788,7 @@ impl SettingsCx {
                 width,
                 p,
                 row_idx,
+                bindings,
                 &name,
                 &value,
                 if tool.command.trim().is_empty() {
@@ -773,6 +803,7 @@ impl SettingsCx {
             width,
             p,
             row_idx,
+            bindings,
             "[+ add tool]",
             "create a user-defined bash-command tool",
             Style::default().add_modifier(Modifier::BOLD),
@@ -785,6 +816,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let cfg = self.load_mcp();
         let enabled_servers = cfg.enabled_servers();
@@ -811,6 +843,7 @@ impl SettingsCx {
                         width,
                         p,
                         row_idx,
+                        bindings,
                         &format!("{server_name}/{}", tool.name),
                         first_line_or_default(&tool.description),
                         muted_style(),
@@ -829,6 +862,7 @@ impl SettingsCx {
             width,
             p,
             row_idx,
+            bindings,
             "configure in MCP ->",
             "jump to MCP server settings",
             Style::default().add_modifier(Modifier::BOLD),
@@ -836,10 +870,18 @@ impl SettingsCx {
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
-        let lines = self.build_tools_page_lines(area.width, p);
+        let (lines, bindings) = self.build_tools_page_lines_with_bindings(area.width, p);
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "tools", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "tools",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("tools"),
+        );
     }
 }
 
@@ -875,10 +917,12 @@ fn push_selectable_row(
     width: u16,
     p: &ToolsPage,
     row_idx: &mut usize,
+    bindings: &mut Vec<(usize, SettingsControlId)>,
     label: &str,
     value: &str,
     value_style: Style,
 ) {
+    let first_line = lines.len();
     let selected = p.cursor == *row_idx;
     let marker = if selected { "▸ " } else { "  " };
     let label_style = if selected {
@@ -887,6 +931,8 @@ fn push_selectable_row(
         focused_field_style()
     };
     push_tool_value_row(lines, width, marker, label, label_style, value, value_style);
+    bindings
+        .extend((first_line..lines.len()).map(|line| (line, SettingsControlId(*row_idx as u64))));
     *row_idx += 1;
 }
 
@@ -924,6 +970,32 @@ impl SettingsPage for ToolsPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_tools_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        if index >= cx.tool_rows().len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_tools_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("tools") && self.editing.is_none() {
+            self.delete_pending = None;
+            self.reset.disarm();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.tool_rows().len().saturating_sub(1));
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

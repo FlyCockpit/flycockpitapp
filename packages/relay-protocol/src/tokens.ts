@@ -22,8 +22,6 @@ export const RELAY_TOKEN_ALG = "ES256" as const;
 const curve = "prime256v1";
 const derivationContext = "flycockpit-relay-token-es256-v1";
 
-type RelayTokenType = "connector" | "client" | "user";
-
 const basePayloadSchema = z
   .object({
     iss: z.string().min(1),

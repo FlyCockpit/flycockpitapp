@@ -234,6 +234,28 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
+    handle_serialized_request_with_remote_operation(request, state, shared, ctx, effects, None)
+        .await
+}
+
+pub(super) async fn handle_serialized_request_with_remote_operation(
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(operation) = remote_operation {
+        tracing::debug!(
+            request_id = %operation.request_id,
+            operation_id = %operation.operation_id,
+            logical_attachment_id = %operation.logical_attachment_id,
+            authenticated_device_id = %operation.authenticated_device_id,
+            authenticated_device_generation = operation.authenticated_device_generation,
+            "dispatching admitted remote operation"
+        );
+    }
     validate_request_semantics(&request)?;
     debug_assert_eq!(shared.principal, state.principal);
     let pruned = prune_expired_attachments(state);
@@ -2188,6 +2210,25 @@ pub(super) async fn handle_concurrent_request(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    handle_concurrent_request_with_remote_operation(request, shared, ctx, None).await
+}
+
+pub(super) async fn handle_concurrent_request_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(operation) = remote_operation {
+        tracing::debug!(
+            request_id = %operation.request_id,
+            operation_id = %operation.operation_id,
+            logical_attachment_id = %operation.logical_attachment_id,
+            authenticated_device_id = %operation.authenticated_device_id,
+            authenticated_device_generation = operation.authenticated_device_generation,
+            "dispatching admitted concurrent remote operation"
+        );
+    }
     validate_request_semantics(&request)?;
     let request_kind = principal::request_kind(&request);
     let audit_path = request_audit_path(&request);

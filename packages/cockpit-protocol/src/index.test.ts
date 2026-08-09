@@ -20,6 +20,7 @@ import {
   modelSelectionResultDataSchema,
   PROTOCOL_VERSION,
   pausedWorkSummarySchema,
+  remoteOperationIdentityV1Schema,
   resolveResponseSchema,
   responseEnvelopeSchema,
   sandboxEscalationSchema,
@@ -36,6 +37,21 @@ const goldenFiles = [
 const interruptRaisedDataSchema = z.object({ question: interruptQuestionSchema });
 
 describe("cockpit-proto daemon wire schemas", () => {
+  it("enforces canonical UUIDv7 remote operation identities", () => {
+    const valid = requestsFixture.mark_app_flag_seen.operation;
+    expect(remoteOperationIdentityV1Schema.safeParse(valid).success).toBe(true);
+    for (const malformed of [
+      { ...valid, schemaVersion: 2 },
+      { ...valid, extra: true },
+      { ...valid, logicalAttachmentId: "00000000-0000-0000-0000-000000000000" },
+      { ...valid, logicalAttachmentId: valid.logicalAttachmentId.toUpperCase() },
+      { ...valid, operationId: "018f3f24-7a10-4cc2-8f55-111111111111" },
+      { ...valid, operationId: "018f3f24-7a10-7cc2-7f55-111111111111" },
+    ]) {
+      expect(remoteOperationIdentityV1Schema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
   it("parses every golden request envelope", () => {
     for (const [name, frame] of Object.entries(requestsFixture)) {
       const parsed = clientEnvelopeSchema.safeParse(frame);

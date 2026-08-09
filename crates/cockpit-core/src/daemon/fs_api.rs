@@ -746,6 +746,7 @@ mod tests {
     fn remote_project_files(root: &Path) -> ClientPrincipal {
         ClientPrincipal::Remote(RemotePrincipal {
             user_id: "user-1".into(),
+            actor_binding: None,
             grants: vec![PrincipalGrant {
                 scope: PrincipalScope::ProjectFiles,
                 project_root: Some(root.to_string_lossy().into_owned()),

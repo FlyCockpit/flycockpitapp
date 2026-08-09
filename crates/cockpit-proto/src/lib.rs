@@ -735,8 +735,8 @@ pub enum Body {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteOperationIdentityV1 {
     pub schema_version: u8,
     pub logical_attachment_id: Uuid,
@@ -746,10 +746,14 @@ pub struct RemoteOperationIdentityV1 {
 impl RemoteOperationIdentityV1 {
     pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
         anyhow::ensure!(
-            !logical_attachment_id.is_nil(),
-            "logical attachment id must be nonnil"
+            !logical_attachment_id.is_nil()
+                && logical_attachment_id.get_variant() == uuid::Variant::RFC4122,
+            "logical attachment id must be a nonnil RFC UUID"
         );
-        anyhow::ensure!(!operation_id.is_nil(), "operation id must be nonnil");
+        anyhow::ensure!(
+            !operation_id.is_nil() && operation_id.get_variant() == uuid::Variant::RFC4122,
+            "operation id must be a nonnil RFC UUID"
+        );
         anyhow::ensure!(
             operation_id.get_version_num() == 7,
             "operation id must be UUIDv7"
@@ -759,6 +763,29 @@ impl RemoteOperationIdentityV1 {
             logical_attachment_id,
             operation_id,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            schema_version: u8,
+            logical_attachment_id: Uuid,
+            operation_id: Uuid,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version != 1 {
+            return Err(serde::de::Error::custom(
+                "remote operation identity schemaVersion must be 1",
+            ));
+        }
+        Self::new(wire.logical_attachment_id, wire.operation_id).map_err(serde::de::Error::custom)
     }
 }
 
@@ -3478,6 +3505,25 @@ mod errorcode_forward_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
+        let valid = json!({
+            "schemaVersion": 1,
+            "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+            "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
+        });
+        assert!(serde_json::from_value::<RemoteOperationIdentityV1>(valid).is_ok());
+        for malformed in [
+            json!({ "schemaVersion": 2, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111" }),
+            json!({ "schemaVersion": 1, "logicalAttachmentId": "00000000-0000-0000-0000-000000000000", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111" }),
+            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-4cc2-8f55-111111111111" }),
+            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-7f55-111111111111" }),
+            json!({ "schemaVersion": 1, "logicalAttachmentId": "22222222-2222-4222-8222-222222222222", "operationId": "018f3f24-7a10-7cc2-8f55-111111111111", "extra": true }),
+        ] {
+            assert!(serde_json::from_value::<RemoteOperationIdentityV1>(malformed).is_err());
+        }
+    }
     use serde_json::json;
     use tokio::io::duplex;
 

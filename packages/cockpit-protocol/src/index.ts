@@ -73,6 +73,25 @@ export const exportSessionDataSchema = z
   .passthrough();
 
 export const uuidSchema = z.string().uuid();
+const canonicalRfcUuidSchema = uuidSchema.refine(
+  (value) =>
+    value === value.toLowerCase() &&
+    value !== "00000000-0000-0000-0000-000000000000" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value),
+  "expected a canonical lowercase nonnil RFC UUID",
+);
+const uuidV7Schema = canonicalRfcUuidSchema.refine(
+  (value) => value[14] === "7",
+  "expected a UUIDv7 operation identity",
+);
+export const remoteOperationIdentityV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    logicalAttachmentId: canonicalRfcUuidSchema,
+    operationId: uuidV7Schema,
+  })
+  .strict();
+export type RemoteOperationIdentityV1 = z.infer<typeof remoteOperationIdentityV1Schema>;
 const clientSubmissionIdSchema = uuidSchema.refine(
   (value) => value !== "00000000-0000-0000-0000-000000000000",
   { message: "client_submission_id must not be nil" },
@@ -544,6 +563,7 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       v: z.literal(PROTOCOL_VERSION),
       kind: z.literal("req"),
       id: requestIdSchema,
+      operation: remoteOperationIdentityV1Schema.optional(),
       ...variant.shape,
     })
     .strict(),

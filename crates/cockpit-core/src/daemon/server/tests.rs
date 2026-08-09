@@ -777,11 +777,109 @@ fn invalid_response_metrics_tokenizer_dispatch_error_is_exact_and_safe() {
 fn remote_principal() -> ClientPrincipal {
     ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-user".to_string(),
+        actor_binding: None,
         grants: vec![principal::PrincipalGrant {
             scope: principal::PrincipalScope::AgentReadonly,
             project_root: None,
         }],
     })
+}
+
+#[test]
+fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+    let request_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let device_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id,
+        device_generation: 9,
+        logical_attachment_id,
+    };
+    let principal = |actor_binding| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "remote-user".into(),
+            grants: Vec::new(),
+            actor_binding,
+        })
+    };
+    let read = Request::DaemonStatus;
+    let mutation = Request::MarkAppFlagSeen {
+        key: proto::AppFlagKey::DaemonAutostartNotice,
+        expected_version: 0,
+    };
+    let mut reached_dispatch = 0;
+    let cases = [
+        (principal(None), None, &read, true),
+        (principal(None), None, &mutation, false),
+        (principal(Some(actor.clone())), None, &mutation, false),
+        (
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                schema_version: 2,
+                ..operation
+            }),
+            &mutation,
+            false,
+        ),
+        (
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                logical_attachment_id: device_id,
+                ..operation
+            }),
+            &mutation,
+            false,
+        ),
+        (
+            principal(Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                device_generation: 0,
+                ..actor.clone()
+            })),
+            Some(operation),
+            &mutation,
+            false,
+        ),
+        (
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-7f55-111111111111").unwrap(),
+                ..operation
+            }),
+            &read,
+            false,
+        ),
+        (
+            principal(Some(actor.clone())),
+            Some(operation),
+            &mutation,
+            true,
+        ),
+        (ClientPrincipal::owner(), None, &mutation, true),
+        (
+            principal(Some(actor)),
+            Some(operation),
+            &Request::Unknown,
+            false,
+        ),
+    ];
+    for (principal, operation, request, allowed) in cases {
+        let admitted = admit_remote_operation(&principal, request_id, operation, request);
+        assert_eq!(admitted.is_ok(), allowed);
+        if let Ok(context) = admitted {
+            reached_dispatch += 1;
+            if let Some(context) = context {
+                assert_eq!(context.request_id, request_id);
+                assert_eq!(context.operation_id, operation_id);
+                assert_ne!(context.request_id, context.operation_id);
+                assert_eq!(context.authenticated_device_generation, 9);
+            }
+        }
+    }
+    assert_eq!(reached_dispatch, 3);
 }
 
 fn table_for(secret: &str) -> Arc<RedactionTable> {
@@ -1435,6 +1533,7 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
         .unwrap();
     state.principal = ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
         user_id: "writer".into(),
+        actor_binding: None,
         grants: vec![crate::daemon::principal::PrincipalGrant {
             scope: crate::daemon::principal::PrincipalScope::Agent,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
@@ -1694,6 +1793,7 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
         };
         let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "readonly-env-test".to_string(),
+            actor_binding: None,
             grants: vec![principal::PrincipalGrant {
                 scope: principal::PrincipalScope::AgentReadonly,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
@@ -2805,6 +2905,7 @@ fn remote_state_with_grants(
     MutableClientState {
         principal: ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
             user_id: "user-1".into(),
+            actor_binding: None,
             grants,
         }),
         attached: None,
@@ -5308,11 +5409,13 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
             };
             ClientPrincipal::Remote(principal::RemotePrincipal {
                 user_id: "authz-writer".into(),
+                actor_binding: None,
                 grants,
             })
         }
         AuthzLevel::Readonly => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-readonly".into(),
+            actor_binding: None,
             grants: vec![principal::PrincipalGrant {
                 scope: principal::PrincipalScope::AgentReadonly,
                 project_root: Some(project_root),
@@ -5320,6 +5423,7 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
         }),
         AuthzLevel::NoAccess => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-none".into(),
+            actor_binding: None,
             grants: Vec::new(),
         }),
     }

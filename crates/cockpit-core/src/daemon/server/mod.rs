@@ -3585,6 +3585,71 @@ async fn handle_client_frame(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RemoteOperationContext {
+    pub(super) request_id: Uuid,
+    pub(super) logical_attachment_id: Uuid,
+    pub(super) operation_id: Uuid,
+    pub(super) authenticated_device_id: Uuid,
+    pub(super) authenticated_device_generation: u64,
+}
+
+fn remote_operation_denied() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Authorization,
+        message: "remote operations require a valid server-authenticated actor binding and operation identity"
+            .to_string(),
+    }
+}
+
+fn admit_remote_operation(
+    principal: &ClientPrincipal,
+    request_id: Uuid,
+    operation: Option<proto::RemoteOperationIdentityV1>,
+    request: &Request,
+) -> std::result::Result<Option<RemoteOperationContext>, ErrorPayload> {
+    if principal.is_owner() {
+        return Ok(None);
+    }
+    let class = request
+        .remote_operation_class()
+        .map_err(|_| remote_operation_denied())?;
+    if class == proto::RemoteOperationClass::ReadOnly && operation.is_none() {
+        return Ok(None);
+    }
+    let ClientPrincipal::Remote(remote) = principal else {
+        unreachable!("owner principal returned above")
+    };
+    let (Some(actor), Some(operation)) = (remote.actor_binding.as_ref(), operation) else {
+        return Err(remote_operation_denied());
+    };
+    let operation_valid = operation.schema_version == 1
+        && !operation.logical_attachment_id.is_nil()
+        && operation.logical_attachment_id.get_variant() == uuid::Variant::RFC4122
+        && !operation.operation_id.is_nil()
+        && operation.operation_id.get_variant() == uuid::Variant::RFC4122
+        && operation.operation_id.get_version_num() == 7;
+    let actor_valid = actor.schema_version == 1
+        && actor.device_generation > 0
+        && !actor.device_id.is_nil()
+        && actor.device_id.get_variant() == uuid::Variant::RFC4122
+        && !actor.logical_attachment_id.is_nil()
+        && actor.logical_attachment_id.get_variant() == uuid::Variant::RFC4122;
+    if !operation_valid
+        || !actor_valid
+        || actor.logical_attachment_id != operation.logical_attachment_id
+    {
+        return Err(remote_operation_denied());
+    }
+    Ok(Some(RemoteOperationContext {
+        request_id,
+        logical_attachment_id: operation.logical_attachment_id,
+        operation_id: operation.operation_id,
+        authenticated_device_id: actor.device_id,
+        authenticated_device_generation: actor.device_generation,
+    }))
+}
+
 async fn handle_envelope(
     env: Envelope,
     state: &mut MutableClientState,
@@ -3600,35 +3665,15 @@ async fn handle_envelope(
             operation,
             request,
         } => {
-            if request
-                .remote_operation_class()
-                .is_ok_and(|class| class != proto::RemoteOperationClass::ReadOnly)
-                && let ClientPrincipal::Remote(remote) = &state.principal
-            {
-                let valid = remote
-                    .actor_binding
-                    .as_ref()
-                    .zip(operation.as_ref())
-                    .is_some_and(|(actor, operation)| {
-                        operation.schema_version == 1
-                            && operation.operation_id.get_version_num() == 7
-                            && !operation.operation_id.is_nil()
-                            && actor.schema_version == 1
-                            && actor.device_generation > 0
-                            && actor.logical_attachment_id == operation.logical_attachment_id
-                    });
-                if !valid {
-                    let envelope = Envelope::error(
-                        Some(id),
-                        ErrorPayload {
-                            code: ErrorCode::Authorization,
-                            message: "remote mutations require a live actor-bound v2 attachment and UUIDv7 operation identity".to_string(),
-                        },
-                    );
-                    let _ = send_writer_envelope(writer_tx, envelope).await;
-                    return Ok(());
-                }
-            }
+            let remote_operation =
+                match admit_remote_operation(&state.principal, id, operation, &request) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let envelope = Envelope::error(Some(id), error);
+                        let _ = send_writer_envelope(writer_tx, envelope).await;
+                        return Ok(());
+                    }
+                };
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -3639,8 +3684,13 @@ async fn handle_envelope(
                 concurrent.tasks.spawn(async move {
                     let _permit = permit;
                     let response_shared = request_shared.clone();
-                    let result =
-                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
+                    let result = run_concurrent_request_catching_panic_with_remote_operation(
+                        request,
+                        request_shared,
+                        ctx,
+                        remote_operation,
+                    )
+                    .await;
                     let envelope = response_envelope_for_shared(id, result, &response_shared);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
                 });
@@ -3648,9 +3698,15 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result =
-                dispatch::handle_serialized_request(request, state, shared, ctx, &mut effects)
-                    .await;
+            let result = dispatch::handle_serialized_request_with_remote_operation(
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
+                remote_operation.as_ref(),
+            )
+            .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
@@ -3725,9 +3781,23 @@ async fn run_concurrent_request_catching_panic(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
-        .catch_unwind()
-        .await
+    run_concurrent_request_catching_panic_with_remote_operation(request, shared, ctx, None).await
+}
+
+async fn run_concurrent_request_catching_panic_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    match AssertUnwindSafe(dispatch::handle_concurrent_request_with_remote_operation(
+        request,
+        shared,
+        ctx,
+        remote_operation,
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(ErrorPayload {

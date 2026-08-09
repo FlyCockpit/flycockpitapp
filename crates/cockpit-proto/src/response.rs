@@ -17,6 +17,8 @@ pub enum Response {
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
 
+    MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,

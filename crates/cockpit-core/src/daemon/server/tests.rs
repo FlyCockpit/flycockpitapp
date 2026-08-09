@@ -1563,6 +1563,32 @@ async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_au
     else {
         panic!("registration rejected")
     };
+    let status = handle_request(
+        Request::GetMediaAttachmentStatus(
+            cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id,
+                canonical_project_digest: request.canonical_project_digest.clone(),
+                attachment_id,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaAttachmentStatus(status) = status else {
+        panic!("unexpected status response")
+    };
+    assert_eq!(status.attachment_id, attachment_id);
+    assert_eq!(status.reference_generation, 1);
+    assert!(status.can_discard);
+    assert!(!status.preview_available);
+    assert!(matches!(
+        status.detail,
+        cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Registered
+    ));
     let storage_id = Uuid::now_v7();
     let component_id = Uuid::now_v7();
     let component_path = temp.path().join("media").join(storage_id.to_string());

@@ -99,6 +99,110 @@ pub struct LocalPathRegistrationReceiptV1 {
     pub committed_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetMediaAttachmentStatusV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub attachment_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAttachmentReasonV1 {
+    AmbiguousOrUnsupportedContainer,
+    UnsupportedCodec,
+    UnsupportedColorProfile,
+    InvalidMedia,
+    ResourceLimit,
+    DecodeFailed,
+    NormalizationFailed,
+    ModelRuntimeUnavailable,
+    SourceChanged,
+    StorageFailure,
+    StorageSecurityViolation,
+    CleanupPending,
+    RetainedCopyDeleted,
+    BorrowedDerivativesDeleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaAttachmentPreviewSummaryV1 {
+    pub generation: u64,
+    pub checksum: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "availabilityState",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MediaAttachmentStatusDetailV1 {
+    Quarantined,
+    Registered,
+    Probing,
+    Decoding,
+    Normalizing,
+    Ready {
+        #[serde(rename = "readyChecksum")]
+        ready_checksum: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<MediaAttachmentPreviewSummaryV1>,
+    },
+    ModelDerivativeUnavailable {
+        reason: MediaAttachmentReasonV1,
+    },
+    Failed {
+        reason: MediaAttachmentReasonV1,
+    },
+    SourceChanged {
+        reason: MediaAttachmentReasonV1,
+    },
+    SecurityBlocked {
+        reason: MediaAttachmentReasonV1,
+    },
+    OwnedCleanupPending {
+        reason: MediaAttachmentReasonV1,
+    },
+    BorrowedCleanupPending {
+        reason: MediaAttachmentReasonV1,
+    },
+    RetainedCopyDeleted {
+        reason: MediaAttachmentReasonV1,
+    },
+    BorrowedDerivativesDeleted {
+        reason: MediaAttachmentReasonV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaAttachmentStatusV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub media_kind: RequestedLocalPathMediaKind,
+    pub availability_generation: u64,
+    pub reference_generation: u64,
+    pub can_discard: bool,
+    pub preview_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_expires_at_unix_ms: Option<i64>,
+    #[serde(flatten)]
+    pub detail: MediaAttachmentStatusDetailV1,
+}
+
 impl MediaSourceKind {
     fn is_borrowed(self) -> bool {
         self == Self::LocalPath
@@ -430,6 +534,128 @@ pub enum SecurityRecoverySnapshotResult {
 }
 
 impl super::Db {
+    pub fn media_attachment_status_for_owner_conn(
+        conn: &Connection,
+        request: &GetMediaAttachmentStatusV1,
+    ) -> Result<Option<MediaAttachmentStatusV1>> {
+        ensure!(
+            request.schema_version == 1 && request.kind == "getMediaAttachmentStatus",
+            "invalid media attachment status request"
+        );
+        ensure!(
+            is_strict_uuid_v7(request.session_id) && is_strict_uuid_v7(request.attachment_id),
+            "status ids must be UUIDv7"
+        );
+        validate_digest(&request.canonical_project_digest, "project digest")?;
+        let Some(record) = Self::media_attachment_for_owner_conn(
+            conn,
+            request.attachment_id,
+            request.session_id,
+            &request.canonical_project_digest,
+        )?
+        else {
+            return Ok(None);
+        };
+        let live:i64=conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0))?;
+        let eligible = matches!(
+            record.availability,
+            MediaAvailability::Registered
+                | MediaAvailability::Quarantined
+                | MediaAvailability::Probing
+                | MediaAvailability::Decoding
+                | MediaAvailability::Normalizing
+                | MediaAvailability::Ready
+                | MediaAvailability::ModelDerivativeUnavailable
+                | MediaAvailability::SourceChanged
+                | MediaAvailability::Failed
+        );
+        let detail = match record.availability {
+            MediaAvailability::Quarantined => MediaAttachmentStatusDetailV1::Quarantined,
+            MediaAvailability::Registered => MediaAttachmentStatusDetailV1::Registered,
+            MediaAvailability::Probing => MediaAttachmentStatusDetailV1::Probing,
+            MediaAvailability::Decoding => MediaAttachmentStatusDetailV1::Decoding,
+            MediaAvailability::Normalizing => MediaAttachmentStatusDetailV1::Normalizing,
+            MediaAvailability::Ready => {
+                let checksum:Option<String>=conn.query_row("SELECT sha256 FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind IN ('image_model','audio_model','video_model') AND lifecycle_state='ready' ORDER BY component_kind LIMIT 1",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0)).optional()?;
+                ensure!(
+                    record.media_kind != MediaKind::Image,
+                    "ready image status requires preview dimensions"
+                );
+                MediaAttachmentStatusDetailV1::Ready {
+                    ready_checksum: checksum.context("ready media component missing")?,
+                    preview: None,
+                }
+            }
+            MediaAvailability::ModelDerivativeUnavailable => {
+                MediaAttachmentStatusDetailV1::ModelDerivativeUnavailable {
+                    reason: MediaAttachmentReasonV1::ModelRuntimeUnavailable,
+                }
+            }
+            MediaAvailability::Failed => MediaAttachmentStatusDetailV1::Failed {
+                reason: MediaAttachmentReasonV1::StorageFailure,
+            },
+            MediaAvailability::SourceChanged => MediaAttachmentStatusDetailV1::SourceChanged {
+                reason: MediaAttachmentReasonV1::SourceChanged,
+            },
+            MediaAvailability::SecurityBlocked => MediaAttachmentStatusDetailV1::SecurityBlocked {
+                reason: MediaAttachmentReasonV1::StorageSecurityViolation,
+            },
+            MediaAvailability::OwnedCleanupPending => {
+                MediaAttachmentStatusDetailV1::OwnedCleanupPending {
+                    reason: MediaAttachmentReasonV1::CleanupPending,
+                }
+            }
+            MediaAvailability::BorrowedCleanupPending => {
+                MediaAttachmentStatusDetailV1::BorrowedCleanupPending {
+                    reason: MediaAttachmentReasonV1::CleanupPending,
+                }
+            }
+            MediaAvailability::RetainedCopyDeleted => {
+                MediaAttachmentStatusDetailV1::RetainedCopyDeleted {
+                    reason: MediaAttachmentReasonV1::RetainedCopyDeleted,
+                }
+            }
+            MediaAvailability::BorrowedDerivativesDeleted => {
+                MediaAttachmentStatusDetailV1::BorrowedDerivativesDeleted {
+                    reason: MediaAttachmentReasonV1::BorrowedDerivativesDeleted,
+                }
+            }
+            MediaAvailability::MetadataDeleted => return Ok(None),
+        };
+        let media_kind = match record.media_kind {
+            MediaKind::Image => RequestedLocalPathMediaKind::Image,
+            MediaKind::Audio => RequestedLocalPathMediaKind::Audio,
+            MediaKind::Video => RequestedLocalPathMediaKind::Video,
+        };
+        let terminal = matches!(
+            record.availability,
+            MediaAvailability::RetainedCopyDeleted | MediaAvailability::BorrowedDerivativesDeleted
+        );
+        Ok(Some(MediaAttachmentStatusV1 {
+            schema_version: 1,
+            kind: "mediaAttachmentStatus".into(),
+            attachment_id: record.attachment_id,
+            attachment_version: record.attachment_version,
+            media_kind,
+            availability_generation: record.availability_generation,
+            reference_generation: record.reference_generation,
+            can_discard: eligible && live == 0,
+            preview_available: matches!(
+                &detail,
+                MediaAttachmentStatusDetailV1::Ready {
+                    preview: Some(_),
+                    ..
+                }
+            ),
+            draft_expires_at_unix_ms: if terminal {
+                None
+            } else {
+                record.draft_expires_at_unix_ms
+            },
+            detail,
+        }))
+    }
+
     pub fn validate_recover_security_blocked_media_v1(
         request: &RecoverSecurityBlockedMediaV1,
         source_kind: MediaSourceKind,
@@ -1179,6 +1405,42 @@ mod tests {
                 "accepted {malformed}"
             );
         }
+    }
+
+    #[test]
+    fn media_attachment_status_v1_codec_is_closed_and_path_free() {
+        let attachment_id = Uuid::now_v7();
+        let status = MediaAttachmentStatusV1 {
+            schema_version: 1,
+            kind: "mediaAttachmentStatus".into(),
+            attachment_id,
+            attachment_version: 1,
+            media_kind: RequestedLocalPathMediaKind::Image,
+            availability_generation: 1,
+            reference_generation: 1,
+            can_discard: true,
+            preview_available: false,
+            draft_expires_at_unix_ms: None,
+            detail: MediaAttachmentStatusDetailV1::Registered,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"schemaVersion":1,"kind":"mediaAttachmentStatus","attachmentId":attachment_id.to_string(),"attachmentVersion":1,"mediaKind":"image","availabilityGeneration":1,"referenceGeneration":1,"canDiscard":true,"previewAvailable":false,"availabilityState":"registered"})
+        );
+        let text = serde_json::to_string(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MediaAttachmentStatusV1>(&text).unwrap(),
+            status
+        );
+        let mut unknown = encoded;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("path".into(), serde_json::json!("/secret"));
+        assert!(serde_json::from_value::<MediaAttachmentStatusV1>(unknown).is_err());
+        let request = serde_json::json!({"schemaVersion":1,"kind":"getMediaAttachmentStatus","sessionId":Uuid::now_v7().to_string(),"canonicalProjectDigest":"11".repeat(32),"attachmentId":attachment_id.to_string(),"extra":true});
+        assert!(serde_json::from_value::<GetMediaAttachmentStatusV1>(request).is_err());
     }
 
     #[test]

@@ -2286,6 +2286,37 @@ pub(super) async fn handle_serialized_request(
                 })?;
             Ok(Response::LocalPathMediaRegistration(receipt))
         }
+        Request::GetMediaAttachmentStatus(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            authorize_session_row_reader(&state.principal, ctx, request.session_id)
+                .await
+                .map_err(|_| unavailable())?;
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            let status = ctx
+                .db
+                .read(move |conn| {
+                    cockpit_db::Db::media_attachment_status_for_owner_conn(conn, &request)
+                })
+                .await
+                .map_err(internal)?
+                .ok_or_else(unavailable)?;
+            Ok(Response::MediaAttachmentStatus(status))
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,

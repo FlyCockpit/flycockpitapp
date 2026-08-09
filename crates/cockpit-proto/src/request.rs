@@ -1047,6 +1047,8 @@ pub enum Request {
     /// Register a project-contained local file while retaining its verified handle.
     RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
 
+    GetMediaAttachmentStatus(cockpit_db::media_attachments::GetMediaAttachmentStatusV1),
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon {
@@ -1315,6 +1317,7 @@ macro_rules! request_variants {
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
+            (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
             (Request::StopDaemon { .. }, "stop_daemon");
             (Request::RestartIfIdle, "restart_if_idle");
             (Request::Unknown, "__unknown");
@@ -1463,6 +1466,7 @@ macro_rules! command {
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, serialized, none);
+            (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, serialized, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, serialized, none);
             (Request::Unknown, "unknown", owner_only, none, false, serialized, none);

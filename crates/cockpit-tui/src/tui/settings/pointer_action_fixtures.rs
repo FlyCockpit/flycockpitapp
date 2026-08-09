@@ -212,7 +212,6 @@ fixture_enum!(ProvidersFixture {
     WizardCopilotContinue,
     WizardCopilotNoControl,
     WizardTestSkippedContinue,
-    WizardFetchingNoControl,
     WizardDoneNoControl,
     RowHeaderOpen,
     RowHeaderAdd,
@@ -322,10 +321,7 @@ impl PayloadFixtureKey {
         !matches!(
             self,
             Self::WizardStep(
-                ProviderWizardStep::Saving
-                    | ProviderWizardStep::TestKey
-                    | ProviderWizardStep::Fetching
-                    | ProviderWizardStep::Done
+                ProviderWizardStep::Saving | ProviderWizardStep::TestKey | ProviderWizardStep::Done
             )
         )
     }
@@ -447,13 +443,16 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
 
 /// Wizard lifecycle states that can survive long enough to be rendered by the
 /// settings dialog. `Saving` is submitted through synchronously by
-/// `save_and_fetch_provider`; `TestKey` is likewise acknowledged immediately
-/// after its fetch is spawned. Neither transient is a pointer source.
+/// `save_and_fetch_provider`; `TestKey` and `Fetching` are likewise
+/// acknowledged immediately after their fetch is spawned. These transient
+/// lifecycle states are not pointer sources.
 pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWizardStep> {
     ProviderWizardStep::ALL
         .into_iter()
         .filter(|step| match step {
-            ProviderWizardStep::Saving | ProviderWizardStep::TestKey => false,
+            ProviderWizardStep::Saving
+            | ProviderWizardStep::TestKey
+            | ProviderWizardStep::Fetching => false,
             ProviderWizardStep::Template
             | ProviderWizardStep::ProviderId
             | ProviderWizardStep::Url
@@ -466,7 +465,6 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::CodexOAuth
             | ProviderWizardStep::TestKeyChoice
             | ProviderWizardStep::TestSkipped
-            | ProviderWizardStep::Fetching
             | ProviderWizardStep::Done => true,
         })
 }
@@ -533,9 +531,7 @@ impl ActionFixtureKey {
                 ExpectedReducerOutcome::Disabled
             }
             Self::Providers(
-                ProvidersFixture::WizardCopilotNoControl
-                | ProvidersFixture::WizardFetchingNoControl
-                | ProvidersFixture::WizardDoneNoControl,
+                ProvidersFixture::WizardCopilotNoControl | ProvidersFixture::WizardDoneNoControl,
             ) => ExpectedReducerOutcome::NoPointerControl,
             Self::List(ListFixture::MoveUp | ListFixture::MoveDown) => {
                 ExpectedReducerOutcome::Contextual

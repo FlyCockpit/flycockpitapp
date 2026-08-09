@@ -3139,11 +3139,14 @@ impl SettingsCx {
         };
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut controls = Vec::new();
         lines.push(Line::from(Span::styled(
             p.category.heading().to_string(),
             heading_style(),
         )));
+        controls.push(None);
         lines.push(Line::default());
+        controls.push(None);
 
         let ids = p.setting_ids();
         let label_w = ids
@@ -3158,22 +3161,28 @@ impl SettingsCx {
             match row {
                 Row::Heading(heading) => {
                     lines.push(Line::default());
+                    controls.push(None);
                     lines.push(Line::from(Span::styled(
                         format!("-- {} --", heading.title),
                         muted_style().add_modifier(Modifier::BOLD),
                     )));
+                    controls.push(None);
+                    let before = lines.len();
                     push_wrapped_text(
                         &mut lines,
                         settings_area.width,
                         heading.blurb,
                         muted_style(),
                     );
+                    controls.resize(lines.len(), None);
+                    debug_assert!(lines.len() >= before);
                 }
                 Row::Setting(id) => {
                     let on_cursor = sel == p.cursor;
                     if on_cursor {
                         selected_line = lines.len();
                     }
+                    let before = lines.len();
                     if p.editing == Some(*id) {
                         push_label_text_field_row(
                             &mut lines,
@@ -3195,6 +3204,11 @@ impl SettingsCx {
                             muted_style(),
                         );
                     }
+                    controls.resize(
+                        lines.len(),
+                        Some((super::shell::SettingsControlId(sel as u64), true, None)),
+                    );
+                    debug_assert!(lines.len() > before);
                     sel += 1;
                 }
             }
@@ -3202,6 +3216,7 @@ impl SettingsCx {
 
         if let Some(label) = p.category.reset_label() {
             lines.push(Line::default());
+            controls.push(None);
             if Some(p.cursor) == p.reset_cursor() {
                 selected_line = lines.len();
             }
@@ -3209,19 +3224,29 @@ impl SettingsCx {
                 p.reset
                     .render_line(Some(p.cursor) == p.reset_cursor(), label),
             );
+            controls.push(Some((
+                super::shell::SettingsControlId(sel as u64),
+                true,
+                None,
+            )));
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), warning_style())));
+            controls.push(None);
         }
 
-        self.scroll_states.render_lines(
+        self.scroll_states.render_control_lines(
             frame,
             settings_area,
             format!("category:{:?}", p.category),
             lines,
             Some(selected_line),
+            controls,
+            &self.pointer_surface,
+            super::shell::SettingsScrollRegionId("category:settings"),
         );
 
         let mut help: Vec<Line<'static>> = Vec::new();
@@ -3302,6 +3327,37 @@ impl SettingsPage for CategoryPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_category_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: super::shell::SettingsControlId,
+    ) -> Nav {
+        let index = control.0 as usize;
+        if index >= self.nav_len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_category_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        _cx: &mut SettingsCx,
+        region: super::shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == super::shell::SettingsScrollRegionId("category:settings")
+            && self.text_editor.is_none()
+            && self.utility_picker.is_none()
+        {
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(self.nav_len().saturating_sub(1));
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -918,24 +918,32 @@ fn render_all_non_provider_pointer_surface_variants() {
     // Harnesses: list, add-name editor, harness editor, field editor.
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
-    d.extended.tui.mouse_capture = false;
     enter_harnesses_from_root(&mut d);
+    d.extended.tui.mouse_capture = false;
+    assert_eq!(d.page.pointer_surface_token(), 200);
     let _ = render_settings_rows(&d, 100, 40);
     d.handle_key(press(KeyCode::Char('a')));
+    assert_eq!(d.page.pointer_surface_token(), 202);
     let _ = render_settings_rows(&d, 100, 40);
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
+    enter_harnesses_from_root(&mut d);
     d.extended.tui.mouse_capture = false;
     let (_, harness) = cockpit_config::extended::builtin_harness_presets()
         .into_iter()
         .next()
         .expect("built-in harness fixture");
     d.extended.harnesses.insert("fixture".into(), harness);
-    enter_harnesses_from_root(&mut d);
+    let TestPageMut::Harnesses(HarnessesPage::List(state)) = d.test_page_mut() else {
+        panic!("Harnesses edit surface fixture did not enter list");
+    };
+    state.cursor = 0;
     d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.page.pointer_surface_token(), 201);
     let _ = render_settings_rows(&d, 100, 40);
     d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.page.pointer_surface_token(), 203);
     let _ = render_settings_rows(&d, 100, 40);
 
     // Agents: list, structured detail, and the in-TUI source editor.

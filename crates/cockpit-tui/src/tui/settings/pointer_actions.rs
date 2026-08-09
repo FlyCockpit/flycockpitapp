@@ -39,9 +39,10 @@ pub(super) enum RootNodeId {
     Lsp,
 }
 impl RootNodeId {
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::DefaultModel,
         Self::Providers,
+        Self::Dependencies,
         Self::Agents,
         Self::Interface,
         Self::Behavior,

@@ -466,6 +466,30 @@ impl SettingsCx {
             format!("{add_marker}[+ add server]"),
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        if let Some(name) = names.get(s.cursor) {
+            lines.push(Line::from(""));
+            if s.delete_pending {
+                lines.push(Line::from(format!("Delete {name}?")));
+                bindings.push((lines.len(), SettingsControlId(10_000)));
+                lines.push(Line::from("[Delete]"));
+                bindings.push((lines.len(), SettingsControlId(10_001)));
+                lines.push(Line::from("[Cancel]"));
+            } else {
+                bindings.push((lines.len(), SettingsControlId(10_002)));
+                lines.push(Line::from("[Toggle enabled]"));
+                let oauth = self
+                    .load_mcp()
+                    .servers
+                    .get(name)
+                    .is_some_and(|server| matches!(server.auth, Auth::Oauth(_)));
+                if oauth {
+                    bindings.push((lines.len(), SettingsControlId(10_003)));
+                    lines.push(Line::from("[Authenticate]"));
+                }
+                bindings.push((lines.len(), SettingsControlId(10_004)));
+                lines.push(Line::from("[Delete]"));
+            }
+        }
         if names.is_empty() {
             lines.insert(2, Line::from("No MCP servers configured."));
             for (line, _) in &mut bindings {
@@ -1161,6 +1185,23 @@ impl SettingsPage for McpPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        if let McpPage::List(state) = self {
+            let key = match index {
+                10_000 if state.delete_pending => Some(KeyCode::Char('d')),
+                10_001 if state.delete_pending => {
+                    state.delete_pending = false;
+                    state.status = Some("delete cancelled".into());
+                    return Nav::Stay;
+                }
+                10_002 if !state.delete_pending => Some(KeyCode::Char(' ')),
+                10_003 if !state.delete_pending => Some(KeyCode::Char('a')),
+                10_004 if !state.delete_pending => Some(KeyCode::Char('d')),
+                _ => None,
+            };
+            if let Some(key) = key {
+                return cx.handle_mcp_list_key(KeyEvent::new(key, KeyModifiers::NONE), state);
+            }
+        }
         match self {
             McpPage::List(state) => {
                 if index > cx.load_mcp().servers.len() {

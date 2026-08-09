@@ -1268,14 +1268,111 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     )
     .await
     .unwrap();
-    match recv_writer_body(&mut writer_rx, "actor-bound serialized result").await {
-        Body::Error { id, error } => {
-            assert_eq!(id, Some(actor_mutation_id));
-            assert_ne!(error.message, remote_operation_denied().message);
+    let first_response =
+        match recv_writer_body(&mut writer_rx, "actor-bound serialized result").await {
+            Body::Response { id, response } => {
+                assert_eq!(id, actor_mutation_id);
+                assert!(matches!(
+                    &*response,
+                    Response::AppFlagSeen {
+                        version: 1,
+                        changed: true,
+                        ..
+                    }
+                ));
+                serde_json::to_vec(&response).unwrap()
+            }
+            other => panic!("unexpected actor-bound mutation result: {other:?}"),
+        };
+
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "actor-bound replay result").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), first_response);
         }
-        Body::Response { id, .. } => assert_eq!(id, actor_mutation_id),
-        other => panic!("unexpected actor-bound mutation result: {other:?}"),
+        other => panic!("unexpected actor-bound replay result: {other:?}"),
     }
+
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "actor-bound changed-bytes conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    let domain_conflict_id = Uuid::new_v4();
+    let domain_conflict_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-222222222222").unwrap(),
+    )
+    .unwrap();
+    handle_envelope(
+        Envelope::remote_request(
+            domain_conflict_id,
+            domain_conflict_operation,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "actor-bound domain conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == domain_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        ctx.db
+            .read(|conn| crate::db::Db::app_flag_version_conn(conn, "daemon-autostart"))
+            .await
+            .unwrap(),
+        1,
+        "replay and conflict must not execute a second domain mutation"
+    );
 
     // Local owner mutations bypass remote identity requirements and enter the
     // serialized dispatcher (the exact domain result is not a gate denial).

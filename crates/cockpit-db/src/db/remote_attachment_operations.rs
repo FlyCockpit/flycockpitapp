@@ -4,7 +4,7 @@
 //! safe response bytes. Canonical request bytes, credentials, grants, and
 //! transport metadata have no representation here.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -124,6 +124,10 @@ impl Db {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<TransactionalRemoteMutation<T>> + Send + 'static,
     {
+        ensure!(
+            request.operation_class == RemoteOperationClass::TransactionalMutation,
+            "transactional executor requires transactional_mutation class"
+        );
         let owned = OwnedReserveRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.to_owned(),
             operation_id: request.operation_id.to_owned(),
@@ -538,6 +542,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retried, TransactionalRemoteOperationOutcome::Applied(2));
+
+        let mut wrong_class = request();
+        wrong_class.operation_id = "01890f3e-4c00-7000-8000-000000000097";
+        wrong_class.operation_class = RemoteOperationClass::IdempotentAdapterMutation;
+        assert!(
+            db.execute_transactional_remote_operation::<(), _>(wrong_class, |_| {
+                panic!("wrong-class operation must not execute domain closure")
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires transactional_mutation class")
+        );
     }
 
     const ATTACHMENT: &str = "00000000-0000-4000-8000-000000000001";

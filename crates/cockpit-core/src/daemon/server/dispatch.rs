@@ -5,6 +5,17 @@ use super::*;
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[derive(Debug)]
+struct AppFlagVersionConflict;
+
+impl std::fmt::Display for AppFlagVersionConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("app flag version conflict")
+    }
+}
+
+impl std::error::Error for AppFlagVersionConflict {}
+
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
         proto::AppFlagKey::DaemonAutostartNotice => "daemon-autostart",
@@ -1049,12 +1060,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         now_ms: chrono::Utc::now().timestamp_millis(),
                     },
                     move |conn| {
-                        let Some((version, changed)) = crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)? else { anyhow::bail!("app flag version conflict") };
+                        let Some((version, changed)) = crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)? else { return Err(AppFlagVersionConflict.into()) };
                         let response = Response::AppFlagSeen { key, version, changed };
                         let safe_response = serde_json::to_vec(&response)?;
                         Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "mark_app_flag_seen".into(), outbox_payload: safe_response })
                     },
-                ).await.map_err(internal)?;
+                ).await.map_err(|error| {
+                    if error.downcast_ref::<AppFlagVersionConflict>().is_some() {
+                        ErrorPayload { code: ErrorCode::Conflict, message: error.to_string() }
+                    } else {
+                        internal(error)
+                    }
+                })?;
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),

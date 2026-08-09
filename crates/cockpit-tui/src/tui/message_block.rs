@@ -7,6 +7,7 @@
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::markdown;
@@ -15,6 +16,10 @@ use crate::tui::markdown;
 pub(crate) struct MessageBlock {
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) continuations: Vec<bool>,
+    pub(crate) copy_cells: Vec<Vec<Option<u32>>>,
+    pub(crate) copy_newlines_before: Vec<usize>,
+    pub(crate) copy_incomplete: Vec<bool>,
+    pub(crate) copy_fragments: Rc<Vec<markdown::CopyFragment>>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +40,43 @@ pub(crate) fn render_markdown_message_block(
     indent: usize,
     body_style: Style,
 ) -> MessageBlock {
-    let logical = markdown::render_with_width(text, max_width.max(1));
-    layout_markdown_message_lines(logical, max_width, reserve_first, indent, body_style)
+    let logical = markdown::render_with_provenance(text, max_width.max(1));
+    layout_rendered_markdown_message(logical, max_width, reserve_first, indent, body_style)
+}
+
+pub(crate) fn layout_rendered_markdown_message(
+    rendered: markdown::RenderedMarkdown,
+    max_width: usize,
+    reserve_first: usize,
+    indent: usize,
+    body_style: Style,
+) -> MessageBlock {
+    let (mut lines, continuations, mut copy_cells, copy_newlines_before, copy_incomplete) =
+        wrap_rendered_markdown(
+            rendered.lines,
+            rendered.copy_cells,
+            rendered.copy_newlines_before,
+            rendered.copy_incomplete,
+            max_width,
+            reserve_first,
+        );
+    lines = indent_lines(lines, indent);
+    if indent > 0 {
+        for cells in &mut copy_cells {
+            cells.splice(0..0, std::iter::repeat_n(None, indent));
+        }
+    }
+    for line in &mut lines {
+        line.style = body_style;
+    }
+    MessageBlock {
+        lines,
+        continuations,
+        copy_cells,
+        copy_newlines_before,
+        copy_incomplete,
+        copy_fragments: rendered.copy_fragments,
+    }
 }
 
 /// Lay out already-parsed Markdown. The pending transcript renderer uses this
@@ -57,7 +97,74 @@ pub(crate) fn layout_markdown_message_lines(
     MessageBlock {
         lines,
         continuations,
+        copy_cells: Vec::new(),
+        copy_newlines_before: Vec::new(),
+        copy_incomplete: Vec::new(),
+        copy_fragments: Rc::new(Vec::new()),
     }
+}
+
+fn wrap_rendered_markdown(
+    lines: Vec<Line<'static>>,
+    cells: Vec<Vec<Option<u32>>>,
+    newlines: Vec<usize>,
+    incomplete: Vec<bool>,
+    max_width: usize,
+    reserve_first: usize,
+) -> (
+    Vec<Line<'static>>,
+    Vec<bool>,
+    Vec<Vec<Option<u32>>>,
+    Vec<usize>,
+    Vec<bool>,
+) {
+    let mut out_lines = Vec::new();
+    let mut out_continuations = Vec::new();
+    let mut out_cells = Vec::new();
+    let mut out_newlines = Vec::new();
+    let mut out_incomplete = Vec::new();
+    let mut first_overall = true;
+    for (index, line) in lines.into_iter().enumerate() {
+        let mut remaining = line.spans;
+        let mut remaining_cells = cells.get(index).cloned().unwrap_or_default();
+        let mut first = true;
+        loop {
+            let width = if first_overall {
+                max_width.saturating_sub(reserve_first).max(1)
+            } else {
+                max_width
+            };
+            let (head, tail) = slice_spans_at_width(remaining, width);
+            let head_width = head.iter().map(|span| span.content.width()).sum::<usize>();
+            let split = head_width.min(remaining_cells.len());
+            let tail_cells = remaining_cells.split_off(split);
+            out_lines.push(Line::from(head));
+            out_cells.push(remaining_cells);
+            out_continuations.push(!first);
+            out_newlines.push(if first {
+                newlines.get(index).copied().unwrap_or(0)
+            } else {
+                0
+            });
+            out_incomplete.push(incomplete.get(index).copied().unwrap_or(false));
+            first = false;
+            first_overall = false;
+            match tail {
+                Some(tail) => {
+                    remaining = tail;
+                    remaining_cells = tail_cells;
+                }
+                None => break,
+            }
+        }
+    }
+    (
+        out_lines,
+        out_continuations,
+        out_cells,
+        out_newlines,
+        out_incomplete,
+    )
 }
 
 impl MessageBlock {
@@ -198,4 +305,27 @@ fn group_into_spans(chars: &[(char, Style)]) -> Vec<Span<'static>> {
         out.push(Span::styled(current_text, style));
     }
     out
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_provenance_wraps_and_indents_with_the_rendered_cells() {
+        let block = render_markdown_message_block("**alpha** beta", 6, 0, 2, Style::default());
+        assert_eq!(block.lines.len(), block.copy_cells.len());
+        assert_eq!(block.lines.len(), block.copy_newlines_before.len());
+        assert!(
+            block
+                .copy_cells
+                .iter()
+                .all(|row| row.starts_with(&[None, None]))
+        );
+        assert_eq!(
+            block.copy_newlines_before[1], 0,
+            "soft wrapping is not a semantic newline"
+        );
+        assert!(!block.copy_fragments.is_empty());
+    }
 }

@@ -2343,7 +2343,7 @@ impl App {
         entry: &HistoryEntry,
         idx: usize,
         rendered: &Rendered,
-        render_width: usize,
+        _render_width: usize,
     ) -> Vec<ChatRowMeta> {
         let Rendered {
             lines,
@@ -2363,14 +2363,7 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
-        let copy = semantic_copy_rows(
-            entry,
-            lines,
-            continuations,
-            *copy_body_start,
-            render_width,
-            pin_region.as_ref(),
-        );
+        let empty_fragments = Rc::new(Vec::new());
 
         for i in 0..lines.len() {
             let chip_target = if Some(i) == *chip_row {
@@ -2445,13 +2438,28 @@ impl App {
                 fork_hit,
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
-                copy_cells: copy.cells.get(i).cloned().unwrap_or_default(),
-                copy_fragments: Rc::clone(&copy.fragments),
-                copy_newlines_before: copy.newlines_before.get(i).copied().unwrap_or(0),
+                copy_cells: copy_body_start
+                    .as_ref()
+                    .and_then(|copy| copy.cells.get(i))
+                    .cloned()
+                    .unwrap_or_default(),
+                copy_fragments: copy_body_start.as_ref().map_or_else(
+                    || Rc::clone(&empty_fragments),
+                    |copy| Rc::clone(&copy.fragments),
+                ),
+                copy_newlines_before: copy_body_start
+                    .as_ref()
+                    .and_then(|copy| copy.newlines_before.get(i))
+                    .copied()
+                    .unwrap_or(0),
                 copy_fallback_if_unmapped: base_copy.is_some()
                     && row_kind != ChatRowKind::Chip
-                    && (copy_body_start.is_none_or(|start| i < start)
-                        || copy.incomplete.get(i).copied().unwrap_or(false)),
+                    && (copy_body_start.as_ref().is_none_or(|copy| i < copy.start)
+                        || copy_body_start
+                            .as_ref()
+                            .and_then(|copy| copy.incomplete.get(i))
+                            .copied()
+                            .unwrap_or(false)),
             });
         }
 
@@ -4503,320 +4511,6 @@ fn rendered_line_text(line: &Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
-}
-
-/// Attach parser-emitted semantic fragments to the exact cells occupied by
-/// the corresponding rendered grapheme. Matching is a single forward walk of
-/// the render output and parser event stream; it never searches source text.
-struct SemanticCopyRows {
-    cells: Vec<Vec<Option<u32>>>,
-    newlines_before: Vec<usize>,
-    incomplete: Vec<bool>,
-    fragments: Rc<Vec<crate::tui::markdown::CopyFragment>>,
-}
-
-fn semantic_copy_rows(
-    entry: &HistoryEntry,
-    lines: &[Line<'static>],
-    continuations: &[bool],
-    body_start: Option<usize>,
-    render_width: usize,
-    pin_region: Option<&crate::tui::history::PinRegion>,
-) -> SemanticCopyRows {
-    use crate::tui::markdown::{CopyAtom, semantic_copy_atoms, semantic_graphemes};
-    let Some(body_start) = body_start else {
-        return SemanticCopyRows {
-            cells: vec![Vec::new(); lines.len()],
-            newlines_before: vec![0; lines.len()],
-            incomplete: vec![false; lines.len()],
-            fragments: Rc::new(Vec::new()),
-        };
-    };
-    let (source, semantic_width, external_prefix, table_bar_offset, body_has_timestamp) =
-        match entry {
-            HistoryEntry::User {
-                text,
-                cleaned,
-                expanded,
-                preflight_pending,
-                ..
-            } => {
-                if *preflight_pending || cleaned.is_none() || *expanded {
-                    (
-                        text.as_str(),
-                        render_width.saturating_sub(4).max(1),
-                        2,
-                        1,
-                        true,
-                    )
-                } else {
-                    (
-                        cleaned.as_deref().unwrap_or(text),
-                        render_width.saturating_sub(4).max(1),
-                        2,
-                        1,
-                        true,
-                    )
-                }
-            }
-            HistoryEntry::Agent { text, .. } => (
-                text.as_str(),
-                render_width.saturating_sub(2 * AGENT_INDENT).max(1),
-                AGENT_INDENT,
-                0,
-                body_start == 0,
-            ),
-            _ => {
-                return SemanticCopyRows {
-                    cells: vec![Vec::new(); lines.len()],
-                    newlines_before: vec![0; lines.len()],
-                    incomplete: vec![false; lines.len()],
-                    fragments: Rc::new(Vec::new()),
-                };
-            }
-        };
-    let atoms = semantic_copy_atoms(source, semantic_width);
-    let fragments = Rc::new(
-        atoms
-            .iter()
-            .filter_map(|atom| match atom {
-                CopyAtom::Fragment(fragment) => Some(fragment.clone()),
-                CopyAtom::Newline => None,
-            })
-            .collect::<Vec<_>>(),
-    );
-    let mut atom = 0usize;
-    let mut used = std::collections::HashSet::new();
-    let mut table_atoms: std::collections::HashMap<
-        (usize, String),
-        std::collections::VecDeque<usize>,
-    > = std::collections::HashMap::new();
-    for (index, candidate) in atoms.iter().enumerate() {
-        if let CopyAtom::Fragment(fragment) = candidate
-            && let Some((_, col)) = fragment.table_cell
-        {
-            table_atoms
-                .entry((col, fragment.text.clone()))
-                .or_default()
-                .push_back(index);
-        }
-    }
-    let mut rows = Vec::with_capacity(lines.len());
-    let mut breaks = Vec::with_capacity(lines.len());
-    let mut incomplete = Vec::with_capacity(lines.len());
-    let mut previous_mapped_row = None;
-    let first_body_end = pin_region
-        .into_iter()
-        .filter(|region| region.row == body_start)
-        .flat_map(|region| [Some(region.col_start), region.fork_col_start])
-        .flatten()
-        .map(usize::from)
-        .min()
-        .unwrap_or_else(|| {
-            if body_has_timestamp {
-                render_width.saturating_sub(TIMESTAMP_WIDTH + TIMESTAMP_RIGHT_MARGIN)
-            } else {
-                render_width
-            }
-        });
-
-    for (row_index, line) in lines.iter().enumerate() {
-        let mut hard_breaks = 0usize;
-        let text = rendered_line_text(line);
-        let mut cells = vec![None; text.width()];
-        if row_index < body_start {
-            breaks.push(0);
-            incomplete.push(false);
-            rows.push(cells);
-            continue;
-        }
-        let mut col = 0usize;
-        let mut row_emitted = false;
-        let mut table_bars = 0usize;
-        let mut tab_cells_remaining = 0usize;
-        let chrome_end = markdown_chrome_prefix_width(
-            line,
-            &text,
-            external_prefix,
-            continuations.get(row_index).copied().unwrap_or(false),
-        );
-        let mut row_incomplete = false;
-        for visible in semantic_graphemes(&text) {
-            if row_index == body_start && col >= first_body_end {
-                break;
-            }
-            let width = visible.width().max(1);
-            if tab_cells_remaining > 0 && visible == " " {
-                tab_cells_remaining -= 1;
-                col = col.saturating_add(width);
-                continue;
-            }
-            if visible == "│" {
-                table_bars += 1;
-            }
-            if col < chrome_end {
-                col = col.saturating_add(width);
-                continue;
-            }
-            while atoms.get(atom).is_some_and(|candidate| match candidate {
-                CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
-                CopyAtom::Newline => false,
-            }) {
-                atom += 1;
-            }
-            let mut next_atom = atom;
-            while !row_emitted && matches!(atoms.get(next_atom), Some(CopyAtom::Newline)) {
-                next_atom += 1;
-            }
-            let mut next = atoms.get(next_atom).and_then(|candidate| match candidate {
-                CopyAtom::Fragment(fragment) if !used.contains(&fragment.id) => Some(fragment),
-                CopyAtom::Newline => None,
-                CopyAtom::Fragment(_) => None,
-            });
-            let mut matched_atom = next_atom;
-            if visible != " "
-                && next.is_some_and(|fragment| fragment.text != visible)
-                && next.is_some_and(|fragment| fragment.table_cell.is_some())
-                && let Some(table_col) = table_bars.checked_sub(table_bar_offset + 1)
-                && let Some(queue) = table_atoms.get_mut(&(table_col, visible.clone()))
-            {
-                while queue.front().is_some_and(|index| {
-                    atoms.get(*index).is_some_and(|candidate| match candidate {
-                        CopyAtom::Fragment(fragment) => used.contains(&fragment.id),
-                        CopyAtom::Newline => true,
-                    })
-                }) {
-                    queue.pop_front();
-                }
-                if let Some(index) = queue.pop_front()
-                    && let Some(CopyAtom::Fragment(fragment)) = atoms.get(index)
-                {
-                    matched_atom = index;
-                    next = Some(fragment);
-                }
-            }
-            if let Some(fragment) = next
-                && (fragment.text == visible || (fragment.text == "\t" && visible == " "))
-            {
-                let first_fragment_on_row = !row_emitted;
-                let fragment_width = if fragment.text == "\t" {
-                    crate::tui::markdown::TAB_STOP
-                        - col.saturating_sub(external_prefix) % crate::tui::markdown::TAB_STOP
-                } else {
-                    width
-                };
-                if fragment.text == "\t" {
-                    tab_cells_remaining = fragment_width.saturating_sub(1);
-                }
-                for cell in cells
-                    .iter_mut()
-                    .take(col.saturating_add(fragment_width))
-                    .skip(col)
-                {
-                    *cell = u32::try_from(fragment.id).ok();
-                }
-                used.insert(fragment.id);
-                row_emitted = true;
-                if matched_atom == next_atom {
-                    if first_fragment_on_row {
-                        hard_breaks = next_atom.saturating_sub(atom);
-                    }
-                    atom = next_atom + 1;
-                }
-            }
-            if cells.get(col).is_none_or(Option::is_none)
-                && visible.chars().any(|ch| !ch.is_whitespace())
-                && !visible.chars().all(is_border_chrome)
-            {
-                row_incomplete = true;
-            }
-            col = col.saturating_add(width);
-        }
-        if row_emitted {
-            if previous_mapped_row.is_none()
-                || continuations.get(row_index).copied().unwrap_or(false)
-            {
-                hard_breaks = 0;
-            }
-            previous_mapped_row = Some(row_index);
-        }
-        breaks.push(hard_breaks);
-        incomplete.push(row_incomplete);
-        rows.push(cells);
-    }
-    SemanticCopyRows {
-        cells: rows,
-        newlines_before: breaks,
-        incomplete,
-        fragments,
-    }
-}
-
-/// Columns injected by the Markdown renderer rather than emitted by parser
-/// text events. These cells deliberately have no copy fragment and therefore
-/// cannot steal a same-prefix fragment from later semantic content.
-fn markdown_chrome_prefix_width(
-    line: &Line<'_>,
-    rendered: &str,
-    external_prefix: usize,
-    continuation: bool,
-) -> usize {
-    if continuation {
-        return external_prefix;
-    }
-    if line.spans.iter().any(|span| {
-        span.style.add_modifier.contains(Modifier::DIM)
-            && span.content.trim_start().starts_with("```")
-    }) {
-        return rendered.width();
-    }
-    let mut spans = line.spans.iter();
-    if spans
-        .next()
-        .is_none_or(|span| span.content.width() != external_prefix)
-    {
-        spans = line.spans.iter();
-    }
-    if let Some(marker) = spans.next() {
-        if marker.style.bg.is_some() {
-            return external_prefix;
-        }
-        let text = marker.content.as_ref();
-        if text.starts_with("│ ") {
-            return external_prefix + 2;
-        }
-        if marker.style.add_modifier.contains(Modifier::BOLD)
-            && let Some(width) = heading_marker_width(text)
-        {
-            return external_prefix + width;
-        }
-        if let Some(width) = list_marker_width(text) {
-            return external_prefix + width;
-        }
-    }
-    external_prefix
-}
-
-fn is_border_chrome(ch: char) -> bool {
-    matches!(
-        ch,
-        '│' | '─' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘'
-    )
-}
-
-fn heading_marker_width(body: &str) -> Option<usize> {
-    let hashes = body.chars().take_while(|ch| *ch == '#').count();
-    (hashes > 0 && body.chars().nth(hashes) == Some(' ')).then_some(hashes + 1)
-}
-
-fn list_marker_width(body: &str) -> Option<usize> {
-    let leading = body.chars().take_while(|ch| *ch == ' ').count();
-    let rest = body.chars().skip(leading).collect::<String>();
-    if rest.starts_with("• ") {
-        return Some(leading + 2);
-    }
-    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    (digits > 0 && rest.chars().skip(digits).take(2).eq(['.', ' '])).then_some(leading + digits + 2)
 }
 
 fn render_transcript_find_bar(

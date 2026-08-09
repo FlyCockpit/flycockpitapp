@@ -584,7 +584,7 @@ pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     /// First row occupied by parser-rendered Markdown message content. `None`
     /// for non-message entries and when Markdown rendering is disabled.
-    pub copy_body_start: Option<usize>,
+    pub copy_body_start: Option<RenderedCopy>,
     /// Index of the row within `lines` that is the clickable "thinking"
     /// chip. `None` for entries without one (everything except a
     /// `HistoryEntry::Agent` with non-empty reasoning).
@@ -608,6 +608,36 @@ pub struct Rendered {
     /// too narrow to fit any control. Carries the seq + exact row/column
     /// ranges so hit-tests route only visible glyphs.
     pub pin_region: Option<PinRegion>,
+}
+
+#[derive(Clone)]
+pub struct RenderedCopy {
+    pub start: usize,
+    pub cells: Vec<Vec<Option<u32>>>,
+    pub newlines_before: Vec<usize>,
+    pub incomplete: Vec<bool>,
+    pub fragments: std::rc::Rc<Vec<markdown::CopyFragment>>,
+}
+
+impl RenderedCopy {
+    fn from_block(start: usize, block: &crate::tui::message_block::MessageBlock) -> Self {
+        Self {
+            start,
+            cells: block.copy_cells.clone(),
+            newlines_before: block.copy_newlines_before.clone(),
+            incomplete: block.copy_incomplete.clone(),
+            fragments: std::rc::Rc::clone(&block.copy_fragments),
+        }
+    }
+}
+
+fn prepend_copy_rows(copy: &mut RenderedCopy, count: usize) {
+    copy.cells
+        .splice(0..0, std::iter::repeat_n(Vec::new(), count));
+    copy.newlines_before
+        .splice(0..0, std::iter::repeat_n(0, count));
+    copy.incomplete
+        .splice(0..0, std::iter::repeat_n(false, count));
 }
 
 /// The render-time placement + state of a pinnable message's fork/pin controls,
@@ -754,7 +784,7 @@ pub fn render_entry(
                     None => (text.as_str(), None, false),
                 }
             };
-            let (lines, mut continuations, pin_region) =
+            let (lines, mut continuations, pin_region, copy_body_start) =
                 render_user(body, *timestamp, width, md.user, chip, *persist_failed, pin);
             if !md.user && lines.len() > 3 {
                 for continuation in continuations.iter_mut().take(lines.len() - 1).skip(2) {
@@ -767,7 +797,7 @@ pub fn render_entry(
             let chip_row = toggleable.then_some(0);
             Rendered {
                 lines,
-                copy_body_start: md.user.then_some(chip.is_some() as usize),
+                copy_body_start,
                 chip_row,
                 continuations,
                 tool_call_rows: Vec::new(),
@@ -1433,7 +1463,12 @@ fn render_user(
     chip: Option<&str>,
     failed: bool,
     pin: Option<PinControl>,
-) -> (Vec<Line<'static>>, Vec<bool>, Option<PinRegion>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<bool>,
+    Option<PinRegion>,
+    Option<RenderedCopy>,
+) {
     if markdown {
         return render_user_markdown(text, timestamp, width, chip, failed, pin);
     }
@@ -1495,7 +1530,7 @@ fn render_user(
     ]));
 
     let continuations = vec![false; out.len()];
-    (out, continuations, pin_region)
+    (out, continuations, pin_region, None)
 }
 
 /// Build the bubble's top border spans (`╭───╮`) with the fork/pin controls —
@@ -1603,13 +1638,28 @@ fn render_user_markdown(
     chip: Option<&str>,
     failed: bool,
     pin: Option<PinControl>,
-) -> (Vec<Line<'static>>, Vec<bool>, Option<PinRegion>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<bool>,
+    Option<PinRegion>,
+    Option<RenderedCopy>,
+) {
     let bar_style = Style::default().fg(if failed { ERROR_TEXT } else { USER_BORDER_FG });
     // Content width inside the `│ ` bar (and a matching right margin), so
     // display-math blocks degrade to raw if they'd exceed the viewport.
     let md_width = (width as usize).saturating_sub(2 + 2).max(1);
     let reserve_first = TIMESTAMP_WIDTH + 1 + TIMESTAMP_RIGHT_MARGIN + agent_pin_reserve(pin);
     let body = render_markdown_message_block(text, md_width, reserve_first, 0, Style::default());
+    let body_row_offset = chip.is_some() as usize;
+    let mut copy = RenderedCopy::from_block(body_row_offset, &body);
+    for cells in &mut copy.cells {
+        cells.splice(0..0, [None, None]);
+    }
+    if body_row_offset > 0 {
+        copy.cells.insert(0, Vec::new());
+        copy.newlines_before.insert(0, 0);
+        copy.incomplete.insert(0, false);
+    }
     let mut body_continuations = body.continuations.into_iter();
     let body = body.lines;
 
@@ -1620,7 +1670,6 @@ fn render_user_markdown(
     let mut pin_region: Option<PinRegion> = None;
     // The control block lives on the first *body* line; once the chip takes
     // row 0, the body's first line is offset by one.
-    let body_row_offset = chip.is_some() as usize;
     // Request-preflight chip on its own row 0 (implementation note)
     // — the clickable reveal-toggle row for the markdown render shape.
     if let Some(chip) = chip {
@@ -1659,7 +1708,7 @@ fn render_user_markdown(
         continuations.push(false);
     }
     continuations.resize(out.len(), false);
-    (out, continuations, pin_region)
+    (out, continuations, pin_region, Some(copy))
 }
 
 fn render_interrupt_decision(
@@ -1847,7 +1896,7 @@ fn render_agent(
     // control (mouse mode on and it fit). The `▶` pick-arrow alone is not
     // clickable, so it leaves this `None`.
     let mut pin_region: Option<PinRegion> = None;
-    let mut copy_body_start = None;
+    let mut copy_body_start: Option<RenderedCopy> = None;
 
     let mut out: Vec<Line<'static>> = Vec::new();
     // Parallel to `out`: `conts[i]` is `true` when row `i` is a
@@ -1911,7 +1960,7 @@ fn render_agent(
         // wrapped continuations don't go all the way to the right
         // edge.
         let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
-        let (body_lines, body_conts): (Vec<Line<'static>>, Vec<bool>) = if markdown {
+        let (body_lines, body_conts, body_copy) = if markdown {
             // Pre-wrap the markdown lines ourselves so ratatui's
             // Paragraph::wrap doesn't strip the indent on
             // continuation rows.
@@ -1922,7 +1971,8 @@ fn render_agent(
                 AGENT_INDENT,
                 Style::default(),
             );
-            (body.lines, body.continuations)
+            let copy = RenderedCopy::from_block(0, &body);
+            (body.lines, body.continuations, Some(copy))
         } else {
             let lines = wrapped
                 .iter()
@@ -1931,7 +1981,7 @@ fn render_agent(
             // wrapped[0] starts a fresh logical line; the rest are
             // soft-wrap continuations of the agent's text.
             let conts = (0..lines.len()).map(|i| i > 0).collect();
-            (lines, conts)
+            (lines, conts, None)
         };
 
         if expanded {
@@ -2006,7 +2056,11 @@ fn render_agent(
                     max_offset: window.max_offset,
                 });
             }
-            copy_body_start = markdown.then_some(out.len());
+            if let Some(mut copy) = body_copy {
+                copy.start = out.len();
+                prepend_copy_rows(&mut copy, out.len());
+                copy_body_start = Some(copy);
+            }
             out.extend(body_lines);
             conts.extend(body_conts);
         } else if markdown {
@@ -2018,7 +2072,11 @@ fn render_agent(
             pin_region = region;
             out.push(line);
             conts.push(false);
-            copy_body_start = Some(out.len());
+            if let Some(mut copy) = body_copy {
+                copy.start = out.len();
+                prepend_copy_rows(&mut copy, out.len());
+                copy_body_start = Some(copy);
+            }
             out.extend(body_lines);
             conts.extend(body_conts);
         } else {
@@ -2047,7 +2105,6 @@ fn render_agent(
             }
         }
     } else if markdown {
-        copy_body_start = Some(0);
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every
         // line carries AGENT_INDENT on the left AND a matching right
@@ -2070,6 +2127,7 @@ fn render_agent(
             AGENT_INDENT,
             Style::default(),
         );
+        copy_body_start = Some(RenderedCopy::from_block(0, &body));
         if body.lines.is_empty() {
             let (line, region) =
                 render_first_line_with_pin_and_timestamp(vec![], timestamp, width, pin);

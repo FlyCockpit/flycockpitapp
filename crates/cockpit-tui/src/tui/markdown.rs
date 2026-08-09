@@ -16,6 +16,7 @@ use super::math_render;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Copy provenance emitted from the Markdown event stream.  `text` is exactly
@@ -25,223 +26,20 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub(crate) struct CopyFragment {
     pub(crate) id: usize,
     pub(crate) text: String,
-    #[allow(dead_code)] // retained for render diagnostics, never extraction
+    #[allow(dead_code)]
     pub(crate) source: Option<std::ops::Range<usize>>,
-    #[allow(dead_code)] // stable semantic identity across viewport slices
     pub(crate) logical_line: usize,
     pub(crate) table_cell: Option<(usize, usize)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CopyAtom {
-    Fragment(CopyFragment),
-    Newline,
-}
-
-/// Parse Markdown into semantic clipboard atoms.  This deliberately shares
-/// pulldown-cmark's event stream with rendering: formatting/link/code fences
-/// are tags and therefore never become copy fragments, while escapes and
-/// entities arrive already decoded as visible text.
-pub(crate) fn semantic_copy_atoms(src: &str, width: usize) -> Vec<CopyAtom> {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_MATH);
-    opts.insert(Options::ENABLE_TABLES);
-    let mut atoms = Vec::new();
-    let mut id = 0usize;
-    let mut logical_line = 0usize;
-    let mut table_row = None;
-    let mut table_col = 0usize;
-    let mut pending_block_break = 0usize;
-    let normalized = normalize_backslash_math(src);
-    let source_unchanged = normalized == src;
-    for (event, range) in Parser::new_ext(&normalized, opts).into_offset_iter() {
-        match event {
-            Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                if pending_block_break > 0 && !atoms.is_empty() {
-                    for _ in 0..pending_block_break {
-                        atoms.push(CopyAtom::Newline);
-                        logical_line += 1;
-                    }
-                }
-                pending_block_break = 0;
-                push_copy_text(
-                    &mut atoms,
-                    &mut id,
-                    &mut logical_line,
-                    &text,
-                    source_unchanged.then_some(range),
-                    table_row.map(|row| (row, table_col)),
-                );
-            }
-            Event::SoftBreak => {
-                // The renderer shows a space, but wrapping this space must not
-                // manufacture a newline.
-                atoms.push(CopyAtom::Fragment(CopyFragment {
-                    id,
-                    text: " ".into(),
-                    source: source_unchanged.then_some(range),
-                    logical_line,
-                    table_cell: table_row.map(|row| (row, table_col)),
-                }));
-                id += 1;
-            }
-            Event::HardBreak => {
-                atoms.push(CopyAtom::Newline);
-                logical_line += 1;
-                pending_block_break = 0;
-            }
-            Event::Start(Tag::TableHead) => {
-                table_row = Some(0);
-                table_col = 0;
-            }
-            Event::Start(Tag::List(_)) => {
-                if pending_block_break == 0 && matches!(atoms.last(), Some(CopyAtom::Fragment(_))) {
-                    atoms.push(CopyAtom::Newline);
-                    logical_line += 1;
-                }
-            }
-            Event::Start(Tag::TableRow) => {
-                table_row = Some(table_row.map_or(0, |row| row + 1));
-                table_col = 0;
-            }
-            Event::End(TagEnd::TableCell) => table_col += 1,
-            Event::End(TagEnd::Item) => {
-                if pending_block_break == 0 {
-                    atoms.push(CopyAtom::Newline);
-                    logical_line += 1;
-                }
-            }
-            Event::End(TagEnd::TableRow) => {
-                atoms.push(CopyAtom::Newline);
-                logical_line += 1;
-            }
-            Event::End(TagEnd::TableHead) => {
-                atoms.push(CopyAtom::Newline);
-                logical_line += 1;
-            }
-            Event::End(TagEnd::Table) => {
-                table_row = None;
-                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
-                    atoms.pop();
-                    logical_line = logical_line.saturating_sub(1);
-                }
-                pending_block_break = 2;
-            }
-            Event::End(TagEnd::Paragraph)
-            | Event::End(TagEnd::Heading(_))
-            | Event::End(TagEnd::BlockQuote(_)) => pending_block_break = 2,
-            Event::End(TagEnd::CodeBlock) => {
-                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
-                    atoms.pop();
-                    logical_line = logical_line.saturating_sub(1);
-                }
-                pending_block_break = 2;
-            }
-            Event::End(TagEnd::List(_)) => {
-                if matches!(atoms.last(), Some(CopyAtom::Newline)) {
-                    atoms.pop();
-                    logical_line = logical_line.saturating_sub(1);
-                }
-                pending_block_break = 2;
-            }
-            Event::InlineMath(text) => {
-                if pending_block_break > 0 && !atoms.is_empty() {
-                    for _ in 0..pending_block_break {
-                        atoms.push(CopyAtom::Newline);
-                        logical_line += 1;
-                    }
-                }
-                pending_block_break = 0;
-                let visible =
-                    math_render::render_inline(&text).unwrap_or_else(|| format!("${text}$"));
-                push_copy_text(
-                    &mut atoms,
-                    &mut id,
-                    &mut logical_line,
-                    &visible,
-                    source_unchanged.then_some(range),
-                    table_row.map(|row| (row, table_col)),
-                );
-            }
-            Event::DisplayMath(text) => {
-                if let Some(row) = table_row {
-                    let visible =
-                        math_render::render_inline(&text).unwrap_or_else(|| format!("$${text}$$"));
-                    push_copy_text(
-                        &mut atoms,
-                        &mut id,
-                        &mut logical_line,
-                        &visible,
-                        source_unchanged.then_some(range),
-                        Some((row, table_col)),
-                    );
-                    continue;
-                }
-                if pending_block_break == 0 && matches!(atoms.last(), Some(CopyAtom::Fragment(_))) {
-                    atoms.push(CopyAtom::Newline);
-                    logical_line += 1;
-                }
-                if pending_block_break > 0 && !atoms.is_empty() {
-                    for _ in 0..pending_block_break {
-                        atoms.push(CopyAtom::Newline);
-                        logical_line += 1;
-                    }
-                }
-                let visible = math_render::render_display(&text, width)
-                    .map(|rows| rows.join("\n"))
-                    .unwrap_or_else(|| {
-                        let mut rows = vec!["$$".to_string()];
-                        rows.extend(text.lines().map(str::to_string));
-                        if text.is_empty() {
-                            rows.push(String::new());
-                        }
-                        rows.push("$$".to_string());
-                        rows.join("\n")
-                    });
-                push_copy_text(
-                    &mut atoms,
-                    &mut id,
-                    &mut logical_line,
-                    &visible,
-                    source_unchanged.then_some(range),
-                    None,
-                );
-                pending_block_break = 2;
-            }
-            _ => {}
-        }
-    }
-    while matches!(atoms.last(), Some(CopyAtom::Newline)) {
-        atoms.pop();
-    }
-    atoms
-}
-
-fn push_copy_text(
-    atoms: &mut Vec<CopyAtom>,
-    id: &mut usize,
-    logical_line: &mut usize,
-    text: &str,
-    source: Option<std::ops::Range<usize>>,
-    table_cell: Option<(usize, usize)>,
-) {
-    for (piece_index, piece) in text.split('\n').enumerate() {
-        if piece_index > 0 {
-            atoms.push(CopyAtom::Newline);
-            *logical_line += 1;
-        }
-        for grapheme in semantic_graphemes(piece) {
-            atoms.push(CopyAtom::Fragment(CopyFragment {
-                id: *id,
-                text: grapheme,
-                source: source.clone(),
-                logical_line: *logical_line,
-                table_cell,
-            }));
-            *id += 1;
-        }
-    }
+/// Markdown presentation and semantic-copy data produced by one parser pass.
+#[derive(Debug, Clone)]
+pub(crate) struct RenderedMarkdown {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) copy_cells: Vec<Vec<Option<u32>>>,
+    pub(crate) copy_newlines_before: Vec<usize>,
+    pub(crate) copy_incomplete: Vec<bool>,
+    pub(crate) copy_fragments: Rc<Vec<CopyFragment>>,
 }
 
 /// Dependency-free terminal grapheme clustering. In addition to zero-width
@@ -269,7 +67,8 @@ pub(crate) fn semantic_graphemes(text: &str) -> Vec<String> {
                 | (Some(HangulJamo::V), Some(HangulJamo::V | HangulJamo::T))
                 | (Some(HangulJamo::T), Some(HangulJamo::T))
         );
-        if combining || join_next || after_virama || joins_hangul || (regional && regional_in_last) {
+        if combining || join_next || after_virama || joins_hangul || (regional && regional_in_last)
+        {
             if let Some(last) = out.last_mut() {
                 last.push(ch);
             } else {
@@ -308,15 +107,63 @@ fn hangul_jamo_class(cp: u32) -> Option<HangulJamo> {
 fn is_virama(cp: u32) -> bool {
     matches!(
         cp,
-        0x094d | 0x09cd | 0x0a4d | 0x0acd | 0x0b4d | 0x0bcd | 0x0c4d
-            | 0x0ccd | 0x0d3b | 0x0d3c | 0x0d4d | 0x0dca | 0x0e3a | 0x0f84
-            | 0x1039 | 0x103a | 0x1714 | 0x1734 | 0x17d2 | 0x1a60 | 0x1b44
-            | 0x1baa | 0x1bab | 0xa806 | 0xa8c4 | 0xa953 | 0xa9c0 | 0xaaf6
-            | 0xabed | 0x10a3f | 0x11046 | 0x11070 | 0x11133 | 0x11134
-            | 0x111c0 | 0x11235 | 0x112ea | 0x1134d | 0x11442 | 0x114c2
-            | 0x115bf | 0x1163f | 0x116b6 | 0x1172b | 0x11839 | 0x1193d
-            | 0x1193e | 0x119e0 | 0x11a34 | 0x11a47 | 0x11a99 | 0x11c3f
-            | 0x11d44 | 0x11d45 | 0x11d97 | 0x11f41 | 0x11f42
+        0x094d
+            | 0x09cd
+            | 0x0a4d
+            | 0x0acd
+            | 0x0b4d
+            | 0x0bcd
+            | 0x0c4d
+            | 0x0ccd
+            | 0x0d3b
+            | 0x0d3c
+            | 0x0d4d
+            | 0x0dca
+            | 0x0e3a
+            | 0x0f84
+            | 0x1039
+            | 0x103a
+            | 0x1714
+            | 0x1734
+            | 0x17d2
+            | 0x1a60
+            | 0x1b44
+            | 0x1baa
+            | 0x1bab
+            | 0xa806
+            | 0xa8c4
+            | 0xa953
+            | 0xa9c0
+            | 0xaaf6
+            | 0xabed
+            | 0x10a3f
+            | 0x11046
+            | 0x11070
+            | 0x11133
+            | 0x11134
+            | 0x111c0
+            | 0x11235
+            | 0x112ea
+            | 0x1134d
+            | 0x11442
+            | 0x114c2
+            | 0x115bf
+            | 0x1163f
+            | 0x116b6
+            | 0x1172b
+            | 0x11839
+            | 0x1193d
+            | 0x1193e
+            | 0x119e0
+            | 0x11a34
+            | 0x11a47
+            | 0x11a99
+            | 0x11c3f
+            | 0x11d44
+            | 0x11d45
+            | 0x11d97
+            | 0x11f41
+            | 0x11f42
     )
 }
 
@@ -373,13 +220,23 @@ fn expand_tabs(text: &str, start_col: usize) -> String {
 /// `width` falls back to its raw source rather than producing broken/
 /// wrapped typesetting.
 pub fn render_with_width(src: &str, width: usize) -> Vec<Line<'static>> {
+    render_with_provenance(src, width).lines
+}
+
+pub(crate) fn render_with_provenance(src: &str, width: usize) -> RenderedMarkdown {
     #[cfg(test)]
     {
         RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + src.len()));
         RENDER_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
     if src.is_empty() {
-        return vec![Line::default()];
+        return RenderedMarkdown {
+            lines: vec![Line::default()],
+            copy_cells: vec![Vec::new()],
+            copy_newlines_before: vec![0],
+            copy_incomplete: vec![false],
+            copy_fragments: Rc::new(Vec::new()),
+        };
     }
     // pulldown-cmark's math extension handles `$…$`/`$$…$$` but not the
     // backslash-delimiter forms `\(…\)`/`\[…\]`. Normalize *closed*
@@ -391,13 +248,14 @@ pub fn render_with_width(src: &str, width: usize) -> Vec<Line<'static>> {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_MATH);
     opts.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(&normalized, opts);
+    let source_unchanged = normalized == src;
+    let parser = Parser::new_ext(&normalized, opts).into_offset_iter();
     let mut emitter = Emitter {
         math_width: width,
         ..Emitter::default()
     };
-    for event in parser {
-        emitter.handle(event);
+    for (event, range) in parser {
+        emitter.handle(event, source_unchanged.then_some(range));
     }
     emitter.finish()
 }
@@ -564,6 +422,14 @@ struct Emitter {
     lines: Vec<Line<'static>>,
     /// Spans accumulating into the current logical row.
     current: Vec<Span<'static>>,
+    current_copy: Vec<Option<u32>>,
+    copy_cells: Vec<Vec<Option<u32>>>,
+    copy_newlines_before: Vec<usize>,
+    copy_fragments: Vec<CopyFragment>,
+    next_fragment_id: usize,
+    logical_line: usize,
+    pending_copy_newlines: usize,
+    event_source: Option<std::ops::Range<usize>>,
     /// Stack of style modifiers from open inline tags (bold/italic/etc).
     style_stack: Vec<Style>,
     /// True while inside a fenced/indented code block.
@@ -599,10 +465,12 @@ struct TableRow {
 #[derive(Clone)]
 struct TableCell {
     spans: Vec<Span<'static>>,
+    copy_cells: Vec<Option<u32>>,
 }
 
 impl Emitter {
-    fn handle(&mut self, event: Event) {
+    fn handle(&mut self, event: Event, source: Option<std::ops::Range<usize>>) {
+        self.event_source = source;
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
@@ -623,23 +491,13 @@ impl Emitter {
     fn inline_math(&mut self, latex: String) {
         match math_render::render_inline(&latex) {
             Some(typeset) => {
-                if let Some(cell) = self.current_table_cell_mut() {
-                    cell.spans
-                        .push(Span::styled(typeset, Style::default().fg(MATH_FG)));
-                    return;
-                }
-                self.current
-                    .push(Span::styled(typeset, Style::default().fg(MATH_FG)));
+                self.push_semantic_text(typeset, Style::default().fg(MATH_FG));
             }
             None => {
                 // Verbatim raw source, delimiters included, in the normal
                 // text style so nothing is dropped.
                 let style = self.current_style();
-                if let Some(cell) = self.current_table_cell_mut() {
-                    cell.spans.push(Span::styled(format!("${latex}$"), style));
-                    return;
-                }
-                self.current.push(Span::styled(format!("${latex}$"), style));
+                self.push_semantic_text(format!("${latex}$"), style);
             }
         }
     }
@@ -647,41 +505,56 @@ impl Emitter {
     /// Render a display math span as a multi-line block. Falls back to the
     /// raw `$$…$$` source if unsupported or wider than the viewport.
     fn display_math(&mut self, latex: String) {
-        if let Some(cell) = self.current_table_cell_mut() {
-            match math_render::render_inline(&latex) {
-                Some(typeset) => cell
-                    .spans
-                    .push(Span::styled(typeset, Style::default().fg(MATH_FG))),
-                None => cell.spans.push(Span::styled(
-                    format!("$${latex}$$"),
-                    Style::default().fg(MATH_FG),
-                )),
-            }
+        if self.table.is_some() {
+            let visible =
+                math_render::render_inline(&latex).unwrap_or_else(|| format!("$${latex}$$"));
+            self.push_semantic_text(visible, Style::default().fg(MATH_FG));
             return;
         }
         self.flush_line();
         match math_render::render_display(&latex, self.math_width) {
             Some(block) => {
                 for row in block {
-                    self.lines
-                        .push(Line::from(Span::styled(row, Style::default().fg(MATH_FG))));
+                    let (fragments, cells) = make_copy_fragments(
+                        &row,
+                        &mut self.next_fragment_id,
+                        self.logical_line,
+                        None,
+                        self.event_source.clone(),
+                    );
+                    self.copy_fragments.extend(fragments);
+                    self.push_output_line(
+                        Line::from(Span::styled(row, Style::default().fg(MATH_FG))),
+                        cells,
+                    );
+                    self.logical_line += 1;
                 }
             }
             None => {
                 // Raw source verbatim across its own lines so nothing is
                 // dropped and no broken typesetting is shown.
-                self.lines.push(Line::from(Span::raw("$$".to_string())));
+                self.push_output_line(Line::from(Span::raw("$$".to_string())), vec![None; 2]);
                 for raw in latex.lines() {
-                    self.lines.push(Line::from(Span::raw(raw.to_string())));
+                    let raw = raw.to_string();
+                    let (fragments, cells) = make_copy_fragments(
+                        &raw,
+                        &mut self.next_fragment_id,
+                        self.logical_line,
+                        None,
+                        self.event_source.clone(),
+                    );
+                    self.copy_fragments.extend(fragments);
+                    self.push_output_line(Line::from(Span::raw(raw)), cells);
+                    self.logical_line += 1;
                 }
                 if latex.is_empty() {
                     // keep an empty body row for an empty display span
-                    self.lines.push(Line::default());
+                    self.push_output_line(Line::default(), Vec::new());
                 }
-                self.lines.push(Line::from(Span::raw("$$".to_string())));
+                self.push_output_line(Line::from(Span::raw("$$".to_string())), vec![None; 2]);
             }
         }
-        self.lines.push(Line::default());
+        self.push_output_line(Line::default(), Vec::new());
     }
 
     fn start(&mut self, tag: Tag) {
@@ -694,6 +567,8 @@ impl Emitter {
                     format!("{hashes} "),
                     Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
                 ));
+                self.current_copy
+                    .extend(std::iter::repeat_n(None, hashes.len() + 1));
                 self.push_style(Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD));
             }
             Tag::BlockQuote(_) => {
@@ -706,10 +581,13 @@ impl Emitter {
                 if let CodeBlockKind::Fenced(lang) = kind
                     && !lang.is_empty()
                 {
-                    self.lines.push(Line::from(Span::styled(
-                        format!("```{lang}"),
-                        Style::default().fg(CODE_FG).add_modifier(Modifier::DIM),
-                    )));
+                    self.push_output_line(
+                        Line::from(Span::styled(
+                            format!("```{lang}"),
+                            Style::default().fg(CODE_FG).add_modifier(Modifier::DIM),
+                        )),
+                        vec![None; 3 + UnicodeWidthStr::width(lang.as_ref())],
+                    );
                 }
             }
             Tag::List(start) => {
@@ -746,7 +624,10 @@ impl Emitter {
             }
             Tag::TableCell => {
                 if let Some(table) = &mut self.table {
-                    table.current_cell = Some(TableCell { spans: Vec::new() });
+                    table.current_cell = Some(TableCell {
+                        spans: Vec::new(),
+                        copy_cells: Vec::new(),
+                    });
                 }
             }
             Tag::Item => {
@@ -763,7 +644,10 @@ impl Emitter {
                     },
                     None => "• ".to_string(),
                 };
-                self.current.push(Span::raw(format!("{indent}{marker}")));
+                let prefix = format!("{indent}{marker}");
+                self.current_copy
+                    .extend(std::iter::repeat_n(None, prefix.width()));
+                self.current.push(Span::raw(prefix));
             }
             Tag::Emphasis => self.push_style(Style::default().add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
@@ -796,11 +680,14 @@ impl Emitter {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 self.flush_line();
-                self.lines.push(Line::from(Span::styled(
-                    "```".to_string(),
-                    Style::default().fg(CODE_FG).add_modifier(Modifier::DIM),
-                )));
-                self.lines.push(Line::default());
+                self.push_output_line(
+                    Line::from(Span::styled(
+                        "```".to_string(),
+                        Style::default().fg(CODE_FG).add_modifier(Modifier::DIM),
+                    )),
+                    vec![None; 3],
+                );
+                self.push_output_line(Line::default(), Vec::new());
             }
             TagEnd::List(_) => {
                 self.list_stack.pop();
@@ -809,7 +696,7 @@ impl Emitter {
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
                     self.emit_table(table);
-                    self.lines.push(Line::default());
+                    self.push_output_line(Line::default(), Vec::new());
                 }
             }
             TagEnd::TableHead => {
@@ -857,14 +744,17 @@ impl Emitter {
                 let chunk = trimmed_nl.unwrap_or(raw).to_string();
                 if !chunk.is_empty() {
                     let start = self.current.iter().map(|span| span.content.width()).sum();
-                    self.current.push(Span::styled(
-                        expand_tabs(&chunk, start),
+                    let expanded = expand_tabs(&chunk, start);
+                    self.push_semantic_current_source(
+                        &chunk,
+                        expanded,
+                        start,
                         Style::default().fg(CODE_FG).bg(CODE_BG),
-                    ));
+                    );
                 }
                 if trimmed_nl.is_some() {
                     if self.current.is_empty() {
-                        self.lines.push(Line::default());
+                        self.push_output_line(Line::default(), Vec::new());
                     } else {
                         self.flush_line();
                     }
@@ -880,43 +770,67 @@ impl Emitter {
         for piece in s.split('\n') {
             if !first {
                 if self.current.is_empty() {
-                    self.lines.push(Line::default());
+                    self.push_output_line(Line::default(), Vec::new());
                 } else {
                     self.flush_line();
                 }
             }
             if !piece.is_empty() {
                 let start = self.current.iter().map(|span| span.content.width()).sum();
-                self.current
-                    .push(Span::styled(expand_tabs(piece, start), style));
+                let expanded = expand_tabs(piece, start);
+                self.push_semantic_current_source(piece, expanded, start, style);
             }
             first = false;
         }
     }
 
     fn inline_code(&mut self, s: String) {
-        if let Some(cell) = self.current_table_cell_mut() {
-            let start = cell.spans.iter().map(|span| span.content.width()).sum();
-            cell.spans.push(Span::styled(
-                expand_tabs(&s, start),
-                Style::default().fg(CODE_FG).bg(CODE_BG),
-            ));
+        let source = self.event_source.clone();
+        let logical_line = self.logical_line;
+        let table_cell = self.current_table_coordinates();
+        if self.table.is_some() {
+            let start = self
+                .table
+                .as_ref()
+                .and_then(|table| table.current_cell.as_ref())
+                .map(|cell| cell.spans.iter().map(|span| span.content.width()).sum())
+                .unwrap_or(0);
+            let expanded = expand_tabs(&s, start);
+            let (fragments, cells) = make_copy_fragments_with_tabs(
+                &s,
+                start,
+                &mut self.next_fragment_id,
+                logical_line,
+                table_cell,
+                source,
+            );
+            self.copy_fragments.extend(fragments);
+            if let Some(cell) = self.current_table_cell_mut() {
+                cell.copy_cells.extend(cells);
+                cell.spans.push(Span::styled(
+                    expanded,
+                    Style::default().fg(CODE_FG).bg(CODE_BG),
+                ));
+            }
             return;
         }
         let start = self.current.iter().map(|span| span.content.width()).sum();
-        self.current.push(Span::styled(
-            expand_tabs(&s, start),
+        let expanded = expand_tabs(&s, start);
+        self.push_semantic_current_source(
+            &s,
+            expanded,
+            start,
             Style::default().fg(CODE_FG).bg(CODE_BG),
-        ));
+        );
     }
 
     fn horizontal_rule(&mut self) {
         self.flush_line();
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(40),
-            Style::default().fg(QUOTE_FG),
-        )));
-        self.lines.push(Line::default());
+        self.push_output_line(
+            Line::from(Span::styled("─".repeat(40), Style::default().fg(QUOTE_FG))),
+            vec![None; 40],
+        );
+        self.push_output_line(Line::default(), Vec::new());
     }
 
     fn push_style(&mut self, style: Style) {
@@ -936,13 +850,95 @@ impl Emitter {
         self.table.as_mut()?.current_cell.as_mut()
     }
 
+    fn current_table_coordinates(&self) -> Option<(usize, usize)> {
+        let table = self.table.as_ref()?;
+        Some((table.rows.len(), table.current_row.as_ref()?.cells.len()))
+    }
+
+    fn push_semantic_text(&mut self, text: String, style: Style) {
+        if self.table.is_some() {
+            let source = self.event_source.clone();
+            let logical_line = self.logical_line;
+            let table_cell = self.current_table_coordinates();
+            let (fragments, cells) = make_copy_fragments(
+                &text,
+                &mut self.next_fragment_id,
+                logical_line,
+                table_cell,
+                source,
+            );
+            self.copy_fragments.extend(fragments);
+            if let Some(cell) = self.current_table_cell_mut() {
+                cell.copy_cells.extend(cells);
+                cell.spans.push(Span::styled(text, style));
+            }
+        } else {
+            self.push_semantic_current(text, style);
+        }
+    }
+
+    fn push_semantic_current(&mut self, text: String, style: Style) {
+        let table_cell = self.current_table_coordinates();
+        let (fragments, cells) = make_copy_fragments(
+            &text,
+            &mut self.next_fragment_id,
+            self.logical_line,
+            table_cell,
+            self.event_source.clone(),
+        );
+        self.copy_fragments.extend(fragments);
+        self.current_copy.extend(cells);
+        self.current.push(Span::styled(text, style));
+    }
+
+    fn push_semantic_current_source(
+        &mut self,
+        semantic: &str,
+        rendered: String,
+        start: usize,
+        style: Style,
+    ) {
+        let table_cell = self.current_table_coordinates();
+        let (fragments, cells) = make_copy_fragments_with_tabs(
+            semantic,
+            start,
+            &mut self.next_fragment_id,
+            self.logical_line,
+            table_cell,
+            self.event_source.clone(),
+        );
+        self.copy_fragments.extend(fragments);
+        self.current_copy.extend(cells);
+        self.current.push(Span::styled(rendered, style));
+    }
+
     fn table_text(&mut self, s: String) {
         let style = self.current_style();
-        if let Some(cell) = self.current_table_cell_mut() {
-            let start = cell.spans.iter().map(|span| span.content.width()).sum();
+        let source = self.event_source.clone();
+        let logical_line = self.logical_line;
+        let table_cell = self.current_table_coordinates();
+        if self.table.is_some() {
+            let start = self
+                .table
+                .as_ref()
+                .and_then(|table| table.current_cell.as_ref())
+                .map(|cell| cell.spans.iter().map(|span| span.content.width()).sum())
+                .unwrap_or(0);
             let text = expand_tabs(&s.replace('\n', " "), start);
             if !text.is_empty() {
-                cell.spans.push(Span::styled(text, style));
+                let (fragments, cells) = make_copy_fragments_with_tabs(
+                    &s.replace('\n', " "),
+                    start,
+                    &mut self.next_fragment_id,
+                    logical_line,
+                    table_cell,
+                    source,
+                );
+                self.copy_fragments.extend(fragments);
+                if let Some(cell) = self.current_table_cell_mut() {
+                    cell.copy_cells.extend(cells);
+                    cell.spans.push(Span::styled(text, style));
+                }
             }
         }
     }
@@ -988,7 +984,8 @@ impl Emitter {
                 text.push_str(junction);
             }
         }
-        self.lines.push(Line::from(Span::raw(text)));
+        let width = text.width();
+        self.push_output_line(Line::from(Span::raw(text)), vec![None; width]);
     }
 
     fn push_table_row(
@@ -1000,17 +997,31 @@ impl Emitter {
     ) {
         let wrapped: Vec<Vec<Vec<Span<'static>>>> = (0..column_count)
             .map(|idx| {
-                let cell = row
-                    .cells
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or(TableCell { spans: Vec::new() });
+                let cell = row.cells.get(idx).cloned().unwrap_or(TableCell {
+                    spans: Vec::new(),
+                    copy_cells: Vec::new(),
+                });
                 wrap_spans_to_width(&cell.spans, widths[idx])
             })
             .collect();
+        let wrapped_copy: Vec<Vec<Vec<Option<u32>>>> = (0..column_count)
+            .map(|idx| {
+                let cells = row
+                    .cells
+                    .get(idx)
+                    .map(|cell| cell.copy_cells.as_slice())
+                    .unwrap_or_default();
+                wrap_copy_cells_for_rows(cells, &wrapped[idx])
+            })
+            .collect();
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let row_logical_line = self.logical_line;
         for visual_row in 0..height {
+            if visual_row > 0 {
+                self.pending_copy_newlines = 0;
+            }
             let mut spans = Vec::new();
+            let mut copy = vec![None];
             spans.push(Span::raw("│"));
             for col in 0..column_count {
                 let cell_line = wrapped[col]
@@ -1026,11 +1037,26 @@ impl Emitter {
                         Alignment::Left | Alignment::None => (0, slack),
                     };
                 spans.push(Span::raw(format!(" {}", " ".repeat(left_pad))));
+                copy.extend(std::iter::repeat_n(None, left_pad + 1));
                 spans.extend(cell_line);
+                copy.extend(
+                    wrapped_copy[col]
+                        .get(visual_row)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
                 spans.push(Span::raw(format!("{} │", " ".repeat(right_pad))));
+                copy.extend(std::iter::repeat_n(None, right_pad + 2));
             }
-            self.lines.push(Line::from(spans));
+            for fragment_id in copy.iter().flatten().copied() {
+                if let Some(fragment) = self.copy_fragments.get_mut(fragment_id as usize) {
+                    fragment.logical_line = row_logical_line;
+                }
+            }
+            self.push_output_line(Line::from(spans), copy);
         }
+        self.logical_line += 1;
+        self.pending_copy_newlines = 1;
     }
 
     fn flush_line(&mut self) {
@@ -1038,6 +1064,7 @@ impl Emitter {
             return;
         }
         let spans = std::mem::take(&mut self.current);
+        let mut copy = std::mem::take(&mut self.current_copy);
         let line = if self.in_block_quote {
             let mut with_bar: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 1);
             with_bar.push(Span::styled(
@@ -1045,32 +1072,62 @@ impl Emitter {
                 Style::default().fg(QUOTE_FG),
             ));
             with_bar.extend(spans);
+            copy.splice(0..0, [None, None]);
             Line::from(with_bar)
         } else {
             Line::from(spans)
         };
-        self.lines.push(line);
+        let width = spans_width(&line.spans);
+        copy.resize(width, None);
+        self.push_output_line(line, copy);
+        self.logical_line += 1;
     }
 
     fn flush_line_then_blank(&mut self) {
         self.flush_line();
         if !matches!(self.lines.last(), Some(l) if l.spans.is_empty()) {
-            self.lines.push(Line::default());
+            self.push_output_line(Line::default(), Vec::new());
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn push_output_line(&mut self, line: Line<'static>, cells: Vec<Option<u32>>) {
+        let has_semantic = cells.iter().any(Option::is_some);
+        let is_blank = line.spans.is_empty();
+        self.lines.push(line);
+        self.copy_cells.push(cells);
+        self.copy_newlines_before.push(if has_semantic {
+            self.pending_copy_newlines
+        } else {
+            0
+        });
+        if has_semantic {
+            self.pending_copy_newlines = 1;
+        } else if is_blank {
+            self.pending_copy_newlines += 1;
+        }
+    }
+
+    fn finish(mut self) -> RenderedMarkdown {
         self.flush_line();
         // Trim trailing blank lines — the chat pane already insets a
         // gap row between entries, so dangling blanks here just widen
         // the gap.
         while matches!(self.lines.last(), Some(l) if l.spans.is_empty()) {
             self.lines.pop();
+            self.copy_cells.pop();
+            self.copy_newlines_before.pop();
         }
         if self.lines.is_empty() {
-            self.lines.push(Line::default());
+            self.push_output_line(Line::default(), Vec::new());
         }
-        self.lines
+        let incomplete = vec![false; self.lines.len()];
+        RenderedMarkdown {
+            lines: self.lines,
+            copy_cells: self.copy_cells,
+            copy_newlines_before: self.copy_newlines_before,
+            copy_incomplete: incomplete,
+            copy_fragments: Rc::new(self.copy_fragments),
+        }
     }
 }
 
@@ -1128,6 +1185,63 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
         .sum()
 }
 
+fn make_copy_fragments(
+    text: &str,
+    next_id: &mut usize,
+    logical_line: usize,
+    table_cell: Option<(usize, usize)>,
+    source: Option<std::ops::Range<usize>>,
+) -> (Vec<CopyFragment>, Vec<Option<u32>>) {
+    let mut fragments = Vec::new();
+    let mut cells = Vec::new();
+    for grapheme in semantic_graphemes(text) {
+        let id = *next_id;
+        *next_id += 1;
+        let width = UnicodeWidthStr::width(grapheme.as_str());
+        cells.extend(std::iter::repeat_n(Some(id as u32), width));
+        fragments.push(CopyFragment {
+            id,
+            text: grapheme,
+            source: source.clone(),
+            logical_line,
+            table_cell,
+        });
+    }
+    (fragments, cells)
+}
+
+fn make_copy_fragments_with_tabs(
+    text: &str,
+    start_col: usize,
+    next_id: &mut usize,
+    logical_line: usize,
+    table_cell: Option<(usize, usize)>,
+    source: Option<std::ops::Range<usize>>,
+) -> (Vec<CopyFragment>, Vec<Option<u32>>) {
+    let mut fragments = Vec::new();
+    let mut cells = Vec::new();
+    let mut col = start_col;
+    for grapheme in semantic_graphemes(text) {
+        let id = *next_id;
+        *next_id += 1;
+        let width = if grapheme == "\t" {
+            TAB_STOP - col % TAB_STOP
+        } else {
+            grapheme.width()
+        };
+        cells.extend(std::iter::repeat_n(Some(id as u32), width));
+        col += width;
+        fragments.push(CopyFragment {
+            id,
+            text: grapheme,
+            source: source.clone(),
+            logical_line,
+            table_cell,
+        });
+    }
+    (fragments, cells)
+}
+
 fn wrap_spans_to_width(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
@@ -1158,6 +1272,21 @@ fn wrap_spans_to_width(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'s
         rows.push(current);
     }
     rows
+}
+
+fn wrap_copy_cells_for_rows(
+    cells: &[Option<u32>],
+    rows: &[Vec<Span<'static>>],
+) -> Vec<Vec<Option<u32>>> {
+    let mut offset = 0usize;
+    rows.iter()
+        .map(|row| {
+            let end = (offset + spans_width(row)).min(cells.len());
+            let slice = cells[offset..end].to_vec();
+            offset = end;
+            slice
+        })
+        .collect()
 }
 
 fn heading_depth(level: HeadingLevel) -> usize {
@@ -1431,24 +1560,32 @@ mod tests {
     }
 
     fn copied(src: &str) -> String {
-        semantic_copy_atoms(src, 80)
-            .into_iter()
-            .map(|atom| match atom {
-                CopyAtom::Fragment(fragment) => fragment.text,
-                CopyAtom::Newline => "\n".to_string(),
-            })
-            .collect()
+        let rendered = render_with_provenance(src, 80);
+        let mut out = String::new();
+        let mut last = None;
+        for (row, cells) in rendered.copy_cells.iter().enumerate() {
+            let ids = cells.iter().flatten().copied().collect::<Vec<_>>();
+            if !ids.is_empty() && !out.is_empty() {
+                out.push_str(&"\n".repeat(rendered.copy_newlines_before[row]));
+            }
+            for id in ids {
+                if last == Some(id) {
+                    continue;
+                }
+                out.push_str(&rendered.copy_fragments[id as usize].text);
+                last = Some(id);
+            }
+        }
+        out
     }
 
     #[test]
     fn selection_source_map_survives_wrap_and_viewport_slice() {
-        let atoms = semantic_copy_atoms("alpha **wide界** omega", 80);
-        let ids = atoms
+        let rendered = render_with_provenance("alpha **wide界** omega", 80);
+        let ids = rendered
+            .copy_fragments
             .iter()
-            .filter_map(|atom| match atom {
-                CopyAtom::Fragment(fragment) => Some(fragment.id),
-                CopyAtom::Newline => None,
-            })
+            .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, (0..ids.len()).collect::<Vec<_>>());
         assert_eq!(copied("alpha **wide界** omega"), "alpha wide界 omega");
@@ -1523,13 +1660,11 @@ mod tests {
 
     #[test]
     fn selection_scrolled_mid_message_preserves_semantic_identity() {
-        let atoms = semantic_copy_atoms("first\nsecond\nthird", 80);
-        let second = atoms
+        let rendered = render_with_provenance("first\nsecond\nthird", 80);
+        let second = rendered
+            .copy_fragments
             .iter()
-            .find_map(|atom| match atom {
-                CopyAtom::Fragment(fragment) if fragment.text == "s" => Some(fragment),
-                _ => None,
-            })
+            .find(|fragment| fragment.text == "s")
             .unwrap();
         assert_eq!(second.logical_line, 0); // soft breaks remain one semantic line
         assert!(second.id > 0);
@@ -1537,13 +1672,11 @@ mod tests {
 
     #[test]
     fn selection_table_fragments_exclude_borders_and_padding() {
-        let atoms = semantic_copy_atoms("| A | B |\n|---|---|\n| x | y |", 80);
-        let cells = atoms
+        let rendered = render_with_provenance("| A | B |\n|---|---|\n| x | y |", 80);
+        let cells = rendered
+            .copy_fragments
             .iter()
-            .filter_map(|atom| match atom {
-                CopyAtom::Fragment(fragment) => fragment.table_cell,
-                CopyAtom::Newline => None,
-            })
+            .filter_map(|fragment| fragment.table_cell)
             .collect::<Vec<_>>();
         assert!(cells.contains(&(0, 0)) && cells.iter().any(|cell| cell.0 >= 1));
         assert_eq!(copied("| A | B |\n|---|---|\n| x | y |"), "AB\nxy");
@@ -1551,12 +1684,13 @@ mod tests {
             copied("| math |\n|---|\n| $$\\frac{a}{b}$$ |"),
             "math\n$$\\frac{a}{b}$$"
         );
-        let inline_math = semantic_copy_atoms("| $a$ | b |\n|---|---|\n| c | d |", 80);
-        assert!(inline_math.iter().any(|atom| matches!(
-            atom,
-            CopyAtom::Fragment(fragment)
-                if fragment.text == "a" && fragment.table_cell == Some((0, 0))
-        )));
+        let inline_math = render_with_provenance("| $a$ | b |\n|---|---|\n| c | d |", 80);
+        assert!(
+            inline_math
+                .copy_fragments
+                .iter()
+                .any(|fragment| fragment.text == "a" && fragment.table_cell == Some((0, 0)))
+        );
     }
 
     #[test]

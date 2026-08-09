@@ -169,6 +169,31 @@ function EnterpriseAdmin() {
     onError: () => trigger("error"),
     meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
   });
+  const nominateSecurityAdmin = useMutation({
+    mutationFn: async (nomineeId: string) => {
+      if (!overview.data?.org) throw new Error("Enterprise organization is unavailable.");
+      const ceremony = await orpc.enterprise.beginRemoteAdminStepUp.call({
+        orgId: overview.data.org.id,
+        action: "credential_governance",
+      });
+      const assertion = await assertRemoteAdminCredential(ceremony);
+      const stepUp = await orpc.enterprise.completeRemoteAdminStepUp.call({
+        challengeId: ceremony.challengeId,
+        ...assertion,
+      });
+      return orpc.enterprise.beginSecurityAdminBootstrap.call({
+        orgId: overview.data.org.id,
+        nomineeId,
+        stepUp: stepUp.stepUp,
+      });
+    },
+    onSuccess: () => {
+      invalidate();
+      trigger("success");
+    },
+    onError: () => trigger("error"),
+    meta: { errorFallbackKey: "admin:enterprise.bootstrapFailed" },
+  });
   const updatePolicy = useMutation({
     ...orpc.enterprise.updatePolicy.mutationOptions({
       onSuccess: () => {
@@ -287,6 +312,35 @@ function EnterpriseAdmin() {
                   <ShieldCheck className="size-4" />
                   {t("admin:enterprise.recoveryReconfirm")}
                 </Button>
+              </CardContent>
+            </Card>
+          ) : null}
+          {data.membership.role === "OWNER" &&
+          !data.members.some((member) => member.role === "SECURITY_ADMIN") &&
+          data.members.some((member) => member.role === "MEMBER") ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("admin:enterprise.securityNominationTitle")}</CardTitle>
+                <CardDescription>
+                  {t("admin:enterprise.securityNominationDescription")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {data.members
+                  .filter((member) => member.role === "MEMBER")
+                  .map((member) => (
+                    <Button
+                      key={member.id}
+                      variant="outline"
+                      className="mr-2 min-h-[44px]"
+                      disabled={nominateSecurityAdmin.isPending}
+                      onClick={() => nominateSecurityAdmin.mutate(member.userId)}
+                    >
+                      {t("admin:enterprise.securityNominationAction", {
+                        name: member.User.name ?? member.User.email,
+                      })}
+                    </Button>
+                  ))}
               </CardContent>
             </Card>
           ) : null}

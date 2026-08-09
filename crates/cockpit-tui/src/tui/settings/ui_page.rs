@@ -780,6 +780,21 @@ fn render_grab_list(
     if grabbed.is_some() {
         lines.push(Line::default());
         controls.push(None);
+        let can_up = cursor > 0;
+        let can_down = cursor + 1 < items.len();
+        for (id, label, enabled, reason) in [
+            (1000, "[Move up]", can_up, "already first"),
+            (1001, "[Move down]", can_down, "already last"),
+            (1002, "[Save]", true, ""),
+            (1003, "[Cancel]", true, ""),
+        ] {
+            lines.push(Line::from(label));
+            controls.push(Some((
+                SettingsControlId(id),
+                enabled,
+                (!enabled).then_some(reason),
+            )));
+        }
         lines.push(grab::grab_hint_line(grab::GRAB_HINT));
         controls.push(None);
     }
@@ -818,6 +833,16 @@ impl SettingsPage for InstructionsPage {
     }
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        if self.grabbed.is_some() {
+            let key = match control.0 {
+                1000 => KeyCode::Up,
+                1001 => KeyCode::Down,
+                1002 => KeyCode::Enter,
+                1003 => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx.handle_instructions_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
         let index = control.0 as usize;
         if index > cx.extended.agent_guidance_files.len() {
             return Nav::Stay;
@@ -882,6 +907,17 @@ impl SettingsPage for RedactPatternsPage {
     }
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        if self.grabbed.is_some() {
+            let key = match control.0 {
+                1000 => KeyCode::Up,
+                1001 => KeyCode::Down,
+                1002 => KeyCode::Enter,
+                1003 => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx
+                .handle_redact_patterns_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
         let index = control.0 as usize;
         if index > cx.extended.redact.dotenv_patterns.len() {
             return Nav::Stay;

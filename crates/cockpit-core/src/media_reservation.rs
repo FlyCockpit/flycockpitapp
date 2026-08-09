@@ -305,7 +305,7 @@ impl MediaReservationLedger {
             let current = ReservationState::parse(&row.0)?;
             if row.1 != expected_version { return Err(anyhow!("stale_version")); }
             if !current.allows(next) { return Err(anyhow!("invalid_transition")); }
-            if matches!(next, ReservationState::ExecutingLocal | ReservationState::DispatchingExternal | ReservationState::OverageQuarantined | ReservationState::Settling | ReservationState::Released) {
+            if matches!(next, ReservationState::ExecutingLocal | ReservationState::DispatchingExternal | ReservationState::CancellationRequested | ReservationState::OverageQuarantined | ReservationState::Settling | ReservationState::Released) {
                 return Err(anyhow!("side_effect_transition_requires_typed_operation"));
             }
             if matches!(next, ReservationState::ExternalPending | ReservationState::ReconcilingExternal) {
@@ -325,6 +325,55 @@ impl MediaReservationLedger {
                 block_corrupt_scopes(conn,&id,&row.4,&row.5)?;
             }
             Ok(ReservationReceipt { reservation_id:id,state:next,version,queue_sequence:row.2,deadline_monotonic_ms:row.3 })
+        }).await.map_err(classify_storage_error)
+    }
+
+    /// Requests cancellation while atomically applying the resource lifecycle
+    /// implied by the current state.  A queued operation has performed no
+    /// execution or external handoff, so cancellation releases its queue
+    /// permits and terminates immediately.  Once execution or handoff may have
+    /// happened, charges remain held until the corresponding cleanup or
+    /// journal reconciliation proves that they can be released.
+    pub async fn request_cancellation(
+        &self,
+        id: &str,
+        expected_version: u64,
+        wall_ms: u64,
+    ) -> Result<ReservationReceipt, LedgerError> {
+        let id = id.to_owned();
+        self.db.transaction(move |conn| {
+            let (state, version, sequence, deadline, project, session, external_operation_id) =
+                conn.query_row(
+                    "SELECT state,version,queue_sequence,deadline_monotonic_ms,project_id,owner_session_key,external_operation_id FROM media_reservations WHERE reservation_id=?1",
+                    [&id],
+                    |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?, row_u64(row, 2)?, row_u64(row, 3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, Option<String>>(6)?)),
+                )?;
+            if version != expected_version { return Err(anyhow!("stale_version")); }
+            let current = ReservationState::parse(&state)?;
+            if !current.allows(ReservationState::CancellationRequested) {
+                return Err(anyhow!("invalid_transition"));
+            }
+            let owner = MediaOwner { project_id: project, session_id: session };
+            let next_version = version.checked_add(1).ok_or_else(|| anyhow!("accounting_overflow"))?;
+            let next = if current == ReservationState::ReservedQueued {
+                release_queued(conn, &id, &owner, next_version, wall_ms)?;
+                ReservationState::Released
+            } else {
+                if let Some(operation_id) = external_operation_id {
+                    let journal_state: String = conn.query_row(
+                        "SELECT state FROM external_journal_operations WHERE operation_id=?1",
+                        [&operation_id], |row| row.get(0))?;
+                    if !matches!(journal_state.as_str(), "dispatching" | "accepted" | "submission_unknown" | "reconciling" | "cancellation_requested") {
+                        return Err(anyhow!("external_journal_state_mismatch"));
+                    }
+                }
+                ReservationState::CancellationRequested
+            };
+            conn.execute(
+                "UPDATE media_reservations SET state=?1,cancellation_requested=1,version=?2 WHERE reservation_id=?3 AND version=?4",
+                params![next.as_str(), sqlite_i64(next_version)?, id, sqlite_i64(expected_version)?],
+            )?;
+            Ok(ReservationReceipt { reservation_id: id, state: next, version: next_version, queue_sequence: sequence, deadline_monotonic_ms: deadline })
         }).await.map_err(classify_storage_error)
     }
 
@@ -1344,6 +1393,50 @@ mod tests {
         ));
         let charged=db.read(|conn|Ok(conn.query_row("SELECT charged FROM media_resource_counters WHERE scope_kind='global' AND dimension='queued_operations_global'",[],|r|row_u64(r,0))?)).await.unwrap();
         assert_eq!(charged, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_is_typed_atomic_and_releases_all_queue_permits() {
+        let db = Db::open_in_memory().unwrap();
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(Clock(AtomicU64::new(0))));
+        let receipt = ledger
+            .reserve(request(
+                "cancel-queued",
+                vec![
+                    plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                    plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                    plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ledger.transition(&receipt.reservation_id, receipt.version, ReservationState::CancellationRequested, 2).await,
+            Err(LedgerError::Storage(error)) if error.to_string().contains("side_effect_transition_requires_typed_operation")
+        ));
+        let cancelled = ledger
+            .request_cancellation(&receipt.reservation_id, receipt.version, 2)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, ReservationState::Released);
+        let counters = db.read(|conn| {
+            let mut statement = conn.prepare("SELECT dimension,charged FROM media_resource_counters WHERE dimension LIKE 'queued_operations_%' ORDER BY dimension")?;
+            Ok(statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await.unwrap();
+        assert_eq!(
+            counters,
+            vec![
+                ("queued_operations_global".into(), 0),
+                ("queued_operations_per_session".into(), 0),
+            ]
+        );
+        assert!(
+            !ledger
+                .publication_allowed(&receipt.reservation_id)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -297,6 +297,7 @@ pub struct AsyncActionRunner {
     pending: HashMap<AsyncActionId, PendingAction>,
     keyed: HashMap<AsyncActionKey, AsyncActionId>,
     serialized: HashMap<AsyncActionKey, tokio::sync::oneshot::Receiver<()>>,
+    cancelled: Vec<AsyncActionResult>,
     tx: mpsc::UnboundedSender<CompletedAction>,
     rx: mpsc::UnboundedReceiver<CompletedAction>,
     notify: Arc<Notify>,
@@ -312,6 +313,7 @@ impl Default for AsyncActionRunner {
             pending: HashMap::new(),
             keyed: HashMap::new(),
             serialized: HashMap::new(),
+            cancelled: Vec::new(),
             tx,
             rx,
             notify: Arc::new(Notify::new()),
@@ -636,9 +638,18 @@ impl AsyncActionRunner {
         results
     }
 
+    pub fn drain_cancelled(&mut self) -> Vec<AsyncActionResult> {
+        std::mem::take(&mut self.cancelled)
+    }
+
     pub fn shutdown(&mut self) {
-        for (_, pending) in self.pending.drain() {
+        for (id, pending) in self.pending.drain() {
             pending.handle.abort();
+            self.cancelled.push(AsyncActionResult {
+                id,
+                kind: pending.kind,
+                payload: Err("operation cancelled by shutdown".to_string()),
+            });
         }
         self.keyed.clear();
         self.serialized.clear();
@@ -666,6 +677,11 @@ impl AsyncActionRunner {
             self.keyed.remove(&key);
         }
         pending.handle.abort();
+        self.cancelled.push(AsyncActionResult {
+            id,
+            kind: pending.kind,
+            payload: Err("operation cancelled".to_string()),
+        });
         true
     }
 }
@@ -815,6 +831,26 @@ mod tests {
         let _ = release.send(());
         tokio::task::yield_now().await;
         assert!(runner.drain_completed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_async_action_cancellation_is_terminal_once() {
+        let mut runner = AsyncActionRunner::default();
+        let (_release, barrier) = oneshot::channel::<()>();
+        let action = runner.start(
+            AsyncActionKind::Blocking("doctor.snapshot"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+        assert!(runner.abort_id(action.id()));
+        assert!(!runner.abort_id(action.id()));
+        let cancelled = runner.drain_cancelled();
+        assert_eq!(cancelled.len(), 1);
+        assert!(matches!(&cancelled[0].payload, Err(error) if error.contains("cancelled")));
+        assert!(runner.drain_cancelled().is_empty());
     }
 
     fn assert_text_payload(result: &AsyncActionResult, expected: &str) {

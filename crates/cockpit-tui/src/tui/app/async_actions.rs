@@ -75,6 +75,9 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
+        // Cancellation is a terminal runner outcome, but ownership ended, so
+        // it is intentionally acknowledged without applying UI mutations.
+        let _cancelled = self.async_actions.drain_cancelled();
         let mut results = self.async_actions.expire_blocking(
             self.event_loop_monotonic_now,
             std::time::Duration::from_secs(30),

@@ -308,9 +308,13 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
     to: PublicAuthorityRing;
     toDigest: string;
     statusGeneration: string;
+    status: RemoteAuthorityStatusV1;
     statusBodyDigest: string;
     signerKid: string;
   }) {
+    const candidateJson = canonicalizeRfc8785(args.status);
+    if (createHash("sha256").update(candidateJson).digest("hex") !== args.statusBodyDigest)
+      throw new Error("transition status body digest mismatch");
     return this.db.$transaction(
       async (tx) => {
         const lifecycle = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
@@ -325,7 +329,7 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
         )
           return false;
         await tx.$executeRawUnsafe(
-          `INSERT INTO remote_authority_lifecycle_transitions ("transitionId","deploymentId","state","fromRevision","toRevision","fromDigest","toDigest","fromAuthorityEpoch","toAuthorityEpoch","fromCurrentKid","toCurrentKid","statusGeneration","statusBodyDigest","signingGeneration","signerKid","createdAt","updatedAt") VALUES ($1,$2,'reserved',$3::numeric,$4::numeric,$5,$6,$7::numeric,$8::numeric,$9,$10,$11::numeric,$12,$8::numeric,$13,NOW(),NOW()) ON CONFLICT ("transitionId") DO UPDATE SET "state"='reserved',"statusCompactJws"=NULL,"statusGeneration"=EXCLUDED."statusGeneration","statusBodyDigest"=EXCLUDED."statusBodyDigest","signerKid"=EXCLUDED."signerKid","updatedAt"=NOW() WHERE remote_authority_lifecycle_transitions."state"='aborted' AND remote_authority_lifecycle_transitions."deploymentId"=EXCLUDED."deploymentId" AND remote_authority_lifecycle_transitions."fromDigest"=EXCLUDED."fromDigest" AND remote_authority_lifecycle_transitions."toDigest"=EXCLUDED."toDigest" AND remote_authority_lifecycle_transitions."fromRevision"=EXCLUDED."fromRevision" AND remote_authority_lifecycle_transitions."toRevision"=EXCLUDED."toRevision"`,
+          `INSERT INTO remote_authority_lifecycle_transitions ("transitionId","deploymentId","state","fromRevision","toRevision","fromDigest","toDigest","fromAuthorityEpoch","toAuthorityEpoch","fromCurrentKid","toCurrentKid","statusGeneration","statusBodyDigest","statusBodyJson","signingGeneration","signerKid","createdAt","updatedAt") VALUES ($1,$2,'reserved',$3::numeric,$4::numeric,$5,$6,$7::numeric,$8::numeric,$9,$10,$11::numeric,$12,$13,$8::numeric,$14,NOW(),NOW()) ON CONFLICT ("transitionId") DO UPDATE SET "state"='reserved',"statusCompactJws"=NULL,"statusGeneration"=EXCLUDED."statusGeneration","statusBodyDigest"=EXCLUDED."statusBodyDigest","statusBodyJson"=EXCLUDED."statusBodyJson","signerKid"=EXCLUDED."signerKid","updatedAt"=NOW() WHERE remote_authority_lifecycle_transitions."state"='aborted' AND remote_authority_lifecycle_transitions."deploymentId"=EXCLUDED."deploymentId" AND remote_authority_lifecycle_transitions."fromDigest"=EXCLUDED."fromDigest" AND remote_authority_lifecycle_transitions."toDigest"=EXCLUDED."toDigest" AND remote_authority_lifecycle_transitions."fromRevision"=EXCLUDED."fromRevision" AND remote_authority_lifecycle_transitions."toRevision"=EXCLUDED."toRevision"`,
           args.transitionId,
           args.deploymentId,
           args.from.revision,
@@ -338,20 +342,25 @@ export class PostgresAuthorityRuntimeStore implements AuthorityRuntimeStore {
           args.to.currentKid,
           args.statusGeneration,
           args.statusBodyDigest,
+          candidateJson,
           args.signerKid,
         );
         const transition = await tx.$queryRawUnsafe<Array<Record<string, unknown>>>(
-          `SELECT "statusCompactJws","statusBodyDigest","signerKid" FROM remote_authority_lifecycle_transitions WHERE "transitionId"=$1`,
+          `SELECT "statusCompactJws","statusBodyDigest","statusBodyJson","signerKid" FROM remote_authority_lifecycle_transitions WHERE "transitionId"=$1`,
           args.transitionId,
         );
+        const stored = transition[0],
+          statusBodyJson = text(stored?.statusBodyJson),
+          statusBodyDigest = createHash("sha256").update(statusBodyJson).digest("hex");
         if (
-          text(transition[0]?.statusBodyDigest) !== args.statusBodyDigest ||
-          text(transition[0]?.signerKid) !== args.signerKid
+          statusBodyDigest !== text(stored?.statusBodyDigest) ||
+          text(stored?.signerKid) !== args.signerKid
         )
           return false;
-        return typeof transition[0]?.statusCompactJws === "string"
-          ? transition[0].statusCompactJws
-          : true;
+        return {
+          status: JSON.parse(statusBodyJson) as RemoteAuthorityStatusV1,
+          compactJws: typeof stored?.statusCompactJws === "string" ? stored.statusCompactJws : null,
+        };
       },
       { isolationLevel: "Serializable" },
     );

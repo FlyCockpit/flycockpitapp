@@ -36,6 +36,10 @@ export interface FinalizedAuthorityStatus {
   compactJws: string;
   status: RemoteAuthorityStatusV1;
 }
+export interface PreparedLifecycleStatus {
+  status: RemoteAuthorityStatusV1;
+  compactJws: string | null;
+}
 export interface AuthorityRuntimeStore {
   bootstrapAuthority(args: {
     deploymentId: string;
@@ -81,9 +85,10 @@ export interface AuthorityRuntimeStore {
     to: PublicAuthorityRing;
     toDigest: string;
     statusGeneration: string;
+    status: RemoteAuthorityStatusV1;
     statusBodyDigest: string;
     signerKid: string;
-  }): Promise<boolean | string>;
+  }): Promise<false | PreparedLifecycleStatus>;
   markTransitionStatusSigned(args: {
     transitionId: string;
     compactJws: string;
@@ -145,6 +150,16 @@ export function shouldAbortSupersededTransitions(
     leases.length > 0 &&
     leases.every((lease) => lease.digest === lifecycleDigest)
   );
+}
+
+export function isExpectedLifecycleOverlap(
+  plan: readonly string[],
+  localDigest: string,
+  committedDigest: string,
+) {
+  const localIndex = plan.indexOf(localDigest),
+    committedIndex = plan.indexOf(committedDigest);
+  return plan.length === 3 && localIndex >= 0 && committedIndex === localIndex + 1;
 }
 export class RemoteAuthorityRuntime {
   readonly config: AuthorityConfig;
@@ -301,16 +316,25 @@ export class RemoteAuthorityRuntime {
     if (localMember.state !== "required") return this.#fail("replica_not_required");
     if (!this.#decision.ready) return this.#fail(this.#decision.reason);
     if (lifecycle.ringDigest !== digest) {
+      const isExpectedOverlapReplica = isExpectedLifecycleOverlap(
+        this.config.allowedDigests,
+        digest,
+        lifecycle.ringDigest,
+      );
       if (
         BigInt(ring.revision) !== BigInt(lifecycle.revision) + 1n ||
         BigInt(ring.authorityEpoch) !== BigInt(lifecycle.authorityEpoch) + 1n
       ) {
-        return this.#fail(
-          BigInt(ring.revision) < BigInt(lifecycle.revision) ||
-            BigInt(ring.authorityEpoch) < BigInt(lifecycle.authorityEpoch)
-            ? "lifecycle_revision_regression"
-            : "lifecycle_transition_required",
-        );
+        if (isExpectedOverlapReplica) {
+          // Earlier replicas remain available during the declared D0/D1/D2
+          // overlap, but can never authorize an unconfigured rollback.
+        } else
+          return this.#fail(
+            BigInt(ring.revision) < BigInt(lifecycle.revision) ||
+              BigInt(ring.authorityEpoch) < BigInt(lifecycle.authorityEpoch)
+              ? "lifecycle_revision_regression"
+              : "lifecycle_transition_required",
+          );
       } else {
         const generation = (BigInt(lifecycle.highestStatusGeneration) + 1n).toString(),
           revokedKids = publicRing.keys
@@ -361,18 +385,17 @@ export class RemoteAuthorityRuntime {
             to: publicRing,
             toDigest: digest,
             statusGeneration: generation,
+            status: candidateBody,
             statusBodyDigest: bodyDigest,
             signerKid: signer.kid,
           });
         void _validatedTransition;
         if (!prepared) return this.#fail("lifecycle_transition_conflict");
-        let body = candidateBody,
-          compactJws: string;
-        if (typeof prepared === "string") {
-          compactJws = prepared;
-          const payload = compactJws.split(".")[1];
-          if (!payload) return this.#fail("stored_transition_status_invalid");
-          body = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+        const body = prepared.status,
+          pinnedBodyDigest = createHash("sha256").update(canonicalizeRfc8785(body)).digest("hex");
+        let compactJws: string;
+        if (prepared.compactJws) {
+          compactJws = prepared.compactJws;
           await verifyRemoteAuthorityStatusJws(compactJws, new RingAuthorityVerifier(ring, now), {
             issuer: this.config.issuer,
             deploymentId: this.config.deploymentId,
@@ -384,11 +407,11 @@ export class RemoteAuthorityRuntime {
           });
         } else compactJws = await createRemoteAuthorityStatusJws(body, signer);
         if (
-          (typeof prepared !== "string" &&
+          (!prepared.compactJws &&
             !(await this.options.store.markTransitionStatusSigned({
               transitionId,
               compactJws,
-              statusBodyDigest: bodyDigest,
+              statusBodyDigest: pinnedBodyDigest,
               signerKid: signer.kid,
             }))) ||
           !(await this.options.store.commitLifecycleTransition({

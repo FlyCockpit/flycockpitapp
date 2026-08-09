@@ -82,6 +82,7 @@ model RemoteAuthorityLifecycleTransition {
   toCurrentKid       String
   statusGeneration   Decimal                        @db.Decimal(20, 0)
   statusBodyDigest   String
+  statusBodyJson     String
   statusCompactJws   String?
   signerKid          String
   signingGeneration  Decimal                        @db.Decimal(20, 0)

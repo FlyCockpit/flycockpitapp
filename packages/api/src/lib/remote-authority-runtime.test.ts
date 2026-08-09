@@ -26,6 +26,7 @@ import {
   type AuthorityObservationStore,
   type AuthorityRuntimeStore,
   type FinalizedAuthorityStatus,
+  isExpectedLifecycleOverlap,
   RemoteAuthorityRuntime,
   shouldAbortSupersededTransitions,
 } from "./remote-authority-runtime";
@@ -163,6 +164,18 @@ describe("RemoteAuthorityRuntime outage recovery", () => {
 });
 
 describe("authority overlap, replacement, and public status boundaries", () => {
+  it("allows only earlier replicas in the same declared three-digest lifecycle", () => {
+    const d0 = "0".repeat(64),
+      d1 = "1".repeat(64),
+      d2 = "2".repeat(64);
+    expect(isExpectedLifecycleOverlap([d0, d1, d2], d0, d1)).toBe(true);
+    expect(isExpectedLifecycleOverlap([d0, d1, d2], d1, d2)).toBe(true);
+    expect(isExpectedLifecycleOverlap([d0, d1, d2], d0, d2)).toBe(false);
+    expect(isExpectedLifecycleOverlap([d0], d0, d1)).toBe(false);
+    expect(isExpectedLifecycleOverlap([d0, d1, d2], d2, d1)).toBe(false);
+    expect(isExpectedLifecycleOverlap([d0, d1, d2], "x".repeat(64), d1)).toBe(false);
+  });
+
   it("aborts rollback transitions only after steady-plan lease convergence", () => {
     const digest = "a".repeat(64),
       other = "b".repeat(64),

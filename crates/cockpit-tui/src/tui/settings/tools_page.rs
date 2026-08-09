@@ -17,6 +17,7 @@ use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
 
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};
+use super::shell;
 use super::shell::{
     SettingsControlId, SettingsScrollRegionId, WrappedValueLayout, focused_field_style,
     muted_style, push_text_field_at_cursor, push_wrapped_prefixed_value, selected_line_from_marker,

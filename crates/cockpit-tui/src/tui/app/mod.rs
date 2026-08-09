@@ -339,6 +339,7 @@ pub(crate) struct DeferredFenceDispatch {
     pub submission: cockpit_core::engine::message::UserSubmission,
     pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
     pub waiting_model_selection: Option<uuid::Uuid>,
+    pub parked_fence_sequence: Option<u64>,
 }
 
 pub(crate) struct ModelSelectionRetry {
@@ -3747,6 +3748,7 @@ impl App {
                     self.submission_order.cancel(fence.fence_sequence);
                 }
             }
+            self.dispatch_next_ready_paste_fence();
             if had_unowned {
                 self.show_toast("Paste unavailable", ToastKind::Error);
             }

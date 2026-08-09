@@ -501,14 +501,16 @@ impl App {
             );
             return false;
         };
-        let parked = self
+        let mut parked = self
             .deferred_fence_dispatches
             .iter()
             .filter_map(|(id, deferred)| {
-                (deferred.waiting_model_selection == Some(uuid::Uuid::nil())).then_some(*id)
+                (deferred.waiting_model_selection == Some(uuid::Uuid::nil()))
+                    .then_some((*id, deferred.parked_fence_sequence.unwrap_or(u64::MAX)))
             })
             .collect::<Vec<_>>();
-        for id in parked {
+        parked.sort_by_key(|(_, old_sequence)| *old_sequence);
+        for (id, _) in parked {
             let Ok(fence_sequence) = self
                 .submission_order
                 .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(id))
@@ -520,6 +522,7 @@ impl App {
             }
             if let Some(deferred) = self.deferred_fence_dispatches.get_mut(&id) {
                 deferred.waiting_model_selection = Some(selection_id);
+                deferred.parked_fence_sequence = None;
             }
         }
         let queued_submission = self
@@ -924,8 +927,12 @@ impl App {
                 .collect::<Vec<_>>();
             for id in parked {
                 if let Some(fence) = self.submission_fences.get_mut(&id) {
+                    let old_sequence = fence.fence_sequence;
                     self.submission_order.cancel(fence.fence_sequence);
                     fence.fence_sequence = 0;
+                    if let Some(deferred) = self.deferred_fence_dispatches.get_mut(&id) {
+                        deferred.parked_fence_sequence = Some(old_sequence);
+                    }
                 }
                 if let Some(deferred) = self.deferred_fence_dispatches.get_mut(&id) {
                     deferred.waiting_model_selection = Some(uuid::Uuid::nil());

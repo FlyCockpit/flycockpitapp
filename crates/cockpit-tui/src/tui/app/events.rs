@@ -610,6 +610,7 @@ impl App {
                             submission: queued.submission,
                             tag_expansions: queued.tag_expansions,
                             waiting_model_selection: None,
+                            parked_fence_sequence: None,
                         },
                     );
                 }

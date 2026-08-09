@@ -184,7 +184,7 @@ fn image_requester_subgraph(edges: &BTreeSet<EdgeFixture>) -> BTreeSet<EdgeFixtu
 }
 
 fn deserialize_toml_document(text: &str) -> toml::Value {
-    toml::Value::deserialize(toml::de::Deserializer::new(text)).unwrap()
+    toml::de::from_str::<toml::Value>(text).unwrap()
 }
 
 fn actual_dependency_name<'a>(key: &'a str, declaration: &'a toml::Value) -> &'a str {

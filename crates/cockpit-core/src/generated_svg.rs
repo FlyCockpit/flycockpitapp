@@ -262,9 +262,14 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
             "document",
         ));
     }
-    let mut hush = Vec::with_capacity(canonical.len().min(MAX_CANONICAL_BYTES));
+    // svg-hush 0.9.6 drops every namespaced attribute and documents
+    // `xml:space` as unsupported. Project only its two closed canonical
+    // spellings out of the defense input; the authoritative tree and the
+    // independent final verification still retain and validate them.
+    let defense_input = defense_projection(&canonical)?;
+    let mut hush = Vec::with_capacity(defense_input.len().min(MAX_CANONICAL_BYTES));
     svg_hush::Filter::new()
-        .filter(canonical.as_slice(), &mut hush)
+        .filter(defense_input.as_slice(), &mut hush)
         .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?;
     if hush.len() > MAX_CANONICAL_BYTES {
         return Err(SvgSanitizeError::new(
@@ -272,7 +277,7 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
             "svg-hush",
         ));
     }
-    verify_defense_output(&canonical, &hush)?;
+    verify_defense_output(&defense_input, &hush)?;
     let verified = canonicalize(
         parse_validate(&canonical, true, false)
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?,
@@ -284,6 +289,15 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
         ));
     }
     Ok(SanitizedSvgArtifact(canonical))
+}
+
+fn defense_projection(canonical: &[u8]) -> Result<Vec<u8>> {
+    let canonical = std::str::from_utf8(canonical)
+        .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?;
+    Ok(canonical
+        .replace(" xml:space=\"default\"", "")
+        .replace(" xml:space=\"preserve\"", "")
+        .into_bytes())
 }
 
 fn verify_defense_output(canonical: &[u8], hush: &[u8]) -> Result<()> {
@@ -394,7 +408,8 @@ fn start_node(
     if stack.len() + 1 > MAX_DEPTH {
         return Err(SvgSanitizeError::new(SvgSanitizeCode::Depth, "element"));
     }
-    let raw_name = std::str::from_utf8(e.name().as_ref())
+    let element_name = e.name();
+    let raw_name = std::str::from_utf8(element_name.as_ref())
         .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Namespace, "element"))?;
     if raw_name.contains(':') {
         return Err(SvgSanitizeError::new(SvgSanitizeCode::Namespace, "element"));
@@ -408,13 +423,13 @@ fn start_node(
     } else if stack.is_empty() {
         return Err(SvgSanitizeError::new(SvgSanitizeCode::Xml, "multiple-root"));
     }
-    if let Some(parent) = stack.last() {
-        if !allowed_child(parent.kind, kind) {
-            return Err(SvgSanitizeError::new(
-                SvgSanitizeCode::ParentChild,
-                "element",
-            ));
-        }
+    if let Some(parent) = stack.last()
+        && !allowed_child(parent.kind, kind)
+    {
+        return Err(SvgSanitizeError::new(
+            SvgSanitizeCode::ParentChild,
+            "element",
+        ));
     }
     let mut attrs = BTreeMap::new();
     let mut xmlns = None;
@@ -819,20 +834,20 @@ fn validate_node(
             }
         }
     }
-    if node.kind == ElementKind::RadialGradient {
-        if let (Some(radius), Some(focal)) = (node.attrs.get("r"), node.attrs.get("fr")) {
-            let radius_percent = radius.ends_with('%');
-            if radius_percent != focal.ends_with('%') {
-                return Err(SvgSanitizeError::new(
-                    SvgSanitizeCode::Number,
-                    "radial-unit-class",
-                ));
-            }
-            let r = parse_fixed(radius.strip_suffix('%').unwrap_or(radius))?;
-            let fr = parse_fixed(focal.strip_suffix('%').unwrap_or(focal))?;
-            if fr > r {
-                return Err(SvgSanitizeError::new(SvgSanitizeCode::Number, "radial-fr"));
-            }
+    if node.kind == ElementKind::RadialGradient
+        && let (Some(radius), Some(focal)) = (node.attrs.get("r"), node.attrs.get("fr"))
+    {
+        let radius_percent = radius.ends_with('%');
+        if radius_percent != focal.ends_with('%') {
+            return Err(SvgSanitizeError::new(
+                SvgSanitizeCode::Number,
+                "radial-unit-class",
+            ));
+        }
+        let r = parse_fixed(radius.strip_suffix('%').unwrap_or(radius))?;
+        let fr = parse_fixed(focal.strip_suffix('%').unwrap_or(focal))?;
+        if fr > r {
+            return Err(SvgSanitizeError::new(SvgSanitizeCode::Number, "radial-fr"));
         }
     }
     for child in &mut node.children {
@@ -1326,18 +1341,19 @@ fn color(v: &str, allow_none: bool) -> Result<String> {
     if !named.is_empty() {
         return Ok(named.into());
     }
-    if let Some(h) = v.strip_prefix('#') {
-        if matches!(h.len(), 3 | 4 | 6 | 8) && h.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let lower = h.to_ascii_lowercase();
-            return Ok(if h.len() < 6 {
-                format!(
-                    "#{}",
-                    lower.chars().flat_map(|c| [c, c]).collect::<String>()
-                )
-            } else {
-                format!("#{lower}")
-            });
-        }
+    if let Some(h) = v.strip_prefix('#')
+        && matches!(h.len(), 3 | 4 | 6 | 8)
+        && h.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        let lower = h.to_ascii_lowercase();
+        return Ok(if h.len() < 6 {
+            format!(
+                "#{}",
+                lower.chars().flat_map(|c| [c, c]).collect::<String>()
+            )
+        } else {
+            format!("#{lower}")
+        });
     }
     Err(SvgSanitizeError::new(SvgSanitizeCode::Attribute, "color"))
 }

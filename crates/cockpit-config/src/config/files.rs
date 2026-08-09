@@ -572,7 +572,19 @@ pub(crate) fn read_file_nofollow_with_identity(
         0,
     )?;
     #[cfg(windows)]
-    let file = open_windows_child_nofollow(&parent, &file_name, false, false)?;
+    let file = {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+        open_windows_relative_nofollow(
+            &parent,
+            &file_name,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        )?
+    };
     #[cfg(all(not(unix), not(windows)))]
     let file = std::fs::File::open(path)?;
     let before = file.metadata()?;

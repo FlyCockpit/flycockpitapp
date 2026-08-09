@@ -104,6 +104,21 @@ fn stale_at_suggestion_result_is_discarded() {
 }
 
 #[test]
+fn at_suggestions_distinguish_loading_from_empty() {
+    let source = include_str!("render.rs");
+    assert!(source.contains("loading files…"));
+    assert!(source.contains("no matching files"));
+}
+
+#[test]
+fn export_is_atomic_and_does_not_clobber() {
+    let source = include_str!("export_actions.rs");
+    assert!(source.contains("create_new(true)"));
+    assert!(source.contains("hard_link(&temp, out_path)"));
+    assert!(source.contains("remove_file(&temp)"));
+}
+
+#[test]
 fn owned_async_actions_reject_late_and_double_completion() {
     let source = include_str!("../async_action.rs");
     assert!(source.contains("pending.generation != completed.generation"));

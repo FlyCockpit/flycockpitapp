@@ -95,7 +95,7 @@ pub(super) struct AgentExternalEdit {
     /// matching typed `Saved` completion.
     staging: tempfile::TempPath,
     original_contents: Vec<u8>,
-    original_permissions: std::fs::Permissions,
+    original_metadata: AgentFileMetadata,
     /// Buffer write owned by the injected host effect.
     pub(super) text_before_launch: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
@@ -116,7 +116,67 @@ pub(crate) struct AgentExternalEditEffect {
 struct AgentExternalEditStaging {
     path: tempfile::TempPath,
     original_contents: Vec<u8>,
-    original_permissions: std::fs::Permissions,
+    original_metadata: AgentFileMetadata,
+}
+
+struct AgentFileMetadata {
+    permissions: std::fs::Permissions,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+impl AgentFileMetadata {
+    fn capture(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            permissions: metadata.permissions(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+        }
+    }
+
+    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        self.len == metadata.len()
+            && self.modified == metadata.modified().ok()
+            && self.permissions.readonly() == metadata.permissions().readonly()
+            && {
+                #[cfg(unix)]
+                {
+                    self.device == metadata.dev()
+                        && self.inode == metadata.ino()
+                        && self.mode == metadata.mode()
+                        && self.uid == metadata.uid()
+                        && self.gid == metadata.gid()
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+    }
 }
 
 fn agent_external_edit_staging(
@@ -136,7 +196,17 @@ fn agent_external_edit_staging(
             target.display()
         ));
     }
-    let original_contents = std::fs::read(target)
+    let mut original = std::fs::File::open(target)
+        .map_err(|error| format!("failed to open external-edit target: {error}"))?;
+    let opened_metadata = original
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened external-edit target: {error}"))?;
+    let original_metadata = AgentFileMetadata::capture(&metadata);
+    if !original_metadata.matches(&opened_metadata) {
+        return Err("external-edit target changed while it was being opened".into());
+    }
+    let mut original_contents = Vec::new();
+    std::io::Read::read_to_end(&mut original, &mut original_contents)
         .map_err(|error| format!("failed to read external-edit target: {error}"))?;
     let parent = target
         .parent()
@@ -150,7 +220,7 @@ fn agent_external_edit_staging(
     Ok(AgentExternalEditStaging {
         path,
         original_contents,
-        original_permissions: metadata.permissions(),
+        original_metadata,
     })
 }
 
@@ -317,7 +387,25 @@ impl AgentsPage {
                     if !current_metadata.is_file() {
                         return Err("agent path is no longer a regular file".into());
                     }
-                    let current = std::fs::read(&pending.path)
+                    if !pending.original_metadata.matches(&current_metadata) {
+                        return Err(
+                            "agent file metadata changed during external edit; refusing overwrite"
+                                .into(),
+                        );
+                    }
+                    let mut current_file = std::fs::File::open(&pending.path)
+                        .map_err(|error| format!("failed to re-open agent path: {error}"))?;
+                    let opened_metadata = current_file
+                        .metadata()
+                        .map_err(|error| format!("failed to inspect opened agent path: {error}"))?;
+                    if !pending.original_metadata.matches(&opened_metadata) {
+                        return Err(
+                            "agent file changed while commit was being validated; refusing overwrite"
+                                .into(),
+                        );
+                    }
+                    let mut current = Vec::new();
+                    std::io::Read::read_to_end(&mut current_file, &mut current)
                         .map_err(|error| format!("failed to re-read agent path: {error}"))?;
                     if current != pending.original_contents {
                         return Err(
@@ -326,11 +414,26 @@ impl AgentsPage {
                     }
                     std::fs::set_permissions(
                         pending.staging.as_ref(),
-                        pending.original_permissions.clone(),
+                        pending.original_metadata.permissions.clone(),
                     )
                     .map_err(|error| {
                         format!("failed to preserve agent-file permissions: {error}")
                     })?;
+                    // Keep the pathname check adjacent to the atomic rename. The
+                    // descriptor above binds content validation to the opened
+                    // file; this final no-follow check catches a pathname swap
+                    // during that read or while staging permissions were set.
+                    let final_metadata = std::fs::symlink_metadata(&pending.path)
+                        .map_err(|error| format!("failed final agent-path validation: {error}"))?;
+                    if final_metadata.file_type().is_symlink()
+                        || !final_metadata.is_file()
+                        || !pending.original_metadata.matches(&final_metadata)
+                    {
+                        return Err(
+                            "agent path changed before atomic replacement; refusing overwrite"
+                                .into(),
+                        );
+                    }
                     pending
                         .staging
                         .persist(&pending.path)
@@ -651,7 +754,7 @@ impl SettingsCx {
             agent: expected,
             path,
             original_contents: staging.original_contents,
-            original_permissions: staging.original_permissions,
+            original_metadata: staging.original_metadata,
             staging: staging.path,
             text_before_launch: text,
             draft,
@@ -880,7 +983,7 @@ impl SettingsCx {
                 agent: super::pointer_actions::AgentId(name.clone()),
                 path,
                 original_contents: staging.original_contents,
-                original_permissions: staging.original_permissions,
+                original_metadata: staging.original_metadata,
                 staging: staging.path,
                 text_before_launch: text,
                 draft: None,
@@ -2648,6 +2751,99 @@ pub(super) mod tests {
             );
         }
 
+        let replacement_cases: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
+        for &replacement in replacement_cases {
+            let target = agents_dir.join("pointer-agent.md");
+            fs::write(&target, "---\ndescription: pointer fixture\n---\nXbody\n").unwrap();
+            let mut conflict = agents_dialog(&tmp);
+            focus(&mut conflict, "pointer-agent");
+            conflict.handle_key(press(KeyCode::Enter));
+            conflict.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            conflict
+                .page
+                .handle_pointer_control(&mut conflict.cx, action.clone());
+            conflict
+                .page
+                .handle_pointer_control(&mut conflict.cx, action);
+            let effect = page_mut(&mut conflict)
+                .take_external_edit_request()
+                .expect("regular-file conflict effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            let concurrent = b"---\ndescription: pointer fixture\n---\nYbody\n";
+            if replacement {
+                let replacement_path = agents_dir.join("replacement.md");
+                fs::write(&replacement_path, concurrent).unwrap();
+                fs::rename(replacement_path, &target).unwrap();
+            } else {
+                fs::write(&target, concurrent).unwrap();
+            }
+            conflict.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                concurrent,
+                "{} conflict keeps the concurrent file",
+                if replacement { "identity" } else { "content" }
+            );
+            assert!(page(&conflict).editing.is_some(), "conflict restores draft");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let target = agents_dir.join("pointer-agent.md");
+            let before = fs::read(&target).unwrap();
+            let mut chmod_race = agents_dialog(&tmp);
+            focus(&mut chmod_race, "pointer-agent");
+            chmod_race.handle_key(press(KeyCode::Enter));
+            chmod_race.handle_key(press(KeyCode::Char('e')));
+            let action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
+            );
+            chmod_race
+                .page
+                .handle_pointer_control(&mut chmod_race.cx, action.clone());
+            chmod_race
+                .page
+                .handle_pointer_control(&mut chmod_race.cx, action);
+            let effect = page_mut(&mut chmod_race)
+                .take_external_edit_request()
+                .expect("chmod-race effect");
+            fs::write(&effect.path, "staged replacement").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            chmod_race.finish_agent_external_edit(
+                effect.operation_id,
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+                None,
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                before,
+                "chmod conflict keeps bytes"
+            );
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "commit must not restore stale permissions after a concurrent chmod"
+            );
+            assert!(
+                page(&chmod_race).editing.is_some(),
+                "draft restored on chmod conflict"
+            );
+            assert!(
+                page(&chmod_race)
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("metadata changed"))
+            );
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
@@ -2704,6 +2900,19 @@ pub(super) mod tests {
             .expect("symlink target must be rejected");
         assert!(error.contains("symbolic link"), "{error}");
         assert_eq!(fs::read_to_string(&real).unwrap(), "real");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn external_editor_metadata_detects_readonly_permission_change() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.md");
+        fs::write(&path, "agent").unwrap();
+        let original = AgentFileMetadata::capture(&fs::metadata(&path).unwrap());
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(!permissions.readonly());
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(!original.matches(&fs::metadata(&path).unwrap()));
     }
 
     #[test]

@@ -386,7 +386,7 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
         }) if Some(*default_update_id) == staged
             && provider == "p"
             && model == "stale"
-            && retention == "extended"
+            && *retention == PromptCacheRetention::Extended
     ));
     let reloaded = cockpit_config::providers::ConfigDoc::load(&fresh.config_path)
         .unwrap()

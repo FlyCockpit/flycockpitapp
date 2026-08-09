@@ -924,7 +924,7 @@ fn actual_dependency_name<'a>(key: &'a str, declaration: &'a toml::Value) -> &'a
         .unwrap_or(key)
 }
 
-fn image_declarations<'a>(manifest: &'a toml::Value) -> Vec<(&'a str, &'a toml::Value)> {
+fn image_declarations(manifest: &toml::Value) -> Vec<(&str, &toml::Value)> {
     let mut declarations = Vec::new();
     let root = manifest.as_table().unwrap();
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {

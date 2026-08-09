@@ -1590,4 +1590,32 @@ mod tests {
         assert_eq!(app.composer.text(), "main");
         assert_eq!(pane.composer.text(), "s");
     }
+
+    #[tokio::test]
+    async fn end_ack_then_create_failure_closes_dead_pane() {
+        let mut app = App::new(None, false);
+        app.open_btw_pane_from_info(info(false), false);
+        app.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Blocking("btw.teardown"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async {
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::BtwTransition {
+                        created: None,
+                        ended: true,
+                        question: None,
+                        error: Some("create failed".to_string()),
+                    },
+                )
+            },
+        );
+        tokio::task::yield_now().await;
+        app.drain_async_actions();
+
+        assert!(app.btw_pane.is_none());
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Plain { line }) if line.contains("create failed")
+        ));
+    }
 }

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(private_interfaces)]
 //! `/settings` dialog state machine + rendering.
 //!
 //! Lifecycle:

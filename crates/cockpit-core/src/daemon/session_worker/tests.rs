@@ -9,8 +9,8 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-#[test]
-fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() {
+#[tokio::test]
+async fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() {
     let selection = cockpit_config::providers::ActiveModelRef {
         provider: "provider-a".to_string(),
         model: "model-a".to_string(),
@@ -31,9 +31,29 @@ fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() {
     assert!(!model_expectation_matches(Some(&changed), 7, &selection));
     assert!(!model_expectation_matches(None, 7, &selection));
 
-    // Once accepted, the queue's idempotent receipt wins over a later model
-    // generation; the actor checks `already_accepted` before this predicate.
-    assert!(model_expectation_matches(Some(&current), 7, &selection));
+    let (updates, _updates_rx) = watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    let id = Uuid::new_v4();
+    let submission = crate::engine::message::UserSubmission::text("captured payload");
+    let receipt = crate::engine::message::ClientSubmissionReceipt {
+        id,
+        fingerprint: submission.client_fingerprint(),
+        wire_fingerprint: "wire-v1".to_string(),
+        origin_principal: None,
+    };
+    queue
+        .push_idempotent(
+            receipt,
+            submission,
+            crate::engine::message::QueueTarget::root("Build"),
+        )
+        .await;
+    assert!(queue.has_accepted(id).await);
+    assert!(!model_expectation_matches(Some(&changed), 7, &selection));
+    assert!(
+        queue.has_accepted(id).await || model_expectation_matches(Some(&changed), 7, &selection),
+        "lost-ack replay bypasses the fresh-insert model fence"
+    );
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {

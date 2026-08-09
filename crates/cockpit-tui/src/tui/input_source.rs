@@ -331,46 +331,45 @@ mod tests {
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn terminal_input_observation_time_is_source_time() {
+    #[tokio::test]
+    async fn terminal_input_observation_time_is_source_time() {
         let mut input = TerminalInput::new_for_test();
         let first = input.generation();
         input.suspend();
         input.resume();
         assert!(input.generation() > first);
 
-        let ticks = Arc::new(AtomicUsize::new(4));
+        let ticks = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&ticks);
-        let input = TerminalInput::new_for_test_with_clock(Arc::new(move || {
-            Duration::from_millis(observed.fetch_add(1, Ordering::SeqCst) as u64)
-        }));
-        assert_eq!((input.clock)(), Duration::from_millis(4));
-        assert_eq!((input.clock)(), Duration::from_millis(5));
-
-        let mut classifier = crate::tui::structured_paste::TerminalPasteClassifier::default();
-        for (index, ch) in "12345678".chars().enumerate() {
-            classifier.observe(
-                Event::Key(crossterm::event::KeyEvent::new(
+        let mut input = TerminalInput::new_for_test_events(
+            Arc::new(move || Duration::from_millis(observed.fetch_add(5, Ordering::SeqCst) as u64)),
+            "12345678".chars().map(|ch| {
+                Ok(Event::Key(crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::Char(ch),
                     crossterm::event::KeyModifiers::NONE,
-                )),
-                Duration::from_millis(index as u64 * 5),
-            );
+                )))
+            }),
+        );
+        let mut classifier = crate::tui::structured_paste::TerminalPasteClassifier::default();
+        for _ in 0..8 {
+            let observed = input.next().await.expect("test event");
+            classifier.observe(observed.event.unwrap(), observed.observed_at);
         }
-        // Arbitrary reducer delay cannot rewrite the already observed gaps.
         assert!(matches!(
             classifier.flush_idle(Duration::from_millis(47)),
             crate::tui::structured_paste::ClassifierDecision::Paste { .. }
         ));
 
-        let mut shortcut = crate::tui::structured_paste::TerminalPasteClassifier::default();
-        shortcut.observe(
-            Event::Key(crossterm::event::KeyEvent::new(
+        let mut shortcut_input = TerminalInput::new_for_test_events(
+            Arc::new(|| Duration::from_millis(1_000)),
+            [Ok(Event::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('v'),
                 crossterm::event::KeyModifiers::CONTROL,
-            )),
-            Duration::from_millis(1_000),
+            )))],
         );
+        let observed = shortcut_input.next().await.expect("shortcut event");
+        let mut shortcut = crate::tui::structured_paste::TerminalPasteClassifier::default();
+        shortcut.observe(observed.event.unwrap(), observed.observed_at);
         assert!(matches!(
             shortcut.flush_due(Duration::from_millis(1_249)),
             crate::tui::structured_paste::ClassifierDecision::Pending

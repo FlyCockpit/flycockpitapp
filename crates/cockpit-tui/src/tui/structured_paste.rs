@@ -773,13 +773,6 @@ mod tests {
 
     #[test]
     fn paste_authoritative_source_contract() {
-        let sources = [
-            PasteSource::BracketedPty,
-            PasteSource::NativePaste,
-            PasteSource::RapidPty,
-        ];
-        assert_eq!(sources.len(), 3);
-        assert_ne!(PasteSource::BracketedPty, PasteSource::RapidPty);
         let mut classifier = TerminalPasteClassifier::default();
         assert!(matches!(
             classifier.observe(Event::Paste("browser text".into()), Duration::ZERO),
@@ -799,15 +792,18 @@ mod tests {
                 ..
             }
         ));
-        let source_tag = |source| match source {
-            PasteSource::BracketedPty => "bracketed_pty",
-            PasteSource::NativePaste => "native_paste",
-            PasteSource::RapidPty => "rapid_pty",
+        let native = PasteRequest {
+            paste_generation: 1,
+            paste_correlation_id: Uuid::new_v4(),
+            source: PasteSource::NativePaste,
+            host: HostIdentity {
+                client_instance_id: Uuid::new_v4(),
+                connection_epoch: 1,
+                session_id: Uuid::new_v4(),
+                terminal_generation: 1,
+            },
         };
-        assert_eq!(
-            sources.map(source_tag),
-            ["bracketed_pty", "native_paste", "rapid_pty"]
-        );
+        assert_eq!(native.source, PasteSource::NativePaste);
     }
 
     #[test]

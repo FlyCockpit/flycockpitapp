@@ -2644,6 +2644,26 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
+        // A model switch is itself the earlier ordered intent. Attach this
+        // fence to that transaction rather than treating it as a generic
+        // deferred fence: the terminal model result completes the switch,
+        // installs the exact queued payload below, and then releases this
+        // already-ordered fence.
+        if let Some(pending) = self.pending_model_selection.as_mut() {
+            let status = format!(
+                "Switching to {}/{}; message will send when ready.",
+                pending.requested.provider, pending.requested.model
+            );
+            pending.queued_submission = Some(super::QueuedModelSubmission {
+                client_submission_id,
+                composer_text: self.composer.text().to_string(),
+                display: submitted,
+                submission,
+                tag_expansions,
+            });
+            self.push_plain(status);
+            return false;
+        }
         let order_front = self.submission_order.front();
         let stages_behind_session_switch = self.has_pending_session_switch_action()
             && matches!(
@@ -2678,22 +2698,6 @@ impl App {
             self.dispatch_next_ready_paste_fence();
             return false;
         }
-        if let Some(pending) = self.pending_model_selection.as_mut() {
-            let status = format!(
-                "Switching to {}/{}; message will send when ready.",
-                pending.requested.provider, pending.requested.model
-            );
-            pending.queued_submission = Some(super::QueuedModelSubmission {
-                client_submission_id,
-                composer_text: self.composer.text().to_string(),
-                display: submitted,
-                submission,
-                tag_expansions,
-            });
-            self.push_plain(status);
-            return false;
-        }
-
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
         // it locally so the user sees what's pending; cleared when the

@@ -426,6 +426,135 @@ impl CanonicalFcorValueV1 for cockpit_db::wire::ResolveResponse {
     }
 }
 
+canonical_unit_enum16!(crate::MissedRunPolicy, {
+    Skip = 1,
+    RunOnceOnStart = 2,
+});
+
+impl CanonicalFcorValueV1 for crate::ScheduledJobSchedule {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Cron { expr } => {
+                nested.push_u16(1);
+                expr.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Every { seconds } => {
+                nested.push_u16(2);
+                seconds.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Once { at } => {
+                nested.push_u16(3);
+                at.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Idle {
+                min_idle_seconds,
+                max_age_seconds,
+            } => {
+                nested.push_u16(4);
+                min_idle_seconds.encode_fcor_value_v1(&mut nested)?;
+                max_age_seconds.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::ScheduledJobPayload {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::RunPrompt {
+                assistant,
+                prompt,
+                project_root: _,
+            } => {
+                nested.push_u16(1);
+                assistant.encode_fcor_value_v1(&mut nested)?;
+                prompt.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Callback { subsystem } => {
+                nested.push_u16(2);
+                subsystem.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::ScheduledJobCreate {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        // `id` is the ordered SchedulerId resource.
+        self.owner.encode_fcor_value_v1(&mut nested)?;
+        self.schedule.encode_fcor_value_v1(&mut nested)?;
+        self.payload.encode_fcor_value_v1(&mut nested)?;
+        self.enabled.encode_fcor_value_v1(&mut nested)?;
+        self.missed_run_policy.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::CuratorAction {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Status => nested.push_u16(1),
+            Self::Run {
+                dry_run,
+                consolidate,
+            } => {
+                nested.push_u16(2);
+                dry_run.encode_fcor_value_v1(&mut nested)?;
+                consolidate.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Pin { name } => {
+                nested.push_u16(3);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Unpin { name } => {
+                nested.push_u16(4);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Restore { name } => {
+                nested.push_u16(5);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Rollback { list, id } => {
+                nested.push_u16(6);
+                list.encode_fcor_value_v1(&mut nested)?;
+                id.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+canonical_struct!(crate::AccountInfo, self, out, [user_id, email]);
+canonical_struct!(
+    crate::RelayChoice,
+    self,
+    out,
+    [relay_id, region, ws_url, rtt_ms, chosen_at]
+);
+canonical_struct!(
+    crate::StoredFlycockpitCredential,
+    self,
+    out,
+    [
+        server_url,
+        instance_id,
+        instance_token,
+        account,
+        display_name,
+        relay_choice
+    ]
+);
+
 impl CanonicalParamsV1 {
     pub fn new() -> Self {
         Self::default()

@@ -70,6 +70,15 @@
     "kind": "err",
     "v": 8
   },
+  "model_generation_stale_paired": {
+    "error": {
+      "code": "model_generation_stale",
+      "message": "captured model generation is no longer active"
+    },
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "err",
+    "v": 6
+  },
   "protocol_version_paired": {
     "error": {
       "code": "protocol_version",

@@ -2832,6 +2832,12 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 ErrorCode::InvalidResponseMetricsTokenizer,
                 "configuration value is invalid",
             ),
+            (
+                "model_generation_stale_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::ModelGenerationStale,
+                "captured model generation is no longer active",
+            ),
         ] {
             generated.insert(
                 name.to_string(),

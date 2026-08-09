@@ -1645,6 +1645,10 @@ pub struct App {
     /// retry the RPC rather than silently entering the session.
     pub(super) startup_disclosures_ready: bool,
     pub(super) startup_disclosures_generation: u64,
+    /// True only after this attach epoch receives authoritative model state
+    /// from the daemon. Config-derived display defaults must never fence a
+    /// submission.
+    pub(super) active_model_state_confirmed: bool,
     /// Complete daemon-confirmed session selection. Quick edits modify this
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
@@ -3143,6 +3147,7 @@ impl App {
             // daemon fake; gate-focused tests explicitly set this false.
             startup_disclosures_ready: cfg!(test),
             startup_disclosures_generation: 0,
+            active_model_state_confirmed: false,
             active_model_selection,
             composer,
             vim_setting,

@@ -584,7 +584,7 @@ pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     /// First row occupied by parser-rendered Markdown message content. `None`
     /// for non-message entries and when Markdown rendering is disabled.
-    pub copy_body_start: Option<RenderedCopy>,
+    pub(crate) copy_body_start: Option<RenderedCopy>,
     /// Index of the row within `lines` that is the clickable "thinking"
     /// chip. `None` for entries without one (everything except a
     /// `HistoryEntry::Agent` with non-empty reasoning).
@@ -611,12 +611,12 @@ pub struct Rendered {
 }
 
 #[derive(Clone)]
-pub struct RenderedCopy {
-    pub start: usize,
-    pub cells: Vec<Vec<Option<u32>>>,
-    pub newlines_before: Vec<usize>,
-    pub incomplete: Vec<bool>,
-    pub fragments: std::rc::Rc<Vec<markdown::CopyFragment>>,
+pub(crate) struct RenderedCopy {
+    pub(crate) start: usize,
+    pub(crate) cells: Vec<Vec<Option<u32>>>,
+    pub(crate) newlines_before: Vec<usize>,
+    pub(crate) incomplete: Vec<bool>,
+    pub(crate) fragments: std::rc::Rc<Vec<markdown::CopyFragment>>,
 }
 
 impl RenderedCopy {

@@ -28,9 +28,8 @@ use crate::tui::composer::{
 };
 use crate::tui::geometry::{INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneGeometry};
 use crate::tui::history::{
-    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, TIMESTAMP_RIGHT_MARGIN, TIMESTAMP_WIDTH,
-    ToolCallState, agent_display_label, format_status_elapsed, render_entry,
-    render_pending_incremental, thinking_dots_padded,
+    AGENT_INDENT, HistoryEntry, PendingRender, Rendered, ToolCallState, agent_display_label,
+    format_status_elapsed, render_entry, render_pending_incremental, thinking_dots_padded,
 };
 use crate::tui::theme::{
     BUSY_BORDER, CHIP_TEXT, DIVIDER_DIM, DIVIDER_FOCUSED, ERROR_TEXT, IDLE_BORDER, INFO_TEXT,

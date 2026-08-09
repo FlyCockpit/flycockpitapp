@@ -543,8 +543,8 @@ fn assert_user_border_fg(lines: &[Line<'static>], expected: Color) {
 #[test]
 fn failed_user_bubble_recolors_border_without_adding_chip_or_rows() {
     let ts = fixed_ts();
-    let (normal, _, _) = render_user("hello", ts, 60, false, None, false, None);
-    let (failed, _, _) = render_user("hello", ts, 60, false, None, true, None);
+    let (normal, _, _, _) = render_user("hello", ts, 60, false, None, false, None);
+    let (failed, _, _, _) = render_user("hello", ts, 60, false, None, true, None);
 
     assert_eq!(failed.len(), normal.len());
     assert_eq!(
@@ -594,8 +594,8 @@ fn user_top_border_draws_fork_left_of_pin_and_drops_fork_first() {
 #[test]
 fn failed_user_markdown_recolors_left_bar_without_adding_chip_or_rows() {
     let ts = fixed_ts();
-    let (normal, _, _) = render_user("**hello**", ts, 60, true, None, false, None);
-    let (failed, _, _) = render_user("**hello**", ts, 60, true, None, true, None);
+    let (normal, _, _, _) = render_user("**hello**", ts, 60, true, None, false, None);
+    let (failed, _, _, _) = render_user("**hello**", ts, 60, true, None, true, None);
 
     assert_eq!(failed.len(), normal.len());
     assert_eq!(

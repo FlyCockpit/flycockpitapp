@@ -2796,7 +2796,6 @@ fn format_upload_bytes(bytes: usize) -> String {
 #[derive(Debug, Default)]
 struct UploadAccounting {
     pending: HashMap<Uuid, usize>,
-    consumed_message_attachments: HashMap<Uuid, ConsumedMessageAttachment>,
 }
 
 impl UploadAccounting {
@@ -2839,15 +2838,6 @@ struct ReadyAttachment {
     mime: String,
     bytes: Vec<u8>,
     purpose: proto::AttachmentPurpose,
-    created_at: Instant,
-}
-
-#[derive(Debug)]
-struct ConsumedMessageAttachment {
-    client_submission_id: Uuid,
-    origin_principal: Option<String>,
-    consumed_at: Instant,
-    attachment: ReadyAttachment,
 }
 
 struct AttachedSession {

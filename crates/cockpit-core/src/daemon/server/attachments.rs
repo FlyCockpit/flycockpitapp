@@ -23,24 +23,10 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> Prune
         .filter_map(|upload| upload.media_reservation)
         .collect();
     release_uploads(&state.upload_accounting, expired);
-    let expired_ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| {
-            (now.duration_since(attachment.created_at) > ttl).then_some(*id)
-        })
-        .collect();
-    let destroyed: Vec<_> = expired_ready
-        .into_iter()
-        .filter_map(|id| state.ready_attachments.remove(&id))
-        .filter_map(|attachment| attachment.media_reservation)
-        .collect();
-    // This cache is not authoritative ownership: the session actor already
-    // received an image clone. Cache TTL must not release that actor-owned
-    // durable reservation.
-    crate::sync::lock_or_recover(&state.upload_accounting)
-        .consumed_message_attachments
-        .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
+    // Published attachments are not pending uploads and never inherit the
+    // legacy 600-second transport TTL. Durable draft/session retention owns
+    // their cleanup after publication.
+    let destroyed = Vec::new();
     PrunedMediaReservations {
         cancelled,
         destroyed,
@@ -530,7 +516,6 @@ pub(super) async fn finish_attachment_upload(
                     mime: upload.mime,
                     bytes,
                     purpose: upload.purpose,
-                    created_at: Instant::now(),
                 },
             );
             Ok(Response::AttachmentUploaded { image_ref })
@@ -729,7 +714,6 @@ pub(super) async fn finish_attachment_upload_admitted(
                     mime: upload.mime,
                     bytes,
                     purpose: upload.purpose,
-                    created_at: Instant::now(),
                 },
             );
             abandon.reservation_id = None;
@@ -759,65 +743,14 @@ pub(super) fn consume_image_refs(
     session_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    if refs.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
-        return Err(bad_request(format!(
-            "too many images: {} exceeds {} image limit",
-            refs.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
-        )));
-    }
-    let mut seen = HashSet::new();
-    for image_ref in refs {
-        if !seen.insert(image_ref.id) {
-            return Err(bad_request("duplicate image ref in user message"));
-        }
-    }
-    let mut total = 0usize;
-    for image_ref in refs {
-        let Some(attachment) = state.ready_attachments.get(&image_ref.id) else {
-            return Err(bad_request(
-                "unknown, expired, or already consumed image ref",
-            ));
-        };
-        if attachment.session_id != session_id {
-            return Err(bad_request("image ref belongs to a different session"));
-        }
-        if attachment.mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
-            return Err(bad_request("image ref has unsupported MIME"));
-        }
-        if attachment.purpose != proto::AttachmentPurpose::UserMessageImage {
-            return Err(bad_request("image ref has unsupported purpose"));
-        }
-        total += attachment.bytes.len();
-        if total > proto::MAX_TOTAL_IMAGE_BYTES {
-            return Err(bad_request(format!(
-                "total image data is too large: {} bytes exceeds {} byte limit",
-                total,
-                proto::MAX_TOTAL_IMAGE_BYTES
-            )));
-        }
-    }
-    let images = refs
-        .iter()
-        .map(|image_ref| {
-            state
-                .ready_attachments
-                .remove(&image_ref.id)
-                .expect("image ref was validated before removal")
-                .bytes
-        })
-        .collect();
-    Ok(images)
+    claim_message_image_refs(state, session_id, Uuid::nil(), refs)
 }
 
-/// Atomically bind a message's single-use image refs to its client UUID and
-/// return their bytes.
+/// Acquire reusable immutable attachment bytes for one submission.
 ///
-/// Moving ready refs into the consumed map before the first await prevents a
-/// competing UUID from racing worker acceptance or reusing a ref after an
-/// ambiguous/lost worker response. The bytes remain TTL-scoped and resolvable
-/// only by this exact UUID, so the worker can still perform its authoritative
-/// durable/in-memory fingerprint check on every retry.
+/// Attachment ownership remains with the session. Submission UUID
+/// idempotency belongs to the worker receipt, while the durable media layer
+/// records a distinct reference per committed consumer.
 pub(super) fn claim_message_image_refs(
     state: &mut MutableClientState,
     session_id: Uuid,
@@ -826,46 +759,16 @@ pub(super) fn claim_message_image_refs(
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
     validate_image_ref_shape(refs)?;
 
-    let origin_principal = state.principal.tag();
-    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
     let mut total = 0usize;
     let mut images = Vec::with_capacity(refs.len());
     for image_ref in refs {
-        let attachment = if let Some(attachment) = state.ready_attachments.get(&image_ref.id) {
-            attachment
-        } else if let Some(consumed) = accounting.consumed_message_attachments.get(&image_ref.id) {
-            if consumed.client_submission_id != client_submission_id
-                || consumed.origin_principal != origin_principal
-            {
-                return Err(bad_request(
-                    "unknown, expired, or already consumed image ref",
-                ));
-            }
-            &consumed.attachment
-        } else {
-            return Err(bad_request(
-                "unknown, expired, or already consumed image ref",
-            ));
+        let Some(attachment) = state.ready_attachments.get(&image_ref.id) else {
+            return Err(bad_request("media attachment unavailable"));
         };
         validate_message_attachment(attachment, session_id, &mut total)?;
         images.push(attachment.bytes.clone());
     }
-
-    // Validation above is all-or-nothing. Move only after every ref and the
-    // aggregate size have passed, with no await between validation and bind.
-    for image_ref in refs {
-        if let Some(attachment) = state.ready_attachments.remove(&image_ref.id) {
-            accounting.consumed_message_attachments.insert(
-                image_ref.id,
-                ConsumedMessageAttachment {
-                    client_submission_id,
-                    origin_principal: origin_principal.clone(),
-                    consumed_at: Instant::now(),
-                    attachment,
-                },
-            );
-        }
-    }
+    let _ = client_submission_id;
     Ok(images)
 }
 
@@ -878,13 +781,12 @@ pub(super) async fn claim_message_image_refs_admitted(
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
     let images = claim_message_image_refs(state, session_id, client_submission_id, refs)?;
     let reservation_ids = {
-        let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
         refs.iter()
             .filter_map(|image_ref| {
-                accounting
-                    .consumed_message_attachments
+                state
+                    .ready_attachments
                     .get(&image_ref.id)
-                    .and_then(|consumed| consumed.attachment.media_reservation.as_ref())
+                    .and_then(|attachment| attachment.media_reservation.as_ref())
                     .map(|receipt| receipt.reservation_id.clone())
             })
             .collect::<Vec<_>>()
@@ -912,33 +814,14 @@ pub(super) async fn claim_message_image_refs_admitted(
     Ok(images)
 }
 
-/// Roll back only this submission's freshly claimed refs when the session
-/// actor proves the model fence stale before queue insertion.
+/// Reusable attachments do not transfer ownership during acquisition, so a
+/// rejected submission has no in-memory attachment mutation to roll back.
 pub(super) fn release_message_image_refs(
     state: &mut MutableClientState,
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) {
-    let origin_principal = state.principal.tag();
-    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
-    for image_ref in refs {
-        let matches = accounting
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .is_some_and(|consumed| {
-                consumed.client_submission_id == client_submission_id
-                    && consumed.origin_principal == origin_principal
-            });
-        if matches
-            && let Some(consumed) = accounting
-                .consumed_message_attachments
-                .remove(&image_ref.id)
-        {
-            state
-                .ready_attachments
-                .insert(image_ref.id, consumed.attachment);
-        }
-    }
+    let _ = (state, client_submission_id, refs);
 }
 
 fn validate_image_ref_shape(

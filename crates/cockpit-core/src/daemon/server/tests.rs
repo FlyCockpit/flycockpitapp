@@ -11160,14 +11160,7 @@ async fn image_submission_exact_retry_case() {
         panic!("expected queued first submission");
     };
     assert_eq!(first.id, client_submission_id);
-    assert!(!state.ready_attachments.contains_key(&image_ref.id));
-    assert_eq!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .map(|consumed| consumed.client_submission_id),
-        Some(client_submission_id)
-    );
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -11185,41 +11178,6 @@ async fn image_submission_exact_retry_case() {
     })
     .await
     .expect("the accepted submission becomes durable");
-    // Simulate either consumed-cache TTL expiry or a daemon process restart.
-    // The exact wire fingerprint is durable, so the retry must be acknowledged
-    // before dispatch needs the now-unavailable attachment bytes.
-    crate::sync::lock_or_recover(&state.upload_accounting)
-        .consumed_message_attachments
-        .clear();
-
-    // Drop the entire per-client attachment state, then reconnect. Neither the
-    // old client nor the daemon replay cache has the bytes now; the durable
-    // wire receipt alone must acknowledge the exact request.
-    drop(state);
-    let mut state = MutableClientState::detached_with_principal(
-        ctx.upload_accounting.clone(),
-        ClientPrincipal::owner(),
-        ctx.terminal_host.clone(),
-    );
-    handle_request(
-        Request::Attach {
-            session_id: Some(session_id),
-            since_seq: None,
-            project_root: Some(project.path().to_string_lossy().into_owned()),
-            initial_model: None,
-            no_sandbox: true,
-            interactive: true,
-            model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
-            env_snapshot: None,
-            env_policy: EnvDriftPolicy::Daemon,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("reconnect to live worker");
-
     let retry = handle_request(
         request(client_submission_id, "inspect this image"),
         &mut state,
@@ -11259,7 +11217,7 @@ async fn image_submission_exact_retry_case() {
     .await
     .expect("same bytes under a fresh ref dedupe by content");
     assert!(matches!(reuploaded, Response::UserMessageQueued { .. }));
-    assert!(!state.ready_attachments.contains_key(&reuploaded_ref.id));
+    assert!(state.ready_attachments.contains_key(&reuploaded_ref.id));
 
     let conflict = handle_request(
         request(client_submission_id, "different payload"),
@@ -11271,15 +11229,14 @@ async fn image_submission_exact_retry_case() {
     assert_eq!(conflict.code, ErrorCode::BadRequest);
     assert!(conflict.message.contains("different payload"));
 
-    let consumed = handle_request(
+    let reused = handle_request(
         request(Uuid::new_v4(), "inspect this image"),
         &mut state,
         &ctx,
     )
     .await
-    .expect_err("a consumed ref must not be reusable by a new submission");
-    assert_eq!(consumed.code, ErrorCode::BadRequest);
-    assert!(consumed.message.contains("already consumed"));
+    .expect("one immutable attachment version is reusable by another submission");
+    assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
     let user_messages = ctx
         .db
@@ -11289,7 +11246,7 @@ async fn image_submission_exact_retry_case() {
         .into_iter()
         .filter(|event| event.kind == "user_message")
         .count();
-    assert_eq!(user_messages, 1, "exact retry must not duplicate inference");
+    assert_eq!(user_messages, 2, "exact retry must not duplicate inference");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11335,20 +11292,13 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
 
-    // Dropping the worker response after delivery creates a genuinely
-    // ambiguous outcome: dispatch cannot know whether the worker accepted and
-    // durably recorded the request. The image ref must remain bound.
+    // Dropping the worker response makes only this submission outcome
+    // ambiguous. It never grants exclusive ownership of immutable media.
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
     let error = result.expect_err("lost worker response is ambiguous");
     assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .map(|consumed| consumed.client_submission_id),
-        Some(first_id)
-    );
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 
     let competing_ctx = ctx.clone();
     let competing_request = request(Uuid::new_v4());
@@ -11366,17 +11316,31 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     respond_to
         .send(Ok(UserMessageProbeResult::Unknown))
         .unwrap();
+    let SessionWork::UserMessage {
+        submission,
+        respond_to,
+    } = work_rx
+        .recv()
+        .await
+        .expect("competing request reaches worker")
+    else {
+        panic!("expected competing UserMessage work");
+    };
+    assert_eq!(submission.images, vec![sample_png()]);
+    let competing_id = submission.client_submissions[0].id;
+    let item = proto::QueueItem {
+        id: competing_id,
+        status: proto::QueueItemStatus::Folding,
+        text: submission.text.clone(),
+        display_text: submission.display_text.clone(),
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (mut state, competing) = competing.await.unwrap();
-    let competing =
-        competing.expect_err("competing UUID must not reuse an ambiguously delivered ref");
-    assert_eq!(competing.code, ErrorCode::BadRequest);
-    assert!(competing.message.contains("already consumed"));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), work_rx.recv())
-            .await
-            .is_err(),
-        "competing UUID must be rejected before worker delivery"
-    );
+    assert!(matches!(
+        competing.unwrap(),
+        Response::UserMessageQueued { .. }
+    ));
 
     let retry_ctx = ctx.clone();
     let retry_request = request(first_id);
@@ -11420,37 +11384,38 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
 }
 
 #[tokio::test]
-async fn attachment_upload_consumes_image_refs_exactly_once() {
+async fn attachment_upload_reuses_one_version_for_distinct_committed_references() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
-    let images = consume_image_refs(&mut state, session_id, std::slice::from_ref(&image_ref))
-        .expect("first consume");
-    assert_eq!(images, vec![png]);
-
-    let err = consume_image_refs(&mut state, session_id, &[image_ref])
-        .expect_err("second consume must fail");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("already consumed"));
+    let first = claim_message_image_refs(
+        &mut state,
+        session_id,
+        Uuid::new_v4(),
+        std::slice::from_ref(&image_ref),
+    )
+    .expect("first reference");
+    let second = claim_message_image_refs(
+        &mut state,
+        session_id,
+        Uuid::new_v4(),
+        std::slice::from_ref(&image_ref),
+    )
+    .expect("second distinct reference");
+    assert_eq!(first, vec![png.clone()]);
+    assert_eq!(second, vec![png]);
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 }
 
 #[tokio::test]
-async fn consumed_image_ref_ttl_starts_when_submission_claims_it() {
+async fn acquiring_image_ref_does_not_start_or_refresh_transport_ttl() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
-    let ttl = std::time::Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
-    state
-        .ready_attachments
-        .get_mut(&image_ref.id)
-        .expect("ready attachment")
-        .created_at = Instant::now() - ttl + std::time::Duration::from_millis(1);
-
-    let claimed_at = Instant::now();
     let client_submission_id = Uuid::new_v4();
     let images = claim_message_image_refs(
         &mut state,
@@ -11460,21 +11425,10 @@ async fn consumed_image_ref_ttl_starts_when_submission_claims_it() {
     )
     .expect("near-expiry ready ref is claimable");
     assert_eq!(images, vec![sample_png()]);
-    assert!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .expect("claimed attachment retained")
-            .consumed_at
-            >= claimed_at
-    );
-
     prune_expired_attachments(&mut state);
     assert!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .contains_key(&image_ref.id),
-        "claim refreshes replay TTL even when the upload itself was nearly expired"
+        state.ready_attachments.contains_key(&image_ref.id),
+        "published attachments do not use the pending-upload transport TTL"
     );
 }
 

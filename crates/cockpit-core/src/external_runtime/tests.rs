@@ -17,6 +17,76 @@ fn ctx(platform: HostPlatform) -> EvaluationContext {
 }
 
 #[test]
+fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
+    fn snapshot(ffmpeg: Option<&str>, ffprobe: Option<&str>) -> ExternalRuntimeSnapshot {
+        let mut executor = RecordingProbeExecutor::new();
+        if ffmpeg.is_some() {
+            executor = executor.with_resolve("ffmpeg", "/tools/ffmpeg");
+        }
+        if ffprobe.is_some() {
+            executor = executor.with_resolve("ffprobe", "/tools/ffprobe");
+        }
+        let ffmpeg = ffmpeg.map(str::to_owned);
+        let ffprobe = ffprobe.map(str::to_owned);
+        executor.set_handler(move |program, _| {
+            let value = if program.ends_with("ffmpeg") {
+                ffmpeg.as_deref().unwrap_or("")
+            } else {
+                ffprobe.as_deref().unwrap_or("")
+            };
+            ProbeCommandResult {
+                exit_code: Some(0),
+                stdout: format!("{value}\n").into_bytes(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                spawn_error: None,
+            }
+        });
+        let descriptors: Vec<_> = catalog_adapter_descriptors()
+            .into_iter()
+            .filter(|item| matches!(item.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE))
+            .collect();
+        refresh_snapshot(
+            1,
+            &descriptors,
+            &executor,
+            None,
+            Path::new("."),
+            &ctx(HostPlatform::GenericLinux).with_features(["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        )
+    }
+
+    let available = snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 7.0"));
+    assert!(media_runtime_pair_is_compatible(&available));
+    assert_eq!(
+        select_media_runtime_pair(&available),
+        Ok((Path::new("/tools/ffmpeg"), Path::new("/tools/ffprobe")))
+    );
+    assert!(matches!(
+        available.get(ID_MEDIA_FFMPEG).unwrap().state,
+        HealthState::Available { .. }
+    ));
+
+    for unhealthy in [
+        snapshot(Some("ffmpeg version 7.1"), None),
+        snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1")),
+        snapshot(Some("version unknown"), Some("version unknown")),
+    ] {
+        assert!(!media_runtime_pair_is_compatible(&unhealthy));
+        assert!(select_media_runtime_pair(&unhealthy).is_err());
+        assert!(unhealthy.entries.values().any(|entry| {
+            matches!(
+                entry.state,
+                HealthState::Missing | HealthState::Incompatible { .. }
+            )
+        }));
+    }
+}
+
+#[test]
 fn dependency_headless_schema_and_shared_reason_are_stable() {
     let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
         .owner("test", "selected")

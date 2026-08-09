@@ -29,6 +29,7 @@ jobs:
       # Matches the workspace-scoped gate in cli-ci.yml. Every Cargo step runs
       # from the monorepo root and reuses flycockpitapp/target via CARGO_TARGET_DIR.
       - run: cargo fmt --all --check
+      - run: python3 apps/cli/scripts/generate-runtime-docs.py --check
       - run: cargo clippy --workspace --tests --locked -- -D warnings
       - run: cargo clippy --locked --workspace --examples -- -D warnings
       - uses: taiki-e/install-action@314b6e93a9b2f40a64f401a23fed55603083dc69 # nextest

@@ -17,8 +17,8 @@ use super::health::{ExternalRuntimeSnapshot, HealthEntry, HealthState};
 use super::platform::{common_platform_remedy, configured_command_remedy, package_remedy_table};
 use super::registry::{ExternalRuntimeRegistry, RegistryError};
 use super::schema::{
-    Applicability, DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId,
-    HostPlatform, ProbePolicy, RemedyKind, VersionParser,
+    Applicability, CompatibilityRule, DependencyImportance, ExternalRuntimeDescriptor,
+    ExternalRuntimeId, HostPlatform, ProbePolicy, RemedyKind, VersionParser,
 };
 use crate::capabilities::ExecutionTarget;
 
@@ -48,6 +48,10 @@ pub const ID_ACCEL_FD: &str = "accel.fd";
 pub const ID_ACCEL_GSED: &str = "accel.gsed";
 /// Host `jq` only for features the built-in Cockpit jq applet cannot serve.
 pub const ID_JQ_EXTERNAL: &str = "jq.external";
+/// FFmpeg decoder used for selected audio and video attachments.
+pub const ID_MEDIA_FFMPEG: &str = "media.ffmpeg";
+/// FFprobe metadata reader paired with FFmpeg.
+pub const ID_MEDIA_FFPROBE: &str = "media.ffprobe";
 
 /// Closed exact roster of known trusted-catalog integration adapters.
 ///
@@ -67,12 +71,65 @@ pub fn known_catalog_adapter_ids() -> &'static [&'static str] {
         ID_ACCEL_FD,
         ID_ACCEL_GSED,
         ID_JQ_EXTERNAL,
+        ID_MEDIA_FFMPEG,
+        ID_MEDIA_FFPROBE,
     ]
 }
 
 /// Known harness preset names that receive trusted-catalog recipes.
 pub fn known_harness_preset_names() -> &'static [&'static str] {
     &["claude", "codex", "gemini", "opencode"]
+}
+
+/// Fail-closed compatibility gate for selected audio/video media.
+///
+/// FFmpeg and FFprobe must both be available and report the same release major.
+/// Missing or unparsable version evidence is not treated as compatible.
+pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> bool {
+    fn major(entry: Option<&HealthEntry>) -> Option<u64> {
+        let HealthState::Available {
+            version_evidence: Some(version),
+            ..
+        } = &entry?.state
+        else {
+            return None;
+        };
+        version
+            .split(|character: char| !character.is_ascii_digit())
+            .find(|part| !part.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    match (
+        major(snapshot.get(ID_MEDIA_FFMPEG)),
+        major(snapshot.get(ID_MEDIA_FFPROBE)),
+    ) {
+        (Some(ffmpeg), Some(ffprobe)) => ffmpeg == ffprobe,
+        _ => false,
+    }
+}
+
+/// Select the resolved executable paths used by the media inspection/decoding
+/// path.
+///
+/// Callers must obtain the pair through this gate immediately before spawning
+/// either process. Returning paths independently would permit an incompatible
+/// FFmpeg/FFprobe pair to escape the health rule.
+pub fn select_media_runtime_pair(
+    snapshot: &ExternalRuntimeSnapshot,
+) -> Result<(&Path, &Path), &'static str> {
+    if !media_runtime_pair_is_compatible(snapshot) {
+        return Err("media inspection requires a healthy compatible FFmpeg/FFprobe pair");
+    }
+    let resolved = |id| match &snapshot.get(id)?.state {
+        HealthState::Available { resolved_path, .. } => resolved_path.as_deref(),
+        _ => None,
+    };
+    match (resolved(ID_MEDIA_FFMPEG), resolved(ID_MEDIA_FFPROBE)) {
+        (Some(ffmpeg), Some(ffprobe)) => Ok((ffmpeg, ffprobe)),
+        _ => Err("media inspection requires resolved FFmpeg and FFprobe paths"),
+    }
 }
 
 // ── ID builders for configured commands ─────────────────────────────────────
@@ -96,6 +153,20 @@ pub fn stdio_mcp_id(server_name: &str) -> ExternalRuntimeId {
 
 fn version_first_line_policy() -> ProbePolicy {
     ProbePolicy::trusted_catalog(["--version"], VersionParser::FirstSemverToken, None)
+}
+
+fn media_version_policy() -> ProbePolicy {
+    // Keep this contract identical to apps/worker/src/lib/media-runtime.ts:
+    // FFmpeg's supported version flag is singular, and health requires the
+    // tool-shaped release-major prefix rather than an arbitrary semver token.
+    ProbePolicy::trusted_catalog(
+        ["-version"],
+        VersionParser::RegexCapture {
+            pattern: r"(?i)\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)".into(),
+            group: 1,
+        },
+        None,
+    )
 }
 
 fn catalog_owner(feature: &str) -> (String, String) {
@@ -175,6 +246,29 @@ fn trusted_descriptor(
     remedy_binary: &str,
     remedy_prose: &str,
 ) -> ExternalRuntimeDescriptor {
+    trusted_descriptor_with_policy(
+        id,
+        feature,
+        candidates,
+        importance,
+        applicability,
+        remedy_binary,
+        remedy_prose,
+        version_first_line_policy(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trusted_descriptor_with_policy(
+    id: &str,
+    feature: &str,
+    candidates: &[&str],
+    importance: DependencyImportance,
+    applicability: Applicability,
+    remedy_binary: &str,
+    remedy_prose: &str,
+    probe_policy: ProbePolicy,
+) -> ExternalRuntimeDescriptor {
     let (owner, feat) = catalog_owner(feature);
     ExternalRuntimeDescriptor::builder(id)
         .owner(owner, feat)
@@ -182,7 +276,7 @@ fn trusted_descriptor(
         .applicability(applicability)
         .importance(importance)
         .target(ExecutionTarget::Host)
-        .probe_policy(version_first_line_policy())
+        .probe_policy(probe_policy)
         .remedy(integration_remedy(remedy_binary, remedy_prose))
         .build()
         .expect("catalog descriptor is well-formed")
@@ -301,6 +395,32 @@ pub fn catalog_adapter_descriptors() -> Vec<ExternalRuntimeDescriptor> {
             "jq",
             "Install host jq only when a feature cannot use Cockpit's bundled `cockpit jq` applet.",
         ),
+        trusted_descriptor_with_policy(
+            ID_MEDIA_FFMPEG,
+            "media.decode",
+            &["ffmpeg"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffmpeg",
+            "Install FFmpeg from https://ffmpeg.org/download.html and verify it with `ffmpeg -version`. Cockpit never downloads or bundles it.",
+            media_version_policy(),
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
+        trusted_descriptor_with_policy(
+            ID_MEDIA_FFPROBE,
+            "media.decode",
+            &["ffprobe"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffprobe",
+            "Install FFprobe with FFmpeg from https://ffmpeg.org/download.html and verify it with `ffprobe -version`. Cockpit never downloads or bundles it.",
+            media_version_policy(),
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
     ]
 }
 
@@ -1233,6 +1353,81 @@ mod tests {
     }
 
     #[test]
+    fn media_probe_contract_matches_worker_argv_status_and_release_major() {
+        let descriptors: Vec<_> = catalog_adapter_descriptors()
+            .into_iter()
+            .filter(|desc| matches!(desc.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE))
+            .collect();
+        for desc in &descriptors {
+            let policy = desc.probe_policy.as_trusted_catalog().unwrap();
+            assert_eq!(policy.version_argv(), &["-version".to_string()]);
+        }
+
+        let executor = RecordingProbeExecutor::new()
+            .with_resolve("ffmpeg", "/tools/ffmpeg")
+            .with_resolve("ffprobe", "/tools/ffprobe");
+        executor.set_handler(|program, args| {
+            assert_eq!(args, &["-version".to_string()]);
+            let tool = program.file_name().unwrap().to_string_lossy();
+            crate::external_runtime::ProbeCommandResult {
+                exit_code: Some(0),
+                stdout: format!("{tool} version 7.1 Copyright FFmpeg\n").into_bytes(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                spawn_error: None,
+            }
+        });
+        let snapshot = refresh_snapshot(
+            1,
+            &descriptors,
+            &executor,
+            None,
+            Path::new("/"),
+            &ctx_features(HostPlatform::GenericLinux, &["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        );
+        assert!(media_runtime_pair_is_compatible(&snapshot));
+        assert!(descriptors.iter().all(|desc| matches!(
+            snapshot.get(desc.id.as_str()).map(|entry| &entry.state),
+            Some(HealthState::Available { version_evidence: Some(major), .. }) if major == "7"
+        )));
+
+        let failed_executor = RecordingProbeExecutor::new().with_resolve("ffmpeg", "/tools/ffmpeg");
+        failed_executor.set_handler(|_, _| crate::external_runtime::ProbeCommandResult {
+            exit_code: Some(8),
+            stdout: b"ffmpeg version 7.1\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            cancelled: false,
+            spawn_error: None,
+        });
+        let failed = evaluate_descriptor(
+            descriptors
+                .iter()
+                .find(|desc| desc.id.as_str() == ID_MEDIA_FFMPEG)
+                .unwrap(),
+            &failed_executor,
+            None,
+            Path::new("/"),
+            &ctx_features(HostPlatform::GenericLinux, &["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        );
+        assert!(matches!(
+            failed.state,
+            HealthState::Failed { cause: HealthCause::NonZeroExit { code: Some(8) } }
+        ));
+
+        let worker_contract = include_str!("../../../../apps/worker/src/lib/media-runtime.ts");
+        assert!(worker_contract.contains(r#"execFileAsync(program, ["-version"]"#));
+        assert!(worker_contract.contains(
+            r#"/\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)/i"#
+        ));
+    }
+
+    #[test]
     fn external_dependency_adapter_inventory() {
         let expected: BTreeSet<&str> = known_catalog_adapter_ids().iter().copied().collect();
         let descriptors = catalog_adapter_descriptors();
@@ -1796,7 +1991,12 @@ mod tests {
         for desc in &descriptors {
             let policy = desc.probe_policy.as_trusted_catalog().unwrap();
             // Only version probes (no functional side-effect probes today).
-            assert_eq!(policy.version_argv(), &["--version".to_string()]);
+            let expected = if matches!(desc.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE) {
+                "-version"
+            } else {
+                "--version"
+            };
+            assert_eq!(policy.version_argv(), &[expected.to_string()]);
             assert!(policy.functional_argv().is_none());
             discovery_probe_argv_is_safe(policy.version_argv()).unwrap();
         }

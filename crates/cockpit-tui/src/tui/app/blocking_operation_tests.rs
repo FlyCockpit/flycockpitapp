@@ -1,3 +1,4 @@
+use super::blocking_operations::BlockingOperationKind;
 use super::*;
 
 struct BarrierRelease(Option<std::sync::Arc<blocking_operations::OwnedTestGate>>);
@@ -26,7 +27,7 @@ fn activate_composer(app: &mut App) {
 
 #[test]
 fn blocking_operation_manifest_is_complete() {
-    use super::blocking_operations::{BLOCKING_OPERATION_MANIFEST, BlockingOperationKind};
+    use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
 
     let app = App::new(None, false);
     for registration in BLOCKING_OPERATION_MANIFEST {
@@ -61,18 +62,23 @@ fn blocking_operation_manifest_is_complete() {
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
         }
-        let calls = analyze_handler_source(
+        validate_handler_source(
             registration.source,
             registration.handler,
             registration.wrapper,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
-        assert_eq!(
-            calls, 1,
-            "{:?} must call its typed wrapper once",
-            registration.site
-        );
     }
+}
+
+fn validate_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<(), String> {
+    let calls = analyze_handler_source(source, handler, wrapper)?;
+    if calls != 1 {
+        return Err(format!(
+            "`{handler}` must call `{wrapper}` exactly once, found {calls}"
+        ));
+    }
+    Ok(())
 }
 
 fn analyze_handler_source(source: &str, handler: &str, wrapper: &str) -> Result<usize, String> {
@@ -152,20 +158,18 @@ fn inspect_handler_calls(
 
 #[test]
 fn handler_source_gate_rejects_bypasses() {
-    assert!(analyze_handler_source("fn h() {}", "h", "dispatch").is_ok_and(|n| n == 0));
+    assert!(validate_handler_source("fn h() {}", "h", "dispatch").is_err());
     assert!(
-        analyze_handler_source(
+        validate_handler_source(
             "fn h(){ self.dispatch(); self.dispatch(); }",
             "h",
             "dispatch"
         )
-        .is_ok_and(|n| n == 2)
+        .is_err()
     );
+    assert!(validate_handler_source("fn h(){ self.wrong(); }", "h", "dispatch").is_err());
     assert!(
-        analyze_handler_source("fn h(){ self.wrong(); }", "h", "dispatch").is_ok_and(|n| n == 0)
-    );
-    assert!(
-        analyze_handler_source(
+        validate_handler_source(
             "fn h(){ self.dispatch(); std::fs::read(\"x\"); }",
             "h",
             "dispatch"

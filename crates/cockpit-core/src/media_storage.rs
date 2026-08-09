@@ -1057,6 +1057,151 @@ fn probe_upload_container(
     Ok((container, mime))
 }
 
+struct NormalizedImageDerivatives {
+    model_png: Vec<u8>,
+    thumbnail_png: Vec<u8>,
+    width: u32,
+    height: u32,
+    thumbnail_width: u32,
+    thumbnail_height: u32,
+}
+
+fn normalize_png_image(bytes: &[u8]) -> Result<NormalizedImageDerivatives> {
+    use image::{
+        DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, ImageReader, Limits,
+    };
+    reject_png_color_metadata(bytes)?;
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Png);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(8_192);
+    limits.max_image_height = Some(8_192);
+    limits.max_alloc = Some(160_000_000);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().context("invalid_media")?;
+    let (width, height) = decoder.dimensions();
+    ensure!(
+        width > 0 && height > 0 && width <= 8_192 && height <= 8_192,
+        "resource_limit"
+    );
+    ensure!(
+        u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_some_and(|p| p <= 40_000_000),
+        "resource_limit"
+    );
+    let mut rgba = DynamicImage::from_decoder(decoder)
+        .context("decode_failed")?
+        .into_rgba8();
+    for pixel in rgba.pixels_mut() {
+        if pixel[3] == 0 {
+            *pixel = image::Rgba([0, 0, 0, 0]);
+        }
+    }
+    let model_png = encode_canonical_png(&rgba)?;
+    let max_edge = u64::from(width.max(height));
+    let (thumbnail_width, thumbnail_height) = if max_edge <= 256 {
+        (width, height)
+    } else {
+        (
+            u32::try_from((u64::from(width) * 256 / max_edge).max(1))?,
+            u32::try_from((u64::from(height) * 256 / max_edge).max(1))?,
+        )
+    };
+    let thumbnail = image::imageops::resize(
+        &rgba,
+        thumbnail_width,
+        thumbnail_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let thumbnail_png = encode_canonical_png(&thumbnail)?;
+    ensure!(thumbnail_png.len() <= 512 * 1024, "resource_limit");
+    Ok(NormalizedImageDerivatives {
+        model_png,
+        thumbnail_png,
+        width,
+        height,
+        thumbnail_width,
+        thumbnail_height,
+    })
+}
+
+fn encode_canonical_png(image: &image::RgbaImage) -> Result<Vec<u8>> {
+    use image::ImageEncoder as _;
+    let mut encoded = Vec::new();
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut encoded,
+        image::codecs::png::CompressionType::Level(6),
+        image::codecs::png::FilterType::Paeth,
+    )
+    .write_image(
+        image,
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )?;
+    insert_png_srgb(encoded)
+}
+
+fn reject_png_color_metadata(bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "invalid_media");
+    let mut offset = 8usize;
+    let mut srgb = 0usize;
+    while offset.checked_add(12).is_some_and(|end| end <= bytes.len()) {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+        let end = offset
+            .checked_add(12)
+            .and_then(|v| v.checked_add(length))
+            .context("invalid_media")?;
+        ensure!(end <= bytes.len(), "invalid_media");
+        let kind = &bytes[offset + 4..offset + 8];
+        ensure!(
+            kind != b"iCCP" && kind != b"cICP" && kind != b"gAMA" && kind != b"cHRM",
+            "unsupported_color_profile"
+        );
+        if kind == b"sRGB" {
+            srgb += 1;
+            ensure!(
+                length == 1 && bytes[offset + 8] == 0 && srgb == 1,
+                "unsupported_color_profile"
+            );
+        }
+        offset = end;
+        if kind == b"IEND" {
+            ensure!(offset == bytes.len(), "invalid_media");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("invalid_media")
+}
+
+fn insert_png_srgb(encoded: Vec<u8>) -> Result<Vec<u8>> {
+    ensure!(
+        encoded.len() >= 33 && &encoded[12..16] == b"IHDR",
+        "normalization_failed"
+    );
+    let mut chunk = Vec::with_capacity(13);
+    chunk.extend_from_slice(&1u32.to_be_bytes());
+    chunk.extend_from_slice(b"sRGB");
+    chunk.push(0);
+    chunk.extend_from_slice(&png_crc32(b"sRGB\0").to_be_bytes());
+    let mut out = Vec::with_capacity(encoded.len() + chunk.len());
+    out.extend_from_slice(&encoded[..33]);
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&encoded[33..]);
+    Ok(out)
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
 fn modified_ns(metadata: &std::fs::Metadata) -> Result<u128> {
     Ok(metadata
         .modified()?
@@ -1489,6 +1634,39 @@ mod tests {
         let mut caller_claim = tempfile::tempfile().unwrap();
         caller_claim.write_all(b"photo.png").unwrap();
         assert!(probe_upload_container(&mut caller_claim, MediaKind::Image).is_err());
+    }
+
+    #[test]
+    fn png_normalization_is_deterministic_bounded_and_metadata_minimal() {
+        let source = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 90, 80, 70, 0]).unwrap();
+        let mut input = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut input, image::ImageFormat::Png)
+            .unwrap();
+        let first = normalize_png_image(input.get_ref()).unwrap();
+        let second = normalize_png_image(input.get_ref()).unwrap();
+        assert_eq!(first.model_png, second.model_png);
+        assert_eq!((first.width, first.height), (2, 1));
+        assert_eq!((first.thumbnail_width, first.thumbnail_height), (2, 1));
+        assert_eq!(first.thumbnail_png, first.model_png);
+        let chunks = png_chunk_names(&first.model_png);
+        assert_eq!(chunks, vec![*b"IHDR", *b"sRGB", *b"IDAT", *b"IEND"]);
+        let decoded =
+            image::load_from_memory_with_format(&first.model_png, image::ImageFormat::Png)
+                .unwrap()
+                .into_rgba8();
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 0, 0, 0]);
+    }
+
+    fn png_chunk_names(bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut names = Vec::new();
+        let mut offset = 8usize;
+        while offset + 12 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            names.push(bytes[offset + 4..offset + 8].try_into().unwrap());
+            offset += 12 + length;
+        }
+        names
     }
 
     #[tokio::test]

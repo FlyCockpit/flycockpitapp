@@ -3,732 +3,854 @@
   "rows": [
     {
       "tag": "attach",
+      "fcorSchema": "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy",
       "class": "idempotent_adapter_mutation",
       "strategy": "domain_transaction",
       "evidence": "domain_result_tuple"
     },
     {
       "tag": "subagent_transcript",
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "send_user_message",
+      "fcorSchema": "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "get_run_invocation_status",
+      "fcorSchema": "client_submission_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "cancel_run_invocation",
+      "fcorSchema": "client_submission_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "steer_delegation",
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|message:String",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "begin_attachment_upload",
+      "fcorSchema": "mime:String|byte_len:usize|sha256:String|purpose:AttachmentPurpose",
       "class": "idempotent_adapter_mutation",
       "strategy": "domain_transaction",
       "evidence": "domain_result_tuple"
     },
     {
       "tag": "upload_attachment_chunk",
+      "fcorSchema": "upload_id:Uuid|offset:usize|data_base64:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "domain_transaction",
       "evidence": "domain_result_tuple"
     },
     {
       "tag": "finish_attachment_upload",
+      "fcorSchema": "upload_id:Uuid",
       "class": "idempotent_adapter_mutation",
       "strategy": "domain_transaction",
       "evidence": "domain_result_tuple"
     },
     {
       "tag": "cancel_attachment_upload",
+      "fcorSchema": "upload_id:Uuid",
       "class": "idempotent_adapter_mutation",
       "strategy": "domain_transaction",
       "evidence": "domain_result_tuple"
     },
     {
       "tag": "remove_queued_user_message",
+      "fcorSchema": "queue_item_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "remove_newest_queued_user_message",
+      "fcorSchema": "target_id:Option<String>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "remove_editable_queued_user_messages",
+      "fcorSchema": "target_id:Option<String>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "resume_paused_work",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "cancel_paused_work",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "repair_resume",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "goal_status",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "create_goal",
+      "fcorSchema": "session_id:Uuid|objective:String|token_budget:Option<i64>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "set_goal_status",
+      "fcorSchema": "session_id:Uuid|status:GoalDisposition",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "clear_goal",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "pin_message",
+      "fcorSchema": "session_id:Uuid|seq:i64",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "unpin_message",
+      "fcorSchema": "session_id:Uuid|seq:i64",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "toggle_pinned_message",
+      "fcorSchema": "session_id:Uuid|seq:i64",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "count_pinned_messages",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "list_pinned_message_seqs",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "list_pinned_messages_with_text",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "pinned_message_state",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "list_sealed_values",
+      "fcorSchema": "session_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "delete_sealed_value",
+      "fcorSchema": "session_id:Uuid|value_id:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "list_project_notes",
+      "fcorSchema": "project_root:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "create_project_note",
+      "fcorSchema": "project_root:String|name:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "set_project_note_content",
+      "fcorSchema": "project_root:String|id:Uuid|content:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "rename_project_note",
+      "fcorSchema": "project_root:String|id:Uuid|name:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "delete_project_note",
+      "fcorSchema": "project_root:String|id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "set_workspace_trust",
+      "fcorSchema": "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "get_startup_disclosures",
+      "fcorSchema": "project_root:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "get_app_flag",
+      "fcorSchema": "key:AppFlagKey",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "mark_app_flag_seen",
+      "fcorSchema": "key:AppFlagKey|expected_version:u64",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "resolve_assistant_session",
+      "fcorSchema": "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "list_assistants",
+      "fcorSchema": "-",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "upsert_assistant",
+      "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "create_assistant_session",
+      "fcorSchema": "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "auto_title",
+      "fcorSchema": "session_id:Uuid",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "export_session_data",
+      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "import_session_archive",
+      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "write_bulk_transfer_chunk",
+      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "read_bulk_transfer_chunk",
+      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "curator",
+      "fcorSchema": "project_root:String|action:CuratorAction",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "cancel_turn",
+      "fcorSchema": "-",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "fs_list",
+      "fcorSchema": "project_root:String|path:String|show_hidden:bool",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "fs_stat",
+      "fcorSchema": "project_root:String|path:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "fs_read",
+      "fcorSchema": "project_root:String|path:String|base64:bool",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "fs_write",
+      "fcorSchema": "project_root:String|path:String|content:String|base_hash:Option<String>",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "fs_create_dir",
+      "fcorSchema": "project_root:String|path:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "fs_rename",
+      "fcorSchema": "project_root:String|from_path:String|to_path:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "fs_delete",
+      "fcorSchema": "project_root:String|path:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "git_status",
+      "fcorSchema": "project_root:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "git_diff_file",
+      "fcorSchema": "project_root:String|path:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "open_terminal",
+      "fcorSchema": "cwd:Option<String>|cols:u16|rows:u16",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "attach_terminal",
+      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "terminal_input",
+      "fcorSchema": "terminal_id:Uuid|bytes:Vec<u8>",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "terminal_resize",
+      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "close_terminal",
+      "fcorSchema": "terminal_id:Uuid",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "lsp_control",
+      "fcorSchema": "project_root:String|server_id:String|action:LspControlAction",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "resolve_interrupt",
+      "fcorSchema": "interrupt_id:Uuid|response:ResolveResponse",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "list_sessions",
+      "fcorSchema": "project_id:Option<String>|parent_session_id:Option<Uuid>",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "read_session_messages",
+      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "read_client_submission_receipt",
+      "fcorSchema": "session_id:Uuid|client_submission_id:Uuid",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "read_history_page",
+      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "read_subagent_history_page",
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "session_live_status",
+      "fcorSchema": "session_ids:Vec<Uuid>",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "archive_session",
+      "fcorSchema": "session_id:Uuid|cascade:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "unarchive_session",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "fork_session",
+      "fcorSchema": "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "discard_session",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "btw_create",
+      "fcorSchema": "parent_session_id:Uuid|tangent:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "btw_end",
+      "fcorSchema": "parent_session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "rename_session",
+      "fcorSchema": "session_id:Uuid|title:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "share_session",
+      "fcorSchema": "session_id:Uuid|shared:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "record_session_note",
+      "fcorSchema": "session_id:Uuid|text:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "delete_session",
+      "fcorSchema": "session_id:Uuid",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "get_inventory_bundle",
+      "fcorSchema": "project_root:String|session_id:Uuid|selected_agent:String",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "resource_snapshot",
+      "fcorSchema": "-",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "promote_resource",
+      "fcorSchema": "request_id:String|session_id:Option<Uuid>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "create_scheduled_job",
+      "fcorSchema": "job:ScheduledJobCreate",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "list_scheduled_jobs",
+      "fcorSchema": "owner:Option<String>",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "delete_scheduled_job",
+      "fcorSchema": "id:String",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "set_scheduled_job_enabled",
+      "fcorSchema": "id:String|enabled:bool",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "run_scheduled_job",
+      "fcorSchema": "id:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "set_model_favorite",
+      "fcorSchema": "provider:String|model:String|favorite:bool",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "set_default_model",
+      "fcorSchema": "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "set_active_model",
+      "fcorSchema": "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_agent",
+      "fcorSchema": "name:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_llm_mode",
+      "fcorSchema": "mode:Option<LlmMode>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_session_llm_mode",
+      "fcorSchema": "mode:LlmMode",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_tool_surface_override",
+      "fcorSchema": "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_goal_settings_override",
+      "fcorSchema": "override_json:Option<String>|persist_session:bool",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_approval_mode",
+      "fcorSchema": "mode:ApprovalMode",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_delegation_recursion",
+      "fcorSchema": "enabled:bool|default_depth:u32",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_sandbox",
+      "fcorSchema": "mode:Option<SandboxMode>|container_network_enabled:Option<bool>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_sandbox_escalation",
+      "fcorSchema": "enabled:bool",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_preflight",
+      "fcorSchema": "enabled:Option<bool>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_longcache",
+      "fcorSchema": "enabled:Option<bool>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_redaction",
+      "fcorSchema": "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_tandem_models",
+      "fcorSchema": "models:Vec<(String, String)>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "set_caffeinate",
+      "fcorSchema": "mode:CaffeinateMode",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "cancel_schedule",
+      "fcorSchema": "job_id:String",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation"
     },
     {
       "tag": "prune",
+      "fcorSchema": "-",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "compact",
+      "fcorSchema": "-",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "pin",
+      "fcorSchema": "text:String",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "store_flycockpit_credential",
+      "fcorSchema": "credential:StoredFlycockpitCredential",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "clear_flycockpit_credential",
+      "fcorSchema": "-",
       "class": "idempotent_adapter_mutation",
       "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers"
     },
     {
       "tag": "daemon_status",
+      "fcorSchema": "-",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "refresh_env",
+      "fcorSchema": "vars:HashMap<String, String>",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "refresh_config",
+      "fcorSchema": "-",
       "class": "idempotent_adapter_mutation",
       "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest"
     },
     {
       "tag": "record_usage",
+      "fcorSchema": "kind:UsageKind|key:String|project_id:Option<String>",
       "class": "transactional_mutation",
       "strategy": "sql_transaction",
       "evidence": null
     },
     {
       "tag": "get_usage_counts",
+      "fcorSchema": "project_id:Option<String>",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "stats_rollup",
+      "fcorSchema": "project_id:Option<String>|range:StatsRange|by_role:bool",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "guidance_estimate",
+      "fcorSchema": "project_root:String|provider:Option<String>|model:Option<String>",
       "class": "read_only",
       "strategy": "none",
       "evidence": null
     },
     {
       "tag": "stop_daemon",
+      "fcorSchema": "grace_secs:Option<u64>",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "restart_if_idle",
+      "fcorSchema": "-",
       "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
       "evidence": null
     },
     {
       "tag": "unknown",
+      "fcorSchema": "-",
       "class": "rejected",
       "strategy": "rejected_before_dispatch",
       "evidence": null

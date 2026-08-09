@@ -584,7 +584,21 @@ impl SettingsPage for DefaultModelPage {
         }
     }
 
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: shell::SettingsControlId,
+    ) -> Nav {
+        match control.0 {
+            0 => self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            1 if self.effective_default.is_some() => {
+                self.handle_key(cx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         // Both values are resolved when the page opens: each is a layered
         // resolution and must not run per frame.
         let default = self.effective_default.as_ref();
@@ -606,10 +620,10 @@ impl SettingsPage for DefaultModelPage {
         }
         lines.push(Line::from(format!("Scope: {scope}")));
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            "Enter: choose the default model for new sessions",
-        ));
-        lines.push(Line::from("x: clear the default for this scope"));
+        let choose_line = lines.len();
+        lines.push(Line::from("[Choose default model]"));
+        let clear_line = lines.len();
+        lines.push(Line::from("[Clear default for this scope]"));
         lines.push(Line::from("Applies to newly created sessions only."));
         lines.push(Line::from(
             "Reopening an existing session keeps its own saved model.",
@@ -620,6 +634,22 @@ impl SettingsPage for DefaultModelPage {
         }
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, area);
+        for (line, id, enabled, reason) in [
+            (choose_line, 0, true, None),
+            (
+                clear_line,
+                1,
+                self.effective_default.is_some(),
+                Some("no effective default is set"),
+            ),
+        ] {
+            cx.pointer_surface.register(shell::SettingsPointerTarget {
+                rect: Rect::new(area.x, area.y.saturating_add(line as u16), area.width, 1),
+                action: shell::SettingsPointerAction::Page(shell::SettingsControlId(id)),
+                enabled,
+                disabled_reason: if enabled { None } else { reason },
+            });
+        }
     }
 
     fn title(&self, _cx: &SettingsCx) -> String {

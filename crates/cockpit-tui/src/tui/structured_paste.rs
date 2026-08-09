@@ -491,9 +491,12 @@ impl PasteCorrelationCache {
             id,
             CorrelationEntry {
                 host,
-                // Claims are never expired out from under their owner. The
-                // two-second producer-retry window starts at positive commit.
-                expires_at: None,
+                // Every retry-capable producer stops at the two-second
+                // horizon. Expiring an abandoned claim at that boundary
+                // prevents cancellation paths from consuming capacity for
+                // the remainder of the process; commit refreshes the same
+                // horizon for positive acknowledgement replay.
+                expires_at: Some(now + CORRELATION_TTL),
                 committed: false,
             },
         );
@@ -814,6 +817,14 @@ mod tests {
         assert_eq!(
             full.claim(Uuid::new_v4(), host, Duration::ZERO),
             DedupResult::Busy
+        );
+        assert_eq!(
+            full.claim(Uuid::new_v4(), host, Duration::from_millis(1_999)),
+            DedupResult::Busy
+        );
+        assert_eq!(
+            full.claim(Uuid::new_v4(), host, Duration::from_millis(2_000)),
+            DedupResult::Claimed
         );
         let mut changed = host;
         changed.connection_epoch += 1;

@@ -657,15 +657,17 @@ CREATE TABLE client_submission_terminal_receipts (
 -- actor identity is deliberately absent for the local-owner tuple.
 CREATE TABLE message_operation_receipts (
     session_id             TEXT NOT NULL,
-    operation_id           BLOB NOT NULL CHECK (length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
     actor_kind             TEXT NOT NULL CHECK (actor_kind IN ('local_owner', 'remote_device')),
     actor_id               BLOB,
-    actor_generation       INTEGER NOT NULL,
-    request_hash           BLOB NOT NULL CHECK (length(request_hash) = 32),
-    message_request_digest BLOB NOT NULL CHECK (length(message_request_digest) = 32),
-    client_submission_id   BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    -- Canonical unsigned big-endian u64: zeroblob(8) for local owner and a
+    -- nonzero value for a remote-device generation.
+    actor_generation       BLOB NOT NULL CHECK (typeof(actor_generation) = 'blob' AND length(actor_generation) = 8),
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    message_request_digest BLOB NOT NULL CHECK (typeof(message_request_digest) = 'blob' AND length(message_request_digest) = 32),
+    client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
     state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
-    safe_outcome           BLOB NOT NULL,
+    safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
     outbox_sequence        INTEGER NOT NULL CHECK (outbox_sequence >= 0),
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL,
@@ -673,23 +675,23 @@ CREATE TABLE message_operation_receipts (
     UNIQUE (session_id, client_submission_id),
     UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
     CHECK (
-      (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = 0) OR
-      (actor_kind = 'remote_device' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation > 0)
+      (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = zeroblob(8)) OR
+      (actor_kind = 'remote_device' AND typeof(actor_id) = 'blob' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation <> zeroblob(8))
     ),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE message_submission_receipts (
     session_id             TEXT NOT NULL,
-    client_submission_id   BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
-    operation_id           BLOB NOT NULL CHECK (length(operation_id) = 16 AND operation_id <> zeroblob(16)),
-    message_request_digest BLOB NOT NULL CHECK (length(message_request_digest) = 32),
-    attachment_set_digest  BLOB NOT NULL CHECK (length(attachment_set_digest) = 32),
+    client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    message_request_digest BLOB NOT NULL CHECK (typeof(message_request_digest) = 'blob' AND length(message_request_digest) = 32),
+    attachment_set_digest  BLOB NOT NULL CHECK (typeof(attachment_set_digest) = 'blob' AND length(attachment_set_digest) = 32),
     state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
-    queue_item_id          BLOB NOT NULL CHECK (length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    queue_item_id          BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
     message_seq            INTEGER CHECK (message_seq IS NULL OR message_seq > 0),
     fold_ordinal           INTEGER CHECK (fold_ordinal IS NULL OR fold_ordinal >= 0),
-    safe_outcome           BLOB NOT NULL,
+    safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
@@ -705,13 +707,13 @@ CREATE TABLE message_submission_receipts (
 
 CREATE TABLE message_attachment_references (
     session_id           TEXT NOT NULL,
-    client_submission_id BLOB NOT NULL CHECK (length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
     ordinal              INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 16),
-    attachment_id        BLOB NOT NULL CHECK (length(attachment_id) = 16 AND attachment_id <> zeroblob(16)),
+    attachment_id        BLOB NOT NULL CHECK (typeof(attachment_id) = 'blob' AND length(attachment_id) = 16 AND attachment_id <> zeroblob(16)),
     -- Canonical unsigned big-endian u64. SQLite INTEGER cannot represent the
     -- upper half of the wire domain without lossy signed coercion.
-    attachment_version   BLOB NOT NULL CHECK (length(attachment_version) = 8 AND attachment_version <> zeroblob(8)),
-    checksum             BLOB NOT NULL CHECK (length(checksum) = 32),
+    attachment_version   BLOB NOT NULL CHECK (typeof(attachment_version) = 'blob' AND length(attachment_version) = 8 AND attachment_version <> zeroblob(8)),
+    checksum             BLOB NOT NULL CHECK (typeof(checksum) = 'blob' AND length(checksum) = 32),
     kind                 INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
     acquired_at          INTEGER NOT NULL,
     released_at          INTEGER,

@@ -87,6 +87,15 @@ pub fn has_message_text(text: &str) -> bool {
     })
 }
 
+/// Checks the outer allocation bound before a decoder allocates any field.
+pub fn validate_fcm2_length(length: usize) -> Result<()> {
+    ensure!(
+        length <= MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+        "FCM2 exceeds maximum size"
+    );
+    Ok(())
+}
+
 fn validate_text(value: &str, name: &str) -> Result<()> {
     ensure!(
         value.len() <= MAX_MESSAGE_TEXT_BYTES,
@@ -202,10 +211,7 @@ impl CanonicalSendUserMessageV2 {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        ensure!(
-            bytes.len() <= MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
-            "FCM2 exceeds maximum size"
-        );
+        validate_fcm2_length(bytes.len())?;
         let mut r = Reader { bytes, at: 0 };
         ensure!(r.take(4)? == FCM2_MAGIC, "invalid FCM2 magic");
         ensure!(r.u8()? == FCM2_SCHEMA_VERSION, "unsupported FCM2 schema");

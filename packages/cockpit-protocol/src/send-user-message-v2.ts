@@ -32,6 +32,11 @@ export interface CanonicalSendUserMessageV2 {
   request: SendUserMessageV2;
 }
 
+export function validateFcm2Length(length: number) {
+  if (!Number.isSafeInteger(length) || length < 0 || length > FCM2_MAX_BYTES)
+    throw new Error("FCM2 exceeds maximum size");
+}
+
 function rejectUnpairedSurrogates(value: string) {
   for (let i = 0; i < value.length; i++) {
     const n = value.charCodeAt(i);
@@ -246,7 +251,7 @@ class Reader {
   }
 }
 export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUserMessageV2 {
-  if (b.length > FCM2_MAX_BYTES) throw new Error("FCM2 exceeds maximum size");
+  validateFcm2Length(b.length);
   const r = new Reader(b);
   if (r.text(4) !== "FCM2" || r.u8() !== 2) throw new Error("invalid FCM2 header");
   const client_submission_id = uuidString(r.raw(16)),

@@ -3571,15 +3571,15 @@ impl Driver {
             | Some(crate::db::session_goals::GoalPhase::Evaluating)
             | Some(crate::db::session_goals::GoalPhase::Verifying) => {
                 self.maybe_start_goal_supervision_round(&goal, tx).await?;
-                return Ok(());
+                Ok(())
             }
             Some(crate::db::session_goals::GoalPhase::Executing) => {
                 if self.schedule.snapshot().is_empty() {
                     self.dispatch_goal_root_turn(&goal, input_rx, tx).await?;
                 }
-                return Ok(());
+                Ok(())
             }
-            None => return Ok(()),
+            None => Ok(()),
         }
     }
 

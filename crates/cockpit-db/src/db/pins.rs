@@ -39,24 +39,30 @@ pub struct PinnedMessage {
 }
 
 impl Db {
+    pub fn pin_message_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        seq: i64,
+        pinned_ms: i64,
+    ) -> Result<bool> {
+        let n = map_pin_insert(
+            conn.execute(
+                "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms) VALUES (?1, ?2, ?3)",
+                params![session_id.to_string(), seq, pinned_ms],
+            ),
+            session_id,
+            seq,
+        )?;
+        Ok(n == 1)
+    }
+
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
     /// new pin was created, `false` when it was already pinned.
     pub async fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
-        self.write(move |conn| {
-            let n = map_pin_insert(
-                conn.execute(
-                    "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id.to_string(), seq, pinned_ms],
-                ),
-                session_id,
-                seq,
-            )?;
-            Ok(n == 1)
-        })
-        .await
+        self.write(move |conn| Self::pin_message_conn(conn, session_id, seq, pinned_ms))
+            .await
     }
 
     /// Unpin the message at `(session_id, seq)`. Returns `true` when a pin

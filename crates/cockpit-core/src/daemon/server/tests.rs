@@ -1539,6 +1539,97 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         .unwrap();
     assert_eq!(count, 1, "replay and conflict must not append another note");
 
+    let note_seq = ctx
+        .db
+        .insert_session_event(
+            session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": "pinnable" }),
+        )
+        .await
+        .unwrap();
+    let pin_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-555555555555").unwrap(),
+    )
+    .unwrap();
+    let pin_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first pin").await,
+        Body::Response { id, response }
+            if id == pin_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let pin_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_replay_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "pin replay").await,
+        Body::Response { id, response }
+            if id == pin_replay_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let pin_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_conflict_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq + 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "pin conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == pin_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(ctx.db.is_pinned(session_id, note_seq).await.unwrap());
+    assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
+
     let rename_operation = proto::RemoteOperationIdentityV1::new(
         logical_attachment_id,
         Uuid::parse_str("018f3f24-7a10-7cc2-8f55-444444444444").unwrap(),

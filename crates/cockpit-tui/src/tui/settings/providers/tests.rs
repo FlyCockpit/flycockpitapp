@@ -3215,7 +3215,7 @@ fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
 
     let (live_flow, live_operation) = state.begin_copy_for_test();
     state.complete_copy(
-        oauth_flow::OAuthFlowId(live_flow.0.saturating_add(1)),
+        super::super::pointer_actions::OAuthFlowId(live_flow.0.saturating_add(1)),
         live_operation,
         Err("wrong flow".into()),
     );

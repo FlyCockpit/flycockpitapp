@@ -1,10 +1,8 @@
+use super::super::pointer_actions::OAuthFlowId;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OAuthFlowId(pub u64);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));

@@ -57,6 +57,7 @@ async function registerRemoteAdminCredential(ceremony: { challenge: string; rpId
   if (!asserted || !(asserted.response instanceof AuthenticatorAssertionResponse))
     throw new Error("Passkey verification was cancelled.");
   return {
+    rawCredentialId: toBase64Url(created.rawId),
     credentialIdHash: toBase64Url(credentialIdHash),
     publicKeySpki: toBase64Url(publicKey),
     declaredCustody: "UNKNOWN" as const,

@@ -91,7 +91,10 @@ export const enterpriseRouter = {
     )
     .handler(async ({ input }) => {
       const classification = classifyRemotePolicyRevision(input.current, input.proposed);
-      const expectedCount = classification === "weakening" ? 2 : 1;
+      // Until the signer-owned policy snapshot is available here, policy operation 4
+      // is conservatively dual-controlled. Never let caller-supplied comparison data
+      // downgrade the approval cardinality.
+      const expectedCount = 2;
       if (input.approvalIds.length !== expectedCount)
         throw new ORPCError("PRECONDITION_FAILED", {
           message: "Policy approval cardinality is invalid.",
@@ -121,18 +124,13 @@ export const enterpriseRouter = {
             throw new ORPCError("PRECONDITION_FAILED", {
               message: "Current policy approval is required.",
             });
-          if (classification === "weakening") {
-            if (
-              approvals[0]!.principalId === approvals[1]!.principalId ||
-              !approvals.some((approval) => approval.role === "OWNER") ||
-              !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
-            )
-              throw new ORPCError("PRECONDITION_FAILED", {
-                message: "Dual policy approval is invalid.",
-              });
-          } else if (approvals[0]!.role !== "SECURITY_ADMIN") {
+          if (
+            approvals[0]!.principalId === approvals[1]!.principalId ||
+            !approvals.some((approval) => approval.role === "OWNER") ||
+            !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
+          ) {
             throw new ORPCError("PRECONDITION_FAILED", {
-              message: "Security administrator approval is required.",
+              message: "Dual policy approval is invalid.",
             });
           }
           if (
@@ -893,9 +891,7 @@ export const enterpriseRouter = {
           orgId_userId: { orgId: input.orgId, userId: context.session.user.id },
         },
       });
-      const dual =
-        remoteAdminOperationRequiresDualControl(operation) ||
-        (operation === 4 && input.policyWeakening);
+      const dual = remoteAdminOperationRequiresDualControl(operation) || operation === 4;
       if (!member || member.role === "MEMBER" || (!dual && member.role !== "SECURITY_ADMIN"))
         throw new ORPCError("FORBIDDEN", { message: "This role cannot approve the operation." });
       const registry = await prisma.remoteAdminRegistry.findUnique({
@@ -910,7 +906,7 @@ export const enterpriseRouter = {
         operation,
         ...digest,
         ...u64Bytes(epoch),
-        input.policyWeakening ? 1 : 0,
+        operation === 4 ? 1 : 0,
       ]);
       const challenge = await approvalChallenge(operationBytes, nonce);
       const challengeId = randomUUID(),
@@ -927,7 +923,7 @@ export const enterpriseRouter = {
           requestPayload: {
             operation,
             operationEpoch: input.operationEpoch,
-            policyWeakening: input.policyWeakening,
+            policyWeakening: operation === 4,
           },
           challengeHash: createHash("sha256").update(challenge).digest(),
           challengeBytes: Buffer.from(challenge),
@@ -997,7 +993,7 @@ export const enterpriseRouter = {
         credential.principalId !== context.session.user.id ||
         credential.state !== "ACTIVE" ||
         credential.role === "MEMBER" ||
-        credential.registryGeneration !== registry.generation
+        credential.registryGeneration > registry.generation
       )
         throw new ORPCError("UNAUTHORIZED", { message: "Approval credential is not current." });
       const dual =
@@ -1084,6 +1080,36 @@ export const enterpriseRouter = {
             ).count !== 1
           )
             throw new ORPCError("CONFLICT", { message: "Approval ceremony was already consumed." });
+          const counter = await tx.remoteAdminCredentialCounter.findUnique({
+            where: {
+              registryId_credentialIdHash: {
+                registryId: registry.id,
+                credentialIdHash: credential.credentialIdHash,
+              },
+            },
+          });
+          if (!counter || counter.state !== "ACTIVE")
+            throw new ORPCError("UNAUTHORIZED", { message: "Credential counter is unavailable." });
+          const observed = BigInt(verified.signCount);
+          const accepted =
+            (counter.lastAcceptedSignCount === 0n && observed === 0n) ||
+            observed > counter.lastAcceptedSignCount;
+          const counterUpdate = await tx.remoteAdminCredentialCounter.updateMany({
+            where: { id: counter.id, stateGeneration: counter.stateGeneration, state: "ACTIVE" },
+            data: accepted
+              ? {
+                  lastAcceptedSignCount:
+                    observed > counter.lastAcceptedSignCount
+                      ? observed
+                      : counter.lastAcceptedSignCount,
+                  stateGeneration: { increment: 1 },
+                }
+              : { state: "SUSPECT", stateGeneration: { increment: 1 } },
+          });
+          if (counterUpdate.count !== 1)
+            throw new ORPCError("CONFLICT", { message: "Credential counter raced." });
+          if (!accepted)
+            throw new ORPCError("UNAUTHORIZED", { message: "Credential counter replay detected." });
           await tx.remoteAdminApproval.create({
             data: {
               id: approvalId,
@@ -1211,6 +1237,7 @@ export const enterpriseRouter = {
     .input(
       z.object({
         challengeId: z.string().uuid(),
+        rawCredentialId: z.string().min(1).max(1400),
         credentialIdHash: z.string().max(64),
         publicKeySpki: z.string().max(256),
         declaredCustody: z.enum(["SYNCED_PASSKEY", "EXTERNAL_SECURITY_KEY", "UNKNOWN"]),
@@ -1250,6 +1277,14 @@ export const enterpriseRouter = {
       if (typeof payload?.name !== "string" || typeof payload.slug !== "string")
         throw new ORPCError("CONFLICT", { message: "Owner bootstrap payload is invalid." });
       const credentialIdHash = base64urlBytes(input.credentialIdHash, 32);
+      const rawCredentialId = base64urlBytes(input.rawCredentialId);
+      if (
+        rawCredentialId.length > 1023 ||
+        !createHash("sha256").update(rawCredentialId).digest().equals(Buffer.from(credentialIdHash))
+      )
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Credential identifier binding is invalid.",
+        });
       const spki = base64urlBytes(input.publicKeySpki);
       let publicJwk: { kty?: string; crv?: string; x?: string; y?: string };
       try {
@@ -1398,6 +1433,7 @@ export const enterpriseRouter = {
       z.object({
         challengeId: z.string().uuid(),
         accept: z.literal(true),
+        rawCredentialId: z.string().min(1).max(1400),
         credentialIdHash: z.string().max(64),
         publicKeySpki: z.string().max(256),
         declaredCustody: z.enum(["SYNCED_PASSKEY", "EXTERNAL_SECURITY_KEY", "UNKNOWN"]),
@@ -1437,6 +1473,14 @@ export const enterpriseRouter = {
           message: "Security bootstrap is invalid or expired.",
         });
       const credentialIdHash = base64urlBytes(input.credentialIdHash, 32);
+      const rawCredentialId = base64urlBytes(input.rawCredentialId);
+      if (
+        rawCredentialId.length > 1023 ||
+        !createHash("sha256").update(rawCredentialId).digest().equals(Buffer.from(credentialIdHash))
+      )
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Credential identifier binding is invalid.",
+        });
       const spki = base64urlBytes(input.publicKeySpki);
       let jwk: { kty?: string; crv?: string; x?: string; y?: string };
       try {
@@ -1503,6 +1547,20 @@ export const enterpriseRouter = {
         nextGeneration = registry.generation + 1n;
       const result = await prisma.$transaction(
         async (tx) => {
+          const nominator = ceremony.nominatorId
+            ? await tx.enterpriseOrgMember.findUnique({
+                where: {
+                  orgId_userId: { orgId: ceremony.orgId!, userId: ceremony.nominatorId },
+                },
+              })
+            : null;
+          if (
+            isClosedBootstrap &&
+            (!nominator ||
+              nominator.role !== "OWNER" ||
+              nominator.userId === context.session.user.id)
+          )
+            throw new ORPCError("CONFLICT", { message: "Nominating owner is no longer eligible." });
           if (
             (
               await tx.remoteAdminCeremony.updateMany({
@@ -1697,7 +1755,7 @@ export const enterpriseRouter = {
         !credential ||
         credential.principalId !== context.session.user.id ||
         credential.state !== "ACTIVE" ||
-        credential.registryGeneration !== registry.generation ||
+        credential.registryGeneration > registry.generation ||
         credential.role === "MEMBER"
       )
         throw new ORPCError("UNAUTHORIZED", { message: "Passkey credential is not active." });

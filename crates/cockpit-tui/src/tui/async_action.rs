@@ -311,21 +311,26 @@ fn export_temp_reaper() -> &'static ExportReaper {
                 loop {
                     while let Ok(message) = rx.try_recv() {
                         match message {
-                            ExportReaperMessage::Reap(path) => pending.push_back(path),
+                            ExportReaperMessage::Reap(path) => pending.push_back((path, 0u8)),
                             ExportReaperMessage::DrainAndStop(done) => stop = Some(done),
                         }
                     }
-                    if let Some(path) = pending.pop_front() {
+                    if let Some((path, attempts)) = pending.pop_front() {
                         match std::fs::remove_file(&path) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => {
-                                eprintln!(
-                                    "cockpit: export recovery retained {}: {error}",
-                                    path.display()
-                                );
-                                pending.push_back(path);
-                                std::thread::sleep(Duration::from_millis(100));
+                                if attempts < 3 {
+                                    eprintln!("cockpit: export recovery retry {} retained {}: {error}", attempts + 1, path.display());
+                                    pending.push_back((path, attempts + 1));
+                                    std::thread::sleep(Duration::from_millis(10));
+                                } else {
+                                    let deferred = path.with_extension("partial.cleanup-deferred");
+                                    match std::fs::rename(&path, &deferred) {
+                                        Ok(()) => eprintln!("cockpit: CleanupDeferred — export recovery recorded at {}", deferred.display()),
+                                        Err(rename_error) => eprintln!("cockpit: CleanupDeferred — could not quarantine {} after {error}: {rename_error}", path.display()),
+                                    }
+                                }
                             }
                         }
                         continue;
@@ -335,7 +340,7 @@ fn export_temp_reaper() -> &'static ExportReaper {
                         break;
                     }
                     match rx.recv() {
-                        Ok(ExportReaperMessage::Reap(path)) => pending.push_back(path),
+                        Ok(ExportReaperMessage::Reap(path)) => pending.push_back((path, 0u8)),
                         Ok(ExportReaperMessage::DrainAndStop(done)) => stop = Some(done),
                         Err(_) => break,
                     }
@@ -391,6 +396,21 @@ pub(crate) fn drain_export_temp_reaper() {
         .take()
     {
         let _ = handle.join();
+    }
+}
+
+pub(crate) struct ExportTempReaperGuard;
+
+impl ExportTempReaperGuard {
+    pub(crate) fn new() -> Self {
+        let _ = export_temp_reaper();
+        Self
+    }
+}
+
+impl Drop for ExportTempReaperGuard {
+    fn drop(&mut self) {
+        drain_export_temp_reaper();
     }
 }
 
@@ -1361,6 +1381,17 @@ mod tests {
         let partial = tmp.path().join(".spawn-failure.partial");
         std::fs::write(&partial, b"partial").unwrap();
         synchronous_export_cleanup_fallback(&partial);
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn reaper_guard_drop_drains_cleanup_on_cancelled_run_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(".cancelled-run.partial");
+        std::fs::write(&partial, b"partial").unwrap();
+        let guard = ExportTempReaperGuard::new();
+        enqueue_export_temp_reap(partial.clone());
+        drop(guard);
         assert!(!partial.exists());
     }
 

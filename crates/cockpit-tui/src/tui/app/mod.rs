@@ -3484,6 +3484,11 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let _export_reaper_guard = crate::tui::async_action::ExportTempReaperGuard::new();
+        export_actions::recover_deferred_export_cleanup(
+            &self.launch.cwd.join(".cockpit").join("exports"),
+        )
+        .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
             let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
             let state = crate::tui::agent_runner::daemon_request_blocking(
@@ -3599,8 +3604,6 @@ impl App {
                 async_shutdown.export_cleanup_retry_scheduled,
             );
         }
-        crate::tui::async_action::drain_export_temp_reaper();
-
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous
         // `StopDaemon` through the daemon's single graceful drain path, so

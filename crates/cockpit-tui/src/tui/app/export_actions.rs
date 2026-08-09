@@ -139,6 +139,7 @@ async fn export_via_attached_daemon(
     // bulk chunks, then verify the transfer's length and digest before writing.
     let bytes = pull_bulk_transfer(&attached_request, &data.transfer, command, &shutdown).await?;
     let out_path = exports_dir.join(format!("{file_stem}.{}", data.filename_extension));
+    recover_deferred_export_cleanup(&exports_dir).await;
     tokio::fs::create_dir_all(&exports_dir)
         .await
         .map_err(|error| format!("{command}: creating export directory failed: {error}"))?;
@@ -158,6 +159,30 @@ async fn export_via_attached_daemon(
             out_path.display()
         ),
     })
+}
+
+pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(exports_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".cleanup-deferred")
+        {
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => eprintln!(
+                    "cockpit: recovered deferred export cleanup {}",
+                    entry.path().display()
+                ),
+                Err(error) => eprintln!(
+                    "cockpit: CleanupDeferred remains at {}: {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+    }
 }
 
 /// Publish through an owned temporary file and a no-replace hard link.  The
@@ -564,6 +589,15 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains("partial"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn next_export_start_clears_deferred_cleanup_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deferred = tmp.path().join(".old.partial.cleanup-deferred");
+        tokio::fs::write(&deferred, b"partial").await.unwrap();
+        recover_deferred_export_cleanup(tmp.path()).await;
+        assert!(!deferred.exists());
     }
 
     #[tokio::test]

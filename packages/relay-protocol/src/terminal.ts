@@ -118,6 +118,7 @@ export const terminalOpenedFrameSchema = z
     recording: z.boolean(),
     bindingId: z.string().uuid(),
     bindingEpoch: z.number().int().nonnegative(),
+    terminalGeneration: z.number().int().positive(),
   })
   .strict();
 

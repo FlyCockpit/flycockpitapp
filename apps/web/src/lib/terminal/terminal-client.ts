@@ -42,13 +42,19 @@ export class TerminalClient {
   private binding: { id: string; epoch: number } | null = null;
   private ingressWaiters = new Map<
     string,
-    (state: { state: "prepared" | "committed"; nextOffset: number }) => void
+    {
+      resolve: (state: { state: "prepared" | "committed"; nextOffset: number }) => void;
+      reject: (error: Error) => void;
+      timer: number;
+    }
   >();
+  private terminalGeneration: number | null = null;
   private pendingIngress: {
     operationId: string;
     mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
     size: number;
     sha256: string;
+    terminalGeneration: number;
   } | null = null;
   private closedByUser = false;
 
@@ -146,6 +152,7 @@ export class TerminalClient {
 
   async uploadImage(file: File, onProgress?: (sentBytes: number, totalBytes: number) => void) {
     if (!this.binding) throw new Error("terminal binding is unavailable");
+    if (!this.terminalGeneration) throw new Error("terminal generation is unavailable");
     if (
       !(
         file.type === "image/png" ||
@@ -163,7 +170,13 @@ export class TerminalClient {
     }
     const sha256 = bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)));
     const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-    this.pendingIngress = { operationId, mediaType, size: buffer.byteLength, sha256 };
+    this.pendingIngress = {
+      operationId,
+      mediaType,
+      size: buffer.byteLength,
+      sha256,
+      terminalGeneration: this.terminalGeneration,
+    };
     const identity = () => {
       if (!this.binding) throw new Error("terminal binding is unavailable");
       return { operationId, bindingId: this.binding.id, bindingEpoch: this.binding.epoch };
@@ -231,17 +244,28 @@ export class TerminalClient {
     if (payload.type === "terminal.opened") {
       this.terminalId = payload.terminalId;
       this.binding = { id: payload.bindingId, epoch: payload.bindingEpoch };
+      this.terminalGeneration = payload.terminalGeneration;
       if (this.pendingIngress) {
-        this.sendPayload({
-          type: "terminal.ingress_begin",
-          v: TERMINAL_PROTOCOL_VERSION,
-          operationId: this.pendingIngress.operationId,
-          bindingId: this.binding.id,
-          bindingEpoch: this.binding.epoch,
-          mediaType: this.pendingIngress.mediaType,
-          size: this.pendingIngress.size,
-          sha256: this.pendingIngress.sha256,
-        });
+        if (this.pendingIngress.terminalGeneration === payload.terminalGeneration) {
+          this.sendPayload({
+            type: "terminal.ingress_begin",
+            v: TERMINAL_PROTOCOL_VERSION,
+            operationId: this.pendingIngress.operationId,
+            bindingId: this.binding.id,
+            bindingEpoch: this.binding.epoch,
+            mediaType: this.pendingIngress.mediaType,
+            size: this.pendingIngress.size,
+            sha256: this.pendingIngress.sha256,
+          });
+        } else {
+          const waiter = this.ingressWaiters.get(this.pendingIngress.operationId);
+          if (waiter) {
+            window.clearTimeout(waiter.timer);
+            waiter.reject(new Error("terminal generation is gone"));
+            this.ingressWaiters.delete(this.pendingIngress.operationId);
+          }
+          this.pendingIngress = null;
+        }
       }
       this.emit("status", "open");
       this.emit("opened", {
@@ -254,7 +278,11 @@ export class TerminalClient {
     if (payload.type === "terminal.output") this.emit("output", payload.data);
     if (payload.type === "terminal.clipboard") this.emit("clipboard", payload.text);
     if (payload.type === "terminal.ingress_state") {
-      this.ingressWaiters.get(payload.operationId)?.(payload);
+      const waiter = this.ingressWaiters.get(payload.operationId);
+      if (waiter) {
+        window.clearTimeout(waiter.timer);
+        waiter.resolve(payload);
+      }
       this.ingressWaiters.delete(payload.operationId);
       this.emit("attachmentProgress", {
         operationId: payload.operationId,
@@ -283,10 +311,7 @@ export class TerminalClient {
           this.ingressWaiters.delete(operationId);
           reject(new Error("terminal ingress acknowledgement timed out"));
         }, 30_000);
-        this.ingressWaiters.set(operationId, (state) => {
-          window.clearTimeout(timer);
-          resolve(state);
-        });
+        this.ingressWaiters.set(operationId, { resolve, reject, timer });
       },
     );
   }

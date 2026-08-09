@@ -247,6 +247,7 @@ pub enum MediaSecurityRecoveryDisposition {
 pub struct RecoverSecurityBlockedMediaV1 {
     pub schema_version: u8,
     pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
     pub local_request_id: Uuid,
     pub owner_principal_digest: String,
     pub attachment_id: Uuid,
@@ -282,7 +283,9 @@ pub struct MediaSecurityRecoveryComponentTransitionV1 {
 pub struct LocalMediaOwnerReceiptV1 {
     pub schema_version: u8,
     pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
     pub receipt_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
     pub local_request_id: Uuid,
     pub owner_principal_digest: String,
     pub attachment_id: Uuid,
@@ -295,6 +298,36 @@ pub struct LocalMediaOwnerReceiptV1 {
     pub availability_generation_after: u64,
     pub components: Vec<MediaSecurityRecoveryComponentTransitionV1>,
     pub committed_at_unix_ms: i64,
+}
+
+mod strict_uuid_v7 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+    use uuid::Uuid;
+
+    pub fn serialize<S>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        let value = Uuid::parse_str(&text).map_err(D::Error::custom)?;
+        if value.is_nil()
+            || value.get_version_num() != 7
+            || value.get_variant() != uuid::Variant::RFC4122
+            || value.to_string() != text
+        {
+            return Err(D::Error::custom(
+                "UUID must be nonnil RFC 9562 UUIDv7 in canonical lowercase hyphenated form",
+            ));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1137,6 +1170,31 @@ mod tests {
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
+    }
+
+    #[test]
+    fn media_owner_recovery_uuid_codec_matches_shared_malformed_vectors() {
+        #[derive(Deserialize)]
+        struct StrictUuid(#[serde(with = "strict_uuid_v7")] Uuid);
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../packages/cockpit-protocol/fixtures/media-owner-recovery-uuid-v1.json"
+        ))
+        .unwrap();
+        let valid = fixture["valid"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<StrictUuid>(&format!("\"{valid}\""))
+                .unwrap()
+                .0
+                .to_string(),
+            valid
+        );
+        for malformed in fixture["malformed"].as_array().unwrap() {
+            assert!(
+                serde_json::from_str::<StrictUuid>(&serde_json::to_string(malformed).unwrap())
+                    .is_err(),
+                "accepted {malformed}"
+            );
+        }
     }
 
     #[test]

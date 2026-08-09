@@ -220,8 +220,32 @@ fn stable_identity_digest(file: &File) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn stable_identity_digest(_file: &File) -> Result<String> {
-    anyhow::bail!("Windows stable file identity recovery is unavailable")
+fn stable_identity_digest(file: &File) -> Result<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "media object is not a regular file");
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .context("querying held Windows media identity")?;
+    ensure!(
+        information.nNumberOfLinks == 1,
+        "media object is not singly linked"
+    );
+    ensure!(
+        information.dwFileAttributes & 0x400 == 0,
+        "media object is a reparse point"
+    );
+    let mut digest = Sha256::new();
+    digest.update(b"windows-file-identity-v1");
+    digest.update(information.dwVolumeSerialNumber.to_be_bytes());
+    digest.update(information.nFileIndexHigh.to_be_bytes());
+    digest.update(information.nFileIndexLow.to_be_bytes());
+    Ok(hex_lower(&digest.finalize()))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

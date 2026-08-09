@@ -734,6 +734,7 @@ pub(super) struct CopilotSetupState {
     /// inject `GH_TOKEN` into the running process so the resolver
     /// picks it up before the user restarts.
     pub(super) outcome: Option<Result<String, String>>,
+    operation: super::shell::PointerOperationGate,
 }
 
 impl CopilotSetupState {
@@ -749,7 +750,56 @@ impl CopilotSetupState {
             rc_path,
             already_configured,
             outcome: None,
+            operation: super::shell::PointerOperationGate::default(),
         }
+    }
+
+    fn submit(
+        &mut self,
+        credential_store_path: Option<&std::path::Path>,
+        effect: &mut impl CopilotSetupEffect,
+    ) {
+        let (Some(shell), Some(rc_path)) = (self.shell, self.rc_path.as_deref()) else {
+            return;
+        };
+        if self.already_configured || self.operation.pending().is_some() {
+            return;
+        }
+        let operation_id = self.operation.begin();
+        let result = effect.apply(shell, rc_path, credential_store_path);
+        self.complete(operation_id, result);
+    }
+
+    fn complete(
+        &mut self,
+        operation_id: super::shell::PointerOperationId,
+        result: Result<String, String>,
+    ) {
+        if self.operation.complete(operation_id) {
+            self.outcome = Some(result);
+        }
+    }
+}
+
+trait CopilotSetupEffect {
+    fn apply(
+        &mut self,
+        shell: CopilotShell,
+        rc_path: &std::path::Path,
+        credential_store_path: Option<&std::path::Path>,
+    ) -> Result<String, String>;
+}
+
+struct ProductionCopilotSetupEffect;
+
+impl CopilotSetupEffect for ProductionCopilotSetupEffect {
+    fn apply(
+        &mut self,
+        shell: CopilotShell,
+        rc_path: &std::path::Path,
+        credential_store_path: Option<&std::path::Path>,
+    ) -> Result<String, String> {
+        apply_copilot_setup(shell, rc_path, credential_store_path)
     }
 }
 
@@ -1518,13 +1568,10 @@ impl SettingsCx {
                         && state.rc_path.is_some()
                         && !state.already_configured;
                     if can_apply {
-                        let shell = state.shell.unwrap();
-                        let rc_path = state.rc_path.clone().unwrap();
-                        state.outcome = Some(apply_copilot_setup(
-                            shell,
-                            &rc_path,
+                        state.submit(
                             self.credential_store_path.as_deref(),
-                        ));
+                            &mut ProductionCopilotSetupEffect,
+                        );
                     } else {
                         // Skip — move to save + fetch.
                         let template = s.template.expect("template chosen");
@@ -2649,21 +2696,20 @@ impl SettingsCx {
                 // If we can't auto-write (unsupported shell, marker
                 // already present), Enter just returns to the Edit page —
                 // the screen was informational only.
-                let Some(shell) = s.shell else {
+                let Some(_shell) = s.shell else {
                     return back_to_edit(parent, None);
                 };
                 if s.already_configured {
                     return back_to_edit(parent, None);
                 }
-                let Some(rc_path) = s.rc_path.clone() else {
+                let Some(_rc_path) = s.rc_path.clone() else {
                     return back_to_edit(parent, None);
                 };
 
-                s.outcome = Some(apply_copilot_setup(
-                    shell,
-                    &rc_path,
+                s.submit(
                     self.credential_store_path.as_deref(),
-                ));
+                    &mut ProductionCopilotSetupEffect,
+                );
             }
             _ => {}
         }
@@ -4742,6 +4788,21 @@ impl SettingsPage for ProvidersPage {
             }
         }
         Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        match self {
+            ProvidersPage::CopilotSetup { state, .. } => state.operation.cancel(),
+            ProvidersPage::OAuthSetup { state, .. } => state.cancel_copy_effect(),
+            ProvidersPage::Add(state) => {
+                if let Some(oauth) = state.oauth_auth.as_mut() {
+                    oauth.cancel_copy_effect();
+                }
+            }
+            ProvidersPage::List { delete_pending, .. } => *delete_pending = false,
+            ProvidersPage::Edit(state) => state.delete_pending = false,
+            _ => {}
+        }
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

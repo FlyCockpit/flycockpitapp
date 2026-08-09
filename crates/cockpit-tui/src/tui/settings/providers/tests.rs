@@ -3151,3 +3151,73 @@ fn committed_entry_records_template_identity() {
         Some("anthropic")
     );
 }
+
+#[test]
+fn copilot_setup_effect_accepts_only_its_live_operation_once() {
+    struct Spy {
+        calls: usize,
+    }
+    impl CopilotSetupEffect for Spy {
+        fn apply(
+            &mut self,
+            _shell: CopilotShell,
+            _rc_path: &std::path::Path,
+            _credential_store_path: Option<&std::path::Path>,
+        ) -> Result<String, String> {
+            self.calls += 1;
+            Ok("effect complete".into())
+        }
+    }
+
+    let mut state = CopilotSetupState {
+        shell: Some(CopilotShell::Bash),
+        rc_path: Some(std::path::PathBuf::from("/not-touched-in-test")),
+        already_configured: false,
+        outcome: None,
+        operation: super::super::shell::PointerOperationGate::default(),
+    };
+    let mut spy = Spy { calls: 0 };
+    state.submit(None, &mut spy);
+    assert_eq!(spy.calls, 1);
+    assert_eq!(
+        state.outcome.as_ref().unwrap().as_deref(),
+        Ok("effect complete")
+    );
+
+    let stale = super::super::shell::PointerOperationId(99);
+    state.complete(stale, Err("stale".into()));
+    assert_eq!(
+        state.outcome.as_ref().unwrap().as_deref(),
+        Ok("effect complete")
+    );
+    state.submit(None, &mut spy);
+    assert_eq!(spy.calls, 2, "a new explicit submission gets one new id");
+}
+
+#[test]
+fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    let (flow_id, operation_id) = state.begin_copy_for_test();
+    state.complete_copy(flow_id, operation_id, Ok("copied".into()));
+    assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
+
+    state.complete_copy(flow_id, operation_id, Err("duplicate".into()));
+    assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
+
+    let (live_flow, live_operation) = state.begin_copy_for_test();
+    state.cancel_copy_effect();
+    state.complete_copy(
+        live_flow,
+        live_operation,
+        Err("cancelled late result".into()),
+    );
+    assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
+
+    let (live_flow, live_operation) = state.begin_copy_for_test();
+    state.complete_copy(
+        oauth_flow::OAuthFlowId(live_flow.0.saturating_add(1)),
+        live_operation,
+        Err("wrong flow".into()),
+    );
+    assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
+}

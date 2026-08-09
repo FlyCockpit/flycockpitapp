@@ -1,4 +1,10 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OAuthFlowId(pub u64);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -351,6 +357,7 @@ enum OAuthSession {
 }
 
 pub(crate) struct OAuthFlowState {
+    pub(crate) flow_id: OAuthFlowId,
     pub(crate) provider: OAuthProvider,
     shape: FlowShape,
     pub(crate) cursor: usize,
@@ -365,6 +372,7 @@ pub(crate) struct OAuthFlowState {
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
+    copy_operation: super::super::shell::PointerOperationGate,
 }
 
 impl OAuthFlowState {
@@ -416,6 +424,7 @@ impl OAuthFlowState {
             OAuthProvider::Codex => (FlowShape::DeviceCode, codex_oauth::is_logged_in()),
         };
         Self {
+            flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
             provider,
             shape,
             cursor: 0,
@@ -430,7 +439,55 @@ impl OAuthFlowState {
             ssh: (effects.is_ssh)(),
             spinner_tick: 0,
             acknowledgement_required: acknowledgement_required(provider),
+            copy_operation: super::super::shell::PointerOperationGate::default(),
         }
+    }
+
+    pub(super) fn complete_copy(
+        &mut self,
+        flow_id: OAuthFlowId,
+        operation_id: super::super::shell::PointerOperationId,
+        result: Result<String, String>,
+    ) {
+        if self.flow_id == flow_id && self.copy_operation.complete(operation_id) {
+            self.status = Some(result);
+        }
+    }
+
+    fn submit_copy(
+        &mut self,
+        value: Option<&str>,
+        open_after_copy: Option<&str>,
+        effects: OAuthEffects,
+    ) {
+        if self.copy_operation.pending().is_some() {
+            return;
+        }
+        let flow_id = self.flow_id;
+        let operation_id = self.copy_operation.begin();
+        let mut result = None;
+        copy_oauth_url_with(value, &mut result, effects.copy);
+        if let Some(url) = open_after_copy
+            && let Err(error) = (effects.open)(url)
+        {
+            result = Some(Err(error.to_string()));
+        }
+        self.complete_copy(
+            flow_id,
+            operation_id,
+            result.unwrap_or_else(|| Err("OAuth copy effect returned no result".into())),
+        );
+    }
+
+    pub(super) fn cancel_copy_effect(&mut self) {
+        self.copy_operation.cancel();
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin_copy_for_test(
+        &mut self,
+    ) -> (OAuthFlowId, super::super::shell::PointerOperationId) {
+        (self.flow_id, self.copy_operation.begin())
     }
 
     pub(super) fn confirming(&self) -> bool {
@@ -687,6 +744,11 @@ pub(super) fn handle_oauth_flow_key_with(
     host: OAuthHost,
     effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
+    if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('y')) {
+        // Any option/focus/navigation change invalidates an outstanding copy
+        // completion for this flow generation.
+        s.cancel_copy_effect();
+    }
     if s.provider == OAuthProvider::Grok && s.paste_focused {
         match key.code {
             KeyCode::Esc => {
@@ -726,13 +788,13 @@ pub(super) fn handle_oauth_flow_key_with(
     match (s.provider, key.code) {
         (OAuthProvider::Grok, KeyCode::Char('c')) => {
             let url = s.authorize_url().map(ToOwned::to_owned);
-            copy_oauth_url_with(url.as_deref(), &mut s.status, effects.copy);
+            s.submit_copy(url.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
             if s.ssh {
                 let url = s.device_login().map(|login| login.verification_uri.clone());
-                copy_oauth_url_with(url.as_deref(), &mut s.status, effects.copy);
+                s.submit_copy(url.as_deref(), None, effects);
             } else {
                 let (code, url) = match s.device_login() {
                     Some(login) => (
@@ -741,18 +803,13 @@ pub(super) fn handle_oauth_flow_key_with(
                     ),
                     None => (None, None),
                 };
-                copy_oauth_url_with(code.as_deref(), &mut s.status, effects.copy);
-                if let Some(url) = url
-                    && let Err(e) = (effects.open)(&url)
-                {
-                    s.status = Some(Err(e.to_string()));
-                }
+                s.submit_copy(code.as_deref(), url.as_deref(), effects);
             }
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
             let code = s.device_login().map(|login| login.user_code.clone());
-            copy_oauth_url_with(code.as_deref(), &mut s.status, effects.copy);
+            s.submit_copy(code.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
         _ => {}

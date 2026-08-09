@@ -26,6 +26,19 @@ export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 const U32_MAX = 0xffffffff;
 export const MAX_FCOR_V1_BYTES = U32_MAX;
 export const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES = 2_631_500;
+export type CanonicalParamErrorCode =
+  | "non_nfc"
+  | "nul"
+  | "invalid_unicode_scalar"
+  | "duplicate_nfc_key";
+export class CanonicalParamError extends Error {
+  constructor(
+    readonly code: CanonicalParamErrorCode,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 export const sendUserMessageV2OpaqueRegistration = {
   requestKind: "send_user_message",
   magic: new Uint8Array([0x46, 0x43, 0x4d, 0x32]),
@@ -84,9 +97,11 @@ export class CanonicalParamsV1 {
     this.#bytes.push(...value);
   }
   pushString(value: string): void {
-    if (hasUnpairedSurrogate(value) || value.includes("\0") || value.normalize("NFC") !== value) {
-      throw new Error("canonical string must be NUL-free NFC");
-    }
+    if (hasUnpairedSurrogate(value))
+      throw new CanonicalParamError("invalid_unicode_scalar", "invalid Unicode scalar input");
+    if (value.includes("\0")) throw new CanonicalParamError("nul", "canonical string contains NUL");
+    if (value.normalize("NFC") !== value)
+      throw new CanonicalParamError("non_nfc", "canonical string is not NFC");
     this.pushBytes(new TextEncoder().encode(value));
   }
   pushOptional<T>(
@@ -114,7 +129,10 @@ export class CanonicalParamsV1 {
   }
   pushStringMap(entries: Iterable<readonly [string, string]>): void {
     const encoded = [...entries].map(([key, value]) => {
-      if (hasUnpairedSurrogate(key) || key.includes("\0")) throw new Error("invalid map key");
+      if (hasUnpairedSurrogate(key))
+        throw new CanonicalParamError("invalid_unicode_scalar", "invalid Unicode scalar input");
+      if (key.includes("\0"))
+        throw new CanonicalParamError("nul", "canonical map key contains NUL");
       const normalizedKey = key.normalize("NFC");
       const encodedKey = new CanonicalParamsV1();
       encodedKey.pushString(normalizedKey);
@@ -129,7 +147,7 @@ export class CanonicalParamsV1 {
     encoded.sort((left, right) => compareBytes(left.key, right.key));
     for (let index = 1; index < encoded.length; index += 1) {
       if (encoded[index - 1].normalizedKey === encoded[index].normalizedKey)
-        throw new Error("duplicate NFC map key");
+        throw new CanonicalParamError("duplicate_nfc_key", "duplicate NFC map key");
     }
     this.pushU32(encoded.length);
     for (const entry of encoded) this.#bytes.push(...entry.key, ...entry.value);

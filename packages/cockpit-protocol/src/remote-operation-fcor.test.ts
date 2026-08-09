@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
 import {
   CanonicalParamsV1,
+  CanonicalParamError,
   checkedFcorV1Size,
   encodeFcorV1,
   hashFcorV1,
@@ -99,7 +100,13 @@ describe("FCOR v1", () => {
           );
         } else if ("entries" in invalid) params.pushStringMap(invalid.entries);
       };
-      expect(call, `${invalid.name}:${invalid.errorClass}`).toThrow();
+      try {
+        call();
+        throw new Error(`expected rejection: ${invalid.name}`);
+      } catch (error) {
+        expect(error, invalid.name).toBeInstanceOf(CanonicalParamError);
+        expect((error as CanonicalParamError).code, invalid.name).toBe(invalid.errorClass);
+      }
     }
     const boundary = (encode: (params: CanonicalParamsV1) => void) => {
       const params = new CanonicalParamsV1();

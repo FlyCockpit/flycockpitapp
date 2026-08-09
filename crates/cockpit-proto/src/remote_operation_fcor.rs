@@ -11,6 +11,41 @@ pub const MAX_FCOR_V1_BYTES: u64 = u32::MAX as u64;
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
 pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 2_631_500;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalParamErrorCode {
+    NonNfc,
+    Nul,
+    InvalidUnicodeScalar,
+    DuplicateNfcKey,
+}
+
+impl CanonicalParamErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NonNfc => "non_nfc",
+            Self::Nul => "nul",
+            Self::InvalidUnicodeScalar => "invalid_unicode_scalar",
+            Self::DuplicateNfcKey => "duplicate_nfc_key",
+        }
+    }
+}
+
+pub fn canonical_param_error_code(error: &anyhow::Error) -> Option<CanonicalParamErrorCode> {
+    match error.to_string().as_str() {
+        "canonical string is not NFC" => Some(CanonicalParamErrorCode::NonNfc),
+        "canonical string contains NUL" | "canonical map key contains NUL" => {
+            Some(CanonicalParamErrorCode::Nul)
+        }
+        "duplicate NFC map key" => Some(CanonicalParamErrorCode::DuplicateNfcKey),
+        "invalid Unicode scalar input" => Some(CanonicalParamErrorCode::InvalidUnicodeScalar),
+        _ => None,
+    }
+}
+
+pub fn validate_utf16_canonical_boundary(units: &[u16]) -> Result<String> {
+    String::from_utf16(units).map_err(|_| anyhow::anyhow!("invalid Unicode scalar input"))
+}
+
 /// Foundation-owned semantic validation seam for an opaque canonical codec.
 /// The ledger never parses or re-encodes the returned bytes.
 pub trait OpaqueCanonicalParamsDecoder {
@@ -451,10 +486,10 @@ mod tests {
                 .unwrap()
         );
         for invalid in fixture["invalidCanonicalCases"].as_array().unwrap() {
-            let rejected = match invalid["kind"].as_str().unwrap() {
+            let error = match invalid["kind"].as_str().unwrap() {
                 "string" => CanonicalParamsV1::new()
                     .push_string(invalid["value"].as_str().unwrap())
-                    .is_err(),
+                    .unwrap_err(),
                 "utf16_string" => {
                     let units: Vec<u16> = invalid["codeUnits"]
                         .as_array()
@@ -462,7 +497,7 @@ mod tests {
                         .iter()
                         .map(|unit| unit.as_u64().unwrap() as u16)
                         .collect();
-                    String::from_utf16(&units).is_err()
+                    validate_utf16_canonical_boundary(&units).unwrap_err()
                 }
                 "string_map" => {
                     let entries: Vec<(&str, &str)> = invalid["entries"]
@@ -474,11 +509,18 @@ mod tests {
                             (pair[0].as_str().unwrap(), pair[1].as_str().unwrap())
                         })
                         .collect();
-                    CanonicalParamsV1::new().push_string_map(entries).is_err()
+                    CanonicalParamsV1::new()
+                        .push_string_map(entries)
+                        .unwrap_err()
                 }
                 other => panic!("unknown invalid canonical case {other}"),
             };
-            assert!(rejected, "{}", invalid["errorClass"]);
+            assert_eq!(
+                canonical_param_error_code(&error).unwrap().as_str(),
+                invalid["errorClass"].as_str().unwrap(),
+                "{}",
+                invalid["name"]
+            );
         }
         let boundary = |encode: fn(&mut CanonicalParamsV1) -> Result<()>| {
             let mut params = CanonicalParamsV1::new();

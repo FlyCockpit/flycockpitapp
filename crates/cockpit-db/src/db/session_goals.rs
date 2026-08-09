@@ -646,7 +646,7 @@ impl SessionGoal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalUpdateOutcome {
-    Updated(SessionGoal),
+    Updated(Box<SessionGoal>),
     BlockAttempt { attempts: i64, required: i64 },
 }
 
@@ -819,11 +819,13 @@ impl Db {
         self.transaction(move |conn| {
             let mut goal = current_goal_required(conn, session_id)?;
             if disposition == GoalDisposition::Running {
-                return Ok(GoalUpdateOutcome::Updated(Db::set_session_goal_status_conn(
-                    conn,
-                    session_id,
-                    GoalDisposition::Running,
-                )?));
+                return Ok(GoalUpdateOutcome::Updated(Box::new(
+                    Db::set_session_goal_status_conn(
+                        conn,
+                        session_id,
+                        GoalDisposition::Running,
+                    )?,
+                )));
             }
             match disposition {
                 GoalDisposition::Complete => {
@@ -907,9 +909,9 @@ impl Db {
                         .transpose()?,
                 },
             )?;
-            Ok(GoalUpdateOutcome::Updated(load_goal(
+            Ok(GoalUpdateOutcome::Updated(Box::new(load_goal(
                 conn, session_id, goal.id,
-            )?))
+            )?)))
         })
         .await
     }

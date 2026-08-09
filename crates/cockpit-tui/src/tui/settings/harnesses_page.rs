@@ -562,6 +562,19 @@ impl SettingsCx {
             s.reset
                 .render_line(s.cursor == reset_row, "reset to verified presets"),
         );
+        if let Some(name) = names.get(s.cursor) {
+            lines.push(Line::default());
+            if s.delete_pending {
+                lines.push(Line::from(format!("Delete {name}?")));
+                bindings.push((lines.len(), SettingsControlId(2000)));
+                lines.push(Line::from("[Delete]"));
+                bindings.push((lines.len(), SettingsControlId(2001)));
+                lines.push(Line::from("[Cancel]"));
+            } else {
+                bindings.push((lines.len(), SettingsControlId(2002)));
+                lines.push(Line::from("[Delete]"));
+            }
+        }
 
         if let Some(buf) = &s.adding {
             lines.push(Line::default());
@@ -758,6 +771,28 @@ impl SettingsPage for HarnessesPage {
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
         let index = control.0 as usize;
+        if let HarnessesPage::List(state) = self {
+            match index {
+                2000 if state.delete_pending => {
+                    return cx.handle_harnesses_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                2001 if state.delete_pending => {
+                    state.delete_pending = false;
+                    state.status = Some("delete cancelled".into());
+                    return Nav::Stay;
+                }
+                2002 if !state.delete_pending => {
+                    return cx.handle_harnesses_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                _ => {}
+            }
+        }
         if matches!(self, HarnessesPage::Edit(state) if state.editing.is_some()) {
             return match index {
                 1000 => Nav::Stay,

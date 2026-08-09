@@ -336,6 +336,44 @@ fn bubblewrap_notice_is_conditional_read_only_and_infallible() {
 }
 
 #[test]
+fn powershell_notice_returns_to_installer_and_wrapper_swallows_failures() {
+    use std::{fs, path::PathBuf, process::Command};
+    let shell = ["pwsh", "powershell"].into_iter().find(|name| {
+        Command::new(name).args(["-NoProfile", "-Command", "exit 0"]).status().is_ok()
+    });
+    let Some(shell) = shell else { return };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/distrib")
+        .join(format!("powershell-notice-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let notice = root.join("notice.ps1");
+    let sentinel = root.join("continued");
+    fs::write(&notice, include_str!("../scripts/runtime-prerequisite-notice.ps1")).unwrap();
+    let command = format!(
+        "& '{}'; [IO.File]::WriteAllText('{}', 'returned')",
+        notice.display(), sentinel.display()
+    );
+    let output = Command::new(shell)
+        .args(["-NoProfile", "-Command", &command])
+        .env("COCKPIT_INSTALLER_TEST_UNAME", "Darwin")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "returned");
+
+    fs::write(&notice, "throw 'fixture notice failure'").unwrap();
+    let command = format!(
+        "try {{ & '{}' }} catch {{}}; [IO.File]::WriteAllText('{}', 'swallowed')",
+        notice.display(), sentinel.display()
+    );
+    let output = Command::new(shell).args(["-NoProfile", "-Command", &command]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "swallowed");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn powershell_fixture_covers_missing_localappdata_and_cleans_staging() {
     use std::{
         fs,
@@ -395,6 +433,7 @@ fn powershell_fixture_covers_missing_localappdata_and_cleans_staging() {
     let checksum = String::from_utf8(digest.stdout).unwrap().trim().to_owned();
     let destination = root.join("destination with spaces");
     let stage = root.join("stage with spaces");
+    let continuation = root.join("installer-continued");
     fs::create_dir_all(&stage).unwrap();
     let invoke = |archive: &Path, checksum: &str, destination: &Path, stage: &Path, arch: &str| {
         fs::create_dir_all(stage).unwrap();
@@ -407,6 +446,7 @@ fn powershell_fixture_covers_missing_localappdata_and_cleans_staging() {
             .env("COCKPIT_FIXTURE_DEST", destination)
             .env("COCKPIT_FIXTURE_STAGE_ROOT", stage)
             .env("COCKPIT_FIXTURE_ARCH", arch)
+            .env("COCKPIT_FIXTURE_CONTINUATION", &continuation)
             .env_remove("HOME")
             .env_remove("LOCALAPPDATA")
             .output()
@@ -419,6 +459,7 @@ fn powershell_fixture_covers_missing_localappdata_and_cleans_staging() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(destination.join("cockpit.exe").is_file());
+    assert_eq!(fs::read_to_string(&continuation).unwrap(), "continued");
     assert!(fs::read_dir(&stage).unwrap().next().is_none());
     for (name, supplied_checksum, arch) in [
         ("checksum", "00".repeat(32), "x64"),

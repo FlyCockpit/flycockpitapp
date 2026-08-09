@@ -23,7 +23,8 @@ try {
   Copy-Item -LiteralPath $bins[0].FullName -Destination $staged
   Move-Item -LiteralPath $staged -Destination $installed
   $notice = Get-ChildItem -LiteralPath $unpack -Recurse -File -Filter runtime-prerequisite-notice.ps1 | Select-Object -First 1
-  if ($notice) { & $notice.FullName }
+  if ($notice) { try { & $notice.FullName } catch {} }
+  [IO.File]::WriteAllText($env:COCKPIT_FIXTURE_CONTINUATION, "continued")
 } finally {
   Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -99,11 +99,25 @@ def patch_powershell_installer(path: Path) -> None:
             raise SystemExit(f"could not find PowerShell binary copy block in {path}")
         text = text.replace(copy_needle, copy_replacement, 1)
 
-    needle = '  Write-Information "everything\'s installed!"\n'
-    replacement = needle + '''  $archiveRoot = Split-Path -Parent $artifacts["bin_paths"][0]
+    needle = '''  Write-Information "everything's installed!"
+  if (-not $NoModifyPath) {
+    Add-Ci-Path $dest_dir
+    if (Add-Path $dest_dir) {
+        Write-Information ""
+        Write-Information "To add $dest_dir to your PATH, either restart your shell or run:"
+        Write-Information ""
+        Write-Information "    set Path=$dest_dir;%Path%   (cmd)"
+        Write-Information "    `$env:Path = `"$dest_dir;`$env:Path`"   (powershell)"
+    }
+  }
+'''
+    replacement = needle + '''
+  # Guidance runs only after cargo-dist has completed its PATH epilogue. It is
+  # deliberately isolated from the installer's error preference and status.
+  $archiveRoot = Split-Path -Parent $artifacts["bin_paths"][0]
   $notice = Join-Path $archiveRoot "runtime-prerequisite-notice.ps1"
   if (Test-Path -LiteralPath $notice -PathType Leaf) {
-    & $notice
+    try { & $notice } catch { Write-Verbose "runtime prerequisite notice failed: $_" }
   }
 '''
     if replacement in text:

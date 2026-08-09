@@ -1,7 +1,7 @@
 # Read-only, best-effort post-install guidance. Never install or invoke remedies.
 $isLinuxHost = if ($env:COCKPIT_INSTALLER_TEST_UNAME) { $env:COCKPIT_INSTALLER_TEST_UNAME -eq "Linux" } else { $IsLinux }
-if (-not $isLinuxHost) { exit 0 }
-if (Get-Command bwrap -ErrorAction SilentlyContinue) { exit 0 }
+if (-not $isLinuxHost) { return }
+if (Get-Command bwrap -ErrorAction SilentlyContinue) { return }
 
 $family = "unknown"
 $osReleasePath = if ($env:COCKPIT_INSTALLER_TEST_OS_RELEASE) { $env:COCKPIT_INSTALLER_TEST_OS_RELEASE } else { "/etc/os-release" }
@@ -20,4 +20,3 @@ switch ($family) {
     "arch" { [Console]::Error.WriteLine("Install the bubblewrap package with your Arch package tools, then verify with: bwrap --version") }
     default { [Console]::Error.WriteLine("See https://github.com/containers/bubblewrap and verify with: bwrap --version") }
 }
-exit 0

@@ -59,14 +59,16 @@ impl App {
         debug_assert!(operation.registration().actions.contains(&action));
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(operation);
+        #[cfg(test)]
+        let has_test_gate = barrier.is_some();
         #[cfg(not(test))]
-        let barrier: Option<std::sync::Arc<std::sync::Barrier>> = None;
+        let has_test_gate = false;
         let attached_request = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok())
             .map(|runner| runner.attached_request_binding());
-        if attached_request.is_none() && barrier.is_none() {
+        if attached_request.is_none() && !has_test_gate {
             self.push_plain(format!(
                 "{command}: an attached daemon is required for export"
             ));
@@ -93,6 +95,7 @@ impl App {
             AsyncActionKind::Blocking(action),
             AsyncActionPolicy::Dedupe(export_key),
             move |shutdown| async move {
+                #[cfg(test)]
                 if let Some(barrier) = barrier {
                     tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
                         .await

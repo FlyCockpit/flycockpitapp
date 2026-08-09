@@ -806,20 +806,22 @@ impl App {
         let existing_mode = self.btw_pane.as_ref().map(BtwPane::mode);
         #[cfg(test)]
         let barrier = self.take_owned_test_barrier(self.btw_blocking_operation());
+        #[cfg(test)]
+        let has_test_gate = barrier.is_some();
         #[cfg(not(test))]
-        let barrier: Option<std::sync::Arc<std::sync::Barrier>> = None;
+        let has_test_gate = false;
         let mut runner = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok());
-        if runner.is_none() && barrier.is_none() {
+        if runner.is_none() && !has_test_gate {
             self.ensure_agent_runner();
             runner = self
                 .agent_runner
                 .as_ref()
                 .and_then(|runner| runner.as_ref().ok());
         }
-        if runner.is_none() && barrier.is_none() {
+        if runner.is_none() && !has_test_gate {
             self.history.push(HistoryEntry::CommandError {
                 line: "/btw: no daemon connection".to_string(),
             });
@@ -853,6 +855,7 @@ impl App {
                 crate::tui::async_action::AsyncActionKey::new("btw.transition"),
             ),
             async move {
+                #[cfg(test)]
                 if let Some(barrier) = barrier {
                     tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
                         .await

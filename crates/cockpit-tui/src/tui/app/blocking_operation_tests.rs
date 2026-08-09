@@ -10,25 +10,45 @@ fn blocking_operation_manifest_is_complete() {
         ("slash:/doctor", BlockingOperationKind::DoctorSnapshot),
         ("slash:/export", BlockingOperationKind::ExportWrite),
         ("key:queue-edit", BlockingOperationKind::QueueMutation),
-        ("composer:/btw-end", BlockingOperationKind::BtwTeardown),
+        ("slash:/btw", BlockingOperationKind::BtwTeardown),
         (
             "composer:@suggestions",
             BlockingOperationKind::FileAutocomplete,
         ),
     ];
-    assert_eq!(BLOCKING_OPERATION_MANIFEST, expected);
+    assert_eq!(
+        BLOCKING_OPERATION_MANIFEST
+            .iter()
+            .map(|entry| (entry.site, entry.kind))
+            .collect::<Vec<_>>(),
+        expected
+    );
 
     let mut sites = std::collections::HashSet::new();
     let mut kinds = std::collections::HashSet::new();
-    for (site, kind) in BLOCKING_OPERATION_MANIFEST {
+    let production = [
+        include_str!("slash.rs"),
+        include_str!("input.rs"),
+        include_str!("btw_pane.rs"),
+        include_str!("export_actions.rs"),
+    ]
+    .join("\n");
+    let mut actions = std::collections::HashSet::new();
+    for registration in BLOCKING_OPERATION_MANIFEST {
         assert!(
-            sites.insert(*site),
-            "duplicate blocking-operation site: {site}"
+            sites.insert(registration.site),
+            "duplicate blocking-operation site: {}",
+            registration.site,
         );
         assert!(
-            kinds.insert(*kind),
-            "duplicate blocking-operation kind: {kind:?}"
+            kinds.insert(registration.kind),
+            "duplicate blocking-operation kind: {:?}",
+            registration.kind,
         );
+        for action in registration.actions {
+            assert!(actions.insert(*action), "duplicate action: {action}");
+            assert!(production.contains(action), "undispatched action: {action}");
+        }
     }
 }
 

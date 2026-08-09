@@ -10,16 +10,44 @@ pub(super) enum BlockingOperationKind {
     FileAutocomplete,
 }
 
-pub(super) const BLOCKING_OPERATION_MANIFEST: &[(&str, BlockingOperationKind)] = &[
-    ("slash:/curator", BlockingOperationKind::CuratorMaintenance),
-    ("slash:/doctor", BlockingOperationKind::DoctorSnapshot),
-    ("slash:/export", BlockingOperationKind::ExportWrite),
-    ("key:queue-edit", BlockingOperationKind::QueueMutation),
-    ("composer:/btw-end", BlockingOperationKind::BtwTeardown),
-    (
-        "composer:@suggestions",
-        BlockingOperationKind::FileAutocomplete,
-    ),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BlockingOperationRegistration {
+    pub(super) site: &'static str,
+    pub(super) kind: BlockingOperationKind,
+    pub(super) actions: &'static [&'static str],
+}
+
+pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
+    BlockingOperationRegistration {
+        site: "slash:/curator",
+        kind: BlockingOperationKind::CuratorMaintenance,
+        actions: &["curator.command"],
+    },
+    BlockingOperationRegistration {
+        site: "slash:/doctor",
+        kind: BlockingOperationKind::DoctorSnapshot,
+        actions: &["doctor.snapshot"],
+    },
+    BlockingOperationRegistration {
+        site: "slash:/export",
+        kind: BlockingOperationKind::ExportWrite,
+        actions: &["export.transcript", "export.debug"],
+    },
+    BlockingOperationRegistration {
+        site: "key:queue-edit",
+        kind: BlockingOperationKind::QueueMutation,
+        actions: &["queue.edit"],
+    },
+    BlockingOperationRegistration {
+        site: "slash:/btw",
+        kind: BlockingOperationKind::BtwTeardown,
+        actions: &["btw.teardown"],
+    },
+    BlockingOperationRegistration {
+        site: "composer:@suggestions",
+        kind: BlockingOperationKind::FileAutocomplete,
+        actions: &["autocomplete.files"],
+    },
 ];
 
 impl BlockingOperationKind {
@@ -27,7 +55,7 @@ impl BlockingOperationKind {
         match self {
             Self::CuratorMaintenance => "curator.command",
             Self::DoctorSnapshot => "doctor.snapshot",
-            Self::ExportWrite => "export.write",
+            Self::ExportWrite => "export.transcript",
             Self::QueueMutation => "queue.edit",
             Self::BtwTeardown => "btw.teardown",
             Self::FileAutocomplete => "autocomplete.files",

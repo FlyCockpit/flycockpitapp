@@ -779,18 +779,34 @@ impl App {
                 self.apply_queue_edit_outcome(outcome);
             }
             AsyncActionKind::Blocking("btw.teardown") => match result.payload {
-                Ok(AsyncActionPayload::DaemonResponse(response))
-                    if matches!(*response, cockpit_core::daemon::proto::Response::Ack) =>
-                {
-                    self.close_btw_pane();
+                Ok(AsyncActionPayload::BtwTransition {
+                    created,
+                    ended,
+                    question,
+                }) => {
+                    if ended {
+                        self.close_btw_pane();
+                    }
+                    if let Some(info) = created {
+                        self.open_btw_pane_from_info(info, true);
+                    }
+                    if let Some(pane) = self.btw_pane.as_mut() {
+                        pane.focused = true;
+                        if let Some(question) = question
+                            && let Err(error) = pane.send_text(question)
+                        {
+                            pane.history.push(HistoryEntry::InferenceError {
+                                summary: error.clone(),
+                                detail: error,
+                                expanded: false,
+                            });
+                        }
+                    } else if !ended {
+                        self.push_plain("/btw: no live fork".to_string());
+                    }
                 }
-                Ok(AsyncActionPayload::DaemonResponse(response)) => {
-                    self.push_plain(format!(
-                        "/btw end: unexpected daemon response: {response:?}"
-                    ));
-                }
-                Ok(_) => self.push_plain("/btw end: unexpected async response".to_string()),
-                Err(error) => self.push_plain(format!("/btw end: {error}")),
+                Ok(_) => self.push_plain("/btw: unexpected async response".to_string()),
+                Err(error) => self.push_plain(format!("/btw: {error}")),
             },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {

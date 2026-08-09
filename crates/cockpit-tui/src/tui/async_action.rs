@@ -220,6 +220,11 @@ pub enum AsyncActionPayload {
         query: String,
         suggestions: Vec<cockpit_core::tags::Suggestion>,
     },
+    BtwTransition {
+        created: Option<cockpit_core::daemon::proto::BtwForkInfo>,
+        ended: bool,
+        question: Option<String>,
+    },
 }
 
 #[derive(Debug)]

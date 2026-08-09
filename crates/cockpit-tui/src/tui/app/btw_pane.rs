@@ -823,87 +823,48 @@ impl App {
             _ => unreachable!("runner checked above"),
         };
 
-        let plan = plan_btw_rpcs(&command, existing_mode);
-        if plan.as_slice() == [BtwRpcPlan::End] {
-            self.push_plain("/btw end: pending".to_string());
-            self.async_actions.start(
-                super::blocking_operations::BlockingOperationKind::BtwTeardown.action_kind(),
-                crate::tui::async_action::AsyncActionPolicy::Replace(
-                    crate::tui::async_action::AsyncActionKey::new("btw.teardown"),
-                ),
-                async move {
-                    attached_request
-                        .request(Request::EndBtwFork { parent_session_id })
-                        .await
-                        .map(|response| {
-                            crate::tui::async_action::AsyncActionPayload::DaemonResponse(Box::new(
-                                response,
-                            ))
-                        })
-                },
-            );
-            return;
-        }
-        let mut created_info = None;
-        for rpc in plan {
-            let request = match rpc {
+        let requests = plan_btw_rpcs(&command, existing_mode)
+            .into_iter()
+            .map(|rpc| match rpc {
                 BtwRpcPlan::End => Request::EndBtwFork { parent_session_id },
                 BtwRpcPlan::Create { mode } => Request::CreateBtwFork {
                     parent_session_id,
                     tangent: mode.tangent(),
                 },
-            };
-            match agent_runner::attached_request_tx_blocking(attached_request.clone(), request) {
-                Ok(Response::Ack) => {
-                    self.close_btw_pane();
-                }
-                Ok(Response::BtwFork { info, .. }) => {
-                    created_info = Some(info);
-                }
-                Ok(other) => {
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/btw: unexpected daemon response: {other:?}"),
-                    });
-                    return;
-                }
-                Err(error) => {
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/btw: {error}"),
-                    });
-                    return;
-                }
-            }
-        }
-
-        if let Some(info) = created_info {
-            self.open_btw_pane_from_info(info, true);
-        } else if matches!(command, BtwCommand::End) {
-            self.close_btw_pane();
-            return;
-        } else if self.btw_pane.is_none() {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/btw: no live fork".to_string(),
-            });
-            return;
-        }
-
+            })
+            .collect::<Vec<_>>();
         let question = match command {
             BtwCommand::Open { question } | BtwCommand::New { question } => question,
             BtwCommand::Tangent { question } => Some(question),
             BtwCommand::End | BtwCommand::NotYetAvailable(_) => None,
         };
-        if let Some(pane) = self.btw_pane.as_mut() {
-            pane.focused = true;
-            if let Some(question) = question
-                && let Err(error) = pane.send_text(question.clone())
-            {
-                pane.history.push(HistoryEntry::InferenceError {
-                    summary: error.clone(),
-                    detail: error,
-                    expanded: false,
-                });
-            }
-        }
+        self.push_plain("/btw: pending".to_string());
+        self.async_actions.start(
+            super::blocking_operations::BlockingOperationKind::BtwTeardown.action_kind(),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("btw.transition"),
+            ),
+            async move {
+                let mut created = None;
+                let mut ended = false;
+                for request in requests {
+                    match attached_request.request(request).await? {
+                        Response::Ack => ended = true,
+                        Response::BtwFork { info, .. } => created = Some(info),
+                        other => {
+                            return Err(format!("/btw: unexpected daemon response: {other:?}"));
+                        }
+                    }
+                }
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::BtwTransition {
+                        created,
+                        ended,
+                        question,
+                    },
+                )
+            },
+        );
     }
 
     pub(super) fn open_btw_pane_from_info(&mut self, info: proto::BtwForkInfo, attach: bool) {

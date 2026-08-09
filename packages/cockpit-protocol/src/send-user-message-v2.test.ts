@@ -127,6 +127,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
       },
       { id: new Uint8Array(16).fill(42), generation: 9n },
     );
+    expect(remote.ingress).toBe("authenticated_remote");
     expect(remote.actor).toEqual({
       kind: "remote_device",
       id: new Uint8Array(16).fill(42),

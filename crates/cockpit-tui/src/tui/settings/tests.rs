@@ -652,6 +652,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     pointer_harness_editor_lifecycle_dispatches_from_fresh_sources();
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
+    pointer_string_list_action_families_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -665,6 +666,236 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
+    use pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
+    use string_list::{StringListKind, StringListPage};
+
+    fn fixture(tmp: &TempDir, kind: StringListKind) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        match kind {
+            StringListKind::AgentDirs => {
+                dialog.extended.agent_dirs = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::ExtraDotenvPaths => {
+                dialog.extended.redact.extra_dotenv_paths = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::RedactDenylist => {
+                dialog.extended.redact.denylist = vec!["alpha".into(), "beta".into()]
+            }
+            StringListKind::RedactAllowlist => {
+                dialog.extended.redact.allowlist = vec!["ALPHA".into(), "BETA".into()]
+            }
+            StringListKind::GitignoreAllow => {
+                dialog.extended.gitignore_allow = vec!["alpha/**".into(), "beta/**".into()]
+            }
+        }
+        let page = match kind {
+            StringListKind::AgentDirs => StringListPage::agent_dirs(),
+            StringListKind::ExtraDotenvPaths => StringListPage::extra_dotenv_paths(),
+            StringListKind::RedactDenylist => StringListPage::redact_denylist(),
+            StringListKind::RedactAllowlist => StringListPage::redact_allowlist(),
+            StringListKind::GitignoreAllow => StringListPage::gitignore_allow(),
+        };
+        dialog.set_test_page(Page::StringList(Box::new(page)));
+        dialog
+    }
+
+    fn values(dialog: &SettingsDialog, kind: StringListKind) -> Vec<String> {
+        match kind {
+            StringListKind::AgentDirs => dialog
+                .extended
+                .agent_dirs
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::ExtraDotenvPaths => dialog
+                .extended
+                .redact
+                .extra_dotenv_paths
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::RedactDenylist => dialog.extended.redact.denylist.clone(),
+            StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.clone(),
+            StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.clone(),
+        }
+    }
+
+    fn persisted_values(dialog: &SettingsDialog, kind: StringListKind) -> Vec<String> {
+        let config = ExtendedConfigDoc::load(&dialog.extended_path)
+            .expect("persisted string-list config")
+            .config();
+        match kind {
+            StringListKind::AgentDirs => config
+                .agent_dirs
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::ExtraDotenvPaths => config
+                .redact
+                .extra_dotenv_paths
+                .iter()
+                .map(|value| value.display().to_string())
+                .collect(),
+            StringListKind::RedactDenylist => config.redact.denylist,
+            StringListKind::RedactAllowlist => config.redact.allowlist,
+            StringListKind::GitignoreAllow => config.gitignore_allow,
+        }
+    }
+
+    let kinds = [
+        StringListKind::AgentDirs,
+        StringListKind::ExtraDotenvPaths,
+        StringListKind::RedactDenylist,
+        StringListKind::RedactAllowlist,
+        StringListKind::GitignoreAllow,
+    ];
+    for kind in kinds {
+        let source_tmp = TempDir::new().unwrap();
+        let source = fixture(&source_tmp, kind);
+        let _ = render_settings_rows(&source, 100, 40);
+        assert!(matches!(
+            source.test_page(),
+            TestPageRef::StringList(page) if page.kind == kind
+        ));
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::List(_)),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SettingsPointerAction::List(ListAction::Add)))
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, SettingsPointerAction::List(ListAction::Edit(_))))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    SettingsPointerAction::List(ListAction::Delete(_))
+                ))
+                .count(),
+            2,
+            "each concrete list publishes both stable delete identities"
+        );
+        let expected_ids = values(&source, kind)
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| ListRowId {
+                kind: ListKind::String(kind),
+                index,
+                value,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for ids in [
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    SettingsPointerAction::List(ListAction::Edit(id)) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>(),
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    SettingsPointerAction::List(ListAction::Delete(id)) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>(),
+        ] {
+            assert_eq!(
+                ids, expected_ids,
+                "row payloads preserve exact source identity"
+            );
+        }
+
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fixture(&tmp, kind);
+            let before = values(&dialog, kind);
+            let disk_before = std::fs::read(&dialog.extended_path).ok();
+            click_settings_action(&mut dialog, &action);
+            match &action {
+                SettingsPointerAction::List(ListAction::Delete(id)) => {
+                    click_settings_action(&mut dialog, &action);
+                    let after = values(&dialog, kind);
+                    assert_eq!(after.len(), 1);
+                    assert!(!after.contains(&id.value));
+                    assert_eq!(after[0], before[1usize.saturating_sub(id.index)]);
+                    assert_eq!(persisted_values(&dialog, kind), after);
+                    assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+                }
+                SettingsPointerAction::List(ListAction::Add) => {
+                    type_chars(&mut dialog, "gamma");
+                    click_settings_action(
+                        &mut dialog,
+                        &SettingsPointerAction::List(ListAction::Save),
+                    );
+                    let mut expected = before.clone();
+                    expected.push("gamma".into());
+                    assert_eq!(values(&dialog, kind), expected);
+                    assert_eq!(persisted_values(&dialog, kind), expected);
+                    assert_ne!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+                }
+                SettingsPointerAction::List(ListAction::Edit(id)) => {
+                    assert!(matches!(
+                        dialog.test_page(),
+                        TestPageRef::StringList(page) if page.grabbed.is_some()
+                    ));
+                    type_chars(&mut dialog, "discarded");
+                    click_settings_action(
+                        &mut dialog,
+                        &SettingsPointerAction::List(ListAction::Cancel),
+                    );
+                    assert_eq!(values(&dialog, kind), before);
+                    assert_eq!(std::fs::read(&dialog.extended_path).ok(), disk_before);
+
+                    let save_tmp = TempDir::new().unwrap();
+                    let mut save_dialog = fixture(&save_tmp, kind);
+                    let save_before = values(&save_dialog, kind);
+                    let save_disk_before = std::fs::read(&save_dialog.extended_path).ok();
+                    click_settings_action(&mut save_dialog, &action);
+                    type_chars(&mut save_dialog, "updated");
+                    click_settings_action(
+                        &mut save_dialog,
+                        &SettingsPointerAction::List(ListAction::Save),
+                    );
+                    let after = values(&save_dialog, kind);
+                    let mut expected = save_before.clone();
+                    expected[id.index] = if kind == StringListKind::RedactDenylist {
+                        "updated".into()
+                    } else {
+                        format!("{}updated", save_before[id.index])
+                    };
+                    assert_eq!(after, expected);
+                    assert_eq!(persisted_values(&save_dialog, kind), expected);
+                    assert_ne!(
+                        std::fs::read(&save_dialog.extended_path).ok(),
+                        save_disk_before
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn pointer_tool_credential_family_dispatches_from_fresh_sources() {

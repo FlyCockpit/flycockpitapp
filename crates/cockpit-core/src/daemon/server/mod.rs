@@ -1762,6 +1762,9 @@ pub struct DaemonContext {
     /// and revalidated recovery capacity; every consumer must treat `None` as
     /// "external dispatch is not enabled".
     pub external_journal: Option<std::sync::Arc<crate::external_journal::ExternalJournal>>,
+    /// Boot-held authority for the fixed private media component root.
+    pub(crate) media_storage_recovery:
+        Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
     /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
     pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     _process_containment_actor: Option<crate::process_containment::ProcessContainmentActor>,
@@ -1860,6 +1863,15 @@ impl DaemonContext {
             db.clone(),
             Arc::new(DaemonMediaClock(started_at)),
         );
+        let media_storage_recovery = (!paths.ephemeral)
+            .then(|| crate::config::resolve::cockpit_data_dir().map(|dir| dir.join("media")))
+            .transpose()
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
+            })
+            .map(Arc::new);
         Self {
             db,
             media_ledger,
@@ -1886,6 +1898,7 @@ impl DaemonContext {
             secure_key: None,
             _secure_key_actor: None,
             external_journal: None,
+            media_storage_recovery,
             process_containment: None,
             _process_containment_actor: None,
             write_scope: None,

@@ -2176,6 +2176,26 @@ pub(super) async fn handle_serialized_request(
                 reason: None,
             })
         }
+        Request::RecoverSecurityBlockedMedia(request) => {
+            let expected_owner = super::run_invocation::principal_digest(&state.principal);
+            if request.owner_principal_digest != expected_owner {
+                return Err(authorization_error(
+                    "media recovery owner binding is invalid",
+                ));
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "media storage authority is unavailable".into(),
+                })?;
+            let receipt = recovery
+                .recover(request, None, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(internal)?;
+            Ok(Response::MediaOwnerRecovery(receipt))
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,

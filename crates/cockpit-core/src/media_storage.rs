@@ -38,6 +38,17 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) fn open_or_create(db: cockpit_db::Db, owned_root: &Path) -> Result<Self> {
+        let root = DirGuard::open_root(owned_root, true)
+            .map_err(anyhow::Error::new)
+            .context("opening held media storage root")?;
+        root.verify_private().map_err(anyhow::Error::new)?;
+        Ok(Self {
+            db,
+            owned_root: std::sync::Arc::new(root),
+        })
+    }
+
     pub(crate) fn open(db: cockpit_db::Db, owned_root: &Path) -> Result<Self> {
         let root = DirGuard::open_root(owned_root, false)
             .map_err(anyhow::Error::new)

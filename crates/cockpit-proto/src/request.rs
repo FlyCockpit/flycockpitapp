@@ -1041,6 +1041,9 @@ pub enum Request {
         model: Option<String>,
     },
 
+    /// Owner-only, daemon-local disposition of a security-blocked aggregate.
+    RecoverSecurityBlockedMedia(cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1),
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon {
@@ -1453,6 +1456,7 @@ macro_rules! command {
             (Request::GetUsageCounts { .. }, "get_usage_counts", owner_only, none, false, concurrent, none);
             (Request::StatsRollup { .. }, "stats_rollup", owner_only, none, false, concurrent, none);
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
+            (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
             (Request::StopDaemon { .. }, "stop_daemon", owner_only, none, true, serialized, none);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, serialized, none);
             (Request::Unknown, "unknown", owner_only, none, false, serialized, none);

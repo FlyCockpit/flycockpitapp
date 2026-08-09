@@ -13,6 +13,8 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,

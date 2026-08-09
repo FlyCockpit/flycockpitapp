@@ -73,6 +73,12 @@ pub struct TerminalPasteClassifier {
 }
 
 impl TerminalPasteClassifier {
+    /// Resolve only the local shortcut intent after a native clipboard image
+    /// commits. Buffered rapid keys retain their ordinary ownership.
+    pub fn resolve_shortcut_intent(&mut self) {
+        self.shortcut_at = None;
+    }
+
     pub fn observe(&mut self, event: Event, observed_at: Duration) -> ClassifierDecision {
         if let Event::Paste(text) = event {
             let replay = self.take_replay();

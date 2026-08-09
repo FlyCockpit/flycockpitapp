@@ -161,20 +161,14 @@ impl App {
                 }) if terminal_generation == self.terminal_input_generation
                     && source_draft_generation == self.draft_generation =>
                 {
+                    self.terminal_paste_classifier.resolve_shortcut_intent();
                     self.composer.set_cursor(cursor);
                     self.insert_image_block(png);
                 }
-                Ok(AsyncActionPayload::NativeImagePaste {
-                    terminal_generation,
-                    source_draft_generation,
-                    png: None,
-                    ..
-                }) if terminal_generation == self.terminal_input_generation
-                    && source_draft_generation == self.draft_generation =>
-                {
-                    self.show_toast("Paste unavailable", ToastKind::Error);
-                }
-                Err(_) => self.show_toast("Paste unavailable", ToastKind::Error),
+                // The classifier owns the 250 ms timeout notice. A missing
+                // bitmap can still be followed by authoritative bracketed
+                // text, so the speculative native probe remains silent.
+                Ok(AsyncActionPayload::NativeImagePaste { png: None, .. }) | Err(_) => {}
                 Ok(_) => {}
             },
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {

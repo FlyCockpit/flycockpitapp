@@ -134,6 +134,99 @@ CREATE TABLE sessions (
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- ---- typed media attachments ----------------------------------------------
+-- Full-range monotonic values are canonical decimal text because SQLite's
+-- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
+-- values outside u64 before any mutation.
+CREATE TABLE media_attachments (
+    attachment_id                  TEXT PRIMARY KEY,
+    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    canonical_project_digest       TEXT NOT NULL,
+    media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
+    source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
+    canonical_container            TEXT NOT NULL,
+    canonical_mime                 TEXT NOT NULL,
+    availability                   TEXT NOT NULL CHECK (availability IN (
+        'registered', 'quarantined', 'probing', 'decoding', 'normalizing',
+        'ready', 'model_derivative_unavailable', 'source_changed', 'failed',
+        'security_blocked', 'owned_cleanup_pending', 'retained_copy_deleted',
+        'borrowed_cleanup_pending', 'borrowed_derivatives_deleted', 'metadata_deleted'
+    )),
+    attachment_version             TEXT NOT NULL,
+    availability_generation        TEXT NOT NULL,
+    reference_generation           TEXT NOT NULL,
+    captured_capability_generation TEXT NOT NULL,
+    source_identity_digest         TEXT NOT NULL,
+    source_byte_length             TEXT NOT NULL,
+    source_sha256                  TEXT NOT NULL,
+    selected_video_stream_json     TEXT,
+    selected_audio_stream_json     TEXT,
+    created_at_unix_ms             INTEGER NOT NULL,
+    updated_at_unix_ms             INTEGER NOT NULL,
+    draft_expires_at_unix_ms       INTEGER,
+    first_referenced_at_unix_ms    INTEGER,
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_identity_digest) = 64 AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((source_kind = 'authenticated_session_upload') OR draft_expires_at_unix_ms IS NULL)
+);
+
+CREATE INDEX idx_media_attachments_session
+    ON media_attachments(session_id, created_at_unix_ms, attachment_id);
+CREATE INDEX idx_media_attachments_cleanup
+    ON media_attachments(availability, draft_expires_at_unix_ms);
+
+CREATE TABLE media_attachment_components (
+    component_id          TEXT PRIMARY KEY,
+    attachment_id         TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_version    TEXT NOT NULL,
+    component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
+    storage_id            TEXT NOT NULL UNIQUE,
+    lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN ('temporary', 'ready', 'cleanup_pending', 'deleted', 'security_blocked')),
+    component_generation  TEXT NOT NULL,
+    stable_identity_digest TEXT NOT NULL,
+    byte_length           TEXT NOT NULL,
+    sha256                TEXT NOT NULL,
+    reservation_id        TEXT NOT NULL UNIQUE,
+    deletion_evidence_digest TEXT,
+    created_at_unix_ms    INTEGER NOT NULL,
+    updated_at_unix_ms    INTEGER NOT NULL,
+    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*'))
+);
+
+CREATE INDEX idx_media_attachment_components_attachment
+    ON media_attachment_components(attachment_id, component_id);
+
+CREATE TABLE media_attachment_references (
+    reference_id          TEXT PRIMARY KEY,
+    attachment_id         TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_version    TEXT NOT NULL,
+    consumer_kind         TEXT NOT NULL CHECK (consumer_kind IN ('message', 'tool', 'job')),
+    consumer_id           TEXT NOT NULL,
+    acquired_generation   TEXT NOT NULL,
+    acquired_at_unix_ms   INTEGER NOT NULL,
+    released_at_unix_ms   INTEGER,
+    UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id)
+);
+
+CREATE INDEX idx_media_attachment_references_live
+    ON media_attachment_references(attachment_id, released_at_unix_ms);
+
+CREATE TABLE media_attachment_cleanup_intents (
+    intent_id                         TEXT PRIMARY KEY,
+    attachment_id                    TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_version               TEXT NOT NULL,
+    expected_availability_generation TEXT NOT NULL,
+    expected_reference_generation    TEXT NOT NULL,
+    component_set_digest             TEXT NOT NULL,
+    reason                           TEXT NOT NULL CHECK (reason IN ('discard', 'draft_expired', 'session_retention', 'session_deleted', 'security_recovery')),
+    created_at_unix_ms               INTEGER NOT NULL,
+    completed_at_unix_ms             INTEGER,
+    CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*')
+);
+
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;

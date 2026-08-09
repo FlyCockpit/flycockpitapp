@@ -1,0 +1,850 @@
+//! Durable, session-owned typed media attachment records.
+//!
+//! Mutating `_conn` entry points deliberately accept the caller's SQLite
+//! connection. Callers compose them inside [`Db::transaction`](super::Db::transaction)
+//! with reservations, receipts, audit rows, or message commits; this module
+//! never opens or commits an independent transaction.
+
+use anyhow::{Context, Result, bail, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSourceKind {
+    LocalPath,
+    RetainedHttps,
+    AuthenticatedSessionUpload,
+}
+
+impl MediaSourceKind {
+    fn is_borrowed(self) -> bool {
+        self == Self::LocalPath
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaAvailability {
+    Registered,
+    Quarantined,
+    Probing,
+    Decoding,
+    Normalizing,
+    Ready,
+    ModelDerivativeUnavailable,
+    SourceChanged,
+    Failed,
+    SecurityBlocked,
+    OwnedCleanupPending,
+    RetainedCopyDeleted,
+    BorrowedCleanupPending,
+    BorrowedDerivativesDeleted,
+    MetadataDeleted,
+}
+
+impl MediaAvailability {
+    pub fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    pub fn permits_transition(self, source: MediaSourceKind, next: Self) -> bool {
+        use MediaAvailability as A;
+        let common_processing = matches!(
+            (self, next),
+            (A::Probing, A::Decoding)
+                | (A::Decoding, A::Normalizing)
+                | (A::Normalizing, A::Ready | A::ModelDerivativeUnavailable)
+                | (A::ModelDerivativeUnavailable, A::Normalizing)
+        );
+        if common_processing {
+            return true;
+        }
+        if source.is_borrowed() {
+            matches!(
+                (self, next),
+                (A::Registered, A::Probing)
+                    | (A::BorrowedDerivativesDeleted, A::MetadataDeleted)
+                    | (A::SecurityBlocked, A::BorrowedCleanupPending)
+            ) || matches!(next, A::SourceChanged)
+                && matches!(
+                    self,
+                    A::Registered
+                        | A::Probing
+                        | A::Decoding
+                        | A::Normalizing
+                        | A::Ready
+                        | A::ModelDerivativeUnavailable
+                )
+                || matches!(next, A::Failed)
+                    && matches!(
+                        self,
+                        A::Registered | A::Probing | A::Decoding | A::Normalizing
+                    )
+                || next == A::SecurityBlocked
+                    && !matches!(self, A::BorrowedDerivativesDeleted | A::MetadataDeleted)
+                || next == A::BorrowedCleanupPending
+                    && matches!(
+                        self,
+                        A::Registered
+                            | A::Probing
+                            | A::Decoding
+                            | A::Normalizing
+                            | A::Ready
+                            | A::ModelDerivativeUnavailable
+                            | A::SourceChanged
+                            | A::Failed
+                    )
+                || self == A::BorrowedCleanupPending && next == A::BorrowedDerivativesDeleted
+        } else {
+            matches!((self, next), (A::Quarantined, A::Probing))
+                || next == A::Failed
+                    && matches!(
+                        self,
+                        A::Quarantined | A::Probing | A::Decoding | A::Normalizing
+                    )
+                || next == A::SecurityBlocked
+                    && !matches!(self, A::OwnedCleanupPending | A::RetainedCopyDeleted)
+                || next == A::OwnedCleanupPending
+                    && matches!(
+                        self,
+                        A::Quarantined
+                            | A::Probing
+                            | A::Decoding
+                            | A::Normalizing
+                            | A::Ready
+                            | A::ModelDerivativeUnavailable
+                            | A::Failed
+                            | A::SecurityBlocked
+                    )
+                || self == A::OwnedCleanupPending && next == A::RetainedCopyDeleted
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedMediaStream {
+    pub index: u32,
+    pub codec: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaAttachmentRecord {
+    pub attachment_id: Uuid,
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    pub media_kind: MediaKind,
+    pub source_kind: MediaSourceKind,
+    pub canonical_container: String,
+    pub canonical_mime: String,
+    pub availability: MediaAvailability,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub reference_generation: u64,
+    pub captured_capability_generation: u64,
+    pub source_identity_digest: String,
+    pub source_byte_length: u64,
+    pub source_sha256: String,
+    pub selected_video_stream: Option<SelectedMediaStream>,
+    pub selected_audio_stream: Option<SelectedMediaStream>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub draft_expires_at_unix_ms: Option<i64>,
+    pub first_referenced_at_unix_ms: Option<i64>,
+}
+
+impl MediaAttachmentRecord {
+    pub fn ready_for(&self, session_id: Uuid, project_digest: &str) -> bool {
+        self.session_id == session_id
+            && self.canonical_project_digest == project_digest
+            && self.availability.is_ready()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaReferenceConsumerKind {
+    Message,
+    Tool,
+    Job,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquiredMediaReference {
+    pub reference_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub reference_generation: u64,
+    pub inserted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaCleanupIntent {
+    pub intent_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub expected_availability_generation: u64,
+    pub expected_reference_generation: u64,
+    pub component_set_digest: String,
+    pub reason: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaAttachmentComponent {
+    pub component_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub component_kind: String,
+    /// Opaque relative UUID storage name; never an absolute/caller path.
+    pub storage_id: Uuid,
+    pub lifecycle_state: String,
+    pub component_generation: u64,
+    pub stable_identity_digest: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    pub reservation_id: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+impl super::Db {
+    pub fn insert_media_attachment_component_conn(
+        conn: &Connection,
+        component: &MediaAttachmentComponent,
+    ) -> Result<()> {
+        ensure!(
+            component.attachment_version > 0
+                && component.component_generation > 0
+                && component.byte_length > 0,
+            "media component versions, generations, and bytes must be positive"
+        );
+        ensure!(
+            matches!(
+                component.component_kind.as_str(),
+                "quarantined_original"
+                    | "image_model"
+                    | "browser_thumbnail"
+                    | "audio_model"
+                    | "video_model"
+                    | "upload_temporary"
+            ),
+            "invalid media component kind"
+        );
+        ensure!(
+            matches!(
+                component.lifecycle_state.as_str(),
+                "temporary" | "ready" | "cleanup_pending" | "deleted" | "security_blocked"
+            ),
+            "invalid media component state"
+        );
+        validate_digest(
+            &component.stable_identity_digest,
+            "component identity digest",
+        )?;
+        validate_digest(&component.sha256, "component checksum")?;
+        conn.execute(
+            "INSERT INTO media_attachment_components (component_id,attachment_id,attachment_version,component_kind,storage_id,lifecycle_state,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![component.component_id.to_string(),component.attachment_id.to_string(),decimal(component.attachment_version)?,component.component_kind,component.storage_id.to_string(),component.lifecycle_state,decimal(component.component_generation)?,component.stable_identity_digest,decimal(component.byte_length)?,component.sha256,component.reservation_id,component.created_at_unix_ms,component.updated_at_unix_ms],
+        ).context("inserting media attachment component")?;
+        Ok(())
+    }
+
+    pub fn insert_media_attachment_conn(
+        conn: &Connection,
+        record: &MediaAttachmentRecord,
+    ) -> Result<()> {
+        validate_new_record(record)?;
+        conn.execute(
+            "INSERT INTO media_attachments (attachment_id,session_id,canonical_project_digest,media_kind,source_kind,canonical_container,canonical_mime,availability,attachment_version,availability_generation,reference_generation,captured_capability_generation,source_identity_digest,source_byte_length,source_sha256,selected_video_stream_json,selected_audio_stream_json,created_at_unix_ms,updated_at_unix_ms,draft_expires_at_unix_ms,first_referenced_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![
+                record.attachment_id.to_string(), record.session_id.to_string(),
+                record.canonical_project_digest, record.media_kind.as_str(), record.source_kind.as_str(),
+                record.canonical_container, record.canonical_mime, record.availability.as_str(),
+                decimal(record.attachment_version)?, decimal(record.availability_generation)?,
+                decimal(record.reference_generation)?, decimal(record.captured_capability_generation)?,
+                record.source_identity_digest, decimal(record.source_byte_length)?, record.source_sha256,
+                stream_json(&record.selected_video_stream)?, stream_json(&record.selected_audio_stream)?,
+                record.created_at_unix_ms, record.updated_at_unix_ms, record.draft_expires_at_unix_ms,
+                record.first_referenced_at_unix_ms,
+            ],
+        ).context("inserting media attachment")?;
+        Ok(())
+    }
+
+    /// Loads only an exact session/project-owned attachment. A miss is the
+    /// caller's uniform `media_attachment_unavailable` boundary.
+    pub fn media_attachment_for_owner_conn(
+        conn: &Connection,
+        attachment_id: Uuid,
+        session_id: Uuid,
+        canonical_project_digest: &str,
+    ) -> Result<Option<MediaAttachmentRecord>> {
+        conn.query_row(
+            "SELECT attachment_id,session_id,canonical_project_digest,media_kind,source_kind,canonical_container,canonical_mime,availability,attachment_version,availability_generation,reference_generation,captured_capability_generation,source_identity_digest,source_byte_length,source_sha256,selected_video_stream_json,selected_audio_stream_json,created_at_unix_ms,updated_at_unix_ms,draft_expires_at_unix_ms,first_referenced_at_unix_ms FROM media_attachments WHERE attachment_id=?1 AND session_id=?2 AND canonical_project_digest=?3",
+            params![attachment_id.to_string(), session_id.to_string(), canonical_project_digest],
+            decode_record,
+        ).optional().context("loading owned media attachment")
+    }
+
+    pub fn transition_media_attachment_conn(
+        conn: &Connection,
+        attachment_id: Uuid,
+        expected_version: u64,
+        expected_availability_generation: u64,
+        next: MediaAvailability,
+        now_unix_ms: i64,
+    ) -> Result<MediaAttachmentRecord> {
+        let current = media_attachment_by_id(conn, attachment_id)?
+            .context("media attachment does not exist")?;
+        ensure!(
+            current.attachment_version == expected_version,
+            "stale attachment version"
+        );
+        ensure!(
+            current.availability_generation == expected_availability_generation,
+            "stale availability generation"
+        );
+        ensure!(
+            current
+                .availability
+                .permits_transition(current.source_kind, next),
+            "invalid media availability transition"
+        );
+        let generation = current
+            .availability_generation
+            .checked_add(1)
+            .context("media availability generation overflow")?;
+        let changed = conn.execute(
+            "UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6",
+            params![next.as_str(), decimal(generation)?, now_unix_ms, attachment_id.to_string(), decimal(expected_version)?, decimal(expected_availability_generation)?],
+        ).context("transitioning media attachment")?;
+        ensure!(
+            changed == 1,
+            "media attachment transition lost compare-and-swap"
+        );
+        media_attachment_by_id(conn, attachment_id)?
+            .context("transitioned media attachment disappeared")
+    }
+
+    /// Acquires a durable, non-consuming reference. The unique consumer tuple
+    /// makes exact submission retry return the original reference without a
+    /// second generation increment.
+    pub fn acquire_media_reference_conn(
+        conn: &Connection,
+        reference_id: Uuid,
+        attachment_id: Uuid,
+        expected_version: u64,
+        session_id: Uuid,
+        project_digest: &str,
+        consumer_kind: MediaReferenceConsumerKind,
+        consumer_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<AcquiredMediaReference> {
+        let attachment =
+            Self::media_attachment_for_owner_conn(conn, attachment_id, session_id, project_digest)?
+                .context("media attachment unavailable")?;
+        ensure!(
+            attachment.availability.is_ready(),
+            "media attachment unavailable"
+        );
+        ensure!(
+            attachment.attachment_version == expected_version,
+            "media attachment unavailable"
+        );
+        if let Some(existing) = existing_reference(
+            conn,
+            attachment_id,
+            expected_version,
+            consumer_kind,
+            consumer_id,
+        )? {
+            return Ok(existing);
+        }
+        let generation = attachment
+            .reference_generation
+            .checked_add(1)
+            .context("media reference generation overflow")?;
+        conn.execute(
+            "INSERT INTO media_attachment_references (reference_id,attachment_id,attachment_version,consumer_kind,consumer_id,acquired_generation,acquired_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![reference_id.to_string(), attachment_id.to_string(), decimal(expected_version)?, consumer_kind.as_str(), consumer_id, decimal(generation)?, now_unix_ms],
+        ).context("inserting media attachment reference")?;
+        let changed = conn.execute(
+            "UPDATE media_attachments SET reference_generation=?1,first_referenced_at_unix_ms=COALESCE(first_referenced_at_unix_ms,?2),draft_expires_at_unix_ms=NULL,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND reference_generation=?4",
+            params![decimal(generation)?, now_unix_ms, attachment_id.to_string(), decimal(attachment.reference_generation)?],
+        ).context("advancing media reference generation")?;
+        ensure!(
+            changed == 1,
+            "media reference acquisition lost compare-and-swap"
+        );
+        Ok(AcquiredMediaReference {
+            reference_id,
+            attachment_id,
+            attachment_version: expected_version,
+            reference_generation: generation,
+            inserted: true,
+        })
+    }
+
+    pub fn create_media_cleanup_intent_conn(
+        conn: &Connection,
+        intent: &MediaCleanupIntent,
+    ) -> Result<()> {
+        ensure!(
+            intent.attachment_version > 0
+                && intent.expected_availability_generation > 0
+                && intent.expected_reference_generation > 0,
+            "media cleanup generations must be positive"
+        );
+        validate_digest(&intent.component_set_digest, "component set digest")?;
+        ensure!(
+            matches!(
+                intent.reason.as_str(),
+                "discard"
+                    | "draft_expired"
+                    | "session_retention"
+                    | "session_deleted"
+                    | "security_recovery"
+            ),
+            "invalid media cleanup reason"
+        );
+        conn.execute(
+            "INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![intent.intent_id.to_string(), intent.attachment_id.to_string(), decimal(intent.attachment_version)?, decimal(intent.expected_availability_generation)?, decimal(intent.expected_reference_generation)?, intent.component_set_digest, intent.reason, intent.created_at_unix_ms],
+        ).context("inserting media cleanup intent")?;
+        Ok(())
+    }
+
+    pub fn media_cleanup_intent_for_attachment_conn(
+        conn: &Connection,
+        attachment_id: Uuid,
+    ) -> Result<Option<MediaCleanupIntent>> {
+        conn.query_row(
+            "SELECT intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms FROM media_attachment_cleanup_intents WHERE attachment_id=?1",
+            [attachment_id.to_string()],
+            |row| {
+                let intent_id = Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?;
+                let persisted_attachment_id = Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error)))?;
+                let parse = |column, field| parse_decimal(row.get(column)?, field).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into()));
+                Ok(MediaCleanupIntent {
+                    intent_id,
+                    attachment_id: persisted_attachment_id,
+                    attachment_version: parse(2, "cleanup attachment version")?,
+                    expected_availability_generation: parse(3, "cleanup availability generation")?,
+                    expected_reference_generation: parse(4, "cleanup reference generation")?,
+                    component_set_digest: row.get(5)?,
+                    reason: row.get(6)?,
+                    created_at_unix_ms: row.get(7)?,
+                })
+            },
+        ).optional().context("loading media cleanup intent")
+    }
+
+    pub fn release_media_reference_conn(
+        conn: &Connection,
+        reference_id: Uuid,
+        expected_reference_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        let attachment_id = conn.query_row(
+            "SELECT attachment_id FROM media_attachment_references WHERE reference_id=?1 AND released_at_unix_ms IS NULL",
+            [reference_id.to_string()],
+            |row| row.get::<_, String>(0),
+        ).optional().context("loading live media reference")?
+            .context("media reference unavailable")?;
+        let attachment_id =
+            Uuid::parse_str(&attachment_id).context("invalid persisted media attachment id")?;
+        let current = media_attachment_by_id(conn, attachment_id)?
+            .context("referenced media attachment disappeared")?;
+        ensure!(
+            current.reference_generation == expected_reference_generation,
+            "stale reference generation"
+        );
+        let next = current
+            .reference_generation
+            .checked_add(1)
+            .context("media reference generation overflow")?;
+        let released = conn.execute(
+            "UPDATE media_attachment_references SET released_at_unix_ms=?1 WHERE reference_id=?2 AND released_at_unix_ms IS NULL",
+            params![now_unix_ms, reference_id.to_string()],
+        ).context("releasing media reference")?;
+        ensure!(
+            released == 1,
+            "media reference release lost compare-and-swap"
+        );
+        let changed = conn.execute(
+            "UPDATE media_attachments SET reference_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND reference_generation=?4",
+            params![decimal(next)?, now_unix_ms, attachment_id.to_string(), decimal(expected_reference_generation)?],
+        ).context("advancing released media reference generation")?;
+        ensure!(
+            changed == 1,
+            "media reference release lost attachment compare-and-swap"
+        );
+        Ok(next)
+    }
+}
+
+fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
+    ensure!(
+        record.attachment_version > 0
+            && record.availability_generation > 0
+            && record.reference_generation > 0
+            && record.captured_capability_generation > 0
+            && record.source_byte_length > 0,
+        "media versions, generations, and byte length must be positive"
+    );
+    let expected = if record.source_kind.is_borrowed() {
+        MediaAvailability::Registered
+    } else {
+        MediaAvailability::Quarantined
+    };
+    ensure!(
+        record.availability == expected,
+        "invalid initial media availability"
+    );
+    ensure!(
+        record.source_kind == MediaSourceKind::AuthenticatedSessionUpload
+            || record.draft_expires_at_unix_ms.is_none(),
+        "draft expiry is upload-only"
+    );
+    validate_digest(&record.canonical_project_digest, "project digest")?;
+    validate_digest(&record.source_identity_digest, "source identity digest")?;
+    validate_digest(&record.source_sha256, "source checksum")?;
+    ensure!(
+        record.selected_video_stream.is_none() || record.media_kind == MediaKind::Video,
+        "video stream requires video media kind"
+    );
+    ensure!(
+        record.selected_audio_stream.is_none() || record.media_kind != MediaKind::Image,
+        "audio stream is forbidden for images"
+    );
+    Ok(())
+}
+
+fn decimal(value: u64) -> Result<String> {
+    ensure!(value > 0, "media u64 value must be positive");
+    Ok(value.to_string())
+}
+
+fn parse_decimal(value: String, field: &'static str) -> Result<u64> {
+    ensure!(
+        !value.is_empty()
+            && (value == "0" || !value.starts_with('0'))
+            && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid canonical {field}"
+    );
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("invalid {field}"))?;
+    ensure!(parsed > 0, "{field} must be positive");
+    Ok(parsed)
+}
+
+fn validate_digest(value: &str, field: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "{field} must be lowercase SHA-256"
+    );
+    Ok(())
+}
+
+fn stream_json(stream: &Option<SelectedMediaStream>) -> Result<Option<String>> {
+    stream
+        .as_ref()
+        .map(|stream| {
+            serde_json::to_string(&(stream.index, &stream.codec))
+                .context("encoding selected media stream")
+        })
+        .transpose()
+}
+
+fn parse_stream(value: Option<String>) -> Result<Option<SelectedMediaStream>> {
+    value
+        .map(|value| {
+            let (index, codec): (u32, String) =
+                serde_json::from_str(&value).context("decoding selected media stream")?;
+            ensure!(!codec.is_empty(), "selected media stream codec is empty");
+            Ok(SelectedMediaStream { index, codec })
+        })
+        .transpose()
+}
+
+fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAttachmentRecord> {
+    decode_record_fallible(row).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+fn decode_record_fallible(row: &rusqlite::Row<'_>) -> Result<MediaAttachmentRecord> {
+    Ok(MediaAttachmentRecord {
+        attachment_id: Uuid::parse_str(&row.get::<_, String>(0)?)?,
+        session_id: Uuid::parse_str(&row.get::<_, String>(1)?)?,
+        canonical_project_digest: row.get(2)?,
+        media_kind: MediaKind::parse(&row.get::<_, String>(3)?)?,
+        source_kind: MediaSourceKind::parse(&row.get::<_, String>(4)?)?,
+        canonical_container: row.get(5)?,
+        canonical_mime: row.get(6)?,
+        availability: MediaAvailability::parse(&row.get::<_, String>(7)?)?,
+        attachment_version: parse_decimal(row.get(8)?, "attachment version")?,
+        availability_generation: parse_decimal(row.get(9)?, "availability generation")?,
+        reference_generation: parse_decimal(row.get(10)?, "reference generation")?,
+        captured_capability_generation: parse_decimal(
+            row.get(11)?,
+            "captured capability generation",
+        )?,
+        source_identity_digest: row.get(12)?,
+        source_byte_length: parse_decimal(row.get(13)?, "source byte length")?,
+        source_sha256: row.get(14)?,
+        selected_video_stream: parse_stream(row.get(15)?)?,
+        selected_audio_stream: parse_stream(row.get(16)?)?,
+        created_at_unix_ms: row.get(17)?,
+        updated_at_unix_ms: row.get(18)?,
+        draft_expires_at_unix_ms: row.get(19)?,
+        first_referenced_at_unix_ms: row.get(20)?,
+    })
+}
+
+fn media_attachment_by_id(conn: &Connection, id: Uuid) -> Result<Option<MediaAttachmentRecord>> {
+    conn.query_row("SELECT attachment_id,session_id,canonical_project_digest,media_kind,source_kind,canonical_container,canonical_mime,availability,attachment_version,availability_generation,reference_generation,captured_capability_generation,source_identity_digest,source_byte_length,source_sha256,selected_video_stream_json,selected_audio_stream_json,created_at_unix_ms,updated_at_unix_ms,draft_expires_at_unix_ms,first_referenced_at_unix_ms FROM media_attachments WHERE attachment_id=?1", [id.to_string()], decode_record).optional().context("loading media attachment")
+}
+
+fn existing_reference(
+    conn: &Connection,
+    attachment_id: Uuid,
+    version: u64,
+    kind: MediaReferenceConsumerKind,
+    consumer_id: &str,
+) -> Result<Option<AcquiredMediaReference>> {
+    conn.query_row("SELECT reference_id,acquired_generation FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND consumer_kind=?3 AND consumer_id=?4", params![attachment_id.to_string(), decimal(version)?, kind.as_str(), consumer_id], |row| {
+        let reference_id = Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?;
+        let generation = parse_decimal(row.get(1)?, "acquired generation").map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, error.into()))?;
+        Ok(AcquiredMediaReference { reference_id, attachment_id, attachment_version: version, reference_generation: generation, inserted: false })
+    }).optional().context("loading media attachment reference")
+}
+
+macro_rules! text_enum {
+    ($ty:ty, {$($variant:ident => $value:literal),+ $(,)?}) => {
+        impl $ty {
+            fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } }
+            fn parse(value: &str) -> Result<Self> { match value { $($value => Ok(Self::$variant),)+ _ => bail!("invalid {} `{value}`", stringify!($ty)) } }
+        }
+    };
+}
+
+text_enum!(MediaKind, { Image => "image", Audio => "audio", Video => "video" });
+text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload" });
+text_enum!(MediaReferenceConsumerKind, { Message => "message", Tool => "tool", Job => "job" });
+text_enum!(MediaAvailability, {
+    Registered => "registered", Quarantined => "quarantined", Probing => "probing", Decoding => "decoding",
+    Normalizing => "normalizing", Ready => "ready", ModelDerivativeUnavailable => "model_derivative_unavailable",
+    SourceChanged => "source_changed", Failed => "failed", SecurityBlocked => "security_blocked",
+    OwnedCleanupPending => "owned_cleanup_pending", RetainedCopyDeleted => "retained_copy_deleted",
+    BorrowedCleanupPending => "borrowed_cleanup_pending", BorrowedDerivativesDeleted => "borrowed_derivatives_deleted",
+    MetadataDeleted => "metadata_deleted"
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
+
+    #[test]
+    fn media_attachment_source_lifecycles_are_closed() {
+        assert!(
+            MediaAvailability::Registered
+                .permits_transition(MediaSourceKind::LocalPath, MediaAvailability::Probing)
+        );
+        assert!(!MediaAvailability::Registered.permits_transition(
+            MediaSourceKind::LocalPath,
+            MediaAvailability::OwnedCleanupPending
+        ));
+        assert!(MediaAvailability::Ready.permits_transition(
+            MediaSourceKind::RetainedHttps,
+            MediaAvailability::OwnedCleanupPending
+        ));
+        assert!(!MediaAvailability::Ready.permits_transition(
+            MediaSourceKind::RetainedHttps,
+            MediaAvailability::SourceChanged
+        ));
+        assert!(
+            !MediaAvailability::RetainedCopyDeleted
+                .permits_transition(MediaSourceKind::RetainedHttps, MediaAvailability::Ready)
+        );
+    }
+
+    #[test]
+    fn media_attachment_exact_u64_is_canonical() {
+        assert_eq!(
+            parse_decimal(u64::MAX.to_string(), "generation").unwrap(),
+            u64::MAX
+        );
+        assert!(parse_decimal("00".into(), "generation").is_err());
+        assert!(parse_decimal("0".into(), "generation").is_err());
+        assert!(parse_decimal("18446744073709551616".into(), "generation").is_err());
+    }
+
+    #[tokio::test]
+    async fn media_attachment_transaction_exposes_readiness_ownership_and_capability_generation() {
+        let db = super::super::Db::open_in_memory_async().await.unwrap();
+        let session_id = id(1);
+        let attachment_id = id(2);
+        let project_digest = "11".repeat(32);
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::RetainedHttps,
+            canonical_container: "png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Quarantined,
+            attachment_version: u64::MAX,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: u64::MAX,
+            source_identity_digest: "22".repeat(32),
+            source_byte_length: u64::MAX,
+            source_sha256: "33".repeat(32),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 10,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        };
+        let inserted = record.clone();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)",
+                [session_id.to_string()],
+            )?;
+            super::super::Db::insert_media_attachment_conn(conn, &inserted)
+        })
+        .await
+        .unwrap();
+
+        let loaded = db
+            .read(move |conn| {
+                super::super::Db::media_attachment_for_owner_conn(
+                    conn,
+                    attachment_id,
+                    session_id,
+                    &project_digest,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.availability.is_ready());
+        assert_eq!(loaded.attachment_version, u64::MAX);
+        assert_eq!(loaded.source_byte_length, u64::MAX);
+        assert_eq!(loaded.captured_capability_generation, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn media_attachment_reference_is_durable_non_consuming_and_idempotent() {
+        let db = super::super::Db::open_in_memory_async().await.unwrap();
+        let session_id = id(11);
+        let attachment_id = id(12);
+        let project_digest = "44".repeat(32);
+        let inserted_digest = project_digest.clone();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)",
+                [session_id.to_string()],
+            )?;
+            let record = MediaAttachmentRecord {
+                attachment_id,
+                session_id,
+                canonical_project_digest: inserted_digest,
+                media_kind: MediaKind::Image,
+                source_kind: MediaSourceKind::RetainedHttps,
+                canonical_container: "png".into(),
+                canonical_mime: "image/png".into(),
+                availability: MediaAvailability::Quarantined,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                captured_capability_generation: 7,
+                source_identity_digest: "55".repeat(32),
+                source_byte_length: 8,
+                source_sha256: "66".repeat(32),
+                selected_video_stream: None,
+                selected_audio_stream: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                draft_expires_at_unix_ms: None,
+                first_referenced_at_unix_ms: None,
+            };
+            super::super::Db::insert_media_attachment_conn(conn, &record)?;
+            let mut generation = 1;
+            for state in [
+                MediaAvailability::Probing,
+                MediaAvailability::Decoding,
+                MediaAvailability::Normalizing,
+                MediaAvailability::Ready,
+            ] {
+                super::super::Db::transition_media_attachment_conn(
+                    conn,
+                    attachment_id,
+                    1,
+                    generation,
+                    state,
+                    generation as i64 + 1,
+                )?;
+                generation += 1;
+            }
+            let first = super::super::Db::acquire_media_reference_conn(
+                conn,
+                id(13),
+                attachment_id,
+                1,
+                session_id,
+                &project_digest,
+                MediaReferenceConsumerKind::Message,
+                "message-a",
+                10,
+            )?;
+            let retry = super::super::Db::acquire_media_reference_conn(
+                conn,
+                id(14),
+                attachment_id,
+                1,
+                session_id,
+                &project_digest,
+                MediaReferenceConsumerKind::Message,
+                "message-a",
+                11,
+            )?;
+            let second = super::super::Db::acquire_media_reference_conn(
+                conn,
+                id(15),
+                attachment_id,
+                1,
+                session_id,
+                &project_digest,
+                MediaReferenceConsumerKind::Message,
+                "message-b",
+                12,
+            )?;
+            assert!(first.inserted);
+            assert!(!retry.inserted);
+            assert_eq!(retry.reference_id, first.reference_id);
+            assert!(second.inserted);
+            assert_eq!(second.reference_generation, first.reference_generation + 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+}

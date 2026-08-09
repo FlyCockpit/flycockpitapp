@@ -50,7 +50,7 @@ mod pointer_acceptance_tests;
 #[cfg(test)]
 mod pointer_action_fixtures;
 #[allow(dead_code)] // The registry is consumed incrementally by page fixture matrices.
-mod pointer_actions;
+pub(crate) mod pointer_actions;
 mod providers;
 mod reset;
 pub(crate) mod secret_display;
@@ -1311,20 +1311,18 @@ impl Dialog {
     /// Apply the result of an external-editor session the event loop ran on
     /// behalf of the Agents page: re-read the file from disk, re-parse it,
     /// surface any parse error inline, and refresh the row markers/model.
-    /// `editor_error` carries an external-process failure (non-zero exit /
-    /// missing binary) so the page reports it and leaves the file as-is.
+    /// The host reports a typed Saved/Cancelled/Failed terminal outcome;
+    /// only Saved may atomically replace the real agent path.
     pub(crate) fn finish_agent_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
-        editor_error: Option<String>,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
         let Dialog::Settings(s) = self else {
             return;
         };
-        let cwd = s.agents_cwd();
-        if let Some(p) = s.page.downcast_mut::<AgentsPage>() {
-            p.finish_external_edit(&cwd, operation_id, editor_error);
-        }
+        s.finish_agent_external_edit(operation_id, outcome, detail);
     }
 
     /// Drain a pending category setting `$EDITOR` request. The category page
@@ -1343,12 +1341,13 @@ impl Dialog {
     pub(crate) fn finish_category_setting_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
-        editor_error: Option<String>,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
         let Dialog::Settings(s) = self else {
             return;
         };
-        s.finish_category_external_edit(operation_id, editor_error);
+        s.finish_category_external_edit(operation_id, outcome, detail);
     }
 
     /// Called by the event loop each tick so async fetches can apply
@@ -2294,26 +2293,27 @@ impl SettingsDialog {
     fn finish_category_external_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
-        editor_error: Option<String>,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
         let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
             return;
         };
         self.cx
-            .finish_category_page_external_edit(p, operation_id, editor_error);
+            .finish_category_page_external_edit(p, operation_id, outcome, detail);
     }
 
-    #[cfg(test)]
-    fn finish_category_external_edit_outcome_for_test(
+    fn finish_agent_external_edit(
         &mut self,
         operation_id: shell::PointerOperationId,
         outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
-        let Some(p) = self.page.downcast_mut::<CategoryPage>() else {
+        let cwd = self.agents_cwd();
+        let Some(page) = self.page.downcast_mut::<AgentsPage>() else {
             return;
         };
-        self.cx
-            .finish_category_external_edit_outcome_for_test(p, operation_id, outcome);
+        page.finish_external_edit(&cwd, operation_id, outcome, detail);
     }
 
     // ── Rendering ────────────────────────────────────────────────────────

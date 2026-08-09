@@ -2248,13 +2248,9 @@ impl SettingsCx {
         &mut self,
         p: &mut CategoryPage,
         operation_id: PointerOperationId,
-        editor_error: Option<String>,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
-        let outcome = if editor_error.is_some() {
-            super::pointer_actions::ExternalEditOutcome::Failed
-        } else {
-            super::pointer_actions::ExternalEditOutcome::Saved
-        };
         let Some(setting) = p
             .pending_external_edit
             .as_ref()
@@ -2267,7 +2263,7 @@ impl SettingsCx {
             p,
             operation_id,
             super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome),
-            editor_error,
+            detail,
         );
     }
 
@@ -2301,14 +2297,6 @@ impl SettingsCx {
         let Some(pending) = p.pending_external_edit.take() else {
             return;
         };
-        let typed_action = super::pointer_actions::SettingsPointerAction::Category(
-            super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome),
-        );
-        #[cfg(test)]
-        {
-            super::pointer_acceptance_tests::record_rendered_action(&typed_action, true);
-            super::pointer_acceptance_tests::record_dispatched_action(&typed_action);
-        }
         match outcome {
             super::pointer_actions::ExternalEditOutcome::Cancelled => {
                 p.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
@@ -2355,34 +2343,14 @@ impl SettingsCx {
                 p.path_editor = None;
                 p.status = None;
                 self.finish_category_save(id, p);
+                if let Some(detail) = detail {
+                    p.status = Some(format!("saved; {detail}"));
+                }
             }
             Err(reason) => {
                 self.restore_category_external_edit(p, id, text, pending.source, reason);
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn finish_category_external_edit_outcome_for_test(
-        &mut self,
-        p: &mut CategoryPage,
-        operation_id: PointerOperationId,
-        outcome: super::pointer_actions::ExternalEditOutcome,
-    ) {
-        let Some(setting) = p
-            .pending_external_edit
-            .as_ref()
-            .filter(|pending| pending.operation_id == operation_id)
-            .map(|pending| pending.id)
-        else {
-            return;
-        };
-        self.reduce_category_external_edit_result(
-            p,
-            operation_id,
-            super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome),
-            None,
-        );
     }
 
     fn restore_category_external_edit(

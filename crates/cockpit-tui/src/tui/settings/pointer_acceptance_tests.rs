@@ -81,6 +81,13 @@ pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bo
     }
 }
 
+/// Record a typed action emitted by an injected non-visual effect source.
+/// Completion intents have no hit rectangle, but are still production
+/// vocabulary and must enter the same exhaustive source/reducer matrix.
+pub(super) fn record_source_action(action: &SettingsPointerAction) {
+    record_rendered_action(action, true);
+}
+
 pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
     ACTION_COVERAGE.with(|coverage| {
         coverage.borrow_mut().1.insert(action.clone());

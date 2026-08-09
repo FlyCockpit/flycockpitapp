@@ -91,9 +91,11 @@ pub(super) struct AgentExternalEdit {
     pub(super) id: PointerOperationId,
     pub(super) agent: super::pointer_actions::AgentId,
     pub(super) path: PathBuf,
-    /// Buffer write owned by the injected host effect. Keyboard list edits
-    /// pass `None` because their on-disk file is already the source.
-    pub(super) text_before_launch: Option<String>,
+    /// Same-directory staging file. The real path is replaced only after a
+    /// matching typed `Saved` completion.
+    staging: tempfile::TempPath,
+    /// Buffer write owned by the injected host effect.
+    pub(super) text_before_launch: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
     /// failed/cancelled operation restores this exact editor for retry.
     draft: Option<AgentEditor>,
@@ -106,7 +108,19 @@ pub(super) struct AgentExternalEdit {
 pub(crate) struct AgentExternalEditEffect {
     pub(crate) operation_id: PointerOperationId,
     pub(crate) path: PathBuf,
-    pub(crate) text_before_launch: Option<String>,
+    pub(crate) text_before_launch: String,
+}
+
+fn agent_external_edit_staging(target: &std::path::Path) -> Result<tempfile::TempPath, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("external edit target has no parent: {}", target.display()))?;
+    tempfile::Builder::new()
+        .prefix(".cockpit-agent-edit-")
+        .suffix(".stage")
+        .tempfile_in(parent)
+        .map(|file| file.into_temp_path())
+        .map_err(|error| format!("failed to create external-edit staging file: {error}"))
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -204,7 +218,7 @@ impl AgentsPage {
         pending.servicing = true;
         Some(AgentExternalEditEffect {
             operation_id: pending.id,
-            path: pending.path.clone(),
+            path: pending.staging.to_path_buf(),
             text_before_launch: pending.text_before_launch.clone(),
         })
     }
@@ -216,13 +230,9 @@ impl AgentsPage {
         &mut self,
         cwd: &std::path::Path,
         id: PointerOperationId,
-        editor_error: Option<String>,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
     ) {
-        let outcome = if editor_error.is_some() {
-            super::pointer_actions::ExternalEditOutcome::Failed
-        } else {
-            super::pointer_actions::ExternalEditOutcome::Saved
-        };
         let Some(agent) = self
             .pending_external_edit
             .as_ref()
@@ -235,7 +245,7 @@ impl AgentsPage {
             cwd,
             id,
             super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome),
-            editor_error,
+            detail,
         );
     }
 
@@ -261,20 +271,25 @@ impl AgentsPage {
         if !self.external_edit_ops.complete(id) {
             return;
         }
-        let typed_action = super::pointer_actions::SettingsPointerAction::Agents(
-            super::pointer_actions::AgentsAction::ExternalEditResult(agent.clone(), outcome),
-        );
-        #[cfg(test)]
-        {
-            super::pointer_acceptance_tests::record_rendered_action(&typed_action, true);
-            super::pointer_acceptance_tests::record_dispatched_action(&typed_action);
-        }
         let Some(mut pending) = self.pending_external_edit.take() else {
             return;
         };
         match outcome {
             super::pointer_actions::ExternalEditOutcome::Saved => {
-                self.refresh_after_edit(cwd, Some(&agent.0));
+                match pending.staging.persist(&pending.path) {
+                    Ok(_) => {
+                        self.refresh_after_edit(cwd, Some(&agent.0));
+                        if let Some(detail) = detail {
+                            self.status = Some(format!("saved `{}`; {detail}", agent.0));
+                        }
+                    }
+                    Err(error) => {
+                        self.editing = pending.draft.take();
+                        self.status = Some(format!(
+                            "failed to atomically commit external edit: {error}"
+                        ));
+                    }
+                }
             }
             super::pointer_actions::ExternalEditOutcome::Cancelled => {
                 self.editing = pending.draft.take();
@@ -285,29 +300,6 @@ impl AgentsPage {
                 self.status = Some(detail.unwrap_or_else(|| "external edit failed".into()));
             }
         }
-    }
-
-    #[cfg(test)]
-    fn finish_external_edit_outcome_for_test(
-        &mut self,
-        cwd: &std::path::Path,
-        id: PointerOperationId,
-        outcome: super::pointer_actions::ExternalEditOutcome,
-    ) {
-        let Some(agent) = self
-            .pending_external_edit
-            .as_ref()
-            .filter(|pending| pending.id == id)
-            .map(|pending| pending.agent.clone())
-        else {
-            return;
-        };
-        self.reduce_external_edit_result(
-            cwd,
-            id,
-            super::pointer_actions::AgentsAction::ExternalEditResult(agent, outcome),
-            None,
-        );
     }
 }
 
@@ -584,13 +576,21 @@ impl SettingsCx {
         }
         let path = editor.path.clone();
         let text = format!("{}\n", editor.text().trim_end_matches('\n'));
+        let staging = match agent_external_edit_staging(&path) {
+            Ok(staging) => staging,
+            Err(error) => {
+                p.status = Some(error);
+                return;
+            }
+        };
         let draft = p.editing.take();
         let id = p.external_edit_ops.begin();
         p.pending_external_edit = Some(AgentExternalEdit {
             id,
             agent: expected,
             path,
-            text_before_launch: Some(text),
+            staging,
+            text_before_launch: text,
             draft,
             servicing: false,
         });
@@ -797,12 +797,27 @@ impl SettingsCx {
             // marked overridden under the cursor; the loop will re-read the
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    p.status = Some(format!("edit failed: reading {}: {error}", path.display()));
+                    return;
+                }
+            };
+            let staging = match agent_external_edit_staging(&path) {
+                Ok(staging) => staging,
+                Err(error) => {
+                    p.status = Some(error);
+                    return;
+                }
+            };
             let id = p.external_edit_ops.begin();
             p.pending_external_edit = Some(AgentExternalEdit {
                 id,
                 agent: super::pointer_actions::AgentId(name.clone()),
                 path,
-                text_before_launch: None,
+                staging,
+                text_before_launch: text,
                 draft: None,
                 servicing: false,
             });
@@ -2282,9 +2297,19 @@ pub(super) mod tests {
         // Second drain is empty (taken).
         assert!(outer.take_pending_agent_edit().is_none());
         // A matching completion is accepted once; a duplicate is inert.
-        let operation_id = drained.unwrap().operation_id;
-        outer.finish_agent_edit(operation_id, None);
-        outer.finish_agent_edit(operation_id, Some("late duplicate".into()));
+        let effect = drained.unwrap();
+        let operation_id = effect.operation_id;
+        fs::write(&effect.path, &effect.text_before_launch).unwrap();
+        outer.finish_agent_edit(
+            operation_id,
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
+        outer.finish_agent_edit(
+            operation_id,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+            Some("late duplicate".into()),
+        );
         if let super::super::Dialog::Settings(s) = &mut outer {
             assert_ne!(page(s).status.as_deref(), Some("late duplicate"));
         }
@@ -2425,8 +2450,8 @@ pub(super) mod tests {
             .expect("effect request drains once");
         assert_eq!(request.operation_id, operation);
         assert_eq!(
-            request.text_before_launch.as_deref(),
-            Some("---\ndescription: pointer fixture\n---\nXbody\n")
+            request.text_before_launch,
+            "---\ndescription: pointer fixture\n---\nXbody\n"
         );
         assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
         let cwd = dialog.cx.agents_cwd();
@@ -2443,19 +2468,41 @@ pub(super) mod tests {
             page(&dialog).pending_external_edit.is_some(),
             "stale stable identity is inert"
         );
-        page_mut(&mut dialog).finish_external_edit(&cwd, PointerOperationId(operation.0 + 1), None);
+        dialog.finish_agent_external_edit(
+            PointerOperationId(operation.0 + 1),
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
         assert!(
             page(&dialog).pending_external_edit.is_some(),
             "stale completion is inert"
         );
-        fs::write(
-            &request.path,
-            request.text_before_launch.as_deref().unwrap(),
-        )
-        .unwrap();
-        page_mut(&mut dialog).finish_external_edit(&cwd, operation, None);
+        fs::write(&request.path, &request.text_before_launch).unwrap();
+        let saved_result = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                agent.clone(),
+                super::super::pointer_actions::ExternalEditOutcome::Saved,
+            ),
+        );
+        super::super::pointer_acceptance_tests::record_source_action(&saved_result);
+        dialog.finish_agent_external_edit(
+            operation,
+            super::super::pointer_actions::ExternalEditOutcome::Saved,
+            None,
+        );
+        super::super::pointer_acceptance_tests::record_dispatched_action(&saved_result);
+        assert!(
+            fs::read_to_string(agents_dir.join("pointer-agent.md"))
+                .unwrap()
+                .contains("\nXbody"),
+            "Saved atomically commits the staged edit"
+        );
         let status = page(&dialog).status.clone();
-        page_mut(&mut dialog).finish_external_edit(&cwd, operation, Some("duplicate".into()));
+        dialog.finish_agent_external_edit(
+            operation,
+            super::super::pointer_actions::ExternalEditOutcome::Failed,
+            Some("duplicate".into()),
+        );
         assert_eq!(
             page(&dialog).status,
             status,
@@ -2482,12 +2529,21 @@ pub(super) mod tests {
                 .page
                 .handle_pointer_control(&mut retry.cx, action.clone());
             retry.page.handle_pointer_control(&mut retry.cx, action);
-            let operation = page_mut(&mut retry)
+            let effect = page_mut(&mut retry)
                 .take_external_edit_request()
-                .expect("terminal outcome effect")
-                .operation_id;
+                .expect("terminal outcome effect");
+            let operation = effect.operation_id;
+            fs::write(&effect.path, "externally changed staging").unwrap();
             let cwd = retry.cx.agents_cwd();
-            page_mut(&mut retry).finish_external_edit_outcome_for_test(&cwd, operation, outcome);
+            let result_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                    agent.clone(),
+                    outcome,
+                ),
+            );
+            super::super::pointer_acceptance_tests::record_source_action(&result_action);
+            retry.finish_agent_external_edit(operation, outcome, None);
+            super::super::pointer_acceptance_tests::record_dispatched_action(&result_action);
             assert!(page(&retry).pending_external_edit.is_none());
             assert!(
                 page(&retry)
@@ -2497,6 +2553,12 @@ pub(super) mod tests {
                 "{outcome:?} restores the exact retryable draft"
             );
             assert!(page(&retry).external_edit_ops.pending().is_none());
+            assert!(
+                !fs::read_to_string(agents_dir.join("pointer-agent.md"))
+                    .unwrap()
+                    .contains("RETAINED"),
+                "{outcome:?} never mutates the real agent path"
+            );
         }
     }
 

@@ -157,7 +157,7 @@ pub(super) enum ConfirmationChoice {
     Cancel,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum ExternalEditOutcome {
+pub(crate) enum ExternalEditOutcome {
     Saved,
     Cancelled,
     Failed,

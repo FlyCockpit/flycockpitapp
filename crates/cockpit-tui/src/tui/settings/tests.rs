@@ -2324,7 +2324,11 @@ fn category_ctrl_g_focused_prose_setting_round_trips_and_commits() {
         .expect("category external edit should be pending");
     assert!(d.take_pending_category_external_edit().is_none());
     std::fs::write(&path, "external compact prompt\n").unwrap();
-    d.finish_category_external_edit(operation_id, None);
+    d.finish_category_external_edit(
+        operation_id,
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
 
     assert_eq!(
         d.extended.compact_prompt.as_deref(),
@@ -2722,17 +2726,37 @@ pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
         .take_pending_category_external_edit()
         .expect("category effect drains once");
     assert!(dialog.take_pending_category_external_edit().is_none());
-    dialog.finish_category_external_edit(PointerOperationId(operation.0 + 1), None);
+    dialog.finish_category_external_edit(
+        PointerOperationId(operation.0 + 1),
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
     assert!(matches!(
         dialog.test_page(),
         TestPageRef::Category(page) if page.pending_external_edit.is_some()
     ));
-    dialog.finish_category_external_edit(operation, None);
+    let saved_action = pointer_actions::SettingsPointerAction::Category(
+        pointer_actions::CategoryAction::ExternalEditResult(
+            SettingId::Name,
+            pointer_actions::ExternalEditOutcome::Saved,
+        ),
+    );
+    super::pointer_acceptance_tests::record_source_action(&saved_action);
+    dialog.finish_category_external_edit(
+        operation,
+        pointer_actions::ExternalEditOutcome::Saved,
+        None,
+    );
+    super::pointer_acceptance_tests::record_dispatched_action(&saved_action);
     let status = match dialog.test_page() {
         TestPageRef::Category(page) => page.status.clone(),
         _ => unreachable!(),
     };
-    dialog.finish_category_external_edit(operation, Some("duplicate".into()));
+    dialog.finish_category_external_edit(
+        operation,
+        pointer_actions::ExternalEditOutcome::Failed,
+        Some("duplicate".into()),
+    );
     assert!(matches!(
         dialog.test_page(),
         TestPageRef::Category(page) if page.status == status
@@ -2761,7 +2785,12 @@ pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
             .take_pending_category_external_edit()
             .expect("category outcome effect")
             .0;
-        dialog.finish_category_external_edit_outcome_for_test(operation, outcome);
+        let result_action = pointer_actions::SettingsPointerAction::Category(
+            pointer_actions::CategoryAction::ExternalEditResult(SettingId::Name, outcome),
+        );
+        super::pointer_acceptance_tests::record_source_action(&result_action);
+        dialog.finish_category_external_edit(operation, outcome, None);
+        super::pointer_acceptance_tests::record_dispatched_action(&result_action);
         assert!(matches!(
             dialog.test_page(),
             TestPageRef::Category(page)

@@ -488,13 +488,16 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             byte_len,
             sha256,
             purpose,
-        } => begin_attachment_upload_admitted(ctx, state, mime, byte_len, sha256, purpose).await,
+        } => {
+            begin_attachment_upload_admitted(ctx, state, mime, byte_len as usize, sha256, purpose)
+                .await
+        }
 
         Request::UploadAttachmentChunk {
             upload_id,
             offset,
             data_base64,
-        } => upload_attachment_chunk(state, upload_id, offset, data_base64),
+        } => upload_attachment_chunk(state, upload_id, offset as usize, data_base64),
 
         Request::FinishAttachmentUpload { upload_id } => {
             finish_attachment_upload_admitted(ctx, state, upload_id).await

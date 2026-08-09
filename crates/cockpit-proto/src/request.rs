@@ -196,14 +196,14 @@ pub enum Request {
 
     BeginAttachmentUpload {
         mime: String,
-        byte_len: usize,
+        byte_len: u64,
         sha256: String,
         purpose: AttachmentPurpose,
     },
 
     UploadAttachmentChunk {
         upload_id: Uuid,
-        offset: usize,
+        offset: u64,
         data_base64: String,
     },
 
@@ -1073,6 +1073,14 @@ impl Request {
         }
 
         match self {
+            Self::BeginAttachmentUpload { byte_len, .. } => {
+                usize::try_from(*byte_len)
+                    .map_err(|_| "byte_len exceeds daemon platform capacity".to_string())?;
+            }
+            Self::UploadAttachmentChunk { offset, .. } => {
+                usize::try_from(*offset)
+                    .map_err(|_| "offset exceeds daemon platform capacity".to_string())?;
+            }
             Self::Attach {
                 initial_model,
                 model_override,
@@ -1340,8 +1348,8 @@ macro_rules! command {
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid");
             (Request::CancelRunInvocation { client_submission_id }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid");
             (Request::SteerDelegation { session_id, task_call_id, label, message }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|task_call_id:String|label:String|message:String");
-            (Request::BeginAttachmentUpload { mime, byte_len, sha256, purpose }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "mime:String|byte_len:usize|sha256:String|purpose:AttachmentPurpose");
-            (Request::UploadAttachmentChunk { upload_id, offset, data_base64 }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid|offset:usize|data_base64:String");
+            (Request::BeginAttachmentUpload { mime, byte_len, sha256, purpose }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "mime:String|byte_len:u64|sha256:String|purpose:AttachmentPurpose");
+            (Request::UploadAttachmentChunk { upload_id, offset, data_base64 }, "upload_attachment_chunk", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid|offset:u64|data_base64:String");
             (Request::FinishAttachmentUpload { upload_id }, "finish_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
             (Request::CancelAttachmentUpload { upload_id }, "cancel_attachment_upload", custom(authorize_attachment_upload_step), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "upload_id:Uuid");
             (Request::RemoveQueuedUserMessage { queue_item_id }, "remove_queued_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "queue_item_id:Uuid");
@@ -1438,7 +1446,7 @@ macro_rules! command {
             (Request::SetPreflight { enabled }, "set_preflight", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
             (Request::SetLongcache { enabled }, "set_longcache", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "enabled:Option<bool>");
             (Request::SetRedaction { scan_environment, scan_dotenv, scan_ssh_keys }, "set_redaction", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>");
-            (Request::SetTandemModels { models }, "set_tandem_models", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "models:Vec<(String, String)>");
+            (Request::SetTandemModels { models }, "set_tandem_models", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "models:Vec<(String,String)>");
             (Request::SetCaffeinate { mode }, "set_caffeinate", owner_only, none, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "mode:CaffeinateMode");
             (Request::CancelSchedule { job_id }, "cancel_schedule", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "job_id:String");
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-");
@@ -1447,7 +1455,7 @@ macro_rules! command {
             (Request::StoreFlycockpitCredential { credential }, "store_flycockpit_credential", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "credential:StoredFlycockpitCredential");
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "-");
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-");
-            (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "vars:HashMap<String, String>");
+            (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "vars:HashMap<String,String>");
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "-");
             (Request::RecordUsage { kind, key, project_id }, "record_usage", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>");
             (Request::GetUsageCounts { project_id }, "get_usage_counts", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>");
@@ -1648,6 +1656,78 @@ pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass>
 }
 pub fn remote_operation_fcor_schema_for_tag(tag: &str) -> Option<&'static str> {
     crate::command!(command_remote_fcor_schema_tag, tag)
+}
+
+fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "u16" => "u16",
+        "u32" => "u32",
+        "u64" => "u64",
+        "i64" => "i64",
+        "bool" => "bool",
+        "String" => "string",
+        "Uuid" => "uuid",
+        "Vec<u8>" => "bytes",
+        "Option<String>" => "option<string>",
+        "Option<Uuid>" => "option<uuid>",
+        "Option<bool>" => "option<bool>",
+        "Option<i64>" => "option<i64>",
+        "Option<u64>" => "option<u64>",
+        "Vec<Uuid>" => "list<uuid>",
+        "Vec<(String,String)>" => "list<tuple<string,string>>",
+        "HashMap<String,String>" => "map<string,string>",
+        "Vec<ImageAttachmentRef>" => "list<struct:ImageAttachmentRef:v1>",
+        "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",
+        "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
+        "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
+        "Option<LlmMode>" => "option<enum16:LlmMode>",
+        "Option<PromptCacheRetention>" => "option<enum16:PromptCacheRetention>",
+        "Option<SandboxMode>" => "option<enum16:SandboxMode>",
+        "Option<cockpit_config::config::providers::ThinkingMode>" => "option<enum16:ThinkingMode>",
+        "Option<cockpit_config::config::providers::ActiveModelRef>" => {
+            "option<struct:ActiveModelRef:v1>"
+        }
+        "ActiveModelSwitchTrigger"
+        | "AppFlagKey"
+        | "ApprovalMode"
+        | "AssistantSessionResolutionMode"
+        | "AttachmentPurpose"
+        | "CaffeinateMode"
+        | "CuratorAction"
+        | "EnvDriftPolicy"
+        | "ExportSessionKind"
+        | "GoalDisposition"
+        | "LlmMode"
+        | "LspControlAction"
+        | "UsageKind"
+        | "WorkspaceTrustMode"
+        | "StatsRange" => "enum16",
+        "ResolveResponse" | "ScheduledJobCreate" | "StoredFlycockpitCredential" => "struct:v1",
+        "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
+        "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
+        _ => return None,
+    })
+}
+
+pub fn canonical_remote_operation_fcor_schema_for_tag(tag: &str) -> Option<String> {
+    let source = remote_operation_fcor_schema_for_tag(tag)?;
+    if source == "-" {
+        return Some("-".to_owned());
+    }
+    source
+        .split('|')
+        .map(|field| {
+            let (name, ty) = field.split_once(':')?;
+            let codec = canonical_fcor_codec_for_rust_type(ty)?;
+            let codec = match codec {
+                "enum16" => format!("enum16:{ty}"),
+                "struct:v1" => format!("struct:{ty}:v1"),
+                other => other.to_owned(),
+            };
+            Some(format!("{name}:{codec}"))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|fields| fields.join("|"))
 }
 pub fn remote_adapter_recovery_contract_for_tag(
     tag: &str,
@@ -1932,6 +2012,14 @@ mod tests {
                 Some(schema),
                 "FCOR source schema drift for {tag} ({variant})"
             );
+            assert!(
+                canonical_remote_operation_fcor_schema_for_tag(tag).is_some(),
+                "unsupported canonical FCOR type in {tag}: {schema}"
+            );
+            assert!(
+                !schema.contains("usize"),
+                "platform-width FCOR field in {tag}"
+            );
         }
         assert_eq!(
             variants.len(),
@@ -1957,6 +2045,8 @@ mod tests {
                 "strategy": stringify!($recovery),
                 "evidence": remote_evidence_json!($($recovery_evidence)?),
                 "fcorSchema": $fcor_schema,
+                "fcorCanonicalSchema": canonical_remote_operation_fcor_schema_for_tag($tag)
+                    .expect("registered canonical FCOR schema"),
             })),+]
         }};
     }

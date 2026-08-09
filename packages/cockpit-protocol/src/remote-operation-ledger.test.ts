@@ -7,6 +7,7 @@ describe("remote operation classification fixture", () => {
     expect(fixture.rows.length).toBeGreaterThan(100);
     expect(new Set(fixture.rows.map((row) => row.tag)).size).toBe(fixture.rows.length);
     expect(fixture.rows.every((row) => typeof row.fcorSchema === "string")).toBe(true);
+    expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);
     const byTag = new Map(fixture.rows.map((row) => [row.tag, row]));
     for (const tag of [
       "cancel_run_invocation",
@@ -39,6 +40,7 @@ describe("remote operation classification fixture", () => {
     expect(byTag.get("fs_rename")?.fcorSchema).toBe(
       "project_root:String|from_path:String|to_path:String",
     );
+    expect(byTag.get("refresh_env")?.fcorCanonicalSchema).toBe("vars:map<string,string>");
     expect(byTag.get("unknown")).toMatchObject({
       class: "rejected",
       strategy: "rejected_before_dispatch",

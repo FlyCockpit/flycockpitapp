@@ -8070,7 +8070,7 @@ async fn assert_attachment_mutating_happy(kind: &str) {
             begin_id,
             Request::BeginAttachmentUpload {
                 mime: proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
-                byte_len: png.len(),
+                byte_len: png.len() as u64,
                 sha256: sha,
                 purpose: proto::AttachmentPurpose::UserMessageImage,
             },

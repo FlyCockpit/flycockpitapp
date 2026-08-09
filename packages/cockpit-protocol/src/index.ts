@@ -31,6 +31,14 @@ const opaqueProtocolIdSchema = z.string().superRefine((value, ctx) => {
 
 /** A `u32` wire field: Rust bounds this by type, so the schema must too. */
 const u32Schema = z.number().int().nonnegative().max(0xffffffff);
+/** JSON-number projection of Rust `u64`; unsafe integers cannot round-trip exactly in JS. */
+const safeU64NumberSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+/** JSON-number projection of Rust `i64`; unsafe integers cannot round-trip exactly in JS. */
+const safeI64NumberSchema = z
+  .number()
+  .int()
+  .min(Number.MIN_SAFE_INTEGER)
+  .max(Number.MAX_SAFE_INTEGER);
 
 export const bulkTransferRefSchema = z
   .object({
@@ -242,7 +250,7 @@ const requestParamSchemas = {
   mark_app_flag_seen: z
     .object({
       key: z.literal("daemon_autostart_notice"),
-      expected_version: z.number().int().nonnegative(),
+      expected_version: safeU64NumberSchema,
     })
     .strict(),
   resolve_assistant_session: z
@@ -256,7 +264,7 @@ const requestParamSchemas = {
     .object({
       project_root: projectRootSchema,
       mode: z.enum(["trust", "ignore_config", "untrusted"]),
-      expected_config_generation: z.number().int().nonnegative(),
+      expected_config_generation: safeU64NumberSchema,
     })
     .strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
@@ -932,7 +940,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
       .object({
         key: z.literal("daemon_autostart_notice"),
         seen: z.boolean(),
-        version: z.number().int().nonnegative(),
+        version: safeU64NumberSchema,
       })
       .strict(),
   ),
@@ -941,7 +949,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z
       .object({
         key: z.literal("daemon_autostart_notice"),
-        version: z.number().int().nonnegative(),
+        version: safeU64NumberSchema,
         changed: z.boolean(),
       })
       .strict(),
@@ -957,8 +965,8 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
         org_sync: z
           .object({
             org_id: z.string(),
-            cursor_seq: z.number().int(),
-            last_synced_at_ms: z.number().int().optional(),
+            cursor_seq: safeI64NumberSchema,
+            last_synced_at_ms: safeI64NumberSchema.optional(),
           })
           .strict()
           .optional(),
@@ -973,17 +981,17 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
           })
           .strict()
           .optional(),
-        config_generation: z.number().int().nonnegative(),
+        config_generation: safeU64NumberSchema,
       })
       .strict(),
   ),
   responseVariant(
     "workspace_trust_set",
-    z.object({ config_generation: z.number().int().nonnegative() }).strict(),
+    z.object({ config_generation: safeU64NumberSchema }).strict(),
   ),
   responseVariant(
     "config_refreshed",
-    z.object({ applied_generation: z.number().int().nonnegative(), changed: z.boolean() }).strict(),
+    z.object({ applied_generation: safeU64NumberSchema, changed: z.boolean() }).strict(),
   ),
   responseVariant("attached", attachedDataSchema),
   responseVariant("export_session_data", z.object({ data: exportSessionDataSchema }).passthrough()),

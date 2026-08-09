@@ -429,4 +429,59 @@ describe("cockpit-proto daemon wire schemas", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("bounds mirrored Rust u64 and i64 JSON numbers to exact JavaScript integers", () => {
+    const markSeen = requestsFixture.mark_app_flag_seen;
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...markSeen,
+        params: { ...markSeen.params, expected_version: Number.MAX_SAFE_INTEGER },
+      }).success,
+    ).toBe(true);
+    for (const expected_version of [-1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...markSeen,
+          params: { ...markSeen.params, expected_version },
+        }).success,
+      ).toBe(false);
+    }
+
+    const disclosures = responsesFixture.startup_disclosures;
+    for (const cursor_seq of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...disclosures,
+          data: {
+            ...disclosures.data,
+            org_sync: { ...disclosures.data.org_sync, cursor_seq },
+          },
+        }).success,
+      ).toBe(true);
+    }
+    for (const cursor_seq of [Number.MIN_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...disclosures,
+          data: {
+            ...disclosures.data,
+            org_sync: { ...disclosures.data.org_sync, cursor_seq },
+          },
+        }).success,
+      ).toBe(false);
+    }
+
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.workspace_trust_set,
+        data: { config_generation: 1e100 },
+      }).success,
+    ).toBe(false);
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.config_refreshed,
+        data: { ...responsesFixture.config_refreshed.data, applied_generation: 1e100 },
+      }).success,
+    ).toBe(false);
+  });
 });

@@ -164,6 +164,7 @@ pub(super) fn user_message_wire_fingerprint(
     crate::intel::hex_lower(&hasher.finalize())
 }
 
+#[cfg(test)]
 pub(super) async fn validate_png_attachment(
     bytes: Vec<u8>,
 ) -> std::result::Result<ValidatedPngAttachment, ErrorPayload> {

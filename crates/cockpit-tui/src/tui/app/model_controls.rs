@@ -501,6 +501,27 @@ impl App {
             );
             return false;
         };
+        let parked = self
+            .deferred_fence_dispatches
+            .iter()
+            .filter_map(|(id, deferred)| {
+                (deferred.waiting_model_selection == Some(uuid::Uuid::nil())).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in parked {
+            let Ok(fence_sequence) = self
+                .submission_order
+                .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(id))
+            else {
+                continue;
+            };
+            if let Some(fence) = self.submission_fences.get_mut(&id) {
+                fence.fence_sequence = fence_sequence;
+            }
+            if let Some(deferred) = self.deferred_fence_dispatches.get_mut(&id) {
+                deferred.waiting_model_selection = Some(selection_id);
+            }
+        }
         let queued_submission = self
             .take_current_model_selection_retry()
             .and_then(|retry| retry.queued_submission);
@@ -893,10 +914,27 @@ impl App {
     pub(super) fn cancel_model_controls_for_runner_epoch(
         &mut self,
     ) -> Option<super::PendingModelSelection> {
-        let pending = self
-            .pending_model_selection
-            .take()
-            .map(|pending| self.preserve_failed_model_selection(pending));
+        let pending = self.pending_model_selection.take();
+        if let Some(pending) = pending.as_ref() {
+            self.submission_order.cancel(pending.order_sequence);
+            let parked = self
+                .deferred_fence_dispatches
+                .iter()
+                .filter_map(|(id, deferred)| {
+                    (deferred.waiting_model_selection == Some(pending.selection_id)).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in parked {
+                if let Some(fence) = self.submission_fences.get_mut(&id) {
+                    self.submission_order.cancel(fence.fence_sequence);
+                    fence.fence_sequence = 0;
+                }
+                if let Some(deferred) = self.deferred_fence_dispatches.get_mut(&id) {
+                    deferred.waiting_model_selection = Some(uuid::Uuid::nil());
+                }
+            }
+        }
+        let pending = pending.map(|pending| self.preserve_failed_model_selection(pending));
         self.pending_control_requests
             .retain(|_, request| !matches!(request.applied, ControlApplied::ModelSelection { .. }));
         pending

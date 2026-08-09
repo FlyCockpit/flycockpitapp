@@ -3776,6 +3776,25 @@ impl App {
     ) -> bool {
         if self.terminal_input_generation != Some(terminal_generation) {
             let replay = self.terminal_paste_classifier.cancel();
+            let cancelled_fences = self
+                .pending_paste_probes
+                .values()
+                .filter_map(|probe| probe.owner_fence)
+                .collect::<std::collections::HashSet<_>>();
+            let had_unowned = self
+                .pending_paste_probes
+                .values()
+                .any(|probe| probe.owner_fence.is_none());
+            self.pending_paste_probes.clear();
+            for id in cancelled_fences {
+                self.deferred_fence_dispatches.remove(&id);
+                if let Some(fence) = self.submission_fences.remove(&id) {
+                    self.submission_order.cancel(fence.fence_sequence);
+                }
+            }
+            if had_unowned {
+                self.show_toast("Paste unavailable", ToastKind::Error);
+            }
             self.terminal_input_generation = Some(terminal_generation);
             for key in replay {
                 if self.handle_key(key) {

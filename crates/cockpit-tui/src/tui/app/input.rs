@@ -2085,7 +2085,7 @@ impl App {
             .expand_display(self.composer.text())
             .trim()
             .to_string();
-        let pending_probe_ids = self
+        let mut pending_probe_ids = self
             .pending_paste_probes
             .iter()
             .filter_map(|(id, probe)| {
@@ -2094,6 +2094,12 @@ impl App {
                 .then_some(*id)
             })
             .collect::<Vec<_>>();
+        pending_probe_ids.sort_unstable_by_key(|id| {
+            self.pending_paste_probes
+                .get(id)
+                .map(|probe| probe.request.paste_generation)
+                .unwrap_or_default()
+        });
         if submitted.is_empty() && self.paste_registry.is_empty() && pending_probe_ids.is_empty() {
             return false;
         }

@@ -176,12 +176,15 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
     let (external_journal, external_journal_failed) = external_journal_lines();
 
-    let dependency_snapshot = crate::external_runtime::global_health_store().current();
-    let dependency_descriptors = crate::external_runtime::global_registry().descriptors();
-    let dependencies = crate::external_runtime::project_dependencies(
-        dependency_snapshot.as_deref(),
-        &dependency_descriptors,
-    );
+    let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
+        Some((snapshot, descriptors)) => {
+            crate::external_runtime::project_dependencies(Some(snapshot.as_ref()), &descriptors)
+        }
+        None => crate::external_runtime::project_dependencies(
+            None,
+            &crate::external_runtime::global_registry().descriptors(),
+        ),
+    };
 
     Ok(DiagnosticsSnapshot {
         session: session_label(input.session_id, input.session_short_id.as_deref()),
@@ -1073,6 +1076,14 @@ pub fn dependency_projection_with_deadline_and_publish(
     dependency_projection_with_deadline_internal(cwd, deadline, true, true)
 }
 
+pub fn dependency_projection_with_deadline_and_publish_for_run(
+    cwd: PathBuf,
+    deadline: Duration,
+    sandbox_enabled: bool,
+) -> Result<crate::external_runtime::DependencyProjection> {
+    dependency_projection_with_deadline_internal(cwd, deadline, sandbox_enabled, true)
+}
+
 pub fn dependency_projection_with_deadline_for_run(
     cwd: PathBuf,
     deadline: Duration,
@@ -1104,12 +1115,8 @@ fn dependency_projection_with_deadline_internal(
     let worker_cwd = cwd.clone();
     let harnesses = crate::config::extended::resolve_harnesses(&worker_cwd);
     let compose = doctor_integration_input(&worker_cwd, &harnesses, sandbox_enabled);
-    let descriptors = if publish_complete {
-        crate::external_runtime::publish_invocation_descriptor_roster(&compose)
-    } else {
-        crate::external_runtime::invocation_descriptor_roster(&compose)
-    }
-    .map_err(anyhow::Error::new)?;
+    let descriptors = crate::external_runtime::invocation_descriptor_roster(&compose)
+        .map_err(anyhow::Error::new)?;
     let generation = if publish_complete {
         crate::external_runtime::global_health_store().begin_refresh()
     } else {
@@ -1165,7 +1172,7 @@ fn dependency_projection_with_deadline_internal(
                 let snapshot = result?;
                 if publish_complete {
                     let _ = crate::external_runtime::global_health_store()
-                        .publish(snapshot.as_ref().clone());
+                        .publish_bundle(snapshot.as_ref().clone(), descriptors.clone());
                 }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(snapshot.as_ref()),
@@ -1189,7 +1196,7 @@ fn dependency_projection_with_deadline_internal(
                             let snapshot = result?;
                             if publish_complete {
                                 let _ = crate::external_runtime::global_health_store()
-                                    .publish(snapshot.as_ref().clone());
+                                    .publish_bundle(snapshot.as_ref().clone(), descriptors.clone());
                             }
                             return Ok(crate::external_runtime::project_dependencies(
                                 Some(snapshot.as_ref()),
@@ -1228,8 +1235,8 @@ fn dependency_projection_with_deadline_internal(
                 }
                 let snapshot = crate::external_runtime::freeze_pending_as_timed_out(&snapshot);
                 if publish_complete {
-                    let _ =
-                        crate::external_runtime::global_health_store().publish(snapshot.clone());
+                    let _ = crate::external_runtime::global_health_store()
+                        .publish_bundle(snapshot.clone(), descriptors.clone());
                 }
                 return Ok(crate::external_runtime::project_dependencies(
                     Some(&snapshot),

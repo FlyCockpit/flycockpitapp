@@ -65,6 +65,7 @@ pub enum AsyncActionPayload {
         active_model: Option<(String, String)>,
         estimate: crate::tui::agent_runner::GuidanceEstimate,
     },
+    StartupDependencyProjection(cockpit_core::external_runtime::DependencyProjection),
     SessionSwitched(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
     ForkSessionSwitched {
         outcome: Box<crate::tui::agent_runner::SessionSwitchOutcome>,

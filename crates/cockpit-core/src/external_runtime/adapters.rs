@@ -395,7 +395,7 @@ pub fn require_live_available_for_launch_with_cancel(
         return Err(LaunchGateError::Cancelled);
     }
     let store = global_health_store();
-    let (published, generation) = store.publish_live_entry(entry.clone(), platform);
+    let (published, generation) = store.publish_live_entry(entry.clone(), descriptor, platform);
     require_available_for_launch(&published, id, generation)?;
     Ok(entry)
 }
@@ -475,7 +475,7 @@ pub fn require_configured_command_available_for_launch_with_cancel(
         return Err(LaunchGateError::Cancelled);
     }
     let store = global_health_store();
-    let (published, generation) = store.publish_live_entry(entry.clone(), platform);
+    let (published, generation) = store.publish_live_entry(entry.clone(), desc, platform);
     require_available_for_launch(&published, id.as_str(), generation)?;
     Ok(entry)
 }
@@ -563,28 +563,6 @@ pub(crate) fn invocation_descriptor_roster(
     input: &IntegrationHealthComposeInput,
 ) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
     let registry = ExternalRuntimeRegistry::new();
-    ensure_integration_adapters_registered(&registry)?;
-    let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
-    let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
-    let lsp_ids = upsert_lsp_servers(&registry, input.lsp_servers.clone())?;
-    let mcp_ids = upsert_stdio_mcp_servers(&registry, input.stdio_mcp.clone())?;
-    let keep = harness_ids
-        .iter()
-        .chain(lsp_ids.iter())
-        .chain(mcp_ids.iter())
-        .map(|id| id.as_str().to_owned())
-        .collect();
-    registry.retain_configured_ids(&keep);
-    Ok(registry.descriptors())
-}
-
-/// Make a Settings invocation's configured roster authoritative for the
-/// process before its completed snapshot is published. Contextual projections
-/// therefore use the same descriptors (including version requirements).
-pub(crate) fn publish_invocation_descriptor_roster(
-    input: &IntegrationHealthComposeInput,
-) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
-    let registry = super::registry::global_registry();
     ensure_integration_adapters_registered(&registry)?;
     let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
     let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
@@ -728,7 +706,7 @@ fn compose_settings_doctor_health_internal(
     if !publish_global {
         return Ok(Arc::new(snapshot));
     }
-    if !store.publish(snapshot.clone()) {
+    if !store.publish_bundle(snapshot.clone(), descriptors) {
         // A newer full refresh or live handoff superseded this composition;
         // surface the current published snapshot when available.
         if let Some(current) = store.current() {

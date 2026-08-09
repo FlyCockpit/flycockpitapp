@@ -253,16 +253,39 @@ fn model_supports_images(
         .supports_image_input()
 }
 
-pub fn print(project: Option<&Path>) {
+pub fn print(project: Option<&Path>, sandbox_enabled: bool) {
     // Headless splash: no event loop to fill the branch pill in later, so
     // fetch git status synchronously here.
     let info = load(project, true);
     // Headless output is immediate. It may project an already-complete shared
     // snapshot, but never waits for dependency probes before its first byte.
-    print_header(&info);
+    // Emit and flush the first usable output before starting the bounded
+    // dependency construction. Piped/headless startup must never hold its
+    // first byte behind host probes.
+    for line in header_lines(&info) {
+        println!("{line}");
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    print_dependency_warning(&info.cwd, sandbox_enabled);
     println!();
     println!("{INPUT_PREFIX}");
     println!("{}", info.agent_name);
+}
+
+/// Complete the bounded startup projection after the caller has emitted and
+/// flushed its first bytes.
+pub fn print_dependency_warning(cwd: &Path, sandbox_enabled: bool) {
+    if let Ok(projection) =
+        crate::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+            cwd.to_path_buf(),
+            std::time::Duration::from_secs(2),
+            sandbox_enabled,
+        )
+        && let Some(summary) =
+            crate::external_runtime::startup_dependency_policy(&projection).summary
+    {
+        println!("dependency warning: {summary}");
+    }
 }
 
 /// The 6-line launch header as ANSI-styled strings (logo + title,

@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    DependencyImportance, ExternalRuntimeId, HostPlatform, RemedyKind, RequirementGroup,
+    DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId, HostPlatform, RemedyKind,
+    RequirementGroup,
 };
 use crate::capabilities::ExecutionTarget;
 
@@ -241,6 +242,7 @@ struct StoreInner {
     /// Highest generation number reserved via [`HealthSnapshotStore::begin_refresh`].
     next_generation: u64,
     current: Option<Arc<ExternalRuntimeSnapshot>>,
+    descriptors: Vec<ExternalRuntimeDescriptor>,
 }
 
 impl HealthSnapshotStore {
@@ -261,7 +263,18 @@ impl HealthSnapshotStore {
     /// Returns true when the snapshot became current. Older in-flight refreshes
     /// that complete after a newer refresh was reserved are discarded even if
     /// nothing has been published yet.
+    #[cfg(test)]
     pub fn publish(&self, snapshot: ExternalRuntimeSnapshot) -> bool {
+        self.publish_bundle(snapshot, Vec::new())
+    }
+
+    /// Publish a completed snapshot and its exact descriptor roster as one
+    /// generation-gated bundle.
+    pub fn publish_bundle(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+    ) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Must be the latest reserved generation — supersedes older in-flight work.
         if snapshot.generation != inner.next_generation {
@@ -273,6 +286,7 @@ impl HealthSnapshotStore {
             return false;
         }
         inner.current = Some(Arc::new(snapshot));
+        inner.descriptors = descriptors;
         true
     }
 
@@ -282,15 +296,27 @@ impl HealthSnapshotStore {
         inner.current.clone()
     }
 
+    pub fn current_bundle(
+        &self,
+    ) -> Option<(Arc<ExternalRuntimeSnapshot>, Vec<ExternalRuntimeDescriptor>)> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner
+            .current
+            .clone()
+            .map(|snapshot| (snapshot, inner.descriptors.clone()))
+    }
+
     /// Atomically assign a new generation, merge `entry` into the published
     /// snapshot, and return `(published_snapshot, generation)`.
     ///
     /// Used by live launch gates so concurrent multi-id handoffs each publish
     /// a strictly newer generation without racing `begin_refresh` reservations
-    /// (full Settings/doctor refreshes still use begin_refresh + publish).
+    /// (full Settings/doctor refreshes still use begin_refresh +
+    /// publish_bundle).
     pub fn publish_live_entry(
         &self,
         entry: HealthEntry,
+        descriptor: ExternalRuntimeDescriptor,
         platform: HostPlatform,
     ) -> (Arc<ExternalRuntimeSnapshot>, u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -307,6 +333,18 @@ impl HealthSnapshotStore {
         snapshot
             .entries
             .insert(entry.id.as_str().to_string(), entry);
+        if let Some(existing) = inner
+            .descriptors
+            .iter_mut()
+            .find(|current| current.id == descriptor.id)
+        {
+            *existing = descriptor;
+        } else {
+            inner.descriptors.push(descriptor);
+            inner
+                .descriptors
+                .sort_by(|left, right| left.id.cmp(&right.id));
+        }
         let arc = Arc::new(snapshot);
         inner.current = Some(arc.clone());
         (arc, generation)
@@ -315,5 +353,6 @@ impl HealthSnapshotStore {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.current = None;
+        inner.descriptors.clear();
     }
 }

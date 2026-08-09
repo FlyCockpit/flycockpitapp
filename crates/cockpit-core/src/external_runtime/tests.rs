@@ -993,25 +993,38 @@ fn external_dependency_snapshot_atomicity() {
 
     // Older in-flight refresh completing after a newer generation was reserved
     // must not publish even when nothing is current yet.
-    assert!(!store.publish(snap1.clone()));
+    let descriptor1 = ExternalRuntimeDescriptor::builder("a")
+        .owner("test", "old")
+        .probe_policy(ProbePolicy::configured_command("old", None))
+        .build()
+        .unwrap();
+    let descriptor2 = ExternalRuntimeDescriptor::builder("a")
+        .owner("test", "new")
+        .probe_policy(ProbePolicy::configured_command("new", None))
+        .build()
+        .unwrap();
+    assert!(!store.publish_bundle(snap1.clone(), vec![descriptor1.clone()]));
     assert!(store.current().is_none());
 
     // Latest reserved generation publishes.
-    assert!(store.publish(snap2.clone()));
-    let current = store.current().unwrap();
+    assert!(store.publish_bundle(snap2.clone(), vec![descriptor2.clone()]));
+    let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
+    assert_eq!(descriptors, vec![descriptor2.clone()]);
     assert!(matches!(
         current.get("a").unwrap().state,
         HealthState::Missing
     ));
 
     // Late older generation discarded — readers still see complete g2 only
-    assert!(!store.publish(snap1));
-    let current = store.current().unwrap();
+    assert!(!store.publish_bundle(snap1, vec![descriptor1]));
+    let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
+    assert_eq!(descriptors, vec![descriptor2.clone()]);
 
     // Equal/stale generation rejected
-    assert!(!store.publish(snap2));
+    assert!(!store.publish_bundle(snap2, vec![]));
+    assert_eq!(store.current_bundle().unwrap().1, vec![descriptor2]);
 
     // Readers never observe a partial generation: only complete Arc snapshots.
     let g3 = store.begin_refresh();
@@ -1020,6 +1033,38 @@ fn external_dependency_snapshot_atomicity() {
     let seen = store.current().unwrap();
     assert_eq!(seen.generation, g3);
     assert!(seen.entries.is_empty());
+
+    // Live publication inserts its exact descriptor into an empty bundle and
+    // replaces the descriptor by stable id on later handoffs.
+    store.clear();
+    let live_entry = HealthEntry {
+        id: ExternalRuntimeId::new("live"),
+        state: HealthState::Available {
+            resolved_path: None,
+            version_evidence: None,
+        },
+        importance: DependencyImportance::RequiredWhenFeatureSelected,
+        target: ExecutionTarget::Host,
+        remedy: None,
+        platform: HostPlatform::GenericLinux,
+    };
+    let live_old = ExternalRuntimeDescriptor::builder("live")
+        .owner("test", "old")
+        .probe_policy(ProbePolicy::configured_command("old", None))
+        .build()
+        .unwrap();
+    let live_new = ExternalRuntimeDescriptor::builder("live")
+        .owner("test", "new")
+        .probe_policy(ProbePolicy::configured_command("new", None))
+        .build()
+        .unwrap();
+    store.publish_live_entry(live_entry.clone(), live_old, HostPlatform::GenericLinux);
+    assert_eq!(store.current_bundle().unwrap().1[0].owner.feature, "old");
+    store.publish_live_entry(live_entry, live_new, HostPlatform::GenericLinux);
+    let (snapshot, descriptors) = store.current_bundle().unwrap();
+    assert!(snapshot.get("live").is_some());
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].owner.feature, "new");
 }
 
 #[test]

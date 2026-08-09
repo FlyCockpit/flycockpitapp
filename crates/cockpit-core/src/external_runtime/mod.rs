@@ -40,7 +40,6 @@ pub use adapters::{
 };
 pub(crate) use adapters::{
     compose_settings_doctor_health_for_invocation, invocation_descriptor_roster,
-    publish_invocation_descriptor_roster,
 };
 pub use health::{
     ExternalRuntimeSnapshot, GroupHealth, HealthCause, HealthEntry, HealthSnapshotStore,

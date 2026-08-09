@@ -152,6 +152,22 @@ impl App {
             },
         );
 
+        let dependency_cwd = self.launch.cwd.clone();
+        let sandbox_enabled = !self.no_sandbox;
+        self.async_actions.start_blocking(
+            AsyncActionKind::Internal("startup.dependencies"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.dependencies")),
+            move || {
+                cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+                    dependency_cwd,
+                    std::time::Duration::from_secs(2),
+                    sandbox_enabled,
+                )
+                .map(AsyncActionPayload::StartupDependencyProjection)
+                .map_err(|error| error.to_string())
+            },
+        );
+
         self.start_startup_disclosures_fetch();
     }
 

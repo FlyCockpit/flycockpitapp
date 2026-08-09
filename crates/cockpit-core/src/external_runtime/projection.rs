@@ -80,11 +80,8 @@ impl DependencyProjection {
 }
 
 pub fn current_dependency_context_line(id: &str) -> Option<String> {
-    let snapshot = super::global_health_store().current()?;
-    let projection = project_dependencies(
-        Some(snapshot.as_ref()),
-        &super::global_registry().descriptors(),
-    );
+    let (snapshot, descriptors) = super::global_health_store().current_bundle()?;
+    let projection = project_dependencies(Some(snapshot.as_ref()), &descriptors);
     projection.contextual_line(id)
 }
 
@@ -349,11 +346,10 @@ pub fn startup_dependency_policy(projection: &DependencyProjection) -> Dependenc
 /// Non-blocking startup read: absence means no completed snapshot yet and does
 /// not delay first usable UI.
 pub fn current_startup_dependency_policy() -> Option<DependencyStartupPolicy> {
-    let snapshot = super::global_health_store().current()?;
+    let (snapshot, descriptors) = super::global_health_store().current_bundle()?;
     // Startup never invents Unknown rows for catalog entries that have not
     // participated in the latest complete snapshot.
-    let descriptors: Vec<_> = super::global_registry()
-        .descriptors()
+    let descriptors: Vec<_> = descriptors
         .into_iter()
         .filter(|descriptor| snapshot.entries.contains_key(descriptor.id.as_str()))
         .collect();

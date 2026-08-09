@@ -14,7 +14,7 @@ pub async fn run(
     launch_start: Option<Instant>,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
-        welcome::print(project);
+        welcome::print(project, !no_sandbox);
         return Ok(());
     }
 
@@ -33,6 +33,12 @@ pub async fn run_with_session(
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
         println!("session {session_id}");
+        let _ = std::io::Write::flush(&mut stdout());
+        let cwd = project.map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            std::path::Path::to_path_buf,
+        );
+        welcome::print_dependency_warning(&cwd, !no_sandbox);
         return Ok(());
     }
 

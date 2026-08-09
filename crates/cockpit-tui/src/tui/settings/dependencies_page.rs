@@ -18,12 +18,19 @@ type DependencyRefreshResult = Result<cockpit_core::external_runtime::Dependency
 type PendingDependencyRefresh = Option<(u64, mpsc::Receiver<DependencyRefreshResult>)>;
 
 pub(super) fn page(cwd: PathBuf) -> PageBox {
-    let mut state = cockpit_core::external_runtime::DependenciesPageState::first_paint(
-        cockpit_core::external_runtime::global_health_store()
-            .current()
-            .as_deref(),
-        &cockpit_core::external_runtime::global_registry().descriptors(),
-    );
+    let bundle = cockpit_core::external_runtime::global_health_store().current_bundle();
+    let mut state = match bundle {
+        Some((snapshot, descriptors)) => {
+            cockpit_core::external_runtime::DependenciesPageState::first_paint(
+                Some(snapshot.as_ref()),
+                &descriptors,
+            )
+        }
+        None => cockpit_core::external_runtime::DependenciesPageState::first_paint(
+            None,
+            &cockpit_core::external_runtime::global_registry().descriptors(),
+        ),
+    };
     let generation = state.begin_refresh();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {

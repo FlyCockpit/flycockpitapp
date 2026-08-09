@@ -328,6 +328,16 @@ impl App {
                     }
                 }
             }
+            AsyncActionKind::Internal("startup.dependencies") => {
+                if let Ok(AsyncActionPayload::StartupDependencyProjection(projection)) =
+                    result.payload
+                    && let Some(summary) =
+                        cockpit_core::external_runtime::startup_dependency_policy(&projection)
+                            .summary
+                {
+                    self.show_toast(format!("Dependency warning: {summary}"), ToastKind::Warning);
+                }
+            }
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {

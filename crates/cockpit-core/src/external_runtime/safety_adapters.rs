@@ -782,7 +782,12 @@ pub fn publish_safety_refresh(
     let snapshot = refresh_safety_snapshot(
         registry, executor, path_env, cwd, ctx, deadlines, cancel, generation, mode,
     );
-    if store.publish(snapshot.clone()) {
+    let descriptors = registry
+        .descriptors()
+        .into_iter()
+        .filter(|descriptor| snapshot.entries.contains_key(descriptor.id.as_str()))
+        .collect();
+    if store.publish_bundle(snapshot.clone(), descriptors) {
         Some(snapshot)
     } else {
         None
@@ -1472,6 +1477,29 @@ mod tests {
             launch.availability.runtime,
             Some(ContainerRuntimeKind::Docker)
         );
+
+        let bundled_store = HealthSnapshotStore::new();
+        let published = publish_safety_refresh(
+            &bundled_store,
+            &registry,
+            &executor_new,
+            None,
+            Path::new("/"),
+            &ctx,
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+            ContainerEngineMode::Docker,
+        )
+        .expect("latest safety refresh publishes");
+        let (bundled, descriptors) = bundled_store.current_bundle().expect("atomic bundle");
+        assert_eq!(bundled, std::sync::Arc::new(published));
+        let descriptor_ids: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.id.as_str())
+            .collect();
+        let entry_ids: std::collections::BTreeSet<_> =
+            bundled.entries.keys().map(String::as_str).collect();
+        assert_eq!(descriptor_ids, entry_ids);
 
         // Cancellation during probe → Unknown, not available for launch.
         let cancel = CancelToken::new();

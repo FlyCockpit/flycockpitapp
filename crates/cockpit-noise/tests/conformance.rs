@@ -4,7 +4,6 @@ use cockpit_noise::{
     TranscriptAuthorizationGate, TranscriptAuthorizationRequest,
 };
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 
 fn prologue() -> RemoteNoisePrologueV1 {
     RemoteNoisePrologueV1 {
@@ -237,19 +236,18 @@ fn remote_noise_binding_conformance_uses_the_same_opaque_core() {
         cockpit_noise::noise_handshake_hash(client).unwrap(),
         cockpit_noise::noise_handshake_hash(daemon).unwrap()
     );
-    let gate: Arc<dyn cockpit_noise::BindingAuthorizationGate> = Arc::new(BindingGate);
     cockpit_noise::noise_authorize(
         client,
         b"client-proof".to_vec(),
         b"daemon-proof".to_vec(),
-        Arc::clone(&gate),
+        Box::new(BindingGate),
     )
     .unwrap();
     cockpit_noise::noise_authorize(
         daemon,
         b"client-proof".to_vec(),
         b"daemon-proof".to_vec(),
-        gate,
+        Box::new(BindingGate),
     )
     .unwrap();
     let ciphertext = cockpit_noise::noise_encrypt_record(client, 1, b"binding".to_vec()).unwrap();

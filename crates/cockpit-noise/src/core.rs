@@ -598,6 +598,10 @@ impl Drop for NoiseChild {
 }
 
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the protocol transcript binds eleven independently specified fields"
+)]
 pub fn final_proof_binding_bytes(
     role: u8,
     child_attempt_id: [u8; 16],
@@ -628,6 +632,10 @@ pub fn final_proof_binding_bytes(
 }
 
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the digest API mirrors the complete protocol transcript binding"
+)]
 pub fn final_proof_binding_digest(
     role: u8,
     child_attempt_id: [u8; 16],

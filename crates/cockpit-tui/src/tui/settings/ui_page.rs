@@ -12,7 +12,7 @@
 //! into the five [`super::category`] pages, and these drill-ins were
 //! re-homed under the categories where their fields now live.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -24,7 +24,10 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
-use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsControlId, SettingsPointerSurface, SettingsScrollRegionId, SettingsScrollStates,
+    push_wrapped_text, selected_line_from_marker,
+};
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 // ── Utility-model picker ─────────────────────────────────────────────────
@@ -364,6 +367,7 @@ impl SettingsCx {
     ) {
         render_grab_list(
             &self.scroll_states,
+            &self.pointer_surface,
             "instructions",
             frame,
             area,
@@ -524,6 +528,7 @@ impl SettingsCx {
     ) {
         render_grab_list(
             &self.scroll_states,
+            &self.pointer_surface,
             "redact-patterns",
             frame,
             area,
@@ -676,6 +681,7 @@ impl SettingsCx {
 #[allow(clippy::too_many_arguments)]
 fn render_grab_list(
     scroll_states: &SettingsScrollStates,
+    pointer_surface: &SettingsPointerSurface,
     key: &'static str,
     frame: &mut Frame,
     area: Rect,
@@ -697,8 +703,11 @@ fn render_grab_list(
         )),
         Line::default(),
     ];
+    let mut controls = vec![None; lines.len()];
     push_wrapped_text(&mut lines, area.width, intro, muted);
+    controls.resize(lines.len(), None);
     lines.push(Line::default());
+    controls.push(None);
 
     for (i, item) in items.iter().enumerate() {
         let is_grabbed = grabbed.is_some() && i == cursor;
@@ -710,6 +719,7 @@ fn render_grab_list(
                 grabbed.buf.cursor(),
                 empty_hint,
             )));
+            controls.push(Some((SettingsControlId(i as u64), true, None)));
             continue;
         }
         let marker = if on_cursor {
@@ -726,6 +736,7 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(item.clone(), style),
         ]));
+        controls.push(Some((SettingsControlId(i as u64), true, None)));
     }
 
     if grabbed.is_none() {
@@ -745,20 +756,34 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(add_label.to_string(), style),
         ]));
+        controls.push(Some((SettingsControlId(add_idx as u64), true, None)));
     }
 
     if grabbed.is_some() {
         lines.push(Line::default());
+        controls.push(None);
         lines.push(grab::grab_hint_line(grab::GRAB_HINT));
+        controls.push(None);
     }
 
     if let Some(status) = status {
         lines.push(Line::default());
+        controls.push(None);
         lines.push(Line::from(Span::styled(status.to_string(), yellow)));
+        controls.push(None);
     }
 
     let selected_line = selected_line_from_marker(&lines);
-    scroll_states.render_lines(frame, area, key, lines, selected_line);
+    scroll_states.render_control_lines(
+        frame,
+        area,
+        key,
+        lines,
+        selected_line,
+        controls,
+        pointer_surface,
+        SettingsScrollRegionId(key),
+    );
 }
 
 impl SettingsPage for InstructionsPage {
@@ -768,6 +793,30 @@ impl SettingsPage for InstructionsPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_instructions_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        if index > cx.extended.agent_guidance_files.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_instructions_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("instructions") && self.grabbed.is_none() {
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.extended.agent_guidance_files.len());
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -804,6 +853,30 @@ impl SettingsPage for RedactPatternsPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_redact_patterns_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        if index > cx.extended.redact.dotenv_patterns.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_redact_patterns_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("redact-patterns") && self.grabbed.is_none() {
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.extended.redact.dotenv_patterns.len());
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -3600,6 +3600,12 @@ impl SettingsPage for CategoryPage {
         Nav::Stay
     }
 
+    fn cancel_pointer_transients(&mut self) {
+        self.reset.disarm();
+        self.external_edit_ops.cancel();
+        self.pending_external_edit = None;
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › {}",

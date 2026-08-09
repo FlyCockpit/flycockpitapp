@@ -3191,7 +3191,7 @@ fn copilot_setup_effect_accepts_only_its_live_operation_once() {
         Ok("effect complete")
     );
     state.submit(None, &mut spy);
-    assert_eq!(spy.calls, 2, "a new explicit submission gets one new id");
+    assert_eq!(spy.calls, 1, "a terminal result cannot be submitted twice");
 }
 
 #[test]

@@ -762,7 +762,7 @@ impl CopilotSetupState {
         let (Some(shell), Some(rc_path)) = (self.shell, self.rc_path.as_deref()) else {
             return;
         };
-        if self.already_configured || self.operation.pending().is_some() {
+        if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
             return;
         }
         let operation_id = self.operation.begin();

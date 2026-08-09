@@ -1186,6 +1186,8 @@ impl SettingsPage for AgentsPage {
     fn cancel_pointer_transients(&mut self) {
         self.confirm_reset = false;
         self.disarm_guards();
+        self.external_edit_ops.cancel();
+        self.pending_external_edit = None;
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

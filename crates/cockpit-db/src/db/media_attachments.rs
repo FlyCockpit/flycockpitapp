@@ -260,6 +260,10 @@ impl super::Db {
         conn: &Connection,
         request: &VerifiedSecurityRecoveryRequest,
     ) -> Result<MediaSecurityRecoveryReceipt> {
+        ensure!(
+            request.local_request_id.get_version_num() == 7,
+            "local recovery request id must be UUIDv7"
+        );
         validate_digest(&request.owner_principal_digest, "owner principal digest")?;
         let affected_components = &request.affected_components;
         ensure!(
@@ -361,10 +365,10 @@ impl super::Db {
             MediaAvailability::OwnedCleanupPending
         };
         ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state.as_str(),decimal(next_generation)?,request.now_unix_ms,request.attachment_id.to_string(),decimal(request.attachment_version)?,decimal(request.expected_availability_generation)?])? == 1, "security recovery aggregate CAS failed");
-        let intent_id = Uuid::new_v4();
+        let intent_id = Uuid::now_v7();
         conn.execute("INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,'security_recovery',?7)", params![intent_id.to_string(),request.attachment_id.to_string(),decimal(request.attachment_version)?,decimal(next_generation)?,decimal(parent.reference_generation)?,affected_set_digest,request.now_unix_ms])?;
         let receipt = MediaSecurityRecoveryReceipt {
-            receipt_id: Uuid::new_v4(),
+            receipt_id: Uuid::now_v7(),
             local_request_id: request.local_request_id,
             attachment_id: request.attachment_id,
             attachment_version: request.attachment_version,

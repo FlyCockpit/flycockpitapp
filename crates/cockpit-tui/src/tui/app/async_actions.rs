@@ -127,48 +127,84 @@ impl App {
             }
             AsyncActionKind::Internal("paste.image_path_probe") => match result.payload {
                 Ok(AsyncActionPayload::ImagePathProbe {
+                    request_id,
+                    request_generation,
                     terminal_generation,
                     original: _,
                     source_draft_generation,
                     cursor,
                     png: Some(png),
-                }) if terminal_generation == self.terminal_input_generation
-                    && source_draft_generation == self.draft_generation =>
-                {
-                    self.composer.set_cursor(cursor);
-                    self.insert_image_block(png)
+                }) if terminal_generation == self.terminal_input_generation => {
+                    self.settle_paste_probe(
+                        request_id,
+                        request_generation,
+                        source_draft_generation,
+                        cursor,
+                        Some(png),
+                        false,
+                    );
                 }
                 Ok(AsyncActionPayload::ImagePathProbe {
+                    request_id,
+                    request_generation,
                     terminal_generation,
                     original: _,
                     source_draft_generation,
                     cursor: _,
                     png: None,
-                }) if terminal_generation == self.terminal_input_generation
-                    && source_draft_generation == self.draft_generation =>
-                {
-                    self.show_toast("Paste unavailable", ToastKind::Error);
+                }) if terminal_generation == self.terminal_input_generation => {
+                    self.settle_paste_probe(
+                        request_id,
+                        request_generation,
+                        source_draft_generation,
+                        0,
+                        None,
+                        true,
+                    );
                 }
                 Err(_) => self.show_toast("Paste unavailable", ToastKind::Error),
                 Ok(_) => {}
             },
             AsyncActionKind::Internal("paste.native_image") => match result.payload {
                 Ok(AsyncActionPayload::NativeImagePaste {
+                    request_id,
+                    request_generation,
                     terminal_generation,
                     source_draft_generation,
                     cursor,
                     png: Some(png),
-                }) if terminal_generation == self.terminal_input_generation
-                    && source_draft_generation == self.draft_generation =>
-                {
+                }) if terminal_generation == self.terminal_input_generation => {
                     self.terminal_paste_classifier.resolve_shortcut_intent();
-                    self.composer.set_cursor(cursor);
-                    self.insert_image_block(png);
+                    self.settle_paste_probe(
+                        request_id,
+                        request_generation,
+                        source_draft_generation,
+                        cursor,
+                        Some(png),
+                        false,
+                    );
                 }
                 // The classifier owns the 250 ms timeout notice. A missing
                 // bitmap can still be followed by authoritative bracketed
                 // text, so the speculative native probe remains silent.
-                Ok(AsyncActionPayload::NativeImagePaste { png: None, .. }) | Err(_) => {}
+                Ok(AsyncActionPayload::NativeImagePaste {
+                    request_id,
+                    request_generation,
+                    terminal_generation,
+                    source_draft_generation,
+                    png: None,
+                    ..
+                }) if terminal_generation == self.terminal_input_generation => {
+                    self.settle_paste_probe(
+                        request_id,
+                        request_generation,
+                        source_draft_generation,
+                        0,
+                        None,
+                        false,
+                    );
+                }
+                Err(_) => {}
                 Ok(_) => {}
             },
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
@@ -803,6 +839,140 @@ impl App {
                     .apply_oauth_complete(OAuthProvider::Grok, payload);
             }
             _ => self.completed_async_actions.push(result),
+        }
+    }
+
+    fn settle_paste_probe(
+        &mut self,
+        request_id: uuid::Uuid,
+        request_generation: u64,
+        source_draft_generation: u64,
+        cursor: usize,
+        png: Option<Vec<u8>>,
+        report_unavailable: bool,
+    ) {
+        let Some(probe) = self.pending_paste_probes.remove(&request_id) else {
+            return;
+        };
+        if probe.request.paste_generation != request_generation
+            || probe.source_draft_generation != source_draft_generation
+        {
+            return;
+        }
+        let Some(fence_id) = probe.owner_fence else {
+            if source_draft_generation != self.draft_generation {
+                return;
+            }
+            if let Some(png) = png {
+                self.composer.set_cursor(cursor);
+                self.insert_image_block(png);
+            } else if report_unavailable {
+                self.show_toast("Paste unavailable", ToastKind::Error);
+            }
+            return;
+        };
+        if png.is_none() && report_unavailable {
+            self.show_toast("Paste unavailable", ToastKind::Error);
+        }
+        let ready = if let Some(fence) = self.submission_fences.get_mut(&fence_id) {
+            let result = png.map(|png| ("[image]".to_string(), String::new(), Some(png)));
+            let _ = fence.settle_slot(
+                request_id,
+                request_generation,
+                source_draft_generation,
+                result,
+            );
+            fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::Ready
+        } else {
+            false
+        };
+        if ready {
+            self.dispatch_ready_paste_fence(fence_id);
+        }
+    }
+
+    fn dispatch_ready_paste_fence(&mut self, fence_id: uuid::Uuid) {
+        if !matches!(
+            self.submission_order.front(),
+            Some((_, crate::tui::structured_paste::OrderedIntent::Fence(id))) if id == fence_id
+        ) {
+            return;
+        }
+        if self
+            .deferred_fence_dispatches
+            .get(&fence_id)
+            .is_some_and(|dispatch| dispatch.waiting_model_selection.is_some())
+        {
+            return;
+        }
+        let Some(mut deferred) = self.deferred_fence_dispatches.remove(&fence_id) else {
+            return;
+        };
+        let Some(fence) = self.submission_fences.get_mut(&fence_id) else {
+            return;
+        };
+        for slot in &fence.slots {
+            if let crate::tui::structured_paste::PasteSlotState::Ready { display, wire, png } = slot
+            {
+                if !display.is_empty() {
+                    if !deferred.display.is_empty() {
+                        deferred.display.push('\n');
+                    }
+                    deferred.display.push_str(display);
+                }
+                if !wire.is_empty() {
+                    if !deferred.submission.text.is_empty() {
+                        deferred.submission.text.push('\n');
+                    }
+                    deferred.submission.text.push_str(wire);
+                }
+                if let Some(png) = png {
+                    deferred.submission.images.push(png.clone());
+                }
+            }
+        }
+        if deferred.submission.text.trim().is_empty() && deferred.submission.images.is_empty() {
+            fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::NoPayload;
+            let sequence = fence.fence_sequence;
+            self.submission_fences.remove(&fence_id);
+            let _ = self.submission_order.complete(sequence);
+            self.dispatch_next_ready_paste_fence();
+            return;
+        }
+        if let Err(message) =
+            super::input::validate_pasted_images_for_submit(&deferred.submission.images)
+        {
+            let sequence = fence.fence_sequence;
+            self.submission_fences.remove(&fence_id);
+            let _ = self.submission_order.complete(sequence);
+            self.show_toast(message, ToastKind::Error);
+            self.dispatch_next_ready_paste_fence();
+            return;
+        }
+        let sequence = fence.fence_sequence;
+        fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+        self.dispatch_optimistic_user_submission_with_id(
+            fence_id,
+            deferred.display,
+            deferred.submission,
+            "engine",
+            true,
+            &deferred.tag_expansions,
+        );
+        let _ = self.submission_order.complete(sequence);
+        self.dispatch_next_ready_paste_fence();
+    }
+
+    pub(super) fn dispatch_next_ready_paste_fence(&mut self) {
+        let Some((_, crate::tui::structured_paste::OrderedIntent::Fence(id))) =
+            self.submission_order.front()
+        else {
+            return;
+        };
+        if self.submission_fences.get(&id).is_some_and(|fence| {
+            fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::Ready
+        }) {
+            self.dispatch_ready_paste_fence(id);
         }
     }
 

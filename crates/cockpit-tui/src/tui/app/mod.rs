@@ -327,6 +327,19 @@ pub(crate) struct QueuedModelSubmission {
     pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
 }
 
+pub(crate) struct PendingPasteProbe {
+    pub request: crate::tui::structured_paste::PasteRequest,
+    pub source_draft_generation: u64,
+    pub owner_fence: Option<uuid::Uuid>,
+}
+
+pub(crate) struct DeferredFenceDispatch {
+    pub display: String,
+    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+    pub waiting_model_selection: Option<uuid::Uuid>,
+}
+
 pub(crate) struct ModelSelectionRetry {
     /// Durable session attachment that owns this retry. Retry payloads are
     /// never transferable between conversations, even while another session
@@ -1929,6 +1942,10 @@ pub struct App {
     /// are keyed by the durable wire identity, never by mutable draft text.
     pub(super) submission_fences:
         std::collections::HashMap<uuid::Uuid, crate::tui::structured_paste::SubmissionFenceV1>,
+    pub(super) pending_paste_probes: std::collections::HashMap<uuid::Uuid, PendingPasteProbe>,
+    pub(super) deferred_fence_dispatches:
+        std::collections::HashMap<uuid::Uuid, DeferredFenceDispatch>,
+    pub(super) next_paste_generation: u64,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
     /// `Some(false)` after `i` (inner), in operator-pending / visual
     /// contexts; the next char picks the object (`w`, `"`, `(`, …). `None`
@@ -3224,6 +3241,9 @@ impl App {
             terminal_input_generation: None,
             submission_order: Default::default(),
             submission_fences: Default::default(),
+            pending_paste_probes: Default::default(),
+            deferred_fence_dispatches: Default::default(),
+            next_paste_generation: 0,
             pending_text_object: None,
             at_dismissed: false,
             slash_selected: 0,

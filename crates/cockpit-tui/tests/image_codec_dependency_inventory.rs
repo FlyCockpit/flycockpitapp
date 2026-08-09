@@ -10,7 +10,28 @@ use serde::Deserialize;
 struct Fixture {
     schema_version: u64,
     packages: BTreeMap<String, PackageFixture>,
-    targets: BTreeMap<String, TargetFixture>,
+    targets: TargetsFixture,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetsFixture {
+    #[serde(rename = "x86_64-unknown-linux-gnu")]
+    linux: TargetFixture,
+    #[serde(rename = "aarch64-apple-darwin")]
+    macos: TargetFixture,
+    #[serde(rename = "x86_64-pc-windows-msvc")]
+    windows: TargetFixture,
+}
+
+impl TargetsFixture {
+    fn iter(&self) -> [(TargetTriple, &TargetFixture); 3] {
+        [
+            (TargetTriple::Linux, &self.linux),
+            (TargetTriple::Macos, &self.macos),
+            (TargetTriple::Windows, &self.windows),
+        ]
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,13 +57,41 @@ struct TargetFixture {
     tui_features: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+enum TargetTriple {
+    #[serde(rename = "x86_64-unknown-linux-gnu")]
+    Linux,
+    #[serde(rename = "aarch64-apple-darwin")]
+    Macos,
+    #[serde(rename = "x86_64-pc-windows-msvc")]
+    Windows,
+}
+
+impl TargetTriple {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "x86_64-unknown-linux-gnu",
+            Self::Macos => "aarch64-apple-darwin",
+            Self::Windows => "x86_64-pc-windows-msvc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+enum Provenance {
+    ImageDescendant,
+    ImageRequester,
+    TuiNormal,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(deny_unknown_fields)]
 struct EdgeFixture {
     from: String,
     to: String,
-    target: String,
-    provenance: String,
+    target: TargetTriple,
+    provenance: Provenance,
 }
 
 fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format: &str) -> String {
@@ -84,8 +133,8 @@ fn tree_package_key(row: &str) -> String {
 
 fn normal_tree_graph(
     tree: &str,
-    target: &str,
-    provenance: &str,
+    target: TargetTriple,
+    provenance: Provenance,
 ) -> (BTreeSet<String>, BTreeSet<EdgeFixture>) {
     let mut packages = BTreeSet::new();
     let mut edges = BTreeSet::new();
@@ -102,8 +151,8 @@ fn normal_tree_graph(
             edges.insert(EdgeFixture {
                 from: parent.clone(),
                 to: package.clone(),
-                target: target.to_owned(),
-                provenance: provenance.to_owned(),
+                target,
+                provenance,
             });
         }
         ancestors.push(package);
@@ -128,24 +177,79 @@ fn image_requester_subgraph(edges: &BTreeSet<EdgeFixture>) -> BTreeSet<EdgeFixtu
         .iter()
         .filter(|edge| ancestors.contains(&edge.from) && ancestors.contains(&edge.to))
         .map(|edge| EdgeFixture {
-            provenance: "image-requester".to_owned(),
+            provenance: Provenance::ImageRequester,
             ..edge.clone()
         })
         .collect()
+}
+
+fn deserialize_toml_document(text: &str) -> toml::Value {
+    toml::Value::deserialize(toml::de::Deserializer::new(text)).unwrap()
+}
+
+fn actual_dependency_name<'a>(key: &'a str, declaration: &'a toml::Value) -> &'a str {
+    declaration
+        .as_table()
+        .and_then(|table| table.get("package"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or(key)
+}
+
+fn image_declarations<'a>(manifest: &'a toml::Value) -> Vec<(&'a str, &'a toml::Value)> {
+    let mut declarations = Vec::new();
+    let root = manifest.as_table().unwrap();
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = root.get(section).and_then(toml::Value::as_table) {
+            declarations.extend(
+                table
+                    .iter()
+                    .filter(|(key, value)| actual_dependency_name(key, value) == "image")
+                    .map(|(key, value)| (key.as_str(), value)),
+            );
+        }
+    }
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            let target = target.as_table().unwrap();
+            for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(table) = target.get(section).and_then(toml::Value::as_table) {
+                    declarations.extend(
+                        table
+                            .iter()
+                            .filter(|(key, value)| actual_dependency_name(key, value) == "image")
+                            .map(|(key, value)| (key.as_str(), value)),
+                    );
+                }
+            }
+        }
+    }
+    declarations
 }
 
 #[test]
 fn tui_image_codec_dependency_inventory() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir.parent().unwrap().parent().unwrap();
-    let root_manifest = fs::read_to_string(workspace.join("Cargo.toml"))
-        .unwrap()
-        .parse::<toml::Value>()
+    let root_text = fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+    let root_manifest = deserialize_toml_document(&root_text);
+    let tui_text = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+    let tui_manifest = deserialize_toml_document(&tui_text);
+    let workspace_dependencies = root_manifest["workspace"]["dependencies"]
+        .as_table()
         .unwrap();
-    let tui_manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
-        .unwrap()
-        .parse::<toml::Value>()
-        .unwrap();
+    let workspace_image_declarations = workspace_dependencies
+        .iter()
+        .filter(|(key, value)| actual_dependency_name(key, value) == "image")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        workspace_image_declarations.len(),
+        1,
+        "workspace dependencies must contain exactly one actual-name image declaration"
+    );
+    assert_eq!(
+        workspace_image_declarations[0].0, "image",
+        "the workspace image declaration must use its canonical package name"
+    );
     let root_image = &root_manifest["workspace"]["dependencies"]["image"];
     assert_eq!(
         root_image
@@ -164,6 +268,16 @@ fn tui_image_codec_dependency_inventory() {
         toml::Value::Array(vec!["png".into()])
     );
     let tui_dependencies = tui_manifest["dependencies"].as_table().unwrap();
+    let direct_image_declarations = image_declarations(&tui_manifest);
+    assert_eq!(
+        direct_image_declarations.len(),
+        1,
+        "cockpit-tui must declare image exactly once across normal/dev/build and target sections"
+    );
+    assert_eq!(
+        direct_image_declarations[0].0, "image",
+        "the sole image dependency must use its canonical package name, not an alias"
+    );
     let tui_image = &tui_dependencies["image"];
     assert_eq!(
         tui_image
@@ -198,11 +312,7 @@ fn tui_image_codec_dependency_inventory() {
         "webp-animation",
     ]);
     for (dependency_key, declaration) in tui_dependencies {
-        let actual_package = declaration
-            .as_table()
-            .and_then(|table| table.get("package"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or(dependency_key);
+        let actual_package = actual_dependency_name(dependency_key, declaration);
         assert!(
             !prohibited_codec_packages.contains(actual_package),
             "cockpit-tui dependency {dependency_key} aliases prohibited codec package {actual_package}"
@@ -214,15 +324,35 @@ fn tui_image_codec_dependency_inventory() {
     ))
     .unwrap();
     assert_eq!(fixture.schema_version, 5);
-    assert_eq!(fixture.targets.len(), 3);
-    let lock = fs::read_to_string(workspace.join("Cargo.lock"))
-        .unwrap()
-        .parse::<toml::Value>()
-        .unwrap();
+    let lock_text = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
+    let lock = deserialize_toml_document(&lock_text);
     let locked_packages = lock["package"].as_array().unwrap();
     let mut observed_fixture_rows = BTreeSet::new();
 
-    for (triple, expected) in &fixture.targets {
+    for (target, expected) in fixture.targets.iter() {
+        let triple = target.as_str();
+        for edge in &expected.edges {
+            assert_eq!(
+                edge.target, target,
+                "{triple} fixture contains a cross-target edge"
+            );
+            assert_eq!(
+                edge.provenance,
+                Provenance::ImageDescendant,
+                "{triple} package edge has the wrong provenance class"
+            );
+        }
+        for edge in &expected.provenance_edges {
+            assert_eq!(
+                edge.target, target,
+                "{triple} fixture contains a cross-target provenance edge"
+            );
+            assert_eq!(
+                edge.provenance,
+                Provenance::ImageRequester,
+                "{triple} requester edge has the wrong provenance class"
+            );
+        }
         let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
             .current_dir(workspace)
             .args([
@@ -302,7 +432,7 @@ fn tui_image_codec_dependency_inventory() {
         // by a fixture-derived allowlist.
         let normal_tree = cargo_tree(workspace, triple, "image@0.25.10", "normal", "{p}");
         let (graph_packages, graph_edges) =
-            normal_tree_graph(&normal_tree, triple, "image-descendant");
+            normal_tree_graph(&normal_tree, target, Provenance::ImageDescendant);
         let expected_packages = expected.packages.iter().cloned().collect::<BTreeSet<_>>();
         let expected_edges = expected.edges.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(graph_packages, expected_packages, "{triple} package drift");
@@ -393,12 +523,33 @@ fn tui_image_codec_dependency_inventory() {
             .iter()
             .find(|package| package["name"] == "cockpit-tui")
             .unwrap();
-        let tui_image = tui["dependencies"]
+        let direct_images = tui["dependencies"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|dependency| dependency["name"] == "image")
-            .unwrap();
+            .filter(|dependency| dependency["name"] == "image")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            direct_images.len(),
+            1,
+            "{triple} graph must expose exactly one direct actual-name image dependency"
+        );
+        let tui_image = direct_images[0];
+        assert_eq!(
+            tui_image["rename"],
+            serde_json::Value::Null,
+            "{triple} image dependency must not be aliased"
+        );
+        assert_eq!(
+            tui_image["kind"],
+            serde_json::Value::Null,
+            "{triple} image dependency must be normal, not dev/build"
+        );
+        assert_eq!(
+            tui_image["target"],
+            serde_json::Value::Null,
+            "{triple} image dependency must be unconditional"
+        );
         assert_eq!(tui_image["uses_default_features"], false);
         assert_eq!(
             tui_image["features"],
@@ -419,7 +570,7 @@ fn tui_image_codec_dependency_inventory() {
         }
 
         let tui_tree = cargo_tree(workspace, triple, "cockpit-tui", "normal", "{p}");
-        let (_, tui_edges) = normal_tree_graph(&tui_tree, triple, "tui-normal");
+        let (_, tui_edges) = normal_tree_graph(&tui_tree, target, Provenance::TuiNormal);
         let observed_provenance = image_requester_subgraph(&tui_edges);
         let expected_provenance = expected
             .provenance_edges
@@ -437,7 +588,7 @@ fn tui_image_codec_dependency_inventory() {
             .iter()
             .find(|package| package["name"] == "arboard")
             .unwrap();
-        let target_marker = match triple.as_str() {
+        let target_marker = match triple {
             "x86_64-unknown-linux-gnu" => "all(unix",
             "aarch64-apple-darwin" => "target_os = \"macos\"",
             "x86_64-pc-windows-msvc" => "windows",

@@ -1461,6 +1461,48 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
 }
 
 #[tokio::test]
+async fn media_security_recovery_denial_precedes_operation_table() {
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+    );
+    let request = Request::RecoverSecurityBlockedMedia(
+        cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
+            schema_version: 1,
+            kind: "recoverSecurityBlockedMedia".into(),
+            local_request_id: Uuid::now_v7(),
+            owner_principal_digest: super::run_invocation::principal_digest(
+                &ClientPrincipal::owner(),
+            ),
+            attachment_id: Uuid::now_v7(),
+            attachment_version: 1,
+            expected_availability_generation: 1,
+            affected_components: vec![],
+            borrowed_source_evidence_digest: None,
+            disposition:
+                cockpit_db::media_attachments::MediaSecurityRecoveryDisposition::RetainBlocked,
+        },
+    );
+    let error = authorize_request(&request, &state, &ctx).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Authorization);
+    let rows: i64 = ctx
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM media_security_recovery_operations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
 async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
     for live in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
@@ -4545,6 +4587,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_app_flag"),
         authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
+        authz_owner_only("recover_security_blocked_media"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),

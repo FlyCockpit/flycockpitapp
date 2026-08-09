@@ -154,6 +154,7 @@ fn settings_pointer_contract_covers_all_current_pages() {
         SettingsPointerSurfaceKind::Skills,
         SettingsPointerSurfaceKind::Mcp,
         SettingsPointerSurfaceKind::Lsp,
+        SettingsPointerSurfaceKind::Dependencies,
     ];
     assert_eq!(surfaces.len(), 13);
 }
@@ -474,6 +475,7 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             SettingsPointerSurfaceKind::Skills,
             SettingsPointerSurfaceKind::Mcp,
             SettingsPointerSurfaceKind::Lsp,
+            SettingsPointerSurfaceKind::Dependencies,
         ] {
             assert!(
                 coverage.3.contains(&surface),

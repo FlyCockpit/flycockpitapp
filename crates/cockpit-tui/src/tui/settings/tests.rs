@@ -2671,6 +2671,7 @@ fn render_all_non_provider_pointer_surface_variants() {
     // owned by this acceptance run, never inherited accidentally from some
     // earlier test that happened to execute on the same thread-local worker.
     for (title, expected_surface) in [
+        ("Dependencies", SettingsPointerSurfaceKind::Dependencies),
         ("Tools", SettingsPointerSurfaceKind::Tools),
         ("Skills", SettingsPointerSurfaceKind::Skills),
         ("MCP", SettingsPointerSurfaceKind::Mcp),

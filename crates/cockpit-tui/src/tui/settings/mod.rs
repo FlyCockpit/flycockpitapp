@@ -172,6 +172,7 @@ pub(super) enum SettingsPointerSurfaceKind {
     Skills,
     Mcp,
     Lsp,
+    Dependencies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

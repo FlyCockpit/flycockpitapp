@@ -36,7 +36,7 @@ fn blocking_operation_manifest_is_complete() {
 fn no_owned_blocking_command_runs_on_event_loop() {
     let source = include_str!("slash.rs");
     assert!(source.contains("start_owned_blocking_action"));
-    assert!(!source.contains("cockpit_core::diagnostics::tui_snapshot(input)"));
+    assert!(source.contains("BlockingOperationKind::DoctorSnapshot"));
 
     let input = include_str!("input.rs");
     assert!(!input.contains("attached_request_tx_blocking(\n                attached_request"));

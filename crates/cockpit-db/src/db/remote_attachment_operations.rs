@@ -111,7 +111,115 @@ pub struct TransactionalRemoteMutation<T> {
     pub outbox_payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOutboxDeliveryLease {
+    pub logical_attachment_id: String,
+    pub event_seq: u64,
+    pub delivery_id: String,
+    pub kind: String,
+    pub canonical_payload: Vec<u8>,
+    pub lease_id: String,
+    pub attempts: u32,
+    pub lease_expires_at_ms: i64,
+}
+
 impl Db {
+    /// Claims the oldest event for one independent consumer. A worker ack is
+    /// deliberately unrelated to the snapshot cursor used for client replay.
+    pub async fn claim_remote_outbox_delivery(
+        &self,
+        consumer_kind: &str,
+        outbox_kind: &str,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> Result<Option<RemoteOutboxDeliveryLease>> {
+        ensure!(
+            !consumer_kind.is_empty() && consumer_kind.len() <= 64,
+            "invalid consumer kind"
+        );
+        ensure!(
+            !outbox_kind.is_empty() && outbox_kind.len() <= 255,
+            "invalid outbox kind"
+        );
+        ensure!(
+            lease_duration_ms > 0 && lease_duration_ms <= 300_000,
+            "invalid delivery lease duration"
+        );
+        let consumer_kind = consumer_kind.to_owned();
+        let outbox_kind = outbox_kind.to_owned();
+        self.transaction(move |conn| {
+            let candidate: Option<(String, i64, String, String, Vec<u8>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT o.logical_attachment_id, o.event_seq, o.delivery_id, o.kind,
+                            o.canonical_payload, d.attempts
+                       FROM remote_attachment_outbox o
+                       LEFT JOIN remote_attachment_outbox_deliveries d
+                         ON d.logical_attachment_id=o.logical_attachment_id
+                        AND d.delivery_id=o.delivery_id AND d.consumer_kind=?1
+                      WHERE o.kind=?3 AND (d.state IS NULL OR (d.state='leased' AND d.lease_expires_at_ms<=?2))
+                      ORDER BY o.created_at_ms, o.logical_attachment_id, o.event_seq LIMIT 1",
+                    params![consumer_kind, now_ms, outbox_kind],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )
+                .optional()?;
+            let Some((attachment, event_seq, delivery_id, kind, payload, prior_attempts)) = candidate else {
+                return Ok(None);
+            };
+            let attempts = prior_attempts.unwrap_or(0).checked_add(1).context("delivery attempts overflow")?;
+            ensure!(attempts <= 1_000_000, "delivery attempts exhausted");
+            let lease_id = Uuid::now_v7().to_string();
+            let expires = now_ms.checked_add(lease_duration_ms).context("delivery lease expiry overflow")?;
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_deliveries
+                 (logical_attachment_id, delivery_id, consumer_kind, state, lease_id,
+                  lease_expires_at_ms, attempts, first_claimed_at_ms, updated_at_ms, acked_at_ms)
+                 VALUES (?1,?2,?3,'leased',?4,?5,?6,?7,?7,NULL)
+                 ON CONFLICT(logical_attachment_id,delivery_id,consumer_kind) DO UPDATE SET
+                   state='leased', lease_id=excluded.lease_id,
+                   lease_expires_at_ms=excluded.lease_expires_at_ms,
+                   attempts=excluded.attempts, updated_at_ms=excluded.updated_at_ms, acked_at_ms=NULL",
+                params![attachment, delivery_id, consumer_kind, lease_id, expires, attempts, now_ms],
+            )?;
+            Ok(Some(RemoteOutboxDeliveryLease {
+                logical_attachment_id: attachment, event_seq: event_seq.try_into()?, delivery_id,
+                kind, canonical_payload: payload, lease_id,
+                attempts: attempts.try_into()?, lease_expires_at_ms: expires,
+            }))
+        }).await
+    }
+
+    pub async fn ack_remote_outbox_delivery(
+        &self,
+        logical_attachment_id: &str,
+        delivery_id: &str,
+        consumer_kind: &str,
+        lease_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_uuid("delivery id", delivery_id)?;
+        validate_uuid("lease id", lease_id)?;
+        ensure!(
+            !consumer_kind.is_empty() && consumer_kind.len() <= 64,
+            "invalid consumer kind"
+        );
+        let attachment = logical_attachment_id.to_owned();
+        let delivery = delivery_id.to_owned();
+        let consumer = consumer_kind.to_owned();
+        let lease = lease_id.to_owned();
+        self.transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE remote_attachment_outbox_deliveries
+                    SET state='acked', lease_id=NULL, lease_expires_at_ms=NULL,
+                        updated_at_ms=?1, acked_at_ms=?1
+                  WHERE logical_attachment_id=?2 AND delivery_id=?3 AND consumer_kind=?4
+                    AND state='leased' AND lease_id=?5 AND lease_expires_at_ms>?1",
+                params![now_ms, attachment, delivery, consumer, lease],
+            )?;
+            Ok(changed == 1)
+        })
+        .await
+    }
     /// Reserve, perform one domain mutation, and commit its replay response and
     /// outbox event in one writer transaction. No reserved intermediate state
     /// or connection-level ledger primitive escapes this API.
@@ -1223,6 +1331,102 @@ mod tests {
             .await
             .is_err(),
             "committed state must be final"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_delivery_claim_expiry_ack_and_consumers_are_independent() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000060";
+        let delivery = "00000000-0000-4000-8000-000000000061";
+        db.reserve_remote_attachment_operation(reserve(operation, [6; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"ack",
+            outbox_delivery_id: delivery,
+            outbox_kind: "wake_goal",
+            outbox_payload: b"{}",
+            now_ms: 10,
+        })
+        .await
+        .unwrap();
+        let first = db
+            .claim_remote_outbox_delivery("worker", "wake_goal", 20, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempts, 1);
+        assert!(
+            db.claim_remote_outbox_delivery("worker", "wake_goal", 119, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let second = db
+            .claim_remote_outbox_delivery("worker", "wake_goal", 120, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.delivery_id, first.delivery_id);
+        assert_eq!(second.attempts, 2);
+        assert_ne!(second.lease_id, first.lease_id);
+        assert!(
+            !db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &first.lease_id, 121)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &second.lease_id, 121)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_remote_outbox_delivery("worker", "wake_goal", 500, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let transport = db
+            .claim_remote_outbox_delivery("transport", "wake_goal", 500, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            transport.attempts, 1,
+            "consumer delivery state must be independent"
+        );
+
+        let attachment = ATTACHMENT.to_owned();
+        assert!(db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM remote_attachment_outbox WHERE logical_attachment_id=?1 AND event_seq=1",
+                [&attachment],
+            )?;
+            Ok(())
+        }).await.is_err(), "consumer ack must not authorize replay compaction");
+
+        let attachment = ATTACHMENT.to_owned();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_snapshots
+                 (logical_attachment_id, compacted_through_event_seq, snapshot_high_water_mark, updated_at_ms)
+                 VALUES (?1,1,1,600)",
+                [&attachment],
+            )?;
+            conn.execute(
+                "DELETE FROM remote_attachment_outbox WHERE logical_attachment_id=?1 AND event_seq=1",
+                [&attachment],
+            )?;
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            db.claim_remote_outbox_delivery("transport", "wake_goal", 700, 100)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

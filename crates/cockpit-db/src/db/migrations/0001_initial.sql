@@ -2775,6 +2775,53 @@ CREATE INDEX idx_remote_attachment_outbox_operation
     ON remote_attachment_outbox (logical_attachment_id, operation_seq)
     WHERE operation_seq IS NOT NULL;
 
+-- Delivery attempts are consumer-local and never authorize replay compaction.
+-- The immutable event row remains the sole application replay authority.
+CREATE TABLE remote_attachment_outbox_deliveries (
+    logical_attachment_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    consumer_kind TEXT NOT NULL CHECK (length(consumer_kind) BETWEEN 1 AND 64),
+    state TEXT NOT NULL CHECK (state IN ('leased', 'acked')),
+    lease_id TEXT CHECK (lease_id IS NULL OR (
+        length(lease_id) = 36 AND lease_id = lower(lease_id)
+        AND substr(lease_id, 9, 1) = '-' AND substr(lease_id, 14, 1) = '-'
+        AND substr(lease_id, 19, 1) = '-' AND substr(lease_id, 20, 1) GLOB '[89ab]'
+        AND substr(lease_id, 24, 1) = '-'
+        AND length(replace(lease_id, '-', '')) = 32
+        AND replace(lease_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(lease_id, '-', '') <> '00000000000000000000000000000000'
+    )),
+    lease_expires_at_ms INTEGER,
+    attempts INTEGER NOT NULL CHECK (attempts BETWEEN 1 AND 1000000),
+    first_claimed_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    acked_at_ms INTEGER,
+    PRIMARY KEY (logical_attachment_id, delivery_id, consumer_kind),
+    FOREIGN KEY (logical_attachment_id, delivery_id)
+        REFERENCES remote_attachment_outbox(logical_attachment_id, delivery_id)
+        ON DELETE CASCADE,
+    CHECK ((state = 'leased' AND lease_id IS NOT NULL AND lease_expires_at_ms IS NOT NULL AND acked_at_ms IS NULL)
+        OR (state = 'acked' AND lease_id IS NULL AND lease_expires_at_ms IS NULL AND acked_at_ms IS NOT NULL)),
+    CHECK (updated_at_ms >= first_claimed_at_ms),
+    CHECK (acked_at_ms IS NULL OR acked_at_ms >= first_claimed_at_ms)
+);
+
+CREATE INDEX idx_remote_attachment_outbox_deliveries_claim
+    ON remote_attachment_outbox_deliveries (consumer_kind, state, lease_expires_at_ms);
+
+CREATE TRIGGER remote_attachment_outbox_delivery_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_deliveries
+WHEN NEW.logical_attachment_id <> OLD.logical_attachment_id
+  OR NEW.delivery_id <> OLD.delivery_id
+  OR NEW.consumer_kind <> OLD.consumer_kind
+  OR NEW.first_claimed_at_ms <> OLD.first_claimed_at_ms
+  OR NEW.attempts < OLD.attempts
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR OLD.state = 'acked'
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote outbox delivery transition');
+END;
+
 CREATE TRIGGER remote_attachment_outbox_capacity_insert
 BEFORE INSERT ON remote_attachment_outbox
 WHEN (SELECT COUNT(*) FROM remote_attachment_outbox

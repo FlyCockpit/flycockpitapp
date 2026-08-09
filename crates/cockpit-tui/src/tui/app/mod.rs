@@ -3846,7 +3846,10 @@ impl App {
                 self.handle_mouse(mouse);
                 false
             }
-            Event::Resize(_, _) => false,
+            Event::Resize(_, _) => {
+                self.dialog.cancel_settings_pointer_transients();
+                false
+            }
             _ => false,
         }
     }

@@ -1287,6 +1287,12 @@ impl SettingsPage for McpPage {
         Nav::Stay
     }
 
+    fn cancel_pointer_transients(&mut self) {
+        if let McpPage::List(state) = self {
+            state.delete_pending = false;
+        }
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         let crumbs = match self {
             McpPage::List(_) => " › MCP",

@@ -1054,6 +1054,11 @@ impl SettingsPage for ToolsPage {
         Nav::Stay
     }
 
+    fn cancel_pointer_transients(&mut self) {
+        self.delete_pending = None;
+        self.reset.disarm();
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › Tools",

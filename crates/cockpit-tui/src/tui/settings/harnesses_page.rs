@@ -875,6 +875,13 @@ impl SettingsPage for HarnessesPage {
         Nav::Stay
     }
 
+    fn cancel_pointer_transients(&mut self) {
+        if let HarnessesPage::List(state) = self {
+            state.delete_pending = false;
+            state.reset.disarm();
+        }
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         let crumbs = match self {
             HarnessesPage::List(_) => " › Harnesses".to_string(),

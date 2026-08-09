@@ -316,6 +316,9 @@ pub(super) trait SettingsPage: Any {
         }
         Nav::Stay
     }
+    /// Invalidate pointer-only confirmations/effects whose hit geometry or
+    /// identity is no longer trustworthy after a terminal resize.
+    fn cancel_pointer_transients(&mut self) {}
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     #[cfg(test)]
@@ -798,6 +801,14 @@ impl Dialog {
     pub(crate) fn clear_settings_pointer_hover(&self) {
         if let Dialog::Settings(settings) = self {
             settings.pointer_surface.hover.set(None);
+        }
+    }
+    pub(crate) fn cancel_settings_pointer_transients(&mut self) {
+        if let Dialog::Settings(settings) = self {
+            settings.pointer_surface.hover.set(None);
+            settings.pointer_surface.header_hover.set(None);
+            settings.pointer_surface.pressed.set(None);
+            settings.page.cancel_pointer_transients();
         }
     }
     pub fn is_active(&self) -> bool {

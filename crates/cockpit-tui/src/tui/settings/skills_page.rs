@@ -445,11 +445,17 @@ impl SettingsPage for SkillsPage {
         delta: isize,
     ) -> Nav {
         if region == SettingsScrollRegionId("skills") && self.grabbed.is_none() {
+            self.pointer_delete_pending = None;
             let last = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 1;
             self.reset.disarm();
             self.cursor = self.cursor.saturating_add_signed(delta).min(last);
         }
         Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.pointer_delete_pending = None;
+        self.reset.disarm();
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

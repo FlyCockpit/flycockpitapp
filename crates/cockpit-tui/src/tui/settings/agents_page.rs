@@ -1137,6 +1137,11 @@ impl SettingsPage for AgentsPage {
         Nav::Stay
     }
 
+    fn cancel_pointer_transients(&mut self) {
+        self.confirm_reset = false;
+        self.disarm_guards();
+    }
+
     fn title(&self, cx: &SettingsCx) -> String {
         format!(
             "{} › Agents",

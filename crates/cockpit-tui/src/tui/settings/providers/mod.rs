@@ -3589,6 +3589,7 @@ impl SettingsCx {
             "Don't remove unlisted models (default)",
             "Remove unlisted models",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3596,6 +3597,7 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
@@ -3607,11 +3609,22 @@ impl SettingsCx {
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((lines.len(), SettingsControlId(2)));
         lines.push(Line::from(vec![
             Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-all",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:fetch-all"),
+        );
     }
 
     fn render_fetch_one_prompt(&self, frame: &mut Frame, area: Rect, s: &FetchOnePromptState) {
@@ -3640,6 +3653,7 @@ impl SettingsCx {
             "Don't remove unlisted models (default)",
             "Remove unlisted models",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3647,6 +3661,7 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
@@ -3658,11 +3673,22 @@ impl SettingsCx {
         } else {
             Style::default().fg(Color::White)
         };
+        bindings.push((lines.len(), SettingsControlId(2)));
         lines.push(Line::from(vec![
             Span::raw(if s.cursor == 2 { "▸ " } else { "  " }),
             Span::styled(format!("{check} Do not show again"), style),
         ]));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-one",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:fetch-one"),
+        );
     }
 
     fn render_fetch_fallback_prompt(
@@ -3690,6 +3716,7 @@ impl SettingsCx {
             "Use fallback catalog",
             "Cancel",
         ];
+        let mut bindings = Vec::new();
         for (i, label) in opts.iter().enumerate() {
             let marker = if i == s.cursor { "▸ " } else { "  " };
             let style = if i == s.cursor {
@@ -3697,12 +3724,23 @@ impl SettingsCx {
             } else {
                 Style::default().fg(Color::White)
             };
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(label.to_string(), style),
             ]));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:fetch-fallback",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:fetch-fallback"),
+        );
     }
 }
 
@@ -4285,6 +4323,13 @@ impl SettingsPage for ProvidersPage {
             {
                 editor.cursor = index;
             }
+            ProvidersPage::FetchAll(state)
+                if !state.is_fetching() && !state.unlisted.is_empty() && index <= 2 =>
+            {
+                state.cursor = index;
+            }
+            ProvidersPage::FetchOnePrompt(state) if index <= 2 => state.cursor = index,
+            ProvidersPage::FetchFallbackPrompt(state) if index <= 3 => state.cursor = index,
             _ => return Nav::Stay,
         }
         cx.handle_providers_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
@@ -4346,6 +4391,27 @@ impl SettingsPage for ProvidersPage {
                 .cursor
                 .saturating_add_signed(delta)
                 .min(editor.save_idx());
+        } else {
+            match self {
+                ProvidersPage::FetchAll(state)
+                    if region == SettingsScrollRegionId("providers:fetch-all")
+                        && !state.is_fetching()
+                        && !state.unlisted.is_empty() =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(2);
+                }
+                ProvidersPage::FetchOnePrompt(state)
+                    if region == SettingsScrollRegionId("providers:fetch-one") =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(2);
+                }
+                ProvidersPage::FetchFallbackPrompt(state)
+                    if region == SettingsScrollRegionId("providers:fetch-fallback") =>
+                {
+                    state.cursor = state.cursor.saturating_add_signed(delta).min(3);
+                }
+                _ => {}
+            }
         }
         Nav::Stay
     }

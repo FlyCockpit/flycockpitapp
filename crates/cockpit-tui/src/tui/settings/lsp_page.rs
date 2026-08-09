@@ -540,6 +540,7 @@ fn lsp_edit_row<T: ToString>(
             Span::styled(before.to_string(), muted_style()),
             shell::cursor_marker_span(),
             Span::styled(after.to_string(), muted_style()),
+            Span::styled("  [cancel]", muted_style()),
         ])
     } else {
         lsp_row(idx, p.cursor, label, value.to_string())
@@ -671,6 +672,31 @@ impl SettingsCx {
             shell::SettingsScrollRegionId("lsp"),
         );
         let offset = self.scroll_states.offset_for("lsp");
+        if let Some(edit) = p.editing {
+            let line = lsp_selected_line_for_cursor(row_index(lsp_row_for_edit(edit)));
+            if let Some(screen_row) = line.checked_sub(offset)
+                && screen_row < usize::from(area.height)
+            {
+                // The overlay owns the complete rendered `  [cancel]` span,
+                // beginning immediately after marker + label + draft + caret.
+                let cancel_x = 27usize.saturating_add(p.buf.text().chars().count());
+                if cancel_x < usize::from(area.width) {
+                    self.pointer_surface.register(shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x.saturating_add(cancel_x as u16),
+                            area.y.saturating_add(screen_row as u16),
+                            10.min(area.width.saturating_sub(cancel_x as u16)),
+                            1,
+                        ),
+                        action: shell::SettingsPointerAction::Page(SettingsPointerAction::Lsp(
+                            PointerLspAction::CancelEdit(pointer_edit(edit)),
+                        )),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
+            }
+        }
         let server_count = row_count.saturating_sub(LSP_SERVER_ROW_START);
         for server_idx in 0..server_count {
             let Some(server) = servers.as_ref().and_then(|items| items.get(server_idx)) else {
@@ -726,6 +752,16 @@ fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> PointerLspActio
         PointerLspAction::SaveEdit(edit)
     } else {
         PointerLspAction::Edit(edit)
+    }
+}
+
+fn lsp_row_for_edit(edit: LspEdit) -> LspRow {
+    match edit {
+        LspEdit::OtherFilesLimit => LspRow::OtherFilesLimit,
+        LspEdit::PerFileLimit => LspRow::PerFileLimit,
+        LspEdit::DebounceMs => LspRow::DebounceMs,
+        LspEdit::DocumentTimeoutMs => LspRow::DocumentTimeoutMs,
+        LspEdit::WorkspaceTimeoutMs => LspRow::WorkspaceTimeoutMs,
     }
 }
 

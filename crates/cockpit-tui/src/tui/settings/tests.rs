@@ -1222,6 +1222,51 @@ fn pointer_lsp_save_actions_dispatch_from_fresh_sources() {
             dialog.test_page(),
             TestPageRef::Lsp(page) if page.editing.is_none() && page.status.as_deref() == Some("saved")
         ));
+
+        let cancel_tmp = TempDir::new().unwrap();
+        let mut cancel_dialog = standalone_pointer_dialog(&cancel_tmp, "LSP");
+        enter_root_node(&mut cancel_dialog, "LSP");
+        let config_before = serde_json::to_value(&cancel_dialog.extended).unwrap();
+        click_settings_action(
+            &mut cancel_dialog,
+            &SettingsPointerAction::Lsp(LspAction::Edit(edit)),
+        );
+        let TestPageMut::Lsp(page) = cancel_dialog.test_page_mut() else {
+            panic!("LSP cancel fixture must enter its editor")
+        };
+        page.buf.set("999999");
+        let _ = render_settings_rows(&cancel_dialog, 100, 80);
+        let cancel_actions = cancel_dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Lsp(LspAction::CancelEdit(rendered)),
+                    ),
+                    true,
+                ) if *rendered == edit => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancel_actions.len(),
+            1,
+            "each LSP edit owns one exact cancel source"
+        );
+        click_settings_action(&mut cancel_dialog, &cancel_actions[0]);
+        assert_eq!(
+            serde_json::to_value(&cancel_dialog.extended).unwrap(),
+            config_before,
+            "LSP cancel does not persist its draft"
+        );
+        assert!(matches!(
+            cancel_dialog.test_page(),
+            TestPageRef::Lsp(page)
+                if page.editing.is_none() && page.buf.text().is_empty() && page.status.is_none()
+        ));
     }
 }
 

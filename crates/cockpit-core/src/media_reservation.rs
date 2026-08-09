@@ -265,6 +265,23 @@ impl MediaReservationLedger {
         }).await.map_err(LedgerError::Storage)
     }
 
+    pub async fn bind_downstream_ownership(
+        &self,
+        reservation_ids: Vec<String>,
+        invocation_id: &str,
+        wall_ms: u64,
+    ) -> Result<(), LedgerError> {
+        let invocation_id = invocation_id.to_owned();
+        self.db.transaction(move|conn| {
+            for id in reservation_ids {
+                let(state,published):(String,bool)=conn.query_row("SELECT state,published FROM media_reservations WHERE reservation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                if ReservationState::parse(&state)?!=ReservationState::Settling||!published{return Err(anyhow!("downstream_ownership_requires_published_settling"));}
+                conn.execute("INSERT INTO media_downstream_ownership(reservation_id,invocation_id,bound_wall_ms) VALUES(?1,?2,?3) ON CONFLICT(reservation_id) DO UPDATE SET invocation_id=excluded.invocation_id WHERE media_downstream_ownership.invocation_id=excluded.invocation_id",params![id,invocation_id,sqlite_i64(wall_ms)?])?;
+            }
+            Ok(())
+        }).await.map_err(classify_storage_error)
+    }
+
     /// Releases abandoned daemon uploads whose only storage was process
     /// memory. The operation discriminator and queued state are durable proof
     /// that no ready/published artifact existed; all other operation kinds and

@@ -146,12 +146,15 @@ async fn handle_send_user_message(
             UserMessageProbeResult::ContentCheckRequired => requires_content_check = true,
         }
     }
-    let images = match claim_message_image_refs(
+    let images = match claim_message_image_refs_admitted(
+        ctx,
         state,
         session_id,
         client_submission_id,
         &image_refs,
-    ) {
+    )
+    .await
+    {
         Ok(images) => images,
         Err(_) if requires_content_check => {
             return Err(ErrorPayload {
@@ -3268,8 +3271,7 @@ pub(super) async fn attach(
         state
     });
 
-    state.pending_uploads.clear();
-    state.ready_attachments.clear();
+    drain_client_attachment_ownership(state, ctx, "reattach").await?;
     state.upload_limits = extended_cfg.daemon.uploads.into();
     state.attached = Some(AttachedSession {
         handle,

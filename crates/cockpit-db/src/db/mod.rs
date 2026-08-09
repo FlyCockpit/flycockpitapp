@@ -746,6 +746,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_goal_inference_provenance.sql",
         sql: include_str!("migrations/0002_goal_inference_provenance.sql"),
     },
+    Migration {
+        name: "0003_media_resource_reservation_ledger.sql",
+        sql: include_str!("migrations/0003_media_resource_reservation_ledger.sql"),
+    },
 ];
 
 /// Latest schema version understood by this build.

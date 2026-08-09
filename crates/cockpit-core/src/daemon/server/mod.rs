@@ -2929,7 +2929,7 @@ async fn run_in_process_client(
         Err(mpsc::error::TrySendError::Closed(_)) => return,
     }
 
-    loop {
+    'client: loop {
         let event_branch = async {
             match session_event_rx.as_mut() {
                 Some(rx) => Some(rx.recv().await),
@@ -2946,7 +2946,7 @@ async fn run_in_process_client(
                             permit.send(event);
                         }
                     }
-                    Err(_) => return,
+                    Err(_) => break 'client,
                 }
             }
             Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
@@ -2958,19 +2958,19 @@ async fn run_in_process_client(
                 match global {
                     Ok(envelope) => {
                         if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "in-process client global event stream lagged");
                         pending_lag.record_many(n, None);
                         if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                         {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {}
@@ -2989,7 +2989,7 @@ async fn run_in_process_client(
                             session_id,
                             &mut pending_lag,
                         ) {
-                            return;
+                            break 'client;
                         }
                     }
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
@@ -3010,11 +3010,11 @@ async fn run_in_process_client(
             }
             cmd = request_rx.recv() => {
                 let Some(InProcessRequest { request, reply }) = cmd else {
-                    return;
+                    break 'client;
                 };
                 if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                     let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
-                        return;
+                        break 'client;
                     };
                     let shared = shared.clone();
                     let ctx = ctx.clone();
@@ -3047,13 +3047,13 @@ async fn run_in_process_client(
                         .map(|attached| attached.handle.session_id);
                     for event in std::mem::take(&mut state.pending_replay) {
                         if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     if let Some(event) = ctx.drain_state_event()
                         && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                     {
-                        return;
+                        break 'client;
                     }
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
@@ -3063,6 +3063,9 @@ async fn run_in_process_client(
                 }
             }
         }
+    }
+    if let Err(error) = drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+        tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
     }
 }
 
@@ -3508,6 +3511,9 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
+                    if let Err(error) = drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+                        tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
+                    }
                     return;
                 };
                 match input {

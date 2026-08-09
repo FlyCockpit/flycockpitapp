@@ -30,29 +30,90 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> Prune
             (now.duration_since(attachment.created_at) > ttl).then_some(*id)
         })
         .collect();
-    let mut destroyed: Vec<_> = expired_ready
+    let destroyed: Vec<_> = expired_ready
         .into_iter()
         .filter_map(|id| state.ready_attachments.remove(&id))
         .filter_map(|attachment| attachment.media_reservation)
         .collect();
-    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
-    let expired_consumed: Vec<_> = accounting
+    // This cache is not authoritative ownership: the session actor already
+    // received an image clone. Cache TTL must not release that actor-owned
+    // durable reservation.
+    crate::sync::lock_or_recover(&state.upload_accounting)
         .consumed_message_attachments
-        .iter()
-        .filter_map(|(id, consumed)| {
-            (now.duration_since(consumed.consumed_at) > ttl).then_some(*id)
-        })
-        .collect();
-    destroyed.extend(
-        expired_consumed
-            .into_iter()
-            .filter_map(|id| accounting.consumed_message_attachments.remove(&id))
-            .filter_map(|consumed| consumed.attachment.media_reservation),
-    );
+        .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
     PrunedMediaReservations {
         cancelled,
         destroyed,
     }
+}
+
+pub(super) async fn drain_client_attachment_ownership(
+    state: &mut MutableClientState,
+    ctx: &DaemonContext,
+    reason: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let pending: Vec<_> = state
+        .pending_uploads
+        .iter()
+        .filter_map(|(id, upload)| {
+            upload
+                .media_reservation
+                .clone()
+                .map(|receipt| (*id, receipt))
+        })
+        .collect();
+    let ready: Vec<_> = state
+        .ready_attachments
+        .iter()
+        .filter_map(|(id, attachment)| {
+            attachment
+                .media_reservation
+                .clone()
+                .map(|receipt| (*id, receipt))
+        })
+        .collect();
+    let untracked_pending: Vec<_> = state
+        .pending_uploads
+        .iter()
+        .filter_map(|(id, upload)| upload.media_reservation.is_none().then_some(*id))
+        .collect();
+    let untracked_ready: Vec<_> = state
+        .ready_attachments
+        .iter()
+        .filter_map(|(id, attachment)| attachment.media_reservation.is_none().then_some(*id))
+        .collect();
+    let wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    for (id, receipt) in pending {
+        ctx.media_ledger
+            .request_cancellation(&receipt.reservation_id, receipt.version, wall_ms)
+            .await
+            .map_err(internal)?;
+        state.pending_uploads.remove(&id);
+        release_uploads(&state.upload_accounting, [id]);
+    }
+    for (id, receipt) in ready {
+        ctx.media_ledger
+            .destroy_local_artifacts(
+                &receipt.reservation_id,
+                receipt.version,
+                &format!("attachment-{reason}-destroyed:{}", receipt.reservation_id),
+                wall_ms,
+            )
+            .await
+            .map_err(internal)?;
+        state.ready_attachments.remove(&id);
+    }
+    for id in untracked_pending {
+        state.pending_uploads.remove(&id);
+        release_uploads(&state.upload_accounting, [id]);
+    }
+    for id in untracked_ready {
+        state.ready_attachments.remove(&id);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_sha256_hex(sha256: &str) -> bool {
@@ -275,16 +336,21 @@ pub(super) async fn begin_attachment_upload_admitted(
             return Err(bad_request("attachment exceeds media resource policy"));
         }
     };
-    let session = state
-        .attached
-        .as_ref()
-        .map(|attached| attached.handle.session_id.to_string())
-        .unwrap_or_else(|| {
-            format!(
+    let (project_id, session) = state.attached.as_ref().map_or_else(
+        || {
+            let principal = format!(
                 "principal:{}",
                 state.principal.tag().unwrap_or_else(|| "local".into())
+            );
+            (principal.clone(), principal)
+        },
+        |attached| {
+            (
+                attached.handle.project_id(),
+                attached.handle.session_id.to_string(),
             )
-        });
+        },
+    );
     let reservation_id = format!("attachment:{upload_id}");
     let admission = ctx
         .media_ledger
@@ -292,7 +358,7 @@ pub(super) async fn begin_attachment_upload_admitted(
             reservation_id: reservation_id.clone(),
             recovery_id: reservation_id,
             owner: crate::media_reservation::MediaOwner {
-                project_id: session.clone(),
+                project_id,
                 session_id: session,
             },
             operation: "attachment_upload".into(),
@@ -648,6 +714,44 @@ pub(super) fn claim_message_image_refs(
                 },
             );
         }
+    }
+    Ok(images)
+}
+
+pub(super) async fn claim_message_image_refs_admitted(
+    ctx: &DaemonContext,
+    state: &mut MutableClientState,
+    session_id: Uuid,
+    client_submission_id: Uuid,
+    refs: &[proto::ImageAttachmentRef],
+) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
+    let images = claim_message_image_refs(state, session_id, client_submission_id, refs)?;
+    let reservation_ids = {
+        let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+        refs.iter()
+            .filter_map(|image_ref| {
+                accounting
+                    .consumed_message_attachments
+                    .get(&image_ref.id)
+                    .and_then(|consumed| consumed.attachment.media_reservation.as_ref())
+                    .map(|receipt| receipt.reservation_id.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    if let Err(error) = ctx
+        .media_ledger
+        .bind_downstream_ownership(
+            reservation_ids,
+            &client_submission_id.to_string(),
+            chrono::Utc::now()
+                .timestamp_millis()
+                .try_into()
+                .unwrap_or(0),
+        )
+        .await
+    {
+        release_message_image_refs(state, client_submission_id, refs);
+        return Err(internal(error));
     }
     Ok(images)
 }

@@ -638,6 +638,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
+    pointer_lsp_save_actions_dispatch_from_fresh_sources();
     pointer_skills_action_family_dispatches_from_fresh_sources();
     pointer_mcp_action_family_dispatches_from_fresh_sources();
     pointer_tool_credential_family_dispatches_from_fresh_sources();
@@ -1162,6 +1163,65 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
             };
             assert!(semantic_outcome, "{action:?} produced no semantic outcome");
         }
+    }
+}
+
+fn pointer_lsp_save_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{LspAction, LspEdit as PointerLspEdit, SettingsPointerAction};
+
+    let edits = [
+        PointerLspEdit::OtherFilesLimit,
+        PointerLspEdit::PerFileLimit,
+        PointerLspEdit::DebounceMs,
+        PointerLspEdit::DocumentTimeoutMs,
+        PointerLspEdit::WorkspaceTimeoutMs,
+    ];
+    for (index, edit) in edits.into_iter().enumerate() {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = standalone_pointer_dialog(&tmp, "LSP");
+        enter_root_node(&mut dialog, "LSP");
+        click_settings_action(
+            &mut dialog,
+            &SettingsPointerAction::Lsp(LspAction::Edit(edit)),
+        );
+        let value = 700 + index as u64;
+        let TestPageMut::Lsp(page) = dialog.test_page_mut() else {
+            panic!("LSP edit action must preserve its page")
+        };
+        page.buf.set(value.to_string());
+
+        let _ = render_settings_rows(&dialog, 100, 80);
+        let actions = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Lsp(LspAction::SaveEdit(rendered)),
+                    ),
+                    true,
+                ) if *rendered == edit => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1, "each LSP edit owns one exact save source");
+        click_settings_action(&mut dialog, &actions[0]);
+
+        let diagnostics = &dialog.extended.lsp.diagnostics;
+        let saved = match edit {
+            PointerLspEdit::OtherFilesLimit => diagnostics.other_files_limit as u64,
+            PointerLspEdit::PerFileLimit => diagnostics.per_file_limit as u64,
+            PointerLspEdit::DebounceMs => diagnostics.debounce_ms,
+            PointerLspEdit::DocumentTimeoutMs => diagnostics.document_timeout_ms,
+            PointerLspEdit::WorkspaceTimeoutMs => diagnostics.workspace_timeout_ms,
+        };
+        assert_eq!(saved, value, "LSP save applies its source field exactly");
+        assert!(matches!(
+            dialog.test_page(),
+            TestPageRef::Lsp(page) if page.editing.is_none() && page.status.as_deref() == Some("saved")
+        ));
     }
 }
 

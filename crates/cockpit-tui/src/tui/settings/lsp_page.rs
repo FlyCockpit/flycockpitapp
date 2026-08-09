@@ -632,16 +632,20 @@ impl SettingsCx {
                 LspRow::AutoInstall => Some(PointerLspAction::CycleAutoInstall),
                 LspRow::Diagnostics => Some(PointerLspAction::ToggleDiagnostics),
                 LspRow::OtherFilesLimit => {
-                    Some(PointerLspAction::Edit(PointerLspEdit::OtherFilesLimit))
+                    Some(lsp_edit_pointer_action(p, PointerLspEdit::OtherFilesLimit))
                 }
-                LspRow::PerFileLimit => Some(PointerLspAction::Edit(PointerLspEdit::PerFileLimit)),
-                LspRow::DebounceMs => Some(PointerLspAction::Edit(PointerLspEdit::DebounceMs)),
-                LspRow::DocumentTimeoutMs => {
-                    Some(PointerLspAction::Edit(PointerLspEdit::DocumentTimeoutMs))
+                LspRow::PerFileLimit => {
+                    Some(lsp_edit_pointer_action(p, PointerLspEdit::PerFileLimit))
                 }
-                LspRow::WorkspaceTimeoutMs => {
-                    Some(PointerLspAction::Edit(PointerLspEdit::WorkspaceTimeoutMs))
-                }
+                LspRow::DebounceMs => Some(lsp_edit_pointer_action(p, PointerLspEdit::DebounceMs)),
+                LspRow::DocumentTimeoutMs => Some(lsp_edit_pointer_action(
+                    p,
+                    PointerLspEdit::DocumentTimeoutMs,
+                )),
+                LspRow::WorkspaceTimeoutMs => Some(lsp_edit_pointer_action(
+                    p,
+                    PointerLspEdit::WorkspaceTimeoutMs,
+                )),
                 LspRow::Reset => Some(PointerLspAction::Reset),
                 // The unavailable sentinel is explanatory text, not an
                 // enabled Check control. A real project source below supplies
@@ -714,6 +718,14 @@ impl SettingsCx {
                 });
             }
         }
+    }
+}
+
+fn lsp_edit_pointer_action(p: &LspPage, edit: PointerLspEdit) -> PointerLspAction {
+    if p.editing.map(pointer_edit) == Some(edit) {
+        PointerLspAction::SaveEdit(edit)
+    } else {
+        PointerLspAction::Edit(edit)
     }
 }
 

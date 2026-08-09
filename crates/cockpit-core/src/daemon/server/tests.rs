@@ -2818,6 +2818,183 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     ));
 }
 
+#[tokio::test]
+async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
+    let ctx = test_ctx();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222230").unwrap();
+    let operation = "018f3f24-7a10-7cc2-8f55-aaaaaaaaaaab";
+    ctx.db.reserve_remote_attachment_operation(crate::db::remote_attachment_operations::ReserveRemoteOperation {
+        logical_attachment_id: &attachment.to_string(), operation_id: operation,
+        authenticated_device_id: "33333333-3333-4333-8333-333333333340", authenticated_device_generation: 1,
+        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+        request_hash: [1; 32], now_ms: 1,
+    }).await.unwrap();
+    ctx.db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment.to_string(),
+                operation_id: operation,
+                safe_response: b"ack",
+                outbox_delivery_id: "44444444-4444-4444-8444-444444444441",
+                outbox_kind: "test_replay",
+                outbox_payload: b"one",
+                now_ms: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let principal_for = |device: &str| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "replay-user".into(),
+            grants: vec![],
+            actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                schema_version: 1,
+                device_id: Uuid::parse_str(device).unwrap(),
+                device_generation: 1,
+                logical_attachment_id: attachment,
+            }),
+        })
+    };
+    let mut first = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal_for("33333333-3333-4333-8333-333333333340"),
+        ctx.terminal_host.clone(),
+    );
+    let mut second = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal_for("33333333-3333-4333-8333-333333333341"),
+        ctx.terminal_host.clone(),
+    );
+    let mut first_shared = first.shared_snapshot();
+    let mut second_shared = second.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _event_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+                id: request_id,
+                after_event_seq: None,
+                limit: proto::RemoteReplayLimit::new(2).unwrap(),
+            }),
+        },
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let Body::RemoteReplayResponse(first_page) =
+        recv_writer_body(&mut writer_rx, "first replay").await
+    else {
+        panic!("expected replay response")
+    };
+    assert_eq!(first_page.id, request_id);
+    assert_eq!(first_page.events.len(), 1);
+    let event = first_page.events[0].clone();
+    assert_eq!(event.event_seq.get(), 1);
+
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+                id: Uuid::new_v4(),
+                after_event_seq: None,
+                limit: proto::RemoteReplayLimit::new(2).unwrap(),
+            }),
+        },
+        &mut second,
+        &mut second_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let Body::RemoteReplayResponse(second_page) =
+        recv_writer_body(&mut writer_rx, "second replay").await
+    else {
+        panic!("expected replay response")
+    };
+    assert_eq!(
+        second_page.events[0].delivery_id, event.delivery_id,
+        "physical consumers dedupe by stable delivery id"
+    );
+
+    let wrong_ack_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+                id: wrong_ack_id,
+                delivery_id: event.delivery_id,
+                lease_token: event.lease_token,
+            }),
+        },
+        &mut second,
+        &mut second_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "wrong actor ack").await,
+        Body::RemoteReplayAckResponse(result) if result.id == wrong_ack_id && !result.acked)
+    );
+    let own_ack_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+                id: own_ack_id,
+                delivery_id: event.delivery_id,
+                lease_token: event.lease_token,
+            }),
+        },
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "own ack").await,
+        Body::RemoteReplayAckResponse(result) if result.id == own_ack_id && result.acked));
+
+    let status_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            status_id,
+            Request::OperationStatus {
+                operation_id: Uuid::parse_str(operation).unwrap(),
+            },
+        ),
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "operation status").await,
+        Body::Response { id, response } if id == status_id && matches!(*response, Response::RemoteOperationStatus { status: Some(_) }))
+    );
+}
+
 fn table_for(secret: &str) -> Arc<RedactionTable> {
     let cfg = crate::config::extended::RedactConfig {
         enabled: true,

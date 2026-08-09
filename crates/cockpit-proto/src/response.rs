@@ -509,6 +509,9 @@ pub enum Response {
     RunInvocationStatus {
         status: RunInvocationStatusV1,
     },
+    RemoteOperationStatus {
+        status: Option<RemoteOperationStatusV1>,
+    },
 
     /// Idempotent cancel result ([`Request::CancelRunInvocation`]).
     RunInvocationCancelResult {
@@ -695,6 +698,26 @@ pub struct RemoteGoalOutcomeV1 {
     pub disposition: GoalDisposition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteOperationStatusV1 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub state: RemoteOperationStateV1,
+    pub operation_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub safe_response: Option<Vec<u8>>,
+    pub event_high_water_mark: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperationStateV1 {
+    Reserved,
+    Committed,
+    Rejected,
+    OutcomeUnknown,
+}
+
 /// Versioned, content-free cancel response for a run invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -792,6 +815,7 @@ macro_rules! response_variants {
             (Response::CaffeinateState { .. }, "caffeinate_state");
             (Response::PausedWork { .. }, "paused_work");
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
+            (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::Unknown, "__unknown");
         ] }

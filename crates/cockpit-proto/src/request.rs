@@ -177,6 +177,11 @@ pub enum Request {
         client_submission_id: Uuid,
     },
 
+    /// Query the durable outcome of an operation on the authenticated logical attachment.
+    OperationStatus {
+        operation_id: Uuid,
+    },
+
     /// Request cancellation of a run invocation by the same client submission
     /// id used at start. Idempotent compare-and-set; does not introduce a
     /// second cancellation identity.
@@ -1187,6 +1192,11 @@ impl Request {
             } if client_submission_id.is_nil() => {
                 return Err("client_submission_id must not be nil".to_string());
             }
+            Self::OperationStatus { operation_id }
+                if operation_id.is_nil() || operation_id.get_version_num() != 7 =>
+            {
+                return Err("operation_id must be UUIDv7".to_string());
+            }
             _ => {}
         }
         Ok(())
@@ -1200,6 +1210,7 @@ macro_rules! request_variants {
             (Request::SubagentTranscript { .. }, "subagent_transcript");
             (Request::SendUserMessage { .. }, "send_user_message");
             (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
+            (Request::OperationStatus { .. }, "operation_status");
             (Request::CancelRunInvocation { .. }, "cancel_run_invocation");
             (Request::SteerDelegation { .. }, "steer_delegation");
             (Request::BeginAttachmentUpload { .. }, "begin_attachment_upload");
@@ -1346,6 +1357,7 @@ macro_rules! command {
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
+            (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
             (Request::CancelRunInvocation { client_submission_id }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             (Request::SteerDelegation { session_id, task_call_id, label, message }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|task_call_id:String|label:String|message:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param, message: String => param]);
             (Request::BeginAttachmentUpload { mime, byte_len, sha256, purpose }, "begin_attachment_upload", custom(authorize_begin_attachment_upload), attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "mime:String|byte_len:u64|sha256:String|purpose:AttachmentPurpose", [mime: String => param, byte_len: u64 => param, sha256: String => param, purpose: AttachmentPurpose => param]);

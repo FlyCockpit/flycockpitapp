@@ -1831,6 +1831,52 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             )
             .await
         }
+        Request::OperationStatus { operation_id } => {
+            let ClientPrincipal::Remote(remote) = &shared.principal else {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "operation status requires an authenticated remote actor".into(),
+                });
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "legacy actorless transport cannot query operation status".into(),
+                });
+            };
+            let row = ctx
+                .db
+                .remote_operation_status(
+                    &actor.logical_attachment_id.to_string(),
+                    &operation_id.to_string(),
+                )
+                .await
+                .map_err(internal)?;
+            let status = if let Some(row) = row {
+                let state = match row.state.as_str() {
+                    "reserved" => proto::RemoteOperationStateV1::Reserved,
+                    "committed" => proto::RemoteOperationStateV1::Committed,
+                    "rejected" => proto::RemoteOperationStateV1::Rejected,
+                    "outcome_unknown" => proto::RemoteOperationStateV1::OutcomeUnknown,
+                    _ => return Err(internal(anyhow::anyhow!("invalid remote operation state"))),
+                };
+                Some(proto::RemoteOperationStatusV1 {
+                    schema_version: 1,
+                    operation_id,
+                    state,
+                    operation_seq: proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                        row.operation_seq,
+                    ),
+                    safe_response: row.safe_response,
+                    event_high_water_mark: row
+                        .event_high_water_mark
+                        .map(proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64),
+                })
+            } else {
+                None
+            };
+            Ok(Response::RemoteOperationStatus { status })
+        }
 
         Request::ImportSessionArchive { transfer, as_new } => {
             import_session_archive(ctx, &transfer, as_new).await

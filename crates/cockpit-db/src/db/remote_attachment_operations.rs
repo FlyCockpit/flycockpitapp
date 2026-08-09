@@ -124,6 +124,37 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    pub async fn remote_operation_status(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<RemoteOperationReservation>> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT operation_seq,state,safe_response,event_high_water_mark
+                 FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND operation_id=?2",
+                params![attachment, operation],
+                |row| {
+                    Ok(RemoteOperationReservation {
+                        operation_seq: row.get::<_, i64>(0)? as u64,
+                        state: row.get(1)?,
+                        safe_response: row.get(2)?,
+                        event_high_water_mark: row
+                            .get::<_, Option<i64>>(3)?
+                            .map(|value| value as u64),
+                    })
+                },
+            )
+            .optional()
+            .context("querying remote operation status")
+        })
+        .await
+    }
     pub async fn remote_outbox_high_water(&self, logical_attachment_id: &str) -> Result<u64> {
         validate_uuid("logical attachment id", logical_attachment_id)?;
         let attachment = logical_attachment_id.to_owned();

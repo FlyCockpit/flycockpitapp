@@ -499,7 +499,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::BulkTransferChunkAccepted { .. } => {}
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
-        | proto::Response::RunInvocationCancelResult { .. } => {}
+        | proto::Response::RunInvocationCancelResult { .. }
+        | proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::Unknown => {}
     }
 }

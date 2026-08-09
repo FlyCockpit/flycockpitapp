@@ -442,6 +442,7 @@ const requestParamSchemas = {
     })
     .strict(),
   get_run_invocation_status: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
+  operation_status: z.object({ operation_id: uuidV7Schema }).strict(),
   cancel_run_invocation: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   session_live_status: z.object({ session_ids: z.array(uuidSchema) }).strict(),
   // `provider`/`model` are absent exactly when `clear` is set; the daemon
@@ -578,6 +579,7 @@ const clientRequestVariants = [
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("get_run_invocation_status", requestParamSchemas.get_run_invocation_status),
+  requestVariant("operation_status", requestParamSchemas.operation_status),
   requestVariant("cancel_run_invocation", requestParamSchemas.cancel_run_invocation),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
   requestVariant("set_default_model", requestParamSchemas.set_default_model),
@@ -626,6 +628,7 @@ export const clientEnvelopeSchema = z.discriminatedUnion(
 export type ClientEnvelope = z.infer<typeof clientEnvelopeSchema>;
 
 export const runInvocationLifecycleStateSchema = z.enum([
+  "not_found",
   "accepted",
   "queued",
   "dispatching",
@@ -672,7 +675,7 @@ export const runInvocationCancelResultV1Schema = z
   .object({
     schema_version: z.literal(1),
     client_submission_id: uuidSchema,
-    outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal"]),
+    outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal", "not_found"]),
     state: runInvocationLifecycleStateSchema,
     state_version: safeU64NumberSchema,
   })
@@ -698,6 +701,7 @@ export const responseNameSchema = z.enum([
   "models",
   "restart_decision",
   "run_invocation_status",
+  "remote_operation_status",
   "run_invocation_cancel_result",
   "session_messages",
   "session_live_status",
@@ -1240,6 +1244,17 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   responseVariant(
     "run_invocation_status",
     z.object({ status: runInvocationStatusV1Schema }).strict(),
+  ),
+  responseVariant(
+    "remote_operation_status",
+    z.object({
+      status: z.object({
+        schema_version: z.literal(1), operation_id: uuidV7Schema, state: z.enum(["reserved", "committed", "rejected", "outcome_unknown"]),
+        operation_seq: canonicalU64DecimalStringSchema,
+        safe_response: z.array(z.number().int().min(0).max(255)).max(524288).nullable(),
+        event_high_water_mark: canonicalU64DecimalStringSchema.nullable(),
+      }).strict().nullable(),
+    }).strict(),
   ),
   responseVariant(
     "run_invocation_cancel_result",

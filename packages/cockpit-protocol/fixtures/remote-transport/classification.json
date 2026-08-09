@@ -540,6 +540,12 @@
         "tag": "get_run_invocation_status"
       },
       {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "operation_status"
+      },
+      {
         "class": "cancel",
         "inlinePayloadBound": "bounded",
         "lane": "control",

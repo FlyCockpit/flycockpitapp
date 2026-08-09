@@ -157,6 +157,17 @@
       ]
     },
     {
+      "tag": "operation_status",
+      "fcorSchema": "operation_id:Uuid",
+      "fcorCanonicalSchema": "operation_id:uuid",
+      "class": "read_only",
+      "strategy": "none",
+      "evidence": null,
+      "fcorRoles": [
+        { "field": "operation_id", "type": "Uuid", "role": "param" }
+      ]
+    },
+    {
       "tag": "cancel_run_invocation",
       "fcorSchema": "client_submission_id:Uuid",
       "fcorCanonicalSchema": "client_submission_id:uuid",

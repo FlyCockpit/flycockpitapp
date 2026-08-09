@@ -28,9 +28,10 @@ use crate::config::providers::{
     ReasoningEffortRequestMapping, ThinkingMode, validate_anthropic_model_configuration,
 };
 use crate::envref;
+#[cfg(not(test))]
+use crate::providers::registry::ResolvedProviderOrigin;
 use crate::providers::registry::{
     OAuthCredential, ProviderCredentialKind, ProviderRegistry, ProviderRequestKind,
-    ResolvedProviderOrigin,
 };
 
 const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
@@ -2103,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_attribution_cross_adapter_fixture() {
+    fn openrouter_attribution_merge_fixture() {
         let mut headers = Vec::new();
         merge_openrouter_attribution(&mut headers);
         assert_eq!(headers.len(), 2);
@@ -2111,6 +2112,42 @@ mod tests {
         assert_eq!(headers[0].value, "https://flycockpit.dev");
         assert_eq!(headers[1].name, "X-OpenRouter-Title");
         assert_eq!(headers[1].value, "FlyCockpit");
+    }
+
+    #[tokio::test]
+    async fn openrouter_attribution_cross_adapter_fixture() {
+        let (base_url, request_handle) = serve_models_once(r#"{"data":[]}"#).await;
+        let entry = ProviderEntry {
+            template: Some("openrouter".into()),
+            url: base_url,
+            allow_insecure_http: true,
+            ..ProviderEntry::default()
+        };
+        let resolved =
+            resolve_provider_request_with_sources("renamed", &entry, |_| None, |_| None).unwrap();
+
+        assert_eq!(
+            resolved_header_value(&resolved, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            resolved_header_value(&resolved, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        fetch_models_for_provider("renamed", &entry, &resolved, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let request = request_handle.await.unwrap();
+        assert_eq!(
+            request_header_value(&request, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            request_header_value(&request, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+        assert!(request_header_value(&request, "X-Title").is_none());
     }
 
     #[test]

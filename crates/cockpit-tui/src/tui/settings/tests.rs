@@ -636,6 +636,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// as the keyboard contract instead of rebuilding synthetic registries.
 pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
+    pointer_standalone_root_actions_dispatch_from_fresh_sources();
     pointer_harness_list_actions_dispatch_from_fresh_sources();
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
@@ -651,6 +652,111 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
+    use pointer_actions::{LspAction, McpAction, SettingsPointerAction, SkillsAction, ToolsAction};
+
+    for title in ["Tools", "Skills", "MCP", "LSP"] {
+        let source_tmp = TempDir::new().unwrap();
+        let mut source = fresh_dialog(&source_tmp);
+        enter_root_node(&mut source, title);
+        let _ = render_settings_rows(&source, 100, 80);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled, title) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Tools(_)),
+                    true,
+                    "Tools",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Skills(_)),
+                    true,
+                    "Skills",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Mcp(_)),
+                    true,
+                    "MCP",
+                )
+                | (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Lsp(_)),
+                    true,
+                    "LSP",
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !actions.is_empty(),
+            "{title} source renders enabled actions"
+        );
+
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = fresh_dialog(&tmp);
+            enter_root_node(&mut dialog, title);
+            let before = serde_json::to_value(&dialog.extended).unwrap();
+            let token_before = dialog.page.pointer_surface_token();
+            click_settings_action(&mut dialog, &action);
+            let config_changed = serde_json::to_value(&dialog.extended).unwrap() != before;
+            let token_changed = dialog.page.pointer_surface_token() != token_before;
+            let semantic_outcome = match (&action, dialog.test_page()) {
+                (SettingsPointerAction::Tools(ToolsAction::CycleWebProvider), _) => config_changed,
+                (
+                    SettingsPointerAction::Tools(
+                        ToolsAction::EditFirecrawlBaseUrl
+                        | ToolsAction::EditCredential(_)
+                        | ToolsAction::EditWebFetchCommand
+                        | ToolsAction::EditWebSearchCommand
+                        | ToolsAction::AddUserTool,
+                    ),
+                    TestPageRef::Tools(page),
+                ) => page.editing.is_some(),
+                (SettingsPointerAction::Tools(ToolsAction::Reset), TestPageRef::Tools(page)) => {
+                    page.reset.is_pending()
+                }
+                (SettingsPointerAction::Tools(ToolsAction::McpJump), _) => token_changed,
+                (
+                    SettingsPointerAction::Skills(
+                        SkillsAction::ToggleAutoBangCommands | SkillsAction::ToggleAncestorWalk,
+                    ),
+                    _,
+                ) => config_changed,
+                (
+                    SettingsPointerAction::Skills(SkillsAction::AddScanDirectory),
+                    TestPageRef::Skills(page),
+                ) => page.grabbed.is_some(),
+                (SettingsPointerAction::Skills(SkillsAction::Reset), TestPageRef::Skills(page)) => {
+                    page.reset.is_pending()
+                }
+                (SettingsPointerAction::Mcp(McpAction::Add), _) => token_changed,
+                (
+                    SettingsPointerAction::Lsp(
+                        LspAction::ToggleEnabled
+                        | LspAction::CycleAutoInstall
+                        | LspAction::ToggleDiagnostics,
+                    ),
+                    _,
+                ) => config_changed,
+                (SettingsPointerAction::Lsp(LspAction::Edit(_)), TestPageRef::Lsp(page)) => {
+                    page.editing.is_some()
+                }
+                (SettingsPointerAction::Lsp(LspAction::Reset), TestPageRef::Lsp(page)) => {
+                    page.reset.is_pending()
+                }
+                (SettingsPointerAction::Lsp(LspAction::Check(_)), TestPageRef::Lsp(page)) => {
+                    dialog.pending_daemon_request.is_some() || page.status.is_some()
+                }
+                _ => panic!("unclassified fresh standalone action {action:?}"),
+            };
+            assert!(semantic_outcome, "{action:?} produced no semantic outcome");
+        }
+    }
 }
 
 fn harness_list_pointer_fixture(tmp: &TempDir) -> SettingsDialog {

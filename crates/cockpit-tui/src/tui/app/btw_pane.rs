@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use uuid::Uuid;
 
 use crate::tui::agent_runner::{self, AgentRunner};
+#[cfg(test)]
 use crate::tui::async_action::AsyncActionPayload;
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg, route_text_delta};

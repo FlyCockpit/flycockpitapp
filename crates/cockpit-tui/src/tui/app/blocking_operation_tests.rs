@@ -143,7 +143,33 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
         app.history.last(),
         Some(HistoryEntry::Plain { line }) if line == "⚠ daemon reduced"
     ));
-    assert_eq!(app.async_actions.pending_count(), 6);
+    let retained = [
+        BlockingOperationKind::CuratorMaintenance,
+        BlockingOperationKind::DoctorSnapshot,
+        BlockingOperationKind::ExportWrite,
+        BlockingOperationKind::QueueMutation,
+        BlockingOperationKind::BtwTeardown,
+    ];
+    assert_eq!(app.async_actions.pending_count(), retained.len());
+    for kind in retained {
+        assert_eq!(app.async_actions.pending_kind_count(&kind.action_kind()), 1);
+    }
+    assert_eq!(
+        app.async_actions
+            .pending_kind_count(&BlockingOperationKind::FileAutocomplete.action_kind()),
+        0
+    );
+    let cancelled = app.async_actions.drain_cancelled();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(
+        cancelled[0].kind,
+        BlockingOperationKind::FileAutocomplete.action_kind()
+    );
+    assert!(matches!(
+        &cancelled[0].payload,
+        Err(error) if error == "operation cancelled"
+    ));
+    assert!(app.async_actions.drain_cancelled().is_empty());
     for guard in release_guards {
         guard.release();
     }

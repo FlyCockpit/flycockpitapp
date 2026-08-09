@@ -438,12 +438,26 @@ mod tests {
         assert!(validate_dimensions(8_000, 5_000).is_ok());
         assert!(validate_dimensions(8_000, 5_001).is_err());
 
-        for (format, bytes) in [
-            (ImageFormat::Png, b"header-acTL-tail".as_slice()),
-            (ImageFormat::WebP, b"header-ANMF-tail".as_slice()),
-        ] {
-            assert!(reject_animation(format, bytes).is_err());
-        }
+        let apng = [
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+            &[0, 0, 0, 0],
+            b"acTL",
+            &[0, 0, 0, 0],
+            &[0, 0, 0, 0],
+            b"IEND",
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        assert!(reject_animation(ImageFormat::Png, &apng).is_err());
+        let animated_webp = [
+            b"RIFF".as_slice(),
+            &12u32.to_le_bytes(),
+            b"WEBP",
+            b"ANIM",
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        assert!(reject_animation(ImageFormat::WebP, &animated_webp).is_err());
         // A minimally structured two-frame GIF is rejected before decode.
         let two_frame_gif = [
             b"GIF89a".as_slice(),

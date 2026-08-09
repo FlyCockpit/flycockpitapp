@@ -1000,7 +1000,7 @@ impl App {
                 }
             }
         }
-        resolved_images.sort_unstable_by_key(|(offset, _)| *offset);
+        resolved_images.sort_by_key(|(offset, _)| *offset);
         let positional_wire = deferred.submission.text == fence.captured_composer;
         let positional_display = deferred.display == fence.captured_composer;
         if positional_wire {
@@ -1062,13 +1062,20 @@ impl App {
         let sequence = fence.fence_sequence;
         fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         let was_busy = self.busy;
-        if !was_busy {
+        if was_busy {
+            self.queue.push(super::input::optimistic_queue_item_with_id(
+                fence_id,
+                deferred.submission.text.clone(),
+                Some(deferred.display.clone()),
+            ));
+        } else {
             self.begin_working_span();
             self.prompt_history.push(deferred.display.clone());
             self.prompt_history_cursor = 0;
             self.staged_draft = None;
         }
-        self.dispatch_optimistic_user_submission_with_id(
+        let optimistic_history_start = self.history.len();
+        let outcome = self.dispatch_optimistic_user_submission_with_id(
             fence_id,
             deferred.display,
             deferred.submission,
@@ -1076,6 +1083,12 @@ impl App {
             !was_busy,
             &deferred.tag_expansions,
         );
+        if was_busy {
+            self.history.truncate(optimistic_history_start);
+            if outcome != DispatchOutcome::Sent {
+                self.queue.retain(|item| item.id != fence_id);
+            }
+        }
         let _ = self.submission_order.complete(sequence);
         self.dispatch_next_ready_paste_fence();
     }

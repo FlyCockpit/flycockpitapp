@@ -2366,6 +2366,7 @@ impl App {
                         .pending_model_selection
                         .as_ref()
                         .map(|pending| pending.selection_id),
+                    parked_fence_sequence: None,
                 },
             );
             self.composer.clear();

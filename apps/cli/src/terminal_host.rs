@@ -826,14 +826,16 @@ impl TerminalHost {
             return Err(invalid_ingress());
         }
         if let Some(operation) = state.ingress.get(&metadata.operation_id) {
+            if operation.binding != binding
+                && state.bindings.contains_key(&operation.binding.binding_id)
+            {
+                return Err(invalid_ingress());
+            }
             if operation.metadata != metadata {
                 return Err(ingress_conflict());
             }
             if operation.binding != binding {
                 let old_binding = operation.binding;
-                if state.bindings.contains_key(&old_binding.binding_id) {
-                    return Err(invalid_ingress());
-                }
                 let original_dir = state
                     .binding_dirs
                     .get(&old_binding.binding_id)

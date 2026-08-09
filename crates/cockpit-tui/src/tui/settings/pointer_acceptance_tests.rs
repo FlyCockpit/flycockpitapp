@@ -310,6 +310,7 @@ fn assert_rendered_action_matrix(actions: &[SettingsPointerAction]) {
 
 #[test]
 fn settings_pointer_contract_covers_all_current_pages() {
+    super::tests::run_pointer_dialog_regression_matrix();
     let surfaces = [
         SettingsPointerSurfaceKind::Root,
         SettingsPointerSurfaceKind::DefaultModel,
@@ -415,6 +416,7 @@ fn settings_pointer_clicks_visible_controls_only() {
         SettingsPointerOutcome::Consumed
     );
     assert!(!matches!(dialog.test_page(), TestPageRef::Root { .. }));
+    super::providers::tests::run_pointer_provider_regression_matrix();
 }
 
 #[test]
@@ -465,6 +467,7 @@ fn settings_pointer_destructive_confirmations_remain_two_step() {
 #[test]
 fn settings_pointer_surface_registry_is_exhaustive() {
     settings_pointer_contract_covers_all_current_pages();
+    super::providers::tests::run_pointer_provider_regression_matrix();
 }
 
 #[test]
@@ -538,6 +541,7 @@ fn settings_pointer_copilot_setup_is_explicit_and_exactly_once() {
 
 #[test]
 fn settings_pointer_provider_secret_choices_are_functional() {
+    super::providers::tests::run_pointer_provider_regression_matrix();
     let actions = fixture_actions();
     assert!(
         actions.contains(&SettingsPointerAction::Providers(ProvidersAction::Delete(

@@ -631,6 +631,25 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
     }
 }
 
+/// Real rendered/reducer regressions reused by the named pointer acceptance
+/// suites. Keeping these here lets them share the same concrete page fixtures
+/// as the keyboard contract instead of rebuilding synthetic registries.
+pub(super) fn run_pointer_dialog_regression_matrix() {
+    root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
+    category_short_viewport_keeps_bottom_reset_row_visible();
+    nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
+    nav_stack_restores_privacy_and_string_list_parents();
+    root_children_restore_their_own_root_cursor();
+    instructions_enter_grabs_existing_row_then_arrow_swaps();
+    string_list_delete_requires_second_press_and_first_press_does_not_persist();
+    tools_reset_arms_then_clears_custom_web_commands_and_drops_custom_tools();
+    tools_reset_pending_cancelled_by_navigation();
+    lsp_reset_r_once_arms_without_wiping();
+    lsp_reset_r_twice_restores_defaults();
+    lsp_reset_pending_cancelled_by_navigation();
+    category_reset_pending_cancelled_by_navigation();
+}
+
 #[test]
 fn root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel() {
     let tmp = TempDir::new().unwrap();

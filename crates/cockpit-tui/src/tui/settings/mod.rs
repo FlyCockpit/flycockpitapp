@@ -3798,4 +3798,4 @@ pub fn fetch_all_unlisted_dialog(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

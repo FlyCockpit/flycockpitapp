@@ -4718,7 +4718,7 @@ fn provider_add_pointer_action(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 impl SettingsPage for ProvidersPage {
     fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {

@@ -177,6 +177,22 @@ fn render_provider_links(
     links
 }
 
+pub(super) fn run_pointer_provider_regression_matrix() {
+    pointer_render_boundary_publishes_stable_provider_identity();
+    pointer_edit_menu_mapping_is_exhaustive_over_source_actions();
+    pointer_row_editor_actions_survive_reordering_by_identity();
+    header_delete_requires_second_press_on_same_row();
+    model_delete_requires_second_press_on_same_row();
+    edit_delete_enter_requires_second_enter_to_confirm();
+    provider_delete_removes_its_unshared_stored_secret();
+    provider_delete_preserves_a_shared_stored_secret();
+    provider_delete_offer_can_keep_an_unshared_stored_secret();
+    every_visible_oauth_row_acts_on_enter();
+    standalone_oauth_link_region_survives_scroll_and_clipping();
+    copilot_setup_effect_accepts_only_its_live_operation_once();
+    oauth_copy_completion_is_flow_scoped_and_exactly_once();
+}
+
 #[test]
 fn pointer_render_boundary_publishes_stable_provider_identity() {
     let mut cfg = ProvidersConfig::default();

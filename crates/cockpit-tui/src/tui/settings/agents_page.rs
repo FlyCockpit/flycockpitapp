@@ -2874,7 +2874,13 @@ pub(super) mod tests {
                 .take_external_edit_request()
                 .expect("chmod-race effect");
             fs::write(&effect.path, "staged replacement").unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            // The suite may run under a process umask changed by another
+            // regression, and the identity-replacement case above creates a
+            // fresh inode. Choose a mode relative to the live target so this
+            // is always a real metadata race rather than occasionally a no-op.
+            let original_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            let concurrent_mode = if original_mode == 0o600 { 0o640 } else { 0o600 };
+            fs::set_permissions(&target, fs::Permissions::from_mode(concurrent_mode)).unwrap();
             chmod_race.finish_agent_external_edit(
                 effect.operation_id,
                 super::super::pointer_actions::ExternalEditOutcome::Saved,
@@ -2887,7 +2893,7 @@ pub(super) mod tests {
             );
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-                0o600,
+                concurrent_mode,
                 "commit must not restore stale permissions after a concurrent chmod"
             );
             assert!(

@@ -1940,6 +1940,10 @@ impl SettingsEditor {
             self.status = Some("media capability draft reloaded".into());
             return true;
         }
+        if action == "Reapply" {
+            self.status = Some("media capability draft reapplied".into());
+            return true;
+        }
         if let Some(line) = self
             .multimodal
             .as_ref()

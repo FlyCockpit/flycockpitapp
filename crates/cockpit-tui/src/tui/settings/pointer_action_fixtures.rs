@@ -1015,7 +1015,7 @@ fn provider_key(action: &ProvidersAction) -> ProvidersFixture {
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Reload(_, _)) => {
             ProvidersFixture::ModelReload
         }
-        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Reapply) => {
+        ProvidersAction::ModelLifecycle(ModelLifecycleAction::Reapply(_, _)) => {
             ProvidersFixture::ModelReapply
         }
         ProvidersAction::ModelLifecycle(ModelLifecycleAction::Rebind) => {

@@ -130,6 +130,71 @@ pub fn checked_fcor_v1_size(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CanonicalParamsV1(Vec<u8>);
 
+/// Closed canonical-value contract used by the exhaustive Request encoder.
+/// Implementations must append exactly one value or leave `out` unchanged on
+/// error (container implementations stage nested bytes before appending).
+pub trait CanonicalFcorValueV1 {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()>;
+}
+
+macro_rules! fixed_value {
+    ($ty:ty, $method:ident) => {
+        impl CanonicalFcorValueV1 for $ty {
+            fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+                out.$method(*self);
+                Ok(())
+            }
+        }
+    };
+}
+
+fixed_value!(u8, push_u8);
+fixed_value!(u16, push_u16);
+fixed_value!(u32, push_u32);
+fixed_value!(u64, push_u64);
+fixed_value!(i64, push_i64);
+fixed_value!(bool, push_bool);
+fixed_value!(Uuid, push_uuid);
+
+impl CanonicalFcorValueV1 for String {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.push_string(self)
+    }
+}
+
+impl<T: CanonicalFcorValueV1> CanonicalFcorValueV1 for Option<T> {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.push_optional(self.as_ref(), |nested, value| {
+            value.encode_fcor_value_v1(nested)
+        })
+    }
+}
+
+impl<T: CanonicalFcorValueV1> CanonicalFcorValueV1 for Vec<T> {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.push_list(self, |nested, value| value.encode_fcor_value_v1(nested))
+    }
+}
+
+impl<A: CanonicalFcorValueV1, B: CanonicalFcorValueV1> CanonicalFcorValueV1 for (A, B) {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        self.0.encode_fcor_value_v1(&mut nested)?;
+        self.1.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for std::collections::HashMap<String, String> {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.push_string_map(
+            self.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+    }
+}
+
 impl CanonicalParamsV1 {
     pub fn new() -> Self {
         Self::default()

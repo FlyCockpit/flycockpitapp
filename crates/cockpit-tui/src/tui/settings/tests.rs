@@ -1236,10 +1236,36 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
             ),
             pointer_actions::SettingsPointerAction::UtilityModel(
                 pointer_actions::UtilityModelAction::CancelCustom,
-            ) => assert!(matches!(
-                dialog.test_page(),
-                TestPageRef::Category(page) if page.utility_picker.is_none()
-            )),
+            ) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Category(page)
+                        if page.utility_picker.as_ref().is_some_and(|picker| matches!(
+                            &picker.mode,
+                            super::ui_page::PickerMode::List { .. }
+                        ))
+                ));
+                assert!(dialog.extended.utility_model.is_none());
+
+                let mut keyboard = dialog_with_models(&tmp);
+                open_utility_picker(&mut keyboard);
+                click_settings_action(
+                    &mut keyboard,
+                    &pointer_actions::SettingsPointerAction::UtilityModel(
+                        pointer_actions::UtilityModelAction::OpenCustom,
+                    ),
+                );
+                keyboard.handle_key(press(KeyCode::Esc));
+                assert!(matches!(
+                    keyboard.test_page(),
+                    TestPageRef::Category(page)
+                        if page.utility_picker.as_ref().is_some_and(|picker| matches!(
+                            &picker.mode,
+                            super::ui_page::PickerMode::List { .. }
+                        ))
+                ));
+                assert!(keyboard.extended.utility_model.is_none());
+            }
             _ => unreachable!(),
         }
     }

@@ -1644,11 +1644,35 @@ macro_rules! command_remote_fcor_schema_tag {
     }};
 }
 
+macro_rules! command_typed_fcor_fields {
+    (($request:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty),*]);)+]) => {{
+        match $request {
+            $($pattern => {
+                // Matching `&Request` binds every field by reference. These
+                // assignments make a wrong typed token a compile error and
+                // make every token a consumed runtime value rather than
+                // decorative metadata.
+                $(let _: &$fcor_type = $fcor_field;)*
+                ($tag, vec![$((stringify!($fcor_field), stringify!($fcor_type))),*])
+            },)+
+        }
+    }};
+}
+
 impl Request {
     pub fn remote_operation_class(
         &self,
     ) -> std::result::Result<RemoteOperationClass, UnknownRemoteOperationClass> {
         remote_operation_class_for_tag(self.wire_tag()).ok_or(UnknownRemoteOperationClass)
+    }
+
+    /// Ordered, type-checked FCOR fields for this concrete request variant.
+    /// The value encoder expands this same command-table callback so field
+    /// declaration, field access, and canonical order cannot drift apart.
+    pub fn typed_remote_operation_fcor_fields(
+        &self,
+    ) -> (&'static str, Vec<(&'static str, &'static str)>) {
+        crate::command!(command_typed_fcor_fields, self)
     }
 }
 pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass> {
@@ -1940,7 +1964,12 @@ mod tests {
 
     macro_rules! fcor_source_rows {
         (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty),*]);)+]) => {{
-            vec![$((stringify!($pattern), $tag, $fcor_schema)),+]
+            vec![$((
+                stringify!($pattern),
+                $tag,
+                $fcor_schema,
+                vec![$((stringify!($fcor_field), stringify!($fcor_type))),*],
+            )),+]
         }};
     }
 
@@ -1991,7 +2020,7 @@ mod tests {
         );
         let mut variants = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
-        for (pattern, tag, schema) in rows {
+        for (pattern, tag, schema, typed_fields) in rows {
             assert!(
                 !pattern.contains(".."),
                 "FCOR pattern conceals fields: {pattern}"
@@ -2012,6 +2041,16 @@ mod tests {
                 Some(schema),
                 "FCOR source schema drift for {tag} ({variant})"
             );
+            let typed_schema = if typed_fields.is_empty() {
+                "-".to_owned()
+            } else {
+                typed_fields
+                    .into_iter()
+                    .map(|(name, ty)| format!("{name}:{}", ty.replace(' ', "")))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            assert_eq!(typed_schema, schema, "typed FCOR token drift for {tag}");
             assert!(
                 canonical_remote_operation_fcor_schema_for_tag(tag).is_some(),
                 "unsupported canonical FCOR type in {tag}: {schema}"

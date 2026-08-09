@@ -1538,6 +1538,91 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
         .await
         .unwrap();
     assert_eq!(count, 1, "replay and conflict must not append another note");
+
+    let rename_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-444444444444").unwrap(),
+    )
+    .unwrap();
+    let rename_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "remote title".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first rename").await,
+        Body::Response { id, response }
+            if id == rename_id && matches!(*response, Response::Ack)
+    ));
+
+    let rename_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_replay_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "remote title".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "rename replay").await,
+        Body::Response { id, response }
+            if id == rename_replay_id && matches!(*response, Response::Ack)
+    ));
+
+    let rename_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_conflict_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "must not apply".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "rename conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == rename_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        ctx.db.get_session(session_id).await.unwrap().unwrap().title,
+        Some("remote title".into()),
+        "rename replay and conflict must not perform another domain write"
+    );
 }
 
 fn table_for(secret: &str) -> Arc<RedactionTable> {

@@ -1585,6 +1585,54 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::EndBtwFork { parent_session_id } => end_btw_fork(ctx, parent_session_id).await,
 
         Request::RenameSession { session_id, title } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::RenameSession {
+                    session_id,
+                    title: title.clone(),
+                };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx
+                    .db
+                    .execute_transactional_remote_operation(
+                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                            logical_attachment_id: &logical_attachment_id,
+                            operation_id: &operation_id,
+                            authenticated_device_id: &device_id,
+                            authenticated_device_generation: operation
+                                .authenticated_device_generation,
+                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                            request_hash,
+                            now_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                        move |conn| {
+                            crate::db::Db::rename_session_conn(conn, session_id, &title)?;
+                            let response = Response::Ack;
+                            let safe_response = serde_json::to_vec(&response)?;
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                value: response,
+                                safe_response: safe_response.clone(),
+                                outbox_kind: "rename_session".into(),
+                                outbox_payload: safe_response,
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             rename_session(ctx, session_id, &title).await
         }
 

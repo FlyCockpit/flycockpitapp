@@ -1361,17 +1361,19 @@ impl Db {
 
     /// Set or replace the session's title. `user_renamed` flips to true
     /// to lock out the auto-titling pass (GOALS §17d).
+    pub fn rename_session_conn(conn: &Connection, session_id: Uuid, title: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
+            params![title, session_id.to_string()],
+        )
+        .context("renaming session")?;
+        Ok(())
+    }
+
     pub async fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
-                params![title, session_id.to_string()],
-            )
-            .context("renaming session")?;
-            Ok(())
-        })
-        .await
+        self.write(move |conn| Self::rename_session_conn(conn, session_id, &title))
+            .await
     }
 
     /// Set the title from the auto-titling pass. Refuses to overwrite a

@@ -145,15 +145,64 @@ describe("FCOR v1", () => {
       }),
     ).toThrow();
     expect(rollback.finish()).toEqual(new Uint8Array());
+    for (const item of vector.primitiveBoundaryCases) {
+      const call = () =>
+        boundary((params) => {
+          const value = BigInt(item.value);
+          if (item.codec === "u8") params.pushU8(Number(value));
+          else if (item.codec === "u16") params.pushU16(Number(value));
+          else if (item.codec === "u32") params.pushU32(Number(value));
+          else params.pushU64(value);
+        });
+      if (item.valid) expect(call(), `${item.codec}:${item.value}`).toBe(item.hex);
+      else expect(call, `${item.codec}:${item.value}`).toThrow();
+    }
+    expect(boundary((params) => params.pushBool(false))).toBe(vector.collectionCases.boolFalseHex);
+    expect(boundary((params) => params.pushBool(true))).toBe(vector.collectionCases.boolTrueHex);
+    expect(boundary((params) => params.pushBytes(Uint8Array.from([0, 255])))).toBe(
+      vector.collectionCases.nonemptyBytesHex,
+    );
+    expect(boundary((params) => params.pushString("a"))).toBe(
+      vector.collectionCases.nonemptyStringHex,
+    );
+    expect(boundary((params) => params.pushStringMap([]))).toBe(vector.collectionCases.emptyMapHex);
+    expect(boundary((params) => params.pushStringMap([["a", "x"]]))).toBe(
+      vector.collectionCases.singleMapHex,
+    );
+    expect(
+      boundary((params) => params.pushList([1, 258], (item, value) => item.pushU16(value))),
+    ).toBe(vector.collectionCases.u16ListHex);
+    const listRollback = new CanonicalParamsV1();
+    expect(() =>
+      listRollback.pushList([1], (item) => {
+        item.pushU8(7);
+        throw new Error("fail");
+      }),
+    ).toThrow();
+    expect(listRollback.finish()).toEqual(new Uint8Array());
     const opaque = new TextEncoder().encode("FCM2foundation-owned");
     let decoded: Uint8Array | undefined;
-    validateRegisteredSendUserMessageV2(opaque, (bytes) => {
-      decoded = bytes;
+    validateRegisteredSendUserMessageV2(opaque, {
+      owner: "message-attachment-protocol-foundation",
+      validate(bytes) {
+        decoded = bytes;
+      },
     });
     expect(decoded).toBe(opaque);
     expect(() =>
-      validateRegisteredSendUserMessageV2(new TextEncoder().encode("BAD!"), () => {}),
+      validateRegisteredSendUserMessageV2(new TextEncoder().encode("BAD!"), {
+        owner: "message-attachment-protocol-foundation",
+        validate() {},
+      }),
     ).toThrow();
+    expect(() =>
+      validateRegisteredSendUserMessageV2(opaque, {
+        owner: "message-attachment-protocol-foundation",
+        validate() {
+          throw new Error("semantic rejection");
+        },
+      }),
+    ).toThrow("semantic rejection");
     const opaqueFcor = encodeFcorV1("send_user_message", [], opaque);
     expect(opaqueFcor.subarray(-opaque.length)).toEqual(opaque);
   });

@@ -33,18 +33,23 @@ export const sendUserMessageV2OpaqueRegistration = {
   owner: "message-attachment-protocol-foundation",
 } as const;
 
-export type OpaqueCanonicalParamsDecoder = (bytes: Uint8Array) => void;
+export type SendUserMessageV2FoundationDecoder = {
+  readonly owner: "message-attachment-protocol-foundation";
+  validate(bytes: Uint8Array): void;
+};
 
 export function validateRegisteredSendUserMessageV2(
   bytes: Uint8Array,
-  foundationDecoder: OpaqueCanonicalParamsDecoder,
+  foundationDecoder: SendUserMessageV2FoundationDecoder,
 ): void {
   const registration = sendUserMessageV2OpaqueRegistration;
   if (bytes.length > registration.maximumBytes) throw new Error("FCM2 exceeds registered maximum");
   if (!registration.magic.every((byte, index) => bytes[index] === byte)) {
     throw new Error("FCM2 has wrong magic");
   }
-  foundationDecoder(bytes);
+  if (foundationDecoder.owner !== registration.owner)
+    throw new Error("FCM2 decoder owner mismatch");
+  foundationDecoder.validate(bytes);
 }
 
 export class CanonicalParamsV1 {
@@ -96,6 +101,16 @@ export class CanonicalParamsV1 {
     encode(nested, value);
     this.pushU8(1);
     this.#bytes.push(...nested.finish());
+  }
+  pushList<T>(values: readonly T[], encode: (params: CanonicalParamsV1, value: T) => void): void {
+    if (values.length > U32_MAX) throw new Error("list exceeds u32 count");
+    const encoded = values.map((value) => {
+      const item = new CanonicalParamsV1();
+      encode(item, value);
+      return item.finish();
+    });
+    this.pushU32(encoded.length);
+    for (const item of encoded) this.#bytes.push(...item);
   }
   pushStringMap(entries: Iterable<readonly [string, string]>): void {
     const encoded = [...entries].map(([key, value]) => {

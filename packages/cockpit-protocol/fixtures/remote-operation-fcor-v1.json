@@ -91,6 +91,29 @@
     "composedStringHex": "00000002c3a9",
     "encodedLengthSortedMapHex": "00000002000000016200000001780000000261610000000179"
   },
+  "primitiveBoundaryCases": [
+    { "codec": "u8", "value": "0", "valid": true, "hex": "00" },
+    { "codec": "u8", "value": "255", "valid": true, "hex": "ff" },
+    { "codec": "u8", "value": "256", "valid": false },
+    { "codec": "u16", "value": "0", "valid": true, "hex": "0000" },
+    { "codec": "u16", "value": "65535", "valid": true, "hex": "ffff" },
+    { "codec": "u16", "value": "65536", "valid": false },
+    { "codec": "u32", "value": "0", "valid": true, "hex": "00000000" },
+    { "codec": "u32", "value": "4294967295", "valid": true, "hex": "ffffffff" },
+    { "codec": "u32", "value": "4294967296", "valid": false },
+    { "codec": "u64", "value": "0", "valid": true, "hex": "0000000000000000" },
+    { "codec": "u64", "value": "18446744073709551615", "valid": true, "hex": "ffffffffffffffff" },
+    { "codec": "u64", "value": "18446744073709551616", "valid": false }
+  ],
+  "collectionCases": {
+    "boolFalseHex": "00",
+    "boolTrueHex": "01",
+    "nonemptyBytesHex": "0000000200ff",
+    "nonemptyStringHex": "0000000161",
+    "emptyMapHex": "00000000",
+    "singleMapHex": "0000000100000001610000000178",
+    "u16ListHex": "0000000200010102"
+  },
   "malformed": [
     { "name": "magic", "replaceByte": [0, 0] },
     { "name": "version", "replaceByte": [4, 2] },

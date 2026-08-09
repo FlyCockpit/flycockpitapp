@@ -14,6 +14,7 @@ pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 2_631_500;
 /// Foundation-owned semantic validation seam for an opaque canonical codec.
 /// The ledger never parses or re-encodes the returned bytes.
 pub trait OpaqueCanonicalParamsDecoder {
+    fn owner(&self) -> &'static str;
     fn validate(&self, bytes: &[u8]) -> Result<()>;
 }
 
@@ -49,6 +50,10 @@ pub fn validate_registered_opaque_params(
     ensure!(
         bytes.starts_with(&registration.magic),
         "opaque params have wrong magic"
+    );
+    ensure!(
+        decoder.owner() == registration.owner,
+        "opaque decoder owner mismatch"
     );
     decoder.validate(bytes)
 }
@@ -149,6 +154,24 @@ impl CanonicalParamsV1 {
                 Ok(())
             }
         }
+    }
+
+    pub fn push_list<'a, T: 'a>(
+        &mut self,
+        values: impl IntoIterator<Item = &'a T>,
+        mut encode: impl FnMut(&mut Self, &T) -> Result<()>,
+    ) -> Result<()> {
+        let mut items = Vec::new();
+        for value in values {
+            let mut item = Self::new();
+            encode(&mut item, value)?;
+            items.push(item.0);
+        }
+        self.push_u32(u32::try_from(items.len())?);
+        for item in items {
+            self.0.extend(item);
+        }
+        Ok(())
     }
 
     pub fn push_string_map<'a>(
@@ -493,9 +516,74 @@ mod tests {
                 .is_err()
         );
         assert!(rollback.into_bytes().is_empty());
+        for item in fixture["primitiveBoundaryCases"].as_array().unwrap() {
+            let value = item["value"].as_str().unwrap();
+            let mut params = CanonicalParamsV1::new();
+            let result = match item["codec"].as_str().unwrap() {
+                "u8" => value.parse::<u8>().map(|value| params.push_u8(value)),
+                "u16" => value.parse::<u16>().map(|value| params.push_u16(value)),
+                "u32" => value.parse::<u32>().map(|value| params.push_u32(value)),
+                "u64" => value.parse::<u64>().map(|value| params.push_u64(value)),
+                other => panic!("unknown primitive codec {other}"),
+            };
+            assert_eq!(result.is_ok(), item["valid"].as_bool().unwrap());
+            if result.is_ok() {
+                assert_eq!(hex(&params.into_bytes()), item["hex"].as_str().unwrap());
+            }
+        }
+        assert_eq!(
+            boundary(|p| {
+                p.push_bool(false);
+                Ok(())
+            }),
+            fixture["collectionCases"]["boolFalseHex"]
+        );
+        assert_eq!(
+            boundary(|p| {
+                p.push_bool(true);
+                Ok(())
+            }),
+            fixture["collectionCases"]["boolTrueHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_bytes(&[0, 255])),
+            fixture["collectionCases"]["nonemptyBytesHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_string("a")),
+            fixture["collectionCases"]["nonemptyStringHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_string_map([])),
+            fixture["collectionCases"]["emptyMapHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_string_map([("a", "x")])),
+            fixture["collectionCases"]["singleMapHex"]
+        );
+        assert_eq!(
+            boundary(|p| p.push_list([1_u16, 258].iter(), |item, value| {
+                item.push_u16(*value);
+                Ok(())
+            })),
+            fixture["collectionCases"]["u16ListHex"]
+        );
+        let mut list_rollback = CanonicalParamsV1::new();
+        assert!(
+            list_rollback
+                .push_list([1_u8].iter(), |item, _| {
+                    item.push_u8(7);
+                    bail!("fail")
+                })
+                .is_err()
+        );
+        assert!(list_rollback.into_bytes().is_empty());
 
         struct FoundationDecoder;
         impl OpaqueCanonicalParamsDecoder for FoundationDecoder {
+            fn owner(&self) -> &'static str {
+                "message-attachment-protocol-foundation"
+            }
             fn validate(&self, bytes: &[u8]) -> Result<()> {
                 ensure!(bytes == b"FCM2foundation-owned", "semantic rejection");
                 Ok(())
@@ -521,6 +609,23 @@ mod tests {
                 },
                 opaque,
                 &FoundationDecoder,
+            )
+            .is_err()
+        );
+        struct RejectingFoundationDecoder;
+        impl OpaqueCanonicalParamsDecoder for RejectingFoundationDecoder {
+            fn owner(&self) -> &'static str {
+                "message-attachment-protocol-foundation"
+            }
+            fn validate(&self, _bytes: &[u8]) -> Result<()> {
+                bail!("semantic rejection")
+            }
+        }
+        assert!(
+            validate_registered_opaque_params(
+                SEND_USER_MESSAGE_V2_REGISTRATION,
+                opaque,
+                &RejectingFoundationDecoder,
             )
             .is_err()
         );

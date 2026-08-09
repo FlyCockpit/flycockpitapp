@@ -285,6 +285,15 @@ pub(super) trait SettingsPage: Any {
     ) -> Nav {
         Nav::Stay
     }
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: shell::SettingsControlId,
+        _column: u16,
+        _row: u16,
+    ) -> Nav {
+        self.handle_pointer_control(cx, control)
+    }
     /// Move only the independently scrollable region under the pointer.
     /// `delta` is measured in selectable controls and is already normalized
     /// to the settings wheel step (three per notch).
@@ -2106,7 +2115,12 @@ impl SettingsDialog {
                         let _ = self.apply_nav(nav);
                     }
                     SettingsPointerAction::Page(control) => {
-                        let nav = self.page.handle_pointer_control(&mut self.cx, control);
+                        let nav = self.page.handle_pointer_control_at(
+                            &mut self.cx,
+                            control,
+                            mouse.column,
+                            mouse.row,
+                        );
                         let _ = self.apply_nav(nav);
                     }
                 }

@@ -3325,6 +3325,21 @@ impl SettingsPage for CategoryPage {
         super::SettingsPointerSurfaceKind::Category
     }
 
+    fn pointer_surface_token(&self) -> u64 {
+        if self.path_editor.is_some() {
+            504
+        } else if self.text_editor.is_some() {
+            503
+        } else if let Some(picker) = &self.utility_picker {
+            match &picker.mode {
+                super::ui_page::PickerMode::List { .. } => 501,
+                super::ui_page::PickerMode::Custom { .. } => 502,
+            }
+        } else {
+            500
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_category_page_key(key, self)
     }

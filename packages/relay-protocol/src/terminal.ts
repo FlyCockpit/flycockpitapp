@@ -28,6 +28,8 @@ export const terminalInputFrameSchema = z
     type: z.literal("terminal.input"),
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
     data: z.string().min(1),
+    bindingId: z.string().uuid(),
+    bindingEpoch: z.number().int().nonnegative(),
   })
   .strict();
 
@@ -37,20 +39,51 @@ export const terminalResizeFrameSchema = z
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
     cols: z.number().int().min(2).max(1000),
     rows: z.number().int().min(2).max(1000),
+    bindingId: z.string().uuid(),
+    bindingEpoch: z.number().int().nonnegative(),
   })
   .strict();
 
-export const terminalAttachmentChunkFrameSchema = z
+const terminalIngressIdentitySchema = {
+  operationId: z.string().uuid(),
+  bindingId: z.string().uuid(),
+  bindingEpoch: z.number().int().nonnegative(),
+} as const;
+
+export const terminalIngressBeginFrameSchema = z
   .object({
-    type: z.literal("terminal.attachment_chunk"),
+    type: z.literal("terminal.ingress_begin"),
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
-    uploadId: z.string().min(1).max(128),
-    name: z.string().min(1).max(255),
-    mimeType: z.string().min(1).max(120),
+    ...terminalIngressIdentitySchema,
+    mediaType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]),
     size: z.number().int().min(1).max(TERMINAL_IMAGE_MAX_BYTES),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const terminalIngressChunkFrameSchema = z
+  .object({
+    type: z.literal("terminal.ingress_chunk"),
+    v: z.literal(TERMINAL_PROTOCOL_VERSION),
+    ...terminalIngressIdentitySchema,
     offset: z.number().int().min(0),
     dataBase64: z.string().min(1),
-    final: z.boolean(),
+  })
+  .strict();
+
+export const terminalIngressFinishFrameSchema = z
+  .object({
+    type: z.literal("terminal.ingress_finish"),
+    v: z.literal(TERMINAL_PROTOCOL_VERSION),
+    ...terminalIngressIdentitySchema,
+  })
+  .strict();
+
+export const terminalIngressStatusFrameSchema = z
+  .object({
+    type: z.literal("terminal.ingress_status"),
+    v: z.literal(TERMINAL_PROTOCOL_VERSION),
+    ...terminalIngressIdentitySchema,
   })
   .strict();
 
@@ -58,6 +91,8 @@ export const terminalCloseFrameSchema = z
   .object({
     type: z.literal("terminal.close"),
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
+    bindingId: z.string().uuid(),
+    bindingEpoch: z.number().int().nonnegative(),
   })
   .strict();
 
@@ -66,7 +101,10 @@ export const terminalClientPayloadSchema = z.discriminatedUnion("type", [
   terminalAttachFrameSchema,
   terminalInputFrameSchema,
   terminalResizeFrameSchema,
-  terminalAttachmentChunkFrameSchema,
+  terminalIngressBeginFrameSchema,
+  terminalIngressChunkFrameSchema,
+  terminalIngressFinishFrameSchema,
+  terminalIngressStatusFrameSchema,
   terminalCloseFrameSchema,
 ]);
 export type TerminalClientPayload = z.infer<typeof terminalClientPayloadSchema>;
@@ -78,6 +116,8 @@ export const terminalOpenedFrameSchema = z
     terminalId: z.string().min(1).max(128),
     viewerCount: z.number().int().min(1),
     recording: z.boolean(),
+    bindingId: z.string().uuid(),
+    bindingEpoch: z.number().int().nonnegative(),
   })
   .strict();
 
@@ -97,13 +137,15 @@ export const terminalClipboardFrameSchema = z
   })
   .strict();
 
-export const terminalAttachmentProgressFrameSchema = z
+export const terminalIngressStateFrameSchema = z
   .object({
-    type: z.literal("terminal.attachment_progress"),
+    type: z.literal("terminal.ingress_state"),
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
-    uploadId: z.string().min(1).max(128),
-    receivedBytes: z.number().int().min(0),
-    totalBytes: z.number().int().min(1),
+    operationId: z.string().uuid(),
+    state: z.enum(["prepared", "committed"]),
+    nextOffset: z.number().int().nonnegative(),
+    inputSequence: z.number().int().positive().optional(),
+    expiresAtUnixMs: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -120,7 +162,7 @@ export const terminalDaemonPayloadSchema = z.discriminatedUnion("type", [
   terminalOpenedFrameSchema,
   terminalOutputFrameSchema,
   terminalClipboardFrameSchema,
-  terminalAttachmentProgressFrameSchema,
+  terminalIngressStateFrameSchema,
   terminalErrorFrameSchema,
 ]);
 export type TerminalDaemonPayload = z.infer<typeof terminalDaemonPayloadSchema>;

@@ -508,6 +508,26 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "terminal_ingress_begin",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "terminal_ingress_chunk",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::StreamChunked,
+    ),
+    row(
+        "terminal_ingress_finish",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "terminal_ingress_status",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "lsp_control",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -842,7 +862,7 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "terminal_paste_image",
+        "terminal_ingress",
         RemoteMessageClass::TerminalIo,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1917,6 +1937,10 @@ mod tests {
             "terminal_input",
             "terminal_resize",
             "close_terminal",
+            "terminal_ingress_begin",
+            "terminal_ingress_chunk",
+            "terminal_ingress_finish",
+            "terminal_ingress_status",
         ];
         for tag in terminal_requests {
             let row = classify_request_tag(tag).unwrap();

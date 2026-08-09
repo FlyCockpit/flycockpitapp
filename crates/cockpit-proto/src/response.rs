@@ -52,9 +52,8 @@ pub enum Response {
         image_ref: ImageAttachmentRef,
     },
 
-    TerminalPasteImage {
-        terminal_id: Uuid,
-        path: String,
+    TerminalIngress {
+        receipt: crate::terminal::TerminalIngressReceipt,
     },
 
     /// Result of [`Request::RemoveQueuedUserMessage`].
@@ -381,6 +380,8 @@ pub enum Response {
         terminal_id: Uuid,
         viewer_count: usize,
         recording: bool,
+        binding: crate::terminal::TerminalBinding,
+        terminal_generation: u64,
     },
 
     LspControlResult {
@@ -699,7 +700,7 @@ macro_rules! response_variants {
             (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");
             (Response::AttachmentChunkAccepted { .. }, "attachment_chunk_accepted");
             (Response::AttachmentUploaded { .. }, "attachment_uploaded");
-            (Response::TerminalPasteImage { .. }, "terminal_paste_image");
+            (Response::TerminalIngress { .. }, "terminal_ingress");
             (Response::RemoveQueuedUserMessageResult { .. }, "remove_queued_user_message_result");
             (Response::RemoveQueuedUserMessagesResult { .. }, "remove_queued_user_messages_result");
             (Response::Attached { .. }, "attached");

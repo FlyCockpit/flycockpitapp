@@ -617,6 +617,36 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Create, never replace, one private regular file through the audited
+/// component-relative platform primitives.
+pub(crate) fn create_private_file_nofollow(path: &Path, contents: &[u8]) -> Result<()> {
+    let (parent, file_name) = open_parent_directory_nofollow(path)?;
+    #[cfg(unix)]
+    let mut file = open_file_at_nofollow(
+        &parent,
+        &file_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )?;
+    #[cfg(windows)]
+    let mut file = {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA, SYNCHRONIZE};
+        open_windows_relative_nofollow(
+            &parent,
+            &file_name,
+            false,
+            FILE_WRITE_DATA | SYNCHRONIZE,
+            FILE_CREATE,
+        )?
+    };
+    std::io::Write::write_all(&mut file, contents)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    chmod_file_private(&file)?;
+    Ok(())
+}
+
 /// fsync a directory so a rename or unlink inside it is durable.
 ///
 /// Unlike the best-effort syncs inside [`PreparedAtomicWrite`], a failure here

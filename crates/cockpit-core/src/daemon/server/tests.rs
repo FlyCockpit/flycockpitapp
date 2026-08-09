@@ -2813,7 +2813,7 @@ fn remote_state_with_grants(
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
         upload_limits: AttachmentUploadLimits,
-        terminal_views: HashSet::new(),
+        terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     }
 }
@@ -2841,7 +2841,7 @@ fn owner_state() -> MutableClientState {
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
         upload_limits: AttachmentUploadLimits,
-        terminal_views: HashSet::new(),
+        terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     }
 }
@@ -3074,7 +3074,7 @@ async fn terminal_requests_require_terminal_scope_and_audit_open_close() {
         Response::TerminalOpened { terminal_id, .. } => terminal_id,
         other => panic!("unexpected response: {other:?}"),
     };
-    assert!(terminal_scope.terminal_views.contains(&terminal_id));
+    assert!(terminal_scope.terminal_views.contains_key(&terminal_id));
 
     handle_request(
         Request::CloseTerminal { terminal_id },
@@ -3449,7 +3449,7 @@ async fn attached_state_with_worker_receiver(
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
             upload_limits: AttachmentUploadLimits,
-            terminal_views: HashSet::new(),
+            terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
         },
         session_row.session_id,
@@ -14613,7 +14613,7 @@ async fn btw_concurrent_with_parent_turn() {
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
         upload_limits: AttachmentUploadLimits,
-        terminal_views: HashSet::new(),
+        terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     };
     let ctx_for_parent = ctx.clone();
@@ -14667,7 +14667,7 @@ async fn btw_concurrent_with_parent_turn() {
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
         upload_limits: AttachmentUploadLimits,
-        terminal_views: HashSet::new(),
+        terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     };
     let ctx_for_btw = ctx.clone();

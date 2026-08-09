@@ -864,6 +864,30 @@
         "tag": "close_terminal"
       },
       {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_begin"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "terminal_ingress_chunk"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_finish"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_status"
+      },
+      {
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
@@ -1265,7 +1289,7 @@
         "class": "terminal_io",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "terminal_paste_image"
+        "tag": "terminal_ingress"
       },
       {
         "class": "bounded_request_response",

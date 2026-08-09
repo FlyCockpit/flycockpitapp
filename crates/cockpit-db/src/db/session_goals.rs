@@ -1743,9 +1743,7 @@ fn register_verification_jobs(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(3)
         .clamp(1, 5);
-    let gatekeepers = (!goal.unresolved_gaps.is_empty())
-        .then_some((GoalControlRole::Gatekeeper, 0_i64))
-        .into_iter();
+    let gatekeepers = std::iter::once((GoalControlRole::Gatekeeper, 0_i64));
     for (role, slot) in gatekeepers.chain((0..count).map(|slot| {
         (
             GoalControlRole::ColdSkeptic,
@@ -2864,8 +2862,8 @@ mod tests {
             jobs.iter()
                 .filter(|job| job.role == GoalControlRole::Gatekeeper)
                 .count(),
-            0,
-            "an initial candidate has no unresolved gaps for the resumed-gap gatekeeper"
+            1,
+            "every candidate verification registers exactly one gatekeeper"
         );
         assert!(
             jobs.iter()

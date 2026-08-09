@@ -56,7 +56,7 @@ impl Db {
             "UPDATE session_goals
                 SET tokens_used = tokens_used + MAX(0, ?1 + ?2)
               WHERE session_id = ?3
-                AND disposition IN ('running', 'user_paused', 'infra_paused', 'blocked', 'no_progress_paused', 'budget_limited')",
+                AND disposition = 'running'",
             params![
                 row.input_tokens,
                 row.output_tokens,
@@ -151,6 +151,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::session_goals::GoalDisposition;
 
     #[tokio::test]
     async fn insert_round_trip() {
@@ -235,5 +236,66 @@ mod tests {
         assert!(!flagged.contains(&unknown));
         // Empty input is a clean no-op.
         assert!(db.utility_call_ids(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_accounting_excludes_paused_activity_and_resumes_from_prior_usage() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "a").await.unwrap();
+        let goal = db
+            .create_session_goal(session.session_id, "p", "ship it", None, Some(1_000))
+            .await
+            .unwrap();
+        let inference = |input_tokens, output_tokens| InferenceCallRow {
+            call_id: Uuid::new_v4(),
+            session_id: session.session_id,
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            model: "m".into(),
+            provider: "provider".into(),
+            timestamp: 1,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility: false,
+        };
+
+        db.insert_inference_call(&inference(20, 10)).await.unwrap();
+        let running = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.tokens_used, 30);
+
+        db.set_session_goal_status(session.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        db.insert_inference_call(&inference(40, 30)).await.unwrap();
+        let paused = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            paused.tokens_used, 30,
+            "paused inference must not be charged"
+        );
+
+        let resumed = db
+            .set_session_goal_status(session.session_id, GoalDisposition::Running)
+            .await
+            .unwrap();
+        assert_eq!(resumed.id, goal.id);
+        assert_eq!(resumed.tokens_used, 30);
+        db.insert_inference_call(&inference(7, 4)).await.unwrap();
+        let charged_after_resume = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(charged_after_resume.tokens_used, 41);
     }
 }

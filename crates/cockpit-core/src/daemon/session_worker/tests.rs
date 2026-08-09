@@ -3,6 +3,117 @@ use super::helpers::*;
 use super::lifecycle::*;
 use super::run::*;
 use super::*;
+
+#[test]
+fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
+    let receipt = RemoteQueueMutationReceiptV1 {
+        schema_version: 1,
+        applied: true,
+        reason: proto::RemoveQueuedUserMessageReason::Removed,
+        removed_count: 1,
+    };
+    receipt.validate().unwrap();
+    let encoded = serde_json::to_vec(&receipt).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RemoteQueueMutationReceiptV1>(&encoded).unwrap(),
+        receipt
+    );
+    assert!(!String::from_utf8(encoded).unwrap().contains("text"));
+    assert!(
+        serde_json::from_str::<RemoteQueueMutationReceiptV1>(
+            r#"{"schema_version":1,"applied":true,"reason":"removed","removed_count":1,"text":"secret"}"#
+        )
+        .is_err()
+    );
+    assert!(
+        RemoteQueueMutationReceiptV1 {
+            schema_version: 1,
+            applied: false,
+            reason: proto::RemoveQueuedUserMessageReason::Removed,
+            removed_count: 1,
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn remote_queue_receipt_and_terminal_disposition_commit_and_replay_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session_id = session.id;
+    let submission_id = Uuid::new_v4();
+    let operation = || crate::db::remote_attachment_operations::ReserveRemoteOperation {
+        logical_attachment_id: "00000000-0000-4000-8000-000000000021",
+        operation_id: "01890f3e-4c00-7000-8000-000000000095",
+        authenticated_device_id: "00000000-0000-4000-8000-000000000022",
+        authenticated_device_generation: 1,
+        operation_class:
+            crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+        request_hash: [5; 32],
+        now_ms: 1,
+    };
+    let terminal = crate::db::session_log::ClientSubmissionTerminalReceipt {
+        client_submission_id: submission_id,
+        fingerprint: "fingerprint".into(),
+        wire_fingerprint: "wire-fingerprint".into(),
+        origin_principal: Some("flycockpit:user".into()),
+        disposition: crate::db::session_log::ClientSubmissionTerminalDisposition::Removed,
+    };
+    let applied = db
+        .execute_transactional_remote_operation(operation(), move |conn| {
+            crate::db::Db::insert_client_submission_terminal_receipts_conn(
+                conn,
+                session_id,
+                &[terminal],
+            )?;
+            let receipt = RemoteQueueMutationReceiptV1 {
+                schema_version: 1,
+                applied: true,
+                reason: proto::RemoveQueuedUserMessageReason::Removed,
+                removed_count: 1,
+            };
+            let safe_response = serde_json::to_vec(&receipt)?;
+            Ok(
+                crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                    value: receipt,
+                    safe_response: safe_response.clone(),
+                    outbox_kind: "remove_queued_user_message".into(),
+                    outbox_payload: safe_response,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied,
+        crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(_)
+    ));
+    assert!(
+        db.client_submission_terminal_receipt(session_id, submission_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let replay = db
+        .execute_transactional_remote_operation(operation(), |_| {
+            panic!("replay must not rewrite terminal receipt")
+        })
+        .await
+        .unwrap();
+    let crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) =
+        replay
+    else {
+        panic!("expected replay")
+    };
+    assert_eq!(
+        serde_json::from_slice::<RemoteQueueMutationReceiptV1>(&bytes)
+            .unwrap()
+            .removed_count,
+        1
+    );
+}
 use crate::db::Db;
 use std::io;
 use std::sync::Mutex as StdMutex;
@@ -418,6 +529,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id: id,
+                    remote_operation: None,
                     respond_to,
                 })
                 .await

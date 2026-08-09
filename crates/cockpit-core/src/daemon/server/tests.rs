@@ -8565,10 +8565,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_queued_user_message",
                     SessionWork::RemoveQueuedUserMessage {
                         queue_item_id,
+                        remote_operation,
                         respond_to,
                     },
                 ) => {
                     assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    assert!(remote_operation.is_none());
                     respond_to
                         .send(Ok(proto::RemoveQueuedUserMessageResult {
                             applied: true,
@@ -8875,6 +8877,7 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
         |work| {
             let SessionWork::RemoveQueuedUserMessage {
                 queue_item_id: delivered_id,
+                remote_operation: _,
                 respond_to,
             } = work
             else {

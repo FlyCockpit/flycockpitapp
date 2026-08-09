@@ -619,6 +619,21 @@ impl UserSubmissionQueue {
         });
     }
 
+    /// Release a staged claim when the enclosing remote operation is rejected
+    /// before any durable terminal receipt is written.
+    pub async fn abort_staged_removal(&self, staged: &StagedQueueRemoval) {
+        {
+            let mut state = self.inner.lock().await;
+            assert_staged_removal(&state, staged);
+            state.staged_removal = None;
+            state.staged_removal_failed = false;
+        }
+        self.stage_updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
+        self.notify.notify_one();
+    }
+
     /// Make a staged removal visible only after its terminal receipts are
     /// durable. Consumers resume from the remaining queue at this boundary.
     pub async fn commit_staged_removal(

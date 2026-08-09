@@ -1286,18 +1286,18 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::TextEmbeddedRecovery),
         (Category::Behavior, SettingId::Concurrency),
         (Category::Behavior, SettingId::LoopGuardThreshold),
-        (Category::Behavior, SettingId::GoalVerificationSkepticCount),
+        (Category::Behavior, SettingId::GoalSupervisionSkepticCount),
         (Category::Behavior, SettingId::CheapCodeModel),
-        (Category::Behavior, SettingId::GoalVerificationMaxRounds),
+        (Category::Behavior, SettingId::GoalSupervisionMaxRounds),
         (Category::Behavior, SettingId::CompactModel),
         (Category::Behavior, SettingId::ScheduleMaxConcurrent),
         (Category::Behavior, SettingId::PredictNextMessageModel),
         (Category::Behavior, SettingId::SmartCodeModel),
         (Category::Behavior, SettingId::ReasoningModel),
-        (Category::Behavior, SettingId::GoalVerificationModel),
+        (Category::Behavior, SettingId::GoalSupervisionModel),
         (Category::Behavior, SettingId::DialogLockoutMs),
         (Category::Behavior, SettingId::AgentChoosesSubagentModel),
-        (Category::Behavior, SettingId::GoalVerificationEnabled),
+        (Category::Behavior, SettingId::GoalSupervisionEnabled),
         (
             Category::Behavior,
             SettingId::HarnessReportSummarizationModel,
@@ -1372,7 +1372,7 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::PredictNextMessageModel
             | SettingId::SmartCodeModel
             | SettingId::ReasoningModel
-            | SettingId::GoalVerificationModel
+            | SettingId::GoalSupervisionModel
             | SettingId::HarnessReportSummarizationModel
             | SettingId::SkillInjectionModel
             | SettingId::UtilityModel => assert!(matches!(
@@ -1381,8 +1381,8 @@ fn dispatch_enabled_category_descriptor_actions() {
             )),
             SettingId::DelegationMaxParallel
             | SettingId::LoopGuardThreshold
-            | SettingId::GoalVerificationSkepticCount
-            | SettingId::GoalVerificationMaxRounds
+            | SettingId::GoalSupervisionSkepticCount
+            | SettingId::GoalSupervisionMaxRounds
             | SettingId::ScheduleMaxConcurrent
             | SettingId::DialogLockoutMs
             | SettingId::MaxPrimaryRounds
@@ -1396,7 +1396,7 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::TextEmbeddedRecovery
             | SettingId::Concurrency
             | SettingId::AgentChoosesSubagentModel
-            | SettingId::GoalVerificationEnabled
+            | SettingId::GoalSupervisionEnabled
             | SettingId::SandboxEscalationEnabled
             | SettingId::CommandProfileJava
             | SettingId::CommandProfileGo

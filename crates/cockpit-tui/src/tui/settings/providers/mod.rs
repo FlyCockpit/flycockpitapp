@@ -2819,14 +2819,31 @@ impl SettingsCx {
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
-        let lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
+        let mut lines = oauth_setup_lines(OAuthFlowView::Copilot(s), OAuthHost::Standalone);
+        let mut controls = Vec::new();
+        lines.push(Line::default());
+        if s.outcome.is_some() {
+            controls.push((lines.len(), SettingsControlId(0)));
+            lines.push(Line::from("[Continue]"));
+        } else if s.shell.is_some() && s.rc_path.is_some() && !s.already_configured {
+            controls.push((lines.len(), SettingsControlId(0)));
+            lines.push(Line::from("[Set up Copilot auth]"));
+            controls.push((lines.len(), SettingsControlId(1)));
+            lines.push(Line::from("[Cancel]"));
+        } else {
+            controls.push((lines.len(), SettingsControlId(1)));
+            lines.push(Line::from("[Back]"));
+        }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states.render_lines(
+        self.scroll_states.render_bound_lines(
             frame,
             area,
             "providers:copilot-setup",
             lines,
             selected_line,
+            controls,
+            &self.pointer_surface,
+            SettingsScrollRegionId("providers:copilot-setup"),
         );
     }
 
@@ -4448,6 +4465,19 @@ impl SettingsPage for ProvidersPage {
                         .cursor = index;
                 }
                 Some("id" | "url" | "api-key" | "env-var") => return Nav::Stay,
+                _ => return Nav::Stay,
+            },
+            ProvidersPage::CopilotSetup { state, .. } => match index {
+                0 if state.outcome.is_some()
+                    || (state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured) => {}
+                1 => {
+                    return cx.handle_providers_page_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    );
+                }
                 _ => return Nav::Stay,
             },
             _ => return Nav::Stay,

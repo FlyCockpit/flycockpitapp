@@ -838,6 +838,11 @@ impl Dialog {
         let Dialog::Settings(settings) = self else {
             return None;
         };
+        // App-level z-order may route Settings before chat affordances only
+        // after the dialog has actually rendered a pointer surface. A newly
+        // constructed, not-yet-rendered dialog has no geometry to own and
+        // must not swallow suggestion/selection events underneath it.
+        settings.pointer_surface.area.get()?;
         Some(settings.handle_pointer(mouse))
     }
 

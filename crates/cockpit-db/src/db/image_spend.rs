@@ -389,8 +389,50 @@ mod tests {
             .unwrap();
         assert_eq!(
             (released.state.as_str(), released.charged_usd_micros),
-            ("released", 3)
+            ("reconciled", 3)
         );
+    }
+
+    #[test]
+    fn calendar_epoch_rejects_non_iana_zone_and_derives_membership() {
+        let invalid = ProjectEpochPolicy::CalendarMonth {
+            time_zone: "Not/AZone".into(),
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(BudgetBlockReason::InvalidProjectEpoch)
+        );
+        let valid = ProjectEpochPolicy::CalendarMonth {
+            time_zone: "America/Chicago".into(),
+        };
+        let epoch = valid.resolve_epoch(1_775_000_000_000).unwrap();
+        assert_eq!(epoch.membership_key, "2026-04@America/Chicago");
+    }
+
+    #[tokio::test]
+    async fn finite_policy_preserves_full_u64_micros() {
+        let db = Db::open_in_memory().unwrap();
+        let settings = finite(u64::MAX);
+        db.save_image_spend_policy("project".into(), settings, None, 0)
+            .await
+            .unwrap();
+        db.resolve_image_spend_epoch("project".into(), 1, "epoch".into(), 0, 0)
+            .await
+            .unwrap();
+        let reserved = db
+            .reserve_image_spend(
+                "u64".into(),
+                keys("u64-plan"),
+                vec![AttemptMaximum {
+                    attempt_id: "a".into(),
+                    usd_micros: Some(u64::MAX),
+                }],
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reserved.reserved_usd_micros, Some(u64::MAX));
     }
 }
 

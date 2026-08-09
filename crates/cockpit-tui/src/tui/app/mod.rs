@@ -3488,7 +3488,6 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        crate::tui::async_action::recover_persisted_export_records().await;
         export_actions::recover_deferred_export_cleanup(
             &self.launch.cwd.join(".cockpit").join("exports"),
         )

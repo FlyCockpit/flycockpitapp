@@ -102,7 +102,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 unicode-width = "0.2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 walkdir = "2"
 which = "8"
 zbus = "5"

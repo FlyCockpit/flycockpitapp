@@ -162,13 +162,48 @@ async fn export_via_attached_daemon(
 }
 
 pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Path) {
+    let records = exports_dir.join(".cockpit-export-recovery");
+    if let Ok(mut entries) = tokio::fs::read_dir(&records).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(record) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            let mut lines = record.lines();
+            let (Some("v1"), Some(name), None) = (lines.next(), lines.next(), lines.next()) else {
+                continue;
+            };
+            let owned = name
+                .strip_suffix(".partial")
+                .and_then(|stem| stem.rsplit_once('.'))
+                .is_some_and(|(target, id)| {
+                    target.starts_with('.') && target.len() > 1 && uuid::Uuid::parse_str(id).is_ok()
+                });
+            let candidate = exports_dir.join(name);
+            let regular = tokio::fs::symlink_metadata(&candidate)
+                .await
+                .is_ok_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink());
+            if owned && regular && tokio::fs::remove_file(&candidate).await.is_ok() {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+        let records = records.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::File::open(records)?.sync_all()).await;
+    }
     let Ok(mut entries) = tokio::fs::read_dir(exports_dir).await else {
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".cleanup-deferred") || name.ends_with(".partial") {
+        let partial = name.strip_suffix(".cleanup-deferred").unwrap_or(&name);
+        let owned = partial
+            .strip_suffix(".partial")
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(target, id)| {
+                target.starts_with('.') && target.len() > 1 && uuid::Uuid::parse_str(id).is_ok()
+            });
+        let regular = entry.file_type().await.is_ok_and(|kind| kind.is_file());
+        if owned && regular {
             match tokio::fs::remove_file(entry.path()).await {
                 Ok(()) => eprintln!(
                     "cockpit: recovered deferred export cleanup {}",
@@ -181,6 +216,8 @@ pub(super) async fn recover_deferred_export_cleanup(exports_dir: &std::path::Pat
             }
         }
     }
+    let root = exports_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || std::fs::File::open(root)?.sync_all()).await;
 }
 
 /// Publish through an owned temporary file and a no-replace hard link.  The
@@ -592,10 +629,40 @@ mod tests {
     #[tokio::test]
     async fn next_export_start_clears_deferred_cleanup_record() {
         let tmp = tempfile::tempdir().unwrap();
-        let deferred = tmp.path().join(".old.partial.cleanup-deferred");
+        let deferred = tmp.path().join(format!(
+            ".old.json.{}.partial.cleanup-deferred",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::write(&deferred, b"partial").await.unwrap();
         recover_deferred_export_cleanup(tmp.path()).await;
         assert!(!deferred.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_planted_partial_names_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notes = tmp.path().join("notes.partial");
+        tokio::fs::write(&notes, b"keep").await.unwrap();
+        let planted = tmp.path().join(".notes.not-a-uuid.partial");
+        tokio::fs::write(&planted, b"keep").await.unwrap();
+        #[cfg(unix)]
+        let symlink = {
+            let target = tmp.path().join("valuable");
+            tokio::fs::write(&target, b"keep").await.unwrap();
+            let link = tmp
+                .path()
+                .join(format!(".x.{}.partial", uuid::Uuid::new_v4()));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            Some((link, target))
+        };
+        recover_deferred_export_cleanup(tmp.path()).await;
+        assert!(notes.exists());
+        assert!(planted.exists());
+        #[cfg(unix)]
+        if let Some((link, target)) = symlink {
+            assert!(link.exists());
+            assert_eq!(tokio::fs::read(target).await.unwrap(), b"keep");
+        }
     }
 
     #[tokio::test]

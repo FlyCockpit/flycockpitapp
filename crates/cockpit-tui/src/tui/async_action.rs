@@ -357,48 +357,39 @@ fn export_temp_reaper() -> &'static ExportReaper {
 }
 
 fn persist_export_recovery_record(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let dir = std::env::temp_dir().join("cockpit-export-recovery");
+    let root = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing export root"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid export temp name"))?;
+    let owned = name
+        .strip_suffix(".partial")
+        .and_then(|stem| stem.rsplit_once('.'))
+        .is_some_and(|(target, id)| {
+            target.starts_with('.') && target.len() > 1 && uuid::Uuid::parse_str(id).is_ok()
+        });
+    if !owned {
+        return Err(std::io::Error::other("refusing non-owned export temp"));
+    }
+    let dir = root.join(".cockpit-export-recovery");
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let record = dir.join(format!("{}.record", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let record = dir.join(format!("{}.record", uuid::Uuid::now_v7()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&record)?;
     use std::io::Write as _;
-    file.write_all(path.to_string_lossy().as_bytes())?;
+    file.write_all(format!("v1\n{name}\n").as_bytes())?;
     file.sync_all()?;
     std::fs::File::open(&dir)?.sync_all()?;
     Ok(record)
-}
-
-pub(crate) async fn recover_persisted_export_records() {
-    let dir = std::env::temp_dir().join("cockpit-export-recovery");
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(path) = tokio::fs::read_to_string(entry.path()).await else {
-            continue;
-        };
-        match tokio::fs::remove_file(path.trim()).await {
-            Ok(()) => {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-            Err(error) => eprintln!(
-                "cockpit: CleanupDeferred remains for {}: {error}",
-                path.trim()
-            ),
-        }
-    }
 }
 
 fn enqueue_export_temp_reap(path: std::path::PathBuf) {

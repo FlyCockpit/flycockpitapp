@@ -289,6 +289,22 @@ CREATE TABLE media_attachment_cleanup_intents (
         REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
+CREATE TABLE media_security_recovery_operations (
+    local_request_id       TEXT PRIMARY KEY,
+    owner_principal_digest TEXT NOT NULL,
+    attachment_id          TEXT NOT NULL,
+    attachment_version     TEXT NOT NULL,
+    request_digest         TEXT NOT NULL,
+    affected_set_digest    TEXT NOT NULL,
+    receipt_json           TEXT NOT NULL,
+    committed_at_unix_ms   INTEGER NOT NULL,
+    CHECK (length(owner_principal_digest) = 64 AND owner_principal_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(affected_set_digest) = 64 AND affected_set_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;

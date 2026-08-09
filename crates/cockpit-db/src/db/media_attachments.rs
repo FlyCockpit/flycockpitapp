@@ -7,6 +7,8 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,8 +217,37 @@ pub struct MediaAttachmentComponent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBlockedComponent {
     pub component_id: Uuid,
+    pub component_kind: String,
     pub component_generation: u64,
-    pub recorded_evidence_digest: String,
+    pub stable_identity_digest: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    pub reservation_id: String,
+    pub deletion_evidence_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSecurityRecoveryRequest {
+    pub local_request_id: Uuid,
+    pub owner_principal_digest: String,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub expected_availability_generation: u64,
+    pub affected_components: Vec<VerifiedBlockedComponent>,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSecurityRecoveryReceipt {
+    pub receipt_id: Uuid,
+    pub local_request_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub request_digest: String,
+    pub affected_set_digest: String,
+    pub availability_generation_before: u64,
+    pub availability_generation_after: u64,
+    pub committed_at_unix_ms: i64,
 }
 
 impl super::Db {
@@ -227,17 +258,10 @@ impl super::Db {
     /// `security_blocked`.
     pub fn resume_verified_security_blocked_cleanup_conn(
         conn: &Connection,
-        attachment_id: Uuid,
-        expected_attachment_version: u64,
-        expected_availability_generation: u64,
-        affected_components: &[VerifiedBlockedComponent],
-        handles_and_checksums_verified: bool,
-        now_unix_ms: i64,
-    ) -> Result<MediaAttachmentRecord> {
-        ensure!(
-            handles_and_checksums_verified,
-            "security recovery proof was not verified"
-        );
+        request: &VerifiedSecurityRecoveryRequest,
+    ) -> Result<MediaSecurityRecoveryReceipt> {
+        validate_digest(&request.owner_principal_digest, "owner principal digest")?;
+        let affected_components = &request.affected_components;
         ensure!(
             !affected_components.is_empty() && affected_components.len() <= 256,
             "security recovery requires 1..=256 components"
@@ -250,37 +274,52 @@ impl super::Db {
         );
         for component in affected_components {
             ensure!(
-                component.component_generation > 0,
+                component.component_generation > 0 && component.byte_length > 0,
                 "security recovery component generation must be positive"
             );
-            validate_digest(
-                &component.recorded_evidence_digest,
-                "recorded component evidence digest",
-            )?;
+            validate_digest(&component.stable_identity_digest, "stable identity digest")?;
+            validate_digest(&component.sha256, "component checksum")?;
+            if let Some(digest) = &component.deletion_evidence_digest {
+                validate_digest(digest, "deletion evidence digest")?;
+            }
         }
-        let parent = media_attachment_by_id(conn, attachment_id)?
+        let (request_digest, affected_set_digest) = security_recovery_digests(request)?;
+        if let Some((stored_digest, receipt_json)) = conn.query_row(
+            "SELECT request_digest,receipt_json FROM media_security_recovery_operations WHERE local_request_id=?1",
+            [request.local_request_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()? {
+            ensure!(stored_digest == request_digest, "local operation conflict");
+            return serde_json::from_str(&receipt_json).context("decoding media recovery receipt");
+        }
+        let parent = media_attachment_by_id(conn, request.attachment_id)?
             .context("security-blocked media attachment unavailable")?;
         ensure!(
-            parent.attachment_version == expected_attachment_version,
+            parent.attachment_version == request.attachment_version,
             "stale attachment version"
         );
         ensure!(
-            parent.availability_generation == expected_availability_generation,
+            parent.availability_generation == request.expected_availability_generation,
             "stale availability generation"
         );
         ensure!(
             parent.availability == MediaAvailability::SecurityBlocked,
             "media attachment is not security blocked"
         );
-        let live_references: i64 = conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL", [attachment_id.to_string()], |row| row.get(0))?;
+        let live_references: i64 = conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL", [request.attachment_id.to_string()], |row| row.get(0))?;
         ensure!(live_references == 0, "media attachment is in use");
-        let mut statement = conn.prepare("SELECT component_id,component_generation,stable_identity_digest FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state <> 'deleted' ORDER BY component_id")?;
+        let mut statement = conn.prepare("SELECT component_id,component_kind,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,deletion_evidence_digest FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state <> 'deleted' ORDER BY component_id")?;
         let persisted = statement
-            .query_map([attachment_id.to_string()], |row| {
+            .query_map([request.attachment_id.to_string()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -288,12 +327,20 @@ impl super::Db {
             persisted.len() == affected_components.len(),
             "security recovery component set is incomplete"
         );
-        for ((id, generation, digest), expected) in persisted.iter().zip(affected_components) {
+        for ((id, kind, generation, identity, length, checksum, reservation, deletion), expected) in
+            persisted.iter().zip(affected_components)
+        {
             ensure!(
                 Uuid::parse_str(id)? == expected.component_id
                     && parse_decimal(generation.clone(), "component generation")?
                         == expected.component_generation
-                    && digest == &expected.recorded_evidence_digest,
+                    && kind == &expected.component_kind
+                    && identity == &expected.stable_identity_digest
+                    && parse_decimal(length.clone(), "component byte length")?
+                        == expected.byte_length
+                    && checksum == &expected.sha256
+                    && reservation == &expected.reservation_id
+                    && deletion == &expected.deletion_evidence_digest,
                 "security recovery component evidence mismatch"
             );
         }
@@ -302,9 +349,10 @@ impl super::Db {
                 .component_generation
                 .checked_add(1)
                 .context("media component generation overflow")?;
-            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4", params![decimal(next)?,now_unix_ms,component.component_id.to_string(),decimal(component.component_generation)?])? == 1, "security recovery component CAS failed");
+            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4", params![decimal(next)?,request.now_unix_ms,component.component_id.to_string(),decimal(component.component_generation)?])? == 1, "security recovery component CAS failed");
         }
-        let next_generation = expected_availability_generation
+        let next_generation = request
+            .expected_availability_generation
             .checked_add(1)
             .context("media availability generation overflow")?;
         let next_state = if parent.source_kind.is_borrowed() {
@@ -312,9 +360,23 @@ impl super::Db {
         } else {
             MediaAvailability::OwnedCleanupPending
         };
-        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state.as_str(),decimal(next_generation)?,now_unix_ms,attachment_id.to_string(),decimal(expected_attachment_version)?,decimal(expected_availability_generation)?])? == 1, "security recovery aggregate CAS failed");
-        media_attachment_by_id(conn, attachment_id)?
-            .context("recovered media attachment disappeared")
+        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND attachment_version=?5 AND availability_generation=?6 AND availability='security_blocked'", params![next_state.as_str(),decimal(next_generation)?,request.now_unix_ms,request.attachment_id.to_string(),decimal(request.attachment_version)?,decimal(request.expected_availability_generation)?])? == 1, "security recovery aggregate CAS failed");
+        let intent_id = Uuid::new_v4();
+        conn.execute("INSERT INTO media_attachment_cleanup_intents (intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,'security_recovery',?7)", params![intent_id.to_string(),request.attachment_id.to_string(),decimal(request.attachment_version)?,decimal(next_generation)?,decimal(parent.reference_generation)?,affected_set_digest,request.now_unix_ms])?;
+        let receipt = MediaSecurityRecoveryReceipt {
+            receipt_id: Uuid::new_v4(),
+            local_request_id: request.local_request_id,
+            attachment_id: request.attachment_id,
+            attachment_version: request.attachment_version,
+            request_digest: request_digest.clone(),
+            affected_set_digest: affected_set_digest.clone(),
+            availability_generation_before: request.expected_availability_generation,
+            availability_generation_after: next_generation,
+            committed_at_unix_ms: request.now_unix_ms,
+        };
+        let receipt_json = serde_json::to_string(&receipt)?;
+        conn.execute("INSERT INTO media_security_recovery_operations (local_request_id,owner_principal_digest,attachment_id,attachment_version,request_digest,affected_set_digest,receipt_json,committed_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![request.local_request_id.to_string(),request.owner_principal_digest,request.attachment_id.to_string(),decimal(request.attachment_version)?,request_digest,affected_set_digest,receipt_json,request.now_unix_ms])?;
+        Ok(receipt)
     }
 
     pub fn insert_media_attachment_component_conn(
@@ -670,6 +732,58 @@ fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
         "audio stream is forbidden for images"
     );
     Ok(())
+}
+
+fn security_recovery_digests(
+    request: &VerifiedSecurityRecoveryRequest,
+) -> Result<(String, String)> {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    fn component(hasher: &mut Sha256, value: &VerifiedBlockedComponent) {
+        field(hasher, value.component_id.as_bytes());
+        field(hasher, value.component_kind.as_bytes());
+        field(hasher, &value.component_generation.to_be_bytes());
+        field(hasher, value.stable_identity_digest.as_bytes());
+        field(hasher, &value.byte_length.to_be_bytes());
+        field(hasher, value.sha256.as_bytes());
+        field(hasher, value.reservation_id.as_bytes());
+        match &value.deletion_evidence_digest {
+            Some(digest) => {
+                field(hasher, &[1]);
+                field(hasher, digest.as_bytes());
+            }
+            None => field(hasher, &[0]),
+        }
+    }
+    let mut affected = Sha256::new();
+    field(&mut affected, b"media-security-affected-set-v1");
+    for value in &request.affected_components {
+        component(&mut affected, value);
+    }
+    let affected_set_digest = hex_lower(&affected.finalize());
+    let mut complete = Sha256::new();
+    field(&mut complete, b"recover-security-blocked-media-v1");
+    field(&mut complete, request.local_request_id.as_bytes());
+    field(&mut complete, request.owner_principal_digest.as_bytes());
+    field(&mut complete, request.attachment_id.as_bytes());
+    field(&mut complete, &request.attachment_version.to_be_bytes());
+    field(
+        &mut complete,
+        &request.expected_availability_generation.to_be_bytes(),
+    );
+    field(&mut complete, affected_set_digest.as_bytes());
+    Ok((hex_lower(&complete.finalize()), affected_set_digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn component_kind_compatible(
@@ -1065,5 +1179,43 @@ mod tests {
             "audio_model",
             "temporary"
         ));
+    }
+
+    #[test]
+    fn media_security_recovery_digest_binds_complete_component_evidence() {
+        let component = VerifiedBlockedComponent {
+            component_id: id(31),
+            component_kind: "image_model".into(),
+            component_generation: 4,
+            stable_identity_digest: "aa".repeat(32),
+            byte_length: 9,
+            sha256: "bb".repeat(32),
+            reservation_id: "reservation-1".into(),
+            deletion_evidence_digest: Some("cc".repeat(32)),
+        };
+        let request = VerifiedSecurityRecoveryRequest {
+            local_request_id: id(32),
+            owner_principal_digest: "dd".repeat(32),
+            attachment_id: id(33),
+            attachment_version: 2,
+            expected_availability_generation: 3,
+            affected_components: vec![component.clone()],
+            now_unix_ms: 10,
+        };
+        let baseline = security_recovery_digests(&request).unwrap();
+        let mutations: [fn(&mut VerifiedBlockedComponent); 7] = [
+            |value: &mut VerifiedBlockedComponent| value.component_kind = "video_model".into(),
+            |value: &mut VerifiedBlockedComponent| value.component_generation += 1,
+            |value: &mut VerifiedBlockedComponent| value.stable_identity_digest = "ee".repeat(32),
+            |value: &mut VerifiedBlockedComponent| value.byte_length += 1,
+            |value: &mut VerifiedBlockedComponent| value.sha256 = "ff".repeat(32),
+            |value: &mut VerifiedBlockedComponent| value.reservation_id.push('x'),
+            |value: &mut VerifiedBlockedComponent| value.deletion_evidence_digest = None,
+        ];
+        for mutation in mutations {
+            let mut changed = request.clone();
+            mutation(&mut changed.affected_components[0]);
+            assert_ne!(security_recovery_digests(&changed).unwrap(), baseline);
+        }
     }
 }

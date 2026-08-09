@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use cockpit_config::config::media_budget::{
     MediaAccumulation, MediaAggregationScope, MediaCharge, MediaDimension, MediaReservationPlan,
 };
@@ -558,6 +558,43 @@ pub(crate) fn reserve_conn(
         queue_sequence,
         deadline_monotonic_ms: deadline,
     })
+}
+
+pub(crate) fn cancel_reserved_media_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    let (state,version,project,session):(String,u64,String,String)=conn.query_row("SELECT state,version,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1",[id],|row|Ok((row.get(0)?,row_u64(row,1)?,row.get(2)?,row.get(3)?)))?;
+    if ReservationState::parse(&state)? == ReservationState::Released {
+        return Ok(());
+    }
+    ensure!(
+        ReservationState::parse(&state)? == ReservationState::ReservedQueued && version == 1,
+        "upload reservation is not cancellable"
+    );
+    let next = 2;
+    let owner = MediaOwner {
+        project_id: project,
+        session_id: session,
+    };
+    release_queued(conn, id, &owner, next, wall_ms)?;
+    for dimension in [
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
+        MediaDimension::LocalCpuJobsGlobal,
+    ] {
+        release_dimension_balance(conn, id, next, &dimension_name(dimension), wall_ms)?;
+    }
+    conn.execute("UPDATE media_reservations SET state='released',cancellation_requested=1,version=?1 WHERE reservation_id=?2 AND version=1",params![sqlite_i64(next)?,id])?;
+    conn.execute(
+        "DELETE FROM media_execution_ready WHERE reservation_id=?1",
+        [id],
+    )?;
+    Ok(())
 }
 
 impl MediaReservationLedger {

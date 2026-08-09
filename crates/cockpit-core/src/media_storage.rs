@@ -44,6 +44,93 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn cancel_media_upload(
+        &self,
+        request: cockpit_db::media_attachments::CancelMediaUploadV1,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use cockpit_db::media_attachments::{
+            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaUploadActionV1,
+            MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
+        };
+        cockpit_db::Db::validate_local_media_mutation_v1(&request)?;
+        let LocalMediaMutationPayloadV1::Cancel {
+            session_id,
+            canonical_project_digest,
+            client_draft_id,
+            upload_id,
+            upload_generation,
+        } = &request.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let session = *session_id;
+        let project = canonical_project_digest.clone();
+        let draft = *client_draft_id;
+        let upload = *upload_id;
+        let generation = *upload_generation;
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&request)?;
+        let domain = format!("cancel:{session}:{project}:{draft}:{upload}:{generation}");
+        let op = request.local_operation_id;
+        let pre_domain = domain.clone();
+        let pre_request = request_digest.clone();
+        let pre_semantic = semantic_digest.clone();
+        if let Some(receipt) = self
+            .db
+            .transaction(move |conn| {
+                preflight_local_operation(
+                    conn,
+                    op,
+                    "cancel",
+                    &pre_domain,
+                    &pre_request,
+                    &pre_semantic,
+                    now_unix_ms,
+                )
+            })
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,state,upload_generation,reservation_id FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
+        ensure!(
+            snapshot.2 == "open" && snapshot.3.parse::<u64>()? == generation,
+            "upload generation conflict"
+        );
+        let mut file = self
+            .owned_root
+            .open_file_verified(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        let (length, checksum) = read_full_digest(&mut file)?;
+        ensure!(
+            length == snapshot.1.parse::<u64>()?,
+            "upload temporary length mismatch"
+        );
+        let identity = stable_identity_digest(&file)?;
+        self.owned_root
+            .remove_file(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            ensure!(
+                file.metadata()?.nlink() == 0,
+                "held upload temporary was not deleted"
+            )
+        }
+        let evidence = crate::intel::hex_lower(&Sha256::digest(
+            format!("media-upload-delete-v1\0{identity}\0{length}\0{checksum}").as_bytes(),
+        ));
+        let mutation = request;
+        let transition = MediaUploadLastTransitionV1::Local {
+            action: MediaUploadActionV1::Cancel,
+            local_operation_id: mutation.local_operation_id,
+            outcome: RemoteMediaOperationOutcomeV1::Applied,
+        };
+        self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok(receipt)}let next=generation.checked_add(1).context("upload generation overflow")?;let changed=conn.execute("UPDATE media_uploads SET state='cancelled',upload_generation=?1,next_chunk_index=NULL,terminal_reason='client_cancelled',cleanup_evidence_digest=?2,last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),evidence,serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload cancel lost compare-and-swap");crate::media_reservation::cancel_reserved_media_conn(conn,&snapshot.4,u64::try_from(now_unix_ms)?)?;let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"cancel".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::Upload{generation_before:generation,generation_after:next},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"cancel",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok(receipt)}).await
+    }
     pub(crate) async fn append_media_upload_chunk(
         &self,
         request: cockpit_db::media_attachments::AppendMediaUploadChunkV1,
@@ -1200,6 +1287,35 @@ mod tests {
                 .unwrap(),
             appended
         );
+        let cancel = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "11".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Cancel {
+                session_id,
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: draft_id,
+                upload_id,
+                upload_generation: 2,
+            },
+        };
+        let cancelled = recovery
+            .cancel_media_upload(cancel.clone(), 30)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancelled.transition,
+            LocalMediaMutationTransitionV1::Upload {
+                generation_before: 2,
+                generation_after: 3
+            }
+        ));
+        assert_eq!(
+            recovery.cancel_media_upload(cancel, 31).await.unwrap(),
+            cancelled
+        );
         let counts = db
             .read(|conn| {
                 Ok((
@@ -1219,13 +1335,20 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(counts, (1, 1, 3, 1));
-        let entry = std::fs::read_dir(temp.path().join("media"))
-            .unwrap()
-            .next()
-            .unwrap()
+        assert_eq!(counts, (1, 1, 4, 1));
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("media"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let state: String = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT state FROM media_reservations", [], |r| r.get(0))?)
+            })
+            .await
             .unwrap();
-        assert_eq!(std::fs::read(entry.path()).unwrap(), bytes);
+        assert_eq!(state, "released");
     }
 
     struct Fixture {

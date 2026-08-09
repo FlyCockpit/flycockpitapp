@@ -3,13 +3,16 @@ export type TerminalPasteIngress = (files: readonly File[]) => void;
 export function orderedClipboardFiles(data: DataTransfer): File[] {
   const fromItems: File[] = [];
   const seenItems = new Set<File>();
-  for (let index = 0; index < data.items.length; index += 1) {
-    const item = data.items[index];
-    if (item?.kind !== "file") continue;
-    const file = item.getAsFile();
-    if (file && !seenItems.has(file)) {
-      seenItems.add(file);
-      fromItems.push(file);
+  const items = data.items;
+  if (items) {
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      if (item?.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (file && !seenItems.has(file)) {
+        seenItems.add(file);
+        fromItems.push(file);
+      }
     }
   }
   if (fromItems.length > 0) return fromItems;

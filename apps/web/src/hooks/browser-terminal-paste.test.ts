@@ -13,6 +13,16 @@ function item(file: File | null): DataTransferItem {
   };
 }
 
+function stringItem(): DataTransferItem {
+  return {
+    kind: "string",
+    type: "text/plain",
+    getAsFile: () => null,
+    getAsString: (callback) => callback?.("caption"),
+    webkitGetAsEntry: () => null,
+  };
+}
+
 function transfer(items: readonly DataTransferItem[], files: readonly File[]): DataTransfer {
   const fileList = {
     ...files,
@@ -32,7 +42,11 @@ describe("browser terminal ordered clipboard classifier", () => {
     const second = new File(["2"], "second.png", { type: "image/png" });
     expect(orderedClipboardFiles(transfer([], [first, first, second]))).toEqual([first, second]);
     expect(orderedClipboardFiles(transfer([item(null)], [second, first]))).toEqual([second, first]);
+    expect(orderedClipboardFiles(transfer([stringItem()], [first]))).toEqual([first]);
     expect(orderedClipboardFiles(transfer([item(null)], []))).toEqual([]);
+    const unavailable = transfer([], [second]);
+    Object.defineProperty(unavailable, "items", { value: undefined });
+    expect(orderedClipboardFiles(unavailable)).toEqual([second]);
   });
 
   it("does not merge FileList into a usable item-list result", () => {

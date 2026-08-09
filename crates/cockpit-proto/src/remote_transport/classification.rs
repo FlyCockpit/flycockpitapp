@@ -1774,8 +1774,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 115);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 73);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 116);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 74);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 

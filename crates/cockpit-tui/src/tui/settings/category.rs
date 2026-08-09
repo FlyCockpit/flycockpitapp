@@ -3339,6 +3339,34 @@ impl SettingsPage for CategoryPage {
         control: super::shell::SettingsControlId,
     ) -> Nav {
         let index = control.0 as usize;
+        if let Some(picker) = self.utility_picker.as_mut() {
+            use super::ui_page::{PICKER_ACTION_ROWS, PickerMode};
+            match &mut picker.mode {
+                PickerMode::List { cursor, .. } => {
+                    if index >= PICKER_ACTION_ROWS + picker.entries.len() {
+                        return Nav::Stay;
+                    }
+                    *cursor = index;
+                    cx.handle_category_utility_picker_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                PickerMode::Custom { .. } => match index {
+                    1000 => {}
+                    1001 => cx.handle_category_utility_picker_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        self,
+                    ),
+                    1002 => cx.handle_category_utility_picker_key(
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        self,
+                    ),
+                    _ => {}
+                },
+            }
+            return Nav::Stay;
+        }
         if index >= self.nav_len() {
             return Nav::Stay;
         }
@@ -3352,7 +3380,16 @@ impl SettingsPage for CategoryPage {
         region: super::shell::SettingsScrollRegionId,
         delta: isize,
     ) -> Nav {
-        if region == super::shell::SettingsScrollRegionId("category:settings")
+        if region == super::shell::SettingsScrollRegionId("category:utility-picker") {
+            if let Some(picker) = self.utility_picker.as_mut()
+                && let super::ui_page::PickerMode::List { cursor, scroll } = &mut picker.mode
+            {
+                let last = super::ui_page::PICKER_ACTION_ROWS + picker.entries.len() - 1;
+                *cursor = cursor.saturating_add_signed(delta).min(last);
+                *scroll =
+                    super::ui_page::picker_window_scroll(*cursor, *scroll, picker.entries.len());
+            }
+        } else if region == super::shell::SettingsScrollRegionId("category:settings")
             && self.text_editor.is_none()
             && self.utility_picker.is_none()
         {

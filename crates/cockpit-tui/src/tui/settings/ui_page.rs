@@ -556,6 +556,7 @@ impl SettingsCx {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
 
         lines.push(Line::from(Span::styled(
             "Utility model — picks the cheap background model".to_string(),
@@ -570,6 +571,7 @@ impl SettingsCx {
                     muted,
                 )));
                 let (before, after) = buf.split_at_cursor();
+                bindings.push((lines.len(), SettingsControlId(1000)));
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
@@ -585,10 +587,10 @@ impl SettingsCx {
                         muted,
                     )));
                 }
-                lines.push(Line::from(Span::styled(
-                    "enter: accept (blank clears)  esc: back".to_string(),
-                    muted,
-                )));
+                bindings.push((lines.len(), SettingsControlId(1001)));
+                lines.push(Line::from(Span::styled("[Save custom]", muted)));
+                bindings.push((lines.len(), SettingsControlId(1002)));
+                lines.push(Line::from(Span::styled("[Cancel]", muted)));
             }
             PickerMode::List { cursor, scroll } => {
                 let cur_label = |value: &str| -> &'static str {
@@ -612,6 +614,7 @@ impl SettingsCx {
                 } else {
                     ""
                 };
+                bindings.push((lines.len(), SettingsControlId(PICKER_CLEAR_ROW as u64)));
                 lines.push(Line::from(vec![
                     Span::raw(if clear_active { "▸ " } else { "  " }),
                     Span::styled(
@@ -619,6 +622,7 @@ impl SettingsCx {
                         action_style(clear_active),
                     ),
                 ]));
+                bindings.push((lines.len(), SettingsControlId(PICKER_CUSTOM_ROW as u64)));
                 lines.push(Line::from(vec![
                     Span::raw(if custom_active { "▸ " } else { "  " }),
                     Span::styled(
@@ -662,6 +666,10 @@ impl SettingsCx {
                     if !suffix.is_empty() {
                         spans.push(Span::styled(suffix.to_string(), yellow));
                     }
+                    bindings.push((
+                        lines.len(),
+                        SettingsControlId((i + PICKER_ACTION_ROWS) as u64),
+                    ));
                     lines.push(Line::from(spans));
                 }
 
@@ -673,7 +681,17 @@ impl SettingsCx {
             }
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "category:utility-picker",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("category:utility-picker"),
+        );
     }
 }
 

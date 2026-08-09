@@ -4958,6 +4958,16 @@ mod queued_message_edit_tests {
 
         app.history_up();
         responder.await.unwrap();
+        let kind = app.queue_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
 
         assert_eq!(app.composer.text(), "queued");
         assert_eq!(app.prompt_history_cursor, 0);

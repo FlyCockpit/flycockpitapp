@@ -76,9 +76,6 @@ impl App {
         }
 
         let export_key = AsyncActionKey::new(EXPORT_ACTION_KEY);
-        if self.async_actions.has_pending_key(&export_key) {
-            return;
-        }
         self.push_plain(match kind {
             ExportSessionKind::TranscriptJson => "/export: writing transcript…".to_string(),
             ExportSessionKind::DebugBundle => "/export debug: writing bundle…".to_string(),
@@ -93,7 +90,7 @@ impl App {
         };
         self.async_actions.start_export(
             AsyncActionKind::Blocking(action),
-            AsyncActionPolicy::Dedupe(export_key),
+            AsyncActionPolicy::Replace(export_key),
             move |shutdown| async move {
                 #[cfg(test)]
                 if let Some(barrier) = barrier {
@@ -472,14 +469,16 @@ mod tests {
     }
 
     async fn drain_until_idle(app: &mut App) {
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
+        while app.async_actions.pending_count() != 0 {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
             app.drain_async_actions();
             if app.async_actions.pending_count() == 0 {
                 return;
             }
+            notified.await;
         }
-        panic!("export action did not finish");
+        app.drain_async_actions();
     }
 
     #[test]
@@ -733,14 +732,14 @@ mod tests {
             let id = app
                 .async_actions
                 .start(
-                    AsyncActionKind::Internal(action),
+                    AsyncActionKind::Blocking(action),
                     AsyncActionPolicy::AllowConcurrent,
                     std::future::pending::<Result<AsyncActionPayload, String>>(),
                 )
                 .id();
             app.apply_async_action_result(AsyncActionResult {
                 id,
-                kind: AsyncActionKind::Internal(action),
+                kind: AsyncActionKind::Blocking(action),
                 payload: Ok(AsyncActionPayload::Unit),
             });
             assert_eq!(last_plain(&app), expected);

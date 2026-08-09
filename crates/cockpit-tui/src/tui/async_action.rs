@@ -1120,6 +1120,9 @@ impl AsyncActionRunner {
         {
             self.keyed.remove(&key);
         }
+        if let Some(shutdown) = &pending.shutdown {
+            shutdown.cancel();
+        }
         pending.handle.abort();
         if record_cancelled {
             self.cancelled.push(AsyncActionResult {

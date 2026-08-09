@@ -684,9 +684,6 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
-    if unsafe { EqualSid(owner, expected_owner.as_ptr().cast()) } == 0 {
-        anyhow::bail!("terminal ingress object owner is not the daemon user");
-    }
     if control & SE_DACL_PROTECTED == 0 {
         anyhow::bail!("terminal ingress DACL is not protected");
     }
@@ -702,6 +699,9 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
         || owner.is_null()
     {
         return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { EqualSid(owner, expected_owner.as_ptr().cast()) } == 0 {
+        anyhow::bail!("terminal ingress object owner is not the daemon user");
     }
     let mut dacl_present = 0;
     let mut dacl: *mut ACL = std::ptr::null_mut();

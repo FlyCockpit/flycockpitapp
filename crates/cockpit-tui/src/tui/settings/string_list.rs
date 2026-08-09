@@ -27,7 +27,9 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 use super::grab;
 use super::pointer_actions::{ListAction, SettingsPointerAction, StableRowId};
 use super::secret_display;
-use super::shell::{SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsPointerTarget, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::ui_page::GrabState;
 use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
@@ -343,19 +345,11 @@ impl SettingsCx {
                 self.start_string_list_grab_on_new(p);
             }
             KeyCode::Char('d') | KeyCode::Delete if p.cursor < rows => {
-                let label = string_list_display_value(
-                    kind,
-                    p.cursor,
-                    &self.string_list_values(kind)[p.cursor],
-                );
-                if p.delete.arm_or_confirm(p.cursor) {
-                    self.string_list_remove(kind, p.cursor);
-                    let total = self.string_list_len(kind);
-                    p.cursor = p.cursor.min(total.saturating_sub(1));
-                    p.status = save_status(self.save_extended());
-                } else {
-                    p.status = Some(format!("press d/Delete again to delete `{label}`"));
-                }
+                p.delete.disarm();
+                self.string_list_remove(kind, p.cursor);
+                let total = self.string_list_len(kind);
+                p.cursor = p.cursor.min(total.saturating_sub(1));
+                p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 p.delete.disarm();
@@ -453,6 +447,7 @@ impl SettingsCx {
             Line::default(),
         ];
         let mut controls = vec![None; lines.len()];
+        let mut cancel_lines = Vec::new();
         push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
         controls.resize(lines.len(), None);
         lines.push(Line::default());
@@ -497,10 +492,11 @@ impl SettingsCx {
                 None,
             )));
             let pending = p.delete.is_pending_for(i);
+            let display = string_list_display_value(p.kind, i, val);
             lines.push(Line::from(if pending {
-                "    [Confirm delete]"
+                format!("    Delete {display}? [Delete] [Cancel]")
             } else {
-                "    [Delete]"
+                format!("    [Delete {display}]")
             }));
             controls.push(Some((
                 SettingsPointerAction::List(ListAction::Delete(string_list_row_id(p.kind, i, val))),
@@ -508,12 +504,7 @@ impl SettingsCx {
                 None,
             )));
             if pending {
-                lines.push(Line::from("    [Cancel delete]"));
-                controls.push(Some((
-                    SettingsPointerAction::List(ListAction::Cancel),
-                    true,
-                    None,
-                )));
+                cancel_lines.push((lines.len() - 1, 22 + display.chars().count()));
             }
         }
 
@@ -600,6 +591,28 @@ impl SettingsCx {
             &self.pointer_surface,
             SettingsScrollRegionId("string-list"),
         );
+        let key = format!("string-list:{:?}", p.kind);
+        let offset = self.scroll_states.offset_for(&key);
+        for (line, column) in cancel_lines {
+            if let Some(row) = line
+                .checked_sub(offset)
+                .filter(|row| *row < usize::from(area.height))
+            {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(column as u16),
+                        area.y.saturating_add(row as u16),
+                        8,
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
+                        ListAction::Cancel,
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
     }
 }
 
@@ -662,10 +675,14 @@ impl SettingsPage for StringListPage {
                         return Nav::Stay;
                     };
                     self.cursor = index;
-                    return cx.handle_string_list_page_key(
-                        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-                        self,
-                    );
+                    if self.delete.arm_or_confirm(index) {
+                        cx.string_list_remove(self.kind, index);
+                        self.cursor = index.min(cx.string_list_len(self.kind).saturating_sub(1));
+                        self.status = save_status(cx.save_extended());
+                    } else {
+                        self.status = Some("confirm deletion or cancel".into());
+                    }
+                    return Nav::Stay;
                 }
                 ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
                     self.delete.disarm();

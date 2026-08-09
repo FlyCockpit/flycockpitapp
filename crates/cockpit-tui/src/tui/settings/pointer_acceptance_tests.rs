@@ -371,6 +371,14 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::tests::run_pointer_dialog_regression_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
+    let tmp = TempDir::new().unwrap();
+    let dialog = fresh_dialog(&tmp);
+    let _ = render_settings_rows(&dialog, 90, 30);
+    for target in dialog.pointer_surface.targets.borrow().iter() {
+        if let RenderAction::Page(action) = &target.action {
+            assert_source_action_family_is_exhaustive(action);
+        }
+    }
     // Coverage comes from each page's rendered source state and real reducer
     // matrix above. Synthetic action registries can report success for
     // actions no production page ever publishes, so they are intentionally
@@ -388,6 +396,167 @@ fn assert_source_list_action_is_covered(action: &ListAction) {
         | ListAction::MoveDown(_)
         | ListAction::Save
         | ListAction::Cancel => {}
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_source_action_family_is_exhaustive(action: &SettingsPointerAction) {
+    match action {
+        SettingsPointerAction::Root(action) => match action {
+            RootAction::Open(_) => {}
+        },
+        SettingsPointerAction::Category(action) => match action {
+            CategoryAction::DescriptorActivate(_)
+            | CategoryAction::InlineEditBegin(_)
+            | CategoryAction::InlineEditCommit(_)
+            | CategoryAction::InlineEditCancel(_)
+            | CategoryAction::PathEditBegin(_)
+            | CategoryAction::PathEditCommit(_)
+            | CategoryAction::PathEditCancel(_)
+            | CategoryAction::SuggestionSelect(_, _)
+            | CategoryAction::TextEditorSave(_)
+            | CategoryAction::TextEditorCancel(_)
+            | CategoryAction::PickerSelect(_, _)
+            | CategoryAction::Confirm(_, _)
+            | CategoryAction::Reset
+            | CategoryAction::ExternalEditBegin(_, _)
+            | CategoryAction::ExternalEditResult(_, _) => {}
+        },
+        SettingsPointerAction::Agents(action) => match action {
+            AgentsAction::Open(_)
+            | AgentsAction::Edit(_)
+            | AgentsAction::Delete(_)
+            | AgentsAction::Reset(_)
+            | AgentsAction::ResetAll
+            | AgentsAction::ToggleTool(_, _)
+            | AgentsAction::CycleTier(_, _)
+            | AgentsAction::Save(_)
+            | AgentsAction::OpenRawEditor(_)
+            | AgentsAction::EditText(_)
+            | AgentsAction::Cancel(_)
+            | AgentsAction::ExternalEditBegin(_)
+            | AgentsAction::ExternalEditResult(_, _) => {}
+        },
+        SettingsPointerAction::Tools(action) => match action {
+            ToolsAction::CycleWebProvider
+            | ToolsAction::EditFirecrawlBaseUrl
+            | ToolsAction::EditCredential(_)
+            | ToolsAction::EditWebFetchCommand
+            | ToolsAction::EditWebSearchCommand
+            | ToolsAction::EditUserToolCommand(_)
+            | ToolsAction::AddUserTool
+            | ToolsAction::ToggleUserTool(_)
+            | ToolsAction::ResetToolField(_)
+            | ToolsAction::McpJump
+            | ToolsAction::Reset
+            | ToolsAction::DeleteUserTool(_)
+            | ToolsAction::ReadOnlyBuiltin(_)
+            | ToolsAction::ReadOnlyMcpTool(_, _) => {}
+        },
+        SettingsPointerAction::Harnesses(action) => match action {
+            HarnessesAction::Open(_)
+            | HarnessesAction::Add
+            | HarnessesAction::Delete(_)
+            | HarnessesAction::SeedInstalledPresets
+            | HarnessesAction::ResetAndSeedPresets
+            | HarnessesAction::EditField(_)
+            | HarnessesAction::Save
+            | HarnessesAction::Cancel => {}
+        },
+        SettingsPointerAction::Skills(action) => match action {
+            SkillsAction::ToggleAutoBangCommands
+            | SkillsAction::ToggleAncestorWalk
+            | SkillsAction::AddScanDirectory
+            | SkillsAction::EditScanDirectory(_)
+            | SkillsAction::DeleteScanDirectory(_)
+            | SkillsAction::ConfirmDeleteScanDirectory(_, _)
+            | SkillsAction::Reset => {}
+        },
+        SettingsPointerAction::Mcp(action) => match action {
+            McpAction::Open(_)
+            | McpAction::Add
+            | McpAction::ToggleEnabled(_)
+            | McpAction::Authenticate(_)
+            | McpAction::Delete(_)
+            | McpAction::EditName
+            | McpAction::ToggleEditorEnabled
+            | McpAction::CycleTransport
+            | McpAction::EditEndpoint
+            | McpAction::EditCommand
+            | McpAction::EditArgs
+            | McpAction::EditBaseEnv
+            | McpAction::CycleAuth
+            | McpAction::EditHeaderName
+            | McpAction::EditHeaderValue
+            | McpAction::EditAuthEnv
+            | McpAction::EditOauthAuthorizeUrl
+            | McpAction::EditOauthTokenUrl
+            | McpAction::EditOauthClientId
+            | McpAction::EditOauthScopes
+            | McpAction::EditCacheTtl
+            | McpAction::EditConnectTimeout
+            | McpAction::EditRequestTimeout
+            | McpAction::Save
+            | McpAction::Cancel => {}
+        },
+        SettingsPointerAction::Providers(action) => match action {
+            ProvidersAction::Open(_)
+            | ProvidersAction::Add
+            | ProvidersAction::EditField(_, _)
+            | ProvidersAction::EditHeaders(_)
+            | ProvidersAction::CopilotSetup(_)
+            | ProvidersAction::OAuthSetup(_, _)
+            | ProvidersAction::ManageModels(_)
+            | ProvidersAction::ProviderSettings(_)
+            | ProvidersAction::Favorite(_)
+            | ProvidersAction::Refetch(_)
+            | ProvidersAction::RefetchAll
+            | ProvidersAction::CycleUnlistedPolicy
+            | ProvidersAction::DeepFetchConfirm(_, _)
+            | ProvidersAction::BeginDelete(_)
+            | ProvidersAction::Delete(_, _)
+            | ProvidersAction::SaveProvider(_)
+            | ProvidersAction::LocalBack
+            | ProvidersAction::AddModel(_)
+            | ProvidersAction::RenameModel(_, _)
+            | ProvidersAction::DeleteModel(_, _)
+            | ProvidersAction::ModelSettings(_, _)
+            | ProvidersAction::FetchAllConfirm(_)
+            | ProvidersAction::FetchOneConfirm(_, _)
+            | ProvidersAction::FetchFallbackConfirm(_, _)
+            | ProvidersAction::DeepFetchChoice(_, _)
+            | ProvidersAction::WizardControl(_, _)
+            | ProvidersAction::RowEditor(_)
+            | ProvidersAction::ModelLifecycle(_)
+            | ProvidersAction::CopyOAuth(_, _)
+            | ProvidersAction::CopilotConfirm(_, _) => {}
+        },
+        SettingsPointerAction::Lsp(action) => match action {
+            LspAction::ToggleEnabled
+            | LspAction::CycleAutoInstall
+            | LspAction::ToggleDiagnostics
+            | LspAction::Edit(_)
+            | LspAction::SaveEdit(_)
+            | LspAction::CancelEdit(_)
+            | LspAction::Reset
+            | LspAction::Check(_)
+            | LspAction::Install(_)
+            | LspAction::Uninstall(_)
+            | LspAction::Restart(_) => {}
+        },
+        SettingsPointerAction::List(action) => assert_source_list_action_is_covered(action),
+        SettingsPointerAction::UtilityModel(action) => match action {
+            UtilityModelAction::Select(_)
+            | UtilityModelAction::Clear
+            | UtilityModelAction::OpenCustom
+            | UtilityModelAction::Back
+            | UtilityModelAction::EditCustom
+            | UtilityModelAction::CommitCustom
+            | UtilityModelAction::CancelCustom => {}
+        },
+        SettingsPointerAction::DefaultModel(action) => match action {
+            DefaultModelAction::Choose | DefaultModelAction::Clear => {}
+        },
     }
 }
 
@@ -446,7 +615,14 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
         assert_eq!(list_len(&dialog, kind), 1, "first click only arms {kind:?}");
 
         let rows = render_settings_rows(&dialog, 90, 30).join("\n");
-        assert!(rows.contains("[Confirm delete]") && rows.contains("[Cancel delete]"));
+        let name = if kind == StringListKind::RedactDenylist {
+            "replacement #1"
+        } else if kind == StringListKind::RedactAllowlist {
+            "ONE"
+        } else {
+            "one"
+        };
+        assert!(rows.contains(&format!("Delete {name}? [Delete] [Cancel]")));
         let cancel = dialog
             .pointer_surface
             .targets
@@ -649,29 +825,10 @@ fn settings_pointer_copilot_setup_is_explicit_and_exactly_once() {
 
 #[test]
 fn settings_pointer_provider_secret_choices_are_functional() {
+    // The provider matrix renders the edit page, dispatches BeginDelete,
+    // renders each resulting confirmation choice, and drives the real
+    // credential-aware reducer for remove/keep/cancel.
     super::providers::tests::run_pointer_provider_regression_matrix();
-    let actions = fixture_actions();
-    assert!(
-        actions.contains(&SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider_id(),
-            ProviderDeleteChoice::RemoveSecrets
-        )))
-    );
-    fn provider_id() -> ProviderId {
-        ProviderId("provider".into())
-    }
-    let choices = actions
-        .iter()
-        .filter(|action| {
-            matches!(
-                action,
-                SettingsPointerAction::Providers(ProvidersAction::Delete(_, _))
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(choices.len(), 3);
-    assert_rendered_action_matrix(&choices);
 }
 
 #[test]

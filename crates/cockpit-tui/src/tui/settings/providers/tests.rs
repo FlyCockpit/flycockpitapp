@@ -179,6 +179,7 @@ fn render_provider_links(
 
 pub(crate) fn run_pointer_provider_regression_matrix() {
     pointer_render_boundary_publishes_stable_provider_identity();
+    pointer_delete_confirmation_is_rendered_and_reduced();
     pointer_edit_menu_mapping_is_exhaustive_over_source_actions();
     pointer_row_editor_actions_survive_reordering_by_identity();
     header_delete_requires_second_press_on_same_row();
@@ -193,6 +194,71 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     standalone_oauth_link_region_survives_scroll_and_clipping();
     copilot_setup_effect_accepts_only_its_live_operation_once();
     oauth_copy_completion_is_flow_scoped_and_exactly_once();
+}
+
+#[test]
+pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
+    let cfg = one_provider_config(None);
+    let provider_id = cfg.providers.keys().next().unwrap().clone();
+    let entry = cfg.providers[&provider_id].clone();
+    let (_tmp, mut dialog) = dialog_with_config(cfg);
+    dialog.page = super::super::providers_page(ProvidersPage::Edit(EditState::new(
+        provider_id.clone(),
+        entry,
+    )));
+    let _ = render_provider_rows(&dialog, 100, 40);
+    let begin = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            target.action
+                == super::super::shell::SettingsPointerAction::Page(
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::BeginDelete(
+                            super::super::pointer_actions::ProviderId(provider_id.clone()),
+                        ),
+                    ),
+                )
+        })
+        .cloned()
+        .expect("rendered provider delete arm target");
+    dialog.handle_pointer(super::super::tests::settings_mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        begin.rect.x,
+        begin.rect.y,
+    ));
+    let _ = render_provider_rows(&dialog, 100, 40);
+    let cancel = dialog
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .find(|target| {
+            matches!(
+                &target.action,
+                super::super::shell::SettingsPointerAction::Page(
+                    super::super::pointer_actions::SettingsPointerAction::Providers(
+                        super::super::pointer_actions::ProvidersAction::Delete(
+                            _,
+                            super::super::pointer_actions::ProviderDeleteChoice::Cancel
+                        )
+                    )
+                )
+            )
+        })
+        .cloned()
+        .expect("rendered provider delete cancellation target");
+    dialog.handle_pointer(super::super::tests::settings_mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        cancel.rect.x,
+        cancel.rect.y,
+    ));
+    assert!(matches!(
+        dialog.test_page(),
+        TestPageRef::Providers(ProvidersPage::Edit(state)) if !state.delete_pending
+    ));
 }
 
 #[test]

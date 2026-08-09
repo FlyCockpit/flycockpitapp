@@ -27,10 +27,10 @@ use super::pointer_actions::{
     ListAction, SettingsPointerAction, StableRowId, UtilityModelAction, UtilityModelId,
 };
 use super::shell::{
-    SettingsPointerSurface, SettingsScrollRegionId, SettingsScrollStates, push_wrapped_text,
-    selected_line_from_marker,
+    SettingsPointerSurface, SettingsPointerTarget, SettingsScrollRegionId, SettingsScrollStates,
+    push_wrapped_text, selected_line_from_marker,
 };
-use super::{Nav, SettingsCx, SettingsPage, save_status};
+use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
 // ── Utility-model picker ─────────────────────────────────────────────────
 
@@ -286,14 +286,11 @@ impl SettingsCx {
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.agent_guidance_files.len() =>
             {
-                if p.delete.arm_or_confirm(p.cursor) {
-                    self.extended.agent_guidance_files.remove(p.cursor);
-                    let total = self.extended.agent_guidance_files.len();
-                    p.cursor = p.cursor.min(total.saturating_sub(1));
-                    p.status = save_status(self.save_extended());
-                } else {
-                    p.status = Some("confirm deletion or cancel".into());
-                }
+                p.delete.disarm();
+                self.extended.agent_guidance_files.remove(p.cursor);
+                let total = self.extended.agent_guidance_files.len();
+                p.cursor = p.cursor.min(total.saturating_sub(1));
+                p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 p.delete.disarm();
@@ -458,14 +455,11 @@ impl SettingsCx {
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.redact.dotenv_patterns.len() =>
             {
-                if p.delete.arm_or_confirm(p.cursor) {
-                    self.extended.redact.dotenv_patterns.remove(p.cursor);
-                    let total = self.extended.redact.dotenv_patterns.len();
-                    p.cursor = p.cursor.min(total.saturating_sub(1));
-                    p.status = save_status(self.save_extended());
-                } else {
-                    p.status = Some("confirm deletion or cancel".into());
-                }
+                p.delete.disarm();
+                self.extended.redact.dotenv_patterns.remove(p.cursor);
+                let total = self.extended.redact.dotenv_patterns.len();
+                p.cursor = p.cursor.min(total.saturating_sub(1));
+                p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 p.delete.disarm();
@@ -770,6 +764,7 @@ fn render_grab_list(
         Line::default(),
     ];
     let mut controls = vec![None; lines.len()];
+    let mut cancel_lines = Vec::new();
     push_wrapped_text(&mut lines, area.width, intro, muted);
     controls.resize(lines.len(), None);
     lines.push(Line::default());
@@ -814,9 +809,9 @@ fn render_grab_list(
         let id = grab_list_row_id(key, i, item);
         let pending = delete.is_pending_for(i);
         lines.push(Line::from(if pending {
-            "    [Confirm delete]"
+            format!("    Delete {item}? [Delete] [Cancel]")
         } else {
-            "    [Delete]"
+            format!("    [Delete {item}]")
         }));
         controls.push(Some((
             SettingsPointerAction::List(ListAction::Delete(id)),
@@ -824,12 +819,7 @@ fn render_grab_list(
             None,
         )));
         if pending {
-            lines.push(Line::from("    [Cancel delete]"));
-            controls.push(Some((
-                SettingsPointerAction::List(ListAction::Cancel),
-                true,
-                None,
-            )));
+            cancel_lines.push((lines.len() - 1, 22 + item.chars().count()));
         }
     }
 
@@ -908,6 +898,27 @@ fn render_grab_list(
         pointer_surface,
         SettingsScrollRegionId(key),
     );
+    let offset = scroll_states.offset_for(key);
+    for (line, column) in cancel_lines {
+        if let Some(row) = line
+            .checked_sub(offset)
+            .filter(|row| *row < usize::from(area.height))
+        {
+            pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x.saturating_add(column as u16),
+                    area.y.saturating_add(row as u16),
+                    8,
+                    1,
+                ),
+                action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
+                    ListAction::Cancel,
+                )),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
+    }
 }
 
 fn grab_list_row_id(key: &str, index: usize, value: &str) -> StableRowId {
@@ -980,10 +991,15 @@ impl SettingsPage for InstructionsPage {
                     return Nav::Stay;
                 };
                 self.cursor = index;
-                return cx.handle_instructions_page_key(
-                    KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-                    self,
-                );
+                if self.delete.arm_or_confirm(index) {
+                    cx.extended.agent_guidance_files.remove(index);
+                    self.cursor =
+                        index.min(cx.extended.agent_guidance_files.len().saturating_sub(1));
+                    self.status = save_status(cx.save_extended());
+                } else {
+                    self.status = Some("confirm deletion or cancel".into());
+                }
+                return Nav::Stay;
             }
             ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
                 self.delete.disarm();
@@ -1111,10 +1127,15 @@ impl SettingsPage for RedactPatternsPage {
                     return Nav::Stay;
                 };
                 self.cursor = index;
-                return cx.handle_redact_patterns_page_key(
-                    KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-                    self,
-                );
+                if self.delete.arm_or_confirm(index) {
+                    cx.extended.redact.dotenv_patterns.remove(index);
+                    self.cursor =
+                        index.min(cx.extended.redact.dotenv_patterns.len().saturating_sub(1));
+                    self.status = save_status(cx.save_extended());
+                } else {
+                    self.status = Some("confirm deletion or cancel".into());
+                }
+                return Nav::Stay;
             }
             ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
                 self.delete.disarm();

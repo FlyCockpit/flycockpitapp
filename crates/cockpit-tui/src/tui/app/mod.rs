@@ -331,6 +331,7 @@ pub(crate) struct PendingPasteProbe {
     pub request: crate::tui::structured_paste::PasteRequest,
     pub source_draft_generation: u64,
     pub owner_fence: Option<uuid::Uuid>,
+    pub original_offset: usize,
 }
 
 pub(crate) struct DeferredFenceDispatch {

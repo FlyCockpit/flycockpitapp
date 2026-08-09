@@ -32,6 +32,14 @@ impl App {
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT));
         if self.composer.text() != composer_before && !clears_or_recalls_without_editing {
             self.last_composer_edit_at = Some(Instant::now());
+            let before = self.pending_paste_probes.len();
+            let draft_generation = self.draft_generation;
+            self.pending_paste_probes.retain(|_, probe| {
+                probe.owner_fence.is_some() || probe.source_draft_generation != draft_generation
+            });
+            if self.pending_paste_probes.len() != before {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+            }
         }
         exit
     }
@@ -2222,6 +2230,7 @@ impl App {
             .map(
                 |probe| crate::tui::structured_paste::PasteSlotState::Pending {
                     request: probe.request.clone(),
+                    original_offset: probe.original_offset,
                 },
             )
             .collect::<Vec<_>>();
@@ -2335,7 +2344,11 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
-        if !pending_probe_ids.is_empty() {
+        let waits_for_earlier_intent = !matches!(
+            self.submission_order.front(),
+            Some((sequence, _)) if sequence == fence_sequence
+        );
+        if !pending_probe_ids.is_empty() || waits_for_earlier_intent {
             self.deferred_fence_dispatches.insert(
                 client_submission_id,
                 super::DeferredFenceDispatch {
@@ -2354,6 +2367,7 @@ impl App {
             self.at_dismissed = false;
             self.at_selected = 0;
             self.at_scroll = 0;
+            self.dispatch_next_ready_paste_fence();
             return false;
         }
         if let Some(pending) = self.pending_model_selection.as_mut() {
@@ -2980,6 +2994,12 @@ impl App {
         }
 
         if data.is_empty() {
+            let native_kind =
+                crate::tui::async_action::AsyncActionKind::Internal("paste.native_image");
+            if self.async_actions.pending_kind_count(&native_kind) >= 8 {
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            }
             let Some(request_generation) = self.next_paste_generation.checked_add(1) else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
@@ -3011,16 +3031,15 @@ impl App {
                     },
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
+                    original_offset: self.composer.cursor(),
                 },
             );
             let terminal_generation = self.terminal_input_generation;
             let source_draft_generation = self.draft_generation;
             let cursor = self.composer.cursor();
             self.async_actions.start(
-                crate::tui::async_action::AsyncActionKind::Internal("paste.native_image"),
-                crate::tui::async_action::AsyncActionPolicy::Replace(
-                    crate::tui::async_action::AsyncActionKey::new("paste.native_image"),
-                ),
+                native_kind,
+                crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                 async move {
                     let png = tokio::time::timeout(
                         std::time::Duration::from_secs(2),
@@ -3080,6 +3099,7 @@ impl App {
                     },
                     source_draft_generation: self.draft_generation,
                     owner_fence: None,
+                    original_offset: self.composer.cursor(),
                 },
             );
             let kind =

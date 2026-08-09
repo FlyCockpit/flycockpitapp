@@ -523,6 +523,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "read_client_submission_receipt",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "read_history_page",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -860,6 +865,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         "session_messages",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "client_submission_receipt",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
     ),
     row(
         "history_page",
@@ -1573,6 +1583,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Response, "subagent_transcript"),
     (RemoteMessageKind::Response, "sessions"),
     (RemoteMessageKind::Response, "session_messages"),
+    (RemoteMessageKind::Response, "client_submission_receipt"),
     (RemoteMessageKind::Response, "history_page"),
     (RemoteMessageKind::Response, "subagent_history_page"),
     (RemoteMessageKind::Response, "pins_with_text"),

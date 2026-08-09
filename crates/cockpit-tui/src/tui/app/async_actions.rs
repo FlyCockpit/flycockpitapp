@@ -215,6 +215,44 @@ impl App {
                 Err(_) => {}
                 Ok(_) => {}
             },
+            AsyncActionKind::Blocking("paste.delivery_receipt") => {
+                if let Ok(AsyncActionPayload::ClientSubmissionReceipt {
+                    client_submission_id,
+                    result,
+                }) = result.payload
+                {
+                    match result {
+                        Ok(cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending)
+                        | Err(_) => {
+                            if let Some(record) = self
+                                .delivery_unconfirmed_records
+                                .get_mut(&client_submission_id)
+                            {
+                                record.probe_in_flight = false;
+                                record.next_probe_at = self.event_loop_monotonic_now
+                                    + std::time::Duration::from_millis(250);
+                            }
+                        }
+                        Ok(status) => {
+                            if let Some(record) = self
+                                .delivery_unconfirmed_records
+                                .remove(&client_submission_id)
+                            {
+                                self.submission_fences.remove(&client_submission_id);
+                                let outcome = match status {
+                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Accepted { .. } => "accepted",
+                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal { ref disposition, .. } => disposition,
+                                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
+                                };
+                                self.push_plain(format!(
+                                    "Delivery {outcome} for message {} in session {}.",
+                                    record.client_submission_id, record.session_id
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
@@ -1043,10 +1081,6 @@ impl App {
             return;
         }
         let sequence = fence.fence_sequence;
-        fence.assembled_wire_digest = Some(
-            crate::tui::structured_paste::user_submission_wire_digest(&deferred.submission),
-        );
-        fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         let was_busy = self.busy;
         if was_busy && self.has_pending_session_switch_action() {
             let item = super::input::optimistic_queue_item_with_id(
@@ -1083,6 +1117,8 @@ impl App {
             self.staged_draft = None;
         }
         let optimistic_history_start = self.history.len();
+        let assembled_wire_digest =
+            crate::tui::structured_paste::user_submission_wire_digest(&deferred.submission);
         let outcome = self.dispatch_optimistic_user_submission_with_id(
             fence_id,
             deferred.display,
@@ -1091,6 +1127,12 @@ impl App {
             !was_busy,
             &deferred.tag_expansions,
         );
+        if outcome == DispatchOutcome::Sent
+            && let Some(fence) = self.submission_fences.get_mut(&fence_id)
+        {
+            fence.assembled_wire_digest = Some(assembled_wire_digest);
+            fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+        }
         if was_busy {
             let terminal_notices = self
                 .history

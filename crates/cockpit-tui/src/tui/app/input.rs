@@ -2394,11 +2394,6 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
-        if let Some(fence) = self.submission_fences.get_mut(&client_submission_id) {
-            fence.assembled_wire_digest = Some(
-                crate::tui::structured_paste::user_submission_wire_digest(&submission),
-            );
-        }
         let order_front = self.submission_order.front();
         let stages_behind_session_switch = self.has_pending_session_switch_action()
             && matches!(
@@ -2462,6 +2457,8 @@ impl App {
         // rising edge of the working span and must undo it if the turn
         // can't be handed off. The busy/queue path didn't start a span,
         // so it must never tear one down.
+        let assembled_wire_digest =
+            crate::tui::structured_paste::user_submission_wire_digest(&submission);
         let was_busy = self.busy;
         let optimistic_queue_item = if was_busy {
             let item = optimistic_queue_item_with_id(
@@ -2490,7 +2487,7 @@ impl App {
         };
         let owns_working_span = !was_busy;
 
-        if owns_working_span {
+        let dispatch_outcome = if owns_working_span {
             self.dispatch_optimistic_user_submission_with_id(
                 client_submission_id,
                 submitted.clone(),
@@ -2498,7 +2495,7 @@ impl App {
                 "engine",
                 true,
                 &fresh_tag_expansions,
-            );
+            )
         } else {
             let optimistic_queue_item = optimistic_queue_item
                 .expect("busy submissions always create an optimistic queue item");
@@ -2515,6 +2512,7 @@ impl App {
                         queue_item: Some(optimistic_queue_item),
                     },
                 );
+                DispatchOutcome::SessionSwitching
             } else {
                 self.ensure_agent_runner();
                 let intended_session_id = self
@@ -2556,8 +2554,9 @@ impl App {
                         outcome,
                     );
                 }
+                outcome
             }
-        }
+        };
         self.composer.clear();
         self.draft_generation = self.draft_generation.saturating_add(1);
         // The buffer is gone — its paste blocks go with it.
@@ -2571,9 +2570,11 @@ impl App {
         if self.composer.vim_enabled() {
             self.composer.set_vim_mode(VimMode::Insert);
         }
-        if let Some(fence) = self.submission_fences.get_mut(&client_submission_id)
+        if dispatch_outcome == DispatchOutcome::Sent
+            && let Some(fence) = self.submission_fences.get_mut(&client_submission_id)
             && fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::Ready
         {
+            fence.assembled_wire_digest = Some(assembled_wire_digest);
             fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         }
         let _ = self.submission_order.complete(fence_sequence);

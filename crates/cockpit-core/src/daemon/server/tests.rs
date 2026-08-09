@@ -3549,6 +3549,7 @@ fn dispatch_matrix_class_for_command(
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
         | ("subagent_transcript", "custom", false)
+        | ("read_client_submission_receipt", "custom", false)
         | ("resource_snapshot", "owner_only", false)
         | ("list_scheduled_jobs", "owner_only", false)
         | ("list_assistants", "owner_only", false)
@@ -4267,6 +4268,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_create_dir"
         | "lsp_control"
         | "read_session_messages"
+        | "read_client_submission_receipt"
         | "read_history_page"
         | "read_subagent_history_page"
         | "unarchive_session"
@@ -4427,6 +4429,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
+        authz_session_reader("read_client_submission_receipt"),
         authz_session_reader("read_history_page"),
         authz_session_reader("read_subagent_history_page"),
         authz_session_writer("archive_session"),
@@ -5395,6 +5398,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             before_seq: None,
             limit: 20,
+        },
+        "read_client_submission_receipt" => Request::ReadClientSubmissionReceipt {
+            session_id,
+            client_submission_id: Uuid::new_v4(),
         },
         "read_history_page" => Request::ReadHistoryPage {
             session_id,
@@ -9250,6 +9257,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "count_pinned_messages",
         "pinned_message_state",
         "read_bulk_transfer_chunk",
+        "read_client_submission_receipt",
         "read_history_page",
         "read_subagent_history_page",
         "read_session_messages",
@@ -9367,6 +9375,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: 20,
             },
             kind: "read_session_messages",
+            session_id: Some(transcript_session_id),
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadClientSubmissionReceipt {
+                session_id: transcript_session_id,
+                client_submission_id: Uuid::new_v4(),
+            },
+            kind: "read_client_submission_receipt",
             session_id: Some(transcript_session_id),
             audit_path: None,
             mutating: false,
@@ -10519,6 +10537,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ResolveInterrupt,
         ListSessions,
         ReadSessionMessages,
+        ReadClientSubmissionReceipt,
         ReadHistoryPage,
         ReadSubagentHistoryPage,
         SessionLiveStatus,

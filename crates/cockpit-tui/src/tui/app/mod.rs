@@ -348,6 +348,10 @@ pub(crate) struct DeliveryUnconfirmedRecord {
     pub session_id: uuid::Uuid,
     pub text: String,
     pub wire_digest: [u8; 32],
+    pub fence_sequence: u64,
+    pub surfaced: bool,
+    pub probe_in_flight: bool,
+    pub next_probe_at: std::time::Duration,
 }
 
 pub(crate) struct ModelSelectionRetry {
@@ -1960,6 +1964,9 @@ pub struct App {
     pub(super) paste_correlations: crate::tui::structured_paste::PasteCorrelationCache,
     pub(super) pending_session_switch_order: Option<(u64, uuid::Uuid)>,
     pub(super) pending_session_switch_reconcile_started_at: Option<std::time::Duration>,
+    /// Latest injected TerminalInput clock sample used by App-owned deadline
+    /// reducers. Tests advance this without sleeping.
+    pub(super) event_loop_monotonic_now: std::time::Duration,
     pub(super) delivery_unconfirmed_records:
         std::collections::HashMap<uuid::Uuid, DeliveryUnconfirmedRecord>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
@@ -3264,6 +3271,7 @@ impl App {
             paste_correlations: Default::default(),
             pending_session_switch_order: None,
             pending_session_switch_reconcile_started_at: None,
+            event_loop_monotonic_now: std::time::Duration::ZERO,
             delivery_unconfirmed_records: Default::default(),
             pending_text_object: None,
             at_dismissed: false,
@@ -3607,6 +3615,18 @@ impl App {
                 .terminal_paste_classifier
                 .next_deadline()
                 .map(|deadline| deadline.saturating_sub(terminal_input.now()));
+            let session_reconciliation_wait =
+                self.pending_session_switch_reconcile_started_at
+                    .map(|started| {
+                        crate::tui::structured_paste::SESSION_SWITCH_RECONCILIATION_TIMEOUT
+                            .saturating_sub(terminal_input.now().saturating_sub(started))
+                    });
+            let delivery_receipt_wait = self
+                .delivery_unconfirmed_records
+                .values()
+                .filter(|record| !record.probe_in_flight)
+                .map(|record| record.next_probe_at.saturating_sub(terminal_input.now()))
+                .min();
 
             if self.animation_tick_active() {
                 let animation = tokio::time::sleep(ANIMATION_TICK);
@@ -3633,6 +3653,12 @@ impl App {
                         if self.apply_terminal_paste_decision(decision) {
                             break;
                         }
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(session_reconciliation_wait) => {
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(delivery_receipt_wait) => {
                         needs_redraw = true;
                     }
                     _ = &mut animation => {
@@ -3664,6 +3690,12 @@ impl App {
                         }
                         needs_redraw = true;
                     }
+                    _ = wait_optional_duration(session_reconciliation_wait) => {
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(delivery_receipt_wait) => {
+                        needs_redraw = true;
+                    }
                 }
             }
         }
@@ -3677,6 +3709,8 @@ impl App {
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
         let mut changed = false;
+        self.event_loop_monotonic_now = terminal_input.now();
+        changed |= self.service_delivery_unconfirmed_reconciliation();
         self.ensure_session_for_display();
         changed |= self.sync_repo_status();
         changed |= self.drain_fetch_progress();

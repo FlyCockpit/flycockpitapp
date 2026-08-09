@@ -36,6 +36,10 @@ pub enum AsyncActionPayload {
         messages: Vec<cockpit_core::daemon::proto::SessionMessage>,
         has_more: bool,
     },
+    ClientSubmissionReceipt {
+        client_submission_id: uuid::Uuid,
+        result: Result<cockpit_core::daemon::proto::ClientSubmissionReceiptStatus, String>,
+    },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
     ResourceSnapshot(cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot),
     PromoteResource {

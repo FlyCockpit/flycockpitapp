@@ -394,8 +394,10 @@ pub(super) async fn authorize_read_session_messages(
     state: &MutableClientState,
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
-    let Request::ReadSessionMessages { session_id, .. } = request else {
-        unreachable!("authorize_read_session_messages called for non-ReadSessionMessages request");
+    let session_id = match request {
+        Request::ReadSessionMessages { session_id, .. }
+        | Request::ReadClientSubmissionReceipt { session_id, .. } => session_id,
+        _ => unreachable!("session receipt reader called for an unrelated request"),
     };
 
     authorize_session_reader_by_id(&state.principal, ctx, *session_id).await
@@ -583,6 +585,7 @@ pub(super) async fn authorize_shared_custom(
         }
         Request::SubagentTranscript { session_id, .. }
         | Request::ReadSessionMessages { session_id, .. }
+        | Request::ReadClientSubmissionReceipt { session_id, .. }
         | Request::ReadHistoryPage { session_id, .. }
         | Request::ReadSubagentHistoryPage { session_id, .. } => {
             match ctx.db.get_session(*session_id).await {

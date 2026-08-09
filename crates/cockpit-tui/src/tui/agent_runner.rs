@@ -2748,6 +2748,29 @@ pub fn read_session_messages_blocking(
     }
 }
 
+pub fn read_client_submission_receipt_blocking(
+    socket: &Path,
+    session_id: uuid::Uuid,
+    client_submission_id: uuid::Uuid,
+) -> Result<proto::ClientSubmissionReceiptStatus, String> {
+    match daemon_request_at_blocking(
+        socket,
+        Request::ReadClientSubmissionReceipt {
+            session_id,
+            client_submission_id,
+        },
+    )? {
+        Response::ClientSubmissionReceipt {
+            session_id: got_session,
+            client_submission_id: got_id,
+            status,
+        } if got_session == session_id && got_id == client_submission_id => Ok(status),
+        other => Err(format!(
+            "unexpected client submission receipt response: {other:?}"
+        )),
+    }
+}
+
 pub fn read_history_page_blocking(
     socket: &Path,
     session_id: uuid::Uuid,

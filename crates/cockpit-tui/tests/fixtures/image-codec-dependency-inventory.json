@@ -269,7 +269,7 @@
   "schemaVersion": 5,
   "targets": {
     "aarch64-apple-darwin": {
-      "arboardFeatures": ["tiff"],
+      "arboardFeatures": ["png"],
       "packageFeatures": {
         "adler2@2.0.1": [],
         "autocfg@1.5.1": [],

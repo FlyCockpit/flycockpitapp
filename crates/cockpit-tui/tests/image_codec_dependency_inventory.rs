@@ -1207,6 +1207,24 @@ fn tui_image_codec_dependency_inventory() {
             arboard_features, expected_arboard,
             "{triple} arboard provenance"
         );
+        let arboard_feature_names = arboard_features
+            .iter()
+            .map(|feature| feature.as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            arboard_feature_names.is_subset(&resolved_features),
+            "{triple} arboard requester features must be active in the resolved image root"
+        );
+        if target == TargetTriple::Macos {
+            assert!(
+                image_tree_features.contains("tiff"),
+                "macOS image root must retain the independently resolved TIFF feature"
+            );
+            assert!(
+                !arboard_feature_names.contains("tiff"),
+                "macOS TIFF activation must not be conflated with arboard requester provenance"
+            );
+        }
     }
     assert_eq!(
         observed_fixture_rows,

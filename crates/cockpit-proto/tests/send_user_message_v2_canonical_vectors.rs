@@ -1,6 +1,7 @@
 use cockpit_proto::send_user_message_v2::{
-    CanonicalSendUserMessageV2, LocalOwnerDirectSendUserMessageV2,
-    MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES, MessageAttachmentIdentity, MessageAttachmentKind,
+    AuthenticatedRemoteOperationEnvelopeV2, CanonicalSendUserMessageV2,
+    LocalOwnerDirectSendUserMessageV2, MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+    MessageAttachmentIdentity, MessageAttachmentKind, MessageIngressProvenance,
     MessageTagExpansion, SendUserMessageV2, has_message_text, validate_fcm2_length,
 };
 use serde_json::Value;
@@ -48,13 +49,65 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         request_id,
         operation_id: request_id,
         session_locator: "opaque-session".into(),
-        request: validated.command,
+        request: validated.command.clone(),
     }
     .into_validated()
     .unwrap_err();
     assert_eq!(
         error.to_string(),
         "request, operation, and submission identities must be pairwise distinct"
+    );
+    let mut request_collision = validated.command.clone();
+    request_collision.client_submission_id = request_id;
+    assert!(
+        LocalOwnerDirectSendUserMessageV2 {
+            request_id,
+            operation_id,
+            session_locator: "opaque".into(),
+            request: request_collision
+        }
+        .into_validated()
+        .is_err()
+    );
+    let mut operation_collision = validated.command.clone();
+    operation_collision.client_submission_id = operation_id;
+    assert!(
+        LocalOwnerDirectSendUserMessageV2 {
+            request_id,
+            operation_id,
+            session_locator: "opaque".into(),
+            request: operation_collision
+        }
+        .into_validated()
+        .is_err()
+    );
+    let non_rfc_v7 = Uuid::parse_str("018f47a2-7b3c-7def-0123-000000000003").unwrap();
+    assert_eq!(
+        LocalOwnerDirectSendUserMessageV2 {
+            request_id: non_rfc_v7,
+            operation_id,
+            session_locator: "opaque".into(),
+            request: validated.command.clone()
+        }
+        .into_validated()
+        .unwrap_err()
+        .to_string(),
+        "request_id must be RFC UUIDv7"
+    );
+    let remote = AuthenticatedRemoteOperationEnvelopeV2 {
+        request_id,
+        operation_id,
+        session_locator: "opaque".into(),
+        request: validated.command,
+    }
+    .into_validated([42; 16], 9)
+    .unwrap();
+    assert_eq!(
+        remote.provenance,
+        MessageIngressProvenance::AuthenticatedRemote {
+            actor_id: [42; 16],
+            actor_generation: 9
+        }
     );
 }
 

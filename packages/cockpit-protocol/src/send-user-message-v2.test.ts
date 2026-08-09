@@ -9,6 +9,7 @@ import {
   FCM2_MAX_BYTES,
   validateFcm2Length,
   validateLocalOwnerDirectMessageV2,
+  validateAuthenticatedRemoteMessageV2,
 } from "./send-user-message-v2";
 
 const fixture = JSON.parse(
@@ -79,6 +80,58 @@ describe("send_user_message_v2_canonical_vectors", () => {
         }),
       ),
     ).toBe("request, operation, and submission identities must be pairwise distinct");
+    const requestCollision = structuredClone(request);
+    requestCollision.client_submission_id = envelope.request_id;
+    expect(
+      exactError(() =>
+        validateLocalOwnerDirectMessageV2({
+          ingress: "local_owner_direct",
+          request_id: envelope.request_id,
+          operation_id: envelope.operation_id,
+          session_locator: envelope.session_locator,
+          request: requestCollision,
+        }),
+      ),
+    ).toBe("request, operation, and submission identities must be pairwise distinct");
+    const operationCollision = structuredClone(request);
+    operationCollision.client_submission_id = envelope.operation_id;
+    expect(
+      exactError(() =>
+        validateLocalOwnerDirectMessageV2({
+          ingress: "local_owner_direct",
+          request_id: envelope.request_id,
+          operation_id: envelope.operation_id,
+          session_locator: envelope.session_locator,
+          request: operationCollision,
+        }),
+      ),
+    ).toBe("request, operation, and submission identities must be pairwise distinct");
+    expect(
+      exactError(() =>
+        validateLocalOwnerDirectMessageV2({
+          ingress: "local_owner_direct",
+          request_id: "018f47a2-7b3c-7def-0123-000000000003",
+          operation_id: envelope.operation_id,
+          session_locator: envelope.session_locator,
+          request,
+        }),
+      ),
+    ).toBe("request_id must be UUIDv7");
+    const remote = validateAuthenticatedRemoteMessageV2(
+      {
+        ingress: "authenticated_remote",
+        request_id: envelope.request_id,
+        operation_id: envelope.operation_id,
+        session_locator: envelope.session_locator,
+        request,
+      },
+      { id: new Uint8Array(16).fill(42), generation: 9n },
+    );
+    expect(remote.actor).toEqual({
+      kind: "remote_device",
+      id: new Uint8Array(16).fill(42),
+      generation: 9n,
+    });
   });
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {

@@ -8,7 +8,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::rc::Rc;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::markdown;
 
@@ -254,15 +254,28 @@ pub(crate) fn slice_spans_at_width(
     if total <= max_width || max_width == 0 {
         return (spans, None);
     }
-    let flat: Vec<(char, Style)> = spans
+    let text = spans
         .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
-        .collect();
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let styles = spans
+        .iter()
+        .flat_map(|span| std::iter::repeat_n(span.style, span.content.chars().count()))
+        .collect::<Vec<_>>();
+    let mut style_offset = 0usize;
+    let flat = markdown::semantic_graphemes(&text)
+        .into_iter()
+        .map(|grapheme| {
+            let style = styles.get(style_offset).copied().unwrap_or_default();
+            style_offset += grapheme.chars().count();
+            (grapheme, style)
+        })
+        .collect::<Vec<_>>();
     let mut used = 0usize;
     let mut hard_split = flat.len();
     let mut whitespace_split = None;
-    for (index, (ch, _)) in flat.iter().enumerate() {
-        let width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+    for (index, (grapheme, _)) in flat.iter().enumerate() {
+        let width = grapheme.width();
         if index > 0 && used + width > max_width {
             hard_split = index;
             break;
@@ -272,7 +285,7 @@ pub(crate) fn slice_spans_at_width(
             hard_split = index + 1;
             break;
         }
-        if ch.is_whitespace() {
+        if grapheme.chars().all(char::is_whitespace) {
             whitespace_split = Some(index + 1);
         }
     }
@@ -283,19 +296,19 @@ pub(crate) fn slice_spans_at_width(
     (head, tail)
 }
 
-fn group_into_spans(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+fn group_into_spans(graphemes: &[(String, Style)]) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut current_style = None;
     let mut current_text = String::new();
-    for &(ch, style) in chars {
+    for (grapheme, style) in graphemes {
         match current_style {
-            Some(current) if current == style => current_text.push(ch),
+            Some(current) if current == *style => current_text.push_str(grapheme),
             _ => {
                 if let Some(current) = current_style.take() {
                     out.push(Span::styled(std::mem::take(&mut current_text), current));
                 }
-                current_style = Some(style);
-                current_text.push(ch);
+                current_style = Some(*style);
+                current_text.push_str(grapheme);
             }
         }
     }
@@ -327,5 +340,32 @@ mod provenance_tests {
             "soft wrapping is not a semantic newline"
         );
         assert!(!block.copy_fragments.is_empty());
+    }
+
+    #[test]
+    fn markdown_provenance_wrap_boundary_keeps_graphemes_mapped() {
+        let block =
+            render_markdown_message_block("ab👩\u{200d}💻e\u{301}z", 2, 0, 0, Style::default());
+        assert!(block.lines.len() >= 3);
+        let emoji_row = block
+            .copy_cells
+            .iter()
+            .find(|row| row.iter().flatten().count() == 2)
+            .expect("wide emoji occupies a wrapped row");
+        let ids = emoji_row.iter().flatten().copied().collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1], "wide grapheme keeps one fragment identity");
+        let copied = block
+            .copy_cells
+            .iter()
+            .flat_map(|row| row.iter().flatten().copied())
+            .fold((None, String::new()), |(last, mut text), id| {
+                if last != Some(id) {
+                    text.push_str(&block.copy_fragments[id as usize].text);
+                }
+                (Some(id), text)
+            })
+            .1;
+        assert_eq!(copied, "ab👩\u{200d}💻e\u{301}z");
+        assert!(block.copy_newlines_before.iter().all(|count| *count == 0));
     }
 }

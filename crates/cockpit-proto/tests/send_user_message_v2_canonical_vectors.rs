@@ -44,6 +44,18 @@ fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
         validated.operation_id,
         validated.command.client_submission_id
     );
+    let error = LocalOwnerDirectSendUserMessageV2 {
+        request_id,
+        operation_id: request_id,
+        session_locator: "opaque-session".into(),
+        request: validated.command,
+    }
+    .into_validated()
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "request, operation, and submission identities must be pairwise distinct"
+    );
 }
 
 fn compact_bytes(vector: &Value) -> Vec<u8> {

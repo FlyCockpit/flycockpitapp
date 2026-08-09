@@ -68,6 +68,17 @@ describe("send_user_message_v2_canonical_vectors", () => {
       request,
     });
     expect(envelope.operation_id).not.toBe(request.client_submission_id);
+    expect(
+      exactError(() =>
+        validateLocalOwnerDirectMessageV2({
+          ingress: "local_owner_direct",
+          request_id: envelope.operation_id,
+          operation_id: envelope.operation_id,
+          session_locator: envelope.session_locator,
+          request,
+        }),
+      ),
+    ).toBe("request, operation, and submission identities must be pairwise distinct");
   });
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {

@@ -367,6 +367,14 @@ mod tests {
                 .unwrap(),
             AcceptMessageResult::Conflict
         );
+        let mut changed_attachments = original.clone();
+        changed_attachments.attachment_set_digest[0] ^= 1;
+        assert_eq!(
+            db.accept_message_with_attachments(changed_attachments, Arc::new(Allow))
+                .await
+                .unwrap(),
+            AcceptMessageResult::Conflict
+        );
         assert_eq!(
             db.message_attachment_receipts(session.session_id, original.client_submission_id)
                 .await

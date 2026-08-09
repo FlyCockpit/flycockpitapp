@@ -352,18 +352,26 @@ mod provenance_tests {
         let block =
             render_markdown_message_block("ab👩\u{200d}💻e\u{301}z", 2, 0, 0, Style::default());
         assert!(block.lines.len() >= 3);
-        let emoji_row = block
+        let emoji_id = block
+            .copy_fragments
+            .iter()
+            .position(|fragment| fragment.text == "👩\u{200d}💻")
+            .expect("emoji remains one semantic fragment") as u32;
+        let emoji_rows = block
             .copy_cells
             .iter()
-            .find(|row| {
-                let ids = row.iter().flatten().copied().collect::<Vec<_>>();
-                ids.len() == 2
-                    && ids[0] == ids[1]
-                    && block.copy_fragments[ids[0] as usize].text == "👩\u{200d}💻"
-            })
-            .expect("wide emoji occupies a wrapped row");
-        let ids = emoji_row.iter().flatten().copied().collect::<Vec<_>>();
-        assert_eq!(ids[0], ids[1], "wide grapheme keeps one fragment identity");
+            .filter(|row| row.iter().flatten().any(|id| *id == emoji_id))
+            .collect::<Vec<_>>();
+        assert_eq!(emoji_rows.len(), 1, "wide emoji occupies one wrapped row");
+        assert_eq!(
+            emoji_rows[0]
+                .iter()
+                .flatten()
+                .filter(|id| **id == emoji_id)
+                .count(),
+            2,
+            "wide grapheme keeps one fragment identity across both cells"
+        );
         let copied = block
             .copy_cells
             .iter()

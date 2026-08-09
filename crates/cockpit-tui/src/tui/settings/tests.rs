@@ -1545,6 +1545,29 @@ fn pointer_default_model_actions_dispatch_from_fresh_sources() {
         "configured default-model page exposes its complete action family"
     );
 
+    let unset_tmp = TempDir::new().unwrap();
+    let mut unset = fresh_dialog(&unset_tmp);
+    enter_root_node(&mut unset, DEFAULT_MODEL_TITLE);
+    let _ = render_settings_rows(&unset, 100, 24);
+    let clear_targets = unset
+        .pointer_surface
+        .targets
+        .borrow()
+        .iter()
+        .filter(|target| {
+            target.action
+                == shell::SettingsPointerAction::Page(SettingsPointerAction::DefaultModel(
+                    DefaultModelAction::Clear,
+                ))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(clear_targets.len(), 1, "unset default has one Clear source");
+    assert!(
+        !clear_targets[0].enabled,
+        "unset default renders Clear disabled"
+    );
+
     for action in actions {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fixture(&tmp);
@@ -3505,7 +3528,9 @@ fn boxed_settings_page_can_be_pushed_driven_rendered_and_popped() {
         "probe page should handle keys through SettingsPage"
     );
 
-    let rows = render_settings_rows(&d, 40, 4).join("\n");
+    // The dialog reserves one row each for its header and help strip. Include
+    // one body row inside the border so the boxed page can render content.
+    let rows = render_settings_rows(&d, 40, 5).join("\n");
     assert!(rows.contains("probe page"), "rendered rows were {rows:?}");
 
     d.handle_key(press(KeyCode::Esc));
@@ -3573,7 +3598,7 @@ fn category_wrapped_values_continue_under_value_column() {
     let rendered = render_settings_rows(&d, 62, 18).join("\n");
     let continuation = rendered
         .lines()
-        .find(|line| line.contains("default) uses"))
+        .find(|line| line.contains("decomposition"))
         .unwrap_or_else(|| panic!("expected wrapped llm-mode value:\n{rendered}"));
     assert!(
         continuation.starts_with("│     "),

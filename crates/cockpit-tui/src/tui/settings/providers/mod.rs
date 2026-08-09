@@ -3344,6 +3344,10 @@ impl SettingsCx {
                     "Done.".to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
+                if s.is_step("done") {
+                    controls.push((lines.len(), 0));
+                    lines.push(Line::from("[Continue]"));
+                }
             }
             Some(other) => {
                 lines.push(Line::from(Span::styled(
@@ -4968,10 +4972,8 @@ fn provider_add_pointer_action(
         WizardStepId::TestSkipped => {
             (index == 0).then_some(WizardControlId::TestSkippedContinue)?
         }
-        WizardStepId::Saving
-        | WizardStepId::TestKey
-        | WizardStepId::Fetching
-        | WizardStepId::Done => return None,
+        WizardStepId::Done => (index == 0).then_some(WizardControlId::DoneContinue)?,
+        WizardStepId::Saving | WizardStepId::TestKey | WizardStepId::Fetching => return None,
     };
     Some(SettingsPointerAction::Providers(
         ProvidersAction::WizardControl(step, control),
@@ -5568,6 +5570,7 @@ impl SettingsPage for ProvidersPage {
                 Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
                 Some("copilot-auth") if index == 0 => {}
                 Some("test-skipped") if index == 0 => {}
+                Some("done") if index == 0 => {}
                 Some("grok-oauth" | "codex-oauth")
                     if state.oauth_auth.as_ref().is_some_and(|oauth| {
                         !oauth.paste_focused && index < oauth.option_count(OAuthHost::AddWizard)

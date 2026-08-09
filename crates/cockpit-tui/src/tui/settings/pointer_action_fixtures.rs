@@ -212,7 +212,7 @@ fixture_enum!(ProvidersFixture {
     WizardCopilotContinue,
     WizardCopilotNoControl,
     WizardTestSkippedContinue,
-    WizardDoneNoControl,
+    WizardDoneContinue,
     RowHeaderOpen,
     RowHeaderAdd,
     RowHeaderSave,
@@ -320,9 +320,7 @@ impl PayloadFixtureKey {
     pub(super) fn expects_pointer_control(self) -> bool {
         !matches!(
             self,
-            Self::WizardStep(
-                ProviderWizardStep::Saving | ProviderWizardStep::TestKey | ProviderWizardStep::Done
-            )
+            Self::WizardStep(ProviderWizardStep::Saving | ProviderWizardStep::TestKey)
         )
     }
 }
@@ -345,6 +343,7 @@ fixture_enum!(WizardPayloadControlKey {
     ContinueHeaders,
     CopilotContinue,
     TestSkippedContinue,
+    DoneContinue,
     EditText
 });
 
@@ -381,6 +380,7 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         WizardControlId::ContinueHeaders => WizardPayloadControlKey::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardPayloadControlKey::CopilotContinue,
         WizardControlId::TestSkippedContinue => WizardPayloadControlKey::TestSkippedContinue,
+        WizardControlId::DoneContinue => WizardPayloadControlKey::DoneContinue,
         WizardControlId::EditText => WizardPayloadControlKey::EditText,
     }
 }
@@ -530,9 +530,9 @@ impl ActionFixtureKey {
             Self::Tools(ToolsFixture::ReadOnlyBuiltin | ToolsFixture::ReadOnlyMcpTool) => {
                 ExpectedReducerOutcome::Disabled
             }
-            Self::Providers(
-                ProvidersFixture::WizardCopilotNoControl | ProvidersFixture::WizardDoneNoControl,
-            ) => ExpectedReducerOutcome::NoPointerControl,
+            Self::Providers(ProvidersFixture::WizardCopilotNoControl) => {
+                ExpectedReducerOutcome::NoPointerControl
+            }
             Self::List(ListFixture::MoveUp | ListFixture::MoveDown) => {
                 ExpectedReducerOutcome::Contextual
             }
@@ -845,6 +845,7 @@ enum WizardControlKind {
     ContinueHeaders,
     CopilotContinue,
     TestSkippedContinue,
+    DoneContinue,
     EditText,
 }
 
@@ -864,6 +865,7 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::ContinueHeaders => WizardControlKind::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardControlKind::CopilotContinue,
         WizardControlId::TestSkippedContinue => WizardControlKind::TestSkippedContinue,
+        WizardControlId::DoneContinue => WizardControlKind::DoneContinue,
         WizardControlId::EditText => WizardControlKind::EditText,
     }
 }
@@ -917,6 +919,9 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardTestSkippedContinue
         }
+        ProviderWizardStep::Done if matches!(control, WizardControlKind::DoneContinue) => {
+            ProvidersFixture::WizardDoneContinue
+        }
         ProviderWizardStep::GrokOAuth => {
             let WizardControlKind::OAuth(option) = control else {
                 unreachable!("wizard control does not belong to Grok OAuth")
@@ -934,10 +939,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         {
             ProvidersFixture::WizardCopilotContinue
         }
-        ProviderWizardStep::Saving
-        | ProviderWizardStep::TestKey
-        | ProviderWizardStep::Fetching
-        | ProviderWizardStep::Done => {
+        ProviderWizardStep::Saving | ProviderWizardStep::TestKey | ProviderWizardStep::Fetching => {
             unreachable!("non-interactive provider wizard step cannot publish a pointer control")
         }
         ProviderWizardStep::Template
@@ -949,6 +951,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         | ProviderWizardStep::EnvVar
         | ProviderWizardStep::CopilotAuth
         | ProviderWizardStep::TestSkipped
+        | ProviderWizardStep::Done
         | ProviderWizardStep::TestKeyChoice => {
             unreachable!("wizard control does not belong to its sealed source step")
         }

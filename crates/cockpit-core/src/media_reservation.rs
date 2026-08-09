@@ -1785,6 +1785,21 @@ mod tests {
             .authorize_publication(&completed.reservation_id)
             .await
             .unwrap();
+        ledger
+            .bind_downstream_ownership(vec![completed.reservation_id.clone()], "invocation-1", 3)
+            .await
+            .unwrap();
+        let ownership = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT invocation_id FROM media_downstream_ownership WHERE reservation_id=?1",
+                    [&completed.reservation_id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ownership, "invocation-1");
         assert!(
             ledger
                 .publication_allowed(&completed.reservation_id)
@@ -1796,7 +1811,7 @@ mod tests {
                 &completed.reservation_id,
                 completed.version,
                 "verified-buffer-drop",
-                3,
+                4,
             )
             .await
             .unwrap();

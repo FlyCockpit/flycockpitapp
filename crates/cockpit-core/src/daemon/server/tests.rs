@@ -11830,6 +11830,40 @@ async fn expired_pending_upload_prune_releases_global_accounting() {
     );
 }
 
+#[tokio::test]
+async fn attachment_ledger_uses_authenticated_attached_project_identity() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let expected_project = state.attached.as_ref().unwrap().handle.project_id();
+    let png = sample_png();
+    let response = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await
+    .unwrap();
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        panic!("wrong response")
+    };
+    let project = ctx
+        .db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT project_id FROM media_reservations WHERE reservation_id=?1",
+                [format!("attachment:{upload_id}")],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(project, expected_project);
+}
+
 async fn recv_body<S>(proto: &mut ProtoStream<S>) -> Body
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,

@@ -15,6 +15,24 @@ fn floor_char_boundary(text: &str, requested: usize) -> usize {
 }
 
 impl App {
+    pub(super) fn expire_pending_paste_probes(&mut self) -> bool {
+        let expired = self
+            .pending_paste_probes
+            .iter()
+            .filter_map(|(id, probe)| {
+                (probe.deadline <= self.event_loop_monotonic_now).then_some((
+                    *id,
+                    probe.request.paste_generation,
+                    probe.source_draft_generation,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (id, generation, draft_generation) in &expired {
+            self.settle_paste_probe(*id, *generation, *draft_generation, 0, None, true);
+        }
+        !expired.is_empty()
+    }
+
     pub(super) fn drain_async_actions(&mut self) -> bool {
         let results = self.async_actions.drain_completed();
         let changed = !results.is_empty();
@@ -930,8 +948,9 @@ impl App {
         }
         let _ = self.paste_correlations.commit(
             request_id,
+            request_generation,
             probe.request.host,
-            self.monotonic_origin.elapsed(),
+            self.event_loop_monotonic_now,
         );
         let Some(fence_id) = probe.owner_fence else {
             if source_draft_generation != self.draft_generation {

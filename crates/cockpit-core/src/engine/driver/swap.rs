@@ -285,6 +285,29 @@ impl Driver {
             .await;
             return false;
         }
+        // Every accepted selection must be followed by a strictly newer
+        // ActiveModelState. Once the wire generation space is exhausted we
+        // cannot preserve that fence, so fail closed before mutating either
+        // the live model or its durable default.
+        if self.active_model_state_generation == u64::MAX {
+            self.emit_model_selection_result(
+                selection_id,
+                &target,
+                DefaultModelUpdateResult::not_requested(None),
+                Some(ModelSelectionRejection::failure(
+                    &target,
+                    "active model state generation space is exhausted",
+                    "model_selection_generation_exhausted",
+                )),
+                ModelSelectionTerminalEmission {
+                    claimed: terminal_claimed,
+                    owned: false,
+                },
+                tx,
+            )
+            .await;
+            return false;
+        }
         let old_session_selection = self.session.active_model_ref();
         let old_session_provider = old_session_selection
             .as_ref()
@@ -757,6 +780,13 @@ impl Driver {
             if transaction.correlation.session_id() != self.session.id {
                 continue;
             }
+            let Some(generation) = self.active_model_state_generation.checked_add(1) else {
+                tracing::error!(
+                    session_id = %self.session.id,
+                    "cannot reconcile a recovered model transaction: active model state generation space is exhausted"
+                );
+                break;
+            };
             // A recovered `Applied` for a *session+default* transaction says
             // the durable authorities hold the target while this driver
             // returned before its root swap, so the live agent is still the
@@ -776,9 +806,7 @@ impl Driver {
                 },
                 _ => Ok(()),
             };
-            self.active_model_state_generation =
-                self.active_model_state_generation.saturating_add(1);
-            let generation = self.active_model_state_generation;
+            self.active_model_state_generation = generation;
             if let Err(error) = swapped {
                 // Never claim a model the running agent is not using.
                 let message = format!(
@@ -1370,7 +1398,9 @@ impl Driver {
                 }
                 Ok(DefaultModelUpdateResult::verified(
                     target.clone(),
-                    self.active_model_state_generation.saturating_add(1).max(1),
+                    self.active_model_state_generation
+                        .checked_add(1)
+                        .expect("model selection rejects an exhausted generation"),
                     "test".to_string(),
                     false,
                 ))
@@ -1460,7 +1490,14 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         default_selection_override: Option<crate::config::providers::ActiveModelRef>,
     ) {
-        self.active_model_state_generation = self.active_model_state_generation.saturating_add(1);
+        let Some(generation) = self.active_model_state_generation.checked_add(1) else {
+            tracing::error!(
+                session_id = %self.session.id,
+                "cannot emit active model state: generation space is exhausted"
+            );
+            return;
+        };
+        self.active_model_state_generation = generation;
         self.emit_active_model_state_for_generation(tx, default_selection_override)
             .await;
     }

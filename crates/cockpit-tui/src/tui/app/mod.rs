@@ -332,6 +332,7 @@ pub(crate) struct PendingPasteProbe {
     pub source_draft_generation: u64,
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,
+    pub deadline: std::time::Duration,
 }
 
 pub(crate) struct DeferredFenceDispatch {
@@ -3630,6 +3631,11 @@ impl App {
                 .filter(|record| !record.probe_exhausted && !record.probe_in_flight)
                 .map(|record| record.next_probe_at.saturating_sub(terminal_input.now()))
                 .min();
+            let paste_probe_wait = self
+                .pending_paste_probes
+                .values()
+                .map(|probe| probe.deadline.saturating_sub(terminal_input.now()))
+                .min();
 
             if self.animation_tick_active() {
                 let animation = tokio::time::sleep(ANIMATION_TICK);
@@ -3662,6 +3668,9 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = wait_optional_duration(delivery_receipt_wait) => {
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(paste_probe_wait) => {
                         needs_redraw = true;
                     }
                     _ = &mut animation => {
@@ -3699,6 +3708,9 @@ impl App {
                     _ = wait_optional_duration(delivery_receipt_wait) => {
                         needs_redraw = true;
                     }
+                    _ = wait_optional_duration(paste_probe_wait) => {
+                        needs_redraw = true;
+                    }
                 }
             }
         }
@@ -3713,6 +3725,7 @@ impl App {
     ) -> Result<bool> {
         let mut changed = false;
         self.event_loop_monotonic_now = terminal_input.now();
+        changed |= self.expire_pending_paste_probes();
         changed |= self.service_delivery_unconfirmed_reconciliation();
         self.ensure_session_for_display();
         changed |= self.sync_repo_status();

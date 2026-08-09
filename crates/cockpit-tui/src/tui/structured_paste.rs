@@ -278,6 +278,7 @@ pub enum DedupResult {
 #[derive(Debug, Clone)]
 struct CorrelationEntry {
     host: HostIdentity,
+    paste_generation: u64,
     expires_at: Option<Duration>,
     committed: bool,
 }
@@ -555,10 +556,16 @@ impl SubmissionOrderCoordinator {
 }
 
 impl PasteCorrelationCache {
-    pub fn claim(&mut self, id: Uuid, host: HostIdentity, now: Duration) -> DedupResult {
+    pub fn claim(
+        &mut self,
+        id: Uuid,
+        paste_generation: u64,
+        host: HostIdentity,
+        now: Duration,
+    ) -> DedupResult {
         self.expire(now);
         if let Some(entry) = self.entries.get(&id) {
-            if entry.host != host {
+            if entry.host != host || entry.paste_generation != paste_generation {
                 return DedupResult::HostMismatch;
             }
             return if entry.committed {
@@ -574,6 +581,7 @@ impl PasteCorrelationCache {
             id,
             CorrelationEntry {
                 host,
+                paste_generation,
                 // Every retry-capable producer stops at the two-second
                 // horizon. Expiring an abandoned claim at that boundary
                 // prevents cancellation paths from consuming capacity for
@@ -587,11 +595,18 @@ impl PasteCorrelationCache {
         DedupResult::Claimed
     }
 
-    pub fn commit(&mut self, id: Uuid, host: HostIdentity, now: Duration) -> DedupResult {
+    pub fn commit(
+        &mut self,
+        id: Uuid,
+        paste_generation: u64,
+        host: HostIdentity,
+        now: Duration,
+    ) -> DedupResult {
+        self.expire(now);
         let Some(entry) = self.entries.get_mut(&id) else {
             return DedupResult::Busy;
         };
-        if entry.host != host {
+        if entry.host != host || entry.paste_generation != paste_generation {
             return DedupResult::HostMismatch;
         }
         entry.committed = true;
@@ -623,9 +638,10 @@ pub fn parse_private_image_path_literal(input: &str) -> Option<PathBuf> {
             || inner.contains('%')
             || inner.contains('!')
             || inner.contains('^')
+            || inner.contains('&')
+            || inner.contains('|')
             || inner.contains('<')
             || inner.contains('>')
-            || inner.contains('$')
         {
             return None;
         }
@@ -633,15 +649,7 @@ pub fn parse_private_image_path_literal(input: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
-    if decoded.is_empty()
-        || decoded.contains("$(")
-        || decoded.contains("${")
-        || decoded.contains('$')
-        || decoded.contains('`')
-        || decoded.contains(';')
-        || decoded.contains('|')
-        || decoded.contains('&')
-    {
+    if decoded.is_empty() {
         return None;
     }
     let path = PathBuf::from(&decoded);
@@ -887,45 +895,52 @@ mod tests {
         };
         let id = Uuid::new_v4();
         let mut cache = PasteCorrelationCache::default();
-        assert_eq!(cache.claim(id, host, Duration::ZERO), DedupResult::Claimed);
-        assert_eq!(cache.claim(id, host, Duration::ZERO), DedupResult::Busy);
         assert_eq!(
-            cache.commit(id, host, Duration::ZERO),
+            cache.claim(id, 1, host, Duration::ZERO),
+            DedupResult::Claimed
+        );
+        assert_eq!(cache.claim(id, 1, host, Duration::ZERO), DedupResult::Busy);
+        assert_eq!(
+            cache.claim(id, 2, host, Duration::ZERO),
+            DedupResult::HostMismatch
+        );
+        assert_eq!(
+            cache.commit(id, 1, host, Duration::ZERO),
             DedupResult::Committed
         );
         assert_eq!(
-            cache.claim(id, host, Duration::from_millis(1_999)),
+            cache.claim(id, 1, host, Duration::from_millis(1_999)),
             DedupResult::Committed
         );
         assert_eq!(
-            cache.claim(id, host, Duration::from_millis(2_000)),
+            cache.claim(id, 1, host, Duration::from_millis(2_000)),
             DedupResult::Claimed
         );
 
         let mut full = PasteCorrelationCache::default();
         for _ in 0..CORRELATION_CAPACITY {
             assert_eq!(
-                full.claim(Uuid::new_v4(), host, Duration::ZERO),
+                full.claim(Uuid::new_v4(), 1, host, Duration::ZERO),
                 DedupResult::Claimed
             );
         }
         assert_eq!(
-            full.claim(Uuid::new_v4(), host, Duration::ZERO),
+            full.claim(Uuid::new_v4(), 1, host, Duration::ZERO),
             DedupResult::Busy
         );
         assert_eq!(
-            full.claim(Uuid::new_v4(), host, Duration::from_millis(1_999)),
+            full.claim(Uuid::new_v4(), 1, host, Duration::from_millis(1_999)),
             DedupResult::Busy
         );
         assert_eq!(
-            full.claim(Uuid::new_v4(), host, Duration::from_millis(2_000)),
+            full.claim(Uuid::new_v4(), 1, host, Duration::from_millis(2_000)),
             DedupResult::Claimed
         );
         let mut changed = host;
         changed.connection_epoch += 1;
         let shared_id = *full.order.front().unwrap();
         assert_eq!(
-            full.claim(shared_id, changed, Duration::ZERO),
+            full.claim(shared_id, 1, changed, Duration::ZERO),
             DedupResult::HostMismatch
         );
     }
@@ -937,14 +952,23 @@ mod tests {
             Some(PathBuf::from("/tmp/a b.png"))
         );
         assert_eq!(
+            parse_private_image_path_literal("'/tmp/a'\\''b & $x;`y`.png'"),
+            Some(PathBuf::from("/tmp/a'b & $x;`y`.png"))
+        );
+        assert_eq!(
+            parse_private_image_path_literal("'C:\\tmp\\a''b & $x.png'"),
+            Some(PathBuf::from("C:\\tmp\\a'b & $x.png"))
+        );
+        assert_eq!(
             parse_private_image_path_literal("\"C:\\tmp\\a b.png\""),
             Some(PathBuf::from("C:\\tmp\\a b.png"))
         );
         for rejected in [
             "/tmp/a.png",
-            "'$HOME/a.png'",
-            "'a;b.png'",
+            "'/tmp/a'''b.png'",
+            "'/tmp/a'broken'b.png'",
             "\"%TEMP%\\a.png\"",
+            "\"C:\\tmp\\a&b.png\"",
             "'a\nb.png'",
         ] {
             assert_eq!(

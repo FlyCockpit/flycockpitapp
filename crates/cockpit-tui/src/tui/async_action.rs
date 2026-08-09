@@ -778,7 +778,7 @@ mod tests {
         for kind in [
             "curator.command",
             "doctor.snapshot",
-            "export.write",
+            "export.transcript",
             "queue.edit",
             "btw.teardown",
             "autocomplete.files",

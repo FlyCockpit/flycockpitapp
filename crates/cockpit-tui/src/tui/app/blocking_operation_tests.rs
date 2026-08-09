@@ -86,7 +86,7 @@ fn doctor_snapshot_is_point_in_time() {
 fn export_writes_off_the_loop_thread() {
     let source = include_str!("export_actions.rs");
     assert!(source.contains("self.async_actions.start("));
-    assert!(source.contains("tokio::fs::write"));
+    assert!(source.contains("write_export_no_clobber"));
 }
 
 #[test]

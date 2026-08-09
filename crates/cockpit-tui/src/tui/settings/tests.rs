@@ -639,6 +639,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     render_all_non_provider_pointer_surface_variants();
     pointer_standalone_root_actions_dispatch_from_fresh_sources();
     pointer_skills_action_family_dispatches_from_fresh_sources();
+    pointer_mcp_action_family_dispatches_from_fresh_sources();
     pointer_tool_credential_family_dispatches_from_fresh_sources();
     pointer_tool_custom_command_family_dispatches_from_fresh_sources();
     pointer_user_tool_action_family_dispatches_from_fresh_sources();
@@ -1340,6 +1341,206 @@ fn pointer_skills_action_family_dispatches_from_fresh_sources() {
             }
             SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(_, _)) => {
                 unreachable!("confirmation controls are only rendered after delete")
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
+    use pointer_actions::{McpAction, SettingsPointerAction};
+
+    const MCP: &str = r#"{
+      "servers": {
+        "docs": {
+          "transport": "streamable",
+          "endpoint": "https://example.test/mcp",
+          "auth": { "kind": "oauth" },
+          "enabled": true
+        }
+      }
+    }"#;
+
+    fn fixture(tmp: &TempDir) -> SettingsDialog {
+        let mut dialog = fresh_dialog(tmp);
+        std::fs::write(tmp.path().join("mcp.json"), MCP).unwrap();
+        enter_root_node(&mut dialog, "MCP");
+        dialog
+    }
+
+    fn config(dialog: &SettingsDialog) -> cockpit_core::mcp::config::McpConfig {
+        dialog.load_mcp()
+    }
+
+    fn rendered_actions(
+        dialog: &SettingsDialog,
+    ) -> std::collections::HashSet<SettingsPointerAction> {
+        let _ = render_settings_rows(dialog, 120, 100);
+        dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(action @ SettingsPointerAction::Mcp(_)),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let source_tmp = TempDir::new().unwrap();
+    let source = fixture(&source_tmp);
+    let list_actions = rendered_actions(&source);
+    assert_eq!(
+        list_actions.len(),
+        6,
+        "populated OAuth row publishes full list controls"
+    );
+
+    for action in list_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let before = config(&dialog);
+        match &action {
+            SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async { click_settings_action(&mut dialog, &action) });
+                assert_eq!(
+                    config(&dialog),
+                    before,
+                    "authentication does not rewrite mcp.json"
+                );
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::List(state)) if state.status.is_some())
+                );
+            }
+            _ => click_settings_action(&mut dialog, &action),
+        }
+        match action {
+            SettingsPointerAction::Mcp(McpAction::Open(_)) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.as_deref() == Some("docs"))
+                );
+                assert_eq!(config(&dialog), before);
+            }
+            SettingsPointerAction::Mcp(McpAction::Add) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.is_none())
+                );
+                assert_eq!(config(&dialog), before);
+            }
+            SettingsPointerAction::Mcp(McpAction::ToggleEnabled(_)) => {
+                assert!(!config(&dialog).servers["docs"].enabled);
+            }
+            SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {}
+            SettingsPointerAction::Mcp(McpAction::Delete(_)) => {
+                assert_eq!(
+                    config(&dialog),
+                    before,
+                    "first delete only arms confirmation"
+                );
+                let confirmations = rendered_actions(&dialog);
+                assert!(confirmations.contains(&SettingsPointerAction::Mcp(McpAction::Cancel)));
+                assert!(confirmations.contains(&action));
+
+                let cancel_tmp = TempDir::new().unwrap();
+                let mut cancel = fixture(&cancel_tmp);
+                click_settings_action(&mut cancel, &action);
+                click_settings_action(&mut cancel, &SettingsPointerAction::Mcp(McpAction::Cancel));
+                assert_eq!(config(&cancel), before);
+
+                click_settings_action(&mut dialog, &action);
+                assert!(config(&dialog).servers.is_empty());
+            }
+            SettingsPointerAction::Mcp(McpAction::Cancel) => unreachable!(),
+            _ => unreachable!(),
+        }
+    }
+
+    let editor_source_tmp = TempDir::new().unwrap();
+    let mut editor_source = fixture(&editor_source_tmp);
+    click_settings_action(
+        &mut editor_source,
+        &SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId("docs".into()))),
+    );
+    let editor_actions = rendered_actions(&editor_source);
+    assert_eq!(
+        editor_actions.len(),
+        19,
+        "editor publishes every typed field and save"
+    );
+
+    for action in editor_actions {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fixture(&tmp);
+        let open = SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId(
+            "docs".into(),
+        )));
+        click_settings_action(&mut dialog, &open);
+        let before = config(&dialog);
+        click_settings_action(&mut dialog, &action);
+        match action {
+            SettingsPointerAction::Mcp(McpAction::ToggleEditorEnabled) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if !state.enabled)
+                );
+                assert_eq!(config(&dialog), before);
+            }
+            SettingsPointerAction::Mcp(McpAction::CycleTransport) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.transport == cockpit_core::mcp::config::Transport::Stdio)
+                );
+                assert_eq!(config(&dialog), before);
+            }
+            SettingsPointerAction::Mcp(McpAction::CycleAuth) => {
+                assert!(
+                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.auth == mcp_page::AuthKind::Header)
+                );
+                assert_eq!(config(&dialog), before);
+            }
+            SettingsPointerAction::Mcp(McpAction::Save) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Mcp(McpPage::List(_))
+                ));
+                assert_eq!(
+                    config(&dialog),
+                    before,
+                    "unchanged editor save persists exactly"
+                );
+            }
+            SettingsPointerAction::Mcp(
+                McpAction::EditName
+                | McpAction::EditEndpoint
+                | McpAction::EditCommand
+                | McpAction::EditArgs
+                | McpAction::EditBaseEnv
+                | McpAction::EditHeaderName
+                | McpAction::EditHeaderValue
+                | McpAction::EditAuthEnv
+                | McpAction::EditOauthAuthorizeUrl
+                | McpAction::EditOauthTokenUrl
+                | McpAction::EditOauthClientId
+                | McpAction::EditOauthScopes
+                | McpAction::EditCacheTtl
+                | McpAction::EditConnectTimeout
+                | McpAction::EditRequestTimeout,
+            ) => {
+                assert!(matches!(
+                    dialog.test_page(),
+                    TestPageRef::Mcp(McpPage::Add(_))
+                ));
+                assert_eq!(
+                    config(&dialog),
+                    before,
+                    "field focus does not persist edits"
+                );
             }
             _ => unreachable!(),
         }

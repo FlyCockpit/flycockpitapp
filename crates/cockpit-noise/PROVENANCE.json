@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "rustMsrv": "1.95.0",
+  "suite": "Noise_NN_25519_ChaChaPoly_SHA256",
+  "dependencies": {
+    "snow": {
+      "version": "0.10.0",
+      "checksum": "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82",
+      "license": "Apache-2.0",
+      "features": [
+        "default-resolver",
+        "std",
+        "use-chacha20poly1305",
+        "use-curve25519",
+        "use-getrandom",
+        "use-sha2"
+      ]
+    },
+    "wasm-bindgen": {
+      "version": "0.2.126",
+      "checksum": "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4",
+      "license": "MIT OR Apache-2.0"
+    },
+    "js-sys": {
+      "version": "0.3.103",
+      "checksum": "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102",
+      "license": "MIT OR Apache-2.0"
+    },
+    "getrandom": {
+      "version": "0.3.4",
+      "checksum": "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd",
+      "license": "MIT OR Apache-2.0",
+      "target": "wasm32",
+      "features": ["wasm_js"]
+    },
+    "uniffi": {
+      "version": "0.29.4",
+      "checksum": "c6d968cb62160c11f2573e6be724ef8b1b18a277aededd17033f8a912d73e2b4",
+      "license": "MPL-2.0"
+    },
+    "uniffi_bindgen": {
+      "version": "0.29.4",
+      "checksum": "f6b39ef1acbe1467d5d210f274fae344cb6f8766339330cb4c9688752899bf6b",
+      "license": "MPL-2.0"
+    },
+    "uniffi_build": {
+      "version": "0.29.4",
+      "checksum": "6683e6b665423cddeacd89a3f97312cf400b2fb245a26f197adaf65c45d505b2",
+      "license": "MPL-2.0"
+    }
+  },
+  "tools": {
+    "wasm-bindgen-cli": "0.2.126",
+    "wasm-pack": "0.13.1",
+    "uniffi-bindgen": "0.29.4"
+  },
+  "vector": {
+    "repository": "https://github.com/rweather/noise-c",
+    "commit": "cfe25410979a87391bb9ac8d4d4bef64e9f268c6",
+    "path": "tests/vector/cacophony.txt",
+    "sha256": "e1b0c4100b6c6e76378705a4954c3293f3752a55b586a3a252cecbfc937538c9",
+    "license": "MIT",
+    "licenseSha256": "f2c0cc36aa63c383fd1669b63eff210ee8cabb304dd818a9f442d93906eff587"
+  },
+  "productionFeatureSets": {
+    "daemon": [],
+    "browser": ["wasm"],
+    "iosAndroid": ["native-bindings"]
+  },
+  "forbiddenProductionFeatures": ["test-entropy"],
+  "commands": {
+    "browser": "wasm-pack build crates/cockpit-noise --target web --out-dir ../../packages/cockpit-noise-wasm/generated --no-default-features --features wasm",
+    "native": "cargo build --locked -p cockpit-noise --release --no-default-features --features native-bindings"
+  },
+  "generatedOutputs": "Populated and hash-compared by crates/cockpit-noise/scripts/verify-provenance.mjs; generated binaries are release artifacts, not source-controlled opaque binaries.",
+  "reproducibility": "CI performs two clean generations and compares SHA-256 manifests. Toolchain and source inputs are pinned; bit-for-bit output is a gate, not an audit claim."
+}

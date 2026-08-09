@@ -1,0 +1,31 @@
+{
+  "name": "@flycockpit/cockpit-noise-native",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": [
+    "src",
+    "generated",
+    "ios",
+    "android"
+  ],
+  "peerDependencies": {
+    "react-native": ">=0.82.0"
+  },
+  "codegenConfig": {
+    "name": "CockpitNoiseSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.flycockpit.noise"
+    },
+    "ios": {
+      "modules": {
+        "CockpitNoise": {
+          "className": "CockpitNoiseModule"
+        }
+      }
+    }
+  }
+}

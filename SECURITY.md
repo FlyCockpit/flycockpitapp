@@ -65,6 +65,29 @@ Defaults in this repository:
   a weak `BETTER_AUTH_SECRET` refuses to start in production.
 - Permission-checked asset URLs (authorize before returning asset URLs).
 
+## Remote Noise binding boundary
+
+`crates/cockpit-noise` is the sole owner of the remote
+`Noise_NN_25519_ChaChaPoly_SHA256` state machine. Browser WASM, iOS/Android
+UniFFI libraries, and the daemon use opaque handles into that crate; TypeScript
+may frame and transport bytes but must not implement DH, Noise, record crypto,
+or rekey. Production builds use fresh Snow/getrandom X25519 ephemeral keys and
+the test-only deterministic-entropy feature is forbidden from release bundles.
+
+Split transport state remains sealed until an injected authorization gate has
+verified both signaling-owned durable-P256 final proofs against the exact
+prologue and handshake transcript. Binding errors are stable categories and do
+not contain key, proof, plaintext, transcript, or peer-controlled bytes. Handles
+are removed on close and panic/poisoning maps to an internal error.
+
+Limitations: Rust zeroizes its temporary plaintext buffers and drops opaque
+state promptly, but copies may exist in Snow internals, browser linear memory,
+FFI marshalling buffers, or managed Swift/Kotlin heaps until those runtimes
+reclaim them. Generated bindings and WASM/native binaries are supply-chain and
+memory-surface risks; their pinned inputs, tools, commands, and reproducibility
+gates are recorded in `crates/cockpit-noise/PROVENANCE.json`. This is a design
+and CI control record, not a claim of formal verification or third-party audit.
+
 See `AGENTS.md` § "Safety" for the full list of guardrails a coding agent
 must respect when working in this repo.
 

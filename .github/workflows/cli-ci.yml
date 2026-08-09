@@ -89,6 +89,9 @@ jobs:
         if: contains(matrix.os, 'windows') == false
         run: cargo build --locked --workspace
 
+      - name: Verify remote Noise dependency and binding policy
+        run: node crates/cockpit-noise/scripts/verify-policy.mjs
+
       - name: Build Windows target
         if: contains(matrix.os, 'windows')
         run: cargo build --locked --workspace --target x86_64-pc-windows-msvc
@@ -107,6 +110,10 @@ jobs:
 
       - name: Test
         run: cargo nextest run --locked --workspace
+
+      - name: Run deterministic Noise-C conformance corpus
+        if: contains(matrix.os, 'ubuntu') && matrix.toolchain == '1.95.0'
+        run: cargo nextest run --locked -p cockpit-noise --features test-entropy
 
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
@@ -132,3 +139,28 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  noise-bindings:
+    name: Remote Noise binding reproducibility
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install pinned Rust and WASM target
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install pinned binding tools
+        run: |
+          cargo install --locked wasm-bindgen-cli --version 0.2.126
+          cargo install --locked wasm-pack --version 0.13.1
+          cargo install --locked uniffi_bindgen --version 0.29.4
+      - name: Verify dependency policy
+        run: node crates/cockpit-noise/scripts/verify-policy.mjs
+      - name: Build browser binding twice
+        run: |
+          wasm-pack build crates/cockpit-noise --target web --out-dir ../../packages/cockpit-noise-wasm/generated-a --no-default-features --features wasm
+          wasm-pack build crates/cockpit-noise --target web --out-dir ../../packages/cockpit-noise-wasm/generated-b --no-default-features --features wasm
+          node crates/cockpit-noise/scripts/compare-generated.mjs packages/cockpit-noise-wasm/generated-a packages/cockpit-noise-wasm/generated-b
+      - name: Check native binding surface
+        run: cargo check --locked -p cockpit-noise --no-default-features --features native-bindings

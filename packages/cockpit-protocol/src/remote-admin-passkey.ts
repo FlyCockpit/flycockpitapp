@@ -118,7 +118,15 @@ const u64 = (value: bigint) => {
   return b;
 };
 function validatedRpOrigin(rpId: string, origin: string): [Uint8Array, Uint8Array] {
-  if (rpId.length < 1 || rpId.length > 253 || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(rpId))
+  const labels = rpId.split(".");
+  if (
+    rpId.length < 1 ||
+    rpId.length > 253 ||
+    labels.some(
+      (label) =>
+        label.length < 1 || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label),
+    )
+  )
     throw new Error("rp_id_invalid");
   let parsed: URL;
   try {
@@ -126,7 +134,16 @@ function validatedRpOrigin(rpId: string, origin: string): [Uint8Array, Uint8Arra
   } catch {
     throw new Error("origin_invalid");
   }
-  if (parsed.protocol !== "https:" || parsed.origin !== origin || parsed.pathname !== "/")
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.origin !== origin ||
+    parsed.pathname !== "/" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.hostname !== rpId && !parsed.hostname.endsWith(`.${rpId}`))
+  )
     throw new Error("origin_invalid");
   const rp = utf8.encode(rpId);
   const originBytes = utf8.encode(origin);
@@ -163,6 +180,8 @@ export function encodeRemoteCredentialRegistryV1(value: RemoteCredentialRegistry
       ![1, 2].includes(entry.state)
     )
       throw new Error("entry_discriminant");
+    if ((entry.state === 1) !== (entry.revokedAt === null))
+      throw new Error("credential_state_timestamp_mismatch");
     return concat(
       entry.principalId,
       u8(entry.role),
@@ -265,6 +284,9 @@ export function decodeRemoteCredentialRegistryV1(
     )
       throw new Error("entry_discriminant");
     if (!validateP256Point(p256X, p256Y)) throw new Error("p256_point_invalid");
+    const revokedAt = present ? r.int64() : null;
+    if ((state === 1) !== (revokedAt === null))
+      throw new Error("credential_state_timestamp_mismatch");
     entries.push({
       principalId: principalId as RemoteProtocolIdBytes<"account">,
       role,
@@ -275,7 +297,7 @@ export function decodeRemoteCredentialRegistryV1(
       declaredCustody: declaredCustody as RemoteAdminCustody,
       state,
       createdAt,
-      revokedAt: present ? r.int64() : null,
+      revokedAt,
     });
   }
   r.done();

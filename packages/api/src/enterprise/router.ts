@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   encodeRemoteAdminApprovalEvidenceV1,
   encodeRemoteCredentialRegistryV1,
@@ -27,6 +27,7 @@ import {
   requireOrgAdmin,
   slugifyOrgName,
 } from "./orgs";
+import { classifyRemotePolicyRevision } from "./remote-admin-policy";
 import { REMOTE_ADMIN_ACTIONS, roleCanStartAction } from "./remote-admin-roles";
 import {
   approvalChallenge,
@@ -40,11 +41,32 @@ const remoteAdminActionSchema = z.enum(REMOTE_ADMIN_ACTIONS);
 const SECURITY_ADMIN_BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
 const APPROVAL_TTL_MS = 15 * 60 * 1000;
 const approvalOperationSchema = z.number().int().min(1).max(9);
+const remotePolicyStrengthSchema = z.object({
+  minimumProtocolVersion: z.number().int().min(1),
+  minimumKeyBits: z.number().int().min(128),
+  sessionTtlSeconds: z.number().int().min(1),
+  attemptGrantTtlSeconds: z.number().int().min(1),
+  requireDeviceTrust: z.boolean(),
+  requireDaemonTrust: z.boolean(),
+});
 const uuidBytes = (uuid: string) => new Uint8Array(Buffer.from(uuid.replaceAll("-", ""), "hex"));
 const u64Bytes = (value: bigint) => {
   const bytes = new Uint8Array(8);
   new DataView(bytes.buffer).setBigUint64(0, value);
   return bytes;
+};
+const signStepUpReference = (id: string) =>
+  `${id}.${createHmac("sha256", env.BETTER_AUTH_SECRET)
+    .update(`flycockpit-remote-admin-step-up-v1\0${id}`)
+    .digest("base64url")}`;
+const parseStepUpReference = (reference: string) => {
+  const [id, signature, extra] = reference.split(".");
+  if (!id || !signature || extra || id.length !== 43 || signature.length !== 43)
+    throw new ORPCError("UNAUTHORIZED", { message: "Step-up reference is invalid." });
+  const expected = signStepUpReference(id).slice(44);
+  if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expected)))
+    throw new ORPCError("UNAUTHORIZED", { message: "Step-up reference is invalid." });
+  return id;
 };
 const base64urlBytes = (value: string, expectedLength?: number) => {
   if (!/^[A-Za-z0-9_-]+$/.test(value))
@@ -56,6 +78,83 @@ const base64urlBytes = (value: string, expectedLength?: number) => {
 };
 
 export const enterpriseRouter = {
+  authorizeRemotePolicyRevision: protectedProcedure
+    .input(
+      z.object({
+        orgId: z.string().min(1),
+        current: remotePolicyStrengthSchema,
+        proposed: remotePolicyStrengthSchema,
+        canonicalRequestDigest: z.string().max(64),
+        operationEpoch: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
+        approvalIds: z.array(z.string().uuid()).min(1).max(2),
+      }),
+    )
+    .handler(async ({ input }) => {
+      const classification = classifyRemotePolicyRevision(input.current, input.proposed);
+      const expectedCount = classification === "weakening" ? 2 : 1;
+      if (input.approvalIds.length !== expectedCount)
+        throw new ORPCError("PRECONDITION_FAILED", {
+          message: "Policy approval cardinality is invalid.",
+        });
+      const now = new Date(),
+        digest = base64urlBytes(input.canonicalRequestDigest, 32);
+      return prisma.$transaction(
+        async (tx) => {
+          const registry = await tx.remoteAdminRegistry.findUnique({
+            where: { orgId: input.orgId },
+          });
+          if (!registry)
+            throw new ORPCError("NOT_FOUND", { message: "Remote policy registry not found." });
+          const approvals = await tx.remoteAdminApproval.findMany({
+            where: {
+              id: { in: input.approvalIds },
+              orgId: input.orgId,
+              operation: 4,
+              operationEpoch: BigInt(input.operationEpoch),
+              canonicalRequestDigest: Buffer.from(digest),
+              registryGeneration: registry.generation,
+              consumedAt: null,
+              expiresAt: { gte: now },
+            },
+          });
+          if (approvals.length !== expectedCount)
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Current policy approval is required.",
+            });
+          if (classification === "weakening") {
+            if (
+              approvals[0]!.principalId === approvals[1]!.principalId ||
+              !approvals.some((approval) => approval.role === "OWNER") ||
+              !approvals.some((approval) => approval.role === "SECURITY_ADMIN")
+            )
+              throw new ORPCError("PRECONDITION_FAILED", {
+                message: "Dual policy approval is invalid.",
+              });
+          } else if (approvals[0]!.role !== "SECURITY_ADMIN") {
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "Security administrator approval is required.",
+            });
+          }
+          if (
+            (
+              await tx.remoteAdminApproval.updateMany({
+                where: { id: { in: input.approvalIds }, consumedAt: null },
+                data: { consumedAt: now },
+              })
+            ).count !== expectedCount
+          )
+            throw new ORPCError("CONFLICT", { message: "Policy approval was already consumed." });
+          return {
+            authorized: true as const,
+            classification,
+            registryGeneration: String(registry.generation),
+            operationEpoch: input.operationEpoch,
+          };
+        },
+        { isolationLevel: "Serializable" },
+      );
+    }),
+
   pendingRemoteAdminRegistration: protectedProcedure.handler(async ({ context }) => {
     const now = new Date();
     const ceremony = await prisma.remoteAdminCeremony.findFirst({
@@ -291,7 +390,7 @@ export const enterpriseRouter = {
     }),
 
   exportRemoteCredentialRegistry: protectedProcedure
-    .input(z.object({ orgId: z.string().min(1), stepUp: z.string().length(43) }))
+    .input(z.object({ orgId: z.string().min(1), stepUp: z.string().length(87) }))
     .handler(async ({ input, context }) => {
       const now = new Date();
       return prisma.$transaction(
@@ -307,7 +406,7 @@ export const enterpriseRouter = {
             (
               await tx.remoteAdminStepUp.updateMany({
                 where: {
-                  id: input.stepUp,
+                  id: parseStepUpReference(input.stepUp),
                   orgId: input.orgId,
                   principalId: context.session.user.id,
                   role: "SECURITY_ADMIN",
@@ -584,7 +683,7 @@ export const enterpriseRouter = {
     }),
 
   reconfirmRemoteAdminRecovery: protectedProcedure
-    .input(z.object({ proposalId: z.string().uuid(), stepUp: z.string().length(43) }))
+    .input(z.object({ proposalId: z.string().uuid(), stepUp: z.string().length(87) }))
     .handler(async ({ input, context }) => {
       const now = new Date();
       return prisma.$transaction(
@@ -610,7 +709,7 @@ export const enterpriseRouter = {
             (
               await tx.remoteAdminStepUp.updateMany({
                 where: {
-                  id: input.stepUp,
+                  id: parseStepUpReference(input.stepUp),
                   orgId: proposal.orgId,
                   principalId: context.session.user.id,
                   role,
@@ -647,7 +746,7 @@ export const enterpriseRouter = {
     }),
 
   cancelRemoteAdminRecovery: protectedProcedure
-    .input(z.object({ proposalId: z.string().uuid(), stepUp: z.string().length(43) }))
+    .input(z.object({ proposalId: z.string().uuid(), stepUp: z.string().length(87) }))
     .handler(async ({ input, context }) => {
       const now = new Date();
       return prisma.$transaction(
@@ -674,7 +773,7 @@ export const enterpriseRouter = {
             (
               await tx.remoteAdminStepUp.updateMany({
                 where: {
-                  id: input.stepUp,
+                  id: parseStepUpReference(input.stepUp),
                   orgId: proposal.orgId,
                   principalId: context.session.user.id,
                   role: "OWNER",
@@ -1009,7 +1108,7 @@ export const enterpriseRouter = {
       z.object({
         orgId: z.string().min(1),
         nomineeId: z.string().min(1),
-        stepUp: z.string().length(43),
+        stepUp: z.string().length(87),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1044,7 +1143,7 @@ export const enterpriseRouter = {
         async (tx) => {
           const consumed = await tx.remoteAdminStepUp.updateMany({
             where: {
-              id: input.stepUp,
+              id: parseStepUpReference(input.stepUp),
               orgId: input.orgId,
               principalId: context.session.user.id,
               role: "OWNER",
@@ -1266,6 +1365,15 @@ export const enterpriseRouter = {
               },
             },
           });
+          await tx.remoteAdminNotificationOutbox.create({
+            data: {
+              orgId: org.id,
+              event: "remote_admin.owner_bootstrap.committed",
+              recipients: [context.session.user.id],
+              payload: { registryGeneration: "1" },
+              RecipientRows: { create: [{ userId: context.session.user.id }] },
+            },
+          });
           await tx.remoteAdminCeremony.update({
             where: { id: ceremony.id },
             data: { committedResult: { orgId: org.id }, committedDigest: submissionDigest },
@@ -1450,6 +1558,26 @@ export const enterpriseRouter = {
               entity: "RemoteAdminRegistry",
               entityId: registry.id,
               metadata: { registryGeneration: String(nextGeneration) },
+            },
+          });
+          const recipients = (
+            await tx.enterpriseOrgMember.findMany({
+              where: { orgId: ceremony.orgId!, role: { in: ["OWNER", "SECURITY_ADMIN"] } },
+              select: { userId: true },
+            })
+          ).map((member) => member.userId);
+          await tx.remoteAdminNotificationOutbox.create({
+            data: {
+              orgId: ceremony.orgId!,
+              event: isClosedBootstrap
+                ? "remote_admin.security_bootstrap.committed"
+                : "remote_admin.security_role.granted",
+              recipients,
+              payload: {
+                principalId: context.session.user.id,
+                registryGeneration: String(nextGeneration),
+              },
+              RecipientRows: { create: recipients.map((userId) => ({ userId })) },
             },
           });
           const committed = {
@@ -1643,7 +1771,7 @@ export const enterpriseRouter = {
         { isolationLevel: "Serializable" },
       );
       return {
-        stepUp: stepUpId,
+        stepUp: signStepUpReference(stepUpId),
         expiresAt: String(now.getTime() + REMOTE_ADMIN_CEREMONY_TTL_MS),
       };
     }),

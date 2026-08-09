@@ -67,9 +67,29 @@ export function normalizeCanonicalLowSDerSignature(der: Uint8Array): Uint8Array 
 
 function strictClientData(bytes: Uint8Array): { type: string; challenge: string; origin: string } {
   const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  // WebAuthn fields are security-sensitive: reject duplicate members anywhere rather than
-  // relying on JSON.parse's last-member-wins behavior.
-  const keys = [...source.matchAll(/(?:^|[{,])\s*"((?:[^"\\]|\\.)*)"\s*:/g)].map((m) => m[1]);
+  // JSON.parse is last-member-wins. Scan top-level keys and decode escapes
+  // before comparison without rejecting names reused inside nested values.
+  const keys: string[] = [];
+  let depth = 0;
+  for (let index = 0; index < source.length; index++) {
+    const character = source[index]!;
+    if (character === '"') {
+      const start = index;
+      for (index += 1; index < source.length; index++) {
+        if (source[index] === "\\") index += 1;
+        else if (source[index] === '"') break;
+      }
+      if (index >= source.length) throw new Error("webauthn_client_data_invalid");
+      if (depth === 1) {
+        let next = index + 1;
+        while (/\s/.test(source[next] ?? "")) next += 1;
+        if (source[next] === ":") keys.push(JSON.parse(source.slice(start, index + 1)));
+      }
+      continue;
+    }
+    if (character === "{") depth += 1;
+    else if (character === "}") depth -= 1;
+  }
   if (new Set(keys).size !== keys.length) throw new Error("webauthn_client_data_duplicate_member");
   const value: unknown = JSON.parse(source);
   if (!value || typeof value !== "object" || Array.isArray(value))

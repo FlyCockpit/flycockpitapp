@@ -1,3 +1,4 @@
+import { tagProtocolIdBytes } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it } from "vitest";
 import { type BootstrapChallenge, commitRemoteAdminBootstrap } from "./remote-admin-bootstrap";
 import { classifyRemotePolicyRevision } from "./remote-admin-policy";
@@ -16,7 +17,10 @@ import {
   recoveryReady,
   validateRecoveryTiming,
 } from "./remote-admin-state";
-import { normalizeCanonicalLowSDerSignature } from "./remote-admin-webauthn";
+import {
+  normalizeCanonicalLowSDerSignature,
+  verifyPortableRemoteAdminApproval,
+} from "./remote-admin-webauthn";
 
 describe("remote_admin_roles_corrected_tests_first", () => {
   it("exhausts the closed role/action matrix", () => {
@@ -197,6 +201,78 @@ describe("remote_admin_webauthn_registration_assertion", () => {
         2n,
       ).next.state,
     ).toBe("suspect");
+  });
+
+  it("independently verifies portable P1363 evidence without a session assertion", async () => {
+    const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+      "sign",
+      "verify",
+    ]);
+    const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+    const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64url"));
+    const challenge = new Uint8Array(32).fill(7);
+    const rpId = "admin.example.com",
+      origin = "https://admin.example.com";
+    const clientDataJson = new TextEncoder().encode(
+      JSON.stringify({
+        type: "webauthn.get",
+        challenge: Buffer.from(challenge).toString("base64url"),
+        origin,
+        crossOrigin: false,
+      }),
+    );
+    const authenticatorData = new Uint8Array(37);
+    authenticatorData.set(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rpId))),
+      0,
+    );
+    authenticatorData[32] = 0x05;
+    const clientHash = new Uint8Array(await crypto.subtle.digest("SHA-256", clientDataJson));
+    const signed = new Uint8Array(authenticatorData.length + clientHash.length);
+    signed.set(authenticatorData);
+    signed.set(clientHash, authenticatorData.length);
+    const signatureP1363 = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keys.privateKey, signed),
+    );
+    const credential = {
+      principalId: tagProtocolIdBytes("account", new Uint8Array(16).fill(1)),
+      role: 1 as const,
+      credentialIdHash: new Uint8Array(32).fill(2),
+      coseAlg: -7 as const,
+      p256X: decode(jwk.x!),
+      p256Y: decode(jwk.y!),
+      declaredCustody: 3 as const,
+      state: 1 as const,
+      createdAt: 1n,
+      revokedAt: null,
+    };
+    await expect(
+      verifyPortableRemoteAdminApproval({
+        credential,
+        policy: { rpId, origin },
+        expectedChallenge: challenge,
+        evidence: {
+          tenantId: tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3)),
+          principalId: credential.principalId,
+          role: 1,
+          registryGeneration: 1n,
+          credentialIdHash: credential.credentialIdHash,
+          operation: 5,
+          canonicalRequestDigest: new Uint8Array(32),
+          operationEpoch: 1n,
+          issuedAt: 1n,
+          expiresAt: 2n,
+          challengeId: new Uint8Array(16),
+          challengeHash: new Uint8Array(await crypto.subtle.digest("SHA-256", challenge)),
+          rpId,
+          origin,
+          authenticatorData,
+          clientDataJson,
+          coseAlg: -7,
+          signatureP1363,
+        },
+      }),
+    ).resolves.toEqual({ signCount: 0n });
   });
 });
 

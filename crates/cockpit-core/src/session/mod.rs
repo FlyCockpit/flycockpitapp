@@ -257,9 +257,6 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
-    /// Host-goal identity installed only while the driver dispatches a
-    /// supervised root turn. Request capture snapshots it at dispatch.
-    goal_inference_provenance: Mutex<Option<(Uuid, i64)>>,
     /// Wall-clock instant of the most recent inference send. Stamped by
     /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
     /// it to decide whether the provider's prompt-cache TTL has elapsed.

@@ -4092,6 +4092,7 @@ pub(crate) async fn run_noninteractive_resumable(
             call_id,
             tandem.as_ref(),
             None,
+            None,
             &child_tx,
             Some(&mut turn_metadata),
         );

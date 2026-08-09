@@ -27,6 +27,7 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) emit_inference_error_ui: bool,
     pub(crate) call_id: Uuid,
     pub(crate) tandem: Option<&'a crate::engine::schedule::TandemSet>,
+    pub(crate) goal_provenance: Option<(Uuid, i64)>,
     pub(crate) turn_id: Option<String>,
     pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
 }
@@ -700,6 +701,7 @@ pub(crate) async fn run_turn(
     let emit_inference_error_ui = ctx.emit_inference_error_ui;
     let call_id = ctx.call_id;
     let tandem = ctx.tandem;
+    let goal_provenance = ctx.goal_provenance;
     let turn_id = ctx.turn_id;
     let tx = ctx.tx;
 
@@ -903,6 +905,7 @@ pub(crate) async fn run_turn(
                 call_id,
                 payload,
                 crate::db::session_log::InferenceRequestStatus::Pending,
+                goal_provenance,
             )
             .await
             .map_err(|e| e.to_string())
@@ -996,6 +999,7 @@ pub(crate) async fn run_turn(
         call_id,
         completed_payload.clone(),
         crate::db::session_log::InferenceRequestStatus::Completed,
+        goal_provenance,
     )
     .await
     {

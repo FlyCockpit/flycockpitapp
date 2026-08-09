@@ -1267,6 +1267,74 @@ mod tests {
         assert_eq!(names, vec!["0001_test.sql", "0002_test.sql"]);
     }
 
+    #[test]
+    fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
+             VALUES ('session-v1', 'project-v1', '/tmp/v1', 10, 20)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_goals
+               (id, session_id, project_id, objective, context, status, token_budget,
+                tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                last_read_at, created_at, updated_at)
+             VALUES ('goal-v1', 'session-v1', 'project-v1', 'preserve me', 'legacy context',
+                     'paused', NULL, 37, 2, NULL, 1, 19, 10, 20)",
+            [],
+        )
+        .unwrap();
+
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        let migrated: (String, String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT objective, context, disposition, token_budget, tokens_used, blocked_attempts
+                   FROM session_goals WHERE id = 'goal-v1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            (
+                "preserve me".into(),
+                "legacy context".into(),
+                "user_paused".into(),
+                200_000,
+                37,
+                2,
+            )
+        );
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            MIGRATIONS.len() as i64
+        );
+        assert_eq!(
+            sqlite_schema_version(&conn).unwrap(),
+            MIGRATIONS.len() as i64
+        );
+        foreign_key_check(&conn).unwrap();
+        // Re-opening against the same immutable ledger validates both stored
+        // checksums instead of silently accepting a rewritten v1 migration.
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        let ledger_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ledger_rows, MIGRATIONS.len() as i64);
+    }
+
     #[tokio::test]
     async fn connection_pragmas_set_busy_timeout_to_five_seconds() {
         let db = Db::open_in_memory().unwrap();

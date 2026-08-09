@@ -515,9 +515,15 @@ async fn record_inference_request_async(
     call_id: Uuid,
     payload: Value,
     status: crate::db::session_log::InferenceRequestStatus,
+    goal_provenance: Option<(Uuid, i64)>,
 ) -> anyhow::Result<()> {
     session
-        .record_inference_request_async(call_id, payload, status)
+        .record_inference_request_async_with_goal_provenance(
+            call_id,
+            payload,
+            status,
+            goal_provenance,
+        )
         .await
 }
 
@@ -584,6 +590,7 @@ pub async fn turn(
     // the main call received. `None` on the backup-model attempt so a fallback
     // retry doesn't double-shadow the same logical call.
     tandem: Option<&crate::engine::schedule::TandemSet>,
+    goal_provenance: Option<(Uuid, i64)>,
     turn_id: Option<String>,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
@@ -609,6 +616,7 @@ pub async fn turn(
         emit_inference_error_ui,
         call_id,
         tandem,
+        goal_provenance,
         turn_id,
         tx,
     };

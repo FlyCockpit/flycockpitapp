@@ -137,6 +137,7 @@ pub async fn turn_with_backup(
     // only (the backup retry passes `None`, so a fallback never double-shadows
     // the same logical call). implementation note.
     tandem: Option<&crate::engine::schedule::TandemSet>,
+    goal_provenance: Option<(Uuid, i64)>,
     turn_id: Option<String>,
     tx: &mpsc::Sender<TurnEvent>,
     mut turn_metadata: Option<&mut BackupTurnMetadata>,
@@ -208,6 +209,7 @@ pub async fn turn_with_backup(
             emit_failure_ui,
             call_id,
             if attempt_index == 0 { tandem } else { None },
+            goal_provenance,
             turn_id.clone(),
             tx,
         )
@@ -928,6 +930,7 @@ mod backup_fallback_tests {
             Uuid::new_v4(),
             None,
             None,
+            None,
             tx,
             None,
         )
@@ -1088,6 +1091,7 @@ mod backup_fallback_tests {
             Uuid::new_v4(),
             None,
             None,
+            None,
             &tx,
             Some(&mut metadata),
         )
@@ -1203,6 +1207,7 @@ mod backup_fallback_tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             crate::engine::deferred::DeferredLog::new(),
             Uuid::new_v4(),
+            None,
             None,
             None,
             &tx,
@@ -1325,6 +1330,7 @@ mod backup_fallback_tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             crate::engine::deferred::DeferredLog::new(),
             Uuid::new_v4(),
+            None,
             None,
             None,
             &tx,
@@ -1806,6 +1812,7 @@ mod backup_fallback_tests {
             crate::engine::tool::ContextUsageSnapshot::unavailable(),
             crate::engine::deferred::DeferredLog::new(),
             Uuid::new_v4(),
+            None,
             None,
             None,
             &tx,

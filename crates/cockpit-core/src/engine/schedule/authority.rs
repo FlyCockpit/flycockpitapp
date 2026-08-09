@@ -258,6 +258,10 @@ pub struct SpawnSpec {
     /// Optional preassigned job id for callers that need to correlate queued
     /// work before a concurrency slot is available.
     pub job_id: Option<String>,
+    /// Immutable host-goal attribution for every inference dispatched by this
+    /// job. Stored on the job spec so concurrent workers cannot overwrite one
+    /// another through session-global state.
+    pub goal_provenance: Option<(uuid::Uuid, i64)>,
     /// Which worker factory to use. Both route through this same authority:
     /// write-capable `bee` for Swarm, `scout` for Multireview. `scout` holds no
     /// Cockpit write tools but can still write via `bash`; see
@@ -1174,6 +1178,7 @@ mod tests {
     fn swarm_spec(depth: u32) -> SpawnSpec {
         SpawnSpec {
             job_id: None,
+            goal_provenance: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "slice".into(),
             write_scope: "/tmp/out".into(),

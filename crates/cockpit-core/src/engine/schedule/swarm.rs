@@ -312,6 +312,7 @@ async fn run_swarm_loop(
             // Swarm subagents are not tandem-shadowed (out of the §26 fan-out
             // scope; the spec shadows primary + builder/explore/docs only).
             None,
+            spec.goal_provenance,
             None,
             turn_tx,
             None,
@@ -427,6 +428,7 @@ async fn route_child_spawn(
     };
     let child = SpawnSpec {
         job_id: None,
+        goal_provenance: spec.goal_provenance,
         worker: spec.worker,
         prompt: prompt.to_string(),
         write_scope: write_scope.to_string(),
@@ -649,6 +651,7 @@ mod tests {
     fn spec(depth: u32, max_depth: u32) -> SpawnSpec {
         SpawnSpec {
             job_id: None,
+            goal_provenance: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "find every firm in this state".into(),
             write_scope: "/tmp/state-ca".into(),

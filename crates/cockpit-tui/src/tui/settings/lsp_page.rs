@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -231,6 +231,47 @@ impl SettingsPage for LspPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_lsp_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        control: shell::SettingsControlId,
+    ) -> Nav {
+        let row_count = LSP_SERVER_ROW_START
+            + cx.project_context()
+                .project_root()
+                .map(|cwd| cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len())
+                .unwrap_or(1);
+        let index = control.0 as usize;
+        if index >= row_count {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: shell::SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == shell::SettingsScrollRegionId("lsp") && self.editing.is_none() {
+            let row_count = LSP_SERVER_ROW_START
+                + cx.project_context()
+                    .project_root()
+                    .map(|cwd| {
+                        cockpit_core::daemon::lsp::builtin_server_views(cwd, &cx.extended).len()
+                    })
+                    .unwrap_or(1);
+            self.reset.disarm();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(row_count.saturating_sub(1));
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -501,8 +542,30 @@ impl SettingsCx {
 
     fn render_lsp_page(&self, frame: &mut Frame, area: Rect, p: &LspPage) {
         let (rows, selected_line) = lsp_rows(self, p);
-        self.scroll_states
-            .render_lines(frame, area, "lsp", rows, Some(selected_line));
+        let row_count = LSP_SERVER_ROW_START
+            + self
+                .project_context()
+                .project_root()
+                .map(|cwd| {
+                    cockpit_core::daemon::lsp::builtin_server_views(cwd, &self.extended).len()
+                })
+                .unwrap_or(1);
+        let bindings = (0..row_count).map(|cursor| {
+            (
+                lsp_selected_line_for_cursor(cursor),
+                shell::SettingsControlId(cursor as u64),
+            )
+        });
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "lsp",
+            rows,
+            Some(selected_line),
+            bindings,
+            &self.pointer_surface,
+            shell::SettingsScrollRegionId("lsp"),
+        );
     }
 }
 

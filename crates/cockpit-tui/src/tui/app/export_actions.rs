@@ -390,7 +390,6 @@ mod tests {
             if app.async_actions.pending_count() == 0 {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("export action did not finish");
     }

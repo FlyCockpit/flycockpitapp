@@ -2381,6 +2381,7 @@ impl SettingsPage for RootPage {
                             grabbed: None,
                             status: None,
                             reset: ResetButton::default(),
+                            pointer_delete_pending: None,
                         }))
                     }
                     "MCP" => Some(mcp_page(mcp_page::McpPage::List(mcp_page::ListState {

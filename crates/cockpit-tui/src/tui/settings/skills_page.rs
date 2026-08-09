@@ -46,6 +46,8 @@ pub(super) struct SkillsPage {
     /// Page-level "reset to defaults" confirm state (the last navigable
     /// row, below the `[+ add directory]` synthetic row).
     pub(super) reset: ResetButton,
+    /// Stable row value awaiting an explicit pointer deletion confirmation.
+    pub(super) pointer_delete_pending: Option<String>,
 }
 
 pub(super) struct GrabState {
@@ -87,10 +89,12 @@ impl SettingsCx {
                 return Nav::Back;
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                p.pointer_delete_pending = None;
                 p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                p.pointer_delete_pending = None;
                 p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
             }
@@ -305,6 +309,17 @@ impl SettingsCx {
                 Span::styled(dir.clone(), style),
             ]));
             controls.push(Some((SettingsControlId(row_cursor as u64), true, None)));
+            if p.pointer_delete_pending.as_deref() == Some(dir.as_str()) {
+                lines.push(Line::from(format!("Delete scan directory {dir}?")));
+                controls.push(None);
+                lines.push(Line::from("[Delete]"));
+                controls.push(Some((SettingsControlId(10_000 + i as u64), true, None)));
+                lines.push(Line::from("[Cancel]"));
+                controls.push(Some((SettingsControlId(20_000 + i as u64), true, None)));
+            } else {
+                lines.push(Line::from("  [Delete]"));
+                controls.push(Some((SettingsControlId(30_000 + i as u64), true, None)));
+            }
         }
 
         // `[+ add directory]` row — hidden while a row is grabbed.
@@ -384,12 +399,42 @@ impl SettingsPage for SkillsPage {
     }
 
     fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        if let Some(index) = control.0.checked_sub(10_000).map(|value| value as usize)
+            && index < cx.extended.skills.scan_dirs.len()
+            && self.pointer_delete_pending.as_deref()
+                == cx.extended.skills.scan_dirs.get(index).map(String::as_str)
+        {
+            cx.extended.skills.scan_dirs.remove(index);
+            self.pointer_delete_pending = None;
+            self.cursor = self
+                .cursor
+                .min(TOGGLE_ROWS + cx.extended.skills.scan_dirs.len());
+            self.status = save_status(cx.save_extended());
+            return Nav::Stay;
+        }
+        if let Some(index) = control.0.checked_sub(20_000).map(|value| value as usize)
+            && self.pointer_delete_pending.as_deref()
+                == cx.extended.skills.scan_dirs.get(index).map(String::as_str)
+        {
+            self.pointer_delete_pending = None;
+            self.status = Some("delete cancelled".into());
+            return Nav::Stay;
+        }
+        if let Some(index) = control.0.checked_sub(30_000).map(|value| value as usize)
+            && let Some(path) = cx.extended.skills.scan_dirs.get(index)
+        {
+            self.cursor = TOGGLE_ROWS + index;
+            self.pointer_delete_pending = Some(path.clone());
+            self.reset.disarm();
+            return Nav::Stay;
+        }
         let nav_len = TOGGLE_ROWS + cx.extended.skills.scan_dirs.len() + 2;
         let index = control.0 as usize;
         if index >= nav_len {
             return Nav::Stay;
         }
         self.cursor = index;
+        self.pointer_delete_pending = None;
         cx.handle_skills_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
     }
 
@@ -462,6 +507,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d
     }
@@ -477,6 +523,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d
     }
@@ -573,6 +620,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d.handle_key(press(KeyCode::Char('d')));
         assert!(d.extended.skills.scan_dirs.is_empty());
@@ -607,6 +655,7 @@ mod tests {
             grabbed: None,
             status: None,
             reset: ResetButton::default(),
+            pointer_delete_pending: None,
         }));
         d.handle_key(press(KeyCode::Enter)); // grab existing
         for ch in "XYZ".chars() {

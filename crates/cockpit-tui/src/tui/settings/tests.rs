@@ -3806,6 +3806,7 @@ fn instructions_enter_grabs_existing_row_then_arrow_swaps() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     // Now grabbed at idx 0. Press ↓ to swap with row 1.
@@ -3831,6 +3832,7 @@ fn instructions_esc_after_swap_restores_original_order() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     d.handle_key(press(KeyCode::Down));
@@ -3853,6 +3855,7 @@ fn instructions_typing_while_grabbed_edits_filename() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     for ch in "Y".chars() {
@@ -4200,6 +4203,7 @@ fn instructions_esc_after_rename_restores_original_name() {
         cursor: 0,
         grabbed: None,
         status: None,
+        delete: RowDeleteConfirm::default(),
     }));
     d.handle_key(press(KeyCode::Enter));
     // Type some junk.

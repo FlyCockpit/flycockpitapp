@@ -168,6 +168,7 @@ pub(crate) struct InstructionsPage {
     pub(super) cursor: usize,
     pub(super) grabbed: Option<GrabState>,
     pub(super) status: Option<String>,
+    pub(super) delete: RowDeleteConfirm,
 }
 
 impl InstructionsPage {
@@ -176,6 +177,7 @@ impl InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
+            delete: RowDeleteConfirm::default(),
         }
     }
 }
@@ -187,6 +189,7 @@ pub(crate) struct RedactPatternsPage {
     pub(super) cursor: usize,
     pub(super) grabbed: Option<GrabState>,
     pub(super) status: Option<String>,
+    pub(super) delete: RowDeleteConfirm,
 }
 
 impl RedactPatternsPage {
@@ -195,6 +198,7 @@ impl RedactPatternsPage {
             cursor: 0,
             grabbed: None,
             status: None,
+            delete: RowDeleteConfirm::default(),
         }
     }
 }
@@ -269,20 +273,30 @@ impl SettingsCx {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
+                p.delete.disarm();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
+                p.delete.disarm();
             }
-            KeyCode::Char('a') => self.start_instructions_grab_on_new(p),
+            KeyCode::Char('a') => {
+                p.delete.disarm();
+                self.start_instructions_grab_on_new(p);
+            }
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.agent_guidance_files.len() =>
             {
-                self.extended.agent_guidance_files.remove(p.cursor);
-                let total = self.extended.agent_guidance_files.len();
-                p.cursor = p.cursor.min(total.saturating_sub(1));
-                p.status = save_status(self.save_extended());
+                if p.delete.arm_or_confirm(p.cursor) {
+                    self.extended.agent_guidance_files.remove(p.cursor);
+                    let total = self.extended.agent_guidance_files.len();
+                    p.cursor = p.cursor.min(total.saturating_sub(1));
+                    p.status = save_status(self.save_extended());
+                } else {
+                    p.status = Some("confirm deletion or cancel".into());
+                }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                p.delete.disarm();
                 if p.cursor < self.extended.agent_guidance_files.len() {
                     let cur = self.extended.agent_guidance_files[p.cursor].clone();
                     p.grabbed = Some(GrabState::existing(cur, p.cursor));
@@ -291,7 +305,9 @@ impl SettingsCx {
                     self.start_instructions_grab_on_new(p);
                 }
             }
-            _ => {}
+            _ => {
+                p.delete.disarm();
+            }
         }
         Nav::Stay
     }
@@ -382,6 +398,7 @@ impl SettingsCx {
             "[+ add filename]",
             "  (type filename)",
             p.status.as_deref(),
+            &p.delete,
         );
     }
 
@@ -428,20 +445,30 @@ impl SettingsCx {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
+                p.delete.disarm();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
+                p.delete.disarm();
             }
-            KeyCode::Char('a') => self.start_redact_pattern_grab_on_new(p),
+            KeyCode::Char('a') => {
+                p.delete.disarm();
+                self.start_redact_pattern_grab_on_new(p);
+            }
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.redact.dotenv_patterns.len() =>
             {
-                self.extended.redact.dotenv_patterns.remove(p.cursor);
-                let total = self.extended.redact.dotenv_patterns.len();
-                p.cursor = p.cursor.min(total.saturating_sub(1));
-                p.status = save_status(self.save_extended());
+                if p.delete.arm_or_confirm(p.cursor) {
+                    self.extended.redact.dotenv_patterns.remove(p.cursor);
+                    let total = self.extended.redact.dotenv_patterns.len();
+                    p.cursor = p.cursor.min(total.saturating_sub(1));
+                    p.status = save_status(self.save_extended());
+                } else {
+                    p.status = Some("confirm deletion or cancel".into());
+                }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                p.delete.disarm();
                 if p.cursor < self.extended.redact.dotenv_patterns.len() {
                     let cur = self.extended.redact.dotenv_patterns[p.cursor].clone();
                     p.grabbed = Some(GrabState::existing(cur, p.cursor));
@@ -450,7 +477,7 @@ impl SettingsCx {
                     self.start_redact_pattern_grab_on_new(p);
                 }
             }
-            _ => {}
+            _ => p.delete.disarm(),
         }
         Nav::Stay
     }
@@ -544,6 +571,7 @@ impl SettingsCx {
             "[+ add pattern]",
             "  (type pattern)",
             p.status.as_deref(),
+            &p.delete,
         );
     }
 
@@ -730,6 +758,7 @@ fn render_grab_list(
     add_label: &str,
     empty_hint: &str,
     status: Option<&str>,
+    delete: &RowDeleteConfirm,
 ) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
@@ -782,6 +811,26 @@ fn render_grab_list(
             true,
             None,
         )));
+        let id = grab_list_row_id(key, i, item);
+        let pending = delete.is_pending_for(i);
+        lines.push(Line::from(if pending {
+            "    [Confirm delete]"
+        } else {
+            "    [Delete]"
+        }));
+        controls.push(Some((
+            SettingsPointerAction::List(ListAction::Delete(id)),
+            true,
+            None,
+        )));
+        if pending {
+            lines.push(Line::from("    [Cancel delete]"));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Cancel),
+                true,
+                None,
+            )));
+        }
     }
 
     if grabbed.is_none() {
@@ -861,8 +910,8 @@ fn render_grab_list(
     );
 }
 
-fn grab_list_row_id(key: &str, _index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{key}:{value}"))
+fn grab_list_row_id(key: &str, index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{key}:{index}:{value}"))
 }
 
 impl SettingsPage for InstructionsPage {
@@ -918,6 +967,29 @@ impl SettingsPage for InstructionsPage {
                 .enumerate()
                 .position(|(index, value)| grab_list_row_id("instructions", index, value) == id)
                 .unwrap_or(usize::MAX),
+            ListAction::Delete(id) => {
+                let Some(index) = cx
+                    .extended
+                    .agent_guidance_files
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| {
+                        grab_list_row_id("instructions", index, value) == id
+                    })
+                else {
+                    return Nav::Stay;
+                };
+                self.cursor = index;
+                return cx.handle_instructions_page_key(
+                    KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                self.delete.disarm();
+                self.status = None;
+                return Nav::Stay;
+            }
             _ => return Nav::Stay,
         };
         if index > cx.extended.agent_guidance_files.len() {
@@ -1025,6 +1097,30 @@ impl SettingsPage for RedactPatternsPage {
                 .enumerate()
                 .position(|(index, value)| grab_list_row_id("redact-patterns", index, value) == id)
                 .unwrap_or(usize::MAX),
+            ListAction::Delete(id) => {
+                let Some(index) = cx
+                    .extended
+                    .redact
+                    .dotenv_patterns
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| {
+                        grab_list_row_id("redact-patterns", index, value) == id
+                    })
+                else {
+                    return Nav::Stay;
+                };
+                self.cursor = index;
+                return cx.handle_redact_patterns_page_key(
+                    KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                    self,
+                );
+            }
+            ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                self.delete.disarm();
+                self.status = None;
+                return Nav::Stay;
+            }
             _ => return Nav::Stay,
         };
         if index > cx.extended.redact.dotenv_patterns.len() {

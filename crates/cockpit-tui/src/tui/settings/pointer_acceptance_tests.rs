@@ -11,259 +11,6 @@ use tempfile::TempDir;
 use super::tests::{fresh_dialog, render_settings_rows, settings_mouse};
 use super::{SettingsPointerOutcome, TestPageRef};
 
-fn fixture_actions() -> Vec<SettingsPointerAction> {
-    let row = || StableRowId("fixture".into());
-    let provider = || ProviderId("provider".into());
-    let agent = || AgentId("agent".into());
-    vec![
-        SettingsPointerAction::Root(RootAction::Open(RootNodeId("interface".into()))),
-        SettingsPointerAction::Category(CategoryAction::DescriptorActivate(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::InlineEditBegin(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::InlineEditCommit(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::InlineEditCancel(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::PathEditBegin(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::PathEditCommit(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::PathEditCancel(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::SuggestionSelect(SettingId(1), row())),
-        SettingsPointerAction::Category(CategoryAction::TextEditorSave(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::TextEditorCancel(SettingId(1))),
-        SettingsPointerAction::Category(CategoryAction::PickerSelect(SettingId(1), row())),
-        SettingsPointerAction::Category(CategoryAction::Confirm(
-            SettingId(1),
-            ConfirmationChoice::Confirm,
-        )),
-        SettingsPointerAction::Category(CategoryAction::Reset),
-        SettingsPointerAction::Category(CategoryAction::ExternalEditBegin(
-            SettingId(1),
-            CategoryExternalSource::Cursor,
-        )),
-        SettingsPointerAction::Category(CategoryAction::ExternalEditResult(
-            SettingId(1),
-            ExternalEditOutcome::Saved,
-        )),
-        SettingsPointerAction::Agents(AgentsAction::Open(agent())),
-        SettingsPointerAction::Agents(AgentsAction::Edit(agent())),
-        SettingsPointerAction::Agents(AgentsAction::Delete(agent())),
-        SettingsPointerAction::Agents(AgentsAction::Reset(agent())),
-        SettingsPointerAction::Agents(AgentsAction::ResetAll),
-        SettingsPointerAction::Agents(AgentsAction::ToggleTool(agent(), row())),
-        SettingsPointerAction::Agents(AgentsAction::CycleTier(agent(), row())),
-        SettingsPointerAction::Agents(AgentsAction::Save(agent())),
-        SettingsPointerAction::Agents(AgentsAction::OpenRawEditor(agent())),
-        SettingsPointerAction::Agents(AgentsAction::EditText(agent())),
-        SettingsPointerAction::Agents(AgentsAction::Cancel(agent())),
-        SettingsPointerAction::Agents(AgentsAction::ExternalEditBegin(agent())),
-        SettingsPointerAction::Agents(AgentsAction::ExternalEditResult(
-            agent(),
-            ExternalEditOutcome::Failed,
-        )),
-        SettingsPointerAction::Tools(ToolsAction::CycleWebProvider),
-        SettingsPointerAction::Tools(ToolsAction::EditFirecrawlBaseUrl),
-        SettingsPointerAction::Tools(ToolsAction::EditCredential(CredentialKind::Firecrawl)),
-        SettingsPointerAction::Tools(ToolsAction::EditCredential(CredentialKind::TinyFish)),
-        SettingsPointerAction::Tools(ToolsAction::EditWebFetchCommand),
-        SettingsPointerAction::Tools(ToolsAction::EditWebSearchCommand),
-        SettingsPointerAction::Tools(ToolsAction::EditUserToolCommand(UserToolId("tool".into()))),
-        SettingsPointerAction::Tools(ToolsAction::AddUserTool),
-        SettingsPointerAction::Tools(ToolsAction::ToggleUserTool(UserToolId("tool".into()))),
-        SettingsPointerAction::Tools(ToolsAction::ResetToolField(ToolFieldId::FirecrawlBaseUrl)),
-        SettingsPointerAction::Tools(ToolsAction::McpJump),
-        SettingsPointerAction::Tools(ToolsAction::Reset),
-        SettingsPointerAction::Tools(ToolsAction::DeleteUserTool(UserToolId("tool".into()))),
-        SettingsPointerAction::Tools(ToolsAction::ReadOnlyBuiltin(BuiltinToolId(
-            "builtin".into(),
-        ))),
-        SettingsPointerAction::Tools(ToolsAction::ReadOnlyMcpTool(
-            McpServerId("server".into()),
-            McpToolId("tool".into()),
-        )),
-        SettingsPointerAction::Harnesses(HarnessesAction::Open(row())),
-        SettingsPointerAction::Harnesses(HarnessesAction::Add),
-        SettingsPointerAction::Harnesses(HarnessesAction::Delete(row())),
-        SettingsPointerAction::Harnesses(HarnessesAction::SeedInstalledPresets),
-        SettingsPointerAction::Harnesses(HarnessesAction::ResetAndSeedPresets),
-        SettingsPointerAction::Harnesses(HarnessesAction::EditField(row())),
-        SettingsPointerAction::Harnesses(HarnessesAction::Save),
-        SettingsPointerAction::Harnesses(HarnessesAction::Cancel),
-        SettingsPointerAction::Skills(SkillsAction::ToggleAutoBangCommands),
-        SettingsPointerAction::Skills(SkillsAction::ToggleAncestorWalk),
-        SettingsPointerAction::Skills(SkillsAction::AddScanDirectory),
-        SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(row())),
-        SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(row())),
-        SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
-            row(),
-            ConfirmationChoice::Confirm,
-        )),
-        SettingsPointerAction::Skills(SkillsAction::Reset),
-        SettingsPointerAction::Mcp(McpAction::Open(McpServerId("server".into()))),
-        SettingsPointerAction::Mcp(McpAction::Add),
-        SettingsPointerAction::Mcp(McpAction::ToggleEnabled(McpServerId("server".into()))),
-        SettingsPointerAction::Mcp(McpAction::Authenticate(McpServerId("server".into()))),
-        SettingsPointerAction::Mcp(McpAction::Delete(McpServerId("server".into()))),
-        SettingsPointerAction::Mcp(McpAction::EditName),
-        SettingsPointerAction::Mcp(McpAction::ToggleEditorEnabled),
-        SettingsPointerAction::Mcp(McpAction::CycleTransport),
-        SettingsPointerAction::Mcp(McpAction::EditEndpoint),
-        SettingsPointerAction::Mcp(McpAction::EditCommand),
-        SettingsPointerAction::Mcp(McpAction::EditArgs),
-        SettingsPointerAction::Mcp(McpAction::EditBaseEnv),
-        SettingsPointerAction::Mcp(McpAction::CycleAuth),
-        SettingsPointerAction::Mcp(McpAction::EditHeaderName),
-        SettingsPointerAction::Mcp(McpAction::EditHeaderValue),
-        SettingsPointerAction::Mcp(McpAction::EditAuthEnv),
-        SettingsPointerAction::Mcp(McpAction::EditOauthAuthorizeUrl),
-        SettingsPointerAction::Mcp(McpAction::EditOauthTokenUrl),
-        SettingsPointerAction::Mcp(McpAction::EditOauthClientId),
-        SettingsPointerAction::Mcp(McpAction::EditOauthScopes),
-        SettingsPointerAction::Mcp(McpAction::EditCacheTtl),
-        SettingsPointerAction::Mcp(McpAction::EditConnectTimeout),
-        SettingsPointerAction::Mcp(McpAction::EditRequestTimeout),
-        SettingsPointerAction::Mcp(McpAction::Save),
-        SettingsPointerAction::Mcp(McpAction::Cancel),
-        SettingsPointerAction::Providers(ProvidersAction::Open(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::Add),
-        SettingsPointerAction::Providers(ProvidersAction::EditField(provider(), row())),
-        SettingsPointerAction::Providers(ProvidersAction::EditHeaders(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::CopilotSetup(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::OAuthSetup(provider(), row())),
-        SettingsPointerAction::Providers(ProvidersAction::ManageModels(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::ProviderSettings(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::Favorite(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::Refetch(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::RefetchAll),
-        SettingsPointerAction::Providers(ProvidersAction::CycleUnlistedPolicy),
-        SettingsPointerAction::Providers(ProvidersAction::DeepFetchConfirm(provider(), row())),
-        SettingsPointerAction::Providers(ProvidersAction::BeginDelete(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider(),
-            ProviderDeleteChoice::RemoveSecrets,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider(),
-            ProviderDeleteChoice::KeepSecrets,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::Delete(
-            provider(),
-            ProviderDeleteChoice::Cancel,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::SaveProvider(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::LocalBack),
-        SettingsPointerAction::Providers(ProvidersAction::AddModel(provider())),
-        SettingsPointerAction::Providers(ProvidersAction::RenameModel(
-            provider(),
-            ModelId("model".into()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::DeleteModel(
-            provider(),
-            ModelId("model".into()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::ModelSettings(
-            provider(),
-            ModelId("model".into()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::FetchAllConfirm(FetchAllChoice::Apply)),
-        SettingsPointerAction::Providers(ProvidersAction::FetchOneConfirm(
-            provider(),
-            FetchOneChoice::Apply,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
-            provider(),
-            FetchFallbackChoice::Retry,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
-            provider(),
-            FetchFallbackChoice::KeepLocal,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
-            provider(),
-            FetchFallbackChoice::UseFallback,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::FetchFallbackConfirm(
-            provider(),
-            FetchFallbackChoice::Cancel,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::DeepFetchChoice(
-            provider(),
-            DeepFetchChoice::Fetch,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-            WizardStepId("step".into()),
-            WizardControlId("control".into()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::HeaderOpen(row()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::HeaderAdd,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::HeaderContinue,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::HeaderSave,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::ModelOpen(ModelId("model".into())),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::ModelAdd,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::ModelSave,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::SettingEdit(row()),
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::RowEditor(
-            ProviderRowEditorAction::SettingSave,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::ModelLifecycle(
-            ModelLifecycleAction::Refresh,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
-            OAuthFlowId(1),
-            OAuthCopyKind::AuthorizationUrl,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::CopyOAuth(
-            OAuthFlowId(1),
-            OAuthCopyKind::DeviceCode,
-        )),
-        SettingsPointerAction::Providers(ProvidersAction::CopilotConfirm(
-            provider(),
-            ConfirmationChoice::Confirm,
-        )),
-        SettingsPointerAction::Lsp(LspAction::ToggleEnabled),
-        SettingsPointerAction::Lsp(LspAction::CycleAutoInstall),
-        SettingsPointerAction::Lsp(LspAction::ToggleDiagnostics),
-        SettingsPointerAction::Lsp(LspAction::Edit(LspEdit::DebounceMs)),
-        SettingsPointerAction::Lsp(LspAction::SaveEdit(LspEdit::DebounceMs)),
-        SettingsPointerAction::Lsp(LspAction::CancelEdit(LspEdit::DebounceMs)),
-        SettingsPointerAction::Lsp(LspAction::Reset),
-        SettingsPointerAction::Lsp(LspAction::Check(LspServerId("rust-analyzer".into()))),
-        SettingsPointerAction::Lsp(LspAction::Install(LspServerId("rust-analyzer".into()))),
-        SettingsPointerAction::Lsp(LspAction::Uninstall(LspServerId("rust-analyzer".into()))),
-        SettingsPointerAction::Lsp(LspAction::Restart(LspServerId("rust-analyzer".into()))),
-        SettingsPointerAction::List(ListAction::Add),
-        SettingsPointerAction::List(ListAction::Edit(row())),
-        SettingsPointerAction::List(ListAction::Delete(row())),
-        SettingsPointerAction::List(ListAction::MoveUp(row())),
-        SettingsPointerAction::List(ListAction::MoveDown(row())),
-        SettingsPointerAction::List(ListAction::Save),
-        SettingsPointerAction::List(ListAction::Cancel),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(UtilityModelId(
-            "p/m".into(),
-        ))),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::Back),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
-        SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
-        SettingsPointerAction::DefaultModel(DefaultModelAction::Choose),
-        SettingsPointerAction::DefaultModel(DefaultModelAction::Clear),
-    ]
-}
-
 fn rendered_surface() -> SettingsPointerSurface {
     let surface = SettingsPointerSurface::default();
     surface.clear_for(Rect::new(10, 5, 30, 10));
@@ -624,34 +371,265 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     super::tests::run_pointer_dialog_regression_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
-    let fixtures = fixture_actions();
-    let surface = SettingsPointerSurface::default();
-    surface.clear_for(Rect::new(0, 0, 80, fixtures.len() as u16));
-    for (row, action) in fixtures.iter().cloned().enumerate() {
-        surface.register(SettingsPointerTarget {
-            rect: Rect::new(0, row as u16, 80, 1),
-            action: RenderAction::Page(action.clone()),
-            enabled: true,
-            disabled_reason: None,
-        });
-        assert_eq!(
-            surface.hit(1, row as u16).map(|target| target.action),
-            Some(RenderAction::Page(action)),
-            "fixture row {row} must round-trip through rendered hit geometry"
-        );
+    // Coverage comes from each page's rendered source state and real reducer
+    // matrix above. Synthetic action registries can report success for
+    // actions no production page ever publishes, so they are intentionally
+    // not part of acceptance.
+}
+
+/// No wildcard: adding a list action forces the rendered reducer fixtures to
+/// classify it before acceptance compiles.
+fn assert_source_list_action_is_covered(action: &ListAction) {
+    match action {
+        ListAction::Add
+        | ListAction::Edit(_)
+        | ListAction::Delete(_)
+        | ListAction::MoveUp(_)
+        | ListAction::MoveDown(_)
+        | ListAction::Save
+        | ListAction::Cancel => {}
     }
-    assert!(fixtures.len() >= 100);
-    for expected in [
-        ProviderRowEditorAction::HeaderAdd,
-        ProviderRowEditorAction::HeaderContinue,
-        ProviderRowEditorAction::HeaderSave,
-        ProviderRowEditorAction::ModelAdd,
-        ProviderRowEditorAction::ModelSave,
-        ProviderRowEditorAction::SettingSave,
+}
+
+#[test]
+fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
+    use super::string_list::{StringListKind, StringListPage};
+
+    for kind in [
+        StringListKind::AgentDirs,
+        StringListKind::ExtraDotenvPaths,
+        StringListKind::RedactDenylist,
+        StringListKind::RedactAllowlist,
+        StringListKind::GitignoreAllow,
     ] {
-        assert!(fixtures.contains(&SettingsPointerAction::Providers(
-            ProvidersAction::RowEditor(expected)
-        )));
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        match kind {
+            StringListKind::AgentDirs => dialog.extended.agent_dirs.push("one".into()),
+            StringListKind::ExtraDotenvPaths => {
+                dialog.extended.redact.extra_dotenv_paths.push("one".into())
+            }
+            StringListKind::RedactDenylist => dialog.extended.redact.denylist.push("one".into()),
+            StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.push("ONE".into()),
+            StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.push("one".into()),
+        }
+        dialog.page = super::string_list_page(match kind {
+            StringListKind::AgentDirs => StringListPage::agent_dirs(),
+            StringListKind::ExtraDotenvPaths => StringListPage::extra_dotenv_paths(),
+            StringListKind::RedactDenylist => StringListPage::redact_denylist(),
+            StringListKind::RedactAllowlist => StringListPage::redact_allowlist(),
+            StringListKind::GitignoreAllow => StringListPage::gitignore_allow(),
+        });
+
+        let _ = render_settings_rows(&dialog, 90, 30);
+        let delete = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    RenderAction::Page(SettingsPointerAction::List(ListAction::Delete(_)))
+                )
+            })
+            .cloned()
+            .expect("visible trailing delete target");
+        if let RenderAction::Page(SettingsPointerAction::List(action)) = &delete.action {
+            assert_source_list_action_is_covered(action);
+        }
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            delete.rect.x,
+            delete.rect.y,
+        ));
+        assert_eq!(list_len(&dialog, kind), 1, "first click only arms {kind:?}");
+
+        let rows = render_settings_rows(&dialog, 90, 30).join("\n");
+        assert!(rows.contains("[Confirm delete]") && rows.contains("[Cancel delete]"));
+        let cancel = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    RenderAction::Page(SettingsPointerAction::List(ListAction::Cancel))
+                )
+            })
+            .cloned()
+            .expect("inline cancel target");
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            cancel.rect.x,
+            cancel.rect.y,
+        ));
+        assert_eq!(list_len(&dialog, kind), 1);
+
+        let _ = render_settings_rows(&dialog, 90, 30);
+        for _ in 0..2 {
+            let target = dialog
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    matches!(
+                        target.action,
+                        RenderAction::Page(SettingsPointerAction::List(ListAction::Delete(_)))
+                    )
+                })
+                .cloned()
+                .expect("delete target remains rendered");
+            dialog.handle_pointer(settings_mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            let _ = render_settings_rows(&dialog, 90, 30);
+        }
+        assert_eq!(
+            list_len(&dialog, kind),
+            0,
+            "confirmed deletion mutates {kind:?}"
+        );
+
+        // The action captured before deletion carries index + value identity
+        // and must be inert once that row no longer exists.
+        dialog.page.handle_pointer_control(
+            &mut dialog.cx,
+            match delete.action {
+                RenderAction::Page(action) => action,
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(list_len(&dialog, kind), 0, "stale identity is rejected");
+    }
+}
+
+fn list_len(dialog: &super::SettingsDialog, kind: super::string_list::StringListKind) -> usize {
+    use super::string_list::StringListKind;
+    match kind {
+        StringListKind::AgentDirs => dialog.extended.agent_dirs.len(),
+        StringListKind::ExtraDotenvPaths => dialog.extended.redact.extra_dotenv_paths.len(),
+        StringListKind::RedactDenylist => dialog.extended.redact.denylist.len(),
+        StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.len(),
+        StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.len(),
+    }
+}
+
+#[test]
+fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
+    for redact in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = fresh_dialog(&tmp);
+        if redact {
+            dialog.extended.redact.dotenv_patterns.push("*.env".into());
+            dialog.page = Box::new(super::ui_page::RedactPatternsPage::new());
+        } else {
+            dialog
+                .extended
+                .agent_guidance_files
+                .push("AGENTS.md".into());
+            dialog.page = Box::new(super::ui_page::InstructionsPage::new());
+        }
+        let len = |dialog: &super::SettingsDialog| {
+            if redact {
+                dialog.extended.redact.dotenv_patterns.len()
+            } else {
+                dialog.extended.agent_guidance_files.len()
+            }
+        };
+
+        let _ = render_settings_rows(&dialog, 90, 30);
+        let delete = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    RenderAction::Page(SettingsPointerAction::List(ListAction::Delete(_)))
+                )
+            })
+            .cloned()
+            .expect("list page publishes trailing Delete");
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            delete.rect.x,
+            delete.rect.y,
+        ));
+        assert_eq!(len(&dialog), 1);
+        let _ = render_settings_rows(&dialog, 90, 30);
+        let cancel = dialog
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.action,
+                    RenderAction::Page(SettingsPointerAction::List(ListAction::Cancel))
+                )
+            })
+            .cloned()
+            .expect("inline cancellation is rendered");
+        dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            cancel.rect.x,
+            cancel.rect.y,
+        ));
+        assert_eq!(len(&dialog), 1);
+
+        let _ = render_settings_rows(&dialog, 90, 30);
+        for expected in [1, 0] {
+            let target = if expected == 1 {
+                dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            target.action,
+                            RenderAction::Page(SettingsPointerAction::List(ListAction::Delete(_)))
+                        )
+                    })
+                    .cloned()
+                    .expect("delete target after cancellation")
+            } else {
+                let _ = render_settings_rows(&dialog, 90, 30);
+                dialog
+                    .pointer_surface
+                    .targets
+                    .borrow()
+                    .iter()
+                    .find(|target| {
+                        matches!(
+                            target.action,
+                            RenderAction::Page(SettingsPointerAction::List(ListAction::Delete(_)))
+                        )
+                    })
+                    .cloned()
+                    .expect("confirmation target")
+            };
+            dialog.handle_pointer(settings_mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ));
+            assert_eq!(len(&dialog), expected);
+        }
+        dialog.page.handle_pointer_control(
+            &mut dialog.cx,
+            match delete.action {
+                RenderAction::Page(action) => action,
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(len(&dialog), 0, "stale delete identity stays inert");
     }
 }
 

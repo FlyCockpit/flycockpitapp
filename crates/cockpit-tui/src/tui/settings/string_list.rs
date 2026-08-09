@@ -496,6 +496,25 @@ impl SettingsCx {
                 true,
                 None,
             )));
+            let pending = p.delete.is_pending_for(i);
+            lines.push(Line::from(if pending {
+                "    [Confirm delete]"
+            } else {
+                "    [Delete]"
+            }));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Delete(string_list_row_id(p.kind, i, val))),
+                true,
+                None,
+            )));
+            if pending {
+                lines.push(Line::from("    [Cancel delete]"));
+                controls.push(Some((
+                    SettingsPointerAction::List(ListAction::Cancel),
+                    true,
+                    None,
+                )));
+            }
         }
 
         if p.grabbed.is_none() {
@@ -628,15 +647,33 @@ impl SettingsPage for StringListPage {
             return cx.handle_string_list_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
         }
         let values = cx.string_list_values(self.kind);
-        let index = match action {
-            ListAction::Add => values.len(),
-            ListAction::Edit(id) => values
-                .iter()
-                .enumerate()
-                .position(|(index, value)| string_list_row_id(self.kind, index, value) == id)
-                .unwrap_or(values.len().saturating_add(1)),
-            _ => return Nav::Stay,
-        };
+        let index =
+            match action {
+                ListAction::Add => values.len(),
+                ListAction::Edit(id) => values
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| string_list_row_id(self.kind, index, value) == id)
+                    .unwrap_or(values.len().saturating_add(1)),
+                ListAction::Delete(id) => {
+                    let Some(index) = values.iter().enumerate().position(|(index, value)| {
+                        string_list_row_id(self.kind, index, value) == id
+                    }) else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    return cx.handle_string_list_page_key(
+                        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                    self.delete.disarm();
+                    self.status = None;
+                    return Nav::Stay;
+                }
+                _ => return Nav::Stay,
+            };
         if index > values.len() {
             return Nav::Stay;
         }
@@ -686,8 +723,8 @@ impl SettingsPage for StringListPage {
     }
 }
 
-fn string_list_row_id(kind: StringListKind, _index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{kind:?}:{value}"))
+fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> StableRowId {
+    StableRowId(format!("{kind:?}:{index}:{value}"))
 }
 
 impl StringListPage {

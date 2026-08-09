@@ -47,7 +47,10 @@ fn blocking_operation_manifest_is_complete() {
         );
         for action in registration.actions {
             assert!(actions.insert(*action), "duplicate action: {action}");
-            assert!(production.contains(action), "undispatched action: {action}");
+            assert!(
+                production.contains(*action),
+                "undispatched action: {action}"
+            );
         }
     }
 }

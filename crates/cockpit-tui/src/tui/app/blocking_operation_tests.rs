@@ -27,7 +27,7 @@ fn activate_composer(app: &mut App) {
 
 #[test]
 fn blocking_operation_manifest_is_complete() {
-    use super::blocking_operations::{ALL_BLOCKING_OPERATION_SITES, BLOCKING_OPERATION_MANIFEST};
+    use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
 
     let app = App::new(None, false);
     for registration in BLOCKING_OPERATION_MANIFEST {
@@ -60,10 +60,6 @@ fn blocking_operation_manifest_is_complete() {
                 .unwrap();
             assert_eq!(registration.kind.action_name_at(index), *action);
         }
-        ALL_BLOCKING_OPERATION_SITES
-            .iter()
-            .find(|authority| authority.site == registration.site)
-            .unwrap_or_else(|| panic!("manifest contains undeclared site {:?}", registration.site));
         let (source, handler) = derive_wrapper_handler(registration.wrapper)
             .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
         validate_handler_source(source, &handler, registration.wrapper)
@@ -71,10 +67,7 @@ fn blocking_operation_manifest_is_complete() {
         validate_site_reachability(registration.site, &handler)
             .unwrap_or_else(|error| panic!("{:?}: {error}", registration.site));
     }
-    let declared = ALL_BLOCKING_OPERATION_SITES
-        .iter()
-        .map(|authority| authority.site)
-        .collect::<std::collections::HashSet<_>>();
+    let declared = derive_production_sites().unwrap();
     assert_eq!(
         sites, declared,
         "manifest must cover every sealed site exactly once"
@@ -148,38 +141,59 @@ fn collect_all_functions<'tree>(
     }
 }
 
-fn validate_site_reachability(
-    site: super::blocking_operations::BlockingOperationSite,
-    handler: &str,
-) -> Result<(), String> {
-    use super::blocking_operations::BlockingOperationSite::*;
+fn validate_site_reachability(site: &str, handler: &str) -> Result<(), String> {
     let slash = include_str!("slash.rs");
     let input = include_str!("input.rs");
     let graph = production_call_graph()?;
     let reachable = match site {
-        SlashCurator => slash_route(slash, "curator", &graph, handler)?,
-        SlashDoctor => slash_route(slash, "doctor", &graph, handler)?,
-        SlashExport => slash_route(slash, "export", &graph, handler)?,
-        SlashBtw => slash_route(slash, "btw", &graph, handler)?,
-        QueueEditKey => {
+        "slash:curator" => slash_route(slash, "curator", &graph, handler)?,
+        "slash:doctor" => slash_route(slash, "doctor", &graph, handler)?,
+        "slash:export" => slash_route(slash, "export", &graph, handler)?,
+        "slash:btw" => slash_route(slash, "btw", &graph, handler)?,
+        "key:up-queue-edit" => {
             match_arm_calls(input, "KeyCode::Up", "self.history_up")?
                 && function_invokes_parameter(input, "history_up_with_queue_edit", "edit_queue")?
                 && graph_reaches(&graph, "history_up", handler)?
         }
-        ComposerSuggestions => {
+        "composer:char-reset-at" => {
             match_arm_calls(input, "KeyCode::Char(ch)", "self.reset_at_window")?
                 && graph_reaches(&graph, "reset_at_window", handler)?
         }
+        _ => false,
     };
     reachable.then_some(()).ok_or_else(|| {
         format!("handler `{handler}` is unreachable from its production registration")
     })
 }
 
+fn derive_production_sites() -> Result<std::collections::HashSet<&'static str>, String> {
+    let slash = include_str!("slash.rs");
+    let mut sites = std::collections::HashSet::new();
+    for (command, site) in [
+        ("curator", "slash:curator"),
+        ("doctor", "slash:doctor"),
+        ("export", "slash:export"),
+        ("btw", "slash:btw"),
+    ] {
+        slash_registry_run(slash, command)?;
+        sites.insert(site);
+    }
+    let input = include_str!("input.rs");
+    if match_arm_calls(input, "KeyCode::Up", "self.history_up")? {
+        sites.insert("key:up-queue-edit");
+    }
+    if match_arm_calls(input, "KeyCode::Char(ch)", "self.reset_at_window")? {
+        sites.insert("composer:char-reset-at");
+    }
+    Ok(sites)
+}
+
 fn production_call_graph()
 -> Result<std::collections::HashMap<String, std::collections::HashSet<String>>, String> {
     let mut graph = std::collections::HashMap::new();
-    for source in PRODUCTION_ROUTING_SOURCES {
+    let mut owners = std::collections::HashMap::<String, usize>::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for (source_id, source) in PRODUCTION_ROUTING_SOURCES.iter().enumerate() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -202,10 +216,19 @@ fn production_call_graph()
                 source.as_bytes(),
                 &mut calls,
             );
-            graph
-                .entry(name.to_string())
-                .or_insert_with(std::collections::HashSet::new)
-                .extend(calls);
+            let name = name.to_string();
+            if owners.get(&name).is_some_and(|owner| *owner != source_id) {
+                ambiguous.insert(name.clone());
+                graph.remove(&name);
+                continue;
+            }
+            owners.insert(name.clone(), source_id);
+            if !ambiguous.contains(&name) {
+                graph
+                    .entry(name)
+                    .or_insert_with(std::collections::HashSet::new)
+                    .extend(calls);
+            }
         }
     }
     Ok(graph)
@@ -598,11 +621,8 @@ fn handler_source_gate_rejects_bypasses() {
 
 #[test]
 fn sealed_site_catalog_detects_a_deleted_manifest_row() {
-    use super::blocking_operations::{ALL_BLOCKING_OPERATION_SITES, BLOCKING_OPERATION_MANIFEST};
-    let declared = ALL_BLOCKING_OPERATION_SITES
-        .iter()
-        .map(|authority| authority.site)
-        .collect::<std::collections::HashSet<_>>();
+    use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
+    let declared = derive_production_sites().unwrap();
     let missing_one = BLOCKING_OPERATION_MANIFEST[1..]
         .iter()
         .map(|registration| registration.site)
@@ -612,8 +632,7 @@ fn sealed_site_catalog_detects_a_deleted_manifest_row() {
 
 #[test]
 fn production_route_gate_rejects_unreachable_and_unclassified_handlers() {
-    use super::blocking_operations::BlockingOperationSite;
-    assert!(validate_site_reachability(BlockingOperationSite::SlashCurator, "bypass").is_err());
+    assert!(validate_site_reachability("slash:curator", "bypass").is_err());
     assert!(derive_wrapper_handler("unclassified_owned_dispatch").is_err());
     assert!(
         slash_registry_run(

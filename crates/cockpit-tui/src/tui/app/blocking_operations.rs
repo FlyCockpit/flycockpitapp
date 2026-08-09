@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockingOperationRegistration {
     #[cfg(test)]
-    pub(super) site: BlockingOperationSite,
+    pub(super) site: &'static str,
     #[cfg(test)]
     pub(super) binding: fn(&App) -> BlockingOperationKind,
     #[cfg(test)]
@@ -12,46 +12,8 @@ pub(super) struct BlockingOperationRegistration {
     pub(super) actions: &'static [&'static str],
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum BlockingOperationSite {
-    SlashCurator,
-    SlashDoctor,
-    SlashExport,
-    QueueEditKey,
-    SlashBtw,
-    ComposerSuggestions,
-}
-
-#[cfg(test)]
-pub(super) struct BlockingOperationSiteAuthority {
-    pub(super) site: BlockingOperationSite,
-}
-
-#[cfg(test)]
-pub(super) const ALL_BLOCKING_OPERATION_SITES: &[BlockingOperationSiteAuthority] = &[
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::SlashCurator,
-    },
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::SlashDoctor,
-    },
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::SlashExport,
-    },
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::QueueEditKey,
-    },
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::SlashBtw,
-    },
-    BlockingOperationSiteAuthority {
-        site: BlockingOperationSite::ComposerSuggestions,
-    },
-];
-
 macro_rules! blocking_operation_manifest {
-    ($( $kind:ident => $site:ident => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
+    ($( $kind:ident => $site:literal => $binding:ident => [$($action_binding:ident => $action:literal),+ $(,)?] ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
@@ -59,7 +21,7 @@ macro_rules! blocking_operation_manifest {
         pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
             $(BlockingOperationRegistration {
                 #[cfg(test)]
-                site: BlockingOperationSite::$site,
+                site: $site,
                 #[cfg(test)]
                 binding: App::$binding,
                 #[cfg(test)]
@@ -80,12 +42,12 @@ macro_rules! blocking_operation_manifest {
 }
 
 blocking_operation_manifest! {
-    CuratorMaintenance => SlashCurator => curator_blocking_operation => [curator_action_name => "curator.command"],
-    DoctorSnapshot => SlashDoctor => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
-    ExportWrite => SlashExport => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
-    QueueMutation => QueueEditKey => queue_blocking_operation => [queue_action_name => "queue.edit"],
-    BtwTeardown => SlashBtw => btw_blocking_operation => [btw_action_name => "btw.teardown"],
-    FileAutocomplete => ComposerSuggestions => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
+    CuratorMaintenance => "slash:curator" => curator_blocking_operation => [curator_action_name => "curator.command"],
+    DoctorSnapshot => "slash:doctor" => doctor_blocking_operation => [doctor_action_name => "doctor.snapshot"],
+    ExportWrite => "slash:export" => export_blocking_operation => [export_transcript_action_name => "export.transcript", export_debug_action_name => "export.debug"],
+    QueueMutation => "key:up-queue-edit" => queue_blocking_operation => [queue_action_name => "queue.edit"],
+    BtwTeardown => "slash:btw" => btw_blocking_operation => [btw_action_name => "btw.teardown"],
+    FileAutocomplete => "composer:char-reset-at" => autocomplete_blocking_operation => [autocomplete_action_name => "autocomplete.files"],
 }
 
 impl BlockingOperationKind {

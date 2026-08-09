@@ -31,6 +31,25 @@ export interface CanonicalSendUserMessageV2 {
   canonical_model_digest: Uint8Array;
   request: SendUserMessageV2;
 }
+export interface MessageIngressEnvelopeV2 {
+  request_id: string;
+  operation_id: string;
+  session_locator: string;
+  request: SendUserMessageV2;
+}
+export type LocalOwnerDirectSendUserMessageV2 = MessageIngressEnvelopeV2;
+export type AuthenticatedRemoteOperationEnvelopeV2 = MessageIngressEnvelopeV2;
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export function validateMessageIngressEnvelopeV2(envelope: MessageIngressEnvelopeV2) {
+  if (!UUID_V7.test(envelope.request_id)) throw new Error("request_id must be UUIDv7");
+  if (!UUID_V7.test(envelope.operation_id)) throw new Error("operation_id must be UUIDv7");
+  if (!envelope.session_locator) throw new Error("empty session locator");
+  uuid(envelope.request.client_submission_id);
+  if (envelope.operation_id === envelope.request.client_submission_id)
+    throw new Error("operation and submission identities must differ");
+  return envelope;
+}
 
 export function validateFcm2Length(length: number) {
   if (!Number.isSafeInteger(length) || length < 0 || length > FCM2_MAX_BYTES)

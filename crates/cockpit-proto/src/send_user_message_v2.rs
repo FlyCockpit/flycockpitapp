@@ -78,6 +78,79 @@ pub struct CanonicalSendUserMessageV2 {
     pub request: SendUserMessageV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalOwnerDirectSendUserMessageV2 {
+    pub request_id: Uuid,
+    pub operation_id: Uuid,
+    pub session_locator: String,
+    pub request: SendUserMessageV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedRemoteOperationEnvelopeV2 {
+    pub request_id: Uuid,
+    pub operation_id: Uuid,
+    pub session_locator: String,
+    pub request: SendUserMessageV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedMessageIngress {
+    pub request_id: Uuid,
+    pub operation_id: Uuid,
+    pub session_locator: String,
+    pub command: SendUserMessageV2,
+}
+
+fn validate_ingress(
+    request_id: Uuid,
+    operation_id: Uuid,
+    session_locator: String,
+    command: SendUserMessageV2,
+) -> Result<ValidatedMessageIngress> {
+    ensure!(
+        request_id.get_version_num() == 7,
+        "request_id must be UUIDv7"
+    );
+    ensure!(
+        operation_id.get_version_num() == 7,
+        "operation_id must be UUIDv7"
+    );
+    ensure!(!session_locator.is_empty(), "empty session locator");
+    ensure!(
+        operation_id != command.client_submission_id,
+        "operation and submission identities must differ"
+    );
+    Ok(ValidatedMessageIngress {
+        request_id,
+        operation_id,
+        session_locator,
+        command,
+    })
+}
+
+impl LocalOwnerDirectSendUserMessageV2 {
+    pub fn into_validated(self) -> Result<ValidatedMessageIngress> {
+        validate_ingress(
+            self.request_id,
+            self.operation_id,
+            self.session_locator,
+            self.request,
+        )
+    }
+}
+
+impl AuthenticatedRemoteOperationEnvelopeV2 {
+    pub fn into_validated(self) -> Result<ValidatedMessageIngress> {
+        validate_ingress(
+            self.request_id,
+            self.operation_id,
+            self.session_locator,
+            self.request,
+        )
+    }
+}
+
 pub fn has_message_text(text: &str) -> bool {
     text.chars().any(|c| {
         !matches!(c,

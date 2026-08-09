@@ -8,6 +8,7 @@ import {
   messageRequestDigest,
   FCM2_MAX_BYTES,
   validateFcm2Length,
+  validateMessageIngressEnvelopeV2,
 } from "./send-user-message-v2";
 
 const fixture = JSON.parse(
@@ -57,6 +58,16 @@ function compactBytes(vector: {
 }
 
 describe("send_user_message_v2_canonical_vectors", () => {
+  it("validates distinct UUIDv7 transport and operation identities", () => {
+    const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
+    const envelope = validateMessageIngressEnvelopeV2({
+      request_id: "018f47a2-7b3c-7def-8123-000000000001",
+      operation_id: "018f47a2-7b3c-7def-8123-000000000002",
+      session_locator: "opaque-session",
+      request,
+    });
+    expect(envelope.operation_id).not.toBe(request.client_submission_id);
+  });
   it("round trips the shared bytes and digests", async () => {
     for (const vector of [...fixture.vectors, ...fixture.compact_positive_vectors]) {
       const bytes = vector.fcm2_hex ? fromHex(vector.fcm2_hex) : compactBytes(vector);

@@ -1,7 +1,7 @@
 use cockpit_proto::send_user_message_v2::{
-    CanonicalSendUserMessageV2, MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
-    MessageAttachmentIdentity, MessageAttachmentKind, MessageTagExpansion, SendUserMessageV2,
-    has_message_text, validate_fcm2_length,
+    CanonicalSendUserMessageV2, LocalOwnerDirectSendUserMessageV2,
+    MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES, MessageAttachmentIdentity, MessageAttachmentKind,
+    MessageTagExpansion, SendUserMessageV2, has_message_text, validate_fcm2_length,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -15,6 +15,35 @@ fn hex(raw: &str) -> Vec<u8> {
                 .expect("valid hex")
         })
         .collect()
+}
+
+#[test]
+fn send_user_message_v2_local_envelope_keeps_three_identities_distinct() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let command = CanonicalSendUserMessageV2::decode(&hex(fixture["vectors"][0]["fcm2_hex"]
+        .as_str()
+        .unwrap()))
+    .unwrap()
+    .request;
+    let request_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000001").unwrap();
+    let operation_id = Uuid::parse_str("018f47a2-7b3c-7def-8123-000000000002").unwrap();
+    let validated = LocalOwnerDirectSendUserMessageV2 {
+        request_id,
+        operation_id,
+        session_locator: "opaque-session".into(),
+        request: command,
+    }
+    .into_validated()
+    .unwrap();
+    assert_eq!(validated.request_id, request_id);
+    assert_eq!(validated.operation_id, operation_id);
+    assert_ne!(
+        validated.operation_id,
+        validated.command.client_submission_id
+    );
 }
 
 fn compact_bytes(vector: &Value) -> Vec<u8> {

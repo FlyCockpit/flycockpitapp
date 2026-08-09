@@ -211,7 +211,6 @@ fixture_enum!(ProvidersFixture {
     WizardCodexAcknowledge,
     WizardCopilotContinue,
     WizardCopilotNoControl,
-    WizardTestKeyNoControl,
     WizardTestSkippedNoControl,
     WizardFetchingNoControl,
     WizardDoneNoControl,
@@ -447,12 +446,13 @@ pub(super) fn all_payload_keys() -> Vec<PayloadFixtureKey> {
 
 /// Wizard lifecycle states that can survive long enough to be rendered by the
 /// settings dialog. `Saving` is submitted through synchronously by
-/// `save_and_fetch_provider`, so it is not a pointer source.
+/// `save_and_fetch_provider`; `TestKey` is likewise acknowledged immediately
+/// after its fetch is spawned. Neither transient is a pointer source.
 pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWizardStep> {
     ProviderWizardStep::ALL
         .into_iter()
         .filter(|step| match step {
-            ProviderWizardStep::Saving => false,
+            ProviderWizardStep::Saving | ProviderWizardStep::TestKey => false,
             ProviderWizardStep::Template
             | ProviderWizardStep::ProviderId
             | ProviderWizardStep::Url
@@ -464,7 +464,6 @@ pub(super) fn wizard_pointer_source_steps() -> impl Iterator<Item = ProviderWiza
             | ProviderWizardStep::GrokOAuth
             | ProviderWizardStep::CodexOAuth
             | ProviderWizardStep::TestKeyChoice
-            | ProviderWizardStep::TestKey
             | ProviderWizardStep::TestSkipped
             | ProviderWizardStep::Fetching
             | ProviderWizardStep::Done => true,
@@ -534,7 +533,6 @@ impl ActionFixtureKey {
             }
             Self::Providers(
                 ProvidersFixture::WizardCopilotNoControl
-                | ProvidersFixture::WizardTestKeyNoControl
                 | ProvidersFixture::WizardTestSkippedNoControl
                 | ProvidersFixture::WizardFetchingNoControl
                 | ProvidersFixture::WizardDoneNoControl,

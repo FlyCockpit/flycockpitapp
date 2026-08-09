@@ -170,6 +170,15 @@ pub struct ReservationReceipt {
     pub deadline_monotonic_ms: u64,
 }
 
+/// The sole provider-call authority for a ledger-managed external operation.
+/// Callers cannot obtain this value until journal preparation, durable
+/// dispatch evidence, and resource handoff have all succeeded.
+#[derive(Debug, Clone)]
+pub struct MediaExternalHandoff {
+    pub reservation: ReservationReceipt,
+    pub dispatch: crate::external_journal::DispatchTicket,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MediaDenial {
     pub code: &'static str,
@@ -435,6 +444,64 @@ impl MediaReservationLedger {
             conn.execute("UPDATE media_reservations SET external_operation_id=?1,state='dispatching_external',version=version+1 WHERE reservation_id=?2 AND version=?3",params![journal,id,sqlite_i64(expected_version)?])?;
             Ok(ReservationReceipt{reservation_id:id,state:ReservationState::DispatchingExternal,version:version+1,queue_sequence:sequence,deadline_monotonic_ms:deadline})
         }).await.map_err(classify_storage_error)
+    }
+
+    pub async fn prepare_external_handoff(
+        &self,
+        journal: &crate::external_journal::ExternalJournal,
+        id: &str,
+        expected_version: u64,
+        owner_session_id: &crate::external_journal::projection::SafeToken,
+        idempotency_key: &crate::external_journal::projection::SafeToken,
+        projection: &crate::external_journal::projection::SanitizedProjection,
+        handoff_plans: Vec<MediaReservationPlan>,
+        wall_ms: u64,
+    ) -> Result<MediaExternalHandoff, LedgerError> {
+        let journal_wall_ms = i64::try_from(wall_ms).map_err(|_| LedgerError::Overflow)?;
+        let record = journal
+            .prepare(
+                owner_session_id,
+                idempotency_key,
+                projection,
+                journal_wall_ms,
+            )
+            .await
+            .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
+        let dispatch = journal
+            .begin_dispatch(record.operation_id, projection, journal_wall_ms)
+            .await
+            .map_err(|error| LedgerError::Storage(anyhow!(error)))?;
+        match self
+            .handoff_external(
+                id,
+                expected_version,
+                &record.operation_id.to_string(),
+                handoff_plans,
+                wall_ms,
+            )
+            .await
+        {
+            Ok(reservation) => Ok(MediaExternalHandoff {
+                reservation,
+                dispatch,
+            }),
+            Err(error) => {
+                // No ticket escapes this method, hence no provider call is
+                // authorized. Persist cancellation of the dispatch evidence;
+                // if that persistence fails, return the integrity failure and
+                // leave the journal's own admission latch responsible for
+                // blocking subsequent external work.
+                journal
+                    .request_cancellation(record.operation_id, journal_wall_ms)
+                    .await
+                    .map_err(|cancel_error| {
+                        LedgerError::Storage(anyhow!(
+                            "media handoff failed ({error}); journal containment failed ({cancel_error})"
+                        ))
+                    })?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn promote(
@@ -1848,6 +1915,63 @@ mod tests {
         assert_eq!(
             ledger.next_fair_candidate().await.unwrap(),
             Some("second".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn external_handoff_ticket_requires_journal_and_ledger_commit() {
+        use crate::external_journal::keys::SpoolKeyRing;
+        use crate::external_journal::projection::{
+            Digest, OperationBody, SafeToken, SanitizedProjection,
+        };
+        use crate::external_journal::spool::{Spool, SpoolAccess};
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(temp.path().join("handoff.db")).unwrap();
+        let journal = crate::external_journal::ExternalJournal::new(
+            db.clone(),
+            Spool::open_at(&temp.path().join("spool"), SpoolAccess::Create).unwrap(),
+            SpoolKeyRing::for_test(&[(1, [0xabu8; crate::secure_key::KEY_BYTE_LEN])], 1).unwrap(),
+        );
+        let ledger = MediaReservationLedger::new(db, Arc::new(Clock(AtomicU64::new(0))));
+        let mut value = request(
+            "handoff",
+            vec![
+                plan(MediaDimension::QueuedOperationsGlobal, 1, None),
+                plan(MediaDimension::QueuedOperationsPerSession, 1, None),
+                plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
+                plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
+                plan(MediaDimension::OperationDeadlineSeconds, 10, None),
+            ],
+        );
+        value.owner.session_id = "session-handoff".into();
+        let receipt = ledger.reserve(value).await.unwrap();
+        let projection = SanitizedProjection::new(OperationBody::Sidecar {
+            sidecar_kind: SafeToken::parse("media-test").unwrap(),
+            request_digest: Digest::of(b"request"),
+        });
+        let handoff = ledger
+            .prepare_external_handoff(
+                &journal,
+                &receipt.reservation_id,
+                receipt.version,
+                &SafeToken::parse("session-handoff").unwrap(),
+                &SafeToken::parse("media-handoff-key").unwrap(),
+                &projection,
+                vec![
+                    plan(MediaDimension::OutboundSubmissionsGlobal, 1, None),
+                    plan(MediaDimension::SidecarInvocationsPerSession, 1, None),
+                ],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            handoff.reservation.state,
+            ReservationState::DispatchingExternal
+        );
+        assert_eq!(
+            handoff.dispatch.state(),
+            cockpit_db::external_journal::ExternalJournalState::Dispatching
         );
     }
 

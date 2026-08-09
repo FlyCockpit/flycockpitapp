@@ -534,13 +534,30 @@ impl CanonicalFcorValueV1 for crate::CuratorAction {
     }
 }
 
-canonical_struct!(crate::AccountInfo, self, out, [user_id, email]);
-canonical_struct!(
-    crate::RelayChoice,
-    self,
-    out,
-    [relay_id, region, ws_url, rtt_ms, chosen_at]
-);
+impl CanonicalFcorValueV1 for crate::AccountInfo {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate()?;
+        let mut nested = CanonicalParamsV1::new();
+        self.user_id.encode_fcor_value_v1(&mut nested)?;
+        self.email.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::RelayChoice {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        self.validate()?;
+        let mut nested = CanonicalParamsV1::new();
+        self.relay_id.encode_fcor_value_v1(&mut nested)?;
+        self.region.encode_fcor_value_v1(&mut nested)?;
+        self.ws_url.encode_fcor_value_v1(&mut nested)?;
+        self.rtt_ms.encode_fcor_value_v1(&mut nested)?;
+        self.chosen_at.encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
 impl CanonicalFcorValueV1 for crate::StoredFlycockpitCredential {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         self.validate()?;

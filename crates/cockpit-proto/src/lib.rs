@@ -429,10 +429,38 @@ pub enum ToolFailKind {
     Execution,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AccountInfo {
     pub user_id: String,
     pub email: String,
+}
+
+impl AccountInfo {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.user_id.is_empty(),
+            "account user id must not be empty"
+        );
+        anyhow::ensure!(!self.email.is_empty(), "account email must not be empty");
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            user_id: String,
+            email: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            user_id: wire.user_id,
+            email: wire.email,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
@@ -521,26 +549,15 @@ impl StoredFlycockpitCredential {
             !self.instance_token.is_empty(),
             "instance token must not be empty"
         );
-        anyhow::ensure!(
-            !self.account.user_id.is_empty(),
-            "account user id must not be empty"
-        );
-        anyhow::ensure!(
-            !self.account.email.is_empty(),
-            "account email must not be empty"
-        );
+        self.account.validate()?;
         if let Some(relay) = &self.relay_choice {
-            anyhow::ensure!(!relay.relay_id.is_empty(), "relay id must not be empty");
-            anyhow::ensure!(
-                !relay.ws_url.is_empty(),
-                "relay websocket URL must not be empty"
-            );
+            relay.validate()?;
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayChoice {
     pub relay_id: String,
@@ -553,9 +570,47 @@ pub struct RelayChoice {
 }
 
 impl RelayChoice {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.relay_id.is_empty(), "relay id must not be empty");
+        anyhow::ensure!(
+            !self.ws_url.is_empty(),
+            "relay websocket URL must not be empty"
+        );
+        if let Some(region) = &self.region {
+            anyhow::ensure!(!region.is_empty(), "relay region must not be empty");
+        }
+        Ok(())
+    }
+
     pub fn is_fresh_at(&self, now_ms: i64) -> bool {
         const TTL_MS: i64 = 30 * 60 * 1000;
         now_ms.saturating_sub(self.chosen_at) < TTL_MS
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            relay_id: String,
+            #[serde(default)]
+            region: Option<String>,
+            ws_url: String,
+            #[serde(default)]
+            rtt_ms: Option<u64>,
+            chosen_at: i64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            relay_id: wire.relay_id,
+            region: wire.region,
+            ws_url: wire.ws_url,
+            rtt_ms: wire.rtt_ms,
+            chosen_at: wire.chosen_at,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 

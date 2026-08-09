@@ -1372,6 +1372,10 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         dialog.load_mcp()
     }
 
+    fn snapshot(config: &cockpit_core::mcp::config::McpConfig) -> serde_json::Value {
+        serde_json::to_value(config).expect("serialize canonical MCP assertion snapshot")
+    }
+
     fn rendered_actions(
         dialog: &SettingsDialog,
     ) -> std::collections::HashSet<SettingsPointerAction> {
@@ -1412,8 +1416,8 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                     .unwrap()
                     .block_on(async { click_settings_action(&mut dialog, &action) });
                 assert_eq!(
-                    config(&dialog),
-                    before,
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
                     "authentication does not rewrite mcp.json"
                 );
                 assert!(
@@ -1427,13 +1431,13 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 assert!(
                     matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.as_deref() == Some("docs"))
                 );
-                assert_eq!(config(&dialog), before);
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::Add) => {
                 assert!(
                     matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.original_name.is_none())
                 );
-                assert_eq!(config(&dialog), before);
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::ToggleEnabled(_)) => {
                 assert!(!config(&dialog).servers["docs"].enabled);
@@ -1441,8 +1445,8 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
             SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {}
             SettingsPointerAction::Mcp(McpAction::Delete(_)) => {
                 assert_eq!(
-                    config(&dialog),
-                    before,
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
                     "first delete only arms confirmation"
                 );
                 let confirmations = rendered_actions(&dialog);
@@ -1453,7 +1457,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 let mut cancel = fixture(&cancel_tmp);
                 click_settings_action(&mut cancel, &action);
                 click_settings_action(&mut cancel, &SettingsPointerAction::Mcp(McpAction::Cancel));
-                assert_eq!(config(&cancel), before);
+                assert_eq!(snapshot(&config(&cancel)), snapshot(&before));
 
                 click_settings_action(&mut dialog, &action);
                 assert!(config(&dialog).servers.is_empty());
@@ -1490,19 +1494,19 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                 assert!(
                     matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if !state.enabled)
                 );
-                assert_eq!(config(&dialog), before);
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::CycleTransport) => {
                 assert!(
                     matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.transport == cockpit_core::mcp::config::Transport::Stdio)
                 );
-                assert_eq!(config(&dialog), before);
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::CycleAuth) => {
                 assert!(
                     matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::Add(state)) if state.auth == mcp_page::AuthKind::Header)
                 );
-                assert_eq!(config(&dialog), before);
+                assert_eq!(snapshot(&config(&dialog)), snapshot(&before));
             }
             SettingsPointerAction::Mcp(McpAction::Save) => {
                 assert!(matches!(
@@ -1510,8 +1514,8 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                     TestPageRef::Mcp(McpPage::List(_))
                 ));
                 assert_eq!(
-                    config(&dialog),
-                    before,
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
                     "unchanged editor save persists exactly"
                 );
             }
@@ -1537,8 +1541,8 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
                     TestPageRef::Mcp(McpPage::Add(_))
                 ));
                 assert_eq!(
-                    config(&dialog),
-                    before,
+                    snapshot(&config(&dialog)),
+                    snapshot(&before),
                     "field focus does not persist edits"
                 );
             }

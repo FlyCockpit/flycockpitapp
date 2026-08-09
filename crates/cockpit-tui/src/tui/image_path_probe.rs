@@ -367,7 +367,18 @@ mod tests {
             let decoded = image::load_from_memory_with_format(&normalized, ImageFormat::Png)
                 .expect("normalized output is a PNG");
             assert_eq!(decoded.color(), image::ColorType::Rgba8);
-            assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [1, 2, 3, 255]);
+            let pixel = decoded.to_rgba8().get_pixel(0, 0).0;
+            assert_eq!(pixel[3], 255, "normalization preserves opaque alpha");
+            if format == ImageFormat::Jpeg {
+                for (actual, expected) in pixel[..3].iter().zip([1_u8, 2, 3]) {
+                    assert!(
+                        actual.abs_diff(expected) <= 2,
+                        "JPEG's lossy RGB remains within the encoder bound"
+                    );
+                }
+            } else {
+                assert_eq!(&pixel[..3], &[1, 2, 3]);
+            }
             for literal in [
                 format!("'{}'", path.display()),
                 format!("\"{}\"", path.display()),

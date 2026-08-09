@@ -229,6 +229,11 @@ pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
         begin.rect.x,
         begin.rect.y,
     ));
+    dialog.handle_pointer(super::super::tests::settings_mouse(
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        begin.rect.x,
+        begin.rect.y,
+    ));
     let _ = render_provider_rows(&dialog, 100, 40);
     let cancel = dialog
         .pointer_surface

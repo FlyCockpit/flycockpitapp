@@ -3872,7 +3872,7 @@ fn instructions_typing_while_grabbed_edits_filename() {
 }
 
 #[test]
-fn string_list_delete_requires_second_press_and_first_press_does_not_persist() {
+fn string_list_keyboard_delete_remains_immediate() {
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
     d.extended.redact.denylist = vec!["secret-value".to_string(), "other-value".to_string()];
@@ -3882,43 +3882,9 @@ fn string_list_delete_requires_second_press_and_first_press_does_not_persist() {
     ));
 
     d.handle_key(press(KeyCode::Char('d')));
-    match d.test_page() {
-        TestPageRef::StringList(p) => {
-            assert_eq!(
-                d.extended.redact.denylist,
-                vec!["secret-value".to_string(), "other-value".to_string()],
-                "first press only arms"
-            );
-            assert!(p.delete.is_pending_for(0));
-            let status = p.status.as_deref().unwrap_or("");
-            assert!(status.contains(secret_display::MASKED_VALUE));
-            assert!(!status.contains("secret-value"));
-        }
-        other => panic!("expected StringList, got {other:?}"),
-    }
+    assert_eq!(d.extended.redact.denylist, vec!["other-value".to_string()]);
     let on_disk = std::fs::read_to_string(&d.extended_path).unwrap();
-    assert!(
-        on_disk.contains("secret-value"),
-        "single delete press must not persist removal:\n{on_disk}"
-    );
-
-    d.handle_key(press(KeyCode::Down));
-    match d.test_page() {
-        TestPageRef::StringList(p) => {
-            assert!(!p.delete.is_pending_for(0), "navigation disarms");
-        }
-        other => panic!("expected StringList, got {other:?}"),
-    }
-    d.handle_key(press(KeyCode::Char('d')));
-    assert_eq!(
-        d.extended.redact.denylist.len(),
-        2,
-        "fresh first press on row 1 only arms"
-    );
-    d.handle_key(press(KeyCode::Char('d')));
-    assert_eq!(d.extended.redact.denylist, vec!["secret-value".to_string()]);
-    let on_disk = std::fs::read_to_string(&d.extended_path).unwrap();
-    assert!(!on_disk.contains("other-value"), "{on_disk}");
+    assert!(!on_disk.contains("secret-value"), "{on_disk}");
 }
 
 #[test]

@@ -11,6 +11,15 @@ use tempfile::TempDir;
 use super::tests::{fresh_dialog, render_settings_rows, settings_mouse};
 use super::{SettingsPointerOutcome, TestPageRef};
 
+fn click_target(dialog: &mut super::SettingsDialog, target: &SettingsPointerTarget) {
+    for kind in [
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+    ] {
+        dialog.handle_pointer(settings_mouse(kind, target.rect.x, target.rect.y));
+    }
+}
+
 fn rendered_surface() -> SettingsPointerSurface {
     let surface = SettingsPointerSurface::default();
     surface.clear_for(Rect::new(10, 5, 30, 10));
@@ -607,11 +616,7 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
         if let RenderAction::Page(SettingsPointerAction::List(action)) = &delete.action {
             assert_source_list_action_is_covered(action);
         }
-        dialog.handle_pointer(settings_mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            delete.rect.x,
-            delete.rect.y,
-        ));
+        click_target(&mut dialog, &delete);
         assert_eq!(list_len(&dialog, kind), 1, "first click only arms {kind:?}");
 
         let rows = render_settings_rows(&dialog, 90, 30).join("\n");
@@ -636,11 +641,7 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
             })
             .cloned()
             .expect("inline cancel target");
-        dialog.handle_pointer(settings_mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            cancel.rect.x,
-            cancel.rect.y,
-        ));
+        click_target(&mut dialog, &cancel);
         assert_eq!(list_len(&dialog, kind), 1);
 
         let _ = render_settings_rows(&dialog, 90, 30);
@@ -658,11 +659,7 @@ fn every_string_list_renders_and_reduces_stable_two_step_delete_targets() {
                 })
                 .cloned()
                 .expect("delete target remains rendered");
-            dialog.handle_pointer(settings_mouse(
-                MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                target.rect.x,
-                target.rect.y,
-            ));
+            click_target(&mut dialog, &target);
             let _ = render_settings_rows(&dialog, 90, 30);
         }
         assert_eq!(
@@ -732,11 +729,7 @@ fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
             })
             .cloned()
             .expect("list page publishes trailing Delete");
-        dialog.handle_pointer(settings_mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            delete.rect.x,
-            delete.rect.y,
-        ));
+        click_target(&mut dialog, &delete);
         assert_eq!(len(&dialog), 1);
         let _ = render_settings_rows(&dialog, 90, 30);
         let cancel = dialog
@@ -752,11 +745,7 @@ fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
             })
             .cloned()
             .expect("inline cancellation is rendered");
-        dialog.handle_pointer(settings_mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            cancel.rect.x,
-            cancel.rect.y,
-        ));
+        click_target(&mut dialog, &cancel);
         assert_eq!(len(&dialog), 1);
 
         let _ = render_settings_rows(&dialog, 90, 30);
@@ -791,11 +780,7 @@ fn instructions_and_redact_patterns_use_inline_confirmed_delete_reducers() {
                     .cloned()
                     .expect("confirmation target")
             };
-            dialog.handle_pointer(settings_mouse(
-                MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                target.rect.x,
-                target.rect.y,
-            ));
+            click_target(&mut dialog, &target);
             assert_eq!(len(&dialog), expected);
         }
         dialog.page.handle_pointer_control(

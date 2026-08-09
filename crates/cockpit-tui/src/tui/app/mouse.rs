@@ -75,6 +75,14 @@ impl App {
             } else {
                 self.link_registry.clear_hover();
             }
+            if self.link_registry.hovered().is_some() {
+                self.dialog.clear_settings_pointer_hover();
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                return;
+            }
             if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
                 self.hovered_suggestion = None;
                 self.hovered_control_chip = None;

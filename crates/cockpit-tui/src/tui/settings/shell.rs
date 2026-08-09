@@ -184,6 +184,7 @@ pub(super) struct SettingsPointerTarget {
 #[derive(Debug, Default)]
 pub(super) struct SettingsPointerSurface {
     pub area: std::cell::Cell<Option<Rect>>,
+    page_token: std::cell::Cell<Option<u64>>,
     pub targets: RefCell<Vec<SettingsPointerTarget>>,
     pub scroll_regions: RefCell<Vec<(Rect, SettingsScrollRegionId)>>,
     pub hover: std::cell::Cell<Option<SettingsControlId>>,
@@ -191,10 +192,19 @@ pub(super) struct SettingsPointerSurface {
 
 impl SettingsPointerSurface {
     pub fn clear_for(&self, area: Rect) {
+        if self.area.get() != Some(area) {
+            self.hover.set(None);
+        }
         self.area.set(Some(area));
         self.targets.borrow_mut().clear();
         self.scroll_regions.borrow_mut().clear();
-        self.hover.set(None);
+    }
+
+    pub fn clear_for_page(&self, area: Rect, page_token: u64) {
+        if self.page_token.replace(Some(page_token)) != Some(page_token) {
+            self.hover.set(None);
+        }
+        self.clear_for(area);
     }
 
     pub fn register(&self, target: SettingsPointerTarget) {
@@ -287,6 +297,14 @@ impl SettingsScrollStates {
                 enabled,
                 disabled_reason,
             });
+            if enabled && surface.hover.get() == Some(id) {
+                let y = area.y.saturating_add(screen_row as u16);
+                for x in area.x..area.right() {
+                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                        cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+                    }
+                }
+            }
         }
     }
 

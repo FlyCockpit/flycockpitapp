@@ -144,6 +144,7 @@ pub enum Dialog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
 pub(crate) enum SettingsPointerOutcome {
     Consumed,
     Close,
@@ -750,6 +751,12 @@ impl Dialog {
             return None;
         };
         Some(settings.handle_pointer(mouse))
+    }
+
+    pub(crate) fn clear_settings_pointer_hover(&self) {
+        if let Dialog::Settings(settings) = self {
+            settings.pointer_surface.hover.set(None);
+        }
     }
     pub fn is_active(&self) -> bool {
         !matches!(self, Dialog::None)
@@ -2135,8 +2142,9 @@ impl SettingsDialog {
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect, links: &mut crate::tui::links::LinkRegistry) {
-        let _surface_kind = self.page.pointer_surface_kind();
-        self.pointer_surface.clear_for(area);
+        let surface_kind = self.page.pointer_surface_kind();
+        self.pointer_surface
+            .clear_for_page(area, surface_kind as u64);
         let title = self.title();
         let block = Block::default()
             .borders(Borders::ALL)

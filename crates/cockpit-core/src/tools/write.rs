@@ -332,7 +332,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let project_id = crate::session::project_id_for(&home.to_path_buf());
+        let project_id = crate::session::project_id_for(home);
         let project_root = home.display().to_string();
         let session_row = db
             .write(move |conn| {

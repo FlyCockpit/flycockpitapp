@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
 python3 -c '
@@ -15,7 +16,7 @@ if bad:
 ' <<<"$metadata"
 
 if rg -n \
-  --glob '!tests/tui_db_boundary.rs' \
+  --glob '!**/tests/tui_db_boundary.rs' \
   -e 'cockpit_db' \
   -e 'cockpit_core::db' \
   -e '(^|[^[:alnum:]_])Db::(open|open_default|open_in_memory)' \
@@ -24,13 +25,33 @@ if rg -n \
   exit 1
 fi
 
-# These are real compiler-negative fixtures, not comments. Each aliases a
-# forbidden path so a text gate that only catches the obvious spelling is not
-# sufficient. Both programs must remain uncompilable.
-fixture_manifest="scripts/fixtures/tui-db-boundary/Cargo.toml"
+# These are real compiler-negative fixtures, not comments. Compile them against
+# the root workspace artifact so the proof uses the repository lockfile rather
+# than a second dependency resolver that can fail before reaching the import.
+cargo check --quiet --locked -p cockpit-core
+dependency_dir="$CARGO_TARGET_DIR/debug/deps"
+core_rmeta="$(find "$dependency_dir" -maxdepth 1 -name 'libcockpit_core-*.rmeta' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [[ -z "$core_rmeta" ]]; then
+  echo "cockpit-core metadata artifact missing" >&2
+  exit 1
+fi
 for fixture in direct_alias core_alias; do
-  if cargo check --quiet --manifest-path "$fixture_manifest" --bin "$fixture"; then
+  rustc_args=(--edition=2024 --crate-name "$fixture" --emit=metadata -L "dependency=$dependency_dir")
+  if [[ "$fixture" == core_alias ]]; then
+    rustc_args+=(--extern "cockpit_core=$core_rmeta")
+  fi
+  if output="$(rustc "${rustc_args[@]}" "scripts/fixtures/tui-db-boundary/${fixture}.rs" 2>&1)"; then
     echo "negative fixture unexpectedly compiled: $fixture" >&2
+    exit 1
+  fi
+  if [[ "$fixture" == direct_alias ]]; then
+    expected_diagnostic="unresolved import"
+  else
+    expected_diagnostic='crate `db` is private'
+  fi
+  if ! grep -q "${fixture}.rs" <<<"$output" || ! grep -q "$expected_diagnostic" <<<"$output"; then
+    echo "negative fixture failed before proving the forbidden import: $fixture" >&2
+    printf '%s\n' "$output" >&2
     exit 1
   fi
 done

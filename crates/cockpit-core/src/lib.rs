@@ -70,4 +70,5 @@ pub mod welcome;
 pub mod wizard;
 pub mod write_scope;
 
+pub(crate) use cockpit_db as db;
 pub use cockpit_proto as proto_crate;

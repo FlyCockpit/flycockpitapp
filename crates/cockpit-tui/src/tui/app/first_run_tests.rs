@@ -37,12 +37,6 @@ fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
     }
 }
 
-fn write_raw_config(cwd: &std::path::Path, json: &str) {
-    let cockpit = cwd.join(".cockpit");
-    std::fs::create_dir_all(&cockpit).unwrap();
-    std::fs::write(cockpit.join("config.json"), json).unwrap();
-}
-
 fn with_trusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T {
     let policy = cockpit_config::trust::WorkspaceTrustPolicy {
         root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),

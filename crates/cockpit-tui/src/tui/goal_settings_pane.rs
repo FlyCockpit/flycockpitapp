@@ -406,8 +406,6 @@ fn agent_edit_path(cwd: &Path, name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::session::Session;
-
     fn focus_field(pane: &mut GoalSettingsPane, field: GoalSettingsField) {
         pane.cursor = FIELDS
             .iter()

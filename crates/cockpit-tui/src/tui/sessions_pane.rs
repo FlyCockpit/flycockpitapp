@@ -45,9 +45,6 @@ use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 use cockpit_core::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
 
-/// Root-session row cap for the daemonless direct-DB list — matches the
-/// daemon `ListSessions` handler's `100` so both modes show the same set.
-const PREVIEW_PAGE_LIMIT: u32 = 50;
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Non-error status shown daemonless when the user tries an action that
@@ -3013,7 +3010,6 @@ mod tests {
             daemon_socket: daemon_connected
                 .then(|| std::path::PathBuf::from("/tmp/cockpit-test.sock")),
             use_emojis: true,
-            db: None,
             last_body_height: 100,
             last_content_rows: 0,
             focus: Focus::List,

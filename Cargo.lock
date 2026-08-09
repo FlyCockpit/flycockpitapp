@@ -1252,7 +1252,6 @@ dependencies = [
  "chrono",
  "cockpit-config",
  "cockpit-core",
- "cockpit-db",
  "cockpit-proto",
  "cockpit-test-support",
  "crossterm",

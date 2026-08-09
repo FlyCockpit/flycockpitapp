@@ -26,7 +26,7 @@ use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_core::daemon::proto::{
-    LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
+    LanguageSection, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
 
 /// Width (in cells) of the language bar gauge. Hand-rolled `█`/`░`

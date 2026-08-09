@@ -21,7 +21,7 @@
 #![allow(deprecated)]
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -791,9 +791,9 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
 
 /// Hash the project root into a 12-char hex id. Stable across symlink
 /// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &PathBuf) -> String {
+pub fn project_id_for(root: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let s = canon.to_string_lossy();
     let mut h = Sha256::new();
     h.update(s.as_bytes());

@@ -121,7 +121,10 @@ impl NotesRpcAction {
         let socket = self.daemon_socket;
         let project_root = self.project_root;
         let response_project_root = project_root.clone();
-        let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
+        let send = |request| {
+            crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)
+                .map_err(anyhow::Error::msg)
+        };
         match self.kind {
             NotesRpcActionKind::Load { keep } => {
                 let notes = match send(Request::ListProjectNotes { project_root })? {

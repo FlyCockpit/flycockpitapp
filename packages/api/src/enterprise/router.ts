@@ -308,6 +308,11 @@ export const enterpriseRouter = {
                 nomineeId: input.nomineeId,
                 governed: true,
                 operationEpoch: input.operationEpoch,
+                ownerPrincipalId: approvals.find((approval) => approval.role === "OWNER")!
+                  .principalId,
+                securityPrincipalId: approvals.find(
+                  (approval) => approval.role === "SECURITY_ADMIN",
+                )!.principalId,
               },
               challengeHash: createHash("sha256").update(challenge).digest(),
               challengeBytes: challenge,
@@ -1016,10 +1021,33 @@ export const enterpriseRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      const submissionDigest = createHash("sha256").update(JSON.stringify(input)).digest();
       const ceremony = await prisma.remoteAdminCeremony.findUnique({
         where: { id: input.challengeId },
         include: { EnterpriseOrg: { include: { RemoteAdminRegistry: true } } },
       });
+      if (ceremony?.consumedAt && ceremony.committedResult) {
+        if (
+          !ceremony.committedDigest ||
+          !submissionDigest.equals(Buffer.from(ceremony.committedDigest))
+        )
+          throw new ORPCError("CONFLICT", { message: "Approval retry changed." });
+        const committed = ceremony.committedResult as {
+          approvalId?: unknown;
+          evidence?: unknown;
+          expiresAt?: unknown;
+        };
+        if (
+          typeof committed.approvalId === "string" &&
+          typeof committed.evidence === "string" &&
+          typeof committed.expiresAt === "string"
+        )
+          return {
+            approvalId: committed.approvalId,
+            evidence: committed.evidence,
+            expiresAt: committed.expiresAt,
+          };
+      }
       const registry = ceremony?.EnterpriseOrg?.RemoteAdminRegistry;
       if (
         !ceremony ||
@@ -1133,7 +1161,8 @@ export const enterpriseRouter = {
       });
       const now = new Date(),
         approvalId = randomUUID();
-      await prisma.$transaction(
+      const evidenceText = Buffer.from(evidenceBytes).toString("base64url");
+      const accepted = await prisma.$transaction(
         async (tx) => {
           if (
             (
@@ -1172,8 +1201,7 @@ export const enterpriseRouter = {
           });
           if (counterUpdate.count !== 1)
             throw new ORPCError("CONFLICT", { message: "Credential counter raced." });
-          if (!accepted)
-            throw new ORPCError("UNAUTHORIZED", { message: "Credential counter replay detected." });
+          if (!accepted) return false;
           await tx.remoteAdminApproval.create({
             data: {
               id: approvalId,
@@ -1192,12 +1220,26 @@ export const enterpriseRouter = {
               expiresAt: ceremony.expiresAt,
             },
           });
+          await tx.remoteAdminCeremony.update({
+            where: { id: ceremony.id },
+            data: {
+              committedDigest: submissionDigest,
+              committedResult: {
+                approvalId,
+                evidence: evidenceText,
+                expiresAt: String(ceremony.expiresAt.getTime()),
+              },
+            },
+          });
+          return true;
         },
         { isolationLevel: "Serializable" },
       );
+      if (!accepted)
+        throw new ORPCError("UNAUTHORIZED", { message: "Credential counter replay detected." });
       return {
         approvalId,
-        evidence: Buffer.from(evidenceBytes).toString("base64url"),
+        evidence: evidenceText,
         expiresAt: String(ceremony.expiresAt.getTime()),
       };
     }),
@@ -1647,6 +1689,39 @@ export const enterpriseRouter = {
               nominator.userId === context.session.user.id)
           )
             throw new ORPCError("CONFLICT", { message: "Nominating owner is no longer eligible." });
+          if (!isClosedBootstrap) {
+            const payload = ceremony.requestPayload as {
+              governed?: unknown;
+              ownerPrincipalId?: unknown;
+              securityPrincipalId?: unknown;
+            } | null;
+            if (
+              payload?.governed !== true ||
+              typeof payload.ownerPrincipalId !== "string" ||
+              typeof payload.securityPrincipalId !== "string" ||
+              payload.ownerPrincipalId === payload.securityPrincipalId
+            )
+              throw new ORPCError("CONFLICT", { message: "Governed registration scope changed." });
+            const authorizers = await tx.enterpriseOrgMember.findMany({
+              where: {
+                orgId: ceremony.orgId!,
+                userId: { in: [payload.ownerPrincipalId, payload.securityPrincipalId] },
+              },
+              select: { userId: true, role: true },
+            });
+            if (
+              !authorizers.some(
+                (member) => member.userId === payload.ownerPrincipalId && member.role === "OWNER",
+              ) ||
+              !authorizers.some(
+                (member) =>
+                  member.userId === payload.securityPrincipalId && member.role === "SECURITY_ADMIN",
+              )
+            )
+              throw new ORPCError("CONFLICT", {
+                message: "Governed registration authorizers are no longer eligible.",
+              });
+          }
           if (
             (
               await tx.remoteAdminCeremony.updateMany({

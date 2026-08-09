@@ -790,12 +790,20 @@ mod tests {
                     Some(6),
                     (0..8)
                         .map(|row| {
+                            let ids = [
+                                super::super::pointer_actions::RootNodeId::DefaultModel,
+                                super::super::pointer_actions::RootNodeId::Providers,
+                                super::super::pointer_actions::RootNodeId::Agents,
+                                super::super::pointer_actions::RootNodeId::Interface,
+                                super::super::pointer_actions::RootNodeId::Behavior,
+                                super::super::pointer_actions::RootNodeId::Privacy,
+                                super::super::pointer_actions::RootNodeId::Translation,
+                                super::super::pointer_actions::RootNodeId::Tools,
+                            ];
                             Some((
                                 super::super::pointer_actions::SettingsPointerAction::Root(
                                     super::super::pointer_actions::RootAction::Open(
-                                        super::super::pointer_actions::RootNodeId(format!(
-                                            "row-{row}"
-                                        )),
+                                        ids[row].clone(),
                                     ),
                                 ),
                                 true,
@@ -831,7 +839,7 @@ mod tests {
         surface.clear_for_page(area, 10);
         let action = super::super::pointer_actions::SettingsPointerAction::Root(
             super::super::pointer_actions::RootAction::Open(
-                super::super::pointer_actions::RootNodeId("fixture".into()),
+                super::super::pointer_actions::RootNodeId::Interface,
             ),
         );
         *surface.hover.borrow_mut() = Some(action.clone());

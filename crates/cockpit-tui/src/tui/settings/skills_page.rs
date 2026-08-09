@@ -25,7 +25,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
 use super::pointer_actions::{
-    ConfirmationChoice, SettingsPointerAction, SkillsAction, StableRowId,
+    ConfirmationChoice, ScanDirectoryId, SettingsPointerAction, SkillsAction,
 };
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker};
@@ -301,9 +301,9 @@ impl SettingsCx {
                     "  (type directory)",
                 )));
                 controls.push(Some((
-                    SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(StableRowId(
-                        dir.clone(),
-                    ))),
+                    SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                    )),
                     true,
                     None,
                 )));
@@ -324,7 +324,7 @@ impl SettingsCx {
                 Span::styled(dir.clone(), style),
             ]));
             controls.push(Some((
-                SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(StableRowId(
+                SettingsPointerAction::Skills(SkillsAction::EditScanDirectory(ScanDirectoryId(
                     dir.clone(),
                 ))),
                 true,
@@ -336,7 +336,7 @@ impl SettingsCx {
                 lines.push(Line::from("[Delete]"));
                 controls.push(Some((
                     SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
-                        StableRowId(dir.clone()),
+                        ScanDirectoryId(dir.clone()),
                         ConfirmationChoice::Confirm,
                     )),
                     true,
@@ -345,7 +345,7 @@ impl SettingsCx {
                 lines.push(Line::from("[Cancel]"));
                 controls.push(Some((
                     SettingsPointerAction::Skills(SkillsAction::ConfirmDeleteScanDirectory(
-                        StableRowId(dir.clone()),
+                        ScanDirectoryId(dir.clone()),
                         ConfirmationChoice::Cancel,
                     )),
                     true,
@@ -354,9 +354,9 @@ impl SettingsCx {
             } else {
                 lines.push(Line::from("  [Delete]"));
                 controls.push(Some((
-                    SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(StableRowId(
-                        dir.clone(),
-                    ))),
+                    SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(
+                        ScanDirectoryId(dir.clone()),
+                    )),
                     true,
                     None,
                 )));
@@ -464,7 +464,7 @@ impl SettingsPage for SkillsPage {
             return Nav::Stay;
         };
         if let SkillsAction::ConfirmDeleteScanDirectory(
-            StableRowId(path),
+            ScanDirectoryId(path),
             ConfirmationChoice::Confirm,
         ) = &action
             && self.pointer_delete_pending.as_ref() == Some(path)
@@ -484,7 +484,7 @@ impl SettingsPage for SkillsPage {
             return Nav::Stay;
         }
         if let SkillsAction::ConfirmDeleteScanDirectory(
-            StableRowId(path),
+            ScanDirectoryId(path),
             ConfirmationChoice::Cancel,
         ) = &action
             && self.pointer_delete_pending.as_ref() == Some(path)
@@ -493,7 +493,7 @@ impl SettingsPage for SkillsPage {
             self.status = Some("delete cancelled".into());
             return Nav::Stay;
         }
-        if let SkillsAction::DeleteScanDirectory(StableRowId(path)) = &action
+        if let SkillsAction::DeleteScanDirectory(ScanDirectoryId(path)) = &action
             && let Some(index) = cx
                 .extended
                 .skills
@@ -509,7 +509,7 @@ impl SettingsPage for SkillsPage {
         let index = match action {
             SkillsAction::ToggleAutoBangCommands => 0,
             SkillsAction::ToggleAncestorWalk => 1,
-            SkillsAction::EditScanDirectory(StableRowId(path)) => {
+            SkillsAction::EditScanDirectory(ScanDirectoryId(path)) => {
                 let Some(index) = cx
                     .extended
                     .skills

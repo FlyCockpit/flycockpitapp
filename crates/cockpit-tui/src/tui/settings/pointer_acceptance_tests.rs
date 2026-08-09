@@ -14,44 +14,40 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 thread_local! {
-    static ACTION_COVERAGE: RefCell<(HashSet<String>, HashSet<String>, HashSet<u64>)> = RefCell::default();
+    static ACTION_COVERAGE: RefCell<(
+        HashSet<SettingsPointerAction>,
+        HashSet<SettingsPointerAction>,
+        HashSet<SettingsPointerAction>,
+        HashSet<SettingsPointerSurfaceKind>,
+    )> = RefCell::default();
 }
 
-pub(super) fn record_rendered_surface(token: u64) {
+pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
     ACTION_COVERAGE.with(|coverage| {
-        coverage.borrow_mut().2.insert(token);
+        coverage.borrow_mut().3.insert(surface);
     });
 }
 
-fn action_variant_key(action: &SettingsPointerAction) -> String {
-    let debug = format!("{action:?}");
-    let mut depth = 0;
-    for (index, ch) in debug.char_indices() {
-        match ch {
-            '(' => {
-                depth += 1;
-                if depth == 2 {
-                    return debug[..index].to_string();
-                }
-            }
-            ')' if depth == 1 => return debug[..=index].to_string(),
-            ')' => depth -= 1,
-            _ => {}
-        }
-    }
-    debug
-}
-
-pub(super) fn record_rendered_action(action: &SettingsPointerAction) {
-    assert_source_action_family_is_exhaustive(action);
+pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bool) {
+    assert_eq!(
+        source_action_fixture_is_enabled(action),
+        enabled,
+        "source action fixture disagrees with rendered reducer outcome"
+    );
     ACTION_COVERAGE.with(|coverage| {
-        coverage.borrow_mut().0.insert(action_variant_key(action));
+        let mut coverage = coverage.borrow_mut();
+        if enabled {
+            &mut coverage.0
+        } else {
+            &mut coverage.2
+        }
+        .insert(action.clone());
     });
 }
 
 pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
     ACTION_COVERAGE.with(|coverage| {
-        coverage.borrow_mut().1.insert(action_variant_key(action));
+        coverage.borrow_mut().1.insert(action.clone());
     });
 }
 
@@ -69,9 +65,9 @@ fn rendered_surface() -> SettingsPointerSurface {
     surface.clear_for(Rect::new(10, 5, 30, 10));
     surface.register(SettingsPointerTarget {
         rect: Rect::new(12, 7, 8, 1),
-        action: RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
-            "interface".into(),
-        )))),
+        action: RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(
+            RootNodeId::Interface,
+        ))),
         enabled: true,
         disabled_reason: None,
     });
@@ -113,9 +109,9 @@ fn settings_pointer_dispatch_preempts_chat() {
     let surface = rendered_surface();
     assert_eq!(
         surface.hit(13, 7).unwrap().action,
-        RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
-            "interface".into()
-        ))))
+        RenderAction::Page(SettingsPointerAction::Root(RootAction::Open(
+            RootNodeId::Interface
+        )))
     );
     let area = surface.area.get().unwrap();
     assert!(39 >= area.x && 39 < area.right() && 14 >= area.y && 14 < area.bottom());
@@ -297,9 +293,9 @@ fn settings_pointer_hover_and_help_are_truthful() {
         .expect("disabled target remains discoverable");
     assert!(!disabled.enabled);
     assert_eq!(disabled.disabled_reason, Some("read only"));
-    *surface.hover.borrow_mut() = Some(SettingsPointerAction::Root(RootAction::Open(RootNodeId(
-        "interface".into(),
-    ))));
+    *surface.hover.borrow_mut() = Some(SettingsPointerAction::Root(RootAction::Open(
+        RootNodeId::Interface,
+    )));
     surface.clear_for_page(Rect::new(10, 5, 30, 10), 2);
     assert!(surface.hover.borrow().is_none());
 
@@ -362,11 +358,15 @@ fn settings_pointer_hover_and_help_are_truthful() {
         "resize clears hover"
     );
     dialog.extended.tui.mouse_capture = false;
-    let _ = render_settings_rows(&dialog, 72, 16);
+    let rows = render_settings_rows(&dialog, 72, 16);
     assert!(
         dialog.pointer_surface.targets.borrow().is_empty(),
         "capture-off render has no pointer affordances"
     );
+    let rendered = rows.join("\n");
+    assert!(!rendered.contains("[Close settings]"));
+    assert!(!rendered.contains("[Back]"));
+    assert!(!rendered.contains("[Back to config picker]"));
 }
 
 #[test]
@@ -391,20 +391,44 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
             !coverage.0.is_empty(),
             "real rendered matrix collected no actions"
         );
-        for token in (100..=112)
-            .chain([200, 201, 202, 203])
-            .chain([400, 401, 402])
-            .chain(500..=509)
-        {
+        for surface in [
+            SettingsPointerSurfaceKind::Root,
+            SettingsPointerSurfaceKind::DefaultModel,
+            SettingsPointerSurfaceKind::Agents,
+            SettingsPointerSurfaceKind::Tools,
+            SettingsPointerSurfaceKind::Harnesses,
+            SettingsPointerSurfaceKind::Providers,
+            SettingsPointerSurfaceKind::Category,
+            SettingsPointerSurfaceKind::Instructions,
+            SettingsPointerSurfaceKind::RedactPatterns,
+            SettingsPointerSurfaceKind::StringList,
+            SettingsPointerSurfaceKind::Skills,
+            SettingsPointerSurfaceKind::Mcp,
+            SettingsPointerSurfaceKind::Lsp,
+        ] {
             assert!(
-                coverage.2.contains(&token),
-                "nested settings surface token {token} was never concretely rendered"
+                coverage.3.contains(&surface),
+                "source settings surface {surface:?} was not rendered"
             );
         }
-        for mode in 0..=6 {
+        assert!(
+            !coverage.2.is_empty(),
+            "disabled/read-only targets must be represented explicitly"
+        );
+        assert!(
+            coverage.2.is_disjoint(&coverage.1),
+            "disabled targets reached a reducer"
+        );
+        for expected in ["builtin", "mcp"] {
             assert!(
-                (0..5).any(|category| coverage.2.contains(&(600 + category * 7 + mode))),
-                "category editor mode {mode} was never concretely rendered"
+                coverage.2.iter().any(|action| match (expected, action) {
+                    ("builtin", SettingsPointerAction::Tools(ToolsAction::ReadOnlyBuiltin(_))) =>
+                        true,
+                    ("mcp", SettingsPointerAction::Tools(ToolsAction::ReadOnlyMcpTool(_, _))) =>
+                        true,
+                    _ => false,
+                }),
+                "disabled/read-only {expected} source payload was not rendered"
             );
         }
     });
@@ -474,7 +498,7 @@ fn assert_source_list_action_is_covered(action: &ListAction) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn assert_source_action_family_is_exhaustive(action: &SettingsPointerAction) {
+fn source_action_fixture_is_enabled(action: &SettingsPointerAction) -> bool {
     match action {
         SettingsPointerAction::Root(action) => match action {
             RootAction::Open(_) => {}
@@ -579,14 +603,15 @@ fn assert_source_action_family_is_exhaustive(action: &SettingsPointerAction) {
             | ProvidersAction::EditField(_, _)
             | ProvidersAction::EditHeaders(_)
             | ProvidersAction::CopilotSetup(_)
-            | ProvidersAction::OAuthSetup(_, _)
+            | ProvidersAction::BeginOAuth(_, _)
+            | ProvidersAction::OAuthOption(_, _)
             | ProvidersAction::ManageModels(_)
             | ProvidersAction::ProviderSettings(_)
             | ProvidersAction::Favorite(_)
             | ProvidersAction::Refetch(_)
             | ProvidersAction::RefetchAll
             | ProvidersAction::CycleUnlistedPolicy
-            | ProvidersAction::DeepFetchConfirm(_, _)
+            | ProvidersAction::DeepFetchConfirm(_)
             | ProvidersAction::BeginDelete(_)
             | ProvidersAction::Delete(_, _)
             | ProvidersAction::SaveProvider(_)
@@ -632,6 +657,12 @@ fn assert_source_action_family_is_exhaustive(action: &SettingsPointerAction) {
             DefaultModelAction::Choose | DefaultModelAction::Clear => {}
         },
     }
+    !matches!(
+        action,
+        SettingsPointerAction::Tools(
+            ToolsAction::ReadOnlyBuiltin(_) | ToolsAction::ReadOnlyMcpTool(_, _)
+        )
+    )
 }
 
 #[test]

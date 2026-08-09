@@ -380,7 +380,7 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
                 });
             }
             3 => descend_provider(&mut dialog, "EditAction::DeepFetch", |action| {
-                matches!(action, ProvidersAction::DeepFetchConfirm(_, _))
+                matches!(action, ProvidersAction::DeepFetchConfirm(_))
             }),
             _ => unreachable!(),
         }
@@ -622,7 +622,7 @@ fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog_impl() {
             (
                 super::super::shell::SettingsPointerAction::Page(
                     action @ super::super::pointer_actions::SettingsPointerAction::Providers(
-                        super::super::pointer_actions::ProvidersAction::OAuthSetup(_, _),
+                        super::super::pointer_actions::ProvidersAction::OAuthOption(_, _),
                     ),
                 ),
                 true,
@@ -800,7 +800,7 @@ fn pointer_row_editor_actions_survive_reordering_by_identity() {
         super::super::pointer_actions::SettingsPointerAction::Providers(
             super::super::pointer_actions::ProvidersAction::RowEditor(
                 super::super::pointer_actions::ProviderRowEditorAction::HeaderOpen(
-                    super::super::pointer_actions::StableRowId("X-Second".into()),
+                    super::super::pointer_actions::HeaderName("X-Second".into()),
                 ),
             ),
         )

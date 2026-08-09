@@ -107,6 +107,29 @@ const FIELDS: [Field; 17] = [
 ];
 
 impl Field {
+    fn pointer_id(self) -> super::pointer_actions::HarnessField {
+        use super::pointer_actions::HarnessField as P;
+        match self {
+            Self::Command => P::Command,
+            Self::Args => P::Args,
+            Self::PromptInput => P::PromptInput,
+            Self::ArgvOverflow => P::ArgvOverflow,
+            Self::ModelArgs => P::ModelArgs,
+            Self::DefaultModel => P::DefaultModel,
+            Self::Models => P::Models,
+            Self::ModelListArgs => P::ModelListArgs,
+            Self::SupportsJson => P::SupportsJson,
+            Self::JsonOutputArgs => P::JsonOutputArgs,
+            Self::SupportsAgentFile => P::SupportsAgentFile,
+            Self::AgentFileArgs => P::AgentFileArgs,
+            Self::AgentFileEnv => P::AgentFileEnv,
+            Self::AuthEnvVars => P::AuthEnvVars,
+            Self::AuthProbeArgs => P::AuthProbeArgs,
+            Self::Timeout => P::Timeout,
+            Self::AlwaysAllow => P::AlwaysAllow,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Field::Command => "command",
@@ -539,7 +562,7 @@ impl SettingsCx {
             );
             bindings.push((
                 lines.len(),
-                super::pointer_actions::HarnessesAction::Open(super::pointer_actions::StableRowId(
+                super::pointer_actions::HarnessesAction::Open(super::pointer_actions::HarnessId(
                     (*name).clone(),
                 )),
             ));
@@ -580,7 +603,7 @@ impl SettingsCx {
                 bindings.push((
                     lines.len(),
                     super::pointer_actions::HarnessesAction::Delete(
-                        super::pointer_actions::StableRowId((*name).clone()),
+                        super::pointer_actions::HarnessId((*name).clone()),
                     ),
                 ));
                 lines.push(Line::from("[Delete]"));
@@ -590,7 +613,7 @@ impl SettingsCx {
                 bindings.push((
                     lines.len(),
                     super::pointer_actions::HarnessesAction::Delete(
-                        super::pointer_actions::StableRowId((*name).clone()),
+                        super::pointer_actions::HarnessId((*name).clone()),
                     ),
                 ));
                 lines.push(Line::from("[Delete]"));
@@ -660,9 +683,7 @@ impl SettingsCx {
             };
             bindings.push((
                 lines.len(),
-                super::pointer_actions::HarnessesAction::EditField(
-                    super::pointer_actions::StableRowId(field.label().to_string()),
-                ),
+                super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
             ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
@@ -696,9 +717,7 @@ impl SettingsCx {
                     ),
                     action: super::shell::SettingsPointerAction::Page(
                         super::pointer_actions::SettingsPointerAction::Harnesses(
-                            super::pointer_actions::HarnessesAction::EditField(
-                                super::pointer_actions::StableRowId(field.label().to_string()),
-                            ),
+                            super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
                         ),
                     ),
                     enabled: true,
@@ -883,7 +902,7 @@ impl SettingsPage for HarnessesPage {
                 HarnessesPage::Edit(state),
                 super::pointer_actions::HarnessesAction::EditField(id),
             ) => {
-                let Some(index) = FIELDS.iter().position(|field| field.label() == id.0) else {
+                let Some(index) = FIELDS.iter().position(|field| field.pointer_id() == id) else {
                     return Nav::Stay;
                 };
                 state.cursor = index;

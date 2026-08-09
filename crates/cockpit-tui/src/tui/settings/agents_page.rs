@@ -1095,7 +1095,11 @@ impl SettingsCx {
                         super::pointer_actions::SettingsPointerAction::Agents(
                             super::pointer_actions::AgentsAction::ToggleTool(
                                 super::pointer_actions::AgentId(detail.name.clone()),
-                                super::pointer_actions::StableRowId(index.to_string()),
+                                super::pointer_actions::AgentToolId(
+                                    cockpit_core::agents::tool_surface_catalog()[index]
+                                        .name
+                                        .into(),
+                                ),
                             ),
                         ),
                     )
@@ -1203,7 +1207,10 @@ impl SettingsPage for AgentsPage {
             else {
                 return Nav::Stay;
             };
-            let Ok(index) = row.0.parse::<usize>() else {
+            let Some(index) = cockpit_core::agents::tool_surface_catalog()
+                .iter()
+                .position(|tool| tool.name == row.0)
+            else {
                 return Nav::Stay;
             };
             if index >= cockpit_core::agents::tool_surface_catalog().len() {

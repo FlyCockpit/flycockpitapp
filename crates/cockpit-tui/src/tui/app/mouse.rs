@@ -150,6 +150,16 @@ impl App {
             return;
         }
         if self.mouse_capture
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.sync_mouse_capture_from_dialog();
+                self.resync_config_after_local_write();
+            }
+            return;
+        }
+        if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self
                 .sandbox_notice_copy_rect
@@ -176,16 +186,6 @@ impl App {
                 .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
         {
             self.open_auth_failure_provider();
-            return;
-        }
-        if self.mouse_capture
-            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
-        {
-            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
-                self.dialog = crate::tui::settings::Dialog::None;
-                self.sync_mouse_capture_from_dialog();
-                self.resync_config_after_local_write();
-            }
             return;
         }
         if self.mouse_capture

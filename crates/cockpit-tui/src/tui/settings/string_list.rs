@@ -26,7 +26,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
-use super::pointer_actions::{ListAction, SettingsPointerAction, StableRowId};
+use super::pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
 use super::secret_display;
 use super::shell::{
     SettingsPointerTarget, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
@@ -37,7 +37,7 @@ use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 /// Which config list this editor is bound to. Each variant names its
 /// back-target category (so Esc/h lands on the page it was drilled from),
 /// its title, and a one-line intro.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum StringListKind {
     AgentDirs,
     ExtraDotenvPaths,
@@ -758,12 +758,16 @@ impl SettingsPage for StringListPage {
     }
 }
 
-fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{kind:?}:{index}:{value}"))
+fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> ListRowId {
+    ListRowId {
+        kind: ListKind::String(kind),
+        index,
+        value: value.into(),
+    }
 }
 
 impl StringListPage {
-    fn current_row_id(&self, cx: &SettingsCx) -> Option<StableRowId> {
+    fn current_row_id(&self, cx: &SettingsCx) -> Option<ListRowId> {
         let values = cx.string_list_values(self.kind);
         values
             .get(self.cursor)

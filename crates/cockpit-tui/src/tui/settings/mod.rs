@@ -148,14 +148,14 @@ pub enum Dialog {
     Settings(Box<SettingsDialog>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub(crate) enum SettingsPointerOutcome {
     Consumed,
     Close,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum SettingsPointerSurfaceKind {
     Root,
     DefaultModel,
@@ -646,10 +646,19 @@ impl SettingsPage for DefaultModelPage {
         }
         lines.push(Line::from(format!("Scope: {scope}")));
         lines.push(Line::from(""));
+        let pointer_enabled = cx.pointer_surface.enabled.get();
         let choose_line = lines.len();
-        lines.push(Line::from("[Choose default model]"));
+        lines.push(Line::from(if pointer_enabled {
+            "[Choose default model]"
+        } else {
+            "Choose default model"
+        }));
         let clear_line = lines.len();
-        lines.push(Line::from("[Clear default for this scope]"));
+        lines.push(Line::from(if pointer_enabled {
+            "[Clear default for this scope]"
+        } else {
+            "Clear default for this scope"
+        }));
         lines.push(Line::from("Applies to newly created sessions only."));
         lines.push(Line::from(
             "Reopening an existing session keeps its own saved model.",
@@ -2302,7 +2311,7 @@ impl SettingsDialog {
     ) {
         let surface_token = self.page.pointer_surface_token();
         #[cfg(test)]
-        pointer_acceptance_tests::record_rendered_surface(surface_token);
+        pointer_acceptance_tests::record_rendered_surface(self.page.pointer_surface_kind());
         self.pointer_surface
             .enabled
             .set(self.extended.tui.mouse_capture);
@@ -2323,60 +2332,74 @@ impl SettingsDialog {
             Constraint::Length(1),
         ])
         .split(inner);
+        let pointer_enabled = self.extended.tui.mouse_capture;
         let header_style = |action| {
-            if self.pointer_surface.header_hover.get() == Some(action) {
+            if pointer_enabled && self.pointer_surface.header_hover.get() == Some(action) {
                 Style::default().add_modifier(Modifier::UNDERLINED)
             } else {
                 Style::default()
             }
         };
+        let close_label = if pointer_enabled {
+            "[Close settings]"
+        } else {
+            "Close settings"
+        };
         let mut header = vec![Span::styled(
-            "[Close settings]",
+            close_label,
             header_style(SettingsHeaderAction::Close),
         )];
-        self.pointer_surface.register(SettingsPointerTarget {
-            rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
-            action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
-            enabled: true,
-            disabled_reason: None,
-        });
+        if pointer_enabled {
+            self.pointer_surface.register(SettingsPointerTarget {
+                rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
+                action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
+                enabled: true,
+                disabled_reason: None,
+            });
+        }
         let root = self.page.as_any().is::<RootPage>();
         if !root || !self.stack.is_empty() {
             header.push(Span::styled(
-                "  [Back]",
+                if pointer_enabled {
+                    "  [Back]"
+                } else {
+                    "  Back"
+                },
                 header_style(SettingsHeaderAction::Back),
             ));
-            self.pointer_surface.register(SettingsPointerTarget {
-                rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
-                action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
-                enabled: true,
-                disabled_reason: None,
-            });
+            if pointer_enabled {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
+                    action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
         } else if self.picker_cwd.is_some() {
             header.push(Span::styled(
-                "  [Back to config picker]",
+                if pointer_enabled {
+                    "  [Back to config picker]"
+                } else {
+                    "  Back to config picker"
+                },
                 header_style(SettingsHeaderAction::BackToConfigPicker),
             ));
-            self.pointer_surface.register(SettingsPointerTarget {
-                rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
-                action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
-                enabled: true,
-                disabled_reason: None,
-            });
+            if pointer_enabled {
+                self.pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
+                    action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
         }
         frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
             .render_with_links(&self.cx, frame, layout[1], links);
         #[cfg(test)]
-        for target in self
-            .pointer_surface
-            .targets
-            .borrow()
-            .iter()
-            .filter(|target| target.enabled)
-        {
+        for target in self.pointer_surface.targets.borrow().iter() {
             if let SettingsPointerAction::Page(action) = &target.action {
-                pointer_acceptance_tests::record_rendered_action(action);
+                pointer_acceptance_tests::record_rendered_action(action, target.enabled);
             }
         }
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
@@ -2524,13 +2547,12 @@ impl SettingsPage for RootPage {
         cx: &mut SettingsCx,
         action: pointer_actions::SettingsPointerAction,
     ) -> Nav {
-        let pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
-            pointer_actions::RootNodeId(id),
-        )) = action
+        let pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(id)) =
+            action
         else {
             return Nav::Stay;
         };
-        let Some(index) = root_nodes().iter().position(|node| node.title == id) else {
+        let Some(index) = root_nodes().iter().position(|node| node.id == id) else {
             return Nav::Stay;
         };
         self.cursor = index;
@@ -2578,8 +2600,8 @@ impl SettingsPage for RootPage {
 // ── Helpers / freestanding renderers ─────────────────────────────────────
 
 /// The Providers & Provider Models menu node title (also the dispatch key).
-const PROVIDERS_TITLE: &str = "Providers & Provider Models";
-const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
+pub(super) const PROVIDERS_TITLE: &str = "Providers & Provider Models";
+pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 
 /// The reorganized top-level menu (implementation note).
 /// `Default model for new sessions` leads, then the locked scheme in order;
@@ -2588,58 +2610,72 @@ const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 fn root_nodes() -> [NavNode; 14] {
     [
         NavNode {
-            title: DEFAULT_MODEL_TITLE,
+            id: pointer_actions::RootNodeId::DefaultModel,
+            title: pointer_actions::RootNodeId::DefaultModel.title(),
             description: "Default model for newly created sessions in the current configuration context. Does not change the model of an already-running session.",
         },
         NavNode {
-            title: PROVIDERS_TITLE,
+            id: pointer_actions::RootNodeId::Providers,
+            title: pointer_actions::RootNodeId::Providers.title(),
             description: "Provider setup and request controls: endpoints, headers, model lists, default model, context/cache, fallback, wire API, and per-provider/per-model inline-<think> extraction overrides.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Dependencies,
             title: "Dependencies",
             description: "Read-only dependency health grouped by safety, selected features, optional integrations, and accelerators.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Agents,
             title: "Agents",
             description: "Manage agent definitions, presets, and per-agent overrides.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Interface,
             title: "Interface",
             description: "Display & input only: vim mode, thinking display for stored reasoning, markdown rendering, mouse, diff style, banner, chrome toggles, emojis, and exit scrollback.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Behavior,
             title: "Behavior",
             description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Privacy,
             title: "Privacy & Safety",
             description: "Redaction (master switch + every source), the prompt-injection guard, and the remote-config opt-in. Advanced holds the redaction internals.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Translation,
             title: "Translation",
             description: "Round-trip utility-model translation: your language and the model's language.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Tools,
             title: "Tools",
             description: "Tool inventory and configuration: web providers, builtin tools, user-defined command tools, and MCP catalogs.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Harnesses,
             title: "Harnesses",
             description: "External coding harnesses (claude, codex, opencode, grok, …) Build/Plan can delegate to via harness_invoke.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Skills,
             title: "Skills",
             description: "Skill scan directories and the auto-! command toggle (Claude vs Codex mode).",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Profile,
             title: "Profile",
             description: "Your display name, shown on the startup banner.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Mcp,
             title: "MCP",
             description: "Model Context Protocol servers: transport, auth, and enabled state.",
         },
         NavNode {
+            id: pointer_actions::RootNodeId::Lsp,
             title: "LSP",
             description: "Language servers, diagnostics surfacing, semantic navigation, and install behavior.",
         },
@@ -2647,6 +2683,7 @@ fn root_nodes() -> [NavNode; 14] {
 }
 
 struct NavNode {
+    id: pointer_actions::RootNodeId,
     title: &'static str,
     description: &'static str,
 }
@@ -2697,7 +2734,7 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
         .map(|node| {
             Some((
                 pointer_actions::SettingsPointerAction::Root(pointer_actions::RootAction::Open(
-                    pointer_actions::RootNodeId(node.title.to_string()),
+                    node.id.clone(),
                 )),
                 true,
                 None,

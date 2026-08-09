@@ -252,7 +252,7 @@ fn llm_mode_label(m: LlmMode) -> &'static str {
 /// Which top-level category a [`CategoryPage`] renders. Drives the page
 /// title, the section intro, the row descriptor list, the reset scope, and
 /// the back-target cursor.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub(super) enum Category {
     Interface,
     Behavior,
@@ -1396,7 +1396,7 @@ impl CategoryPathEditor {
                         super::pointer_actions::SettingsPointerAction::Category(
                             super::pointer_actions::CategoryAction::SuggestionSelect(
                                 category_pointer_id(self.id),
-                                super::pointer_actions::StableRowId(entry.replacement.clone()),
+                                super::pointer_actions::SuggestionId(entry.replacement.clone()),
                             ),
                         ),
                     ),
@@ -1465,16 +1465,11 @@ fn path_setting_mode(id: SettingId) -> Option<PathSuggestMode> {
 }
 
 fn category_pointer_id(id: SettingId) -> super::pointer_actions::SettingId {
-    super::pointer_actions::SettingId(
-        ALL_SETTING_IDS
-            .iter()
-            .position(|candidate| *candidate == id)
-            .expect("every category setting is sealed in ALL_SETTING_IDS") as u64,
-    )
+    id
 }
 
 fn category_setting_from_pointer(id: super::pointer_actions::SettingId) -> Option<SettingId> {
-    ALL_SETTING_IDS.get(id.0 as usize).copied()
+    Some(id)
 }
 
 /// Full-area editor for long text and JSON category settings.
@@ -1593,17 +1588,20 @@ impl CategoryPage {
     }
 
     #[cfg(test)]
-    pub(super) fn pointer_surface_fixture(mode: usize, cwd: &std::path::Path) -> Self {
+    pub(super) fn pointer_surface_fixture(
+        mode: CategoryPointerFixtureMode,
+        cwd: &std::path::Path,
+    ) -> Self {
         use super::ui_page::PickerMode;
 
         let mut page = Self::new(Category::Interface);
         match mode {
-            0 => {}
-            1 => {
+            CategoryPointerFixtureMode::Browse => {}
+            CategoryPointerFixtureMode::InlineEdit => {
                 page.editing = Some(SettingId::ExitTailLines);
                 page.buf = TextField::new("7");
             }
-            2 => {
+            CategoryPointerFixtureMode::PathEdit => {
                 page.path_editor = Some(CategoryPathEditor::new(
                     SettingId::PackagesDir,
                     cwd.display().to_string(),
@@ -1611,14 +1609,14 @@ impl CategoryPage {
                     cwd,
                 ));
             }
-            3 => {
+            CategoryPointerFixtureMode::TextEdit => {
                 page.text_editor = Some(CategoryTextEditor::new(
                     SettingId::CompactPrompt,
                     "echo fixture".into(),
                     false,
                 ));
             }
-            4 => {
+            CategoryPointerFixtureMode::ExternalEdit => {
                 page.pending_external_edit = Some(CategoryExternalEdit {
                     operation_id: PointerOperationId(1),
                     id: SettingId::CompactPrompt,
@@ -1629,7 +1627,7 @@ impl CategoryPage {
                     servicing: false,
                 });
             }
-            5 => {
+            CategoryPointerFixtureMode::PickerList => {
                 page.utility_picker = Some(Box::new(UtilityModelPicker {
                     entries: Vec::new(),
                     current: None,
@@ -1640,7 +1638,7 @@ impl CategoryPage {
                 }));
                 page.utility_picker_target = Some(SettingId::UtilityModel);
             }
-            6 => {
+            CategoryPointerFixtureMode::PickerCustom => {
                 page.utility_picker = Some(Box::new(UtilityModelPicker {
                     entries: Vec::new(),
                     current: None,
@@ -1650,7 +1648,6 @@ impl CategoryPage {
                 }));
                 page.utility_picker_target = Some(SettingId::UtilityModel);
             }
-            _ => panic!("unknown category pointer surface mode {mode}"),
         }
         page
     }
@@ -1689,6 +1686,31 @@ impl CategoryPage {
             .reset_label()
             .map(|_| self.setting_ids().len())
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CategoryPointerFixtureMode {
+    Browse,
+    InlineEdit,
+    PathEdit,
+    TextEdit,
+    ExternalEdit,
+    PickerList,
+    PickerCustom,
+}
+
+#[cfg(test)]
+impl CategoryPointerFixtureMode {
+    pub(super) const ALL: [Self; 7] = [
+        Self::Browse,
+        Self::InlineEdit,
+        Self::PathEdit,
+        Self::TextEdit,
+        Self::ExternalEdit,
+        Self::PickerList,
+        Self::PickerCustom,
+    ];
 }
 
 /// Build the descriptor list for a category. Common, foundational settings

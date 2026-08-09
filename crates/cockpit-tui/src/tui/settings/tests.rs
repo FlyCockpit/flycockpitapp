@@ -794,12 +794,12 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
         .collect::<std::collections::HashSet<_>>();
     assert!(
         populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Open(
-            pointer_actions::StableRowId("alpha".into()),
+            pointer_actions::HarnessId("alpha".into()),
         )))
     );
     assert!(
         populated_actions.contains(&SettingsPointerAction::Harnesses(HarnessesAction::Delete(
-            pointer_actions::StableRowId("alpha".into()),
+            pointer_actions::HarnessId("alpha".into()),
         )))
     );
     for action in &populated_actions {
@@ -920,10 +920,8 @@ fn render_all_non_provider_pointer_surface_variants() {
     let mut d = fresh_dialog(&tmp);
     enter_harnesses_from_root(&mut d);
     d.extended.tui.mouse_capture = false;
-    assert_eq!(d.page.pointer_surface_token(), 200);
     let _ = render_settings_rows(&d, 100, 40);
     d.handle_key(press(KeyCode::Char('a')));
-    assert_eq!(d.page.pointer_surface_token(), 202);
     let _ = render_settings_rows(&d, 100, 40);
 
     let tmp = TempDir::new().unwrap();
@@ -940,10 +938,8 @@ fn render_all_non_provider_pointer_surface_variants() {
     };
     state.cursor = 0;
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.page.pointer_surface_token(), 201);
     let _ = render_settings_rows(&d, 100, 40);
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.page.pointer_surface_token(), 203);
     let _ = render_settings_rows(&d, 100, 40);
 
     // Agents: list, structured detail, and the in-TUI source editor.
@@ -984,15 +980,27 @@ fn render_all_non_provider_pointer_surface_variants() {
     // Category base, inline, path, full-text, external, picker-list, and
     // picker-custom modes. The fixture constructor uses the same production
     // editor/picker types as normal descriptor activation.
-    for mode in 0..=6 {
+    for mode in category::CategoryPointerFixtureMode::ALL {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         d.extended.tui.mouse_capture = false;
         d.set_test_page(Page::Category(Box::new(
             category::CategoryPage::pointer_surface_fixture(mode, tmp.path()),
         )));
-        let _ = render_settings_rows(&d, 100, 40);
+        let rows = render_settings_rows(&d, 100, 40);
+        let rendered = rows.join("\n");
+        assert!(!rendered.contains("[Save custom]"));
+        assert!(!rendered.contains("[clear — unset]"));
+        assert!(!rendered.contains("[custom provider:model-id…]"));
     }
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    d.extended.tui.mouse_capture = false;
+    enter_root_node(&mut d, "Default model for new sessions");
+    let rendered = render_settings_rows(&d, 100, 40).join("\n");
+    assert!(!rendered.contains("[Choose default model]"));
+    assert!(!rendered.contains("[Clear default for this scope]"));
 }
 
 pub(super) fn run_pointer_text_layout_matrix() {

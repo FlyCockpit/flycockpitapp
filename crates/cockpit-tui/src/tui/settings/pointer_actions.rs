@@ -18,14 +18,90 @@ pub(super) struct McpServerId(pub String);
 pub(super) struct McpToolId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LspServerId(pub String);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct SettingId(pub u64);
+pub(super) type SettingId = super::category::SettingId;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct UtilityModelId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct RootNodeId(pub String);
+pub(super) enum RootNodeId {
+    DefaultModel,
+    Providers,
+    Dependencies,
+    Agents,
+    Interface,
+    Behavior,
+    Privacy,
+    Translation,
+    Tools,
+    Harnesses,
+    Skills,
+    Profile,
+    Mcp,
+    Lsp,
+}
+impl RootNodeId {
+    pub(super) fn title(&self) -> &'static str {
+        match self {
+            Self::DefaultModel => super::DEFAULT_MODEL_TITLE,
+            Self::Providers => super::PROVIDERS_TITLE,
+            Self::Dependencies => "Dependencies",
+            Self::Agents => "Agents",
+            Self::Interface => "Interface",
+            Self::Behavior => "Behavior",
+            Self::Privacy => "Privacy & Safety",
+            Self::Translation => "Translation",
+            Self::Tools => "Tools",
+            Self::Harnesses => "Harnesses",
+            Self::Skills => "Skills",
+            Self::Profile => "Profile",
+            Self::Mcp => "MCP",
+            Self::Lsp => "LSP",
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct StableRowId(pub String);
+pub(super) struct SuggestionId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct PickerOptionId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct AgentToolId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct HarnessId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ScanDirectoryId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ListRowId {
+    pub kind: ListKind,
+    pub index: usize,
+    pub value: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ListKind {
+    Instructions,
+    RedactPatterns,
+    String(super::string_list::StringListKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct HeaderName(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum HarnessField {
+    Command,
+    Args,
+    PromptInput,
+    ArgvOverflow,
+    ModelArgs,
+    DefaultModel,
+    Models,
+    ModelListArgs,
+    SupportsJson,
+    JsonOutputArgs,
+    SupportsAgentFile,
+    AgentFileArgs,
+    AgentFileEnv,
+    AuthEnvVars,
+    AuthProbeArgs,
+    Timeout,
+    AlwaysAllow,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ToolFieldId {
     FirecrawlBaseUrl,
@@ -34,10 +110,57 @@ pub(super) enum ToolFieldId {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct BuiltinToolId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum WizardStepId {
+    Template,
+    ProviderId,
+    Url,
+    AuthMethod,
+    ApiKey,
+    EnvVar,
+    Headers,
+    TestKeyChoice,
+    GrokOAuth,
+    CodexOAuth,
+}
+impl WizardStepId {
+    pub(super) fn source_id(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::ProviderId => "id",
+            Self::Url => "url",
+            Self::AuthMethod => "auth-method",
+            Self::ApiKey => "api-key",
+            Self::EnvVar => "env-var",
+            Self::Headers => "headers",
+            Self::TestKeyChoice => "test-key-choice",
+            Self::GrokOAuth => "grok-oauth",
+            Self::CodexOAuth => "codex-oauth",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum WizardAuthMethod {
+    PasteKey,
+    EnvVar,
+    AdvancedHeaders,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum WizardTestChoice {
+    TestKey,
+    SkipTest,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct WizardStepId(pub String);
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct WizardControlId(pub String);
+pub(super) enum WizardControlId {
+    Template(String),
+    AuthMethod(WizardAuthMethod),
+    TestChoice(WizardTestChoice),
+    OAuth(super::providers::oauth_flow::OAuthOption),
+    Header(HeaderName),
+    AddHeader,
+    ContinueHeaders,
+    EditText,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct OAuthFlowId(pub u64);
 
@@ -148,10 +271,10 @@ pub(super) enum CategoryAction {
     PathEditBegin(SettingId),
     PathEditCommit(SettingId),
     PathEditCancel(SettingId),
-    SuggestionSelect(SettingId, StableRowId),
+    SuggestionSelect(SettingId, SuggestionId),
     TextEditorSave(SettingId),
     TextEditorCancel(SettingId),
-    PickerSelect(SettingId, StableRowId),
+    PickerSelect(SettingId, PickerOptionId),
     Confirm(SettingId, ConfirmationChoice),
     Reset,
     ExternalEditBegin(SettingId, CategoryExternalSource),
@@ -165,8 +288,8 @@ pub(super) enum AgentsAction {
     Delete(AgentId),
     Reset(AgentId),
     ResetAll,
-    ToggleTool(AgentId, StableRowId),
-    CycleTier(AgentId, StableRowId),
+    ToggleTool(AgentId, AgentToolId),
+    CycleTier(AgentId, AgentToolId),
     Save(AgentId),
     OpenRawEditor(AgentId),
     EditText(AgentId),
@@ -195,12 +318,12 @@ pub(super) enum ToolsAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum HarnessesAction {
-    Open(StableRowId),
+    Open(HarnessId),
     Add,
-    Delete(StableRowId),
+    Delete(HarnessId),
     SeedInstalledPresets,
     ResetAndSeedPresets,
-    EditField(StableRowId),
+    EditField(HarnessField),
     Save,
     Cancel,
 }
@@ -209,9 +332,9 @@ pub(super) enum SkillsAction {
     ToggleAutoBangCommands,
     ToggleAncestorWalk,
     AddScanDirectory,
-    EditScanDirectory(StableRowId),
-    DeleteScanDirectory(StableRowId),
-    ConfirmDeleteScanDirectory(StableRowId, ConfirmationChoice),
+    EditScanDirectory(ScanDirectoryId),
+    DeleteScanDirectory(ScanDirectoryId),
+    ConfirmDeleteScanDirectory(ScanDirectoryId, ConfirmationChoice),
     Reset,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -258,17 +381,18 @@ pub(super) enum OAuthCopyKind {
 pub(super) enum ProvidersAction {
     Open(ProviderId),
     Add,
-    EditField(ProviderId, StableRowId),
+    EditField(ProviderId, super::providers::EditField),
     EditHeaders(ProviderId),
     CopilotSetup(ProviderId),
-    OAuthSetup(ProviderId, StableRowId),
+    BeginOAuth(ProviderId, super::providers::oauth_flow::OAuthProvider),
+    OAuthOption(ProviderId, super::providers::oauth_flow::OAuthOption),
     ManageModels(ProviderId),
     ProviderSettings(ProviderId),
     Favorite(ProviderId),
     Refetch(ProviderId),
     RefetchAll,
     CycleUnlistedPolicy,
-    DeepFetchConfirm(ProviderId, StableRowId),
+    DeepFetchConfirm(ProviderId),
     BeginDelete(ProviderId),
     Delete(ProviderId, ProviderDeleteChoice),
     SaveProvider(ProviderId),
@@ -293,14 +417,14 @@ pub(super) enum ProvidersAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ProviderRowEditorAction {
-    HeaderOpen(StableRowId),
+    HeaderOpen(HeaderName),
     HeaderAdd,
     HeaderContinue,
     HeaderSave,
     ModelOpen(ModelId),
     ModelAdd,
     ModelSave,
-    SettingEdit(StableRowId),
+    SettingEdit(super::settings_editor::ProviderSettingId),
     SettingSave,
 }
 
@@ -322,10 +446,10 @@ pub(super) enum LspAction {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ListAction {
     Add,
-    Edit(StableRowId),
-    Delete(StableRowId),
-    MoveUp(StableRowId),
-    MoveDown(StableRowId),
+    Edit(ListRowId),
+    Delete(ListRowId),
+    MoveUp(ListRowId),
+    MoveDown(ListRowId),
     Save,
     Cancel,
 }

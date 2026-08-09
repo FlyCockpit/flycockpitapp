@@ -25,7 +25,7 @@ use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
 use super::pointer_actions::{
-    ListAction, SettingsPointerAction, StableRowId, UtilityModelAction, UtilityModelId,
+    ListAction, ListKind, ListRowId, SettingsPointerAction, UtilityModelAction, UtilityModelId,
 };
 use super::shell::{
     SettingsPointerSurface, SettingsPointerTarget, SettingsScrollRegionId, SettingsScrollStates,
@@ -580,6 +580,7 @@ impl SettingsCx {
     ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
+        let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut bindings = Vec::new();
 
@@ -619,12 +620,26 @@ impl SettingsCx {
                     lines.len(),
                     SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
                 ));
-                lines.push(Line::from(Span::styled("[Save custom]", muted)));
+                lines.push(Line::from(Span::styled(
+                    if pointer_enabled {
+                        "[Save custom]"
+                    } else {
+                        "Save custom"
+                    },
+                    muted,
+                )));
                 bindings.push((
                     lines.len(),
                     SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
                 ));
-                lines.push(Line::from(Span::styled("[Cancel]", muted)));
+                lines.push(Line::from(Span::styled(
+                    if pointer_enabled {
+                        "[Cancel]"
+                    } else {
+                        "Cancel"
+                    },
+                    muted,
+                )));
             }
             PickerMode::List { cursor, scroll } => {
                 let cur_label = |value: &str| -> &'static str {
@@ -655,7 +670,11 @@ impl SettingsCx {
                 lines.push(Line::from(vec![
                     Span::raw(if clear_active { "▸ " } else { "  " }),
                     Span::styled(
-                        format!("[clear — unset]{clear_suffix}"),
+                        if pointer_enabled {
+                            format!("[clear — unset]{clear_suffix}")
+                        } else {
+                            format!("clear — unset{clear_suffix}")
+                        },
                         action_style(clear_active),
                     ),
                 ]));
@@ -666,7 +685,12 @@ impl SettingsCx {
                 lines.push(Line::from(vec![
                     Span::raw(if custom_active { "▸ " } else { "  " }),
                     Span::styled(
-                        "[custom provider:model-id…]".to_string(),
+                        if pointer_enabled {
+                            "[custom provider:model-id…]"
+                        } else {
+                            "custom provider:model-id…"
+                        }
+                        .to_string(),
                         action_style(custom_active),
                     ),
                 ]));
@@ -929,8 +953,17 @@ fn render_grab_list(
     }
 }
 
-fn grab_list_row_id(key: &str, index: usize, value: &str) -> StableRowId {
-    StableRowId(format!("{key}:{index}:{value}"))
+fn grab_list_row_id(key: &str, index: usize, value: &str) -> ListRowId {
+    let kind = match key {
+        "instructions" => ListKind::Instructions,
+        "redact-patterns" => ListKind::RedactPatterns,
+        _ => unreachable!("list source key is sealed by its page"),
+    };
+    ListRowId {
+        kind,
+        index,
+        value: value.into(),
+    }
 }
 
 impl SettingsPage for InstructionsPage {

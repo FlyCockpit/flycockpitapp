@@ -127,7 +127,7 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OAuthProvider {
     Grok,
     Codex,
@@ -276,7 +276,7 @@ impl OAuthKeyOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OAuthOption {
     Login,
     ManualPaste,

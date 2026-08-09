@@ -50,6 +50,30 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
         .max_by_key(|rect| rect.y)
         .expect("root target");
 
+    app.sandbox_notice_copy_rect = Some(target);
+    app.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
+        provider: "fixture".into(),
+        model: "fixture".into(),
+        kind: cockpit_core::daemon::proto::AuthFailureKind::ProviderNotConfigured,
+    });
+    app.auth_notice_switch_rect = Some(target);
+    app.auth_notice_fix_rect = Some(target);
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        target.x,
+        target.y,
+    ));
+    assert!(
+        matches!(&app.dialog, Dialog::Settings(dialog) if !matches!(dialog.test_page(), TestPageRef::Root { .. })),
+        "settings must preempt ordinary persistent-notice controls"
+    );
+    assert!(app.auth_failure_notice.is_some());
+
+    app.dialog = Dialog::Settings(Box::new(crate::tui::settings::SettingsDialog::open(
+        tmp.path().join("config.json"),
+    )));
+    render_settings(&mut app, 80, 24);
+
     app.keys_overlay = Some(KeysOverlay::open(KeyContext::Composer));
     app.handle_mouse(mouse(MouseEventKind::ScrollDown, target.x, target.y));
     assert!(

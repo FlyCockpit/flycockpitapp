@@ -905,7 +905,7 @@ pub(super) struct EditState {
     pub(super) delete_pending: bool,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum EditField {
     Url,
 }
@@ -3012,9 +3012,9 @@ impl SettingsCx {
                         (
                             line,
                             super::pointer_actions::SettingsPointerAction::Providers(
-                                super::pointer_actions::ProvidersAction::OAuthSetup(
+                                super::pointer_actions::ProvidersAction::OAuthOption(
                                     super::pointer_actions::ProviderId(provider_id.into()),
-                                    super::pointer_actions::StableRowId(option.label().to_string()),
+                                    *option,
                                 ),
                             ),
                         )
@@ -3310,9 +3310,9 @@ impl SettingsCx {
             "providers:add",
             lines,
             selected_line,
-            controls
-                .into_iter()
-                .map(|(line, control)| (line, provider_add_pointer_action(s, control))),
+            controls.into_iter().filter_map(|(line, control)| {
+                provider_add_pointer_action(s, control).map(|action| (line, action))
+            }),
             &self.pointer_surface,
             SettingsScrollRegionId("providers:add"),
         );
@@ -3721,9 +3721,7 @@ impl SettingsCx {
                 lines.len(),
                 super::pointer_actions::SettingsPointerAction::Providers(
                     super::pointer_actions::ProvidersAction::RowEditor(
-                        super::pointer_actions::ProviderRowEditorAction::SettingEdit(
-                            super::pointer_actions::StableRowId(field.label().to_string()),
-                        ),
+                        super::pointer_actions::ProviderRowEditorAction::SettingEdit(*field),
                     ),
                 ),
             ));
@@ -4178,10 +4176,10 @@ fn provider_header_pointer_action(
     index: usize,
 ) -> Option<super::pointer_actions::SettingsPointerAction> {
     use super::pointer_actions::{
-        ProviderRowEditorAction, ProvidersAction, SettingsPointerAction, StableRowId,
+        HeaderName, ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
     };
     let control = if let Some(row) = editor.rows().get(index) {
-        ProviderRowEditorAction::HeaderOpen(StableRowId(row.name.clone()))
+        ProviderRowEditorAction::HeaderOpen(HeaderName(row.name.clone()))
     } else if index == editor.add_row_idx() {
         ProviderRowEditorAction::HeaderAdd
     } else if editor.continue_idx() == Some(index) {
@@ -4657,26 +4655,18 @@ fn provider_edit_pointer_action(
     state: &EditState,
     action: EditAction,
 ) -> super::pointer_actions::SettingsPointerAction {
-    use super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction, StableRowId};
+    use super::pointer_actions::{ProviderId, ProvidersAction, SettingsPointerAction};
     let id = ProviderId(state.provider_id.clone());
     let action = match action {
-        EditAction::Url => ProvidersAction::EditField(id, StableRowId("url".into())),
+        EditAction::Url => ProvidersAction::EditField(id, EditField::Url),
         EditAction::Headers => ProvidersAction::EditHeaders(id),
         EditAction::CopilotAuth => ProvidersAction::CopilotSetup(id),
-        EditAction::OAuthAuth(provider) => {
-            let provider = match provider {
-                OAuthProvider::Grok => "grok",
-                OAuthProvider::Codex => "codex",
-            };
-            ProvidersAction::OAuthSetup(id, StableRowId(provider.into()))
-        }
+        EditAction::OAuthAuth(provider) => ProvidersAction::BeginOAuth(id, provider),
         EditAction::Models => ProvidersAction::ManageModels(id),
         EditAction::Settings => ProvidersAction::ProviderSettings(id),
         EditAction::Favorite => ProvidersAction::Favorite(id),
         EditAction::Refetch => ProvidersAction::Refetch(id),
-        EditAction::DeepFetch => {
-            ProvidersAction::DeepFetchConfirm(id, StableRowId("deep-fetch".into()))
-        }
+        EditAction::DeepFetch => ProvidersAction::DeepFetchConfirm(id),
         EditAction::Delete => ProvidersAction::BeginDelete(id),
         EditAction::Save => ProvidersAction::SaveProvider(id),
         EditAction::Back => ProvidersAction::LocalBack,
@@ -4687,53 +4677,64 @@ fn provider_edit_pointer_action(
 fn provider_add_pointer_action(
     state: &AddState,
     index: usize,
-) -> super::pointer_actions::SettingsPointerAction {
+) -> Option<super::pointer_actions::SettingsPointerAction> {
     use super::pointer_actions::{
-        ProvidersAction, SettingsPointerAction, WizardControlId, WizardStepId,
+        HeaderName, ProvidersAction, SettingsPointerAction, WizardAuthMethod, WizardControlId,
+        WizardStepId, WizardTestChoice,
     };
-    let step = state.run.current_step_id().unwrap_or("done");
+    let step = match state.run.current_step_id()? {
+        "template" => WizardStepId::Template,
+        "id" => WizardStepId::ProviderId,
+        "url" => WizardStepId::Url,
+        "auth-method" => WizardStepId::AuthMethod,
+        "api-key" => WizardStepId::ApiKey,
+        "env-var" => WizardStepId::EnvVar,
+        "headers" => WizardStepId::Headers,
+        "test-key-choice" => WizardStepId::TestKeyChoice,
+        "grok-oauth" => WizardStepId::GrokOAuth,
+        "codex-oauth" => WizardStepId::CodexOAuth,
+        _ => return None,
+    };
     let control = match step {
-        "template" => templates::TEMPLATES.get(index).map_or_else(
-            || "stale-template".to_string(),
-            |template| template.id.to_string(),
+        WizardStepId::Template => {
+            WizardControlId::Template(templates::TEMPLATES.get(index)?.id.to_string())
+        }
+        WizardStepId::AuthMethod => WizardControlId::AuthMethod(
+            *[
+                WizardAuthMethod::PasteKey,
+                WizardAuthMethod::EnvVar,
+                WizardAuthMethod::AdvancedHeaders,
+            ]
+            .get(index)?,
         ),
-        "auth-method" => ["paste-key", "env-var", "advanced-headers"]
-            .get(index)
-            .unwrap_or(&"stale-auth-method")
-            .to_string(),
-        "test-key-choice" => ["test-key", "skip-test"]
-            .get(index)
-            .unwrap_or(&"stale-test-choice")
-            .to_string(),
-        "grok-oauth" | "codex-oauth" => state
-            .oauth_auth
-            .as_deref()
-            .and_then(|oauth| {
+        WizardStepId::TestKeyChoice => WizardControlId::TestChoice(
+            *[WizardTestChoice::TestKey, WizardTestChoice::SkipTest].get(index)?,
+        ),
+        WizardStepId::GrokOAuth | WizardStepId::CodexOAuth => {
+            WizardControlId::OAuth(state.oauth_auth.as_deref().and_then(|oauth| {
                 oauth_options(oauth, OAuthHost::AddWizard)
                     .into_iter()
                     .nth(index)
-            })
-            .map_or_else(
-                || "stale-oauth-option".to_string(),
-                |option| option.label().to_string(),
-            ),
-        "headers" => {
+            })?)
+        }
+        WizardStepId::Headers => {
             if let Some(row) = state.headers.rows().get(index) {
-                format!("header:{}", row.name)
+                WizardControlId::Header(HeaderName(row.name.clone()))
             } else if index == state.headers.add_row_idx() {
-                "add-header".to_string()
+                WizardControlId::AddHeader
             } else if state.headers.continue_idx() == Some(index) {
-                "continue".to_string()
+                WizardControlId::ContinueHeaders
             } else {
-                "stale-header-control".to_string()
+                return None;
             }
         }
-        "id" | "url" | "api-key" | "env-var" => format!("edit-{step}"),
-        _ => format!("{step}-control"),
+        WizardStepId::ProviderId
+        | WizardStepId::Url
+        | WizardStepId::ApiKey
+        | WizardStepId::EnvVar => WizardControlId::EditText,
     };
-    SettingsPointerAction::Providers(ProvidersAction::WizardControl(
-        WizardStepId(step.to_string()),
-        WizardControlId(control),
+    Some(SettingsPointerAction::Providers(
+        ProvidersAction::WizardControl(step, control),
     ))
 }
 
@@ -4918,11 +4919,7 @@ impl SettingsPage for ProvidersPage {
                 super::pointer_actions::ProvidersAction::RowEditor(control),
             ) => match control {
                 super::pointer_actions::ProviderRowEditorAction::SettingEdit(id) => {
-                    let Some(index) = editor
-                        .fields()
-                        .iter()
-                        .position(|field| field.label() == id.0)
-                    else {
+                    let Some(index) = editor.fields().iter().position(|field| field == id) else {
                         return Nav::Stay;
                     };
                     index
@@ -4934,11 +4931,11 @@ impl SettingsPage for ProvidersPage {
             },
             (
                 ProvidersPage::OAuthSetup { state, parent },
-                super::pointer_actions::ProvidersAction::OAuthSetup(id, option),
+                super::pointer_actions::ProvidersAction::OAuthOption(id, option),
             ) if parent.provider_id == id.0 => {
                 let Some(index) = oauth_options(state, OAuthHost::Standalone)
                     .iter()
-                    .position(|candidate| candidate.label() == option.0)
+                    .position(|candidate| candidate == option)
                 else {
                     return Nav::Stay;
                 };
@@ -4947,15 +4944,15 @@ impl SettingsPage for ProvidersPage {
             (
                 ProvidersPage::Add(state),
                 super::pointer_actions::ProvidersAction::WizardControl(step, control),
-            ) if state.run.current_step_id() == Some(step.0.as_str()) => {
+            ) if state.run.current_step_id() == Some(step.source_id()) => {
                 let Some(index) = (0..256).position(|index| {
                     provider_add_pointer_action(state, index)
-                        == super::pointer_actions::SettingsPointerAction::Providers(
+                        == Some(super::pointer_actions::SettingsPointerAction::Providers(
                             super::pointer_actions::ProvidersAction::WizardControl(
-                                step.clone(),
+                                *step,
                                 control.clone(),
                             ),
-                        )
+                        ))
                 }) else {
                     return Nav::Stay;
                 };
@@ -5127,7 +5124,7 @@ impl SettingsPage for ProvidersPage {
                 ),
             ),
         ) = (&mut *self, &action)
-            && editor.editing.is_some_and(|field| field.label() == id.0)
+            && editor.editing.is_some_and(|field| field == *id)
         {
             let label_width = editor
                 .fields()

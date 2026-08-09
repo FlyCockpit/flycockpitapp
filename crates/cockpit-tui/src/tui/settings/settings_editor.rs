@@ -96,7 +96,7 @@ struct DetectedCapabilityPreview {
 }
 
 /// The editable provider/model fields, in row order.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ProviderSettingId {
     /// Provider-only opt-in for plaintext non-loopback HTTP base URLs.
     AllowInsecureHttp,

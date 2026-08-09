@@ -74,7 +74,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
       else if (testCase.mutation === "multibyte_tool")
         value.request.tag_expansions[0].tool = "é".repeat(65);
       expect(() => encodeCanonicalSendUserMessageV2(value), testCase.name).toThrow(
-        testCase.ts_error ?? testCase.error,
+        testCase.error_code,
       );
     }
   });
@@ -160,13 +160,13 @@ describe("send_user_message_v2_canonical_vectors", () => {
     expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("too many attachments");
     maximum.request.attachments.pop();
     maximum.request.tag_expansions[0]!.tool += "t";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("tag tool");
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_tag_tool_too_long");
     maximum.request.tag_expansions[0]!.tool = "t";
     maximum.request.tag_expansions[0]!.path += "p";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("tag path exceeds byte limit");
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_tag_path_too_long");
     maximum.request.tag_expansions[0]!.path = "p";
     maximum.request.forced_skill += "s";
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("forced skill");
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("fcm2_forced_skill_too_long");
     expect(() => validateFcm2Length(FCM2_MAX_BYTES + 1)).toThrow(/maximum/);
   });
 });

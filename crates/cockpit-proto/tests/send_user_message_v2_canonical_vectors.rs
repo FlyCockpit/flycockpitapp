@@ -147,19 +147,19 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
     tool_over.request.tag_expansions[0].tool.push('t');
     assert_eq!(
         tool_over.encode().unwrap_err().to_string(),
-        "invalid tag tool"
+        "fcm2_tag_tool_too_long"
     );
     let mut path_over = value.clone();
     path_over.request.tag_expansions[0].path.push('p');
     assert_eq!(
         path_over.encode().unwrap_err().to_string(),
-        "tag field exceeds limit"
+        "fcm2_tag_path_too_long"
     );
     let mut skill_over = value;
     skill_over.request.forced_skill.as_mut().unwrap().push('s');
     assert_eq!(
         skill_over.encode().unwrap_err().to_string(),
-        "invalid forced skill"
+        "fcm2_forced_skill_too_long"
     );
     assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1).is_err());
 }
@@ -218,12 +218,7 @@ fn send_user_message_v2_shared_semantic_errors() {
             "multibyte_tool" => value.request.tag_expansions[0].tool = "é".repeat(65),
             other => panic!("unknown mutation {other}"),
         }
-        let expected = case
-            .get("rust_error")
-            .or_else(|| case.get("error"))
-            .unwrap()
-            .as_str()
-            .unwrap();
+        let expected = case["error_code"].as_str().unwrap();
         assert_eq!(
             value.encode().unwrap_err().to_string(),
             expected,

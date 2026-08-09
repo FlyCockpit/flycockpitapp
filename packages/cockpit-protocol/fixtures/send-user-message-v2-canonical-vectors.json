@@ -93,25 +93,26 @@
     }
   ],
   "semantic_error_cases": [
-    { "name": "empty_tool", "mutation": "empty_tool", "error": "invalid tag tool" },
+    { "name": "empty_tool", "mutation": "empty_tool", "error_code": "fcm2_empty_tag_tool" },
     {
       "name": "detail_one_over",
       "mutation": "detail_one_over",
-      "rust_error": "tag field exceeds limit",
-      "ts_error": "tag detail exceeds byte limit"
+      "error_code": "fcm2_tag_detail_too_long"
     },
-    { "name": "empty_forced_skill", "mutation": "empty_skill", "error": "invalid forced skill" },
+    {
+      "name": "empty_forced_skill",
+      "mutation": "empty_skill",
+      "error_code": "fcm2_empty_forced_skill"
+    },
     {
       "name": "invalid_forced_skill_char",
       "mutation": "invalid_skill",
-      "rust_error": "non-canonical forced skill",
-      "ts_error": "invalid forced skill"
+      "error_code": "fcm2_invalid_forced_skill"
     },
     {
       "name": "multibyte_tool_byte_one_over",
       "mutation": "multibyte_tool",
-      "rust_error": "invalid tag tool",
-      "ts_error": "tag tool exceeds byte limit"
+      "error_code": "fcm2_tag_tool_too_long"
     }
   ],
   "predicate_vectors": [

@@ -75,6 +75,17 @@ function bytes(value: string, max: number, name: string) {
   if (b.length > max) throw new Error(`${name} exceeds byte limit`);
   return b;
 }
+function boundedFieldBytes(
+  value: string,
+  max: number,
+  emptyCode: string | null,
+  tooLongCode: string,
+) {
+  rejectUnpairedSurrogates(value);
+  const encoded = encoder.encode(value);
+  if (emptyCode && encoded.length === 0) throw new Error(emptyCode);
+  if (encoded.length > max) throw new Error(tooLongCode);
+}
 function scalars(value: string) {
   let n = 0;
   for (const _ of value) n++;
@@ -112,13 +123,20 @@ function validate(v: CanonicalSendUserMessageV2) {
     throw new Error("message has no content");
   if (v.request.tag_expansions.length > 64) throw new Error("too many tags");
   for (const t of v.request.tag_expansions) {
-    const tool = bytes(t.tool, 128, "tag tool");
-    if (!tool.length) throw new Error("empty tag tool");
-    bytes(t.path, 4096, "tag path");
-    bytes(t.detail, 4096, "tag detail");
+    boundedFieldBytes(t.tool, 128, "fcm2_empty_tag_tool", "fcm2_tag_tool_too_long");
+    boundedFieldBytes(t.path, 4096, null, "fcm2_tag_path_too_long");
+    boundedFieldBytes(t.detail, 4096, null, "fcm2_tag_detail_too_long");
   }
-  if (v.request.forced_skill !== null && !/^[A-Za-z0-9_-]{1,128}$/.test(v.request.forced_skill))
-    throw new Error("invalid forced skill");
+  if (v.request.forced_skill !== null) {
+    boundedFieldBytes(
+      v.request.forced_skill,
+      128,
+      "fcm2_empty_forced_skill",
+      "fcm2_forced_skill_too_long",
+    );
+    if (!/^[A-Za-z0-9_-]+$/.test(v.request.forced_skill))
+      throw new Error("fcm2_invalid_forced_skill");
+  }
   if (v.request.attachments.length > 16) throw new Error("too many attachments");
   const ids = new Set<string>();
   for (const a of v.request.attachments) {

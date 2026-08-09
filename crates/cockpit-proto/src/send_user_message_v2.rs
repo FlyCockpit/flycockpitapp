@@ -136,25 +136,19 @@ impl CanonicalSendUserMessageV2 {
             "too many tags"
         );
         for tag in &self.request.tag_expansions {
-            ensure!(
-                !tag.tool.is_empty() && tag.tool.len() <= 128,
-                "invalid tag tool"
-            );
-            ensure!(
-                tag.path.len() <= 4096 && tag.detail.len() <= 4096,
-                "tag field exceeds limit"
-            );
+            ensure!(!tag.tool.is_empty(), "fcm2_empty_tag_tool");
+            ensure!(tag.tool.len() <= 128, "fcm2_tag_tool_too_long");
+            ensure!(tag.path.len() <= 4096, "fcm2_tag_path_too_long");
+            ensure!(tag.detail.len() <= 4096, "fcm2_tag_detail_too_long");
         }
         if let Some(skill) = &self.request.forced_skill {
-            ensure!(
-                !skill.is_empty() && skill.len() <= 128,
-                "invalid forced skill"
-            );
+            ensure!(!skill.is_empty(), "fcm2_empty_forced_skill");
+            ensure!(skill.len() <= 128, "fcm2_forced_skill_too_long");
             ensure!(
                 skill
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
-                "non-canonical forced skill"
+                "fcm2_invalid_forced_skill"
             );
         }
         ensure!(

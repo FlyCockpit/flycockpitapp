@@ -130,7 +130,16 @@ export const stampedClientRelayFrameSchema = z
     principal: relayPrincipalSchema,
     payload: z.unknown(),
   })
-  .strict();
+  .strict()
+  .superRefine((frame, ctx) => {
+    if (frame.v === 1 && frame.principal.actorBinding) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["principal", "actorBinding"],
+        message: "relay envelope v1 must be actorless",
+      });
+    }
+  });
 export type StampedClientRelayFrame = z.infer<typeof stampedClientRelayFrameSchema>;
 
 export const daemonClientRelayFrameSchema = z

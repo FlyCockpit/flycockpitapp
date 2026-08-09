@@ -228,7 +228,7 @@ pub struct ClientRelayFrame {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StampedClientRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
@@ -238,6 +238,35 @@ pub struct StampedClientRelayFrame {
     pub from: ClientFrameOrigin,
     pub principal: RelayPrincipal,
     pub payload: Value,
+}
+
+impl<'de> Deserialize<'de> for StampedClientRelayFrame {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            #[serde(deserialize_with = "relay_envelope_version")]
+            v: u32,
+            #[serde(deserialize_with = "non_empty_string")]
+            channel_id: String,
+            from: ClientFrameOrigin,
+            principal: RelayPrincipal,
+            payload: Value,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.v == 1 && wire.principal.actor_binding.is_some() {
+            return Err(serde::de::Error::custom(
+                "relay envelope v1 must be actorless",
+            ));
+        }
+        Ok(Self {
+            v: wire.v,
+            channel_id: wire.channel_id,
+            from: wire.from,
+            principal: wire.principal,
+            payload: wire.payload,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -461,6 +490,13 @@ pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
         let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed)?.v;
         return Ok(IncomingRelayFrame::Unknown { v, kind });
     }
+    let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed.clone())?.v;
+    if !is_relay_envelope_version_supported(v) {
+        return Ok(IncomingRelayFrame::Unknown {
+            v,
+            kind: "client".to_string(),
+        });
+    }
     serde_json::from_value::<StampedClientRelayFrame>(parsed).map(IncomingRelayFrame::Client)
 }
 
@@ -588,7 +624,7 @@ mod tests {
         let value = serde_json::to_value(frame).unwrap();
         assert_eq!(
             value,
-            json!({ "v": 1, "channelId": "ch-1", "payload": { "text": "world" } })
+            json!({ "v": 2, "channelId": "ch-1", "payload": { "text": "world" } })
         );
     }
 
@@ -605,8 +641,11 @@ mod tests {
             let raw = fs::read_to_string(&path).unwrap();
             match name.as_ref() {
                 "client-relay-frame.json" => assert_roundtrip::<ClientRelayFrame>(&raw),
-                "stamped-client-relay-frame.json" => {
+                "stamped-client-relay-frame.json" | "stamped-client-relay-frame-v1.json" => {
                     assert_roundtrip::<StampedClientRelayFrame>(&raw)
+                }
+                "client-actor-binding-v1.json" => {
+                    let _: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 }
                 "daemon-client-relay-frame.json" => {
                     assert_roundtrip::<DaemonClientRelayFrame>(&raw)

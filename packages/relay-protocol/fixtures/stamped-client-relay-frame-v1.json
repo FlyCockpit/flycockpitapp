@@ -1,0 +1,7 @@
+{
+  "channelId": "ch-stamped-v1",
+  "from": "client",
+  "payload": { "op": "status" },
+  "principal": { "grants": [], "userId": "legacy-user" },
+  "v": 1
+}

@@ -30,6 +30,7 @@ const validFixtures = {
   "client-actor-binding-v1.json": actorBindingVectorsSchema,
   "client-relay-frame.json": clientRelayFrameSchema,
   "stamped-client-relay-frame.json": stampedClientRelayFrameSchema,
+  "stamped-client-relay-frame-v1.json": stampedClientRelayFrameSchema,
   "daemon-client-relay-frame.json": daemonClientRelayFrameSchema,
   "daemon-control-relay-frame.json": daemonControlRelayFrameSchema,
   "user-presence-relay-frame.json": userPresenceRelayFrameSchema,
